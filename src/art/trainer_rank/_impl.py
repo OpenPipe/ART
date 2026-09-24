@@ -1500,7 +1500,8 @@ def _moe_output_bytes_per_token(
     slot_ref: "LoRASlotRef | None" = None,
 ) -> int:
     """Known routed-expert working set, not a complete model/compiled bound."""
-    if shape != ParallelShape(tp=1, cp=1):
+    # CP shards rows, not the per-token working set; EP dispatch is not modeled.
+    if (shape.tp, shape.ep, shape.etp) != (1, 1, 1):
         return 0
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelGroupedLinear,
@@ -3461,7 +3462,9 @@ class TrainerRank:
             assert estimated is not None  # rows are CPU copies
             physical_rows = self._physical_tokens(estimated)
             packed_tokens += physical_rows
-            group_rows.append((physical_rows, grad_enabled))
+            # The most loaded CP rank holds at least an even share.
+            cp = max(1, self._topology_key()[2])
+            group_rows.append((-(-physical_rows // cp), grad_enabled))
             head_requests = tuple(requests[index] for index in group_indices)
             head_workspace_bytes = max(
                 head_workspace_bytes,
@@ -3536,7 +3539,7 @@ class TrainerRank:
             rows <= 0
             or self._padded_vocab_size is None
             or len(self.runtime.model) != 1
-            or self._topology_key()[1:] != (1, 1, 1)
+            or self._topology_key()[1::2] != (1, 1)
         ):
             return 0
         try:
@@ -3776,9 +3779,21 @@ class TrainerRank:
         return peak
 
     def _plan_group_rows(self, plan: _FlatForwardPlan) -> tuple[tuple[int, bool], ...]:
+        """Physical rows per group on the most loaded context-parallel rank."""
+        topology = self._topology() if plan.signature.topology[2] > 1 else None
         return tuple(
             (
-                self._physical_tokens(int(group.packed.tokens.numel())),
+                self._physical_tokens(
+                    int(group.packed.tokens.numel())
+                    if topology is None
+                    else max(
+                        1,
+                        self._max_rank_model_tokens(
+                            _pad_packed_batch(group.packed, multiple=int(topology.tp)),
+                            topology=topology,
+                        ),
+                    )
+                ),
                 group.grad_enabled,
             )
             for group in plan.groups
@@ -3902,8 +3917,7 @@ class TrainerRank:
             or config.params_dtype is not torch.bfloat16
             or self._param_dtype_size != 2
             or next(self.runtime.model[0].parameters()).dtype is not torch.bfloat16
-            or self._topology_key()[1:] != (1, 1, 1)
-            or _expert_parallel_shape(self.runtime.provider) != (1, 1)
+            or self._topology_key()[1::2] != (1, 1)
             or any(
                 type(getattr(config, name, None)) is not type(value)
                 or getattr(config, name) != value
@@ -5106,25 +5120,32 @@ class TrainerRank:
             width = normalize(width)
             result = estimate(width)
             if result is None:
-                # Estimator unavailable (device inputs): admit on the
-                # materialized plan, trying the cost-optimal layouts first and
-                # the memory-minimal layouts if those do not fit.
-                plan = materialize(width)
-                check = self._memory_check(
-                    plan, sync_across_dp=True, sync_planning_errors=True
-                )
-                if not check.fits and not layout_modes.get(width, False):
-                    layout_modes[width] = True
-                    plans.pop(width, None)
-                    plan = materialize(width)
+                # Estimator unavailable (device inputs, or CP per-rank floors):
+                # admit on the materialized plan, trying the cost-optimal
+                # layouts first and the memory-minimal layouts if those do not
+                # fit or fall outside the profile's trust window.
+                def price(plan: _FlatForwardPlan) -> tuple[_MemoryCheck, bool, bool]:
                     check = self._memory_check(
                         plan, sync_across_dp=True, sync_planning_errors=True
                     )
-                trusted = self._all_ranks_have_memory_profile(
-                    packed_tokens=plan.packed_tokens,
-                    signature=plan.signature,
-                )
-                profiled = self._all_ranks_true(plan.signature in self._memory_profiles)
+                    trusted = self._all_ranks_have_memory_profile(
+                        packed_tokens=plan.packed_tokens,
+                        signature=plan.signature,
+                    )
+                    profiled = self._all_ranks_true(
+                        plan.signature in self._memory_profiles
+                    )
+                    return check, trusted, profiled
+
+                plan = materialize(width)
+                check, trusted, profiled = price(plan)
+                if (
+                    not check.fits or (profiled and not trusted)
+                ) and not layout_modes.get(width, False):
+                    layout_modes[width] = True
+                    plans.pop(width, None)
+                    plan = materialize(width)
+                    check, trusted, profiled = price(plan)
             else:
                 check, trusted, profiled = result
             if width in plans:
@@ -5197,6 +5218,19 @@ class TrainerRank:
         first_estimate = estimate(min_width)
         if first_estimate is None or not (first_estimate[0].fits and first_estimate[1]):
             first = candidate(min_width)
+            if (
+                first_estimate is None
+                and first.check.fits
+                and first.cold_start
+                and not layout_modes.get(min_width, False)
+                and self._all_ranks_true(first.plan.signature in self._memory_profiles)
+            ):
+                # Materialized pricing (DP-uniform): a profiled cost-optimal
+                # layout outside trust; full sharing may be trusted, as the
+                # estimator path would find.
+                layout_modes[min_width] = True
+                plans.pop(min_width, None)
+                first = candidate(min_width)
             if not first.check.fits:
                 # The smallest wave cannot run unsplit: best effort is the
                 # bounded split ladder. Each DP rank runs it on its own share,
@@ -5715,6 +5749,7 @@ class TrainerRank:
         whose feasibility is monotone in width (valid for rejecting one).
         ``exact=True`` prices the planner's actual layouts (memoized by
         content) and is used only inside the band where those bounds disagree.
+        Under CP it returns None: per-rank floors need materialized layouts.
         """
 
         if sync_planning_errors:
@@ -5738,14 +5773,10 @@ class TrainerRank:
                 # Pending saves require the actual bucket/replayed-tail geometry.
                 # Existing unavailable handling materializes before admission.
                 return None
-            if (
-                self._topology_key()[2] > 1
-                and self._recompute_granularity != "full"
-                and not self._geometry.moe_experts
-                and any(grad for (_, grad), _ in groups)
-            ):
-                # CP token ownership can be uneven. Use the existing exact-plan
-                # fallback; a global token count alone cannot price its peak.
+            if self._topology_key()[2] > 1:
+                # CP token ownership can be uneven and memory floors are priced
+                # per rank. Use the existing exact-plan fallback; a global token
+                # count alone cannot price its peak.
                 return None
             packed_tokens = 0
             head_workspace_bytes = 0
@@ -7724,7 +7755,12 @@ class TrainerRank:
         static_compute = max(
             static_compute,
             *(
-                self._moe_workspace_bytes(packed_tokens, slot_ref=ref)
+                self._moe_workspace_bytes(
+                    sum(rows for rows, _ in group_rows)
+                    if signature.topology[2] > 1 and group_rows
+                    else packed_tokens,
+                    slot_ref=ref,
+                )
                 for ref in (slot_refs or (None,))
             ),
         )

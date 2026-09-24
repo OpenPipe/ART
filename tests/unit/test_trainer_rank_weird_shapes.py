@@ -782,7 +782,8 @@ def test_adaptive_planner_globally_falls_back_when_one_rank_cannot_estimate(
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 2))
     # Planning succeeds; only estimator availability and profile trust are false.
-    outcomes = iter((True, False, True, True, True, False))
+    # The last outcome says no profile exists, so full sharing is not retried.
+    outcomes = iter((True, False, True, True, True, False, False))
     monkeypatch.setattr(rank, "_all_ranks_true", lambda _local: next(outcomes))
     plans = 0
     original = rank._plan_flat_forward

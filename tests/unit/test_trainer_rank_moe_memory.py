@@ -174,11 +174,12 @@ def test_unknown_fc2_input_keeps_previous_pair(layer, mode):
 
 @pytest.mark.parametrize("field", ["tp", "cp", "ep", "etp"])
 def test_sharded_path_unchanged(layer, field):
-    assert (
-        _moe_output_bytes_per_token(
-            [layer], replace(ParallelShape(tp=1, cp=1), **{field: 2})
-        )
-        == 0
+    # CP shards rows, not the per-token working set; TP/EP/ETP are unmodeled.
+    single = _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1))
+    sharded = replace(ParallelShape(tp=1, cp=1), **{field: 2})
+    assert single > 0
+    assert _moe_output_bytes_per_token([layer], sharded) == (
+        single if field == "cp" else 0
     )
 
 

@@ -181,13 +181,83 @@ def test_actual_config_revalidated(field, value):
     assert r._checkpoint_memory_floor(((10, True),)) == (0, 0)
 
 
-@pytest.mark.parametrize("axis", [1, 2, 3])
+@pytest.mark.parametrize("axis", [1, 3])
 def test_topology_revalidated(axis):
     r = rank()
     topology = [1, 1, 1, 1]
     topology[axis] = 2
     r._topology_key = lambda: tuple(topology)
     assert r._checkpoint_memory_floor(((10, True),)) == (0, 0)
+
+
+@pytest.mark.parametrize("rows", [(10, True), (11, False)])
+@pytest.mark.parametrize("cp", [2, 4])
+def test_cp_floor_prices_rank_rows(cp, rows):
+    # Callers pass rows on the most loaded CP rank; the per-row floor matches CP1.
+    r = rank()
+    single = r._checkpoint_memory_floor((rows,))
+    r._topology_key = lambda: (1, 1, cp, 1)
+    assert r._checkpoint_memory_floor((rows,)) == single != (0, 0)
+
+
+@pytest.mark.parametrize("share", [lambda n: -(-n // 2), lambda n: n * 3 // 4])
+def test_cp_probe_defers_and_lower_bound_stays_below_exact(monkeypatch, share):
+    r = rank()
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    monkeypatch.setattr(r, "_topology", lambda: SimpleNamespace(cp=2, tp=1))
+    # Even (tight) and uneven ownership of each group by the busiest CP rank.
+    monkeypatch.setattr(
+        r, "_max_rank_model_tokens", lambda batch, **_: share(batch.tokens.numel())
+    )
+    reqs = requests()
+    # Global counts would price the per-rank floors about cp times too high.
+    assert r._estimate_flat_forward(reqs) is None
+    plan = r._plan_flat_forward(reqs)
+    assert r._checkpoint_memory_floor(r._plan_group_rows(plan))[0] > 0
+    exact = r._plan_cost(plan)
+    lower = r._split_chunk_lower_cost(
+        reqs, [q.input_tokens for q in reqs], checkpoint=Unset
+    )
+    assert lower.required <= exact.required and lower.retained <= exact.retained
+
+
+def test_cp_width_search_retries_full_sharing_inside_the_trust_window(monkeypatch):
+    r = rank()
+    r._dp_rank_and_size = lambda: (0, 1)
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    monkeypatch.setattr(r, "_topology", lambda: SimpleNamespace(cp=2, tp=1))
+    monkeypatch.setattr(
+        r, "_max_rank_model_tokens", lambda batch, **_: batch.tokens.numel() * 3 // 4
+    )
+    r._available_memory_bytes = lambda: 1 << 50
+    # Cost-optimal layouts stay unshared; memory-minimal layouts share fully.
+    monkeypatch.setattr(
+        r,
+        "_layout_anchor",
+        lambda *, memory_minimal=False: (
+            "full_sharing" if memory_minimal else "no_sharing"
+        ),
+    )
+    items = [
+        ForwardInput(
+            input_tokens=torch.tensor([7, 100 + i]), hidden_states=True, no_grad=True
+        )
+        for i in range(16)
+    ]
+    signature = r._plan_flat_forward(items[:1]).signature
+    r._memory_profiles[signature] = _MemoryProfile(bytes_per_token=1, packed_tokens=2)
+    # Unshared layouts leave the 8x window above width 8; full sharing
+    # (width + 1 packed rows) stays trusted through width 15.
+    selected = r._search_next_micro_batch(items, 0)
+    assert not isinstance(selected, _ForwardRefusal)
+    assert selected.stats_global_count == 15
+    # The minimum wave retries too: one item's unshared layout (32 rows) is
+    # outside a 3-row profile's window; full sharing (17 rows) is inside it.
+    r._memory_profiles[signature] = _MemoryProfile(bytes_per_token=1, packed_tokens=3)
+    r._last_global_micro_batch_size = None
+    selected = r._search_next_micro_batch([items], 0)
+    assert not isinstance(selected, _ForwardRefusal)
+    assert selected.plan.packed_tokens == 17 and not selected.cold_start
 
 
 def test_dp_empty_and_local_count():
@@ -426,11 +496,4 @@ def test_reference_prefix_search_agrees_with_mixed_demand(fits):
 def test_no_grad_enclosure_config_guard(field, value):
     r = rank()
     setattr(r.runtime.model[0].decoder.config, field, value)
-    assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)
-
-
-@pytest.mark.parametrize("cp", [2, 4])
-def test_no_grad_enclosure_keeps_cp_fallback(cp):
-    r = rank()
-    r._topology_key = lambda: (1, 1, cp, 1)
     assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)

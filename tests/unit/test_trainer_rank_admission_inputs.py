@@ -93,7 +93,8 @@ def test_cp_gdn_segments_groups_and_retained_tokens_reach_exact_search(monkeypat
     assert _gdn_memory.model_shapes(rank) is None  # This exercises the CP fallback.
     plan = rank._plan_flat_forward(requests)
     assert plan.grad_segment_count == 2
-    assert rank._plan_group_rows(plan) == ((128, True), (80, False))
+    # Rows on the most loaded CP rank (mocked at 3/4 of each group).
+    assert rank._plan_group_rows(plan) == ((96, True), (60, False))
     assert rank._plan_retained_tokens(plan) == 156
     for exact in (False, True):
         for memory_minimal in (False, True):
@@ -108,7 +109,7 @@ def test_cp_gdn_segments_groups_and_retained_tokens_reach_exact_search(monkeypat
         requests, tuple(item.input_tokens for item in requests), checkpoint=Unset
     )
     assert len(calls) == 1
-    assert calls[0]["group_rows"] == ((128, True), (80, False))
+    assert calls[0]["group_rows"] == ((32, True), (20, False))  # Even CP share.
     assert calls[0]["retained_tokens"] == 52  # Optimistic CP average only here.
     calls.clear()
     cost = rank._plan_cost(plan)
