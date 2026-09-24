@@ -941,6 +941,9 @@ class _MemorySignature:
     grad_enabled: bool
     grad_modes: tuple[bool, ...]
     slot_shapes: tuple[tuple[bool, tuple[tuple[int, ...], ...]], ...] = ()
+    # Short single-target requests keep the logical extrapolation, but share
+    # the profile learned from longer requests of the same signature.
+    short_requests: bool = dataclass_field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -3352,6 +3355,7 @@ class TrainerRank:
                         signature.grad_enabled,
                         signature.grad_modes,
                         signature.slot_shapes,
+                        signature.short_requests,
                         p.packed_tokens,
                         p.logical_tokens,
                         p.inactive_logical_tokens,
@@ -6745,6 +6749,7 @@ class TrainerRank:
             grad_enabled=any(modes),
             grad_modes=modes,
             slot_shapes=shapes if any(any(shape) for _, shape in shapes) else (),
+            short_requests=any(_short_request(request) for request in requests),
         )
 
     def _slot_memory_shapes(
@@ -8797,6 +8802,7 @@ def _packed_priced(signature: "_MemorySignature", one_layer_recompute: bool) -> 
         and bool(signature.grad_modes)
         and all(signature.grad_modes)
         and _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
+        and not signature.short_requests
     )
 
 
@@ -8818,15 +8824,16 @@ def _request_mix_key(request: AnyForwardInput) -> str:
         parts.append("logits")
     if request.hidden_states:
         parts.append("hidden")
-    key = "+".join(parts) if parts else "inactive"
-    if (
-        key == "target:single"
+    return "+".join(parts) if parts else "inactive"
+
+
+def _short_request(request: AnyForwardInput) -> bool:
+    """Too short for packed pricing: a duplicate adds no packed row, and caller
+    memory per request can outgrow its few logical-row charges."""
+    return (
+        _request_mix_key(request) == "target:single"
         and int(request.input_tokens.numel()) < _PACKED_PRICED_MIN_REQUEST_TOKENS
-    ):
-        # Keep short requests out of packed pricing: a duplicate adds no packed
-        # row, and caller memory per request can outgrow its few row charges.
-        key += "+short"
-    return key
+    )
 
 
 def _pad_packed_batch(

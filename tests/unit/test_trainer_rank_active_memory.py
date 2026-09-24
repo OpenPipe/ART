@@ -327,36 +327,30 @@ def test_short_single_target_requests_keep_logical_pricing(monkeypatch, shape):
             tokens = tokens[None]
         return ForwardInput(input_tokens=tokens, target_tokens=tokens + 1)
 
-    assert _request_mix_key(request(63)) == "target:single+short"
-    assert _request_mix_key(request(64)) == _request_mix_key(request(65))
-    assert _request_mix_key(request(64)) == "target:single"
-    assert _request_mix_key(ForwardInput(input_tokens=torch.arange(3))) == "inactive"
+    assert [_impl._short_request(request(n)) for n in (63, 64, 65)] == [
+        True,
+        False,
+        False,
+    ]
+    assert not _impl._short_request(ForwardInput(input_tokens=torch.arange(3)))
     rank = _rank()
-    long_plan = rank._plan_flat_forward([request(64), request(65)])
-    mixed_plan = rank._plan_flat_forward([request(64), request(63)])
     recompute = rank._one_layer_recompute()
-    assert _packed_priced(long_plan.signature, recompute)
-    # One short request keeps the whole batch on the logical extrapolation.
-    assert not _packed_priced(mixed_plan.signature, recompute)
-    for plan in (long_plan, mixed_plan):
-        rank._memory_profiles[plan.signature] = _impl._MemoryProfile(
-            bytes_per_token=100_000, packed_tokens=1000
+    # Calibrate on a 64-token request, then price a short one: the short batch
+    # shares the calibrated profile (no cold start) but keeps main's pricing.
+    long_plan = rank._plan_flat_forward([request(64)])
+    rank._update_memory_profile(long_plan, 64 * 100_000, retained_bytes=None)
+    for requests in ([request(63)], [request(64), request(63)]):
+        short = rank._plan_flat_forward(requests)
+        assert short.signature.short_requests and short.signature == long_plan.signature
+        assert _packed_priced(long_plan.signature, recompute)
+        assert not _packed_priced(short.signature, recompute)
+        profile = rank._memory_profiles[short.signature]
+        cost = rank._plan_cost(short)
+        extrapolated = profile.bytes_per_token * max(
+            short.packed_tokens,
+            short.active_logical_tokens / profile.logical_per_packed,
         )
-
-    def estimate(plan) -> int:
-        return rank._estimate_required_memory_bytes_from_values(
-            packed_tokens=10,
-            logical_tokens=1000,
-            output_bytes=0,
-            signature=plan.signature,
-        )
-
-    # Ratio-1 profiles: 1000 logical rows extrapolate to 1000 packed rows, or
-    # are clamped to 1000 / 8 = 125 rows plus the per-row charge.
-    assert estimate(mixed_plan) == int(100_000 * 1000 * 1.1)
-    assert estimate(long_plan) == int(
-        (100_000 * 125 + _PACKED_PRICED_LOGICAL_ROW_BYTES * 1000) * 1.1
-    )
+        assert cost.required >= int((short.output_bytes + extrapolated) * 1.1)
 
 
 def test_packed_sharing_clamp_is_monotone_and_learning_sharing_never_cheapens():

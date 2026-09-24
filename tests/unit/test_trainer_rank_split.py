@@ -1019,7 +1019,7 @@ def test_split_subforwards_track_independent_slot_graphs(
 def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
     monkeypatch: pytest.MonkeyPatch, direction: float | None
 ) -> None:
-    # Short and long requests share one signature here.
+    # Price the short test requests as packed-priced ones.
     monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
     rank = _retained_ratio_rank(monkeypatch)
 
@@ -1095,6 +1095,8 @@ def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
 def test_warm_rounding_preserves_native_split_bound_and_exact_budget(
     monkeypatch: pytest.MonkeyPatch, retained: int | None, admit: bool
 ) -> None:
+    # Price the short test requests as packed-priced ones.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
     rank = _retained_ratio_rank(monkeypatch)
     tokens = torch.arange(3)
     part = [ForwardInput(input_tokens=tokens, target_tokens=tokens) for _ in range(5)]
@@ -1136,13 +1138,15 @@ def test_warm_rounding_preserves_native_split_bound_and_exact_budget(
 def test_normalized_warm_profile_is_monotone_in_packed_tokens(
     monkeypatch: pytest.MonkeyPatch, retained: float | None
 ) -> None:
+    # Price the short test request as a packed-priced one.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
     rank = _retained_ratio_rank(monkeypatch)
     signature = rank._plan_flat_forward([_request(0)]).signature
     rank._memory_profiles[signature] = _MemoryProfile(
         7864330 / 15, 1000, 15 / 13, retained_compute_bytes_per_token=retained
     )
-    # All counts satisfy the retained guard; logical rows no longer scale the
-    # profile, so cost must grow monotonically with packed rows. Check each count.
+    # All counts satisfy the retained guard; the logical charge does not depend
+    # on layout, so cost must grow monotonically with packed rows. Check each.
     costs = [
         rank._subforward_cost(
             packed_tokens=packed,
