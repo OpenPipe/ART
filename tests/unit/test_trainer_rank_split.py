@@ -49,6 +49,7 @@ from art.trainer_rank import (
     TrainerRankMemoryError,
     TrainerRankPartialExecutionError,
     TrainerRankSlotStateError,
+    _impl,
 )
 from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
@@ -536,8 +537,13 @@ def test_changed_output_allocation_does_not_inflate_retained_compute() -> None:
     [(800, 800, True), (801, 801, False), (100, 800, True), (100, 801, False)],
 )
 def test_retained_compute_keeps_growth_and_sharing_trust_limits(
-    packed_tokens: int, logical_tokens: int, trusted: bool
+    monkeypatch: pytest.MonkeyPatch,
+    packed_tokens: int,
+    logical_tokens: int,
+    trusted: bool,
 ) -> None:
+    # Price the short test request as a packed-priced one.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
     rank = TrainerRank(_runtime())
     plan = replace(
         rank._plan_flat_forward([_request(0)]),
@@ -554,14 +560,13 @@ def test_retained_compute_keeps_growth_and_sharing_trust_limits(
     rank._update_memory_profile(plan, 100_000, retained_bytes=None)
     unknown = rank._plan_cost(candidate)
     assert unknown.retained == unknown.required
-    # A retained rate just above the floor of two row charges keeps packed pricing.
-    rate = 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES + 4
+    rate = 260
     rank._update_memory_profile(
         plan, 40_000 + 200 * rate, retained_bytes=40_000 + 100 * rate
     )
     observed = rank._plan_cost(candidate)
     if trusted:
-        rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * (logical_tokens - packed_tokens)
+        rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
         assert observed.retained == int((40_000 + rate * packed_tokens + rows) * 1.1)
         assert observed.retained < observed.required
     else:
@@ -847,11 +852,7 @@ def test_retained_ratio_original_cost_witness_stays_conservative(
     ]
     # Exact retention keeps its conservative fallback. Only treating that
     # fallback as an optimistic split-search bound was incorrect.
-    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES
-    assert (small.required, large.required) == tuple(
-        int((4 * 131_072 * packed + rows * (64_000 - packed) + 10_000) * 1.1)
-        for packed in (4000, 8000)
-    )
+    assert small.required == large.required == 36_909_886_200
     assert small.retained == small.required and large.retained == 11_000
 
 
@@ -1018,6 +1019,8 @@ def test_split_subforwards_track_independent_slot_graphs(
 def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
     monkeypatch: pytest.MonkeyPatch, direction: float | None
 ) -> None:
+    # Short and long requests share one signature here.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
     rank = _retained_ratio_rank(monkeypatch)
 
     def request(tokens: list[int]) -> ForwardInput:

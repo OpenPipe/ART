@@ -2709,6 +2709,16 @@ class TrainerRank:
         no_grad: bool | None = None,
         yield_empty: bool = False,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        """Yield admitted micro-batches; the caller runs its loss and backward.
+
+        Admission learns each call's whole peak, including the caller's loss
+        and backward. For grad-enabled single-target requests of at least 64
+        tokens under one-layer full recompute, it prices model memory by packed
+        rows and charges 6 KiB per logical token for the head plus the caller's
+        loss saves and backward transients. A caller whose per-token head and
+        loss memory peaks above that is unsupported: shared plans can exceed
+        their estimate.
+        """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
@@ -4055,12 +4065,11 @@ class TrainerRank:
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
         rate = profile.retained_compute_bytes_per_token
-        if _packed_priced(
-            signature, profile, self._one_layer_recompute()
-        ) and rate >= _packed_rate_floor(profile):
-            # Saved head indices and masks stay live until backward.
-            retained_compute = rate * packed_tokens + _packed_row_bytes(
-                profile, packed_tokens, logical_tokens
+        if _packed_priced(signature, self._one_layer_recompute()):
+            # Saved head indices, masks and caller saves stay live until
+            # backward. The ratio window above bounds the sharing extrapolation.
+            retained_compute = (
+                rate * packed_tokens + _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
             )
         else:
             retained_compute = rate * max(
@@ -7771,18 +7780,23 @@ class TrainerRank:
             # Local head results coexist with full CP outputs during gathering.
             # Uneven rank plans can assign all of an item's rows to one rank.
             static_compute += output_bytes
-        # Outputs that grow with logical rows make a profile learned under
+        # Memory that grows with logical rows makes a profile learned under
         # lighter sharing underestimate a deeper-shared plan; scale the trusted
-        # estimate up by the ratio gap for them. Normalize before multiplying:
-        # cancelling packed tokens through two float operations can otherwise
-        # make a larger warm layout cheaper.
+        # estimate up by the ratio gap. Packed pricing instead charges head and
+        # caller memory per logical row and extrapolates the rest at most the
+        # usual trust growth. Normalize before multiplying: cancelling packed
+        # tokens through two float operations can otherwise make a larger warm
+        # layout cheaper.
         profiled_tokens: int | float = packed_tokens
         packed_priced = profiled is not None and _packed_priced(
-            signature, profiled, self._one_layer_recompute()
+            signature, self._one_layer_recompute()
         )
-        if profiled is not None and logical_tokens is not None and not packed_priced:
+        if profiled is not None and logical_tokens is not None:
             profiled_tokens = max(
-                packed_tokens, logical_tokens / profiled.logical_per_packed
+                packed_tokens,
+                logical_tokens
+                / profiled.logical_per_packed
+                / (_MEMORY_PROFILE_TRUST_GROWTH if packed_priced else 1),
             )
         # The trust window limits calibration growth, not the empirical floor.
         # Dropping that floor beyond the window can admit a larger request that
@@ -7795,7 +7809,7 @@ class TrainerRank:
                 int(
                     profiled.bytes_per_token * profiled_tokens
                     + (
-                        _packed_row_bytes(profiled, packed_tokens, logical_tokens)
+                        _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
                         # Branch states grow with segments, not packed rows;
                         # backward recomputes one layer at a time.
                         + gdn_segments * self._gdn_segment_layer_bytes()
@@ -8763,26 +8777,19 @@ def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
 # sharing ratios. Wide labels, dense or top-k outputs and no_grad forwards (whose
 # GDN branch states are uncharged) keep the logical/packed ratio extrapolation.
 _PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
-# The head's label copies, positions, row-match vectors and saved masks (about
-# 80-100 B) grow with logical rows. Each request's buffers are separate
-# allocations rounded up to 512 B blocks: on an H200, a fully shared one-token
-# request peaked at nine blocks (4,616 B) at the end of head forward. Under
-# packed pricing, charge each row beyond the profile's observed sharing twelve.
+# Packed pricing charges head and caller memory per active logical row: label
+# copies, positions, row-match vectors, saved masks and the caller's loss saves
+# and backward transients. Each request's buffers are separate allocations
+# rounded up to 512 B blocks; on an H200, a fully shared one-token request's
+# head peaked at nine blocks plus 8 B (4,616 B). Callers whose head and loss
+# memory peaks above this charge per token are unsupported.
 _PACKED_PRICED_LOGICAL_ROW_BYTES = 12 * 512
+# Shorter single-target requests keep the logical extrapolation, so each
+# packed-priced request brings at least 384 KiB for per-request constants.
+_PACKED_PRICED_MIN_REQUEST_TOKENS = 64
 
 
-def _packed_rate_floor(profile: "_MemoryProfile") -> float:
-    """A per-packed rate at least twice the per-row charges it offsets.
-
-    Fewer packed rows then always cost less, with margin for rounding, so
-    lower-bound pruning over more-shared layouts stays sound.
-    """
-    return 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES * profile.logical_per_packed
-
-
-def _packed_priced(
-    signature: "_MemorySignature", profile: "_MemoryProfile", one_layer_recompute: bool
-) -> bool:
+def _packed_priced(signature: "_MemorySignature", one_layer_recompute: bool) -> bool:
     # Measured only under one-layer full recompute: other recompute modes keep
     # more GDN states and activations live per segment and logical row.
     return (
@@ -8790,16 +8797,6 @@ def _packed_priced(
         and bool(signature.grad_modes)
         and all(signature.grad_modes)
         and _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
-        and profile.bytes_per_token >= _packed_rate_floor(profile)
-    )
-
-
-def _packed_row_bytes(
-    profile: "_MemoryProfile", packed_tokens: int, logical_tokens: int
-) -> float:
-    """Head buffers for logical rows beyond the profile's observed sharing."""
-    return _PACKED_PRICED_LOGICAL_ROW_BYTES * max(
-        0, logical_tokens - packed_tokens * profile.logical_per_packed
     )
 
 
@@ -8821,7 +8818,15 @@ def _request_mix_key(request: AnyForwardInput) -> str:
         parts.append("logits")
     if request.hidden_states:
         parts.append("hidden")
-    return "+".join(parts) if parts else "inactive"
+    key = "+".join(parts) if parts else "inactive"
+    if (
+        key == "target:single"
+        and int(request.input_tokens.numel()) < _PACKED_PRICED_MIN_REQUEST_TOKENS
+    ):
+        # Keep short requests out of packed pricing: a duplicate adds no packed
+        # row, and caller memory per request can outgrow its few row charges.
+        key += "+short"
+    return key
 
 
 def _pad_packed_batch(

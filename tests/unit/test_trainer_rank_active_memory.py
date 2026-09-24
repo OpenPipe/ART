@@ -14,12 +14,19 @@ from art.trainer_rank import (
     TrainerRank,
     TrainerRankMemoryError,
     Unset,
+    _impl,
 )
 from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
     _packed_priced,
     _request_mix_key,
 )
+
+
+@pytest.fixture(autouse=True)
+def _price_short_requests(monkeypatch):
+    # These fixtures use short requests; the short-request gate has its own tests.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
 
 
 class _Model(torch.nn.Module):
@@ -277,9 +284,11 @@ def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
         for count in (8, 63, 64, 65, 800)
     ]
     assert values == sorted(values)
-    rate = rank._memory_profiles[observed.signature].bytes_per_token
-    row = _PACKED_PRICED_LOGICAL_ROW_BYTES * 800 * (logical_ratio - 1)
-    assert values[-1] == int((800 * 4 + rate * 800 + row) * 1.1)
+    profile = rank._memory_profiles[observed.signature]
+    logical = 800 * logical_ratio
+    packed = max(800, logical / profile.logical_per_packed / 8)
+    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * logical
+    assert values[-1] == int((800 * 4 + profile.bytes_per_token * packed + rows) * 1.1)
     assert not rank._all_ranks_have_memory_profile(
         packed_tokens=800, signature=observed.signature
     )
@@ -288,11 +297,12 @@ def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
 def test_packed_pricing_covers_allocator_blocks_of_fully_shared_requests():
     # A duplicate one-token request adds no packed row but still allocates its
     # head buffers, each rounded up to a 512 B block: nine at the measured peak.
+    # (The short-request gate keeps such requests out; the charge covers them.)
     rank = _rank()
     observed = rank._plan_flat_forward(_requests("target_tokens"))
     rank._update_memory_profile(observed, 100_000, retained_bytes=1000)
     profile = rank._memory_profiles[observed.signature]
-    assert _packed_priced(observed.signature, profile, rank._one_layer_recompute())
+    assert _packed_priced(observed.signature, rank._one_layer_recompute())
     duplicates = 100_000
 
     def estimate(logical_tokens: int) -> int:
@@ -305,6 +315,82 @@ def test_packed_pricing_covers_allocator_blocks_of_fully_shared_requests():
 
     base = profile.logical_per_packed
     assert estimate(base + duplicates) - estimate(base) >= duplicates * 9 * 512
+
+
+@pytest.mark.parametrize("shape", ["flat", "row"])
+def test_short_single_target_requests_keep_logical_pricing(monkeypatch, shape):
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 64)
+
+    def request(length: int) -> ForwardInput:
+        tokens = torch.arange(length)
+        if shape == "row":
+            tokens = tokens[None]
+        return ForwardInput(input_tokens=tokens, target_tokens=tokens + 1)
+
+    assert _request_mix_key(request(63)) == "target:single+short"
+    assert _request_mix_key(request(64)) == _request_mix_key(request(65))
+    assert _request_mix_key(request(64)) == "target:single"
+    assert _request_mix_key(ForwardInput(input_tokens=torch.arange(3))) == "inactive"
+    rank = _rank()
+    long_plan = rank._plan_flat_forward([request(64), request(65)])
+    mixed_plan = rank._plan_flat_forward([request(64), request(63)])
+    recompute = rank._one_layer_recompute()
+    assert _packed_priced(long_plan.signature, recompute)
+    # One short request keeps the whole batch on the logical extrapolation.
+    assert not _packed_priced(mixed_plan.signature, recompute)
+    for plan in (long_plan, mixed_plan):
+        rank._memory_profiles[plan.signature] = _impl._MemoryProfile(
+            bytes_per_token=100_000, packed_tokens=1000
+        )
+
+    def estimate(plan) -> int:
+        return rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=10,
+            logical_tokens=1000,
+            output_bytes=0,
+            signature=plan.signature,
+        )
+
+    # Ratio-1 profiles: 1000 logical rows extrapolate to 1000 packed rows, or
+    # are clamped to 1000 / 8 = 125 rows plus the per-row charge.
+    assert estimate(mixed_plan) == int(100_000 * 1000 * 1.1)
+    assert estimate(long_plan) == int(
+        (100_000 * 125 + _PACKED_PRICED_LOGICAL_ROW_BYTES * 1000) * 1.1
+    )
+
+
+def test_packed_sharing_clamp_is_monotone_and_learning_sharing_never_cheapens():
+    rank = _rank()
+    observed = rank._plan_flat_forward(_requests("target_tokens"))
+    rank._update_memory_profile(observed, 100_000, retained_bytes=1000)
+    single = observed.signature
+    rank._memory_profiles[single] = replace(
+        rank._memory_profiles[single], bytes_per_token=50_000, logical_per_packed=1
+    )
+
+    def cost(packed: int, logical: int = 8_000):
+        return rank._subforward_cost(
+            packed_tokens=packed,
+            logical_tokens=logical,
+            output_bytes=0,
+            signature=single,
+        ).required
+
+    # Fixed logical rows; packed rows sweep across L / 8r = 1000.
+    sweep = [cost(packed) for packed in (1, 500, 999, 1000, 1001, 4000, 8000)]
+    assert sweep == sorted(sweep)
+    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * 8_000
+    assert sweep[0] == sweep[3] == int((50_000 * 1000 + rows) * 1.1)
+    assert sweep[4] == int((50_000 * 1001 + rows) * 1.1)
+    # Learning more sharing at a lower rate max-merges both; plans at
+    # or below the older ratio never get cheaper.
+    before = [cost(packed, logical) for packed, logical in ((100, 100), (50, 100))]
+    wider = replace(observed, packed_tokens=1, logical_tokens=8)
+    rank._update_memory_profile(wider, 1_000, retained_bytes=None)
+    profile = rank._memory_profiles[single]
+    assert profile.logical_per_packed > 1 and profile.bytes_per_token == 50_000
+    after = [cost(packed, logical) for packed, logical in ((100, 100), (50, 100))]
+    assert all(b >= a for a, b in zip(before, after, strict=True))
 
 
 @pytest.mark.parametrize(
@@ -377,8 +463,8 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
             signature=signatures[name],
         )
 
-    # Packed rows plus head buffers for logical rows beyond the profile's 2x.
-    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * (64 - 8 * 2)
+    # Packed rows plus head and caller memory for every logical row.
+    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * 64
     assert (
         estimate("single") == estimate("multi_grad") == int((100_000 * 8 + rows) * 1.1)
     )
@@ -389,19 +475,15 @@ def test_packed_pricing_is_limited_to_grad_single_target_mixes():
     # Others keep the logical/packed extrapolation: 64 / 2 profiled rows.
     for name in ("no_grad", "mixed_grad", "hidden", "wide"):
         assert estimate(name) == int(100_000 * 32 * 1.1)
-    # Per-row charges must stay well below the profiled rates, or a more-shared
-    # layout could cost more: under two row charges per ratio, both extrapolate.
-    floor = 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES * 2
-    rank._memory_profiles[single] = replace(
-        profile, retained_compute_bytes_per_token=floor - 1
+    # Beyond 8x the profile's sharing, packed rows are priced as if sharing
+    # were 8x: 64 logical rows at ratio 2 x 8 = 16 is 4 rows, not 1.
+    clamped = rank._estimate_required_memory_bytes_from_values(
+        packed_tokens=1, logical_tokens=64, output_bytes=0, signature=single
     )
-    assert rank._retained_memory_bytes(
-        single, packed_tokens=8, logical_tokens=64, output_bytes=0, required=1 << 40
-    ) == int((floor - 1) * 32 * 1.1)
-    rank._memory_profiles[single] = replace(profile, bytes_per_token=floor - 1)
-    assert estimate("single") == int((floor - 1) * 32 * 1.1)
-    # At and above the floor, cost never falls as packed rows grow.
-    for rate in (floor, floor + 1, 100_000):
+    assert clamped == int((100_000 * 4 + rows) * 1.1)
+    # The logical charge does not depend on layout, so at any rate (none gates
+    # eligibility) cost never falls as packed rows grow.
+    for rate in (1, 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES * 2 - 1, 100_000):
         rank._memory_profiles[single] = replace(
             profile, bytes_per_token=rate, retained_compute_bytes_per_token=rate
         )
