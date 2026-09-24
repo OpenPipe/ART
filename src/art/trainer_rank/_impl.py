@@ -5218,6 +5218,19 @@ class TrainerRank:
         first_estimate = estimate(min_width)
         if first_estimate is None or not (first_estimate[0].fits and first_estimate[1]):
             first = candidate(min_width)
+            if (
+                first_estimate is None
+                and first.check.fits
+                and first.cold_start
+                and not layout_modes.get(min_width, False)
+                and self._all_ranks_true(first.plan.signature in self._memory_profiles)
+            ):
+                # Materialized pricing (DP-uniform): a profiled cost-optimal
+                # layout outside trust; full sharing may be trusted, as the
+                # estimator path would find.
+                layout_modes[min_width] = True
+                plans.pop(min_width, None)
+                first = candidate(min_width)
             if not first.check.fits:
                 # The smallest wave cannot run unsplit: best effort is the
                 # bounded split ladder. Each DP rank runs it on its own share,

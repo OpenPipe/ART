@@ -251,6 +251,13 @@ def test_cp_width_search_retries_full_sharing_inside_the_trust_window(monkeypatc
     selected = r._search_next_micro_batch(items, 0)
     assert not isinstance(selected, _ForwardRefusal)
     assert selected.stats_global_count == 15
+    # The minimum wave retries too: one item's unshared layout (32 rows) is
+    # outside a 3-row profile's window; full sharing (17 rows) is inside it.
+    r._memory_profiles[signature] = _MemoryProfile(bytes_per_token=1, packed_tokens=3)
+    r._last_global_micro_batch_size = None
+    selected = r._search_next_micro_batch([items], 0)
+    assert not isinstance(selected, _ForwardRefusal)
+    assert selected.plan.packed_tokens == 17 and not selected.cold_start
 
 
 def test_dp_empty_and_local_count():
