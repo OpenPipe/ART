@@ -4861,6 +4861,7 @@ def _tokenize_chat_view(
             bool,
             _SampledSourceKey,
             object,
+            int | None,
         ]
     ] = []
     search_cursor = 0
@@ -5471,6 +5472,7 @@ def _tokenize_chat_view(
         )
         exact_output_matches: list[tuple[int, int]] | None = None
         exact_output_span: tuple[int, int] | None = None
+        corrected_message_end: int | None = None
         if (
             complete_sampled_message
             and source is not None
@@ -5532,8 +5534,12 @@ def _tokenize_chat_view(
                 and rendered[: len(rendered_completed)] == rendered_completed
             ):
                 marked_bounds[message_index] = corrected_bounds
-                # The marker-derived per-part offsets describe the old render.
-                marked_part_bounds.pop(message_index, None)
+                corrected_message_end = corrected_bounds[1]
+                if any(
+                    not corrected_bounds[0] <= start <= end <= corrected_bounds[1]
+                    for start, end in marked_part_bounds.get(message_index, ())
+                ):
+                    marked_part_bounds.pop(message_index, None)
             else:
                 marked_bounds.pop(message_index, None)
                 marked_part_bounds.pop(message_index, None)
@@ -5656,6 +5662,7 @@ def _tokenize_chat_view(
                     True,
                     _sampled_source_key(source),
                     source,
+                    None,
                 )
             )
             search_cursor = end
@@ -5689,6 +5696,7 @@ def _tokenize_chat_view(
                     False,
                     _sampled_source_key(source),
                     source,
+                    None,
                 )
             )
             search_cursor = end
@@ -5778,6 +5786,7 @@ def _tokenize_chat_view(
                     True,
                     _sampled_source_key(source),
                     source,
+                    None,
                 )
             )
             if (
@@ -5833,9 +5842,60 @@ def _tokenize_chat_view(
                 part=part,
                 full_tokens=(full_exact, full_logprobs),
             )
+            if (
+                exact is None
+                and corrected_message_end is not None
+                and proven_part_bounds is not None
+            ):
+                raise ValueError(
+                    "Could not preserve exact sampled tokens for a corrected history part"
+                )
+            if (
+                exact is not None
+                and corrected_message_end is not None
+                and proven_part_bounds is not None
+                and sampled_bounds is not None
+                and start != sampled_bounds[0]
+            ):
+                raise ValueError("Could not prove the complete sampled part start")
             if exact is not None and rendered[start : start + len(exact)] == exact:
                 end = start + len(exact)
+                if corrected_message_end is not None and end > corrected_message_end:
+                    raise ValueError(
+                        "Exact sampled tokens extend beyond their proven message bounds"
+                    )
                 search_cursor = end
+            elif (
+                exact is not None
+                and corrected_message_end is not None
+                and _sampled_stop_suffix(
+                    exact,
+                    source=source,
+                    source_key=_sampled_source_key(source),
+                    tokenizer=resolved_tokenizer,
+                )
+            ):
+                # Use the proven message end to replace its rendered stop,
+                # just as the whole-message path does for sampled stops.
+                tail_mask, tail_stops = _assistant_stop_masks(
+                    rendered[:corrected_message_end],
+                    assistant_mask[:corrected_message_end],
+                    resolved_tokenizer,
+                )
+                tail_end = end
+                while tail_end < len(tail_mask) and tail_mask[tail_end]:
+                    tail_end += 1
+                if tail_end > end and tail_stops[tail_end - 1]:
+                    end = tail_end
+                    search_cursor = end
+            if (
+                exact is not None
+                and corrected_message_end is not None
+                and _source_stop_evidence(source, _sampled_source_key(source))[0]
+                != "length"
+            ):
+                # Source evidence assigns STOP; retain synthetic length boundaries.
+                stop_mask[start:end] = [False] * (end - start)
             replacement = exact if exact is not None else rendered[start:end]
             if exact is None and not logprobs:
                 exchange = getattr(source, "exchange", None)
@@ -5873,6 +5933,10 @@ def _tokenize_chat_view(
                     exact is not None,
                     _sampled_source_key(source),
                     source,
+                    span[1]
+                    if corrected_message_end is not None
+                    and proven_part_bounds is not None
+                    else None,
                 )
             )
         message_replacements = replacements[replacement_start:]
@@ -5904,6 +5968,7 @@ def _tokenize_chat_view(
                     False,
                     message_replacements[0][5],
                     message_replacements[0][6],
+                    None,
                 )
             )
         if sampled and not parts and full_exact is not None:
@@ -5925,13 +5990,24 @@ def _tokenize_chat_view(
         exact,
         source_key,
         source,
+        part_end,
     ) in sorted(replacements, key=lambda item: (item[0], item[1])):
+        synthetic_stop_token: int | None = None
         if exact and _source_stop_evidence(source, source_key)[0] == "length":
             synthetic_stop = next(
                 (index for index in range(start, end) if stop_mask[index]), None
             )
             if synthetic_stop is not None:
-                end = synthetic_stop
+                if part_end is not None and synthetic_stop + 1 < part_end:
+                    if end < part_end:
+                        raise ValueError(
+                            "Exact sampled tokens do not cover the proven history part"
+                        )
+                    # Keep the boundary without replaying replaced visible content.
+                    synthetic_stop_token = rendered[synthetic_stop]
+                    end = part_end
+                else:
+                    end = synthetic_stop
         if start < cursor:
             raise ValueError("Rendered assistant source spans overlap")
         token_ids.extend(rendered[cursor:start])
@@ -5957,20 +6033,35 @@ def _tokenize_chat_view(
             )
         except ValueError:
             replacement_stop_mask = [False] * len(replacement)
-        replacement_length_stop_mask = _translate_token_mask(
-            rendered[start:end], replacement, length_stop_mask[start:end]
+        if synthetic_stop_token is not None:
+            replacement_stop_mask = [False] * len(replacement)
+        replacement_length_stop_mask = (
+            [False] * len(replacement)
+            if synthetic_stop_token is not None
+            else _translate_token_mask(
+                rendered[start:end], replacement, length_stop_mask[start:end]
+            )
         )
         if exact:
             token_ids.extend(replacement)
             logprobs.extend(replacement_logprobs)
-            flags.extend(
+            replacement_flags = [
                 TokenFlag.EXACT
                 | TokenFlag.SAMPLED
                 | TokenFlag.ASSISTANT
                 | TokenFlag.OUTPUT
                 | (TokenFlag.STOP if stop else TokenFlag(0))
                 for stop in replacement_stop_mask
-            )
+            ]
+            if part_end is not None:
+                _mark_sampled_stops(
+                    replacement,
+                    replacement_flags,
+                    [source_key] * len(replacement),
+                    {source_key: source},
+                    tokenizer=resolved_tokenizer,
+                )
+            flags.extend(replacement_flags)
             source_keys.extend([source_key] * len(replacement))
             sources[source_key] = source
         else:
@@ -5993,6 +6084,11 @@ def _tokenize_chat_view(
                 )
             )
             source_keys.extend([None] * len(replacement))
+        if synthetic_stop_token is not None:
+            token_ids.append(synthetic_stop_token)
+            logprobs.append(math.nan)
+            flags.append(TokenFlag.STOP)
+            source_keys.append(None)
         cursor = end
     token_ids.extend(rendered[cursor:])
     logprobs.extend([math.nan] * (len(rendered) - cursor))
