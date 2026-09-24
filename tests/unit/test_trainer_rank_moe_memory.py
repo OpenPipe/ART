@@ -10,6 +10,7 @@ import torch
 
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import (
+    _PACKED_PRICED_LOGICAL_ROW_BYTES,
     _MemoryProfile,
     _MemorySignature,
     _moe_output_bytes_per_token,
@@ -76,7 +77,11 @@ def _rank(layer=None):
                 model=[model],
                 optimizer=None,
                 provider=SimpleNamespace(
-                    hidden_size=2048, num_layers=40, recompute_granularity="full"
+                    hidden_size=2048,
+                    num_layers=40,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
                 ),
                 model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
             ),
@@ -288,7 +293,7 @@ def test_profiles_outputs_and_empty_plan_preserve_empirical_floor():
     )
     assert estimate(
         packed_tokens=100, logical_tokens=200, output_bytes=123, signature=signature
-    ) == int((100 * 200000 + 123) * 1.1)
+    ) == int((100 * 100000 + _PACKED_PRICED_LOGICAL_ROW_BYTES * 200 + 123) * 1.1)
 
 
 def test_summed_group_envelope_and_retained_profile_unchanged():

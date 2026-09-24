@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from dataclasses import replace
 from datetime import timedelta
 import sys
 from types import SimpleNamespace
@@ -436,3 +437,122 @@ def test_prior_chunk_references_end_before_next_stats(monkeypatch, grad, mode):
             assert model.output_layer.weight.grad is not None
             assert model.output_layer.weight.grad.isfinite().all()
     assert torch.cuda.is_initialized() == cuda_initialized
+
+
+_PRODUCTION_HEAD_CHUNK_TOKENS = _impl._HEAD_CHUNK_TOKENS
+
+
+def _cispo(output, device):
+    # 061's caller: per-history sampled mask, detached clipped ratio.
+    sampled = torch.ones(output.target_logprobs.shape, dtype=torch.bool, device=device)
+    logp = output.target_logprobs[sampled]
+    ratio = (logp.detach() - 0.5).exp().clamp(max=5.0)
+    return -(ratio * logp).sum()
+
+
+_CALLER_LOSSES = {
+    "sum": lambda output, device, refs: -output.target_logprobs.sum(),
+    "cispo": lambda output, device, refs: _cispo(output, device),
+    # Saves a fixed 256 KiB per request, whatever its length.
+    "fixed": lambda output, device, refs: (
+        (output.target_logprobs.sum() - refs).square().mean()
+    ),
+}
+
+
+def _duplicate_request_peak(monkeypatch, count: int, length: int, loss: str) -> int:
+    """Peak bytes through the real head, a caller loss and backward."""
+    _patch_local_head(monkeypatch)
+    monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", _PRODUCTION_HEAD_CHUNK_TOKENS)
+    device = torch.device("cuda")
+    weight = torch.randn(1024, 64, device=device, dtype=torch.bfloat16) / 8
+    model = SimpleNamespace(
+        output_layer=_Head(weight),
+        vocab_size=1024,
+        share_embeddings_and_output_weights=False,
+        _scale_logits=lambda value: value,
+    )
+    r = object.__new__(TrainerRank)
+    r.runtime = SimpleNamespace(model=[model])
+    tokens = torch.arange(length)
+    request = ForwardInput(input_tokens=tokens, target_tokens=tokens + 1)
+    items = [r._forward_item(request) for _ in range(count)]
+    prepared = SimpleNamespace(
+        positions_by_item=tuple(torch.arange(length) for _ in range(count)),
+        source_positions_by_item=tuple(torch.arange(length) for _ in range(count)),
+    )
+    hidden = torch.randn(length, 64, device=device, dtype=torch.bfloat16)
+    hidden.requires_grad_()
+    refs = torch.zeros(64 * 1024, device=device)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    total = torch.zeros((), device=device)
+    for output in r._project_head(items, prepared, hidden):
+        total = total + _CALLER_LOSSES[loss](output, device, refs)
+    total.backward()
+    torch.cuda.synchronize()
+    assert hidden.grad is not None
+    return torch.cuda.max_memory_allocated() - base
+
+
+@pytest.mark.parametrize(
+    ("length", "loss", "fits"),
+    [
+        (1, "sum", True),
+        (64, "cispo", True),
+        (512, "cispo", True),
+        (64, "fixed", True),
+        # Why short requests keep logical pricing: per-request caller memory
+        # outgrows a one-token request's row charge.
+        (1, "fixed", False),
+    ],
+)
+def test_shared_requests_fit_the_per_row_charge(monkeypatch, length, loss, fits):
+    # A duplicate request adds logical rows but no packed rows. Its head buffers
+    # and the caller's saves are separate CUDA allocations rounded to 512 B
+    # blocks; through backward they must fit the charge on its logical rows.
+    if not torch.cuda.is_available():
+        pytest.skip("allocator rounding needs CUDA")
+    _duplicate_request_peak(monkeypatch, 1, length, loss)
+    extra = 20_000 if length == 1 and loss == "sum" else 1_000
+    single = _duplicate_request_peak(monkeypatch, 1, length, loss)
+    per_request = (
+        _duplicate_request_peak(monkeypatch, 1 + extra, length, loss) - single
+    ) / extra
+    # Nine head blocks per one-token request at least; the rest is the caller.
+    assert per_request >= 9 * 512
+    charge = _impl._PACKED_PRICED_LOGICAL_ROW_BYTES * length
+    assert (per_request <= charge) == fits
+
+
+def test_calibrated_profile_admits_shorter_shared_requests_above_their_peak(
+    monkeypatch,
+):
+    # A profile learned from 16 shared 4,096-token requests prices 20 shared
+    # 64-token requests (sharing 20 against 16) whose caller saves a fixed
+    # 256 KiB each: 64 B per calibration token but 4 KiB per new token.
+    if not torch.cuda.is_available():
+        pytest.skip("allocator rounding needs CUDA")
+    from test_trainer_rank_active_memory import _rank
+
+    rank = _rank()
+    plan = rank._plan_flat_forward(
+        [ForwardInput(input_tokens=torch.arange(64), target_tokens=torch.arange(64))]
+    )
+    assert _impl._packed_priced(plan.signature, rank._one_layer_recompute())
+    _duplicate_request_peak(monkeypatch, 1, 64, "fixed")
+    calibration = _duplicate_request_peak(monkeypatch, 16, 4096, "fixed")
+    observed = replace(
+        plan, packed_tokens=4096, logical_tokens=16 * 4096, output_bytes=16 * 4096 * 4
+    )
+    rank._update_memory_profile(observed, calibration, retained_bytes=None)
+    assert rank._memory_profiles[plan.signature].logical_per_packed == 16
+    peak = _duplicate_request_peak(monkeypatch, 20, 64, "fixed")
+    estimate = rank._estimate_required_memory_bytes_from_values(
+        packed_tokens=64,
+        logical_tokens=20 * 64,
+        output_bytes=20 * 64 * 4,
+        signature=plan.signature,
+    )
+    assert peak <= estimate

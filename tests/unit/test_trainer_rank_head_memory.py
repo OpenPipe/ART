@@ -8,7 +8,11 @@ import pytest
 import torch
 
 from art.trainer_rank import ForwardInput
-from art.trainer_rank._impl import Unset, _MemoryProfile
+from art.trainer_rank._impl import (
+    _PACKED_PRICED_LOGICAL_ROW_BYTES,
+    Unset,
+    _MemoryProfile,
+)
 
 
 def rank():
@@ -151,7 +155,9 @@ def test_outputs_retention_and_empirical_peak_are_counted_once():
         retained_compute_bytes_per_token=1,
     )
     cost = r._plan_cost(plan)
-    assert cost.required == int((plan.output_bytes + 512 * 2_000_000) * 1.1)
+    # Packed pricing adds head and caller memory for every logical row.
+    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * 512
+    assert cost.required == int((plan.output_bytes + 512 * 2_000_000 + rows) * 1.1)
     assert cost.retained == int((plan.output_bytes + retained) * 1.1)
 
 

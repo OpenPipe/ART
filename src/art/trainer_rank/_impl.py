@@ -941,6 +941,9 @@ class _MemorySignature:
     grad_enabled: bool
     grad_modes: tuple[bool, ...]
     slot_shapes: tuple[tuple[bool, tuple[tuple[int, ...], ...]], ...] = ()
+    # Short single-target requests keep the logical extrapolation, but share
+    # the profile learned from longer requests of the same signature.
+    short_requests: bool = dataclass_field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -1791,6 +1794,8 @@ class TrainerRank:
             )
 
         self._recompute_granularity = memory_field("recompute_granularity", None)
+        self._recompute_method = memory_field("recompute_method", None)
+        self._recompute_num_layers = memory_field("recompute_num_layers", None)
         self._recompute_modules: frozenset[str] = frozenset(
             memory_field("recompute_modules", ()) or ()
         )
@@ -2707,6 +2712,16 @@ class TrainerRank:
         no_grad: bool | None = None,
         yield_empty: bool = False,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        """Yield admitted micro-batches; the caller runs its loss and backward.
+
+        Admission learns each call's whole peak, including the caller's loss
+        and backward. For grad-enabled single-target requests of at least 64
+        tokens under one-layer full recompute, it prices model memory by packed
+        rows and charges 6 KiB per logical token for the head plus the caller's
+        loss saves and backward transients. A caller whose per-token head and
+        loss memory peaks above that is unsupported: shared plans can exceed
+        their estimate.
+        """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
@@ -3340,6 +3355,7 @@ class TrainerRank:
                         signature.grad_enabled,
                         signature.grad_modes,
                         signature.slot_shapes,
+                        signature.short_requests,
                         p.packed_tokens,
                         p.logical_tokens,
                         p.inactive_logical_tokens,
@@ -4052,11 +4068,18 @@ class TrainerRank:
         ratio = logical_tokens / max(1, packed_tokens)
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
-        retained = output_bytes + max(
-            checkpoint_retained_bytes,
-            profile.retained_compute_bytes_per_token
-            * max(packed_tokens, logical_tokens / profile.logical_per_packed),
-        )
+        rate = profile.retained_compute_bytes_per_token
+        if _packed_priced(signature, self._one_layer_recompute()):
+            # Saved head indices, masks and caller saves stay live until
+            # backward. The ratio window above bounds the sharing extrapolation.
+            retained_compute = (
+                rate * packed_tokens + _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
+            )
+        else:
+            retained_compute = rate * max(
+                packed_tokens, logical_tokens / profile.logical_per_packed
+            )
+        retained = output_bytes + max(checkpoint_retained_bytes, retained_compute)
         return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
     def _split_request_order(
@@ -6111,6 +6134,7 @@ class TrainerRank:
                 )
             }
             rank_fields["recompute_modules"] = sorted(self._recompute_modules)
+            rank_fields["one_layer_recompute"] = self._one_layer_recompute()
             rank_fields["moe_forward_stages"] = getattr(self, "_moe_forward_stages", ())
             rank_fields["geometry"] = asdict(self._geometry)
             rank_fields["topology"] = list(plan.signature.topology)
@@ -6725,6 +6749,7 @@ class TrainerRank:
             grad_enabled=any(modes),
             grad_modes=modes,
             slot_shapes=shapes if any(any(shape) for _, shape in shapes) else (),
+            short_requests=any(_short_request(request) for request in requests),
         )
 
     def _slot_memory_shapes(
@@ -7719,22 +7744,7 @@ class TrainerRank:
             # state (fp32), plus convolution history. Unlike token activations,
             # these do not shrink with segment length.
             gdn_state_bytes = (
-                2
-                * gdn_segments
-                * gdn_layers
-                / tp
-                * (
-                    4
-                    * geometry.gdn_value_heads
-                    * geometry.gdn_key_head_dim
-                    * geometry.gdn_value_head_dim
-                    + self._param_dtype_size
-                    * (
-                        2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
-                        + geometry.gdn_value_heads * geometry.gdn_value_head_dim
-                    )
-                    * max(0, geometry.gdn_conv_kernel - 1)
-                )
+                gdn_segments * gdn_layers * self._gdn_segment_layer_bytes()
             )
             static_compute = max(
                 static_compute,
@@ -7775,15 +7785,23 @@ class TrainerRank:
             # Local head results coexist with full CP outputs during gathering.
             # Uneven rank plans can assign all of an item's rows to one rank.
             static_compute += output_bytes
-        # A profile learned under lighter sharing (lower logical/packed ratio)
-        # underestimates the per-packed-token footprint of a deeper-shared
-        # plan; scale the trusted estimate up by the ratio gap.
-        # Normalize before multiplying: cancelling packed tokens through two
-        # float operations can otherwise make a larger warm layout cheaper.
+        # Memory that grows with logical rows makes a profile learned under
+        # lighter sharing underestimate a deeper-shared plan; scale the trusted
+        # estimate up by the ratio gap. Packed pricing instead charges head and
+        # caller memory per logical row and extrapolates the rest at most the
+        # usual trust growth. Normalize before multiplying: cancelling packed
+        # tokens through two float operations can otherwise make a larger warm
+        # layout cheaper.
         profiled_tokens: int | float = packed_tokens
+        packed_priced = profiled is not None and _packed_priced(
+            signature, self._one_layer_recompute()
+        )
         if profiled is not None and logical_tokens is not None:
             profiled_tokens = max(
-                packed_tokens, logical_tokens / profiled.logical_per_packed
+                packed_tokens,
+                logical_tokens
+                / profiled.logical_per_packed
+                / (_MEMORY_PROFILE_TRUST_GROWTH if packed_priced else 1),
             )
         # The trust window limits calibration growth, not the empirical floor.
         # Dropping that floor beyond the window can admit a larger request that
@@ -7793,9 +7811,66 @@ class TrainerRank:
         else:
             compute = max(
                 static_compute,
-                int(profiled.bytes_per_token * profiled_tokens),
+                int(
+                    profiled.bytes_per_token * profiled_tokens
+                    + (
+                        _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
+                        # Branch states grow with segments, not packed rows;
+                        # backward recomputes one layer at a time.
+                        + gdn_segments * self._gdn_segment_layer_bytes()
+                        if packed_priced and logical_tokens is not None
+                        else 0
+                    )
+                ),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
+
+    def _one_layer_recompute(self) -> bool:
+        """ART's default full/uniform/1 recompute, which Megatron runs in training.
+
+        Forward keeps only layer inputs and backward recomputes one layer at a
+        time. Megatron checks the decoder's own mode and config, and eval mode
+        skips recompute even with gradients enabled, so read both live.
+        """
+        recorded = self.__dict__.get("_recorded_one_layer_recompute")
+        if recorded is not None:
+            return recorded  # Planner-report replay has no live model.
+        target = ("full", "uniform", 1)
+        names = ("recompute_granularity", "recompute_method", "recompute_num_layers")
+
+        def active(chunk: torch.nn.Module) -> bool:
+            try:
+                decoder = _language_model(chunk).decoder
+                config = decoder.config
+            except (AttributeError, RuntimeError):
+                # No decoder config (stub or non-GPT chunk): stored settings,
+                # and every module must be training.
+                stored = tuple(getattr(self, "_" + name) for name in names)
+                return stored == target and all(m.training for m in chunk.modules())
+            settings = tuple(getattr(config, name, None) for name in names)
+            return settings == target and decoder.training is True
+
+        return all(active(chunk) for chunk in self.runtime.model)
+
+    def _gdn_segment_layer_bytes(self) -> float:
+        """Initial and final fp32 recurrent states plus convolution history."""
+        geometry = self._geometry
+        return (
+            2
+            / max(1, self._topology_key()[1])
+            * (
+                4
+                * geometry.gdn_value_heads
+                * geometry.gdn_key_head_dim
+                * geometry.gdn_value_head_dim
+                + self._param_dtype_size
+                * (
+                    2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                    + geometry.gdn_value_heads * geometry.gdn_value_head_dim
+                )
+                * max(0, geometry.gdn_conv_kernel - 1)
+            )
+        )
 
     def _available_memory_bytes(self, sample: dict[str, Any] | None = None) -> int:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):
@@ -8703,11 +8778,45 @@ def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
     )
 
 
+# Grad-enabled single-target training measured flat per packed row across
+# sharing ratios. Wide labels, dense or top-k outputs and no_grad forwards (whose
+# GDN branch states are uncharged) keep the logical/packed ratio extrapolation.
+_PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
+# Packed pricing charges head and caller memory per active logical row: label
+# copies, positions, row-match vectors, saved masks and the caller's loss saves
+# and backward transients. Each request's buffers are separate allocations
+# rounded up to 512 B blocks; on an H200, a fully shared one-token request's
+# head peaked at nine blocks plus 8 B (4,616 B). Callers whose head and loss
+# memory peaks above this charge per token are unsupported.
+_PACKED_PRICED_LOGICAL_ROW_BYTES = 12 * 512
+# Shorter single-target requests keep the logical extrapolation, so each
+# packed-priced request brings at least 384 KiB for per-request constants.
+_PACKED_PRICED_MIN_REQUEST_TOKENS = 64
+
+
+def _packed_priced(signature: "_MemorySignature", one_layer_recompute: bool) -> bool:
+    # Measured only under one-layer full recompute: other recompute modes keep
+    # more GDN states and activations live per segment and logical row.
+    return (
+        one_layer_recompute
+        and bool(signature.grad_modes)
+        and all(signature.grad_modes)
+        and _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
+        and not signature.short_requests
+    )
+
+
 def _request_mix_key(request: AnyForwardInput) -> str:
     parts = []
     if request.target_tokens is not None:
-        target = request.target_tokens
-        tail_shape = tuple(target.shape[request.input_tokens.ndim :])
+        target, inputs = request.target_tokens, request.input_tokens
+        # Match _forward_item: trailing target dims follow the input shape or a
+        # flattened token axis.
+        tail_shape = tuple(
+            target.shape[inputs.ndim :]
+            if target.shape[: inputs.ndim] == inputs.shape
+            else target.shape[1:]
+        )
         parts.append(f"target:{tail_shape or 'single'}")
     if request.top_k is not None:
         parts.append(f"topk:{int(request.top_k)}")
@@ -8716,6 +8825,15 @@ def _request_mix_key(request: AnyForwardInput) -> str:
     if request.hidden_states:
         parts.append("hidden")
     return "+".join(parts) if parts else "inactive"
+
+
+def _short_request(request: AnyForwardInput) -> bool:
+    """Too short for packed pricing: a duplicate adds no packed row, and caller
+    memory per request can outgrow its few logical-row charges."""
+    return (
+        _request_mix_key(request) == "target:single"
+        and int(request.input_tokens.numel()) < _PACKED_PRICED_MIN_REQUEST_TOKENS
+    )
 
 
 def _pad_packed_batch(

@@ -250,6 +250,7 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
             "hidden_size": 8,
             "param_dtype_size": 2,
             "recompute_granularity": "full",
+            "one_layer_recompute": True,
             "sequence_parallel": False,
             "attention_output_gate": False,
             "mlp_activation_factor": 3,
@@ -345,6 +346,10 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
         changed = json.loads(path.read_bytes())
         changed[field] += 1
         assert reports.replay(changed)["aggregate"]["matches"] is False
+    unrecorded = reports.validate_report(path.read_bytes())
+    unrecorded["replay"]["memory_replay"]["rank"]["one_layer_recompute"] = None
+    with pytest.raises(ValueError, match="recompute mode is not recorded"):
+        reports.replay(unrecorded)
     drifted = reports.validate_report(path.read_bytes())
     drifted["replay"]["source_files"]["_impl.py"]["sha256"] = "0" * 64
     with pytest.raises(ValueError, match="source differs"):
