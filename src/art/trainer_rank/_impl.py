@@ -1537,10 +1537,10 @@ def _expert_lora_weight_storage(
 # and larger batches do not average it away. Qwen3.6-35B-A3B on 3.5M tokens of
 # retail agent trajectories, worst layer in 200k-token batches at EP2 / EP4 /
 # EP8: pretrained up to 1.22 / 1.40 / 1.62, a trained policy up to 1.24 / 1.41 /
-# 1.61; a small rollout sample reached 1.95 at EP8. One production EP2 run was inferred at 1.35. These
-# samples bound what was measured, not all routing. Unmeasured EP sizes use the
-# next measured one; above EP8 the allowance grows with log2(EP) up to EP
-# itself (every pair on one rank).
+# 1.61; a small rollout sample reached 1.95 at EP8. One production EP2 run was
+# inferred at 1.35. These samples bound what was measured, not all routing.
+# Unmeasured EP sizes use the next measured one; above EP8 the allowance grows
+# with log2(EP) up to EP itself (every pair on one rank).
 _EP_ROUTED_ROW_ALLOWANCE = {2: 1.4, 4: 1.6, 8: 2.0}
 
 
