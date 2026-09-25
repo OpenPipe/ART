@@ -515,6 +515,32 @@ def test_no_grad_enclosure_config_guard(field, value):
     assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)
 
 
+def test_routed_rows_move_only_the_routed_moe_part():
+    # A CP2/EP2 real-data trace: the busiest CP rank held 52,480 rows, while
+    # HybridEP dispatched 8 x 96,794 pairs per layer across both ranks, so a
+    # balanced rank receives 48,397 rows' pairs. Boundaries, the mixer and the
+    # shared expert stay on the local rows.
+    r = rank()
+    r._topology_key = lambda: (1, 1, 2, 1)
+    r._moe_gradient_shared_bytes = 8192
+    local, routed = 52480, 48397
+    retained, workspace = r._checkpoint_memory_floor(((local, True),))
+    assert r._checkpoint_memory_floor(((local, True),), None, (local,)) == (
+        retained,
+        workspace,
+    )
+    fewer = r._checkpoint_memory_floor(((local, True),), None, (routed,))
+    assert fewer[0] == retained
+    assert workspace - fewer[1] == (local - routed) * (188416 - 8192)
+    # Never more routed rows than local ones.
+    assert r._moe_workspace_bytes(
+        10, routed_rows=20, checkpoint_grad=True
+    ) == r._moe_workspace_bytes(10, checkpoint_grad=True)
+    r._moe_gradient_shared_bytes = 188417
+    with pytest.raises(ValueError, match="shared-expert"):
+        r._moe_workspace_bytes(10, checkpoint_grad=True)
+
+
 def qwen36_attention(r):
     # Qwen3.6-35B-A3B attention: 16 heads and 2 query groups of 256, gated.
     r._geometry = replace(

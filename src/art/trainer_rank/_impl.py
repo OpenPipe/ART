@@ -1571,6 +1571,29 @@ def _moe_dispatcher_supported(
     )
 
 
+def _ep_group_is_cp_group(shape: ParallelShape) -> bool:
+    """Whether this rank's expert-parallel group is exactly its CP group.
+
+    HybridEP then dispatches that CP group's rows across it: at balanced
+    routing each rank receives the group's rows over EP, however CP split them.
+    """
+    if shape.ep <= 1 or shape.ep != shape.cp or (shape.tp, shape.etp) != (1, 1):
+        return False
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    try:
+        from megatron.core import parallel_state as ps
+    except ModuleNotFoundError:
+        return False
+    expert = ps.get_expert_model_parallel_group(check_initialized=False)
+    context = ps.get_context_parallel_group(check_initialized=False)
+    if expert is None or context is None:
+        return False
+    return sorted(dist.get_process_group_ranks(expert)) == sorted(
+        dist.get_process_group_ranks(context)
+    )
+
+
 def _hybridep_rows_per_rank(capacity: int, ranks: int) -> int:
     """HybridEP's allocated rows per rank: TMA-aligned, at least 512, padded to
     the 64-row combine chunk."""
@@ -1602,8 +1625,13 @@ def _moe_output_bytes_per_token(
     checkpoint_grad: bool = False,
     converted_stages: list[tuple[int, int]] | None = None,
     slot_ref: "LoRASlotRef | None" = None,
+    shared_bytes: list[int] | None = None,
 ) -> int:
-    """Known routed-expert working set, not a complete model/compiled bound."""
+    """Known routed-expert working set, not a complete model/compiled bound.
+
+    ``shared_bytes`` collects each layer's shared-expert part of the per-token
+    coefficient and stages; that part follows local rows, not routed rows.
+    """
     # CP shards rows, not the per-token working set. At EP>1 only ART's
     # HybridEP flex dispatcher is modeled; TP and ETP are not.
     if (shape.tp, shape.etp) != (1, 1):
@@ -1746,6 +1774,8 @@ def _moe_output_bytes_per_token(
                 # Gate-score backward saves a distinct pre-gate X. Charge it
                 # beside this layer's returned X, not another layer's maximum.
                 shared += shared
+            if shared_bytes is not None:
+                shared_bytes.append(shared)
             routed_rows = config.moe_router_topk * routed_allowance
             row_bytes = (
                 math.ceil(routed_rows * features * weights.element_size()) + shared
@@ -1977,9 +2007,14 @@ class TrainerRank:
         )
         forward_stages: list[tuple[int, int]] = []
         gradient_stages: list[tuple[int, int]] = []
+        forward_shared: list[int] = []
+        gradient_shared: list[int] = []
         self._moe_output_bytes_per_token = (
             _moe_output_bytes_per_token(
-                runtime.model, self._parallel_shape, converted_stages=forward_stages
+                runtime.model,
+                self._parallel_shape,
+                converted_stages=forward_stages,
+                shared_bytes=forward_shared,
             )
             if self._moe_layers
             else 0
@@ -1993,6 +2028,7 @@ class TrainerRank:
                 self._parallel_shape,
                 checkpoint_grad=True,
                 converted_stages=gradient_stages,
+                shared_bytes=gradient_shared,
             )
             if self._moe_layers
             else 0
@@ -2004,6 +2040,15 @@ class TrainerRank:
         self._moe_gradient_stages = (
             tuple(gradient_stages) if self._moe_checkpoint_grad_bytes_per_token else ()
         )
+        self._moe_forward_shared_bytes = (
+            max(forward_shared, default=0) if self._moe_output_bytes_per_token else 0
+        )
+        self._moe_gradient_shared_bytes = (
+            max(gradient_shared, default=0)
+            if self._moe_checkpoint_grad_bytes_per_token
+            else 0
+        )
+        self._ep_group_is_cp_group = _ep_group_is_cp_group(self._parallel_shape)
         selection = select_scoring(
             device_capability=capability,
             device_memory_bytes=device_memory,
@@ -3982,6 +4027,34 @@ class TrainerRank:
             for group in plan.groups
         )
 
+    def _plan_group_routed_rows(self, plan: _FlatForwardPlan) -> tuple[int, ...]:
+        """Rows one rank's experts receive per group at balanced routing.
+
+        HybridEP dispatches the whole EP group's rows. When that group is this
+        rank's CP group, a balanced rank receives the group's rows over EP,
+        however unevenly CP split them; otherwise keep the local rows.
+        """
+        rows = self._plan_group_rows(plan)
+        if (
+            not getattr(self, "_ep_group_is_cp_group", False)
+            or plan.signature.topology[2] <= 1
+        ):
+            return tuple(local for local, _ in rows)
+        topology = self._topology()
+        return tuple(
+            min(
+                local,
+                -(
+                    -self._cp_group_model_tokens(
+                        _pad_packed_batch(group.packed, multiple=int(topology.tp)),
+                        topology=topology,
+                    )
+                    // int(topology.cp)
+                ),
+            )
+            for (local, _), group in zip(rows, plan.groups, strict=True)
+        )
+
     def _checkpoint_moe_bytes_per_token(self) -> int:
         forward = self._moe_output_bytes_per_token
         gradient = self._moe_checkpoint_grad_bytes_per_token
@@ -3998,6 +4071,7 @@ class TrainerRank:
         self,
         rows: int,
         *,
+        routed_rows: int | None = None,
         checkpoint_grad: bool = False,
         slot_ref: "LoRASlotRef | None" = None,
     ) -> int:
@@ -4006,7 +4080,9 @@ class TrainerRank:
         The constructor cache covers original tensors. Explicit slots are
         repriced from their tensor metadata and original owners, including
         this rank's exact dispatcher wrapper. Ordinary non-checkpoint gradients
-        retain only forward-stage coverage.
+        retain only forward-stage coverage. ``routed_rows`` is what this rank's
+        experts receive at balanced routing (``rows`` by default); the shared
+        expert's part stays on the local rows.
         """
         coefficient = (
             self._checkpoint_moe_bytes_per_token()
@@ -4018,8 +4094,16 @@ class TrainerRank:
             "_moe_gradient_stages" if checkpoint_grad else "_moe_forward_stages",
             (),
         )
+        shared = getattr(
+            self,
+            "_moe_gradient_shared_bytes"
+            if checkpoint_grad
+            else "_moe_forward_shared_bytes",
+            0,
+        )
         if slot_ref is not None and slot_ref.name is not None:
             selected: list[tuple[int, int]] = []
+            slot_shared: list[int] = []
             coefficient = (
                 _moe_output_bytes_per_token(
                     self.runtime.model,
@@ -4027,11 +4111,13 @@ class TrainerRank:
                     checkpoint_grad=checkpoint_grad,
                     converted_stages=selected,
                     slot_ref=slot_ref,
+                    shared_bytes=slot_shared,
                 )
                 if self._moe_layers
                 else 0
             )
             stages = tuple(selected) if coefficient else ()
+            shared = max(slot_shared, default=0) if coefficient else 0
         if type(stages) is not tuple or any(
             type(stage) is not tuple
             or len(stage) != 2
@@ -4039,22 +4125,28 @@ class TrainerRank:
             for stage in stages
         ):
             raise ValueError("Invalid constructor converted-weight stages")
-        return (
+        if type(shared) is not int or not 0 <= shared <= coefficient:
+            raise ValueError("Invalid constructor shared-expert coefficient")
+        routed = rows if routed_rows is None else max(0, min(rows, routed_rows))
+        return (rows - routed) * shared + (
             max(
-                rows * coefficient,
-                *(rows * per_row + fixed for per_row, fixed in stages),
+                routed * coefficient,
+                *(routed * per_row + fixed for per_row, fixed in stages),
             )
             if stages and rows > 0
-            else rows * coefficient
+            else routed * coefficient
         )
 
     def _checkpoint_memory_floor(
         self,
         group_rows: tuple[tuple[int, bool], ...],
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+        routed_rows: tuple[int, ...] | None = None,
     ) -> tuple[int, int]:
         """Conservative saved-boundary charge and one recomputed layer's workspace.
 
+        ``routed_rows`` are each group's balanced dispatched rows per rank
+        (``_plan_group_routed_rows``); by default, its local rows.
         Count actual local full/uniform/1 boundaries, including aliases, rather
         than claiming measured distinct storage. Only this call's new groups
         enter the term; already-live graphs remain in the availability baseline.
@@ -4134,10 +4226,15 @@ class TrainerRank:
             if gradient_rows
             else 0
         )
+        routed = (None,) * len(group_rows) if routed_rows is None else routed_rows
         workspace = max(
-            self._moe_workspace_bytes(rows, checkpoint_grad=grad, slot_ref=ref)
+            self._moe_workspace_bytes(
+                rows, routed_rows=dispatched, checkpoint_grad=grad, slot_ref=ref
+            )
             + (mixer * rows if grad else 4 * rows * self._hidden_size * 2)
-            for (rows, grad), ref in zip(group_rows, refs, strict=True)
+            for (rows, grad), ref, dispatched in zip(
+                group_rows, refs, routed, strict=True
+            )
         )
         if moe:
             workspace += self._te_workspace_growth_bytes()
@@ -4203,6 +4300,7 @@ class TrainerRank:
             logical_tokens=plan.active_logical_tokens,
             gdn_segments=plan.grad_segment_count,
             group_rows=self._plan_group_rows(plan),
+            group_routed_rows=self._plan_group_routed_rows(plan),
             slot_refs=tuple(g.slot_ref for g in plan.groups),
             head_workspace_bytes=self._plan_head_workspace_bytes(plan),
             checkpoint_floor=_gdn_memory.plan_floor(self, plan),
@@ -4219,6 +4317,7 @@ class TrainerRank:
         logical_tokens: int,
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
+        group_routed_rows: tuple[int, ...] | None = None,
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
         checkpoint_floor: tuple[int, int] = (0, 0),
@@ -4232,6 +4331,7 @@ class TrainerRank:
             logical_tokens=logical_tokens,
             gdn_segments=gdn_segments,
             group_rows=group_rows,
+            group_routed_rows=group_routed_rows,
             slot_refs=slot_refs,
             head_workspace_bytes=head_workspace_bytes,
             checkpoint_floor=checkpoint_floor,
@@ -4239,7 +4339,7 @@ class TrainerRank:
             include_checkpoint_input_gradient=False,
         )
         checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
-            group_rows, slot_refs
+            group_rows, slot_refs, group_routed_rows
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -6335,6 +6435,7 @@ class TrainerRank:
                             "gdn_segments": child.grad_segment_count,
                             "retained_tokens": self._plan_retained_tokens(child),
                             "group_rows": self._plan_group_rows(child),
+                            "group_routed_rows": self._plan_group_routed_rows(child),
                             "hybridep_growth_bytes": (
                                 self._plan_hybridep_growth_bytes(child)
                             ),
@@ -7059,6 +7160,7 @@ class TrainerRank:
                 logical_tokens=forward.active_logical_tokens,
                 gdn_segments=forward.grad_segment_count,
                 group_rows=self._plan_group_rows(forward),
+                group_routed_rows=self._plan_group_routed_rows(forward),
                 slot_refs=tuple(g.slot_ref for g in forward.groups),
                 head_workspace_bytes=self._plan_head_workspace_bytes(forward),
                 checkpoint_floor=_gdn_memory.plan_floor(self, forward),
@@ -7905,6 +8007,7 @@ class TrainerRank:
         logical_tokens: int | None = None,
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
+        group_routed_rows: tuple[int, ...] | None = None,
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
         checkpoint_floor: tuple[int, int] = (0, 0),
@@ -7982,19 +8085,23 @@ class TrainerRank:
             )
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.
+        grouped = signature.topology[2] > 1 and bool(group_rows)
         static_compute = max(
             static_compute,
             *(
                 self._moe_workspace_bytes(
-                    sum(rows for rows, _ in group_rows)
-                    if signature.topology[2] > 1 and group_rows
-                    else packed_tokens,
+                    sum(rows for rows, _ in group_rows) if grouped else packed_tokens,
+                    routed_rows=sum(group_routed_rows)
+                    if grouped and group_routed_rows is not None
+                    else None,
                     slot_ref=ref,
                 )
                 for ref in (slot_refs or (None,))
             ),
         )
-        retained, workspace = self._checkpoint_memory_floor(group_rows, slot_refs)
+        retained, workspace = self._checkpoint_memory_floor(
+            group_rows, slot_refs, group_routed_rows
+        )
         static_compute = max(
             static_compute,
             max(retained, checkpoint_floor[0])
@@ -8968,6 +9075,38 @@ class TrainerRank:
                 )
             )
         raise AssertionError("unreachable")
+
+    def _cp_group_model_tokens(
+        self,
+        batch: PrefixTreePack,
+        *,
+        topology: "ParallelTopology",
+    ) -> int:
+        """The CP group's model rows in its larger physical layout."""
+        from art.megatron.context_parallel.runtime import (
+            context_parallel_model_token_total,
+        )
+        from art.megatron.training.microbatches import (
+            _context_parallel_config_for_provider,
+            _gdn_planner_config_for_provider,
+        )
+
+        handler = self.runtime.model_support_handler
+        return context_parallel_model_token_total(
+            group_ids=batch.group_ids,
+            parent_ids=batch.parent_ids,
+            topology=topology,
+            config=_context_parallel_config_for_provider(
+                self.runtime.provider,
+                self.device,
+                handler,
+            ),
+            original_seq_len=int(batch.tokens.shape[1]),
+            build_gdn_execution_spec=handler.build_gdn_execution_spec,
+            gdn_planner_config=_gdn_planner_config_for_provider(
+                self.runtime.provider, handler
+            ),
+        )
 
     def _prepare_context_parallel_forward(
         self,

@@ -433,6 +433,39 @@ def context_parallel_rank_model_token_counts(
     )
 
 
+def context_parallel_model_token_total(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+    build_gdn_execution_spec: bool,
+    gdn_planner_config: Any | None = None,
+) -> int:
+    """Return the CP group's model rows in its larger physical layout."""
+    planning_key, bundle, _group_ids_cpu, _parent_ids_cpu = (
+        _get_or_build_planning_bundle(
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+            topology=topology,
+            config=config,
+            original_seq_len=original_seq_len,
+            build_gdn_execution_spec=build_gdn_execution_spec,
+        )
+    )
+    total = sum(bundle.token_layout_index.token_counts_by_rank)
+    if not build_gdn_execution_spec:
+        return total
+    decision = _plan_gdn_global_execution(
+        planning_key=planning_key,
+        bundle=bundle,
+        topology=topology,
+        gdn_planner_config=gdn_planner_config,
+    )
+    return max(total, sum(decision.gdn_token_counts_by_rank))
+
+
 def _normalized_chunk_size(
     *,
     valid_tokens: int,

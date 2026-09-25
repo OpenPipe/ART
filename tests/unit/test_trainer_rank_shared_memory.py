@@ -107,6 +107,9 @@ def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
     assert rank._moe_output_bytes_per_token == 192512
     checkpoint_coefficient = 196608 if gate else 192512
     assert rank._moe_checkpoint_grad_bytes_per_token == checkpoint_coefficient
+    # The shared return is the part that stays on local rows under HybridEP.
+    assert rank._moe_forward_shared_bytes == 4096
+    assert rank._moe_gradient_shared_bytes == (8192 if gate else 4096)
     shapes = g.model_shapes(rank)
     assert shapes is not None and shapes[1][0].moe_bytes_per_row == 192512
     requests = full_requests(no_grad)
@@ -419,9 +422,14 @@ def test_shared_return_escapes_the_ep_routed_allowance(layer, checkpoint_grad, s
     # HybridEP's EP2 allowance (1.4) turns top-k 8 into 11.2 routed rows, each
     # with one dispatched H-wide input; the gated shared return (doubled for
     # checkpoint backward) is per local token.
+    collected: list[int] = []
     assert (
         _moe_output_bytes_per_token(
-            [layer], ParallelShape(tp=1, cp=2, ep=2), checkpoint_grad=checkpoint_grad
+            [layer],
+            ParallelShape(tp=1, cp=2, ep=2),
+            checkpoint_grad=checkpoint_grad,
+            shared_bytes=collected,
         )
         == math.ceil(8 * 1.4 * 9728 * 2) + shared
     )
+    assert collected == [shared]
