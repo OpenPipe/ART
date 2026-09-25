@@ -162,17 +162,6 @@ def _checkpoint_prefetch_executor() -> ThreadPoolExecutor:
         return _CHECKPOINT_PREFETCH_EXECUTOR[1]
 
 
-def _provider_attention_dimensions(provider: Any) -> dict[str, int]:
-    """The running model's attention shape, in adapter-config keys."""
-    dimensions = {
-        "num_attention_heads": getattr(provider, "num_attention_heads", None),
-        "num_key_value_heads": getattr(provider, "num_query_groups", None),
-        "head_dim": getattr(provider, "kv_channels", None),
-        "hidden_size": getattr(provider, "hidden_size", None),
-    }
-    return {key: int(value) for key, value in dimensions.items() if value is not None}
-
-
 class _AdapterConfig(TypedDict):
     base_model_name_or_path: str
     revision: NotRequired[str | None]
@@ -2637,7 +2626,11 @@ class TrainerRank:
                 "adapter_config['base_model_name_or_path'] must be a string"
             )
         if base_model.startswith(("Qwen/Qwen3.5-", "Qwen/Qwen3.6-", "Qwen/Qwen3.8-")):
-            config.update(_provider_attention_dimensions(self.runtime.provider))
+            from art.megatron.model_support.lora_disk import (
+                model_attention_dimensions,
+            )
+
+            config.update(model_attention_dimensions(self.runtime.provider))
         if not isinstance(rank, int) or isinstance(rank, bool):
             raise TypeError("adapter_config['r'] must be an integer")
         if not isinstance(config_alpha_value, int | float) or isinstance(

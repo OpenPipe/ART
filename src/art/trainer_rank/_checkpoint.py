@@ -1488,23 +1488,13 @@ def _load_adapter(
 ) -> dict[str, torch.Tensor]:
     if source.manifest is None:
         from art.megatron.model_support.lora_disk import (
-            load_adapter_config,
             load_lora_tensors_for_megatron,
         )
-        from art.trainer_rank._impl import _provider_attention_dimensions
 
-        # Convert with the running model's attention shape where the adapter
-        # omits it, instead of looking the base model up again by name.
-        adapter_config = {
-            **_provider_attention_dimensions(
-                getattr(trainer.runtime, "provider", None)
-            ),
-            **load_adapter_config(source.path),
-        }
         loaded = load_lora_tensors_for_megatron(
             source.path,
             handler=trainer.runtime.model_support_handler,
-            adapter_config=adapter_config,
+            provider=getattr(trainer.runtime, "provider", None),
         )
         return {key: value for key, value in loaded.items() if key in set(keys)}
     safe_open = importlib.import_module("safetensors").safe_open

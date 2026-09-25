@@ -532,7 +532,7 @@ def _qwen35_attention_dims(adapter_config: dict[str, Any]) -> tuple[int, int, in
             raise RuntimeError("Qwen3.5 LoRA adapter config is missing base model path")
         # Resolve the adapter's pinned snapshot, not whatever the name
         # currently points at (an offline cache may hold only the pin).
-        revision = adapter_config.get("revision")
+        revision = adapter_config.get("revision") or None
         config = _qwen35_text_config(
             str(base_model), None if revision is None else str(revision)
         )

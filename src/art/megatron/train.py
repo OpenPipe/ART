@@ -1006,6 +1006,7 @@ def _prepare_rl_training_state(
         job.source_adapter_path,
         runtime.rank,
         handler=runtime.model_support_handler,
+        provider=runtime.provider,
         optimizer=runtime.optimizer,
     )
     if runtime.optimizer is None:
@@ -1069,10 +1070,13 @@ def _load_adapter_into_model(
     rank: int,
     *,
     handler: Any | None = None,
+    provider: Any = None,
     optimizer: Any | None = None,
 ) -> dict[str, torch.Tensor]:
     print0(rank, "Loading adapter model from", lora_path)
-    adapter_model = load_lora_tensors_for_megatron(lora_path, handler=handler)
+    adapter_model = load_lora_tensors_for_megatron(
+        lora_path, handler=handler, provider=provider
+    )
     load_adapter_into_model(
         model_chunks,
         adapter_model,
@@ -2319,6 +2323,7 @@ def _prepare_kl_reference_logprobs(
                 ref_adapter_path,
                 runtime.rank,
                 handler=runtime.model_support_handler,
+                provider=runtime.provider,
             )
             loaded_ref_adapter = True
         return _precompute_reference_logprobs(

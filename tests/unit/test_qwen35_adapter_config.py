@@ -72,7 +72,9 @@ def test_a_different_main_revision_does_not_change_a_pinned_adapter(hub_cache):
     assert _dims() == (16, 4, 256)  # unpinned adapters still follow main
 
 
-def _write_adapter(path: Path, rows: int) -> dict[str, torch.Tensor]:
+def _write_adapter(
+    path: Path, rows: int, **dimensions: object
+) -> dict[str, torch.Tensor]:
     from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
 
     tensors = {
@@ -87,9 +89,32 @@ def _write_adapter(path: Path, rows: int) -> dict[str, torch.Tensor]:
         "lora_alpha": 32,
         "target_modules": ["q_proj"],
         "art_lora_format": "vllm",
+        **dimensions,
     }
     save_vllm_lora_tensors(path, tensors, config)
     return tensors
+
+
+# Four heads in two query groups, with head_dim 8: the runtime's shape.
+PROVIDER = SimpleNamespace(
+    num_attention_heads=4, num_query_groups=2, kv_channels=8, hidden_size=32
+)
+ROWS = 2 * 2 * 2 * 8  # groups x (query + gate) x heads per group x head_dim
+ART_KEY = f"{LAYER}.lora_B.weight".replace(".language_model.layers.", ".layers.")
+
+
+def _expected(tensors: dict[str, torch.Tensor]) -> torch.Tensor:
+    return qwen35._qwen35_q_proj_lora_b_from_vllm(
+        tensors[f"{LAYER}.lora_B.weight"],
+        {"num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8},
+    )
+
+
+def _forbid_lookup(monkeypatch) -> None:
+    def lookup(*_args):
+        raise AssertionError("adapter conversion looked the base model up again")
+
+    monkeypatch.setattr(qwen35, "_qwen35_text_config", lookup)
 
 
 @pytest.mark.parametrize("handler", ["QWEN3_5_DENSE_HANDLER", "QWEN3_5_MOE_HANDLER"])
@@ -98,60 +123,95 @@ def test_checkpoint_load_converts_with_the_running_models_attention_shape(
 ):
     from art.trainer_rank import _checkpoint
 
-    def lookup(*_args):
-        raise AssertionError("adapter conversion looked the base model up again")
-
-    monkeypatch.setattr(qwen35, "_qwen35_text_config", lookup)
-    provider = SimpleNamespace(
-        num_attention_heads=4, num_query_groups=2, kv_channels=8, hidden_size=32
-    )
+    _forbid_lookup(monkeypatch)
     trainer = SimpleNamespace(
         runtime=SimpleNamespace(
-            provider=provider, model_support_handler=getattr(qwen35, handler)
+            provider=PROVIDER, model_support_handler=getattr(qwen35, handler)
         )
     )
-    # Two query groups of two heads, each with query and gate rows of size 8.
-    tensors = _write_adapter(tmp_path, rows=2 * 2 * 2 * 8)
-    art_key = f"{LAYER}.lora_B.weight".replace(".language_model.layers.", ".layers.")
+    tensors = _write_adapter(tmp_path, ROWS)
     loaded = _checkpoint._load_adapter(
         cast(Any, trainer),
         cast(Any, SimpleNamespace(manifest=None, path=tmp_path)),
-        [art_key],
+        [ART_KEY],
     )
-    expected = qwen35._qwen35_q_proj_lora_b_from_vllm(
-        tensors[f"{LAYER}.lora_B.weight"],
-        {"num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 8},
-    )
-    torch.testing.assert_close(loaded[art_key], expected)
+    torch.testing.assert_close(loaded[ART_KEY], _expected(tensors))
 
 
-def test_adapter_dimensions_take_precedence_over_the_running_model(
+def test_null_adapter_dimensions_are_filled_from_the_running_model(
     tmp_path, monkeypatch
 ):
-    from art.megatron.model_support import lora_disk
-    from art.trainer_rank import _checkpoint
+    from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
 
+    _forbid_lookup(monkeypatch)
+    # A null group count must not fall back to one group per head.
+    tensors = _write_adapter(tmp_path, ROWS, num_key_value_heads=None, head_dim=None)
+    loaded = load_lora_tensors_for_megatron(
+        tmp_path, handler=qwen35.QWEN3_5_MOE_HANDLER, provider=PROVIDER
+    )
+    torch.testing.assert_close(loaded[ART_KEY], _expected(tensors))
+
+
+def test_adapter_dimensions_take_precedence_over_the_running_model():
+    from art.megatron.model_support.lora_disk import with_model_attention_dimensions
+
+    config = with_model_attention_dimensions(
+        {"revision": PIN, "num_attention_heads": 1, "num_key_value_heads": None},
+        PROVIDER,
+    )
+    assert config == {
+        "revision": PIN,
+        "num_attention_heads": 1,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "hidden_size": 32,
+    }
+
+
+def test_an_incomplete_model_shape_falls_back_to_the_pinned_lookup(
+    tmp_path, monkeypatch
+):
+    from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
+
+    looked_up = []
+
+    def lookup(name, revision):
+        looked_up.append((name, revision))
+        return SimpleNamespace(num_attention_heads=4, num_key_value_heads=2, head_dim=8)
+
+    monkeypatch.setattr(qwen35, "_qwen35_text_config", lookup)
+    tensors = _write_adapter(tmp_path, ROWS)
+    # Without query groups, filling heads alone would imply one group per head.
+    provider = SimpleNamespace(num_attention_heads=4, kv_channels=8)
+    loaded = load_lora_tensors_for_megatron(
+        tmp_path, handler=qwen35.QWEN3_5_MOE_HANDLER, provider=provider
+    )
+    assert looked_up == [(REPO, PIN)]
+    torch.testing.assert_close(loaded[ART_KEY], _expected(tensors))
+
+
+def test_export_of_a_pinned_adapter_resolves_its_revision(hub_cache):
+    hub_cache(PIN, groups=2)
+    tensor = torch.randn(2 * 2 * 8 * 256, 2)  # 16 heads in 2 groups, head_dim 256
+    config = {"base_model_name_or_path": REPO, "revision": PIN}
+    art_key = "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight"
+    exported, _ = qwen35.QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        {art_key: tensor}, adapter_config=config
+    )
+    expected = qwen35._qwen35_q_proj_lora_b_to_vllm(
+        tensor, {"num_attention_heads": 16, "num_key_value_heads": 2, "head_dim": 256}
+    )
+    torch.testing.assert_close(exported[f"{LAYER}.lora_B.weight"], expected)
+
+
+def test_megatron_service_adapter_load_passes_the_running_model(monkeypatch):
+    train = pytest.importorskip("art.megatron.train")
     seen = []
     monkeypatch.setattr(
-        lora_disk,
+        train,
         "load_lora_tensors_for_megatron",
-        lambda path, **kwargs: seen.append(kwargs["adapter_config"]) or {},
+        lambda path, **kwargs: seen.append(kwargs) or {},
     )
-    _write_adapter(tmp_path, rows=8)
-    config = json.loads((tmp_path / "adapter_config.json").read_text())
-    config["num_attention_heads"] = 1
-    (tmp_path / "adapter_config.json").write_text(json.dumps(config))
-    trainer = SimpleNamespace(
-        runtime=SimpleNamespace(
-            provider=SimpleNamespace(num_attention_heads=4, num_query_groups=2),
-            model_support_handler=qwen35.QWEN3_5_MOE_HANDLER,
-        )
-    )
-    _checkpoint._load_adapter(
-        cast(Any, trainer),
-        cast(Any, SimpleNamespace(manifest=None, path=tmp_path)),
-        [],
-    )
-    assert seen[0]["num_attention_heads"] == 1
-    assert seen[0]["num_key_value_heads"] == 2
-    assert seen[0]["revision"] == PIN
+    monkeypatch.setattr(train, "load_adapter_into_model", lambda *a, **k: None)
+    train._load_adapter_into_model([], "adapter", 0, handler=None, provider=PROVIDER)
+    assert seen[0]["provider"] is PROVIDER
