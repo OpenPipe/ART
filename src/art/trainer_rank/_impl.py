@@ -3804,17 +3804,21 @@ class TrainerRank:
         positions: Sequence[torch.Tensor] | None = None,
         lower_bound: bool = False,
     ) -> int:
-        """One logits buffer, or logits + both dense target-backward gradients.
+        """Partial dense head component: eager statistics or no-grad logits copies.
 
-        The supported head path overlaps indexing and statistics gradients
-        with recomputed logits; cold library workspaces remain outside this
-        component. Pair each group's mode with its own projected rows.
+        Capacity reserves the eager path even when optional Triton may succeed.
+        Its BF16 logits, FP32 conversion, subtraction and exp overlap. This is
+        not a bound for row vectors, inter-chunk liveness or library workspaces.
+        Rejection lower bounds retain only the unconditional dense components.
         """
         dense = self._head_workspace_bytes(rows)
-        if (
-            not dense
-            or not grad_enabled
-            or not any(request.target_tokens is not None for request in requests)
+        needs_statistics = any(
+            request.target_tokens is not None or request.top_k is not None
+            for request in requests
+        )
+        if not dense or (
+            not needs_statistics
+            and (grad_enabled or lower_bound or not any(r.logits for r in requests))
         ):
             return dense
         from megatron.core.models.common.language_module.language_module import (
@@ -3829,8 +3833,18 @@ class TrainerRank:
             and scale.__func__ is LanguageModule._scale_logits
             and getattr(model.config, "use_mup", None) is False
         ):
+            if not lower_bound:
+                # need_log_z is group-wide, including logits-only chunks and
+                # chunks overlapping ignored labels. A short final chunk can
+                # also take the eager path; optional success is not guaranteed.
+                # Without statistics, local logits and both indexed copies
+                # overlap. Requested output storage is charged separately.
+                return (7 if needs_statistics else 3) * dense
+            if not grad_enabled or not any(
+                request.target_tokens is not None for request in requests
+            ):
+                return dense
             # IndexBackward's dense result overlaps saved logits and grad_logits.
-            # The FP32 fallback already exceeds this three-buffer component.
             target_dense = (
                 self._head_workspace_bytes(
                     self._head_target_chunk_rows(

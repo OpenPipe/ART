@@ -22,7 +22,7 @@ def test_adding_output_cannot_erase_existing_target_admission_floor(extra):
     after = r._plan_cost(plan).required
     print({"extra": extra, "before": before, "after": after})
     assert after >= before
-    assert r._plan_head_workspace_bytes(plan) == 3 * 129 * 248320 * 2
+    assert r._plan_head_workspace_bytes(plan) == 7 * 129 * 248320 * 2
     r._available_memory_bytes = lambda: before - 1
     assert not r._memory_check(plan).fits
 
@@ -42,12 +42,20 @@ def test_sparse_target_prices_its_full_mixed_chunk_and_short_tail(extra):
     dense = 512 * 248320 * 2
     assert (
         r._group_head_workspace_bytes(512, req, grad_enabled=True, positions=full)
-        == 3 * dense
+        == 7 * dense
     )
     assert (
         r._group_head_workspace_bytes(512, req, grad_enabled=True, positions=tail)
-        == dense
+        == 7 * dense
     )
+    # Optional eager demand is not an unconditional rejection lower bound.
+    for positions, expected in ((full, 3 * dense), (tail, dense)):
+        assert (
+            r._group_head_workspace_bytes(
+                512, req, grad_enabled=True, positions=positions, lower_bound=True
+            )
+            == expected
+        )
 
 
 @pytest.mark.parametrize("extra", [{"logits": True}, {"top_k": 2}])
@@ -82,7 +90,7 @@ def test_shared_multilabel_union_matches_actual_and_split_bounds(extra):
         )
     assert (
         r._plan_head_workspace_bytes(r._plan_flat_forward(req, memory_minimal=True))
-        == 3 * 4 * 248320 * 2
+        == 7 * 4 * 248320 * 2
     )
 
 
@@ -91,9 +99,11 @@ def test_ignored_device_labels_and_no_target_keep_distinct_guards(extra):
     r = rank()
     ignored = replace(request(128, grad=True, ignored=True), **extra)
     dense = 128 * 248320 * 2
-    assert r._plan_head_workspace_bytes(r._plan_flat_forward([ignored])) == 3 * dense
+    assert r._plan_head_workspace_bytes(r._plan_flat_forward([ignored])) == 7 * dense
     no_target = replace(ignored, target_tokens=None)
-    assert r._plan_head_workspace_bytes(r._plan_flat_forward([no_target])) == dense
+    assert r._plan_head_workspace_bytes(r._plan_flat_forward([no_target])) == (
+        7 * dense if "top_k" in extra else dense
+    )
     device = replace(
         ignored, target_tokens=torch.empty(128, device="meta", dtype=torch.long)
     )
@@ -109,7 +119,7 @@ def test_ignored_device_labels_and_no_target_keep_distinct_guards(extra):
 
 
 @pytest.mark.parametrize("mutation", ["no_grad", "custom_scale", "mup", "head_hook"])
-def test_mixed_path_preserves_source_scaling_and_gradient_guards(mutation):
+def test_mixed_path_prices_no_grad_but_preserves_source_scaling_guards(mutation):
     r = rank()
     item = replace(request(128, grad=True), logits=True)
     model = r.runtime.model[0]
@@ -121,7 +131,8 @@ def test_mixed_path_preserves_source_scaling_and_gradient_guards(mutation):
         model.config.use_mup = True
     else:
         model.output_layer.register_forward_hook(lambda *args: None)
-    expected = 0 if mutation == "head_hook" else 128 * 248320 * 2
+    multiplier = 0 if mutation == "head_hook" else 7 if mutation == "no_grad" else 1
+    expected = multiplier * 128 * 248320 * 2
     assert r._plan_head_workspace_bytes(r._plan_flat_forward([item])) == expected
 
 

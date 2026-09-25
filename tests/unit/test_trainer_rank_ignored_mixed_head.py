@@ -17,10 +17,10 @@ def test_ignored_rows_reactivated_by_same_item_output_keep_backward_floor(extra)
     item = replace(request(128, grad=True, ignored=True), **extra)
     assert (
         r._plan_head_workspace_bytes(r._plan_flat_forward([item]))
-        == 3 * 128 * 248320 * 2
+        == 7 * 128 * 248320 * 2
     )
-    assert r._estimate_flat_forward([item], exact=True)[-1] == 3 * 128 * 248320 * 2
-    assert r._estimate_flat_forward([item])[-1] == 3 * 128 * 248320 * 2
+    assert r._estimate_flat_forward([item], exact=True)[-1] == 7 * 128 * 248320 * 2
+    assert r._estimate_flat_forward([item])[-1] == 7 * 128 * 248320 * 2
     assert r._head_target_chunk_rows([item], lower_bound=True) == 0
 
 
