@@ -7141,6 +7141,8 @@ class TrainerRank:
                     decision = _planner_evidence.current(self)
                     if decision is not None:
                         decision.outcome = "admitted_oversized"
+                    if isinstance(selected, _CandidateMicroBatch):
+                        selected = replace(selected, recovery_target=None)
                     return selected
             decision = _planner_evidence.current(self)
             if decision is not None:

@@ -5,8 +5,10 @@ uses tiny CPU inputs; recovery uses the existing scalar clock/allocator facade.
 """
 
 from dataclasses import replace
+import gc
 import types
 import unittest
+import weakref
 
 import pytest
 import test_trainer_rank_cache_recovery as recovery_fixture
@@ -174,6 +176,47 @@ class TestSplitRecovery(unittest.TestCase):
             self.recover(q, [self.candidate(), refusal])
         self.assertEqual(c.events.count("release"), 1)
         self.assertIsNone(q._recovery_state().owner)
+
+    def test_oversized_return_releases_recovery_target_after_world_refresh_fails(self):
+        q, c, k, n = self.setup_recovery()
+        q._allow_oversized_batches = True
+        available = iter((10, 3))
+
+        def refresh(check, **kwargs):
+            free = next(available)
+            return replace(
+                check, available_bytes=free, fits=check.estimated_required_bytes <= free
+            )
+
+        q._refresh_memory_check = refresh
+
+        class Target:
+            packed_tokens = 40
+
+        first, later = self.candidate(), self.candidate(6)
+        later = replace(later, recovery_target=(Target(), later.recovery_target[1]))
+        target = weakref.ref(later.recovery_target[0])
+        plan, inputs, indices = later.plan, later.inputs, later.indices
+        pending = [first, later]
+        result = q._recover_admission(
+            lambda: pending.pop(0),
+            lambda value: (value.plan, value.check),
+            lambda value, check: replace(value, check=check),
+            context="forward_micro_batches",
+            sync_across_dp=True,
+            admit_refusal=lambda refusal: self.fail("existing candidate must be used"),
+        )
+        self.assertEqual(pending, [])
+        self.assertEqual(c.events.count("release"), 1)
+        self.assertIs(result.plan, plan)
+        self.assertIs(result.inputs, inputs)
+        self.assertIs(result.indices, indices)
+        self.assertEqual(result.check, _impl._MemoryCheck(6, 3, False))
+        self.assertIsNone(result.recovery_target)
+        self.assertIsNotNone(later.recovery_target)
+        del first, later
+        gc.collect()
+        self.assertIsNone(target())
 
     def test_release_error_preserves_primary_instead_of_running_split(self):
         q, c, k, n = self.setup_recovery()
