@@ -43,6 +43,7 @@ if [[ -n "${PREWARM_INFRAS:-}" ]]; then
 fi
 prewarm_namespace="${PREWARM_NAMESPACE:-default}"
 prewarm_name="${PREWARM_NAME:-art-gpu-image-prewarm}"
+prewarm_run_uid="${PREWARM_RUN_UID:-}"
 prewarm_image_pull_secret="${PREWARM_IMAGE_PULL_SECRET:-art-gpu-registry-auth}"
 prewarm_node_selector="${PREWARM_NODE_SELECTOR:-node.coreweave.cloud/class=gpu}"
 prewarm_hypervisor_label="node.coreweave.cloud/hypervisor"
@@ -162,6 +163,14 @@ prewarm_node_selector_value="${prewarm_node_selector#*=}"
 art_sha="$(git -C "${repo_root}" rev-parse HEAD)"
 art_short_sha="$(git -C "${repo_root}" rev-parse --short=12 HEAD)"
 timestamp="$(date +%m%d-%H%M%S)"
+if [[ -z "${prewarm_run_uid}" ]]; then
+  prewarm_run_uid="${timestamp}-${art_short_sha}-$$"
+fi
+if (( ${#prewarm_run_uid} > 63 )) ||
+  [[ ! "${prewarm_run_uid}" =~ ^[a-z0-9]([-a-z0-9_.]*[a-z0-9])?$ ]]; then
+  echo "PREWARM_RUN_UID must be a valid Kubernetes label value, got: ${prewarm_run_uid}" >&2
+  exit 1
+fi
 
 if [[ -z "${cluster_name}" ]]; then
   cluster_name="art-gpu-build-${timestamp}"
@@ -287,7 +296,19 @@ registry_auth_json_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-auth.XXXXXX")"
 build_command_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-command.XXXXXX")"
 build_log_snapshot_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-log.XXXXXX")"
 build_log_offset_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-log-offset.XXXXXX")"
+cleanup_prewarm_pods() {
+  local context
+  local selector
+
+  selector="art.openpipe/prewarm-name=${prewarm_name},art.openpipe/prewarm-run=${prewarm_run_uid}"
+  for context in "${prewarm_contexts[@]}"; do
+    kubectl --context "${context}" delete pod -n "${prewarm_namespace}" \
+      -l "${selector}" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done
+}
 cleanup() {
+  cleanup_prewarm_pods
   rm -rf "${context_dir}"
   rm -f "${buildkit_manifest_path}" "${registry_auth_json_path}" \
     "${build_command_path}" "${build_log_snapshot_path}" "${build_log_offset_path}"
@@ -808,6 +829,7 @@ metadata:
   labels:
     app: ${prewarm_name}-oneshot
     art.openpipe/prewarm-name: ${prewarm_name}
+    art.openpipe/prewarm-run: "${prewarm_run_uid}"
     art.openpipe/prewarm-token: "${timestamp}-${art_short_sha}"
 spec:
   restartPolicy: Never
@@ -874,6 +896,7 @@ metadata:
   labels:
     app: ${prewarm_name}-oneshot
     art.openpipe/prewarm-name: ${prewarm_name}
+    art.openpipe/prewarm-run: "${prewarm_run_uid}"
     art.openpipe/prewarm-token: "${timestamp}-${art_short_sha}"
 spec:
   restartPolicy: Never
