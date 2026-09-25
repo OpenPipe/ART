@@ -59,7 +59,10 @@ from art.trainer_rank._impl import (
     _MemoryProfile,
     _SplitForwardPlan,
 )
-from art.trainer_rank._prefix_tree_planner import plan_prefix_tree_layout
+from art.trainer_rank._prefix_tree_planner import (
+    build_canonical_prefix_tree,
+    plan_prefix_tree_layout,
+)
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
@@ -182,6 +185,15 @@ def test_dp_rank_forward_splits_instead_of_raising(
     telemetry = rank.last_forward_telemetry()
     assert telemetry["subforward_count"] == 2
     assert telemetry["subforward_request_indices"] == ((0, 1), (2, 3))
+    assert (
+        telemetry["input_tokens_sha256"]
+        == build_canonical_prefix_tree(
+            [request.input_tokens for request in inputs]
+        ).content_fingerprint
+    )
+    assert telemetry["subforward_packing_plan_sha256"] == tuple(
+        rank._telemetry_signature(plan)["packing_plan_sha256"] for plan in executed
+    )
 
 
 def test_unsplit_call_reports_a_single_subforward(
