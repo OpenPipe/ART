@@ -1551,6 +1551,26 @@ def _merge_stage_output_grads_from_tape(
     return stage_out_grads, stage_lse_grads
 
 
+def minimum_retained_bytes_per_row(
+    *,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    value_head_dim: int,
+    element_size: int,
+) -> int:
+    """The least ``retained_stage_record_bytes`` keeps per own row.
+
+    Every rank with rows runs a local stage over all of them (each row attends
+    to itself); an aligned one keeps only the contiguous copies of multi-head
+    views, flex's output and its two LSEs.
+    """
+    copies = (q_heads > 1) * q_heads * head_dim + (kv_heads > 1) * kv_heads * (
+        head_dim + value_head_dim
+    )
+    return (copies + q_heads * value_head_dim) * element_size + 2 * q_heads * 4
+
+
 def retained_stage_record_bytes(
     rank_plan: RankRuntimePlan,
     *,
@@ -1569,9 +1589,10 @@ def retained_stage_record_bytes(
     differs, else a contiguous copy of the permuted ``q_flat``/``k_flat`` view;
     partial-range gathers and remote fetch buffers are kept as the stage's
     inputs. It keeps flex's output and LSE at the execution length, and
-    logical-length copies of them when padded. Every producing stage after the
-    first keeps a merge-tape clone of the accumulators. Accumulators themselves
-    are transient.
+    logical-length copies of them when padded, plus flex's own LSE beside the
+    normalized one the FLASH backend returns (counted on every backend). Every
+    producing stage after the first keeps a merge-tape clone of the
+    accumulators. Accumulators themselves are transient.
     """
     own = int(rank_plan.local_valid_lengths[0]) if rank_plan.local_valid_lengths else 0
     accum_size = 4 if element_size < 4 else element_size
@@ -1615,7 +1636,7 @@ def retained_stage_record_bytes(
             total += (k_row + v_row) * k_pad
         elif k_full and kv_heads > 1:
             total += (k_row + v_row) * k_len
-        total += (out_row + lse_row) * q_pad
+        total += (out_row + 2 * lse_row) * q_pad
         if q_pad != q_len:
             total += (out_row + lse_row) * q_len
         tape = tape_row * (own if q_full else q_len)

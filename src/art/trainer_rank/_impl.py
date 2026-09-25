@@ -3680,6 +3680,7 @@ class TrainerRank:
         unshared_packed_tokens = 0
         head_workspace_bytes = 0
         group_rows: list[tuple[int, bool]] = []
+        group_physical_rows: list[int] = []
         for (_slot, grad_enabled), group_indices in groups:
             estimated = estimate_prefix_tree_packed_tokens(
                 (rows[index] for index in group_indices),
@@ -3687,6 +3688,7 @@ class TrainerRank:
             )
             assert estimated is not None  # rows are CPU copies
             physical_rows = self._physical_tokens(estimated)
+            group_physical_rows.append(physical_rows)
             packed_tokens += physical_rows
             # The most loaded CP rank holds at least an even share.
             cp = max(1, self._topology_key()[2])
@@ -3712,12 +3714,23 @@ class TrainerRank:
             slot_groups=tuple(key for key, _ in groups),
         )
         logical_tokens = _active_logical_tokens(requests)
+        # Where exact plans price each rank's layouts, bound them from below
+        # the same way rather than with the busiest-rank widths.
+        layouts = (
+            self._minimum_layouts(group_physical_rows, signature.topology[2])
+            if self._layout_pricing_supported(
+                signature.topology,
+                gradient_groups=all(grad for _, grad in group_rows),
+            )
+            else None
+        )
         cost = self._subforward_cost(
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
             signature=signature,
             logical_tokens=logical_tokens,
             group_rows=tuple(group_rows),
+            group_layouts=layouts,
             slot_refs=tuple(ref for (ref, _), _ in groups),
             head_workspace_bytes=head_workspace_bytes,
             # The average CP load is an optimistic bound, not an admission cost.
@@ -4356,6 +4369,68 @@ class TrainerRank:
             workspace += self._te_workspace_growth_bytes()
         return retained, workspace
 
+    def _layout_pricing_supported(
+        self, topology: tuple[int, int, int, int], *, gradient_groups: bool
+    ) -> bool:
+        """Whether layout-aware pricing models this runtime and plan shape."""
+        _dp, tp, cp, pp = topology
+        if (tp, cp, pp) != (1, 2, 1) or not gradient_groups:
+            return False
+        geometry = self._geometry
+        if not geometry.num_attention_heads or not geometry.kv_channels:
+            return False
+        try:
+            decoder = _language_model(self.runtime.model[0]).decoder
+            from art.megatron.context_parallel.core_attention import (
+                ArtContextParallelCoreAttention,
+            )
+        except (AttributeError, RuntimeError, ModuleNotFoundError):
+            return False
+        for layer in decoder.layers:
+            boundary = getattr(layer, "_art_gdn_island_boundary", None)
+            if boundary is not None and boundary.is_gdn:
+                continue
+            if self._gdn_layers and boundary is None:
+                return False
+            core = getattr(
+                getattr(layer, "self_attention", None), "core_attention", None
+            )
+            if (
+                type(core) is not ArtContextParallelCoreAttention
+                or getattr(core, "softmax_offset", None) is not None
+            ):
+                return False
+        return True
+
+    def _minimum_layouts(
+        self, physical_rows: Sequence[int], cp: int
+    ) -> tuple[_GroupLayout, ...]:
+        """Even-share layouts keeping the least attention state: a lower bound.
+
+        Some rank holds at least an even share of each layout's rows and runs
+        at least one aligned local stage over them.
+        """
+        from art.megatron.context_parallel.executor import (
+            minimum_retained_bytes_per_row,
+        )
+
+        geometry = self._geometry
+        per_row = minimum_retained_bytes_per_row(
+            q_heads=int(geometry.num_attention_heads),
+            kv_heads=int(geometry.num_query_groups),
+            head_dim=int(geometry.kv_channels),
+            value_head_dim=int(geometry.kv_channels),
+            element_size=self._param_dtype_size,
+        )
+        return tuple(
+            _GroupLayout(
+                attention_rows=(rows // cp,) * cp,
+                gdn_rows=(rows // cp,) * cp if self._gdn_layers else None,
+                attention_retained=(rows // cp * per_row,) * cp,
+            )
+            for rows in physical_rows
+        )
+
     def _plan_group_layouts(
         self, plan: _FlatForwardPlan
     ) -> tuple[_GroupLayout, ...] | None:
@@ -4366,35 +4441,12 @@ class TrainerRank:
         executor's retained set is validated there. Elsewhere ``None`` keeps
         the busiest-rank pricing.
         """
-        _dp, tp, cp, pp = plan.signature.topology
-        if (tp, cp, pp) != (1, 2, 1) or not plan.groups:
-            return None
-        if not all(group.grad_enabled for group in plan.groups):
+        if not plan.groups or not self._layout_pricing_supported(
+            plan.signature.topology,
+            gradient_groups=all(group.grad_enabled for group in plan.groups),
+        ):
             return None
         geometry = self._geometry
-        if not geometry.num_attention_heads or not geometry.kv_channels:
-            return None
-        try:
-            decoder = _language_model(self.runtime.model[0]).decoder
-            from art.megatron.context_parallel.core_attention import (
-                ArtContextParallelCoreAttention,
-            )
-        except (AttributeError, RuntimeError, ModuleNotFoundError):
-            return None
-        for layer in decoder.layers:
-            boundary = getattr(layer, "_art_gdn_island_boundary", None)
-            if boundary is not None and boundary.is_gdn:
-                continue
-            if self._gdn_layers and boundary is None:
-                return None
-            core = getattr(
-                getattr(layer, "self_attention", None), "core_attention", None
-            )
-            if (
-                type(core) is not ArtContextParallelCoreAttention
-                or getattr(core, "softmax_offset", None) is not None
-            ):
-                return None
         from art.megatron.context_parallel.executor import retained_stage_record_bytes
         from art.megatron.context_parallel.runtime import context_parallel_rank_layouts
         from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
@@ -6675,6 +6727,11 @@ class TrainerRank:
                             "retained_tokens": self._plan_retained_tokens(child),
                             "group_rows": self._plan_group_rows(child),
                             "group_routed_rows": self._plan_group_routed_rows(child),
+                            "group_layouts": (
+                                None
+                                if (layouts := self._plan_group_layouts(child)) is None
+                                else [asdict(layout) for layout in layouts]
+                            ),
                             "hybridep_growth_bytes": (
                                 self._plan_hybridep_growth_bytes(child)
                             ),
