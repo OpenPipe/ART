@@ -35,6 +35,7 @@ from .types import (
     DkvReducePlan,
     ExactMaskMetadata,
     FlexMaskSpec,
+    RankRuntimePlan,
     StageExecutionSpec,
     StagePlan,
     TokenRange,
@@ -1548,6 +1549,85 @@ def _merge_stage_output_grads_from_tape(
         grad_accum_lse.index_copy_(1, q_index, grad_prev_lse)
         _release_replay_record_merge_tape(record)
     return stage_out_grads, stage_lse_grads
+
+
+def retained_stage_record_bytes(
+    rank_plan: RankRuntimePlan,
+    *,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    value_head_dim: int,
+    element_size: int,
+    block_size: SparseBlockSize,
+) -> int:
+    """Bytes a recomputed attention keeps for backward beyond its own-row tensors.
+
+    A size-only mirror of ``_forward_stage_records`` with ``record_for_backward``
+    and of ``_run_stage_attention``; keep the three in step. Every stage that
+    runs keeps the Q/K/V flex consumed: a padded copy when the execution length
+    differs, else a contiguous copy of the permuted ``q_flat``/``k_flat`` view;
+    partial-range gathers and remote fetch buffers are kept as the stage's
+    inputs. It keeps flex's output and LSE at the execution length, and
+    logical-length copies of them when padded. Every producing stage after the
+    first keeps a merge-tape clone of the accumulators. Accumulators themselves
+    are transient.
+    """
+    own = int(rank_plan.local_valid_lengths[0]) if rank_plan.local_valid_lengths else 0
+    accum_size = 4 if element_size < 4 else element_size
+    q_row = q_heads * head_dim * element_size
+    k_row = kv_heads * head_dim * element_size
+    v_row = kv_heads * value_head_dim * element_size
+    out_row = q_heads * value_head_dim * element_size
+    lse_row = q_heads * 4
+    tape_row = q_heads * (value_head_dim + 1) * accum_size
+    total = 0
+    local_produced = False
+    tapes: list[int] = []
+    for stage in _ordered_stage_plans(rank_plan.stage_plans):
+        if not (stage.q_len > 0 and stage.k_len > 0 and stage.slices):
+            continue
+        q_len = _logical_stage_q_len(stage)
+        k_len = _logical_stage_k_len(stage)
+        q_pad, k_pad, _family = select_sparse_execution_family(
+            is_local_stage=bool(stage.is_local_stage),
+            q_len=int(stage.q_len),
+            k_len=int(stage.k_len),
+            block_size=block_size,
+        )
+        q_full = _ranges_cover_full_length(stage.owner_local_q_ranges, length=own)
+        # Queries: the full range is a permuted view of q_flat; a partial range
+        # is gathered into a contiguous tensor kept as the stage's input.
+        if not q_full:
+            total += q_row * q_len
+        if q_pad != q_len:
+            total += q_row * q_pad
+        elif q_full and q_heads > 1:
+            total += q_row * q_len
+        # Keys and values: local ranges as for queries; remote ones land in
+        # contiguous head-major fetch buffers kept as the stage's inputs.
+        k_full = bool(stage.is_local_stage) and _ranges_cover_full_length(
+            stage.owner_local_k_ranges, length=own
+        )
+        if not k_full:
+            total += (k_row + v_row) * k_len
+        if k_pad != k_len:
+            total += (k_row + v_row) * k_pad
+        elif k_full and kv_heads > 1:
+            total += (k_row + v_row) * k_len
+        total += (out_row + lse_row) * q_pad
+        if q_pad != q_len:
+            total += (out_row + lse_row) * q_len
+        tape = tape_row * (own if q_full else q_len)
+        if stage.is_local_stage:
+            local_produced = True
+        else:
+            tapes.append(tape)
+    # The first producing stage records no tape: the local stage when it ran,
+    # else whichever remote stage is ready first, so drop the smallest tape.
+    if tapes and not local_produced:
+        tapes.remove(min(tapes))
+    return total + sum(tapes)
 
 
 def _forward_stage_records(
