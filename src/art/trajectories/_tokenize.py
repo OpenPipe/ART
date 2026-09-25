@@ -59,6 +59,7 @@ from . import (
 )
 from ._history import _model_matches
 from ._protocols import Exchange
+from ._render_cache import _render_context_key, cacheable_chat_template
 
 _TOKEN_ID = re.compile(r"token_id:(\d+)$")
 _WARNED_PREFIX_RETOKENIZATION = False
@@ -90,6 +91,73 @@ class _ChatRender(Protocol):
         *,
         add_generation_prompt: bool,
     ) -> str: ...
+
+
+class _PrefixChatRenderCache:
+    """Reuse exact baseline prefixes within one history's rendering context.
+
+    Probes still locate every assistant span. Equal completed text does not prove
+    equal generation prompts, so changed prefixes never reuse baseline renders.
+    Keep one baseline plus bounded prefix deltas, not quadratic rendered strings.
+    """
+
+    _MAX_BYTES = 8 * 1024 * 1024
+    _MAX_ENTRIES = 1024
+
+    def __init__(self, render: _ChatRender) -> None:
+        self.render = render
+        self.context: tuple[object, ...] | None = None
+        self.settings: object = None
+        self.text = ""
+        self.prefixes: dict[tuple[int, bool], tuple[int, str]] = {}
+        self.bytes = 0
+
+    def for_messages(
+        self, messages: list[dict[str, Any]], text: str, *, settings: object = None
+    ) -> _ChatRender:
+        try:
+            context = tuple(_render_context_key(message) for message in messages)
+        except (TypeError, RecursionError):
+            return self.render
+        if self.context is None or settings != self.settings:
+            self.context, self.text = context, text
+            self.settings = settings
+            self.prefixes.clear()
+            self.bytes = 0
+        common = 0
+        for original, current in zip(self.context, context):
+            if original != current:
+                break
+            common += 1
+
+        def render(
+            selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+        ) -> str:
+            count = len(selected_messages)
+            if count > common or any(
+                original is not current
+                for original, current in zip(messages, selected_messages)
+            ):
+                return self.render(
+                    selected_messages, add_generation_prompt=add_generation_prompt
+                )
+            key = count, add_generation_prompt
+            if key in self.prefixes:
+                prefix, tail = self.prefixes[key]
+                return self.text[:prefix] + tail
+            value = self.render(
+                selected_messages, add_generation_prompt=add_generation_prompt
+            )
+            if len(self.prefixes) < self._MAX_ENTRIES:
+                prefix = _common_prefix_length(self.text, value)
+                tail = value[prefix:]
+                size = 256 + 4 * len(tail)
+                if self.bytes + size <= self._MAX_BYTES:
+                    self.prefixes[key] = prefix, tail
+                    self.bytes += size
+            return value
+
+        return render
 
 
 class _TokenChatRender(Protocol):
@@ -4530,13 +4598,11 @@ def _tokenize_chat_view(
             )
         )
 
-    def render_text(
+    def render_normalized_text(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> str:
         value = resolved_tokenizer.apply_chat_template(
-            normalize_tool_call_arguments_for_chat_template(
-                selected_messages, template
-            ),
+            selected_messages,
             tools=history.tools,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
@@ -4547,17 +4613,53 @@ def _tokenize_chat_view(
             raise TypeError("Chat template did not render text")
         return value
 
+    def render_text(
+        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ) -> str:
+        return render_normalized_text(
+            normalize_tool_call_arguments_for_chat_template(
+                selected_messages, template
+            ),
+            add_generation_prompt=add_generation_prompt,
+        )
+
+    prefix_render_cache = _PrefixChatRenderCache(render_normalized_text)
+
     def segmented_render(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> tuple[list[int], list[bool]]:
         try:
-            text = render_text(
-                selected_messages, add_generation_prompt=add_generation_prompt
-            )
+            if cacheable_chat_template(
+                resolved_tokenizer, template, history.tools, kwargs, selected_messages
+            ):
+                # Normalization is message-local. Only the admitted nonmutating
+                # renderer may share its normalized messages between prefixes.
+                selected_messages = normalize_tool_call_arguments_for_chat_template(
+                    selected_messages, template
+                )
+                text = render_normalized_text(
+                    selected_messages, add_generation_prompt=add_generation_prompt
+                )
+                span_render = prefix_render_cache.for_messages(
+                    selected_messages,
+                    text,
+                    settings=_render_context_key(
+                        [
+                            history.tools,
+                            kwargs,
+                            getattr(resolved_tokenizer, "special_tokens_map"),
+                        ]
+                    ),
+                )
+            else:
+                text = render_text(
+                    selected_messages, add_generation_prompt=add_generation_prompt
+                )
+                span_render = render_text
             spans = _assistant_char_spans(
                 selected_messages,
                 text,
-                render_text,
+                span_render,
                 add_generation_prompt=add_generation_prompt,
             )
         except (TypeError, KeyError):
