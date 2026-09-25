@@ -1,6 +1,7 @@
 """CPU contracts for one known MoE component, not a whole-model memory bound."""
 
 from dataclasses import replace
+import math
 from types import SimpleNamespace
 from typing import Any, cast
 import weakref
@@ -11,6 +12,7 @@ import torch
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
+    _ep_routed_row_allowance,
     _MemoryProfile,
     _MemorySignature,
     _moe_output_bytes_per_token,
@@ -203,20 +205,33 @@ def _hybridep(layer, ep: int, manager: str = "hybridep"):
     return layer
 
 
-@pytest.mark.parametrize("ep", [2, 4])
-def test_hybridep_prices_routed_rows_with_imbalance_allowance(layer, ep):
+@pytest.mark.parametrize("ep,allowance", [(2, 1.4), (4, 1.6), (8, 2.0), (16, 2.4)])
+def test_hybridep_prices_routed_rows_with_imbalance_allowance(layer, ep, allowance):
     # HybridEP gives each rank the pairs routed to its local experts: balanced
-    # routing matches EP1's top-k rows per local token, with a 1.5x allowance.
+    # routing matches EP1's top-k rows per local token, scaled by the measured
+    # EP-dependent worst-layer imbalance (log2 growth beyond EP8).
     single = _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1))
     sharded = ParallelShape(tp=1, cp=ep, ep=ep)
     expert = _moe_output_bytes_per_token([_hybridep(layer, ep)], sharded)
-    # Top-k 8 routed rows per local token become 12; no shared experts here.
-    assert single > 0 and expert == single // 8 * 12
+    # Top-k 8 routed rows per local token become 8 x allowance; no shared
+    # experts here.
+    assert _ep_routed_row_allowance(ep) == pytest.approx(allowance)
+    assert single > 0 and expert == math.ceil(single * allowance)
+
+
+def test_unmeasured_ep_sizes_use_the_next_measured_allowance():
+    assert _ep_routed_row_allowance(1) == 1.0
+    assert _ep_routed_row_allowance(3) == _ep_routed_row_allowance(4) == 1.6
+    assert _ep_routed_row_allowance(6) == 2.0
+    # Never above every pair on one rank.
+    assert _ep_routed_row_allowance(1024) <= 1024
 
 
 def test_hybridep_keeps_the_enclosing_fc1_stage(layer):
-    # The FC1 inputs and gate/up sum stay live at the FC2 sum under HybridEP
-    # too; EP1's two dispatched H-wide inputs over-count HybridEP's one.
+    # The FC1 input and gate/up sum stay live at the FC2 sum under HybridEP
+    # too. The EP1 all-to-all path holds two routed H-wide inputs (its
+    # permuted rows and their expert-sorted copy); HybridEP permutes while
+    # dispatching and holds one, as Qwen3.6 CP2 allocator traces show.
     single = _moe_output_bytes_per_token(
         [_enclosing_moe(layer)], ParallelShape(tp=1, cp=1)
     )
@@ -224,7 +239,7 @@ def test_hybridep_keeps_the_enclosing_fc1_stage(layer):
     expert.token_dispatcher.num_local_experts = 128
     sharded = _moe_output_bytes_per_token([expert], ParallelShape(tp=1, cp=2, ep=2))
     assert single == 8 * (512 + 3 * 2048 + 2 * 2048 + 1024) * 2
-    assert sharded == single // 8 * 12
+    assert sharded == math.ceil(8 * 1.4 * (512 + 3 * 2048 + 2048 + 1024) * 2)
 
 
 @pytest.mark.parametrize(
@@ -589,7 +604,9 @@ def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
     # Growth enters the forward and checkpoint peaks, not forward retention.
     rank._update_memory_profile(plan, 10**9, retained_bytes=10**8)
     monkeypatch.setattr(
-        rank, "_checkpoint_memory_floor", lambda rows, refs=None: (10**7, 10**6)
+        rank,
+        "_checkpoint_memory_floor",
+        lambda rows, refs=None, routed=None: (10**7, 10**6),
     )
     grown = rank._plan_cost(plan)
     monkeypatch.setattr(rank, "_plan_hybridep_growth_bytes", lambda plan: 0)
@@ -606,6 +623,92 @@ def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
     rank.runtime.provider.expert_model_parallel_size = 1
     monkeypatch.undo()
     assert rank._plan_hybridep_growth_bytes(plan) == 0
+
+
+def test_converted_stages_follow_routed_rows_and_shared_stays_local():
+    rank = _rank()
+    rank._moe_output_bytes_per_token = 1000
+    rank._moe_forward_stages = ((1200, 50),)
+    rank._moe_forward_shared_bytes = 100
+    assert rank._moe_workspace_bytes(10) == 10 * 1200 + 50
+    assert rank._moe_workspace_bytes(10, routed_rows=6) == 6 * 1200 + 50 + 4 * 100
+    assert rank._moe_workspace_bytes(10, routed_rows=0) == 50 + 10 * 100
+
+
+def test_ep_group_must_be_exactly_the_cp_group(monkeypatch):
+    ps = pytest.importorskip("megatron.core.parallel_state")
+    from art.trainer_rank import _impl
+
+    shape = ParallelShape(tp=1, cp=2, ep=2)
+    for other in (
+        replace(shape, ep=1),
+        replace(shape, ep=4),
+        replace(shape, tp=2),
+        replace(shape, etp=2),
+    ):
+        assert not _impl._ep_group_is_cp_group(other)
+    # Without initialized process groups there is nothing to compare.
+    assert not _impl._ep_group_is_cp_group(shape)
+    monkeypatch.setattr(_impl.dist, "is_initialized", lambda: True)
+    expert, context = object(), object()
+    ranks = {id(expert): [0, 1], id(context): [1, 0]}
+    monkeypatch.setattr(ps, "get_expert_model_parallel_group", lambda **_: expert)
+    monkeypatch.setattr(ps, "get_context_parallel_group", lambda **_: context)
+    monkeypatch.setattr(_impl.dist, "get_process_group_ranks", lambda g: ranks[id(g)])
+    assert _impl._ep_group_is_cp_group(shape)
+    # EP spanning ranks outside this CP group sees other batches' rows.
+    ranks[id(context)] = [0, 2]
+    assert not _impl._ep_group_is_cp_group(shape)
+    monkeypatch.setattr(ps, "get_context_parallel_group", lambda **_: None)
+    assert not _impl._ep_group_is_cp_group(shape)
+
+
+def test_routed_rows_use_the_cp_group_share_only_when_it_is_the_ep_group(
+    monkeypatch,
+):
+    rank = _rank()
+    plan = rank._plan_flat_forward(
+        [ForwardInput(input_tokens=torch.arange(64), target_tokens=torch.arange(64))]
+    )
+    assert rank._plan_group_routed_rows(plan) == (64,)
+    plan = replace(plan, signature=replace(plan.signature, topology=(1, 1, 2, 1)))
+    monkeypatch.setattr(rank, "_topology", lambda: SimpleNamespace(tp=1, cp=2))
+    monkeypatch.setattr(rank, "_plan_group_rows", lambda plan: ((52480, True),))
+    totals = [96794]
+    monkeypatch.setattr(
+        rank, "_cp_group_model_tokens", lambda batch, topology: totals[0]
+    )
+    assert rank._plan_group_routed_rows(plan) == (52480,)
+    rank._ep_group_is_cp_group = True
+    assert rank._plan_group_routed_rows(plan) == (48397,)
+    totals[0] = 10**6
+    assert rank._plan_group_routed_rows(plan) == (52480,)
+
+
+def test_cp_group_total_is_its_larger_layout(monkeypatch):
+    runtime = pytest.importorskip("art.megatron.context_parallel.runtime")
+    bundle = SimpleNamespace(
+        token_layout_index=SimpleNamespace(token_counts_by_rank=(52480, 44314))
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_get_or_build_planning_bundle",
+        lambda **_: ("key", bundle, None, None),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_plan_gdn_global_execution",
+        lambda **_: SimpleNamespace(gdn_token_counts_by_rank=(48100, 48800)),
+    )
+    values: dict[str, Any] = dict(
+        group_ids=None, parent_ids=None, topology=None, config=None, original_seq_len=0
+    )
+    total = runtime.context_parallel_model_token_total
+    assert total(**values, build_gdn_execution_spec=False) == 96794
+    assert total(**values, build_gdn_execution_spec=True) == 96900
+    # An empty rank still dispatches, and routes, one padding row.
+    bundle.token_layout_index.token_counts_by_rank = (2, 0)
+    assert total(**values, build_gdn_execution_spec=False) == 3
 
 
 def test_split_charges_the_largest_hybridep_growth_beside_any_child_peak():

@@ -1,5 +1,6 @@
 """One supported shared return held across routed compute; not all backward saves."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -106,6 +107,9 @@ def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
     assert rank._moe_output_bytes_per_token == 192512
     checkpoint_coefficient = 196608 if gate else 192512
     assert rank._moe_checkpoint_grad_bytes_per_token == checkpoint_coefficient
+    # The shared return is the part that stays on local rows under HybridEP.
+    assert rank._moe_forward_shared_bytes == 4096
+    assert rank._moe_gradient_shared_bytes == (8192 if gate else 4096)
     shapes = g.model_shapes(rank)
     assert shapes is not None and shapes[1][0].moe_bytes_per_row == 192512
     requests = full_requests(no_grad)
@@ -126,7 +130,8 @@ def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
             8296857600,
             50640 * (checkpoint_coefficient + 128) + 3157761952,
         )
-        assert rank._plan_cost(plan).required == (32685829827 if gate else 32457666243)
+        # The incoming gradient replaces one gradient per boundary.
+        assert rank._plan_cost(plan).required == (23787450051 if gate else 23559286467)
     selected = rank._select_next_micro_batch(requests, 0)
     assert (
         selected.check.estimated_required_bytes
@@ -147,7 +152,7 @@ def test_original_norm_installation_preserves_shared_return(layer, gated):
         8296857600,
         50640 * (checkpoint_coefficient + 128) + 3157761952,
     )
-    expected = 32685829827 if gated else 32457666243
+    expected = 23787450051 if gated else 23559286467
     assert rank._memory_check(plan).estimated_required_bytes == expected
     assert rank._plan_cost(plan).required == expected
 
@@ -305,14 +310,18 @@ def test_pre_gate_cache_precedes_owned_dispatcher_and_is_checkpoint_only(layer):
     )  # Installed dispatcher partials must not be repriced.
     assert rank._moe_checkpoint_grad_bytes_per_token == 196608
     groups = ((19, True), (23, False))
+    # Gradient rows also keep the recomputed layer's residual and norm rows and
+    # its MoE routing state; the first call allocates TE's cuBLAS workspaces.
+    beside = 2 * 2048 * 2 + rank._moe_checkpoint_state_bytes_per_token()
     assert rank._checkpoint_memory_floor(groups) == (
         19 * 40 * 4096,
         max(
-            19 * (196608 + 128),
+            19 * (196608 + 128 + beside),
             23 * (192512 + 4 * 2048 * 2),
-            19 * (196608 - 32768 + 128) + 10485760,
+            19 * (196608 - 32768 + 128 + beside) + 10485760,
             23 * (192512 - 32768 + 128 + 4 * 2048 * 2) + 10485760,
-        ),
+        )
+        + rank._te_workspace_growth_bytes(),
     )
     for mode in (None, "selective"):
         rank.runtime.model[0].decoder.config.recompute_granularity = mode
@@ -340,7 +349,7 @@ def test_pre_gate_mixed_reference_and_exact_cost_mode_selection(layer, gradient_
     )
     assert rank._checkpoint_memory_floor(rank._plan_group_rows(mixed)) == (
         67 * 40 * 4096,
-        4096 * (192512 + 4 * 2048 * 2),
+        4096 * (192512 + 4 * 2048 * 2) + rank._te_workspace_growth_bytes(),
     )
     # A reference-only path must not read or validate the unused gradient cache.
     rank._moe_checkpoint_grad_bytes_per_token = None
@@ -410,11 +419,17 @@ def test_shared_return_escapes_the_ep_routed_allowance(layer, checkpoint_grad, s
     layer.config.context_parallel_size = layer.config.expert_model_parallel_size = 2
     # EP2 halves the experts each rank owns.
     _hybridep(layer, 2).token_dispatcher.num_local_experts = local_experts // 2
-    # HybridEP's 1.5x allowance turns top-k 8 into 12 routed rows; the gated
-    # shared return (doubled for checkpoint backward) is per local token.
+    # HybridEP's EP2 allowance (1.4) turns top-k 8 into 11.2 routed rows, each
+    # with one dispatched H-wide input; the gated shared return (doubled for
+    # checkpoint backward) is per local token.
+    collected: list[int] = []
     assert (
         _moe_output_bytes_per_token(
-            [layer], ParallelShape(tp=1, cp=2, ep=2), checkpoint_grad=checkpoint_grad
+            [layer],
+            ParallelShape(tp=1, cp=2, ep=2),
+            checkpoint_grad=checkpoint_grad,
+            shared_bytes=collected,
         )
-        == 12 * 11776 * 2 + shared
+        == math.ceil(8 * 1.4 * 9728 * 2) + shared
     )
+    assert collected == [shared]

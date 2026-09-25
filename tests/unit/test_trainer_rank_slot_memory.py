@@ -245,3 +245,19 @@ def test_generic_signature_needs_neither_megatron_nor_module_walk(monkeypatch, k
 
     monkeypatch.setattr(builtins, "__import__", guarded)
     assert rank._slot_memory_shapes(ref) == ()
+
+
+def test_partial_slot_with_unpriced_fc1_stages_keeps_boundary_gradients(layer):
+    # A slot with FC1 adapters but no FC2 adapter still prices FC2 rows from the
+    # original metadata, but its FC1 converted weights go unpriced: keep one
+    # gradient per boundary for it.
+    rank, _ = rank_with_moe(weights(layer, 8))
+    ref = load_slot(rank, "partial", 8)
+    groups = ((100, True),)
+    assert rank._moe_recompute_covered_for(ref)
+    assert rank._checkpoint_input_gradient_bytes(groups, (ref,)) == 100 * 2048 * 2
+    del layer.experts.linear_fc2.lora._slot_keys[ref]
+    assert rank._moe_workspace_bytes(1, checkpoint_grad=True, slot_ref=ref) > 0
+    assert not rank._moe_recompute_covered_for(ref)
+    assert rank._checkpoint_input_gradient_bytes(groups, (ref,)) == 100 * 40 * 4096
+    assert rank._checkpoint_input_gradient_bytes(groups) == 100 * 2048 * 2

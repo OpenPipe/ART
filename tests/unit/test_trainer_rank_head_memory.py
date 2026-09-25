@@ -143,7 +143,7 @@ def test_outputs_retention_and_empirical_peak_are_counted_once():
     r = rank()
     plan = r._plan_flat_forward([request(grad=True)])
     retained = 512 * 40 * 2048 * 2
-    gradient = 512 * 40 * 2048 * 2
+    gradient = 512 * 2048 * 2  # The incoming gradient beside the MoE stage.
     head = 3 * 512 * 248320 * 2
     cost = r._plan_cost(plan)
     assert cost.retained == int((plan.output_bytes + retained + head) * 1.1)
@@ -308,9 +308,11 @@ def test_tied_standard_head_weight_uses_the_same_capacity():
 @pytest.mark.parametrize("rows", [128, 512])
 def test_target_backward_refuses_budget_below_logits_and_both_gradients(rows):
     r = rank()
+    # Isolate the head term from TE's one-time cuBLAS workspace growth.
+    r._te_workspace_growth_bytes = lambda: 0
     plan = r._plan_flat_forward([request(rows, grad=True)])
     retained, _ = r._checkpoint_memory_floor(r._plan_group_rows(plan))
-    gradient = rows * 40 * 2048 * 2
+    gradient = rows * 2048 * 2
     dense = min(rows, 512) * 248320 * 2
     before = int((plan.output_bytes + retained + gradient + 2 * dense) * 1.1)
     expected = int((plan.output_bytes + retained + gradient + 3 * dense) * 1.1)

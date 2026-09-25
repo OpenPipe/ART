@@ -21,7 +21,7 @@ def module(cls):
     return obj
 
 
-def rank_with_moe(moe_layer, *, install_hooks=False):
+def rank_with_moe(moe_layer, *, install_hooks=False, stand_in=True):
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet
     from megatron.core.transformer.transformer_block import TransformerBlock
     from transformer_engine.pytorch import RMSNorm
@@ -96,6 +96,10 @@ def rank_with_moe(moe_layer, *, install_hooks=False):
         )
     )
     r._dp_rank_and_size = lambda: (0, 1)  # Uninitialized MCore has no CPU DP group.
+    if stand_in:
+        # The one MoE layer stands in for all 40 of Qwen3.6-35B-A3B's: recompute
+        # is covered if that layer prices its FC1 stage too.
+        r._moe_recompute_covered = r._moe_gradient_enclosed == (True,)
     return r, gd
 
 
@@ -133,7 +137,7 @@ def test_actual_constructor_cache_and_full_plan(pending_rank):
     assert (
         rank._memory_check(plan).estimated_required_bytes
         == rank._plan_cost(plan).required
-        == 32229502659
+        == 23331122883
     )
     selected = rank._select_next_micro_batch(requests, 0)
     assert (
@@ -154,7 +158,7 @@ def test_exact_pending_demand_survives_recovery(monkeypatch, pending_rank, fits_
     plan = pending_rank._plan_flat_forward(requests)
     assert pending_rank._estimate_flat_forward(requests) is None
     assert g.plan_floor(pending_rank, plan) == (8296857600, 12705630112)
-    assert pending_rank._memory_check(plan).estimated_required_bytes == 32229502659
+    assert pending_rank._memory_check(plan).estimated_required_bytes == 23331122883
     _check_component_demand_recovery(
         monkeypatch, pending_rank, requests, fits_after=fits_after
     )
@@ -172,8 +176,8 @@ def test_original_installed_norm_preserves_pending_floor(layer):
     assert g.model_shapes(rank) is not None
     plan = rank._plan_flat_forward(full_requests())
     assert g.plan_floor(rank, plan) == (8296857600, 12705630112)
-    assert rank._memory_check(plan).estimated_required_bytes == 32229502659
-    assert rank._plan_cost(plan).required == 32229502659
+    assert rank._memory_check(plan).estimated_required_bytes == 23331122883
+    assert rank._plan_cost(plan).required == 23331122883
     assert rank._estimate_flat_forward(full_requests()) is None
     for requests in ([], full_requests(no_grad=True)):
         assert g.plan_floor(rank, rank._plan_flat_forward(requests)) == (0, 0)
@@ -340,9 +344,11 @@ def test_constructor_declined_moe_keeps_generic_admission(layer, unsupported):
     plan = rank._plan_flat_forward(requests)
     assert g.plan_floor(rank, plan) == (0, 0)
     required = rank._plan_cost(plan).required
-    # Generic checkpoint-input accounting still applies without a MoE component.
+    # Generic checkpoint accounting, including the recomputed layer's mixer,
+    # still applies without a MoE component.
     gradient = 50640 * 40 * 2048 * 2
-    assert required == int((plan.output_bytes + 2 * gradient) * 1.1)
+    mixer = 50640 * rank._recomputed_mixer_bytes_per_token()
+    assert required == int((plan.output_bytes + 2 * gradient + mixer) * 1.1)
     rank._available_memory_bytes = lambda: required - 1
     assert not rank._memory_check(plan).fits
     rank._available_memory_bytes = lambda: required

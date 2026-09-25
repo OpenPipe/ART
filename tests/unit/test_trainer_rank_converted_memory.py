@@ -1,16 +1,21 @@
 """Source-derived affine routed-expert stages; no complete backward/compiled bound."""
 
+import math
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from test_trainer_rank_moe_memory import _enclosing_moe, _rank
+from test_trainer_rank_moe_memory import _enclosing_moe, _hybridep, _rank
 from test_trainer_rank_moe_memory import layer as layer
 from test_trainer_rank_pending_memory import module, rank_with_moe
 import torch
 
 from art.trainer_rank import ForwardInput, _gdn_memory
-from art.trainer_rank._impl import _expert_lora_weight_storage
+from art.trainer_rank._impl import (
+    _expert_lora_weight_storage,
+    _moe_output_bytes_per_token,
+)
+from art.trainer_rank._planner_cost import ParallelShape
 
 
 def weights(layer: Any, rank: int, *, fc1: bool = True, dtype=torch.bfloat16):
@@ -96,9 +101,19 @@ def test_actual_plan_cost_and_admission(layer, rank_value, grad, output):
     retained, workspace = rank._checkpoint_memory_floor(rank._plan_group_rows(plan))
     pending = _gdn_memory.plan_floor(rank, plan)
     if grad:
-        assert workspace == expected(8, rank_value, True)
+        # The recomputed layer's mixer, its residual and pre-MLP norm rows and
+        # its MoE routing state stay live beside its MoE stage; the first call
+        # also allocates TE's cuBLAS workspaces.
+        mixer = rank._recomputed_mixer_bytes_per_token()
+        beside = 2 * 2048 * 2 + rank._moe_checkpoint_state_bytes_per_token()
+        assert mixer > 0
+        assert workspace == (
+            expected(8, rank_value, True)
+            + 8 * (mixer + beside)
+            + rank._te_workspace_growth_bytes()
+        )
+        # The GDN pending floor combines with this one by maximum.
         assert pending[0] == retained == 8 * 40 * 2048 * 2
-        assert pending[1] >= workspace
     else:
         assert retained == 0 and pending == (0, 0)
         assert workspace == expected(8, rank_value, False) + 4 * 8 * 2048 * 2
@@ -124,8 +139,15 @@ def test_reference_and_gradient_keep_distinct_stage_modes(layer, order, rank_val
     assert set(groups) == {(3, True), (9, False)}
     retained, workspace = rank._checkpoint_memory_floor(groups)
     assert retained == 3 * 40 * 2048 * 2
-    assert workspace == max(
-        expected(3, rank_value, True), expected(9, rank_value, False) + 4 * 9 * 2048 * 2
+    beside = 2 * 2048 * 2 + rank._moe_checkpoint_state_bytes_per_token()
+    assert (
+        workspace
+        == max(
+            expected(3, rank_value, True)
+            + 3 * (rank._recomputed_mixer_bytes_per_token() + beside),
+            expected(9, rank_value, False) + 4 * 9 * 2048 * 2,
+        )
+        + rank._te_workspace_growth_bytes()
     )
     assert (
         rank._memory_check(plan).estimated_required_bytes
@@ -260,6 +282,38 @@ def test_fc1_fixed_weights_do_not_scale_with_topk(layer, topk):
         assert rank._moe_workspace_bytes(rows) == max(
             first_inner, second_inner, original
         )
+
+
+def test_hybridep_fc1_stages_hold_one_dispatched_input(layer):
+    # FC1's converted stages hold the routed H-wide inputs too: two under the
+    # EP1 all-to-all, one under HybridEP, over its EP2 allowance rows.
+    weights(layer, 8)
+    single: list[tuple[int, int]] = []
+    _moe_output_bytes_per_token(
+        [layer],
+        ParallelShape(tp=1, cp=1),
+        checkpoint_grad=True,
+        converted_stages=single,
+    )
+    expert = _hybridep(layer, 2)
+    expert.token_dispatcher.num_local_experts = 128
+    sharded: list[tuple[int, int]] = []
+    _moe_output_bytes_per_token(
+        [expert],
+        ParallelShape(tp=1, cp=2, ep=2),
+        checkpoint_grad=True,
+        converted_stages=sharded,
+    )
+    assert [stage[0] for stage in single[:2]] == [
+        16 * (2 * 2048 + 2 * 1024 + 8),
+        16 * (2 * 2048 + 3 * 1024 + 8),
+    ]
+    # 8 x 1.4 routed rows at EP2, rounded up per stage.
+    assert [stage[0] for stage in sharded[:2]] == [
+        math.ceil(8 * 1.4 * 2 * (2048 + 2 * 1024 + 8)),
+        math.ceil(8 * 1.4 * 2 * (2048 + 3 * 1024 + 8)),
+    ]
+    assert [stage[1] for stage in sharded] == [stage[1] for stage in single]
 
 
 def test_wide_fc1_sum_is_a_separate_stage(layer):

@@ -1,11 +1,20 @@
-"""Partial input-gradient extents: CPU admission math, not peak/overlap proof."""
+"""Input-gradient extents: CPU admission math, not peak/overlap proof.
+
+Where the recomputed MoE stage is priced, the floor charges the one incoming
+gradient live at the last layer's recompute peak; elsewhere it keeps one
+gradient per saved boundary.
+"""
 
 from dataclasses import replace
 
 import pytest
 from test_trainer_rank_checkpoint_memory import price, rank, requests
-from test_trainer_rank_moe_memory import layer  # noqa: F401
-from test_trainer_rank_pending_memory import full_requests, pending_rank  # noqa: F401
+from test_trainer_rank_moe_memory import _enclosing_moe, layer  # noqa: F401
+from test_trainer_rank_pending_memory import (  # noqa: F401
+    full_requests,
+    pending_rank,
+    rank_with_moe,
+)
 import torch
 
 from art.trainer_rank import ForwardInput
@@ -25,25 +34,78 @@ def test_pending_cold_peak_does_not_become_forward_retention(pending_rank):
     r = pending_rank
     plan = r._plan_flat_forward(full_requests())
     cost = r._plan_cost(plan)
-    gradient = 8 * 6330 * 40 * 2048 * 2
+    boundaries = 8 * 6330 * 40 * 2048 * 2
+    gradient = 8 * 6330 * 2048 * 2
     assert cost.checkpoint_input_gradient == gradient
-    # Exact previous cold estimate, including outputs and its one safety factor.
+    # Exact cold estimate, including outputs and its one safety factor.
     assert cost.retained == 23102959299
-    assert cost.required == int((plan.output_bytes + 2 * gradient + 12705630112) * 1.1)
+    assert cost.required == int(
+        (plan.output_bytes + boundaries + gradient + cost.checkpoint_workspace) * 1.1
+    )
     assert r._memory_check(plan).estimated_required_bytes == cost.required
     profile(r, plan)
     warm = r._plan_cost(plan)
-    assert warm.retained == int((plan.output_bytes + gradient) * 1.1)
+    assert warm.retained == int((plan.output_bytes + boundaries) * 1.1)
     assert warm.required == cost.required
 
 
+BOUNDARY_GRADIENTS = 8 * 6330 * 40 * 2048 * 2
+
+
+def test_single_gradient_needs_every_layer_priced(layer):
+    # One MoE layer among 40 dense stand-ins: the floor does not price the dense
+    # layers' recompute, so one gradient per boundary stays.
+    r = rank_with_moe(_enclosing_moe(layer), stand_in=False)[0]
+    assert r._moe_gradient_enclosed == (True,) and not r._moe_recompute_covered
+    plan = r._plan_flat_forward(full_requests())
+    assert r._plan_cost(plan).checkpoint_input_gradient == BOUNDARY_GRADIENTS
+
+
+def test_single_gradient_needs_the_fc1_stage(layer):
+    # Without permute fusion the FC1 stage is not enclosed: a positive FC2-only
+    # coefficient does not cover recompute.
+    moe = _enclosing_moe(layer)
+    moe.config.moe_permute_fusion = False
+    r = rank_with_moe(moe)[0]
+    assert r._checkpoint_moe_bytes_per_token() > 0
+    assert r._moe_gradient_enclosed == (False,) and not r._moe_recompute_covered
+    plan = r._plan_flat_forward(full_requests())
+    assert r._plan_cost(plan).checkpoint_input_gradient == BOUNDARY_GRADIENTS
+
+
+def test_a_slot_that_loses_moe_coverage_keeps_boundary_gradients(
+    pending_rank, monkeypatch
+):
+    from art.megatron.lora import LoRASlotRef
+    from art.trainer_rank import _impl
+
+    r = pending_rank
+    ref = LoRASlotRef(kind="checkpoint", name="policy")
+    groups = ((100, True),)
+    assert r._checkpoint_input_gradient_bytes(groups) == 100 * 2048 * 2
+    monkeypatch.setattr(_impl, "_moe_output_bytes_per_token", lambda *a, **k: 0)
+    assert r._checkpoint_input_gradient_bytes(groups, (ref,)) == 100 * 40 * 4096
+
+    def covered(*args, enclosed, **kwargs):
+        enclosed.extend([True] * len(r._moe_gradient_enclosed))
+        return 1
+
+    monkeypatch.setattr(_impl, "_moe_output_bytes_per_token", covered)
+    assert r._checkpoint_input_gradient_bytes(groups, (ref,)) == 100 * 2048 * 2
+
+
+@pytest.mark.parametrize("moe", [True, False])
 @pytest.mark.parametrize("rows", [1, 67, 1024])
-def test_attention_only_extent_scales_with_gradient_rows(rows):
+def test_attention_only_extent_scales_with_gradient_rows(rows, moe):
     r = rank()
+    if not moe:
+        # Without a priced MoE stage, one gradient per boundary stays: it also
+        # covers the dense MLP and other recompute work the floor omits.
+        r._moe_output_bytes_per_token = r._moe_checkpoint_grad_bytes_per_token = 0
     values = r._estimate_flat_forward(requests(rows, 4096))
     cost = price(r, values)
     assert r._gdn_layers == 0
-    assert cost.checkpoint_input_gradient == rows * 40 * 2048 * 2
+    assert cost.checkpoint_input_gradient == rows * (40 if not moe else 1) * 2048 * 2
     assert cost.required >= int(
         (
             cost.checkpoint_retained
@@ -59,10 +121,11 @@ def test_gradient_is_not_absorbed_by_larger_head_workspace():
     n, out, sig, groups, _head = r._estimate_flat_forward(requests(67, 4096))
     head = 10**10
     cost = price(r, (n, out, sig, groups, head))
-    gradient = 67 * 40 * 2048 * 2
+    boundaries = 67 * 40 * 2048 * 2
+    gradient = 67 * 2048 * 2
     assert cost.checkpoint_workspace == head
-    assert cost.required == int((out + head + 2 * gradient) * 1.1)
-    assert cost.retained == int((out + head + gradient) * 1.1)
+    assert cost.required == int((out + head + boundaries + gradient) * 1.1)
+    assert cost.retained == int((out + head + boundaries) * 1.1)
     r._memory_profiles[sig] = _MemoryProfile(
         bytes_per_token=10**9,
         packed_tokens=n,
@@ -111,11 +174,7 @@ def test_split_sums_all_gradient_children_outside_workspace_max():
         profile(r, child)
     costs = [r._plan_cost(child) for child in children]
     split = _SplitForwardPlan(tuple(children), ((0,), (1,), (2,)), 3)
-    assert [c.checkpoint_input_gradient for c in costs] == [
-        17 * 40 * 4096,
-        29 * 40 * 4096,
-        0,
-    ]
+    assert [c.checkpoint_input_gradient for c in costs] == [17 * 4096, 29 * 4096, 0]
     expected = int(
         (
             sum(c.checkpoint_retained + c.checkpoint_input_gradient for c in costs)
@@ -157,7 +216,7 @@ def test_lower_bound_profile_cliff_preserves_separate_peak_component():
     lower = r._split_chunk_lower_cost(
         req, tuple(q.input_tokens for q in req), checkpoint=Unset
     )
-    assert lower.checkpoint_input_gradient == 128 * 40 * 4096
+    assert lower.checkpoint_input_gradient == 128 * 4096
     assert lower.required <= r._plan_cost(full).required
     assert lower.checkpoint_retained == full.output_bytes + 128 * 40 * 4096
 
