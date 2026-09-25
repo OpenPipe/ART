@@ -193,11 +193,18 @@ def test_topology_revalidated(axis):
 @pytest.mark.parametrize("rows", [(10, True), (11, False)])
 @pytest.mark.parametrize("cp", [2, 4])
 def test_cp_floor_prices_rank_rows(cp, rows):
-    # Callers pass rows on the most loaded CP rank; the per-row floor matches CP1.
+    # Callers pass rows on the most loaded CP rank; the per-row floor matches
+    # CP1, except that CP attention also keeps its stage buffers while a
+    # gradient group recomputes the layer.
     r = rank()
     single = r._checkpoint_memory_floor((rows,))
     r._topology_key = lambda: (1, 1, cp, 1)
-    assert r._checkpoint_memory_floor((rows,)) == single != (0, 0)
+    retained, workspace = r._checkpoint_memory_floor((rows,))
+    assert retained == single[0] and single != (0, 0)
+    count, grad = rows
+    # No attention geometry in this stub: Q and KV widths fall back to hidden.
+    stage = count * 2 * (3 * 2048 + 2 * 2048) if grad else 0
+    assert workspace == single[1] + stage
 
 
 @pytest.mark.parametrize("share", [lambda n: -(-n // 2), lambda n: n * 3 // 4])
@@ -497,3 +504,56 @@ def test_no_grad_enclosure_config_guard(field, value):
     r = rank()
     setattr(r.runtime.model[0].decoder.config, field, value)
     assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)
+
+
+def qwen36_attention(r):
+    # Qwen3.6-35B-A3B attention: 16 heads and 2 query groups of 256, gated.
+    r._geometry = replace(
+        r._geometry, num_attention_heads=16, num_query_groups=2, kv_channels=256
+    )
+    r._attention_output_gate = True
+    return r
+
+
+@pytest.mark.parametrize(
+    "cp,expected",
+    # Traces measured 66 KB per token at CP1 and 94 KB at CP2.
+    [(1, 2 * (2 * 2048 + 7 * 4096 + 3 * 512)), (2, 95232), (4, 95232)],
+)
+def test_recomputed_attention_is_priced_beside_the_moe_stage(cp, expected):
+    r = qwen36_attention(rank())
+    r._topology_key = lambda: (1, 1, cp, 1)
+    assert r._recomputed_mixer_bytes_per_token() == expected
+    moe = r._moe_workspace_bytes(10, checkpoint_grad=True)
+    assert r._checkpoint_memory_floor(((10, True),))[1] == moe + 10 * expected
+
+
+@pytest.mark.parametrize(
+    "cp,gdn_layers,expected",
+    [
+        # Hybrid: GDN (74 KB) is larger at CP1, CP attention (95 KB) at CP2.
+        (1, 30, 73728),
+        (2, 30, 95232),
+        # GDN only: its CP rank-exchange copies add a key and a value row.
+        (1, 40, 73728),
+        (2, 40, 86016),
+    ],
+)
+def test_larger_recomputed_mixer_is_priced(cp, gdn_layers, expected):
+    r = qwen36_attention(rank())
+    r._geometry = replace(
+        r._geometry,
+        gdn_key_heads=16,
+        gdn_key_head_dim=128,
+        gdn_value_heads=32,
+        gdn_value_head_dim=128,
+    )
+    r._gdn_layers = gdn_layers
+    r._topology_key = lambda: (1, 1, cp, 1)
+    assert r._recomputed_mixer_bytes_per_token() == expected
+
+
+def test_no_grad_groups_do_not_recompute_a_mixer():
+    r = qwen36_attention(rank())
+    moe = r._moe_workspace_bytes(10)
+    assert r._checkpoint_memory_floor(((10, False),)) == (0, moe + 4 * 10 * 2048 * 2)

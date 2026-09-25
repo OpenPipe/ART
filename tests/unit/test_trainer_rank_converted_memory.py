@@ -96,7 +96,10 @@ def test_actual_plan_cost_and_admission(layer, rank_value, grad, output):
     retained, workspace = rank._checkpoint_memory_floor(rank._plan_group_rows(plan))
     pending = _gdn_memory.plan_floor(rank, plan)
     if grad:
-        assert workspace == expected(8, rank_value, True)
+        # The recomputed layer's mixer stays live beside its MoE stage.
+        mixer = rank._recomputed_mixer_bytes_per_token()
+        assert mixer > 0
+        assert workspace == expected(8, rank_value, True) + 8 * mixer
         assert pending[0] == retained == 8 * 40 * 2048 * 2
         assert pending[1] >= workspace
     else:
@@ -125,7 +128,8 @@ def test_reference_and_gradient_keep_distinct_stage_modes(layer, order, rank_val
     retained, workspace = rank._checkpoint_memory_floor(groups)
     assert retained == 3 * 40 * 2048 * 2
     assert workspace == max(
-        expected(3, rank_value, True), expected(9, rank_value, False) + 4 * 9 * 2048 * 2
+        expected(3, rank_value, True) + 3 * rank._recomputed_mixer_bytes_per_token(),
+        expected(9, rank_value, False) + 4 * 9 * 2048 * 2,
     )
     assert (
         rank._memory_check(plan).estimated_required_bytes

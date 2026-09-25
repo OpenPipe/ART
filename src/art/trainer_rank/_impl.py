@@ -4024,15 +4024,18 @@ class TrainerRank:
         group_rows: tuple[tuple[int, bool], ...],
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
     ) -> tuple[int, int]:
-        """Conservative saved-boundary charge and one disjoint MoE workspace.
+        """Conservative saved-boundary charge and one recomputed layer's workspace.
 
         Count actual local full/uniform/1 boundaries, including aliases, rather
         than claiming measured distinct storage. Only this call's new groups
         enter the term; already-live graphs remain in the availability baseline.
-        No-grad groups also keep decoder input, current layer input, its MLP
-        residual and norm output across the MoE stage. Count these four row
-        tensors separately from returned outputs, allowing storage aliases.
-        This is not a bound for custom preprocessing, attention, or all backward.
+        The workspace is one MoE stage plus what else is live beside it.
+        Gradient groups recompute the layer, so its attention or GDN mixer
+        keeps its saved activations across the MoE stage. No-grad groups keep
+        decoder input, current layer input, its MLP residual and norm output.
+        Count these four row tensors separately from returned outputs, allowing
+        storage aliases. This is not a bound for custom preprocessing or all of
+        backward.
         """
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
         if not group_rows or len(self.runtime.model) != 1:
@@ -4091,9 +4094,10 @@ class TrainerRank:
         if gradient_rows:
             self._checkpoint_moe_bytes_per_token()
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
+        mixer = self._recomputed_mixer_bytes_per_token() if gradient_rows else 0
         workspace = max(
             self._moe_workspace_bytes(rows, checkpoint_grad=grad, slot_ref=ref)
-            + (0 if grad else 4 * rows * self._hidden_size * 2)
+            + (mixer * rows if grad else 4 * rows * self._hidden_size * 2)
             for (rows, grad), ref in zip(group_rows, refs, strict=True)
         )
         return retained, workspace
@@ -7834,28 +7838,7 @@ class TrainerRank:
             # Gathered LoRA inputs alias norm output without sequence sharding.
             gathered = hidden if sp > 1 else 0
             common = 2 * hidden / sp + gathered
-            attention_width = (
-                geometry.num_attention_heads * geometry.kv_channels or hidden
-            )
-            kv_width = geometry.num_query_groups * geometry.kv_channels or hidden
-            gated = self._attention_output_gate
-            attention = (
-                common + ((7 if gated else 5) * attention_width + 3 * kv_width) / tp
-            )
-            if 0 < geometry.num_query_groups < tp:
-                # SelfAttentionLinearQKVLoRA constructs global QKV before
-                # slicing it when KV groups cannot be partitioned across TP.
-                attention += ((2 if gated else 1) * attention_width + 2 * kv_width) * (
-                    1 - 1 / tp
-                )
-            gdn = (
-                common
-                + (
-                    4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
-                    + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
-                )
-                / tp
-            )
+            attention, gdn = self._mixer_activation_widths()
             ffn_width = geometry.ffn_hidden_size or 4 * hidden
             mlp = common + self._mlp_activation_factor * ffn_width / tp
             if geometry.moe_experts:
@@ -7997,6 +7980,74 @@ class TrainerRank:
             return settings == target and decoder.training is True
 
         return all(active(chunk) for chunk in self.runtime.model)
+
+    def _mixer_activation_widths(self) -> tuple[float, float]:
+        """Saved activations per token of one attention and one GDN layer.
+
+        Elements, not bytes: what a layer's attention or GDN mixer keeps for
+        its backward, including the input norm output (and gathered LoRA
+        inputs under sequence parallelism).
+        """
+        geometry = self._geometry
+        hidden = self._hidden_size
+        tp = max(1, self._topology_key()[1])
+        sp = tp if self._sequence_parallel else 1
+        # Gathered LoRA inputs alias norm output without sequence sharding.
+        gathered = hidden if sp > 1 else 0
+        common = 2 * hidden / sp + gathered
+        attention_width = geometry.num_attention_heads * geometry.kv_channels or hidden
+        kv_width = geometry.num_query_groups * geometry.kv_channels or hidden
+        gated = self._attention_output_gate
+        attention = common + ((7 if gated else 5) * attention_width + 3 * kv_width) / tp
+        if 0 < geometry.num_query_groups < tp:
+            # SelfAttentionLinearQKVLoRA constructs global QKV before
+            # slicing it when KV groups cannot be partitioned across TP.
+            attention += ((2 if gated else 1) * attention_width + 2 * kv_width) * (
+                1 - 1 / tp
+            )
+        gdn = (
+            common
+            + (
+                4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+            )
+            / tp
+        )
+        return attention, gdn
+
+    def _recomputed_mixer_bytes_per_token(self) -> int:
+        """Saved mixer activations of the layer being recomputed, per row.
+
+        Full recompute replays one layer with gradients, and its attention or
+        GDN mixer keeps what its backward needs across that layer's MoE stage.
+        Price the larger mixer the model has, from Qwen3.6-35B-A3B allocator
+        traces on H200 (bytes per local token, at the layer's recompute peak):
+
+        - attention: 66 KB at CP1, the retained width below. CP ranks also
+          keep stage-padded Q/K/V, the stage output and a core-attention copy:
+          94 KB at CP2, priced at 95 KB.
+        - GDN: 75 KB at CP1, fewer tensors than the retained width, priced at
+          74 KB. CP ranks add rank-exchange copies: 84 KB at CP2, priced at
+          86 KB.
+        """
+        geometry = self._geometry
+        hidden = self._hidden_size
+        cp = self._topology_key()[2] > 1
+        widths = []
+        if self._gdn_layers < self._num_layers:
+            attention, _gdn = self._mixer_activation_widths()
+            if cp:
+                q = geometry.num_attention_heads * geometry.kv_channels or hidden
+                kv = geometry.num_query_groups * geometry.kv_channels or hidden
+                attention += 3 * q + 2 * kv
+            widths.append(attention)
+        if self._gdn_layers:
+            key = geometry.gdn_key_heads * geometry.gdn_key_head_dim
+            value = geometry.gdn_value_heads * geometry.gdn_value_head_dim
+            widths.append(
+                2 * hidden + 4 * key + 6 * value + ((key + value) if cp else 0)
+            )
+        return int(max(widths, default=0) * self._param_dtype_size)
 
     def _gdn_segment_layer_bytes(self) -> float:
         """Initial and final fp32 recurrent states plus convolution history."""
