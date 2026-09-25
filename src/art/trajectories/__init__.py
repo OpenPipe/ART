@@ -876,6 +876,20 @@ class Trajectory(_CompactModel):
         chat_template: str | None = None,
         chat_template_kwargs: Mapping[str, object] | None = None,
     ) -> TokenizedTrajectory | TokenizedMultiHistoryTrajectory:
+        """Tokenize histories while retaining their sampled-source evidence.
+
+        A recorded sampled logprob belongs to its complete original token
+        prefix. A known different prefix raises ValueError unless exact-source
+        reconstruction can preserve every sampled source's conditioning.
+        Explicit template/tokenizer overrides and text-equivalent reconciliation
+        do not permit carrying sampled logprobs into different conditioning.
+
+        For divergent captured prompts, use ``multi_history=True`` with the
+        default ``reconcile_text_equivalent_tokenizations=False`` to retain
+        separate authoritative histories. This does not recondition samples or
+        discard their evidence. Missing prompt metadata follows the existing
+        fallback and is not certified aligned by this known-mismatch check.
+        """
         from ._tokenize import tokenize_trajectory
 
         return tokenize_trajectory(

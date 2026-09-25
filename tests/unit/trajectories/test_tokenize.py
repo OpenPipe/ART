@@ -5573,7 +5573,7 @@ def test_responses_previous_response_id_resolves_local_history(
     ).tokens == [10, 20, 11, 30]
 
 
-def test_chat_prefix_retokenization_splits_unless_reconciled(
+def test_chat_prefix_retokenization_splits_and_refuses_sampled_reconciliation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     first = _chat_exchange([1], [101, 102])
@@ -5620,23 +5620,27 @@ def test_chat_prefix_retokenization_splits_unless_reconciled(
         reconcile_text_equivalent_tokenizations=True
     )
 
-    with pytest.warns(UserWarning, match="preserved the original sampled token IDs"):
-        tokenized = history.tokenize(base_model="base/model")
+    # Equal decoded text does not make [101, 102] the conditioning [500]
+    # recorded for the second response's sampled logprob.
+    with (
+        pytest.warns(UserWarning, match="preserved the original sampled token IDs"),
+        pytest.raises(ValueError, match="Exact source prefix mismatch"),
+    ):
+        history.tokenize(base_model="base/model")
+    for value in (trajectory, art.TrajectoryGroup([trajectory])):
+        with pytest.raises(ValueError, match="Exact source prefix mismatch"):
+            value.tokenize(
+                reconcile_text_equivalent_tokenizations=True,
+                base_model="base/model",
+            )
 
-    assert tokenized.tokens == [1, 101, 102, 3, 4]
-    assert tokenized.logprobs[1:3] == [-10.1, -10.2]
-    assert all(tokenized.flags[index] & tr.TokenFlag.EXACT for index in (1, 2, 4))
-
-    direct = trajectory.tokenize(
-        reconcile_text_equivalent_tokenizations=True,
-        base_model="base/model",
-    )
-    grouped = art.TrajectoryGroup([trajectory]).tokenize(
-        reconcile_text_equivalent_tokenizations=True,
-        base_model="base/model",
-    )
-    assert direct.tokens == tokenized.tokens
-    assert grouped.trajectories[0].tokens == tokenized.tokens
+    separate = trajectory.tokenize(multi_history=True, base_model="base/model")
+    assert [history.tokens for history in separate.histories] == [
+        [1, 101, 102],
+        [1, 500, 3, 4],
+    ]
+    assert separate.histories[0].logprobs[1:] == [-10.1, -10.2]
+    assert separate.histories[1].logprobs[-1] == -0.4
 
 
 @pytest.mark.parametrize("length_changing_prompt", (False, True))
@@ -7139,7 +7143,7 @@ def test_rerender_does_not_duplicate_sampled_trailing_eos() -> None:
     assert tokenized.logprobs[-2:] == [-0.7, -0.2]
 
 
-def test_chat_view_preserves_initial_prompt_and_ignores_later_disagreement() -> None:
+def test_chat_view_refuses_later_sampled_prompt_disagreement() -> None:
     first = _chat_exchange([1], [2])
     second = _chat_exchange([9, 8, 7], [3], offset=1)
     trajectory = art.Trajectory(
@@ -7162,9 +7166,15 @@ def test_chat_view_preserves_initial_prompt_and_ignores_later_disagreement() -> 
     history = trajectory.chat_completions_history(
         reconcile_text_equivalent_tokenizations=True
     )
-    tokenized = history.tokenize(tokenizer=Tokenizer())
+    with pytest.raises(ValueError, match="Exact source prefix mismatch"):
+        history.tokenize(tokenizer=Tokenizer())
 
-    assert tokenized.tokens == [1, 2, 7, 3]
+    separate = trajectory.tokenize(multi_history=True, tokenizer=Tokenizer())
+    assert [history.tokens for history in separate.histories] == [
+        [1, 2],
+        [9, 8, 7, 3],
+    ]
+    assert [history.logprobs[-1] for history in separate.histories] == [-0.2, -0.3]
 
 
 def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> None:
@@ -8402,7 +8412,7 @@ def test_reasoning_split_trajectory_reuses_prevalidated_projections(
     assert calls == 0
 
 
-def test_explicit_template_override_rerenders_exact_exchange_scaffold() -> None:
+def test_explicit_template_override_refuses_changed_sampled_conditioning() -> None:
     trajectory = art.Trajectory(
         exchanges=TrajectoryExchanges(chat_completions=[_chat_exchange([1], [2])])
     )
@@ -8429,13 +8439,13 @@ def test_explicit_template_override_rerenders_exact_exchange_scaffold() -> None:
             assert add_generation_prompt
             return [10]
 
-    tokenized = trajectory.tokenize(
-        tokenizer=Tokenizer(),
-        chat_template="custom",
-    )
+    # The override would attach the logprob sampled after [1] to prefix [10].
+    with pytest.raises(ValueError, match="Exact source prefix mismatch"):
+        trajectory.tokenize(tokenizer=Tokenizer(), chat_template="custom")
 
-    assert tokenized.tokens == [10, 2, 30]
-    assert tokenized.logprobs[1] == -0.2
+    original = trajectory.tokenize(tokenizer=Tokenizer())
+    assert original.tokens == [1, 2]
+    assert original.logprobs[1] == -0.2
 
 
 def test_responses_external_context_requires_or_uses_exact_prompt_tokens() -> None:
