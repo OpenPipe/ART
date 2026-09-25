@@ -180,11 +180,16 @@ Only missing, proved STOP flags are added, on copies. Tokens, logprobs, other
 flags, history order and original objects remain unchanged. `model` selects
 histories using the same selector as ordinary tokenization. An optional
 `base_model` must agree with each selected model's resolved configuration; it
-cannot substitute a different STOP authority.
+cannot substitute a different STOP authority. The recorded model must resolve to
+a loadable tokenizer model ID or an artifact containing its tokenizer
+configuration. A served alias without that configuration is unsupported; passing
+a different `base_model` does not supply authority.
 
 Incomplete native evidence, changed conditioning, unsupported sampled protocols,
 and extra or incorrect STOP flags raise an error, even if ordinary tokenization
-succeeded. Nonsampled histories are retained. This API does not recover failed
+succeeded. Missing or null logprob carriers are not recorded NaNs; explicitly
+recorded raw NaNs remain valid evidence. Unsupported finish reasons such as
+`content_filter` are not certified as an absence of STOP. Nonsampled histories are retained. This API does not recover failed
 rendering, split or join histories, or establish SFT equivalence.
 
 Generic `art.tokenize` remains unchanged: a native-only path can avoid loading a

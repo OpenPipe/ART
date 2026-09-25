@@ -265,7 +265,7 @@ def test_incomplete_or_inconsistent_native_proof_refuses(
         h.history.messages[-1]["content"] = "edited"
     elif bad == "unsupported":
         h.history = tr.LegacyHistory(messages_and_choices=[])
-    with pytest.raises((ValueError, AssertionError)):
+    with pytest.raises(ValueError):
         _sampled.reconcile_sampled_stops(old, base_model=None)
 
 
@@ -390,3 +390,276 @@ async def test_public_process_dispatch_carries_optin_and_rebinds_sources(
         assert message_source is not None
         assert message_source.exchange is source.exchanges.chat_completions[0]
         assert value.histories[0].flags[-1] & tr.TokenFlag.STOP
+
+
+@pytest.mark.parametrize(
+    "carrier", ["absent", "null", "empty", "packed_null", "packed_null_with_raw"]
+)
+async def test_missing_recorded_logprobs_refuse_public_certification(
+    monkeypatch: pytest.MonkeyPatch, authority: list, carrier: str
+) -> None:
+    from art.preprocessing.dynamo_tokens import COMPLETION_LOGPROBS_KEY
+
+    source = trajectory()
+    choice = source.exchanges.chat_completions[0].response.choices[0]
+    if carrier == "absent":
+        choice = type(choice).model_validate(choice.model_dump(exclude={"logprobs"}))
+        source.exchanges.chat_completions[0].response.choices[0] = choice
+    elif carrier == "empty":
+        assert choice.logprobs is not None
+        choice.logprobs.content = []
+    elif carrier != "packed_null_with_raw":
+        choice.logprobs = None
+    if carrier.startswith("packed_null"):
+        assert choice.model_extra is not None
+        choice.model_extra[COMPLETION_LOGPROBS_KEY] = None
+    before = pickle.dumps(source)
+    returned = []
+    original = tr.Trajectory.tokenize
+
+    def observe(self: tr.Trajectory, **kwargs: Any) -> Any:
+        value = original(self, **kwargs)
+        returned.append(value)
+        return value
+
+    monkeypatch.setattr(tr.Trajectory, "tokenize", observe)
+    with pytest.raises(ValueError, match="recorded logprobs"):
+        await art.tokenize_sampled([source])
+    assert len(returned) == 1  # Real generic exact-token path completed first.
+    assert all(math.isnan(lp) for lp in returned[0].histories[0].logprobs[1:])
+    assert authority == []  # Reject missing evidence before loading STOP authority.
+    assert pickle.dumps(source) == before
+    assert not any(flag & tr.TokenFlag.STOP for flag in returned[0].histories[0].flags)
+
+
+async def test_unsupported_finish_refuses_public_certification(
+    monkeypatch: pytest.MonkeyPatch, authority: list
+) -> None:
+    source = trajectory(finish="content_filter")
+    before = pickle.dumps(source)
+    returned = []
+    original = tr.Trajectory.tokenize
+
+    def observe(self: tr.Trajectory, **kwargs: Any) -> Any:
+        value = original(self, **kwargs)
+        returned.append(value)
+        return value
+
+    monkeypatch.setattr(tr.Trajectory, "tokenize", observe)
+    with pytest.raises(ValueError, match="supported STOP evidence"):
+        await art.tokenize_sampled([source])
+    assert len(returned) == 1
+    assert returned[0].histories[0].tokens == [1, 8, 9]
+    assert returned[0].histories[0].logprobs[1:] == [-0.2, -0.2]
+    assert not any(flag & tr.TokenFlag.STOP for flag in returned[0].histories[0].flags)
+    assert authority == []
+    assert pickle.dumps(source) == before
+
+
+@pytest.mark.parametrize("carrier", ["raw", "recorded_nan", "packed"])
+@pytest.mark.parametrize("finish", ["stop", "tool_calls", "function_call"])
+async def test_recorded_evidence_public_controls(
+    authority: list, carrier: str, finish: str
+) -> None:
+    from art.preprocessing.dynamo_tokens import COMPLETION_LOGPROBS_KEY
+
+    source = trajectory(
+        finish=finish, lp=math.nan if carrier == "recorded_nan" else -0.2
+    )
+    choice = source.exchanges.chat_completions[0].response.choices[0]
+    if carrier == "packed":
+        choice.logprobs = None
+        assert choice.model_extra is not None
+        choice.model_extra[COMPLETION_LOGPROBS_KEY] = [-0.3, -0.4]
+    before = pickle.dumps(source)
+    result = (await art.tokenize_sampled([source]))[0]
+    value = result.histories[0]
+    assert value.tokens == [1, 8, 9]
+    assert [bool(f & tr.TokenFlag.STOP) for f in value.flags] == [False, False, True]
+    if carrier == "recorded_nan":
+        assert all(math.isnan(lp) for lp in value.logprobs[1:])
+    else:
+        assert value.logprobs[1:] == (
+            [-0.3, -0.4] if carrier == "packed" else [-0.2, -0.2]
+        )
+    assert tr.first_occurrence_masks([value], where=tr.TokenFlag.SAMPLED) == [
+        [False, True, True]
+    ]
+    assert pickle.dumps(source) == before
+    assert authority == [("policy", None)]
+    roundtrip = tr.compact_validate(
+        result.compact_dump(), type=tr.TokenizedMultiHistoryTrajectory
+    )
+    from art.trajectories._serialization import _equal_with_nan
+
+    assert _equal_with_nan(roundtrip.model_dump(), result.model_dump())
+
+
+@pytest.mark.parametrize("carrier", ["raw", "recorded_nan", "packed"])
+def test_recorded_length_evidence_certifier_control(
+    authority: list, carrier: str
+) -> None:
+    from art.preprocessing.dynamo_tokens import COMPLETION_LOGPROBS_KEY
+
+    old = native_length_output()
+    choice = old.trajectory.exchanges.chat_completions[0].response.choices[0]
+    if carrier == "recorded_nan":
+        assert choice.logprobs is not None and choice.logprobs.content is not None
+        for entry in choice.logprobs.content:
+            entry.logprob = math.nan
+        old.histories[0].logprobs[1:] = [math.nan, math.nan]
+    elif carrier == "packed":
+        choice.logprobs = None
+        assert choice.model_extra is not None
+        choice.model_extra[COMPLETION_LOGPROBS_KEY] = [-0.2, -0.2]
+    result = _sampled.reconcile_sampled_stops(old, base_model=None)
+    assert result is old
+    assert not any(f & tr.TokenFlag.STOP for f in result.histories[0].flags)
+
+
+@pytest.mark.parametrize("where", ["public", "final_guard"])
+def test_sampled_trace_data_refusal_is_value_error(
+    monkeypatch: pytest.MonkeyPatch, authority: list, where: str
+) -> None:
+    source = trajectory()
+    value = source.tokenize(multi_history=True)
+    history = value.histories[0]
+    assert isinstance(history.history, tr.ChatCompletionsHistory)
+    history.flags[1] &= ~tr.TokenFlag.SAMPLED
+    before = list(history.flags)
+    if where == "public":
+        monkeypatch.setattr(tr.Trajectory, "tokenize", lambda *args, **kwargs: value)
+        import asyncio
+
+        with pytest.raises(
+            ValueError, match="complete conditioned source proof"
+        ) as caught:
+            asyncio.run(art.tokenize_sampled([source]))
+    else:
+        message_source = history.history.message_sources[-1]
+        key = _tokenize._sampled_source_key(message_source)
+        trace = _tokenize._HistoryTokenizationTrace(
+            [None, key, key], {key: message_source}
+        )
+        with pytest.raises(
+            ValueError, match="complete conditioned source proof"
+        ) as caught:
+            _sampled._require_exact_chat_source_edges(
+                history.history, history, trace, StopTokenizer()
+            )
+    assert isinstance(caught.value.__cause__, AssertionError)
+    assert history.flags == before and authority == []
+
+
+async def test_sampled_unresolvable_alias_has_authority_specific_guidance(
+    monkeypatch: pytest.MonkeyPatch, authority: list
+) -> None:
+    failure = ValueError("Could not load tokenizer; pass base_model explicitly")
+
+    def unavailable(config: Any) -> Any:
+        raise failure
+
+    monkeypatch.setattr(_tokenize, "_load_tokenizer", unavailable)
+    with pytest.raises(ValueError, match="loadable tokenizer model ID") as caught:
+        await art.tokenize_sampled([trajectory(model="served-alias")])
+    assert caught.value.__cause__ is failure
+    assert "cannot obtain STOP authority from base_model" in str(caught.value)
+    with pytest.raises(ValueError, match="differs from the requested base model"):
+        await art.tokenize_sampled(
+            [trajectory(model="served-alias")], base_model="different-tokenizer"
+        )
+
+
+async def test_sampled_stop_loader_other_error_identity_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, authority: list
+) -> None:
+    failure = RuntimeError("public sentinel")
+
+    def broken(config: Any) -> Any:
+        raise failure
+
+    monkeypatch.setattr(_tokenize, "_load_tokenizer", broken)
+    with pytest.raises(RuntimeError) as caught:
+        await art.tokenize_sampled([trajectory()])
+    assert caught.value is failure
+
+
+def two_source_trajectory(*, reason: int | None = None) -> tr.Trajectory:
+    first = trajectory(reason=reason)
+    second = trajectory(reason=reason)
+    exchange = second.exchanges.chat_completions[0]
+    exchange.response.id = "response-second"
+    exchange.start_time = exchange.end_time = datetime(2026, 1, 1, 0, 0, 1)
+    exchange.request["messages"] = cast(
+        list[ChatCompletionMessageParam],
+        [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "follow-up"},
+        ],
+    )
+    choice = exchange.response.choices[0]
+    choice.message.content = "another answer"
+    assert choice.model_extra is not None
+    choice.model_extra["prompt_token_ids"] = [1, 8, 9, 2]
+    choice.model_extra["token_ids"] = [10, 9]
+    assert choice.logprobs is not None and choice.logprobs.content is not None
+    choice.logprobs.content[0].token = "token_id:10"
+    first.exchanges.chat_completions.append(exchange)
+    return first
+
+
+@pytest.mark.parametrize("reason", [None, 9])
+async def test_rendered_default_two_sampled_spans(
+    monkeypatch: pytest.MonkeyPatch, authority: list, reason: int | None
+) -> None:
+    source = two_source_trajectory(reason=reason)
+    assert len(source.histories()) == 1
+    before = pickle.dumps(source)
+    returned = []
+    original = tr.Trajectory.tokenize
+
+    def observe(self: tr.Trajectory, **kwargs: Any) -> Any:
+        value = original(self, **kwargs)
+        returned.append(value)
+        return value
+
+    monkeypatch.setattr(tr.Trajectory, "tokenize", observe)
+    result = (await art.tokenize_sampled([source]))[0]
+    assert len(returned) == len(result.histories) == 1
+    old, new = returned[0].histories[0], result.histories[0]
+    assert new.tokens == [1, 8, 9, 2, 10, 9]
+    assert [bool(f & tr.TokenFlag.SAMPLED) for f in new.flags] == [
+        False,
+        True,
+        True,
+        False,
+        True,
+        True,
+    ]
+    assert [bool(f & tr.TokenFlag.STOP) for f in new.flags] == [
+        False,
+        False,
+        True,
+        False,
+        False,
+        True,
+    ]
+    assert new.tokens is old.tokens and new.logprobs is old.logprobs
+    assert [
+        (int(a) ^ int(b)) & ~int(tr.TokenFlag.STOP)
+        for a, b in zip(old.flags, new.flags, strict=True)
+    ] == [0] * 6
+    assert (result is returned[0]) == (reason is not None)
+    assert pickle.dumps(source) == before and authority == [("policy", None)]
+
+
+def test_two_source_overlapping_prompt_refuses(authority: list) -> None:
+    source = two_source_trajectory()
+    value = source.tokenize(multi_history=True)
+    second = source.exchanges.chat_completions[1].response.choices[0]
+    assert second.model_extra is not None
+    second.model_extra["prompt_token_ids"] = [1, 8]
+    with pytest.raises(ValueError):
+        _sampled.reconcile_sampled_stops(value, base_model=None)
+    assert authority == []

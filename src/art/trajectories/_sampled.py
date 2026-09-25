@@ -5,6 +5,10 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+from ..preprocessing.dynamo_tokens import (
+    COMPLETION_LOGPROBS_KEY,
+    choice_completion_logprobs,
+)
 from . import (
     ChatCompletionsExchange,
     ChatCompletionsHistory,
@@ -31,6 +35,49 @@ if TYPE_CHECKING:
     from . import Tokenizer
 
 
+def _validate_sampled_trace(
+    trace: _HistoryTokenizationTrace, tokenized: TokenizedHistory
+) -> None:
+    try:
+        trace.validate(tokenized)
+    except AssertionError as error:
+        raise ValueError(
+            "Sampled output lacks complete conditioned source proof"
+        ) from error
+
+
+def _load_sampled_stop_tokenizer(model: str, *, base_model: str | None) -> Tokenizer:
+    config = original._tokenizer_config(model, None)
+    if base_model is not None and config.base_model != base_model:
+        raise ValueError("Sampled STOP authority differs from the requested base model")
+    try:
+        bound = original._load_tokenizer(config)
+    except ValueError as error:
+        raise ValueError(
+            "Sampled STOP certification requires a loadable tokenizer model ID or "
+            "an artifact with recorded tokenizer configuration; an unconfigured "
+            "served alias cannot obtain STOP authority from base_model"
+        ) from error
+    if bound is None:
+        raise ValueError("Sampled STOP authority is unavailable")
+    return bound
+
+
+def _require_sampled_source_evidence(
+    source: object, key: _SampledSourceKey, output: list[int] | None
+) -> None:
+    choice = original._chat_choice(source)
+    recorded = (
+        choice_completion_logprobs(choice)
+        if COMPLETION_LOGPROBS_KEY in (choice.model_extra or {})
+        else original._logprob_values(original._chat_logprob_entries(choice))
+    )
+    if not output or recorded is None or len(recorded) != len(output):
+        raise ValueError("Sampled output requires complete recorded logprobs")
+    if _source_stop_evidence(source, key)[0] not in {"stop", "length"}:
+        raise ValueError("Sampled output requires supported STOP evidence")
+
+
 def _require_exact_chat_source_edges(
     history: ChatCompletionsHistory,
     tokenized: TokenizedHistory,
@@ -48,7 +95,7 @@ def _require_exact_chat_source_edges(
     ):
         refuse()
     assert trace is not None
-    trace.validate(tokenized)
+    _validate_sampled_trace(trace, tokenized)
     expected = {
         _sampled_source_key(source): source
         for message, source in zip(
@@ -77,6 +124,7 @@ def _require_exact_chat_source_edges(
         prompt = _chat_source_prompt_tokens(source)
         output = _source_output_tokens(source, key)
         lp_ids, logprobs = _chat_source_full_tokens(source)
+        _require_sampled_source_evidence(source, key, output)
         if (
             indices != list(range(start, end))
             or prompt is None
@@ -185,23 +233,19 @@ def reconcile_sampled_stops(
                 raise ValueError(
                     "Sampled output requires complete nonoverlapping native spans"
                 )
+            _require_sampled_source_evidence(source, key, output)
             start, end = len(prompt), len(prompt) + len(output)
             keys[start:end] = [key] * len(output)
             previous_end = end
         trace = _HistoryTokenizationTrace(keys, sources)
-        trace.validate(value)
+        _validate_sampled_trace(trace, value)
         # STOP authority is deliberately separate from ordinary renderer selection.
         # Resolve every exact source model, never a shared caller base/revision.
         if history.model not in resolved:
-            config = original._tokenizer_config(history.model, None)
-            if base_model is not None and config.base_model != base_model:
-                raise ValueError(
-                    "Sampled STOP authority differs from the requested base model"
-                )
-            resolved[history.model] = original._load_tokenizer(config)
+            resolved[history.model] = _load_sampled_stop_tokenizer(
+                history.model, base_model=base_model
+            )
         bound = resolved[history.model]
-        if bound is None:
-            raise ValueError("Sampled STOP authority is unavailable")
         flags = list(value.flags)
         original._mark_sampled_stops(
             value.tokens, flags, keys, sources, tokenizer=bound
