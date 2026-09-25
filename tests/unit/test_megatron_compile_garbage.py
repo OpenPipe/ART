@@ -170,11 +170,12 @@ def test_early_stopped_recompute_leaves_the_mark_for_the_next_call(no_automatic_
     compiled = torch.compile(layer, backend="eager")
     x = torch.randn(4, 8, requires_grad=True)
     w = torch.randn(8, 8, requires_grad=True)
-    out = torch.utils.checkpoint.checkpoint(compiled, x, w, use_reentrant=False)
+    # Checkpoint reads the early-stop setting when it runs forward.
+    with torch.utils.checkpoint.set_checkpoint_early_stop(True):
+        out = torch.utils.checkpoint.checkpoint(compiled, x, w, use_reentrant=False)
     assert lora._COMPILE_GARBAGE is False
     torch._dynamo.reset()  # the recompute compiles again
-    with torch.utils.checkpoint.set_checkpoint_early_stop(True):
-        out.sum().backward()
+    out.sum().backward()
     assert x.grad is not None and lora._COMPILE_GARBAGE is True
     lora._with_captured_lora_slot(lambda: None)()
     assert lora._COMPILE_GARBAGE is False
