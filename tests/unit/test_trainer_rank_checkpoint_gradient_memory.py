@@ -87,7 +87,7 @@ def test_a_slot_that_loses_moe_coverage_keeps_boundary_gradients(
     assert r._checkpoint_input_gradient_bytes(groups, (ref,)) == 100 * 40 * 4096
 
     def covered(*args, enclosed, **kwargs):
-        enclosed.extend([True] * r._num_layers)
+        enclosed.extend([True] * len(r._moe_gradient_enclosed))
         return 1
 
     monkeypatch.setattr(_impl, "_moe_output_bytes_per_token", covered)

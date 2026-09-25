@@ -1535,9 +1535,9 @@ def _expert_lora_weight_storage(
 # Routed rows on the most loaded rank at EP>1, relative to its balanced share.
 # Expert-shard load is uneven per layer, from the router's expert preferences,
 # and larger batches do not average it away. Qwen3.6-35B-A3B on 3.5M tokens of
-# retail agent trajectories, worst layer at EP2 / EP4 / EP8: pretrained 1.21 /
-# 1.41 / 1.63, a trained policy 1.24 / 1.41 / 1.61; a small rollout sample
-# reached 1.95 at EP8. One production EP2 run was inferred at 1.35. These
+# retail agent trajectories, worst layer in 200k-token batches at EP2 / EP4 /
+# EP8: pretrained up to 1.22 / 1.40 / 1.62, a trained policy up to 1.24 / 1.41 /
+# 1.61; a small rollout sample reached 1.95 at EP8. One production EP2 run was inferred at 1.35. These
 # samples bound what was measured, not all routing. Unmeasured EP sizes use the
 # next measured one; above EP8 the allowance grows with log2(EP) up to EP
 # itself (every pair on one rank).
@@ -1767,8 +1767,6 @@ def _moe_output_bytes_per_token(
                     # path. This is one stage, not a backward bound.
                     features += dispatched * fc2.out_features + fc1.out_features
                     enclosing_fc1 = fc1
-            if enclosed is not None:
-                enclosed.append(enclosing_fc1 is not None)
             shared = _shared_expert_output_bytes_per_token(layer)
             if (
                 checkpoint_grad
@@ -1787,6 +1785,7 @@ def _moe_output_bytes_per_token(
             )
             coefficient = max(coefficient, row_bytes)
             storage = _expert_lora_weight_storage(lora, slot_ref)
+            fc1_stages = False
             if converted_stages is not None and storage is not None:
                 padded, transposes, effective = storage
                 saved_fc1, rank_fc1 = 0, 0
@@ -1815,6 +1814,7 @@ def _moe_output_bytes_per_token(
                         and first_tensors[1].shape[2] == enclosing_fc1.out_features
                     ):
                         first_padding, first_transposes, first_rank = first
+                        fc1_stages = True
                         # FC1 retains the routed H inputs and its base O1
                         # while producing adapter O1. Its sum is not live yet.
                         converted_stages.append(
@@ -1889,6 +1889,18 @@ def _moe_output_bytes_per_token(
                                 + 2 * (experts_count + 1) * 4,
                             )
                         )
+            if enclosed is not None:
+                # FC1 is covered when priced beside FC2 and its converted
+                # stages are priced too, unless it has no adapter or the
+                # selected slot has no FC1 tensors to convert.
+                adapter = getattr(enclosing_fc1, "lora", None)
+                inactive = adapter is None or (
+                    slot_ref is not None
+                    and type(adapter) is LoRA
+                    and "_slot" not in vars(adapter)
+                    and _slot_lora_tensors(adapter, slot_ref) is None
+                )
+                enclosed.append(enclosing_fc1 is not None and (fc1_stages or inactive))
     if converted_stages is not None:
         # The EP allowance gives fractional routed rows; round each stage up.
         converted_stages[:] = [
@@ -4302,10 +4314,16 @@ class TrainerRank:
             self.runtime.model,
             self._parallel_shape,
             checkpoint_grad=True,
+            converted_stages=[],
             slot_ref=slot_ref,
             enclosed=enclosed,
         )
-        return coefficient > 0 and len(enclosed) == self._num_layers and all(enclosed)
+        # The constructor's walk already matched every decoder layer.
+        return (
+            coefficient > 0
+            and len(enclosed) == len(getattr(self, "_moe_gradient_enclosed", ()))
+            and all(enclosed)
+        )
 
     def _checkpoint_input_gradient_bytes(
         self,
