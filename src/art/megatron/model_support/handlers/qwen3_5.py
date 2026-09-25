@@ -522,11 +522,15 @@ def _qwen35_text_config(base_model_name_or_path: str, revision: str | None) -> A
 
 
 def _qwen35_attention_dims(adapter_config: dict[str, Any]) -> tuple[int, int, int]:
-    num_heads = adapter_config.get("num_attention_heads")
-    num_groups = adapter_config.get("num_key_value_heads")
-    head_dim = adapter_config.get("head_dim")
+    dims = {
+        key: adapter_config.get(key)
+        for key in ("num_attention_heads", "num_key_value_heads", "head_dim")
+    }
     hidden_size = adapter_config.get("hidden_size")
-    if num_heads is None:
+    if None in dims.values():
+        # Take each missing dimension from the base model's config rather than
+        # defaulting it: Qwen3.5 uses grouped queries and a head size that is
+        # not hidden_size / heads.
         base_model = adapter_config.get("base_model_name_or_path")
         if not base_model:
             raise RuntimeError("Qwen3.5 LoRA adapter config is missing base model path")
@@ -536,10 +540,16 @@ def _qwen35_attention_dims(adapter_config: dict[str, Any]) -> tuple[int, int, in
         config = _qwen35_text_config(
             str(base_model), None if revision is None else str(revision)
         )
-        num_heads = getattr(config, "num_attention_heads")
-        num_groups = getattr(config, "num_key_value_heads", num_heads)
-        head_dim = getattr(config, "head_dim", None)
-        hidden_size = getattr(config, "hidden_size", None)
+        for key, value in dims.items():
+            if value is None:
+                dims[key] = getattr(config, key, None)
+        if hidden_size is None:
+            hidden_size = getattr(config, "hidden_size", None)
+    num_heads = dims["num_attention_heads"]
+    num_groups = dims["num_key_value_heads"]
+    head_dim = dims["head_dim"]
+    if num_heads is None:
+        raise RuntimeError("Qwen3.5 config is missing num_attention_heads")
     num_heads = int(num_heads)
     num_groups = int(num_groups if num_groups is not None else num_heads)
     if head_dim is None:

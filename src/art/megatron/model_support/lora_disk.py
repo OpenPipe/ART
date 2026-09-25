@@ -35,16 +35,11 @@ def with_model_attention_dimensions(
 ) -> dict[str, Any]:
     """Fill attention dimensions the adapter config omits or nulls from the model.
 
-    Only a complete shape is used: a partial one could silently turn grouped
-    query attention into full multi-head attention.
+    Values the adapter sets win. The handler resolves anything still missing
+    from the base model's config at the adapter's revision.
     """
-    dimensions = model_attention_dimensions(provider)
-    if not {"num_attention_heads", "num_key_value_heads", "head_dim"} <= set(
-        dimensions
-    ):
-        return adapter_config
     config = dict(adapter_config)
-    for key, value in dimensions.items():
+    for key, value in model_attention_dimensions(provider).items():
         if config.get(key) is None:
             config[key] = value
     return config

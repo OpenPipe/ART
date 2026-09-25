@@ -73,6 +73,17 @@ def test_a_different_main_revision_does_not_change_a_pinned_adapter(hub_cache):
     assert _dims("") == (16, 4, 256)  # an empty revision is unpinned
 
 
+def test_missing_dimensions_come_from_the_pinned_config_not_defaults(hub_cache):
+    hub_cache(PIN, groups=2)
+    config = {
+        "base_model_name_or_path": REPO,
+        "revision": PIN,
+        "num_attention_heads": 16,
+    }
+    # Not one group per head, nor head_dim = hidden_size / heads = 128.
+    assert qwen35._qwen35_attention_dims(config) == (16, 2, 256)
+
+
 def _write_adapter(
     path: Path, rows: int, **dimensions: object
 ) -> dict[str, torch.Tensor]:
@@ -155,6 +166,21 @@ def test_null_adapter_dimensions_are_filled_from_the_running_model(
     torch.testing.assert_close(loaded[ART_KEY], _expected(tensors))
 
 
+@pytest.mark.parametrize("handler", ["QWEN3_5_DENSE_HANDLER", "QWEN3_5_MOE_HANDLER"])
+def test_adapter_and_model_dimensions_combine(tmp_path, monkeypatch, handler):
+    from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
+
+    _forbid_lookup(monkeypatch)
+    # The adapter has heads and head size, the model has query groups but no
+    # head size: together they are complete.
+    tensors = _write_adapter(tmp_path, ROWS, num_attention_heads=4, head_dim=8)
+    provider = SimpleNamespace(num_attention_heads=4, num_query_groups=2)
+    loaded = load_lora_tensors_for_megatron(
+        tmp_path, handler=getattr(qwen35, handler), provider=provider
+    )
+    torch.testing.assert_close(loaded[ART_KEY], _expected(tensors))
+
+
 def test_adapter_dimensions_take_precedence_over_the_running_model():
     from art.megatron.model_support.lora_disk import with_model_attention_dimensions
 
@@ -174,14 +200,14 @@ def test_adapter_dimensions_take_precedence_over_the_running_model():
 @pytest.mark.parametrize(
     "provider",
     [
-        # Without query groups, filling heads alone would imply MHA.
+        # Query groups must not default to one per head.
         SimpleNamespace(num_attention_heads=4, kv_channels=8, hidden_size=48),
-        # Without a head size, it would be derived from the hidden size.
+        # The head size must not be derived from the hidden size.
         SimpleNamespace(num_attention_heads=4, num_query_groups=2, hidden_size=48),
     ],
     ids=["no-query-groups", "no-head-size"],
 )
-def test_an_incomplete_model_shape_falls_back_to_the_pinned_lookup(
+def test_dimensions_the_model_lacks_come_from_the_pinned_lookup(
     tmp_path, monkeypatch, provider
 ):
     from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
