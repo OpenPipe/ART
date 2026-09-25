@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
+import re
 from typing import Any, cast
 
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -281,4 +282,162 @@ def test_mixed_history_uses_each_generations_own_request(
     assert [message["content"] for message in rendered_messages] == [
         message["content"] for message in history.messages
     ]
+    assert history.model_dump(mode="python") == original
+
+
+class _NewlineRunTokenizer(_TemplateTokenizer):
+    """Reversible public codec that exposes the open/closed scaffold boundary."""
+
+    all_special_tokens = ["<|im_start|>", "<|im_end|>", "<think>", "</think>"]
+    all_special_ids = [200000, 200001, 200002, 200003]
+    eos_token_id = 200001
+
+    def __call__(self, text: str, **kwargs: Any) -> dict[str, Any]:
+        pieces = list(
+            re.finditer(r"<\|im_start\|>|<\|im_end\|>|<think>|</think>|\n+|[^\n]", text)
+        )
+        result = {
+            "input_ids": [
+                self.all_special_ids[self.all_special_tokens.index(piece.group())]
+                if piece.group() in self.all_special_tokens
+                else 300000 + len(piece.group())
+                if piece.group().startswith("\n")
+                else ord(piece.group())
+                for piece in pieces
+            ]
+        }
+        if kwargs.get("return_offsets_mapping"):
+            result["offset_mapping"] = [piece.span() for piece in pieces]
+        return result
+
+    def decode(self, token_ids: list[int], **kwargs: Any) -> str:
+        return "".join(
+            self.all_special_tokens[self.all_special_ids.index(token)]
+            if token in self.all_special_ids
+            else "\n" * (token - 300000)
+            if token > 300000
+            else chr(token)
+            for token in token_ids
+        )
+
+    def convert_tokens_to_ids(self, token: str) -> int | None:
+        return (
+            self.all_special_ids[self.all_special_tokens.index(token)]
+            if token in self.all_special_tokens
+            else None
+        )
+
+    def apply_chat_template(
+        self, messages: list[dict[str, Any]], *, tokenize: bool = True, **kwargs: Any
+    ) -> str | list[int]:
+        text = super().apply_chat_template(messages, tokenize=False, **kwargs)
+        assert isinstance(text, str)
+        return self(text)["input_ids"] if tokenize else text
+
+
+def test_literal_next_turn_preserves_preceding_length_stop_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer = _NewlineRunTokenizer()
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "unchanged preceding output"},
+        {"role": "user", "content": "next query"},
+        {"role": "assistant", "content": _LITERAL},
+    ]
+    exchanges = []
+    for index in (1, 3):
+        single, _ = _history(content=messages[index]["content"])
+        source = single.message_sources[-1]
+        assert source is not None and isinstance(
+            source.exchange, tr.ChatCompletionsExchange
+        )
+        exchange = source.exchange
+        exchange.request["messages"] = cast(
+            list[ChatCompletionMessageParam], deepcopy(messages[:index])
+        )
+        data = exchange.response.model_dump(mode="python")
+        data["id"] = f"public-length-{index}"
+        choice = data["choices"][0]
+        choice["prompt_token_ids"] = tokenizer.apply_chat_template(
+            messages[:index],
+            add_generation_prompt=True,
+            enable_thinking=False,
+            preserve_thinking=True,
+        )
+        choice["token_ids"] = tokenizer(messages[index]["content"])["input_ids"]
+        choice["logprobs"]["content"] = [
+            {
+                "token": f"token_id:{token}",
+                "logprob": -0.5,
+                "bytes": [],
+                "top_logprobs": [],
+            }
+            for token in choice["token_ids"]
+        ]
+        exchange.response = ChatCompletion.model_validate(data)
+        exchanges.append(exchange)
+    history = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(chat_completions=exchanges)
+    ).chat_completions_history()
+    original = history.model_dump(mode="python")
+    first = exchanges[0].response.choices[0].model_extra
+    last = exchanges[1].response.choices[0].model_extra
+    assert first is not None and last is not None
+    end = len(first["prompt_token_ids"]) + len(first["token_ids"])
+    native_boundary = last["prompt_token_ids"][end:]
+    assert (
+        last["prompt_token_ids"][:end] == first["prompt_token_ids"] + first["token_ids"]
+    )
+    source = history.message_sources[1]
+    key = _tokenize._sampled_source_key(source)
+    builder = _tokenize._tokenize_exact_projected_chat_history
+    observed = []
+
+    def observe(*args: Any, **kwargs: Any) -> tr.TokenizedHistory | None:
+        result = builder(*args, **kwargs)
+        if boundary := kwargs.get("length_stop_boundaries", {}).get(key):
+            observed.append((boundary, result))
+        return result
+
+    monkeypatch.setattr(_tokenize, "_tokenize_exact_projected_chat_history", observe)
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
+        )
+        _outcome(history, tokenizer)
+    boundary, old_exact = observed[0]
+    stored = list(boundary.tail + boundary.following)
+    assert old_exact is None
+    assert len(native_boundary) - len(stored) == 2
+    assert stored[:-1] == native_boundary[:-3]
+    assert tokenizer.decode(stored[-1:]) == "\n"
+    assert tokenizer.decode(native_boundary[-3:]) == "\n\n</think>\n\n"
+    observed.clear()
+
+    value = history.tokenize(tokenizer=tokenizer)
+    fixed_boundary, fixed_exact = observed[0]
+    assert fixed_exact is value
+    assert list(fixed_boundary.tail + fixed_boundary.following) == native_boundary
+    assert (
+        value.tokens[: len(last["prompt_token_ids"]) + len(last["token_ids"])]
+        == last["prompt_token_ids"] + last["token_ids"]
+    )
+    assert value.flags[end] == tr.TokenFlag.EXACT | tr.TokenFlag.STOP
+    assert not value.flags[end] & tr.TokenFlag.SAMPLED
+    for exchange in exchanges:
+        extra = exchange.response.choices[0].model_extra
+        assert extra is not None
+        start = len(extra["prompt_token_ids"])
+        stop = start + len(extra["token_ids"])
+        assert value.tokens[start:stop] == extra["token_ids"]
+        assert value.logprobs[start:stop] == [-0.5] * (stop - start)
+        assert all(
+            flag
+            == tr.TokenFlag.EXACT
+            | tr.TokenFlag.SAMPLED
+            | tr.TokenFlag.ASSISTANT
+            | tr.TokenFlag.OUTPUT
+            for flag in value.flags[start:stop]
+        )
     assert history.model_dump(mode="python") == original
