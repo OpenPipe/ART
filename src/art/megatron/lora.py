@@ -113,15 +113,19 @@ def _collect_compile_garbage() -> None:
     # Check tracing first: a traced read of the global would guard on it.
     if torch.compiler.is_compiling() or not install_compile_garbage_collection():
         return
-    if _COMPILE_GARBAGE:
-        _COMPILE_GARBAGE = False
-        started = time.perf_counter()
-        collected = gc.collect()
-        _logger.debug(
-            "Collected %d objects after a dynamo compile in %.3fs",
-            collected,
-            time.perf_counter() - started,
-        )
+    # Finalizers must not run inside a CUDA graph capture; keep the mark.
+    if not _COMPILE_GARBAGE or (
+        torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing()
+    ):
+        return
+    _COMPILE_GARBAGE = False
+    started = time.perf_counter()
+    collected = gc.collect()
+    _logger.debug(
+        "Collected %d objects after a dynamo compile in %.3fs",
+        collected,
+        time.perf_counter() - started,
+    )
 
 
 def _with_captured_lora_slot(function: _F) -> _F:
@@ -132,11 +136,13 @@ def _with_captured_lora_slot(function: _F) -> _F:
         _collect_compile_garbage()
         token = _CURRENT_LORA_SLOT.set(context)
         try:
-            return function(*args, **kwargs)
+            result = function(*args, **kwargs)
         finally:
             _CURRENT_LORA_SLOT.reset(token)
-            # A compile inside this call has unwound; collect before its backward.
-            _collect_compile_garbage()
+        # A compile inside this call has unwound; collect before its backward.
+        # Failed calls leave the mark for the next call, keeping their error.
+        _collect_compile_garbage()
+        return result
 
     return cast(_F, wrapped)
 

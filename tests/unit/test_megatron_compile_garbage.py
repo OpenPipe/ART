@@ -61,12 +61,41 @@ def test_compile_inside_a_call_is_collected_before_it_returns(no_automatic_gc):
     assert held[0]() is None and lora._COMPILE_GARBAGE is False
 
 
-def test_tracing_keeps_the_mark_for_a_later_call(no_automatic_gc, monkeypatch):
+def test_failed_call_raises_its_own_error_and_keeps_the_mark(no_automatic_gc):
+    held = []
+
+    def failing_call():
+        held.append(_garbage_holding_tensor())
+        lora._mark_compile_garbage(None)
+        raise ValueError("model error")
+
+    with pytest.raises(ValueError, match="model error"):
+        lora._with_captured_lora_slot(failing_call)()
+    assert held[0]() is not None and lora._COMPILE_GARBAGE is True
+    lora._with_captured_lora_slot(lambda: None)()
+    assert held[0]() is None
+
+
+@pytest.mark.parametrize(
+    "deferring",
+    [
+        {(torch.compiler, "is_compiling"): True},
+        {
+            (torch.cuda, "is_initialized"): True,
+            (torch.cuda, "is_current_stream_capturing"): True,
+        },
+    ],
+    ids=["tracing", "cuda-graph-capture"],
+)
+def test_deferred_collection_keeps_the_mark_for_a_later_call(
+    no_automatic_gc, monkeypatch, deferring
+):
     wrapped = lora._with_captured_lora_slot(lambda: None)
     held = _garbage_holding_tensor()
     lora._mark_compile_garbage(None)
-    with monkeypatch.context() as tracing:
-        tracing.setattr(torch.compiler, "is_compiling", lambda: True)
+    with monkeypatch.context() as patch:
+        for (module, name), value in deferring.items():
+            patch.setattr(module, name, lambda value=value: value)
         wrapped()
     assert held() is not None and lora._COMPILE_GARBAGE is True
     lora._with_captured_lora_slot(lambda: None)()
