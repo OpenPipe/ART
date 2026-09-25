@@ -297,6 +297,7 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
                     "checkpoint_workspace": 0,
                     "checkpoint_input_gradient": 0,
                     "checkpoint_peak_increment": 0,
+                    "hybridep_growth": 0,
                 },
             }
         ],
@@ -377,6 +378,7 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
         "checkpoint_input_gradient",
         "checkpoint_workspace",
         "checkpoint_peak_increment",
+        "hybridep_growth",
     ):
         altered = json.loads(path.read_bytes())
         altered["replay"]["memory_replay"]["estimates"][0]["cost_components"][

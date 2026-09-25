@@ -188,6 +188,54 @@ def test_sharded_path_unchanged(layer, field):
     )
 
 
+def _hybridep(layer, ep: int, manager: str = "hybridep"):
+    from megatron.core.transformer.moe import token_dispatcher
+
+    dispatcher = object.__new__(token_dispatcher.MoEFlexTokenDispatcher)
+    dispatcher.config = layer.config
+    dispatcher.ep_size, dispatcher.tp_size = ep, 1
+    managers = {
+        "hybridep": token_dispatcher._HybridEPManager,
+        "deepep": token_dispatcher._DeepepManager,
+    }
+    dispatcher._comm_manager = object.__new__(managers[manager])
+    layer.token_dispatcher = dispatcher
+    return layer
+
+
+@pytest.mark.parametrize("ep", [2, 4])
+def test_hybridep_prices_routed_rows_with_imbalance_allowance(layer, ep):
+    # HybridEP gives each rank the pairs routed to its local experts: balanced
+    # routing matches EP1's top-k rows per local token, with a 1.5x allowance.
+    single = _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1))
+    sharded = ParallelShape(tp=1, cp=ep, ep=ep)
+    expert = _moe_output_bytes_per_token([_hybridep(layer, ep)], sharded)
+    # Top-k 8 routed rows per local token become 12; no shared experts here.
+    assert single > 0 and expert == single // 8 * 12
+
+
+def test_hybridep_keeps_the_enclosing_fc1_stage(layer):
+    # The FC1 inputs and gate/up sum stay live at the FC2 sum under HybridEP
+    # too; EP1's two dispatched H-wide inputs over-count HybridEP's one.
+    single = _moe_output_bytes_per_token(
+        [_enclosing_moe(layer)], ParallelShape(tp=1, cp=1)
+    )
+    expert = _hybridep(layer, 2)
+    expert.token_dispatcher.num_local_experts = 128
+    sharded = _moe_output_bytes_per_token([expert], ParallelShape(tp=1, cp=2, ep=2))
+    assert single == 8 * (512 + 3 * 2048 + 2 * 2048 + 1024) * 2
+    assert sharded == single // 8 * 12
+
+
+@pytest.mark.parametrize(
+    "manager,ep,shape_ep", [("deepep", 2, 2), ("hybridep", 2, 4), ("hybridep", 1, 1)]
+)
+def test_other_flex_dispatchers_stay_unmodeled(layer, manager, ep, shape_ep):
+    dispatcher = _hybridep(layer, ep, manager)
+    shape = ParallelShape(tp=1, cp=1, ep=shape_ep)
+    assert _moe_output_bytes_per_token([dispatcher], shape) == 0
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -492,3 +540,91 @@ def test_unknown_enclosing_lifetimes_keep_previous_fc2_floor(
     }
     setattr(sites[site], attribute, value)
     assert _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1)) == 106_496
+
+
+def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
+    fused_a2a = pytest.importorskip("megatron.core.transformer.moe.fused_a2a")
+    from art.trainer_rank._impl import _hybridep_buffer_bytes, _hybridep_rows_per_rank
+
+    # Rows per rank are TMA-aligned, at least 512 and padded to 64-row chunks;
+    # every rank's rows land on one rank: BF16 H, FP32 probs and a routing-map
+    # byte per expert column (256), and FP32 scaling factors per H/128.
+    assert [_hybridep_rows_per_rank(n, 2) for n in (1, 512, 1000, 1025)] == [
+        512,
+        512,
+        1024,
+        1088,
+    ]
+    assert _hybridep_buffer_bytes(1000, 2, 2048, 256) == 2 * 1024 * (4096 + 1280 + 64)
+    assert _hybridep_buffer_bytes(0, 2, 2048, 256) == 0
+    rank = _rank()
+    rank.runtime.provider.expert_model_parallel_size = 2
+    rank.runtime.provider.num_moe_experts = 256
+    plan = rank._plan_flat_forward(
+        [ForwardInput(input_tokens=torch.arange(64), target_tokens=torch.arange(64))]
+    )
+    monkeypatch.setattr(rank, "_topology", lambda: SimpleNamespace(tp=1, cp=2))
+    monkeypatch.setattr(rank, "_plan_group_rows", lambda plan: ((600, True),))
+    monkeypatch.setattr(
+        "art.megatron.train._hybridep_token_capacity", lambda sequence, cp: 1000
+    )
+
+    def held(rows):
+        config = SimpleNamespace(max_num_of_tokens_per_rank=rows)
+        return SimpleNamespace(configurer=SimpleNamespace(buffer_config=config))
+
+    # The old buffer stays referenced while its replacement is allocated, so a
+    # growing plan pays the full new size.
+    full = _hybridep_buffer_bytes(1000, 2, 2048, 256)
+    for current, growth in ((None, full), (held(512), full), (held(1024), 0)):
+        monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", current)
+        assert rank._plan_hybridep_growth_bytes(plan) == growth
+    # ETP multiplies the communication ranks and expert columns.
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+    rank.runtime.provider.expert_tensor_parallel_size = 2
+    assert rank._plan_hybridep_growth_bytes(plan) == _hybridep_buffer_bytes(
+        1000, 4, 2048, 512
+    )
+    rank.runtime.provider.expert_tensor_parallel_size = 1
+    # Growth enters the forward and checkpoint peaks, not forward retention.
+    rank._update_memory_profile(plan, 10**9, retained_bytes=10**8)
+    monkeypatch.setattr(
+        rank, "_checkpoint_memory_floor", lambda rows, refs=None: (10**7, 10**6)
+    )
+    grown = rank._plan_cost(plan)
+    monkeypatch.setattr(rank, "_plan_hybridep_growth_bytes", lambda plan: 0)
+    base = rank._plan_cost(plan)
+    charged = int(full * 1.1)
+    assert grown.retained == base.retained < base.required
+    assert grown.hybridep_growth == full and base.hybridep_growth == 0
+    assert grown.checkpoint_workspace == base.checkpoint_workspace
+    assert grown.required - base.required == charged
+    # A split pays it once, however many children would grow the buffer.
+    split = rank._split_required_memory([grown, grown, grown])
+    extra = split - rank._split_required_memory([base, base, base])
+    assert charged - 1 <= extra <= charged + 1
+    rank.runtime.provider.expert_model_parallel_size = 1
+    monkeypatch.undo()
+    assert rank._plan_hybridep_growth_bytes(plan) == 0
+
+
+def test_split_charges_the_largest_hybridep_growth_beside_any_child_peak():
+    from art.trainer_rank._impl import _SubforwardCost
+
+    def child(workspace: int, growth: int) -> _SubforwardCost:
+        peak = int((workspace + 1) * 1.1)
+        return _SubforwardCost(
+            required=peak + int(growth * 1.1),
+            retained=0,
+            checkpoint_workspace=workspace,
+            checkpoint_input_gradient=1,
+            hybridep_growth=growth,
+        )
+
+    # The first child grows the buffer most; the second has the larger
+    # workspace, which runs while that buffer is still allocated.
+    required = TrainerRank._split_required_memory(
+        [child(10_000, 10_000), child(15_000, 1_000)]
+    )
+    assert required >= int((2 + 15_000 + 10_000) * 1.1)
+    assert required >= int((15_000 + 1) * 1.1) + int(10_000 * 1.1)
