@@ -276,7 +276,10 @@ def test_hybridep_fc1_stages_hold_one_dispatched_input(layer):
     weights(layer, 8)
     single: list[tuple[int, int]] = []
     _moe_output_bytes_per_token(
-        [layer], ParallelShape(tp=1, cp=1), checkpoint_grad=True, converted_stages=single
+        [layer],
+        ParallelShape(tp=1, cp=1),
+        checkpoint_grad=True,
+        converted_stages=single,
     )
     expert = _hybridep(layer, 2)
     expert.token_dispatcher.num_local_experts = 128
