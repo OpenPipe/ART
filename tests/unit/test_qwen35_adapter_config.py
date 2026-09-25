@@ -70,6 +70,7 @@ def test_a_different_main_revision_does_not_change_a_pinned_adapter(hub_cache):
         (16, 2, 256),
     ]
     assert _dims() == (16, 4, 256)  # unpinned adapters still follow main
+    assert _dims("") == (16, 4, 256)  # an empty revision is unpinned
 
 
 def _write_adapter(
@@ -95,9 +96,11 @@ def _write_adapter(
     return tensors
 
 
-# Four heads in two query groups, with head_dim 8: the runtime's shape.
+# Four heads in two query groups, with head_dim 8: the runtime's shape. The
+# hidden size is not heads x head_dim, as in Qwen3.5, so deriving head_dim from
+# it would be caught.
 PROVIDER = SimpleNamespace(
-    num_attention_heads=4, num_query_groups=2, kv_channels=8, hidden_size=32
+    num_attention_heads=4, num_query_groups=2, kv_channels=8, hidden_size=48
 )
 ROWS = 2 * 2 * 2 * 8  # groups x (query + gate) x heads per group x head_dim
 ART_KEY = f"{LAYER}.lora_B.weight".replace(".language_model.layers.", ".layers.")
@@ -164,12 +167,22 @@ def test_adapter_dimensions_take_precedence_over_the_running_model():
         "num_attention_heads": 1,
         "num_key_value_heads": 2,
         "head_dim": 8,
-        "hidden_size": 32,
+        "hidden_size": 48,
     }
 
 
+@pytest.mark.parametrize(
+    "provider",
+    [
+        # Without query groups, filling heads alone would imply MHA.
+        SimpleNamespace(num_attention_heads=4, kv_channels=8, hidden_size=48),
+        # Without a head size, it would be derived from the hidden size.
+        SimpleNamespace(num_attention_heads=4, num_query_groups=2, hidden_size=48),
+    ],
+    ids=["no-query-groups", "no-head-size"],
+)
 def test_an_incomplete_model_shape_falls_back_to_the_pinned_lookup(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, provider
 ):
     from art.megatron.model_support.lora_disk import load_lora_tensors_for_megatron
 
@@ -181,8 +194,6 @@ def test_an_incomplete_model_shape_falls_back_to_the_pinned_lookup(
 
     monkeypatch.setattr(qwen35, "_qwen35_text_config", lookup)
     tensors = _write_adapter(tmp_path, ROWS)
-    # Without query groups, filling heads alone would imply one group per head.
-    provider = SimpleNamespace(num_attention_heads=4, kv_channels=8)
     loaded = load_lora_tensors_for_megatron(
         tmp_path, handler=qwen35.QWEN3_5_MOE_HANDLER, provider=provider
     )
