@@ -391,6 +391,40 @@ def chat_prefix_observations(
     return entries
 
 
+def openai_tool_arguments(message: Mapping[str, Any]) -> Mapping[str, Any]:
+    function_call = message.get("function_call")
+    if isinstance(function_call, Mapping) and isinstance(
+        function_call.get("arguments"), Mapping
+    ):
+        message = {
+            **message,
+            "function_call": {
+                **function_call,
+                "arguments": json.dumps(function_call["arguments"]),
+            },
+        }
+    calls = message.get("tool_calls")
+    if isinstance(calls, list):
+        return {
+            **message,
+            "tool_calls": [
+                {
+                    **call,
+                    "function": {
+                        **call["function"],
+                        "arguments": json.dumps(call["function"]["arguments"]),
+                    },
+                }
+                if isinstance(call, Mapping)
+                and isinstance(call.get("function"), Mapping)
+                and isinstance(call["function"].get("arguments"), Mapping)
+                else call
+                for call in calls
+            ],
+        }
+    return message
+
+
 async def chat_response_prefixes(
     tokenizer: Any,
     request: Any,
@@ -424,39 +458,6 @@ async def chat_response_prefixes(
         )
         if name in fields
     )
-
-    def openai_tool_arguments(message: Mapping[str, Any]) -> Mapping[str, Any]:
-        function_call = message.get("function_call")
-        if isinstance(function_call, Mapping) and isinstance(
-            function_call.get("arguments"), Mapping
-        ):
-            message = {
-                **message,
-                "function_call": {
-                    **function_call,
-                    "arguments": json.dumps(function_call["arguments"]),
-                },
-            }
-        calls = message.get("tool_calls")
-        if isinstance(calls, list):
-            return {
-                **message,
-                "tool_calls": [
-                    {
-                        **call,
-                        "function": {
-                            **call["function"],
-                            "arguments": json.dumps(call["function"]["arguments"]),
-                        },
-                    }
-                    if isinstance(call, Mapping)
-                    and isinstance(call.get("function"), Mapping)
-                    and isinstance(call["function"].get("arguments"), Mapping)
-                    else call
-                    for call in calls
-                ],
-            }
-        return message
 
     # vLLM renders tool-call arguments as mappings and shallow-copies their
     # containers, mutating historical request messages before this observer runs.

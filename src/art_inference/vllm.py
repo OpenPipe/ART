@@ -18,6 +18,7 @@ from .append_only import (
     aligned_values,
     chat_response_prefixes,
     merge_chat_delta,
+    openai_tool_arguments,
     output_prefix_observations,
     patch_deepseek_renderer,
     patch_harmony,
@@ -352,7 +353,9 @@ def patch_history(importer=importlib.import_module) -> None:
                 )
                 view = protocol.ChatCompletionRequest(
                     model=request.model,
-                    messages=conversation,
+                    messages=[
+                        openai_tool_arguments(message) for message in conversation
+                    ],
                     chat_template_kwargs=self._effective_chat_template_kwargs(request),
                 )
 
