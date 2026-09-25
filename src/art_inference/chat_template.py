@@ -50,17 +50,22 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
         }
     if not isinstance(chat_template, str):
         return chat_template
-    chat_template, inline_parsers = _QWEN_INLINE_REASONING.subn("", chat_template)
+    # This source rewrite is deliberately conservative, not a Jinja parser.
+    # In raw/comment-containing templates the same text might be literal data.
+    inline_parsers = 0
+    if not re.search(r"\{#|\{%[-+]?\s*raw\b", chat_template):
+        chat_template, inline_parsers = _QWEN_INLINE_REASONING.subn("", chat_template)
     if inline_parsers:
         # Disabling reasoning preservation may omit a structured reasoning
         # field, but must not trim the visible assistant answer.
-        chat_template = chat_template.replace(
-            "if preserve_thinking and message.role == 'assistant'",
-            "if message.role == 'assistant'",
-        ).replace(
-            "set content = render_content(message.content, true)|trim",
-            "set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim)",
-        )
+        for content in (
+            "render_content(message.content, true)|trim",
+            "(render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
+        ):
+            chat_template = chat_template.replace(
+                "{%- set content = " + content + " %}",
+                "{%- set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim) %}",
+            )
     replacements = (
         (
             _QWEN_DROP_PRIOR_THINKING,

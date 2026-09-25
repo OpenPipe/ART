@@ -209,3 +209,25 @@ def test_unconfigured_template_receives_the_same_correction():
         )
     )
     assert chat_template_with_preserved_thinking(raw) == _FIXED
+
+
+@pytest.mark.parametrize("wrapper", [("{% raw %}", "{% endraw %}"), ("{#", "#}")])
+def test_inline_operation_as_raw_or_comment_text_is_not_rewritten(wrapper):
+    from art_inference.chat_template import _QWEN_INLINE_REASONING
+
+    operation = _QWEN_INLINE_REASONING.search(_TEMPLATE).group()
+    template = wrapper[0] + operation + wrapper[1]
+    assert chat_template_with_preserved_thinking(template) == template
+
+
+def test_other_structured_reasoning_condition_is_not_rewritten():
+    gate = "{% if preserve_thinking and message.role == 'assistant' %}{{ message.reasoning_content }}{% endif %}"
+    template = _TEMPLATE + "{% for message in messages %}" + gate + "{% endfor %}"
+    fixed = chat_template_with_preserved_thinking(template)
+    assert gate in fixed
+    messages = [
+        _USER,
+        {"role": "assistant", "content": "answer", "reasoning_content": "prior reason"},
+        _USER,
+    ]
+    assert "prior reason" not in _render(fixed, messages, preserve_thinking=False)
