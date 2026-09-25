@@ -304,7 +304,8 @@ cleanup_prewarm_pods() {
   for context in "${prewarm_contexts[@]}"; do
     kubectl --context "${context}" delete pod -n "${prewarm_namespace}" \
       -l "${selector}" \
-      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+      --ignore-not-found --wait=false --request-timeout=30s \
+      >/dev/null 2>&1 || true
   done
 }
 cleanup() {

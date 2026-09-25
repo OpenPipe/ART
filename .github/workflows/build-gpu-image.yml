@@ -225,7 +225,7 @@ jobs:
         run: |
           prewarm_selector="art.openpipe/prewarm-name=art-gpu-image-prewarm,art.openpipe/prewarm-run=${PREWARM_RUN_UID}"
           kubectl --context cks-wb3 delete pod -n default "${BUILD_CLUSTER_NAME}" \
-            --ignore-not-found --wait=false
+            --ignore-not-found --wait=false --request-timeout=30s || true
           while IFS= read -r infra; do
             case "${infra}" in
               k8s/*) context="${infra#k8s/}" ;;
@@ -234,7 +234,7 @@ jobs:
             esac
             kubectl --context "${context}" delete pod -n default \
               -l "${prewarm_selector}" \
-              --ignore-not-found --wait=false || true
+              --ignore-not-found --wait=false --request-timeout=30s || true
           done < <(printf '%s\n' "${PREWARM_INFRAS}" \
             | awk 'BEGIN { RS = "[[:space:],]+" } NF { print }')
 
