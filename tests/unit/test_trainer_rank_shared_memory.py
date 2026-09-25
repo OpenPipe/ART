@@ -408,7 +408,8 @@ def test_shared_return_escapes_the_ep_routed_allowance(layer, checkpoint_grad, s
     shared_layer(layer)
     local_experts = layer.token_dispatcher.num_local_experts
     layer.config.context_parallel_size = layer.config.expert_model_parallel_size = 2
-    _hybridep(layer, 2).token_dispatcher.num_local_experts = local_experts
+    # EP2 halves the experts each rank owns.
+    _hybridep(layer, 2).token_dispatcher.num_local_experts = local_experts // 2
     # HybridEP's 1.5x allowance turns top-k 8 into 12 routed rows; the gated
     # shared return (doubled for checkpoint backward) is per local token.
     assert (
