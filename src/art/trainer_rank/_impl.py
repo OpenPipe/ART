@@ -1250,6 +1250,19 @@ def _moe_combine_postprocess(dispatcher: Any, hidden_states: torch.Tensor):
     return result
 
 
+def _release_hybridep_state(manager: Any) -> None:
+    # The dispatched probabilities hold this layer's checkpoint graph, with its
+    # recomputed input and that input's gradient, until the next dispatch.
+    manager.routing_map = manager.token_probs = manager.dispatched_probs = None
+
+
+def _hybridep_combine_postprocess(dispatcher: Any, hidden_states: torch.Tensor):
+    result = type(dispatcher).combine_postprocess(dispatcher, hidden_states)
+    # Backward saves its own; the next setup and dispatch recreate these.
+    _release_hybridep_state(dispatcher._comm_manager)
+    return result
+
+
 def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
     for chunk in model:
         for module in chunk.modules():
@@ -1258,8 +1271,25 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
                 continue
             from megatron.core.transformer.moe.token_dispatcher import (
                 MoEAlltoAllTokenDispatcher,
+                MoEFlexTokenDispatcher,
+                _HybridEPManager,
             )
 
+            if (
+                type(dispatcher) is MoEFlexTokenDispatcher
+                and type(getattr(dispatcher, "_comm_manager", None)) is _HybridEPManager
+                and "combine_postprocess" not in vars(dispatcher)
+                and getattr(dispatcher.config, "cuda_graph_impl", "none") == "none"
+            ):
+                # HybridEP keeps its routing inputs and dispatched probabilities
+                # after combine; CUDA graph capture reads them back instead.
+                setattr(
+                    dispatcher,
+                    "combine_postprocess",
+                    partial(_hybridep_combine_postprocess, dispatcher),
+                )
+                _release_hybridep_state(dispatcher._comm_manager)
+                continue
             if type(dispatcher) is not MoEAlltoAllTokenDispatcher or (
                 "dispatch_preprocess" in vars(dispatcher)
             ):
