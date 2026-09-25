@@ -699,7 +699,7 @@ class _FlexRouterLayer(torch.nn.Module):
         return value + 0.2 * dispatcher.combine_postprocess(combined)
 
 
-def _run_checkpointed_flex_router(model):
+def _run_checkpointed_flex_router(model, *, install_before_backward=False):
     model.zero_grad(set_to_none=True)
     initial = torch.linspace(-1, 1, 88).reshape(1, 11, 8).requires_grad_()
     inputs = []
@@ -719,6 +719,9 @@ def _run_checkpointed_flex_router(model):
             checkpointed(layer), False, hidden
         )
     loss = hidden.square().sum()
+    if install_before_backward:
+        # This forward ran unadapted; installation must release its state.
+        _configure_moe_dispatcher_caches([model])
     loss.backward()
     gc.collect()
     assert len(inputs) == len(model)
@@ -735,27 +738,101 @@ def _run_checkpointed_flex_router(model):
     return loss.detach(), gradients, alive
 
 
-def test_hybridep_state_releases_checkpoint_inputs(cpu_hybridep):
+@pytest.mark.parametrize("pending_graph", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_hybridep_state_releases_checkpoint_inputs(
+    cpu_hybridep, compiled, pending_graph
+):
     torch.manual_seed(954)
     model = torch.nn.ModuleList([_FlexRouterLayer() for _ in range(4)])
+    backend = CompileCounterWithBackend("aot_eager") if compiled else None
+    if backend is not None:
+        model = torch.nn.ModuleList(
+            [
+                cast(torch.nn.Module, torch.compile(layer, backend=backend))
+                for layer in model
+            ]
+        )
     original = MoEFlexTokenDispatcher.combine_postprocess
-    reference_loss, reference_grads, retained = _run_checkpointed_flex_router(model)
-    # Upstream HybridEP keeps each layer's checkpoint graph after backward.
-    assert all(retained)
-    _configure_moe_dispatcher_caches([model])
-    dispatchers = [cast(Any, layer).token_dispatcher for layer in model]
-    for dispatcher in dispatchers:
-        assert isinstance(dispatcher.combine_postprocess, partial)
-        assert dispatcher._comm_manager.token_probs is None
-    loss, gradients, retained = _run_checkpointed_flex_router(model)
-    assert not any(retained)
-    assert torch.equal(loss, reference_loss)
-    for actual, expected in zip(gradients, reference_grads, strict=True):
-        assert torch.equal(actual, expected)
-    assert MoEFlexTokenDispatcher.combine_postprocess is original
-    adapted = [dispatcher.combine_postprocess for dispatcher in dispatchers]
-    _configure_moe_dispatcher_caches([model])
-    assert [dispatcher.combine_postprocess for dispatcher in dispatchers] == adapted
+    try:
+        reference_loss, reference_grads, retained = _run_checkpointed_flex_router(model)
+        # Upstream HybridEP keeps each layer's checkpoint graph after backward.
+        assert all(retained)
+        # Install into the already-warmed (compiled) model without a reset.
+        if not pending_graph:
+            _configure_moe_dispatcher_caches([model])
+        loss, gradients, retained = _run_checkpointed_flex_router(
+            model, install_before_backward=pending_graph
+        )
+        assert not any(retained)
+        assert torch.equal(loss, reference_loss)
+        for actual, expected in zip(gradients, reference_grads, strict=True):
+            assert torch.equal(actual, expected)
+        dispatchers = [cast(Any, layer).token_dispatcher for layer in model]
+        for dispatcher in dispatchers:
+            assert isinstance(dispatcher.combine_postprocess, partial)
+            assert dispatcher._comm_manager.token_probs is None
+        assert MoEFlexTokenDispatcher.combine_postprocess is original
+        adapted = [dispatcher.combine_postprocess for dispatcher in dispatchers]
+        _configure_moe_dispatcher_caches([model])
+        assert [d.combine_postprocess for d in dispatchers] == adapted
+        if backend is not None:
+            assert backend.frame_count > 0
+    finally:
+        torch.compiler.reset()
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_hybridep_state_allows_outstanding_forwards_and_repeated_backward(
+    cpu_hybridep, compiled, checkpointed
+):
+    torch.manual_seed(848)
+    reference = torch.nn.Sequential(_FlexRouterLayer(), _FlexRouterLayer())
+    adapted = deepcopy(reference)
+    _configure_moe_dispatcher_caches([adapted])
+    if compiled:
+        reference = cast(torch.nn.Module, torch.compile(reference, backend="aot_eager"))
+        adapted = cast(torch.nn.Module, torch.compile(adapted, backend="aot_eager"))
+
+    def run(model):
+        inputs = [
+            torch.linspace(-1 + offset, 1 + offset, 88)
+            .reshape(1, 11, 8)
+            .requires_grad_()
+            for offset in (0, 0.3)
+        ]
+        outputs = [
+            mcore_random.CheckpointFunction.apply(model, False, value)
+            if checkpointed
+            else model(value)
+            for value in inputs
+        ]
+        losses = [output.square().sum() for output in outputs]
+        losses[1].backward(retain_graph=True)
+        losses[0].backward()
+        losses[1].backward()
+        gradients = []
+        for tensor in [*inputs, *model.parameters()]:
+            assert tensor.grad is not None
+            gradients.append(tensor.grad.clone())
+        return [output.detach() for output in outputs], gradients
+
+    try:
+        expected_outputs, expected_grads = run(reference)
+        outputs, grads = run(adapted)
+        for actual, expected in zip(
+            [*outputs, *grads], [*expected_outputs, *expected_grads], strict=True
+        ):
+            assert torch.equal(actual, expected)
+        for module in adapted.modules():
+            if isinstance(module, _FlexRouterLayer):
+                comm = module.token_dispatcher._comm_manager
+                assert comm.routing_map is None
+                assert comm.token_probs is None
+                assert comm.dispatched_probs is None
+    finally:
+        torch.compiler.reset()
 
 
 def test_hybridep_state_released_after_each_combine(cpu_hybridep):
@@ -774,10 +851,24 @@ def test_hybridep_state_released_after_each_combine(cpu_hybridep):
     assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
 
 
-@pytest.mark.parametrize("case", ["deepep", "cuda_graph", "custom_combine"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "deepep",
+        "cuda_graph",
+        "custom_combine",
+        "dispatcher_subclass",
+        "manager_subclass",
+    ],
+)
 def test_other_flex_dispatchers_keep_their_state(cpu_hybridep, case):
     layer = _FlexRouterLayer("deepep" if case == "deepep" else "hybridep")
     dispatcher = layer.token_dispatcher
+    if case == "dispatcher_subclass":
+        dispatcher.__class__ = type("CustomFlex", (MoEFlexTokenDispatcher,), {})
+    if case == "manager_subclass":
+        manager_type = type(dispatcher._comm_manager)
+        dispatcher._comm_manager.__class__ = type("CustomManager", (manager_type,), {})
     if case == "cuda_graph":
         # CUDA graph capture reads routing inputs back from the manager.
         dispatcher.config.cuda_graph_impl = "transformer_engine"
