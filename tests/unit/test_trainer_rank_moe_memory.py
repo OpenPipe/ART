@@ -188,6 +188,41 @@ def test_sharded_path_unchanged(layer, field):
     )
 
 
+def _hybridep(layer, ep: int, manager: str = "hybridep"):
+    from megatron.core.transformer.moe import token_dispatcher
+
+    dispatcher = object.__new__(token_dispatcher.MoEFlexTokenDispatcher)
+    dispatcher.config = layer.config
+    dispatcher.ep_size, dispatcher.tp_size = ep, 1
+    managers = {
+        "hybridep": token_dispatcher._HybridEPManager,
+        "deepep": token_dispatcher._DeepepManager,
+    }
+    dispatcher._comm_manager = object.__new__(managers[manager])
+    layer.token_dispatcher = dispatcher
+    return layer
+
+
+@pytest.mark.parametrize("ep", [2, 4])
+def test_hybridep_prices_routed_rows_with_imbalance_allowance(layer, ep):
+    # HybridEP gives each rank the pairs routed to its local experts: balanced
+    # routing matches EP1's top-k rows per local token, with a 1.5x allowance.
+    single = _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1))
+    sharded = ParallelShape(tp=1, cp=ep, ep=ep)
+    expert = _moe_output_bytes_per_token([_hybridep(layer, ep)], sharded)
+    # Top-k 8 routed rows per local token become 12; no shared experts here.
+    assert single > 0 and expert == single // 8 * 12
+
+
+@pytest.mark.parametrize(
+    "manager,ep,shape_ep", [("deepep", 2, 2), ("hybridep", 2, 4), ("hybridep", 1, 1)]
+)
+def test_other_flex_dispatchers_stay_unmodeled(layer, manager, ep, shape_ep):
+    dispatcher = _hybridep(layer, ep, manager)
+    shape = ParallelShape(tp=1, cp=1, ep=shape_ep)
+    assert _moe_output_bytes_per_token([dispatcher], shape) == 0
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -492,3 +527,49 @@ def test_unknown_enclosing_lifetimes_keep_previous_fc2_floor(
     }
     setattr(sites[site], attribute, value)
     assert _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1)) == 106_496
+
+
+def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
+    from megatron.core.transformer.moe import fused_a2a
+
+    from art.trainer_rank._impl import _hybridep_buffer_bytes
+
+    # Two ranks' tokens to one rank: BF16 H, FP32 probs and a routing-map byte
+    # per expert (256), and FP32 scaling factors per H/128.
+    assert _hybridep_buffer_bytes(1000, 2, 2048, 256) == 2000 * (4096 + 1280 + 64)
+    assert _hybridep_buffer_bytes(0, 2, 2048, 256) == 0
+    rank = _rank()
+    rank.runtime.provider.expert_model_parallel_size = 2
+    rank.runtime.provider.num_moe_experts = 256
+    plan = rank._plan_flat_forward(
+        [ForwardInput(input_tokens=torch.arange(64), target_tokens=torch.arange(64))]
+    )
+    monkeypatch.setattr(rank, "_topology", lambda: SimpleNamespace(tp=1, cp=2))
+    monkeypatch.setattr(rank, "_plan_group_rows", lambda plan: ((600, True),))
+    monkeypatch.setattr(
+        "art.megatron.train._hybridep_token_capacity", lambda sequence, cp: 1000
+    )
+
+    def held(capacity):
+        config = SimpleNamespace(max_num_of_tokens_per_rank=capacity)
+        return SimpleNamespace(configurer=SimpleNamespace(buffer_config=config))
+
+    full = _hybridep_buffer_bytes(1000, 2, 2048, 256)
+    for current, growth in (
+        (None, full),
+        (held(400), full - _hybridep_buffer_bytes(400, 2, 2048, 256)),
+        (held(1000), 0),
+    ):
+        monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", current)
+        assert rank._plan_hybridep_growth_bytes(plan) == growth
+    # The growth enters required memory, not forward retention.
+    rank._update_memory_profile(plan, 10**9, retained_bytes=10**8)
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+    grown = rank._plan_cost(plan)
+    monkeypatch.setattr(rank, "_plan_hybridep_growth_bytes", lambda plan: 0)
+    base = rank._plan_cost(plan)
+    assert grown.required - base.required == pytest.approx(full * 1.1, abs=2)
+    assert grown.retained == base.retained < base.required
+    rank.runtime.provider.expert_model_parallel_size = 1
+    monkeypatch.undo()
+    assert rank._plan_hybridep_growth_bytes(plan) == 0
