@@ -596,8 +596,9 @@ def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
     base = rank._plan_cost(plan)
     charged = int(full * 1.1)
     assert grown.retained == base.retained < base.required
-    assert grown.checkpoint_workspace - base.checkpoint_workspace == full
-    assert grown.required - base.required in (charged, charged + 1)
+    assert grown.hybridep_growth == full and base.hybridep_growth == 0
+    assert grown.checkpoint_workspace == base.checkpoint_workspace
+    assert grown.required - base.required == charged
     # A split pays it once, however many children would grow the buffer.
     split = rank._split_required_memory([grown, grown, grown])
     extra = split - rank._split_required_memory([base, base, base])
@@ -605,3 +606,25 @@ def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
     rank.runtime.provider.expert_model_parallel_size = 1
     monkeypatch.undo()
     assert rank._plan_hybridep_growth_bytes(plan) == 0
+
+
+def test_split_charges_the_largest_hybridep_growth_beside_any_child_peak():
+    from art.trainer_rank._impl import _SubforwardCost
+
+    def child(workspace: int, growth: int) -> _SubforwardCost:
+        peak = int((workspace + 1) * 1.1)
+        return _SubforwardCost(
+            required=peak + int(growth * 1.1),
+            retained=0,
+            checkpoint_workspace=workspace,
+            checkpoint_input_gradient=1,
+            hybridep_growth=growth,
+        )
+
+    # The first child grows the buffer most; the second has the larger
+    # workspace, which runs while that buffer is still allocated.
+    required = TrainerRank._split_required_memory(
+        [child(10_000, 10_000), child(15_000, 1_000)]
+    )
+    assert required >= int((2 + 15_000 + 10_000) * 1.1)
+    assert required >= int((15_000 + 1) * 1.1) + int(10_000 * 1.1)

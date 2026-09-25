@@ -1048,6 +1048,9 @@ class _SubforwardCost:
     checkpoint_input_gradient: int = 0
     # Already in required; backward allowance must not reorder forward execution.
     checkpoint_peak_increment: int = 0
+    # HybridEP buffer growth before the safety factor. It is in required, not
+    # retained, and persists across a split, which charges the largest once.
+    hybridep_growth: int = 0
 
     @property
     def ephemeral(self) -> int:
@@ -3340,16 +3343,28 @@ class TrainerRank:
 
     @staticmethod
     def _split_required_memory(costs: Sequence[_SubforwardCost]) -> int:
-        required = sum(cost.retained for cost in costs) + max(
-            cost.ephemeral for cost in costs
+        # A grown HybridEP buffer persists into later children: charge the
+        # largest growth once, beside whichever child peaks highest.
+        growth = max(cost.hybridep_growth for cost in costs)
+        required = (
+            sum(cost.retained for cost in costs)
+            + max(
+                cost.ephemeral - int(cost.hybridep_growth * _MEMORY_SAFETY_FACTOR)
+                for cost in costs
+            )
+            + int(growth * _MEMORY_SAFETY_FACTOR)
         )
         if any(cost.checkpoint_input_gradient for cost in costs):
             # The caller owns all returned graphs. A calibrated forward-retained
             # discount cannot replace the sum of their input-gradient extents.
-            checkpoint = sum(
-                cost.checkpoint_retained + cost.checkpoint_input_gradient
-                for cost in costs
-            ) + max(cost.checkpoint_workspace for cost in costs)
+            checkpoint = (
+                sum(
+                    cost.checkpoint_retained + cost.checkpoint_input_gradient
+                    for cost in costs
+                )
+                + max(cost.checkpoint_workspace for cost in costs)
+                + growth
+            )
             required = max(required, int(checkpoint * _MEMORY_SAFETY_FACTOR))
         return required
 
@@ -4121,13 +4136,9 @@ class TrainerRank:
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
-        # HybridEP buffer growth stays allocated through backward, but is not
-        # forward retention: split plans charge it once, via max workspace.
-        checkpoint_workspace = (
-            max(checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1])
-            + hybridep_growth_bytes
+        checkpoint_workspace = max(
+            checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
-        required += int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR)
         forward_required = required
         if gradient:
             required = max(
@@ -4137,13 +4148,16 @@ class TrainerRank:
                     * _MEMORY_SAFETY_FACTOR
                 ),
             )
+        # HybridEP buffer growth stays allocated through the forward and
+        # backward peaks, but is not forward retention.
         return _SubforwardCost(
-            required=required,
+            required=required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR),
             retained=retained,
             checkpoint_retained=checkpoint_retained,
             checkpoint_workspace=checkpoint_workspace,
             checkpoint_input_gradient=gradient,
             checkpoint_peak_increment=required - forward_required,
+            hybridep_growth=hybridep_growth_bytes,
         )
 
     def _retained_memory_bytes(
