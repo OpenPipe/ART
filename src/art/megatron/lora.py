@@ -6,9 +6,11 @@ import functools
 import gc
 import importlib
 import json
+import logging
 import math
 import os
 import re
+import time
 from typing import Any, Callable, Literal, NamedTuple, TypeVar, cast
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -78,6 +80,8 @@ def use_lora_slot(ref: LoRASlotRef | None) -> Iterator[None]:
         _CURRENT_LORA_SLOT.reset(token)
 
 
+_logger = logging.getLogger(__name__)
+
 # Dynamo compilation can leave reference cycles whose frames still hold the
 # traced call's real activations. A grad-mode recompile during backward's first
 # recompute would otherwise keep one layer's MoE tensors alive through the rest
@@ -90,20 +94,34 @@ def _mark_compile_garbage(_args: Any) -> None:
     _COMPILE_GARBAGE = True
 
 
-def _collect_compile_garbage() -> None:
-    global _COMPILE_GARBAGE
-    if _COMPILE_GARBAGE and not torch.compiler.is_compiling():
-        _COMPILE_GARBAGE = False
-        gc.collect()
+def install_compile_garbage_collection() -> bool:
+    """Mark compiles for collection at checkpointed calls; False when disabled.
 
-
-def install_compile_garbage_collection() -> None:
-    """Collect dynamo's cyclic garbage at the next checkpointed call after a compile."""
+    Idempotent, and re-registers after ``torch._dynamo.reset()`` clears the
+    callback handler.
+    """
     if os.environ.get("ART_COLLECT_COMPILE_GARBAGE", "1") in {"0", "false", "False"}:
-        return
+        return False
     handler = torch._dynamo.callback_handler
     if _mark_compile_garbage not in handler.end_callbacks:
         handler.register_end_callback(_mark_compile_garbage)
+    return True
+
+
+def _collect_compile_garbage() -> None:
+    global _COMPILE_GARBAGE
+    # Check tracing first: a traced read of the global would guard on it.
+    if torch.compiler.is_compiling() or not install_compile_garbage_collection():
+        return
+    if _COMPILE_GARBAGE:
+        _COMPILE_GARBAGE = False
+        started = time.perf_counter()
+        collected = gc.collect()
+        _logger.debug(
+            "Collected %d objects after a dynamo compile in %.3fs",
+            collected,
+            time.perf_counter() - started,
+        )
 
 
 def _with_captured_lora_slot(function: _F) -> _F:
@@ -117,6 +135,8 @@ def _with_captured_lora_slot(function: _F) -> _F:
             return function(*args, **kwargs)
         finally:
             _CURRENT_LORA_SLOT.reset(token)
+            # A compile inside this call has unwound; collect before its backward.
+            _collect_compile_garbage()
 
     return cast(_F, wrapped)
 

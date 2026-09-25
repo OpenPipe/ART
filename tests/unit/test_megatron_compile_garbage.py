@@ -3,6 +3,7 @@ import weakref
 
 import pytest
 import torch
+import torch.utils.checkpoint
 
 lora = pytest.importorskip("art.megatron.lora")
 
@@ -22,6 +23,7 @@ def _garbage_holding_tensor() -> weakref.ref:
 
 @pytest.fixture
 def no_automatic_gc(monkeypatch):
+    monkeypatch.delenv("ART_COLLECT_COMPILE_GARBAGE", raising=False)
     monkeypatch.setattr(lora, "_COMPILE_GARBAGE", False)
     gc.collect()
     gc.disable()
@@ -47,18 +49,80 @@ def test_next_checkpointed_call_collects_compile_garbage(no_automatic_gc):
     assert held() is not None
 
 
-def test_collection_is_registered_once_and_can_be_disabled(monkeypatch):
+def test_compile_inside_a_call_is_collected_before_it_returns(no_automatic_gc):
+    # The compiling call's own garbage is freed before its backward runs.
+    held = []
+
+    def compiling_call():
+        held.append(_garbage_holding_tensor())
+        lora._mark_compile_garbage(None)
+
+    lora._with_captured_lora_slot(compiling_call)()
+    assert held[0]() is None and lora._COMPILE_GARBAGE is False
+
+
+def test_tracing_keeps_the_mark_for_a_later_call(no_automatic_gc, monkeypatch):
+    wrapped = lora._with_captured_lora_slot(lambda: None)
+    held = _garbage_holding_tensor()
+    lora._mark_compile_garbage(None)
+    with monkeypatch.context() as tracing:
+        tracing.setattr(torch.compiler, "is_compiling", lambda: True)
+        wrapped()
+    assert held() is not None and lora._COMPILE_GARBAGE is True
+    lora._with_captured_lora_slot(lambda: None)()
+    assert held() is None
+
+
+def test_registration_survives_dynamo_reset_and_can_be_disabled(monkeypatch):
     handler = torch._dynamo.callback_handler
     callbacks = list(handler.end_callbacks)
-    monkeypatch.setattr(handler, "end_callbacks", [])
+    monkeypatch.setattr(handler, "end_callbacks", [])  # as torch._dynamo.reset()
     try:
         monkeypatch.setenv("ART_COLLECT_COMPILE_GARBAGE", "0")
-        lora.install_compile_garbage_collection()
+        assert lora.install_compile_garbage_collection() is False
+        lora._with_captured_lora_slot(lambda: None)()
         assert handler.end_callbacks == []
         monkeypatch.delenv("ART_COLLECT_COMPILE_GARBAGE")
-        lora.install_compile_garbage_collection()
-        lora.install_compile_garbage_collection()
+        lora._with_captured_lora_slot(lambda: None)()
+        lora._with_captured_lora_slot(lambda: None)()
         assert handler.end_callbacks == [lora._mark_compile_garbage]
     finally:
         monkeypatch.setattr(handler, "end_callbacks", callbacks)
-    assert lora._mark_compile_garbage in callbacks
+
+
+def test_real_compile_marks_garbage(no_automatic_gc):
+    torch._dynamo.reset()
+    lora.install_compile_garbage_collection()
+
+    def double(x):
+        return x * 2 + 1
+
+    torch.compile(double, backend="eager")(torch.ones(3))
+    assert lora._COMPILE_GARBAGE is True
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_checkpoint_backward_with_compile_keeps_gradients(
+    no_automatic_gc, use_reentrant
+):
+    torch._dynamo.reset()
+    lora.install_compile_garbage_collection()
+    torch.manual_seed(0)
+    weight = torch.randn(8, 8)
+
+    def layer(x, w):
+        return torch.tanh(x @ w).square()
+
+    compiled = torch.compile(layer, backend="eager")
+    x = torch.randn(4, 8, requires_grad=True)
+    w = weight.clone().requires_grad_()
+    reference_x = x.detach().clone().requires_grad_()
+    reference_w = weight.clone().requires_grad_()
+    layer(reference_x, reference_w).sum().backward()
+    # The patched checkpoint wraps the function, so recompute runs the
+    # collection hook, and compiles (forward and recompute) set the mark.
+    out = torch.utils.checkpoint.checkpoint(compiled, x, w, use_reentrant=use_reentrant)
+    out.sum().backward()
+    torch.testing.assert_close(x.grad, reference_x.grad)
+    torch.testing.assert_close(w.grad, reference_w.grad)
+    assert lora._COMPILE_GARBAGE is False
