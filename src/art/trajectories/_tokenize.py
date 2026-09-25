@@ -4464,6 +4464,58 @@ def _source_covers_complete_sampled_message(
     ) == normalize_chat_message(projected[0])
 
 
+def _preserve_literal_thinking_off_content(
+    history: ChatCompletionsHistory,
+    messages: list[dict[str, Any]],
+    template: object,
+    kwargs: Mapping[str, object],
+) -> None:
+    # This Qwen3.5 template treats any </think> in unstructured content as a
+    # reasoning separator, even with thinking disabled. Restrict the render-copy
+    # adaptation to its exact preserved template; other templates may interpret
+    # an empty reasoning_content field differently.
+    if (
+        not isinstance(template, str)
+        or sha256(template.encode()).hexdigest()
+        != "098047d425a6673b1fe1a82a197a481616e53a283beaa8cb76cbb74d38ca6644"
+        or kwargs.get("enable_thinking") is not False
+        or kwargs.get("preserve_thinking") is not True
+    ):
+        return
+    for message, source in zip(messages, history.message_sources, strict=True):
+        if (
+            source is None
+            or not isinstance(source.exchange, ChatCompletionsExchange)
+            or source.choice_index is None
+            or message.get("role") != "assistant"
+            or not isinstance(content := message.get("content"), str)
+            or "</think>" not in content
+        ):
+            continue
+        request_kwargs = source.exchange.request.get("chat_template_kwargs")
+        if (
+            not isinstance(request_kwargs, Mapping)
+            or request_kwargs.get("enable_thinking") is not False
+        ):
+            continue
+        choice = _chat_choice(source)
+        # Visible-only histories may omit structured reasoning present in the
+        # source response. Preserve both that source and normalized aliases.
+        if any(
+            value is not None and not (isinstance(value, str) and value == "")
+            for value in (
+                message.get("reasoning"),
+                message.get("reasoning_content"),
+                _field(choice.message, "reasoning"),
+                _field(choice.message, "reasoning_content"),
+            )
+        ):
+            continue
+        prompt, output, _ = _chat_choice_tokens(choice, source.exchange.response)
+        if prompt is not None and output is not None:
+            message["reasoning_content"] = ""
+
+
 def _tokenize_chat_view(
     history: ChatCompletionsHistory,
     *,
@@ -4510,6 +4562,7 @@ def _tokenize_chat_view(
         **default_chat_template_kwargs_for_template(template),
         **explicit_kwargs,
     }
+    _preserve_literal_thinking_off_content(history, messages, template, kwargs)
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
     segmented = False
 
