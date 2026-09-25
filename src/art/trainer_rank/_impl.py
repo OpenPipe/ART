@@ -1032,6 +1032,17 @@ _AnyForwardPlan = _FlatForwardPlan | _SplitForwardPlan
 
 
 @dataclass(frozen=True)
+class _GroupLayout:
+    """One packed group's CP layouts on every rank, for layout-aware pricing."""
+
+    attention_rows: tuple[int, ...]
+    gdn_rows: tuple[int, ...] | None
+    # What each rank's recomputed CP attention keeps for backward beyond its
+    # own-row activations (``retained_stage_record_bytes``).
+    attention_retained: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class _SubforwardCost:
     """Memory terms of one candidate subforward while all graphs stay live.
 
@@ -4157,8 +4168,10 @@ class TrainerRank:
             raise ValueError("Invalid constructor converted-weight stages")
         if type(shared) is not int or not 0 <= shared <= coefficient:
             raise ValueError("Invalid constructor shared-expert coefficient")
-        routed = rows if routed_rows is None else max(0, min(rows, routed_rows))
-        return (rows - routed) * shared + (
+        # A rank can receive more routed rows than it holds (an uneven CP
+        # split); the shared part then stays on the routed rows' count.
+        routed = rows if routed_rows is None else max(0, routed_rows)
+        return max(0, rows - routed) * shared + (
             max(
                 routed * coefficient,
                 *(routed * per_row + fixed for per_row, fixed in stages),
@@ -4172,11 +4185,14 @@ class TrainerRank:
         group_rows: tuple[tuple[int, bool], ...],
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         routed_rows: tuple[int, ...] | None = None,
+        layouts: tuple[_GroupLayout, ...] | None = None,
     ) -> tuple[int, int]:
         """Conservative saved-boundary charge and one recomputed layer's workspace.
 
         ``routed_rows`` are each group's balanced dispatched rows per rank
-        (``_plan_group_routed_rows``); by default, its local rows.
+        (``_plan_group_routed_rows``); by default, its local rows. With
+        ``layouts`` (``_plan_group_layouts``), price every rank on its own CP
+        layouts instead of the busiest rank's rows (``_layout_checkpoint_floor``).
         Count actual local full/uniform/1 boundaries, including aliases, rather
         than claiming measured distinct storage. Only this call's new groups
         enter the term; already-live graphs remain in the availability baseline.
@@ -4241,9 +4257,12 @@ class TrainerRank:
             or getattr(decoder, "_forward_pre_hooks", None)
         ):
             return 0, 0
+        refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
+        routed = (None,) * len(group_rows) if routed_rows is None else routed_rows
+        if layouts is not None and all(grad for _, grad in group_rows):
+            return self._layout_checkpoint_floor(decoder.layers, refs, routed, layouts)
         retained = gradient_rows * layers * self._hidden_size * 2
         moe = self._checkpoint_moe_bytes_per_token() if gradient_rows else 0
-        refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
         # Beside the mixer, the recomputed layer keeps its post-mixer residual
         # and pre-MLP norm output, and its MoE stage its routing state.
         mixer = (
@@ -4256,7 +4275,6 @@ class TrainerRank:
             if gradient_rows
             else 0
         )
-        routed = (None,) * len(group_rows) if routed_rows is None else routed_rows
         workspace = max(
             self._moe_workspace_bytes(
                 rows, routed_rows=dispatched, checkpoint_grad=grad, slot_ref=ref
@@ -4269,6 +4287,164 @@ class TrainerRank:
         if moe:
             workspace += self._te_workspace_growth_bytes()
         return retained, workspace
+
+    def _layout_checkpoint_floor(
+        self,
+        layers: Sequence[torch.nn.Module],
+        refs: tuple["LoRASlotRef | None", ...],
+        routed: tuple[int | None, ...],
+        layouts: tuple[_GroupLayout, ...],
+    ) -> tuple[int, int]:
+        """Each CP rank's boundaries and recomputed layer on its own layouts.
+
+        A saved layer input arrives in the GDN layout when the layer follows a
+        GDN layer in its island (``_art_gdn_island_boundary``), and in the
+        attention layout otherwise. A recomputed attention layer keeps its
+        activations on its attention rows plus what the CP executor keeps for
+        backward; a GDN layer keeps the GDN width on its GDN rows. Either one's
+        residual, norm, routing state and MoE stage use that layer's rows, and
+        routed rows the EP share. Traced CP2 ranks: boundaries match exactly and
+        attention within 0.3%. Returns the largest rank's boundaries and the
+        rest of the largest rank total, so the two sum to that total.
+        """
+        hidden = self._hidden_size * 2
+        gdn_inputs = sum(
+            getattr(
+                getattr(layer, "_art_gdn_island_boundary", None), "input_layout", ""
+            )
+            == "gdn"
+            for layer in layers
+        )
+        attention_inputs = len(layers) - gdn_inputs
+        widths = self._recomputed_mixer_widths(stage_buffers=False)
+        moe = self._checkpoint_moe_bytes_per_token()
+        beside = 2 * hidden + self._moe_checkpoint_state_bytes_per_token() if moe else 0
+        retained_by_rank: list[int] = []
+        totals: list[int] = []
+        for rank in range(len(layouts[0].attention_rows)):
+            retained = workspace = 0
+            for ref, dispatched, layout in zip(refs, routed, layouts, strict=True):
+                attention = max(1, layout.attention_rows[rank])
+                gdn = (
+                    attention
+                    if layout.gdn_rows is None
+                    else max(1, layout.gdn_rows[rank])
+                )
+                retained += hidden * (attention_inputs * attention + gdn_inputs * gdn)
+                for kind, rows, extra in (
+                    ("attention", attention, layout.attention_retained[rank]),
+                    ("gdn", gdn, 0),
+                ):
+                    if kind not in widths:
+                        continue
+                    stage = (
+                        rows * (widths[kind] + beside)
+                        + extra
+                        + self._moe_workspace_bytes(
+                            rows,
+                            routed_rows=dispatched,
+                            checkpoint_grad=True,
+                            slot_ref=ref,
+                        )
+                    )
+                    workspace = max(workspace, stage)
+            retained_by_rank.append(retained)
+            totals.append(retained + workspace)
+        retained = max(retained_by_rank)
+        workspace = max(totals) - retained
+        if moe:
+            workspace += self._te_workspace_growth_bytes()
+        return retained, workspace
+
+    def _plan_group_layouts(
+        self, plan: _FlatForwardPlan
+    ) -> tuple[_GroupLayout, ...] | None:
+        """Every rank's CP layouts per group, where layout pricing is modeled.
+
+        Only CP2 at TP1/PP1 with gradient groups, ART's CP core attention with
+        no softmax offset, and GDN layers marked with island boundaries; the
+        executor's retained set is validated there. Elsewhere ``None`` keeps
+        the busiest-rank pricing.
+        """
+        _dp, tp, cp, pp = plan.signature.topology
+        if (tp, cp, pp) != (1, 2, 1) or not plan.groups:
+            return None
+        if not all(group.grad_enabled for group in plan.groups):
+            return None
+        geometry = self._geometry
+        if not geometry.num_attention_heads or not geometry.kv_channels:
+            return None
+        try:
+            decoder = _language_model(self.runtime.model[0]).decoder
+            from art.megatron.context_parallel.core_attention import (
+                ArtContextParallelCoreAttention,
+            )
+        except (AttributeError, RuntimeError, ModuleNotFoundError):
+            return None
+        for layer in decoder.layers:
+            boundary = getattr(layer, "_art_gdn_island_boundary", None)
+            if boundary is not None and boundary.is_gdn:
+                continue
+            if self._gdn_layers and boundary is None:
+                return None
+            core = getattr(
+                getattr(layer, "self_attention", None), "core_attention", None
+            )
+            if (
+                type(core) is not ArtContextParallelCoreAttention
+                or getattr(core, "softmax_offset", None) is not None
+            ):
+                return None
+        from art.megatron.context_parallel.executor import retained_stage_record_bytes
+        from art.megatron.context_parallel.runtime import context_parallel_rank_layouts
+        from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
+        from art.megatron.training.microbatches import (
+            _context_parallel_config_for_provider,
+            _gdn_planner_config_for_provider,
+        )
+
+        topology = self._topology()
+        handler = self.runtime.model_support_handler
+        config = _context_parallel_config_for_provider(
+            self.runtime.provider, self.device, handler
+        )
+        head = int(geometry.kv_channels)
+        block = flash_sparse_block_size_for_head_dim(
+            head_dim=head, head_dim_v=head, device=self.device
+        )
+        layouts = []
+        for group in plan.groups:
+            batch = _pad_packed_batch(group.packed, multiple=int(topology.tp))
+            attention, gdn, rank_plans = context_parallel_rank_layouts(
+                group_ids=batch.group_ids,
+                parent_ids=batch.parent_ids,
+                topology=topology,
+                config=config,
+                original_seq_len=int(batch.tokens.shape[1]),
+                build_gdn_execution_spec=handler.build_gdn_execution_spec,
+                gdn_planner_config=_gdn_planner_config_for_provider(
+                    self.runtime.provider, handler
+                ),
+            )
+            layouts.append(
+                _GroupLayout(
+                    attention_rows=attention,
+                    gdn_rows=gdn,
+                    attention_retained=tuple(
+                        retained_stage_record_bytes(
+                            rank_plan,
+                            q_heads=int(geometry.num_attention_heads),
+                            kv_heads=int(geometry.num_query_groups),
+                            head_dim=head,
+                            value_head_dim=head,
+                            element_size=self._param_dtype_size,
+                            block_size=block,
+                        )
+                        for rank_plan in rank_plans
+                    ),
+                )
+            )
+        return tuple(layouts)
 
     def _te_workspace_growth_bytes(self) -> int:
         """Transformer Engine's cuBLAS workspaces, until its GEMMs allocate them.
@@ -4361,6 +4537,7 @@ class TrainerRank:
             gdn_segments=plan.grad_segment_count,
             group_rows=self._plan_group_rows(plan),
             group_routed_rows=self._plan_group_routed_rows(plan),
+            group_layouts=self._plan_group_layouts(plan),
             slot_refs=tuple(g.slot_ref for g in plan.groups),
             head_workspace_bytes=self._plan_head_workspace_bytes(plan),
             checkpoint_floor=_gdn_memory.plan_floor(self, plan),
@@ -4378,6 +4555,7 @@ class TrainerRank:
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
         group_routed_rows: tuple[int, ...] | None = None,
+        group_layouts: tuple[_GroupLayout, ...] | None = None,
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
         checkpoint_floor: tuple[int, int] = (0, 0),
@@ -4392,6 +4570,7 @@ class TrainerRank:
             gdn_segments=gdn_segments,
             group_rows=group_rows,
             group_routed_rows=group_routed_rows,
+            group_layouts=group_layouts,
             slot_refs=slot_refs,
             head_workspace_bytes=head_workspace_bytes,
             checkpoint_floor=checkpoint_floor,
@@ -4399,7 +4578,7 @@ class TrainerRank:
             include_checkpoint_input_gradient=False,
         )
         checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
-            group_rows, slot_refs, group_routed_rows
+            group_rows, slot_refs, group_routed_rows, group_layouts
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -7221,6 +7400,7 @@ class TrainerRank:
                 gdn_segments=forward.grad_segment_count,
                 group_rows=self._plan_group_rows(forward),
                 group_routed_rows=self._plan_group_routed_rows(forward),
+                group_layouts=self._plan_group_layouts(forward),
                 slot_refs=tuple(g.slot_ref for g in forward.groups),
                 head_workspace_bytes=self._plan_head_workspace_bytes(forward),
                 checkpoint_floor=_gdn_memory.plan_floor(self, forward),
@@ -8068,6 +8248,7 @@ class TrainerRank:
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
         group_routed_rows: tuple[int, ...] | None = None,
+        group_layouts: tuple[_GroupLayout, ...] | None = None,
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
         checkpoint_floor: tuple[int, int] = (0, 0),
@@ -8160,7 +8341,7 @@ class TrainerRank:
             ),
         )
         retained, workspace = self._checkpoint_memory_floor(
-            group_rows, slot_refs, group_routed_rows
+            group_rows, slot_refs, group_routed_rows, group_layouts
         )
         static_compute = max(
             static_compute,
@@ -8299,18 +8480,26 @@ class TrainerRank:
           more rows; its hidden-width input exchange and value-width output
           allowance price that (88 KB measured at CP2, 94 KB priced).
         """
+        return max(self._recomputed_mixer_widths().values(), default=0)
+
+    def _recomputed_mixer_widths(self, *, stage_buffers: bool = True) -> dict[str, int]:
+        """Recomputed attention and GDN mixer bytes per row, by layer type.
+
+        ``stage_buffers=False`` leaves out the CP attention stage allowance, for
+        callers that price the executor's stage buffers from its stage plan.
+        """
         geometry = self._geometry
         hidden = self._hidden_size
         tp = max(1, self._topology_key()[1])
         cp = self._topology_key()[2] > 1
-        widths = []
+        widths: dict[str, float] = {}
         if self._gdn_layers < self._num_layers:
             attention, _gdn = self._mixer_activation_widths()
-            if cp:
+            if cp and stage_buffers:
                 q = geometry.num_attention_heads * geometry.kv_channels or hidden
                 kv = geometry.num_query_groups * geometry.kv_channels or hidden
                 attention += (3 * q + 2 * kv) / tp
-            widths.append(attention)
+            widths["attention"] = attention
         if self._gdn_layers:
             key = geometry.gdn_key_heads * geometry.gdn_key_head_dim
             value = geometry.gdn_value_heads * geometry.gdn_value_head_dim
@@ -8319,8 +8508,10 @@ class TrainerRank:
             gdn = hidden + (2 * key + normalized + 6 * value + chunk) / tp
             if cp:
                 gdn += hidden + value / tp
-            widths.append(gdn)
-        return int(max(widths, default=0) * self._param_dtype_size)
+            widths["gdn"] = gdn
+        return {
+            kind: int(width * self._param_dtype_size) for kind, width in widths.items()
+        }
 
     def _gdn_segment_layer_bytes(self) -> float:
         """Initial and final fp32 recurrent states plus convolution history."""

@@ -433,6 +433,55 @@ def context_parallel_rank_model_token_counts(
     )
 
 
+def context_parallel_rank_layouts(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+    build_gdn_execution_spec: bool,
+    gdn_planner_config: Any | None = None,
+) -> tuple[tuple[int, ...], tuple[int, ...] | None, tuple[RankRuntimePlan, ...]]:
+    """Each CP rank's attention rows, GDN rows and attention stage plan.
+
+    Uses the cached planning bundle and per-rank runtime plans that execution
+    builds, so a memory estimate sees the layouts the ranks will run.
+    """
+    planning_key, bundle, _group_ids_cpu, _parent_ids_cpu = (
+        _get_or_build_planning_bundle(
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+            topology=topology,
+            config=config,
+            original_seq_len=original_seq_len,
+            build_gdn_execution_spec=build_gdn_execution_spec,
+        )
+    )
+    attention = tuple(bundle.token_layout_index.token_counts_by_rank)
+    gdn = None
+    if build_gdn_execution_spec:
+        gdn = tuple(
+            _plan_gdn_global_execution(
+                planning_key=planning_key,
+                bundle=bundle,
+                topology=topology,
+                gdn_planner_config=gdn_planner_config,
+            ).gdn_token_counts_by_rank
+        )
+    plans = tuple(
+        _get_or_build_bundle_rank_plan(
+            planning_key=planning_key,
+            bundle=bundle,
+            original_seq_len=original_seq_len,
+            target_rank=rank,
+            block_size=config.block_size,
+        )
+        for rank in range(len(attention))
+    )
+    return attention, gdn, plans
+
+
 def context_parallel_model_token_total(
     *,
     group_ids: torch.Tensor,

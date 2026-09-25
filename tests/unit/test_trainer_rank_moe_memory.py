@@ -606,7 +606,7 @@ def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
     monkeypatch.setattr(
         rank,
         "_checkpoint_memory_floor",
-        lambda rows, refs=None, routed=None: (10**7, 10**6),
+        lambda rows, refs=None, routed=None, layouts=None: (10**7, 10**6),
     )
     grown = rank._plan_cost(plan)
     monkeypatch.setattr(rank, "_plan_hybridep_growth_bytes", lambda plan: 0)
