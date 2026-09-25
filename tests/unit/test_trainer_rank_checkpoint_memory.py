@@ -535,7 +535,7 @@ def test_recomputed_attention_is_priced_beside_the_moe_stage(cp, expected):
         # Hybrid: GDN (74 KB) is larger at CP1, CP attention (95 KB) at CP2.
         (1, 30, 73728),
         (2, 30, 95232),
-        # GDN only: its CP rank-exchange copies add a key and a value row.
+        # GDN only: CP exchanges add a hidden-width and a value-width row.
         (1, 40, 73728),
         (2, 40, 86016),
     ],
@@ -586,7 +586,8 @@ def test_gdn_width_follows_hidden_key_and_value_separately(cp):
     r._gdn_layers = r._num_layers
     r._topology_key = lambda: (1, 1, cp, 1)
     key, value = 16 * 128, 48 * 128
-    width = 5120 + 6 * key + 5 * value + 64 * 48
+    # q and k are l2-normalized after expansion to the 48 value heads.
+    width = 5120 + 2 * key + 2 * 48 * 128 + 5 * value + 64 * 48
     if cp > 1:
         width += 5120 + value
     assert r._recomputed_mixer_bytes_per_token() == 2 * width

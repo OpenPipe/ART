@@ -8029,11 +8029,12 @@ class TrainerRank:
           stage-padded Q/K/V, the stage output and a core-attention copy
           (94 KB measured at CP2, 95 KB priced). CP above 2 uses the CP2
           allowance; ranks with several remote stages may keep more.
-        - GDN: norm output, q and k (their fp32 l2norm copies count twice),
-          v, z, two segment-layout tensors, the gated-norm output and the
-          chunk decay matrix (75 KB measured at CP1, 74 KB priced). A
-          context-parallel rank adds its hidden-width input and value-width
-          output exchanges (84 KB measured at CP2, 86 KB priced).
+        - GDN: norm output, q and k, their l2norm outputs expanded to the
+          value heads, v, z, two segment-layout tensors, the gated-norm
+          output and the chunk decay matrix (75 KB measured at CP1, 74 KB
+          priced). A context-parallel rank adds its hidden-width input
+          exchange (measured) and value-width output projection (from
+          source): 84 KB measured at CP2, 86 KB priced.
         """
         geometry = self._geometry
         hidden = self._hidden_size
@@ -8050,8 +8051,9 @@ class TrainerRank:
         if self._gdn_layers:
             key = geometry.gdn_key_heads * geometry.gdn_key_head_dim
             value = geometry.gdn_value_heads * geometry.gdn_value_head_dim
+            normalized = 2 * geometry.gdn_value_heads * geometry.gdn_key_head_dim
             chunk = 64 * geometry.gdn_value_heads
-            gdn = hidden + (6 * key + 5 * value + chunk) / tp
+            gdn = hidden + (2 * key + normalized + 5 * value + chunk) / tp
             if cp:
                 gdn += hidden + value / tp
             widths.append(gdn)
