@@ -851,6 +851,26 @@ def test_hybridep_state_released_after_each_combine(cpu_hybridep):
     assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
 
 
+def test_hybridep_install_releases_existing_state(cpu_hybridep):
+    # A forward that ran before installation leaves its state on the manager;
+    # installation itself must drop it, not only later combines.
+    layer = _FlexRouterLayer()
+    value = torch.randn(1, 11, 8, requires_grad=True)
+    output = layer(value)
+    comm = layer.token_dispatcher._comm_manager
+    held = weakref.ref(comm.dispatched_probs)
+    assert comm.routing_map is not None and comm.token_probs is not None
+    _configure_moe_dispatcher_caches([layer])
+    assert comm.routing_map is None
+    assert comm.token_probs is None
+    assert comm.dispatched_probs is None
+    output.square().sum().backward()
+    assert value.grad is not None and torch.isfinite(value.grad).all()
+    del output
+    gc.collect()
+    assert held() is None
+
+
 @pytest.mark.parametrize(
     "case",
     [
