@@ -144,6 +144,32 @@ trajectory = Trajectory(
 )
 ```
 
+## Recorded exchange histories
+
+`art.tokenize` and `trajectory.tokenize` use recorded prompt and response token IDs
+for unchanged, complete exchange histories. Recorded logprobs belong to those
+exact conditioned tokens. Chat, Responses, Messages, and Completions keep their
+existing protocol-specific projection rules; no separate tokenization API or
+native-representation option is needed. `multi_history=True` preserves the
+histories selected by the trajectory, including their order and model selection.
+
+Templates still own unrecorded separators, role masks, and synthetic stop tokens.
+For supported Chat boundaries, ART decodes the recorded body and encodes only the
+unrecorded separator instead of re-tokenizing the whole conversation. It checks
+that the separator reproduces the next recorded prompt exactly. Edited contexts,
+explicit template overrides, incomplete projections, and unsupported templates
+continue through the generic rendering path and its source validation.
+
+A response copied into a later, shortened prompt is output provenance, but it is
+not a fresh sample under that new prompt. ART keeps its `OUTPUT`, `ASSISTANT`,
+`EXACT`, and proven `STOP` flags while removing `SAMPLED` and the old conditional
+logprob. This requires the complete original sampled occurrence to remain in an
+earlier selected history; otherwise unchanged native replay is refused. The
+original occurrence retains its logprobs and ownership, including recorded NaNs
+before finite-value filtering. Tokenizing only the shortened view cannot prove
+that coverage; tokenize the containing trajectory instead. This correction does
+not change how generic output/SFT masks include copied assistant content.
+
 ## How It Works
 
 ### Tokenization Process

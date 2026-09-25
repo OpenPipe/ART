@@ -146,9 +146,6 @@ def test_native_thinking_off_retains_literal_content(
     # token splicing can recover the terminal output.
     with monkeypatch.context() as patch:
         patch.setattr(
-            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
-        )
-        patch.setattr(
             _tokenize, "chat_template_with_preserved_thinking", lambda value: value
         )
         _outcome(history, tokenizer)
@@ -186,9 +183,7 @@ def test_native_thinking_off_retains_literal_content(
         "visible_only",
     ],
 )
-def test_unrelated_histories_keep_original_rendering(
-    case: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_literal_content_is_not_inferred_from_source_thinking_mode(case: str) -> None:
     history, tokenizer = _history(
         thinking=True
         if case == "source_on"
@@ -225,17 +220,19 @@ def test_unrelated_histories_keep_original_rendering(
     if case == "visible_only":
         cast(dict[str, Any], history.messages[-1]).pop("reasoning")
     original = history.model_dump(mode="python")
-    candidate = _outcome(history, tokenizer)
-    calls = deepcopy(tokenizer.calls)
-    tokenizer.calls.clear()
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
+    _outcome(history, tokenizer)
+    # Plain content stays literal independently of recorded/current thinking mode
+    # and whether the message has complete native token metadata. Structured
+    # reasoning remains a separate field on the render copy.
+    assert tokenizer.calls[0][-1]["content"] == _LITERAL
+    assert _LITERAL in tokenizer.rendered[0]
+    if case in {"structured", "alias"}:
+        assert (
+            tokenizer.calls[0][-1].get(
+                "reasoning_content", tokenizer.calls[0][-1].get("reasoning")
+            )
+            == "explicit reasoning"
         )
-        baseline = _outcome(history, tokenizer)
-    assert candidate == baseline
-    assert len(calls) == len(tokenizer.calls)
-    assert calls[0] == tokenizer.calls[0]
     assert history.model_dump(mode="python") == original
 
 
@@ -406,9 +403,6 @@ def test_literal_next_turn_preserves_preceding_length_stop_boundary(
 
     monkeypatch.setattr(_tokenize, "_tokenize_exact_projected_chat_history", observe)
     with monkeypatch.context() as patch:
-        patch.setattr(
-            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
-        )
         patch.setattr(
             _tokenize, "chat_template_with_preserved_thinking", lambda value: value
         )

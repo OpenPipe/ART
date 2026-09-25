@@ -4624,12 +4624,14 @@ def test_cross_exchange_responses_reasoning_split_uses_later_prompt_backbone() -
         [1, 3, 4, 5],
     ]
     assert math.isnan(tokenized.histories[1].logprobs[0])
-    assert tokenized.histories[1].logprobs[1] == -0.3
+    # The copied 3 was sampled after [1, 2], never after [1].
+    assert tokenized.histories[0].logprobs[1:] == [-0.2, -0.3]
+    assert math.isnan(tokenized.histories[1].logprobs[1])
     assert math.isnan(tokenized.histories[1].logprobs[2])
     assert tokenized.histories[1].logprobs[3] == -0.1
     assert tokenized.histories[1].flags == [
         tr.TokenFlag.EXACT,
-        _SAMPLED_ASSISTANT_OUTPUT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT,
         tr.TokenFlag.EXACT,
         _SAMPLED_ASSISTANT_OUTPUT,
     ]
@@ -7215,13 +7217,19 @@ def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> Non
         [1, 2, 101, 102, 9],
         [1, 101, 102, 9, 4, 5, 6, 9],
     ]
-    assert tokenized.histories[1].flags[1] & tr.TokenFlag.SAMPLED
+    assert not tokenized.histories[1].flags[1] & tr.TokenFlag.SAMPLED
+    assert tokenized.histories[1].flags[1] & tr.TokenFlag.OUTPUT
+    assert tokenized.histories[0].logprobs[2:4] == [-10.1, -10.2]
     assert tokenized.histories[1].flags[1] & tr.TokenFlag.EXACT
-    assert tokenized.histories[1].logprobs[1:3] == [-10.1, -10.2]
+    assert all(math.isnan(value) for value in tokenized.histories[1].logprobs[1:3])
     assert tokenized.histories[1].flags[3] == (
-        _SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.OUTPUT
+        | tr.TokenFlag.STOP
     )
-    assert tokenized.histories[1].logprobs[3] == -0.9
+    assert math.isnan(tokenized.histories[1].logprobs[3])
+    assert tokenized.histories[0].logprobs[4] == -0.9
     assert 2 not in tokenized.histories[1].tokens
     assert 500 not in tokenized.histories[1].tokens
 
@@ -7381,13 +7389,21 @@ def test_reasoning_stripped_tool_call_keeps_exact_evidence_for_strict_training(
         multi_history=True,
         tokenizer=Tokenizer(),
     )
-    second_history = tokenized.histories[1]
+    first_history, second_history = tokenized.histories
+    assert first_history.tokens == [1, 2, 7, 8]
+    assert first_history.logprobs[1:] == [-0.2, -0.7, -0.8]
+    assert first_history.flags[1:] == [_SAMPLED_ASSISTANT_OUTPUT] * 3
     assert second_history.tokens == [1, 7, 8, 4, 5]
-    assert second_history.logprobs[1:3] == [-0.7, -0.8]
-    assert second_history.flags[1:3] == [
-        _SAMPLED_ASSISTANT_OUTPUT,
-        _SAMPLED_ASSISTANT_OUTPUT,
-    ]
+    assert all(math.isnan(lp) for lp in second_history.logprobs[1:3])
+    assert (
+        second_history.flags[1:3]
+        == [
+            tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT,
+        ]
+        * 2
+    )
+    assert second_history.logprobs[-1] == -0.5
+    assert second_history.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
 
     preprocessing = list(
         tokenize_trajectory_groups(

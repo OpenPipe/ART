@@ -215,7 +215,9 @@ def test_unconfigured_template_receives_the_same_correction():
 def test_inline_operation_as_raw_or_comment_text_is_not_rewritten(wrapper):
     from art_inference.chat_template import _QWEN_INLINE_REASONING
 
-    operation = _QWEN_INLINE_REASONING.search(_TEMPLATE).group()
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    operation = match.group()
     template = wrapper[0] + operation + wrapper[1]
     assert chat_template_with_preserved_thinking(template) == template
 
@@ -224,6 +226,7 @@ def test_other_structured_reasoning_condition_is_not_rewritten():
     gate = "{% if preserve_thinking and message.role == 'assistant' %}{{ message.reasoning_content }}{% endif %}"
     template = _TEMPLATE + "{% for message in messages %}" + gate + "{% endfor %}"
     fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
     assert gate in fixed
     messages = [
         _USER,
@@ -236,7 +239,9 @@ def test_other_structured_reasoning_condition_is_not_rewritten():
 def test_inline_operation_inside_quoted_expression_is_literal():
     from art_inference.chat_template import _QWEN_INLINE_REASONING
 
-    operation = _QWEN_INLINE_REASONING.search(_TEMPLATE).group().replace("\n", " ")
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    operation = match.group().replace("\n", " ")
     template = '{{ "' + operation + '" }}'
     fixed = chat_template_with_preserved_thinking(template)
     assert fixed == template
@@ -249,7 +254,9 @@ def test_inline_operation_inside_quoted_expression_is_literal():
 def test_mixed_executable_and_literal_operations_only_changes_executable(wrapper):
     from art_inference.chat_template import _QWEN_INLINE_REASONING
 
-    operation = _QWEN_INLINE_REASONING.search(_TEMPLATE).group().replace("\n", " ")
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    operation = match.group().replace("\n", " ")
     literal = wrapper[0] + operation + wrapper[1]
     template = _TEMPLATE + literal
     fixed = chat_template_with_preserved_thinking(template)
