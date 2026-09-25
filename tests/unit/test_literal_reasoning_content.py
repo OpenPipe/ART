@@ -6,6 +6,8 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 import pytest
 
 from art_inference.chat_template import (
+    _QWEN_INLINE_REASONING,
+    _without_inline_reasoning_parser,
     chat_template_with_preserved_thinking,
     default_chat_template_kwargs_for_template,
 )
@@ -265,3 +267,41 @@ def test_mixed_executable_and_literal_operations_only_changes_executable(wrapper
         fixed,
         [_USER, {"role": "assistant", "content": "head<think>literal</think>tail"}],
     )
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("prefix", ["comment", "data"])
+def test_newline_lexing_preserves_literal_content(newline, prefix):
+    intro = (
+        "{# public\nmultiline comment #}\n"
+        if prefix == "comment"
+        else "public\nheader\n"
+    )
+    template = (intro + _TEMPLATE).replace("\n", newline)
+    content = "prefix<think>literal</think>suffix"
+    fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
+    assert content in _render(
+        fixed,
+        [_USER, {"role": "assistant", "content": content}],
+        enable_thinking=False,
+        preserve_thinking=True,
+    )
+    assert fixed.startswith(intro.replace("\n", newline))
+    assert not _QWEN_INLINE_REASONING.search(fixed)
+    assert chat_template_with_preserved_thinking(fixed) == fixed
+
+
+@pytest.mark.parametrize("newline", ["\r\n", "\r"])
+@pytest.mark.parametrize("wrapper", ["comment", "raw", "quoted"])
+def test_newline_parser_spelling_in_nonexecutable_token_unchanged(newline, wrapper):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    operation = match.group().replace("\n", newline)
+    if wrapper == "comment":
+        template = "{#" + newline + operation + newline + "#}"
+    elif wrapper == "raw":
+        template = "{% raw %}" + newline + operation + newline + "{% endraw %}"
+    else:
+        template = '{{ "' + operation + '" }}'
+    assert _without_inline_reasoning_parser(template) == template

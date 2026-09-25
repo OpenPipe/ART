@@ -809,16 +809,19 @@ def _require_causal_predecessor(trainable: Sequence[bool]) -> None:
 @dataclass
 class _TraceBuilder:
     trace: _HistoryTokenizationTrace | None = None
+    rendered_outputs: tuple[tuple[int, int, object], ...] = ()
 
     def set(
         self,
         tokenized: TokenizedHistory,
         source_keys: list[_SampledSourceKey | None],
         sources: dict[_SampledSourceKey, object],
+        rendered_outputs: tuple[tuple[int, int, object], ...] = (),
     ) -> None:
         trace = _HistoryTokenizationTrace(source_keys=source_keys, sources=sources)
         trace.validate(tokenized)
         self.trace = trace
+        self.rendered_outputs = rendered_outputs
 
 
 def _fingerprint(value: object) -> str:
@@ -4180,7 +4183,7 @@ def _complete_source_is_represented(
 ) -> bool:
     """Prove ownership of the original edge before treating a copy as context."""
     key = _sampled_source_key(source)
-    exchange = getattr(source, "exchange", None)
+    exchange = _source_exchange(source)
     required = (
         TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
     )
@@ -4190,7 +4193,7 @@ def _complete_source_is_represented(
         owner = trace.sources.get(key)
         if (
             previous.model != getattr(exchange, "model", None)
-            or getattr(owner, "exchange", None) is not exchange
+            or _source_exchange(owner) is not exchange
             or getattr(owner, "choice_index", None)
             != getattr(source, "choice_index", None)
             or trace.source_keys[len(prompt) : end] != [key] * len(output)
@@ -4214,7 +4217,13 @@ def _complete_source_is_represented(
 def _source_native_record(
     source: object,
 ) -> tuple[list[int] | None, list[int] | None, list[float]]:
-    exchange = getattr(source, "exchange", None)
+    exchange = _source_exchange(source)
+    if isinstance(exchange, MessagesExchange) and (
+        isinstance(source, MessagesExchange)
+        or isinstance(source, AnthropicMessageSource)
+        and source.request_index is None
+    ):
+        return _messages_tokens(exchange.response)
     if isinstance(exchange, ResponsesExchange):
         index = getattr(source, "generation_index", None)
         generations = _response_generations(exchange.response)
@@ -4238,7 +4247,14 @@ def _source_native_prefix(source: object) -> tuple[list[int] | None, list[int] |
         if prompt is None:
             prompt = (exchange.response.model_extra or {}).get("prompt_token_ids")
         output = (choice.model_extra or {}).get("token_ids")
-        if isinstance(prompt, list) and isinstance(output, list):
+        if (
+            isinstance(prompt, list)
+            and prompt
+            and isinstance(output, list)
+            and output
+            and all(type(value) is int and value >= 0 for value in prompt)
+            and all(type(value) is int and value >= 0 for value in output)
+        ):
             return prompt, output
     prompt, output, _ = _source_native_record(source)
     return prompt, output
@@ -4283,9 +4299,27 @@ def _certify_copied_context(
     trace: _HistoryTokenizationTrace,
     copied: Sequence[object],
     prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]],
+    rendered_outputs: Sequence[tuple[int, int, object]] = (),
 ) -> None:
     """A rendered copy may keep output provenance, never its old prediction LP."""
     copied_keys = {_sampled_source_key(source) for source in copied}
+    # Visible logprob replacements need not be sampled. Keep their output
+    # provenance separate from the trace's strictly sampled-token ownership.
+    for start, end, source in rendered_outputs:
+        if _sampled_source_key(source) not in copied_keys:
+            continue
+        prompt, output, logprobs = _source_native_record(source)
+        if (
+            prompt is None
+            or output is None
+            or not _complete_source_is_represented(
+                source, prompt, output, logprobs, prior
+            )
+        ):
+            raise ValueError(
+                "Copied rendered output has no complete original sampled occurrence"
+            )
+        tokenized.logprobs[start:end] = [math.nan] * (end - start)
     positions: dict[_SampledSourceKey, list[int]] = {}
     for index, key in enumerate(trace.source_keys):
         if key is not None:
@@ -4661,11 +4695,14 @@ def _tokenize_recorded_chat_boundaries(
         ):
             continue
         try:
-            body = decode(
-                output,
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            )
+            try:
+                body = decode(
+                    output,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except ValueError:
+                return None
             generation = render(messages[:index], add_generation_prompt=True)
             completed = render(messages[: index + 1], add_generation_prompt=False)
             # Only the actually sampled body anchors the tail. Literal content,
@@ -4678,11 +4715,14 @@ def _tokenize_recorded_chat_boundaries(
             if len(stops) != 1:
                 return None
             terminator = stops[0]
-            trailing = decode(
-                tail[terminator + 1 :],
-                skip_special_tokens=False,
-                clean_up_tokenization_spaces=False,
-            )
+            try:
+                trailing = decode(
+                    tail[terminator + 1 :],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+            except ValueError:
+                return None
             if not isinstance(trailing, str) or trailing and not trailing.isspace():
                 return None
             following: list[int] = []
@@ -6489,6 +6529,7 @@ def _tokenize_chat_view(
     source_keys: list[_SampledSourceKey | None] = []
     sources: dict[_SampledSourceKey, object] = {}
     cursor = 0
+    rendered_outputs: list[tuple[int, int, object]] = []
     for (
         start,
         end,
@@ -6572,6 +6613,10 @@ def _tokenize_chat_view(
             source_keys.extend([source_key] * len(replacement))
             sources[source_key] = source
         else:
+            if _trace is not None:
+                rendered_outputs.append(
+                    (len(token_ids), len(token_ids) + len(replacement), source)
+                )
             token_ids.extend(replacement)
             logprobs.extend(
                 replacement_logprobs
@@ -6647,7 +6692,7 @@ def _tokenize_chat_view(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tuple(rendered_outputs))
     return tokenized
 
 
@@ -7009,6 +7054,7 @@ def _tokenize_history(
     _trace: _TraceBuilder | None = None,
     _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
     _projection_validated: bool = False,
+    _copied_context: bool = False,
 ) -> TokenizedHistory:
     if isinstance(history, LegacyHistory):
         if model is None:
@@ -7102,7 +7148,9 @@ def _tokenize_history(
             ),
             _trace=_trace,
         )
-    if isinstance(history, AnthropicMessagesHistory) and needs_render:
+    if isinstance(history, AnthropicMessagesHistory) and (
+        needs_render or _copied_context
+    ):
         converted = history.as_chat_completions_history()
         if (
             not has_length_stop
@@ -7120,18 +7168,22 @@ def _tokenize_history(
                     tokenizer=tokenizer,
                     projection_validated=True,
                     _trace=_trace,
+                    _strict_sources=True,
+                    _prior=_prior,
                 )
             )
         ):
             return exact
-        return _tokenize_chat_view(
-            converted,
-            base_model=base_model,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-            _trace=_trace,
-        )
+        if needs_render:
+            return _tokenize_chat_view(
+                converted,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                _trace=_trace,
+                _prior=_prior,
+            )
     if isinstance(history, ResponsesHistory) and needs_render:
         return _tokenize_chat_view(
             history.as_chat_completions_history(),
@@ -7226,13 +7278,20 @@ def tokenize_history(
         _trace=trace_builder,
         _prior=_prior,
         _projection_validated=_projection_validated,
+        _copied_context=bool(copied),
     )
     if copied:
         if trace_builder is None or trace_builder.trace is None:
             raise ValueError(
                 "Copied native context requires a complete tokenization source trace"
             )
-        _certify_copied_context(tokenized, trace_builder.trace, copied, _prior)
+        _certify_copied_context(
+            tokenized,
+            trace_builder.trace,
+            copied,
+            _prior,
+            trace_builder.rendered_outputs,
+        )
     # Internal protocol conversion is an implementation detail. The source is
     # always the public history view the caller asked to tokenize.
     if not isinstance(

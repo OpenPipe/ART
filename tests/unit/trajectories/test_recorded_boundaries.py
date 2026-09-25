@@ -553,3 +553,370 @@ def test_native_record_reuse_is_local_and_observes_later_mutation(
     assert caught.value is failure
     monkeypatch.setattr(module, "_chat_source_record", read)
     assert trajectory.tokenize().logprobs[2] == -7.5
+
+
+@pytest.mark.parametrize("carrier", ["empty", "encoded", "mixed"])
+def test_copied_context_preflight_uses_authoritative_token_carriers(
+    carrier: str,
+) -> None:
+    from test_tokenize import _chat_exchange
+
+    import art.trajectories as tr
+
+    first = _chat_exchange([1], [2, 3])
+    second = _chat_exchange([1, 3, 4], [5], offset=1)
+    first_extra = first.response.choices[0].model_extra
+    second_extra = second.response.choices[0].model_extra
+    assert first_extra is not None and second_extra is not None
+    first_extra["token_ids"] = (
+        [] if carrier == "empty" else ["token_id:2", "token_id:3"]
+    )
+    if carrier == "encoded":
+        first_extra["prompt_token_ids"] = ["token_id:1"]
+        second_extra["prompt_token_ids"] = [
+            "token_id:1",
+            "token_id:3",
+            "token_id:4",
+        ]
+    trajectory = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(chat_completions=[first, second])
+    )
+    before = trajectory.model_dump_json()
+    result = trajectory.tokenize(multi_history=True)
+    assert [history.tokens for history in result.histories] == [[1, 2, 3], [1, 3, 4, 5]]
+    assert result.histories[0].logprobs[1:] == [-0.2, -0.3]
+    assert math.isnan(result.histories[1].logprobs[1])
+    assert not result.histories[1].flags[1] & TokenFlag.SAMPLED
+    assert trajectory.model_dump_json() == before
+
+
+def test_messages_copied_context_requires_and_preserves_original_owner() -> None:
+    from test_tokenize import _message_exchange
+
+    import art.trajectories as tr
+
+    first = _message_exchange(
+        tr.MessagesRequest(
+            model="test/model",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "one"}],
+        ),
+        content=[
+            {"type": "thinking", "thinking": "reason", "signature": "public"},
+            {"type": "text", "text": "answer"},
+        ],
+        prompt_token_ids=[1],
+        token_ids=[2, 3],
+        logprobs=[-0.2, -0.3],
+    )
+    second = _message_exchange(
+        tr.MessagesRequest(
+            model="test/model",
+            max_tokens=16,
+            messages=[
+                {"role": "user", "content": "one"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "two"},
+            ],
+        ),
+        identifier="message-2",
+        offset=1,
+        content=[{"type": "text", "text": "next"}],
+        prompt_token_ids=[1, 3, 4],
+        token_ids=[5],
+        logprobs=[-0.5],
+    )
+    trajectory = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(messages=[first, second])
+    )
+    before = trajectory.model_dump_json()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: Any) -> list[int]:
+            return {
+                "one": [1],
+                "reason": [2],
+                "answer": [3],
+                "two": [4],
+                "next": [5],
+            }.get(text, [99])
+
+        def apply_chat_template(self, messages: Any, **kwargs: Any) -> list[int]:
+            return {
+                1: [1],
+                2: [1, 2, 3] if messages[-1].get("reasoning") else [1, 3],
+                3: [1, 3, 4],
+                4: [1, 3, 4, 5],
+            }[len(messages)]
+
+    tokenizer = Tokenizer()
+    result = trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+    assert [history.tokens for history in result.histories] == [[1, 2, 3], [1, 3, 4, 5]]
+    assert result.histories[0].logprobs[1:] == [-0.2, -0.3]
+    assert (
+        result.histories[0].flags[1:]
+        == [
+            TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+        ]
+        * 2
+    )
+    assert (
+        result.histories[1].flags[1]
+        == TokenFlag.EXACT | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+    )
+    assert math.isnan(result.histories[1].logprobs[1])
+    assert result.histories[1].logprobs[-1] == -0.5
+    assert trajectory.model_dump_json() == before
+    standalone = trajectory.histories()[1]
+    assert isinstance(standalone, tr.AnthropicMessagesHistory)
+    with pytest.raises(ValueError, match="complete original sampled occurrence"):
+        standalone.tokenize(tokenizer=tokenizer)
+
+
+def test_unsupported_native_body_decode_preserves_generic_boundary_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    history, tokenizer, _ = _character_template_history()
+    decode = tokenizer.decode
+    probes = []
+
+    def limited_decode(tokens: list[int], **kwargs: Any) -> str:
+        if any(token in {7001, 7002} for token in tokens):
+            probes.append(tuple(tokens))
+            raise ValueError("served-only public token cannot be decoded")
+        return decode(tokens, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "decode", limited_decode)
+    candidate = history.tokenize(tokenizer=tokenizer)
+    assert probes
+    monkeypatch.setattr(
+        module, "_tokenize_recorded_chat_boundaries", lambda *a, **k: None
+    )
+    baseline = history.tokenize(tokenizer=tokenizer)
+    assert_same(candidate, baseline)
+
+
+def test_rendered_responses_copy_clears_old_logprob_without_sampling_it() -> None:
+    from openai.types.responses import Response
+    from test_tokenize import _response_exchange
+
+    import art.trajectories as tr
+
+    first = _response_exchange("first", 3, prompt_token_ids=[1])
+    payload = first.response.model_dump(mode="python")
+    text = payload["output"][0]
+    text["content"][0]["logprobs"] = [
+        {
+            "token": "answer",
+            "bytes": list(b"answer"),
+            "logprob": -0.3,
+            "top_logprobs": [],
+        }
+    ]
+    payload["output"] = [
+        {
+            "id": "public-reasoning",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "think"}],
+        },
+        text,
+    ]
+    payload["token_generations"] = [
+        {
+            "prompt_token_ids": [1],
+            "output_tokens": [
+                {"token_id": 2, "logprob": -0.2},
+                {"token_id": 3, "logprob": -0.3},
+            ],
+            "output_indices": [0, 1],
+        }
+    ]
+    first.response = Response.model_validate(payload)
+    second = _response_exchange(
+        "second", 5, previous_response_id="first", offset=1, prompt_token_ids=[1, 3, 4]
+    )
+    payload = second.response.model_dump(mode="python")
+    payload["status"] = "incomplete"
+    payload["incomplete_details"] = {"reason": "max_output_tokens"}
+    payload["output"][0]["content"][0]["text"] = "next"
+    second.response = Response.model_validate(payload)
+    trajectory = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(responses=[first, second])
+    )
+    before = trajectory.model_dump_json()
+
+    class Tokenizer:
+        def __call__(self, text: str, **kwargs: Any) -> list[int]:
+            return {
+                "turn 0": [1],
+                "think": [2],
+                "answer": [3],
+                "turn 1": [4],
+                "next": [5],
+            }.get(text, [99])
+
+        def apply_chat_template(self, messages: Any, **kwargs: Any) -> list[int]:
+            tokens = []
+            for message in messages:
+                if message.get("reasoning"):
+                    tokens += self(message["reasoning"])
+                if message.get("content"):
+                    tokens += self(message["content"])
+            return tokens
+
+    result = trajectory.tokenize(multi_history=True, tokenizer=Tokenizer())
+    assert [history.tokens for history in result.histories] == [[1, 2, 3], [1, 3, 4, 5]]
+    assert result.histories[0].logprobs[1:] == [-0.2, -0.3]
+    copied = result.histories[1]
+    assert copied.flags[1] == TokenFlag.EXACT | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+    assert math.isnan(copied.logprobs[1])
+    assert copied.logprobs[-1] == -0.1
+    assert trajectory.model_dump_json() == before
+
+
+@pytest.mark.parametrize("opaque", ["image", "redacted_thinking"])
+def test_complete_messages_records_do_not_require_a_chat_projection(
+    monkeypatch: pytest.MonkeyPatch, opaque: str
+) -> None:
+    from test_tokenize import _message_exchange
+
+    import art.trajectories as tr
+
+    request = tr.MessagesRequest(
+        model="test/model",
+        max_tokens=16,
+        messages=[{"role": "user", "content": "question"}],
+    )
+    if opaque == "image":
+        request["messages"][0]["content"] = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "public",
+                },
+            }
+        ]
+    exchange = _message_exchange(
+        request,
+        prompt_token_ids=[1, 2],
+        token_ids=[3],
+        logprobs=[-0.3],
+        content=[{"type": "redacted_thinking", "data": "public"}]
+        if opaque == "redacted_thinking"
+        else None,
+    )
+    trajectory = tr.Trajectory(exchanges=tr.TrajectoryExchanges(messages=[exchange]))
+    before = trajectory.model_dump_json()
+    monkeypatch.setattr(
+        module,
+        "_load_tokenizer",
+        lambda *_: pytest.fail("complete native record must stay offline"),
+    )
+    result = trajectory.tokenize()
+    assert result.tokens == [1, 2, 3]
+    assert result.logprobs[-1] == -0.3
+    assert result.flags == [
+        TokenFlag.EXACT,
+        TokenFlag.EXACT,
+        TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT | TokenFlag.OUTPUT,
+    ]
+    assert trajectory.model_dump_json() == before
+
+
+def _boundary_render(tokenizer: Any) -> module._ChatRender:
+    def render(
+        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ) -> str:
+        value = tokenizer.apply_chat_template(
+            selected_messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+        )
+        assert isinstance(value, str)
+        return value
+
+    return render
+
+
+def test_optional_trailing_decode_valueerror_declines(monkeypatch):
+    history, tokenizer, _ = _character_template_history()
+    decode = tokenizer.decode
+    trailing = []
+
+    def limited(tokens, **kwargs):
+        if not tokens:
+            trailing.append(True)
+            raise ValueError("public empty suffix unsupported")
+        return decode(tokens, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "decode", limited)
+    result = module._tokenize_recorded_chat_boundaries(
+        history,
+        [dict(message) for message in history.messages],
+        tokenizer=tokenizer,
+        render=_boundary_render(tokenizer),
+        _trace=None,
+    )
+    assert trailing and result is None
+
+
+@pytest.mark.parametrize(
+    "stage", ["native_record", "render", "final_builder", "decoder_runtime"]
+)
+def test_other_errors_propagate_same_exception(monkeypatch, stage):
+    history, tokenizer, _ = _character_template_history()
+    error = (
+        RuntimeError("public decoder failure")
+        if stage == "decoder_runtime"
+        else ValueError("public required validation failed")
+    )
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(True)
+        raise error
+
+    if stage == "native_record":
+        monkeypatch.setattr(module, "_chat_source_record", fail)
+    elif stage == "final_builder":
+        monkeypatch.setattr(module, "_tokenize_exact_projected_chat_history", fail)
+    elif stage == "decoder_runtime":
+        monkeypatch.setattr(tokenizer, "decode", fail)
+    render = fail if stage == "render" else _boundary_render(tokenizer)
+    with pytest.raises(type(error)) as caught:
+        module._tokenize_recorded_chat_boundaries(
+            history,
+            [dict(message) for message in history.messages],
+            tokenizer=tokenizer,
+            render=render,
+            _trace=None,
+        )
+    assert calls == [True] and caught.value is error
+
+
+def test_malformed_native_record_is_still_rejected(monkeypatch):
+    history, tokenizer, _ = _character_template_history()
+    source = history.message_sources[3]
+    assert source is not None and isinstance(
+        source.exchange, module.ChatCompletionsExchange
+    )
+    extra = source.exchange.response.choices[0].model_extra
+    assert extra is not None
+    extra["token_ids"] = ["not-an-exact-id"]
+    called = []
+
+    def render(*args, **kwargs):
+        called.append(True)
+        raise AssertionError("should not reach rendering")
+
+    with pytest.raises(ValueError, match="token_ids"):
+        module._tokenize_recorded_chat_boundaries(
+            history,
+            [dict(message) for message in history.messages],
+            tokenizer=tokenizer,
+            render=render,
+            _trace=None,
+        )
+    assert not called

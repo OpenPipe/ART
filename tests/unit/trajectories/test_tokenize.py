@@ -3698,19 +3698,32 @@ def test_reasoning_stripped_messages_history_preserves_exact_tokens(
             }
             return by_length[len(messages)]
 
-    history = art.Trajectory(
-        exchanges=TrajectoryExchanges(messages=[first, second])
-    ).anthropic_messages_histories()[1]
-    tokenized = history.tokenize(tokenizer=Tokenizer())
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(messages=[first, second]))
+    history = trajectory.anthropic_messages_histories()[1]
+    if top_level_only:
+        with pytest.raises(ValueError, match="complete original sampled occurrence"):
+            history.tokenize(tokenizer=Tokenizer())
+        original, tokenized = trajectory.tokenize(
+            multi_history=True, tokenizer=Tokenizer()
+        ).histories
+        assert original.tokens == [10, 90, 101, 102]
+        assert original.logprobs[1:] == pytest.approx([-9.0, -10.1, -10.2])
+        assert original.flags[1:] == [_SAMPLED_ASSISTANT_OUTPUT] * 3
+        assert all(math.isnan(value) for value in tokenized.logprobs[1:3])
+        assert (
+            tokenized.flags[1:3]
+            == [tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT] * 2
+        )
+    else:
+        # Block-level output evidence has no native prompt. Preserve this
+        # existing generic rendered path rather than invent conditioning.
+        tokenized = history.tokenize(tokenizer=Tokenizer())
+        assert tokenized.logprobs[1:3] == pytest.approx([-10.1, -10.2])
+        assert tokenized.flags[1:3] == [_SAMPLED_ASSISTANT_OUTPUT] * 2
 
     assert tokenized.tokens == [10, 101, 102, 11, 91, 201]
-    assert tokenized.logprobs[1:3] == pytest.approx([-10.1, -10.2])
     assert tokenized.logprobs[-2] == pytest.approx(-10.0)
     assert tokenized.logprobs[-1] == pytest.approx(-20.1)
-    assert tokenized.flags[1:3] == [
-        _SAMPLED_ASSISTANT_OUTPUT,
-        _SAMPLED_ASSISTANT_OUTPUT,
-    ]
     assert tokenized.flags[-2:] == [
         _SAMPLED_ASSISTANT_OUTPUT,
         _SAMPLED_ASSISTANT_OUTPUT,

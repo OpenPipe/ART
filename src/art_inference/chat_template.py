@@ -49,15 +49,22 @@ def _without_inline_reasoning_parser(template: str) -> str:
 
     # Only executable block tokens may be edited. The same spelling inside a
     # quoted expression, raw block or comment is literal template data.
+    # Jinja lexes normalized newlines; map its positions to the original source.
+    normalized = re.sub(r"\r\n?", "\n", template)
+    offsets = [
+        i
+        for i, char in enumerate(template)
+        if not (char == "\n" and i and template[i - 1] == "\r")
+    ]
     starts: set[int] = set()
     cursor = 0
     try:
         for _, kind, value in Environment().lex(template):
-            start = template.find(value, cursor)
-            if start < 0 or template[cursor:start].strip():
+            start = normalized.find(value, cursor)
+            if start < 0 or normalized[cursor:start].strip():
                 return template  # Lexer normalization could not be source-joined.
             if kind == "block_begin":
-                starts.add(start)
+                starts.add(offsets[start])
             cursor = start + len(value)
     except TemplateSyntaxError:
         return template  # Leave invalid templates to their existing renderer.
