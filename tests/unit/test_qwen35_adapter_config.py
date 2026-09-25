@@ -79,6 +79,7 @@ def test_missing_dimensions_come_from_the_pinned_config_not_defaults(hub_cache):
         "base_model_name_or_path": REPO,
         "revision": PIN,
         "num_attention_heads": 16,
+        "hidden_size": 2048,
     }
     # Not one group per head, nor head_dim = hidden_size / heads = 128.
     assert qwen35._qwen35_attention_dims(config) == (16, 2, 256)
