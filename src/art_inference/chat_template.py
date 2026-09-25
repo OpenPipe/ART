@@ -25,10 +25,24 @@ _MINIMAX_PRESERVE_PRIOR_THINKING = (
     "reasoning_content and ((preserve_thinking is defined and preserve_thinking is "
     "true) or loop.index0 > ns.last_user_index)"
 )
+# These operations infer reasoning from arbitrary assistant content and can
+# discard everything before the last <think> or between repeated </think> tags.
+# Match the operations, not a model revision or the text of a particular answer.
+_QWEN_INLINE_REASONING = re.compile(
+    r"\s*".join(
+        r"\{%[-+]?\s*" + re.escape(statement) + r"\s*[-+]?%\}"
+        for statement in (
+            "if '</think>' in content",
+            "set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n')",
+            "set content = content.split('</think>')[-1].lstrip('\\n')",
+            "endif",
+        )
+    )
+)
 
 
 def chat_template_with_preserved_thinking(chat_template: object) -> object:
-    """Preserve prior reasoning by default, while respecting explicit opt-outs."""
+    """Preserve structured reasoning without interpreting tags in plain content."""
     if isinstance(chat_template, dict):
         return {
             name: chat_template_with_preserved_thinking(template)
@@ -36,6 +50,17 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
         }
     if not isinstance(chat_template, str):
         return chat_template
+    chat_template, inline_parsers = _QWEN_INLINE_REASONING.subn("", chat_template)
+    if inline_parsers:
+        # Disabling reasoning preservation may omit a structured reasoning
+        # field, but must not trim the visible assistant answer.
+        chat_template = chat_template.replace(
+            "if preserve_thinking and message.role == 'assistant'",
+            "if message.role == 'assistant'",
+        ).replace(
+            "set content = render_content(message.content, true)|trim",
+            "set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim)",
+        )
     replacements = (
         (
             _QWEN_DROP_PRIOR_THINKING,

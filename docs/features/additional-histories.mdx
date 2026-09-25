@@ -33,6 +33,16 @@ with `chat_template_kwargs={"preserve_thinking": False}`. Additional histories
 remain useful for custom or externally managed templates that do not expose a
 prior-thinking preservation option.
 
+For supported Qwen templates, reasoning belongs in the structured
+`reasoning_content` field. Assistant `content` remains literal, including
+`<think>` and `</think>` anywhere in that content; ART does not infer reasoning
+from those strings. This also applies when the next response has thinking
+enabled or when prior reasoning is explicitly omitted. A legacy adapter that
+knows its response uses a leading reasoning envelope should split that known
+format into `reasoning_content` and `content` before rendering. A leading tag
+pair alone cannot establish that format. Structured reasoning and the template's
+generation-prompt defaults retain their existing behavior.
+
 By splitting each turn into a separate history, you can preserve these tokens for training:
 
 ```python
@@ -44,7 +54,7 @@ trajectory = Trajectory(
     messages_and_choices=[
         # First turn with thinking
         {"role": "user", "content": "What is 2+2?"},
-        {"role": "assistant", "content": "<think>I need to add 2 and 2</think>4"}
+        {"role": "assistant", "reasoning_content": "I need to add 2 and 2", "content": "4"}
     ],
     additional_histories=[
         LegacyHistory(
@@ -53,7 +63,7 @@ trajectory = Trajectory(
                 {"role": "user", "content": "What is 2+2?"},
                 {"role": "assistant", "content": "4"},
                 {"role": "user", "content": "What is 3+3?"},
-                {"role": "assistant", "content": "<think>I need to add 3 and 3</think>6"}
+                {"role": "assistant", "reasoning_content": "I need to add 3 and 3", "content": "6"}
             ]
         )
     ]
