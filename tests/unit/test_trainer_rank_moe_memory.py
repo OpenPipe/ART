@@ -1,6 +1,7 @@
 """CPU contracts for one known MoE component, not a whole-model memory bound."""
 
 from dataclasses import replace
+import math
 from types import SimpleNamespace
 from typing import Any, cast
 import weakref
@@ -11,6 +12,7 @@ import torch
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
+    _ep_routed_row_allowance,
     _MemoryProfile,
     _MemorySignature,
     _moe_output_bytes_per_token,
@@ -203,15 +205,26 @@ def _hybridep(layer, ep: int, manager: str = "hybridep"):
     return layer
 
 
-@pytest.mark.parametrize("ep", [2, 4])
-def test_hybridep_prices_routed_rows_with_imbalance_allowance(layer, ep):
+@pytest.mark.parametrize("ep,allowance", [(2, 1.4), (4, 1.6), (8, 2.0), (16, 2.4)])
+def test_hybridep_prices_routed_rows_with_imbalance_allowance(layer, ep, allowance):
     # HybridEP gives each rank the pairs routed to its local experts: balanced
-    # routing matches EP1's top-k rows per local token, with a 1.5x allowance.
+    # routing matches EP1's top-k rows per local token, scaled by the measured
+    # EP-dependent worst-layer imbalance (log2 growth beyond EP8).
     single = _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1))
     sharded = ParallelShape(tp=1, cp=ep, ep=ep)
     expert = _moe_output_bytes_per_token([_hybridep(layer, ep)], sharded)
-    # Top-k 8 routed rows per local token become 12; no shared experts here.
-    assert single > 0 and expert == single // 8 * 12
+    # Top-k 8 routed rows per local token become 8 x allowance; no shared
+    # experts here.
+    assert _ep_routed_row_allowance(ep) == pytest.approx(allowance)
+    assert single > 0 and expert == math.ceil(single * allowance)
+
+
+def test_unmeasured_ep_sizes_use_the_next_measured_allowance():
+    assert _ep_routed_row_allowance(1) == 1.0
+    assert _ep_routed_row_allowance(3) == _ep_routed_row_allowance(4) == 1.6
+    assert _ep_routed_row_allowance(6) == 2.0
+    # Never above every pair on one rank.
+    assert _ep_routed_row_allowance(1024) <= 1024
 
 
 def test_hybridep_keeps_the_enclosing_fc1_stage(layer):
@@ -226,7 +239,7 @@ def test_hybridep_keeps_the_enclosing_fc1_stage(layer):
     expert.token_dispatcher.num_local_experts = 128
     sharded = _moe_output_bytes_per_token([expert], ParallelShape(tp=1, cp=2, ep=2))
     assert single == 8 * (512 + 3 * 2048 + 2 * 2048 + 1024) * 2
-    assert sharded == 12 * (512 + 3 * 2048 + 2048 + 1024) * 2
+    assert sharded == math.ceil(8 * 1.4 * (512 + 3 * 2048 + 2048 + 1024) * 2)
 
 
 @pytest.mark.parametrize(

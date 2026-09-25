@@ -1532,8 +1532,29 @@ def _expert_lora_weight_storage(
     return (transposes if a.shape[2] < 8 else 0, transposes, effective)
 
 
-# Routed rows per rank at EP>1, relative to balanced routing (see below).
-_EP_ROUTED_ROW_ALLOWANCE = 1.5
+# Routed rows on the most loaded rank at EP>1, relative to balanced routing.
+# Expert-shard load is uneven per layer, from the router's expert preferences,
+# and larger batches do not average it away. Pretrained Qwen3.6-35B-A3B on 3.5M
+# tokens of retail agent trajectories: worst layer 1.21 at EP2, 1.41 at EP4,
+# 1.63 at EP8 (1.88 on a small rollout sample); one production EP2 run saw
+# 1.35. These samples bound what was measured, not all routing. Unmeasured EP
+# sizes use the next measured one; above EP8 the allowance grows with log2(EP)
+# up to EP itself (every pair on one rank).
+_EP_ROUTED_ROW_ALLOWANCE = {2: 1.4, 4: 1.6, 8: 2.0}
+
+
+def _ep_routed_row_allowance(ep: int) -> float:
+    if ep <= 1:
+        return 1.0
+    for size, allowance in sorted(_EP_ROUTED_ROW_ALLOWANCE.items()):
+        if ep <= size:
+            return allowance
+    return min(float(ep), 2.0 + 0.4 * math.log2(ep / 8))
+
+
+# Transformer Engine's Hopper cuBLAS workspaces: one per grouped-GEMM stream
+# (four) plus the plain GEMM's, each 32 MiB + 1 KiB.
+_TE_CUBLAS_WORKSPACE_BYTES = 5 * (32 * 2**20 + 1024)
 
 
 def _moe_dispatcher_supported(
@@ -1603,9 +1624,8 @@ def _moe_output_bytes_per_token(
     from art.megatron.lora import LoRA, MLPExpertsLinearFC1LoRA, MLPExpertsLinearFC2LoRA
 
     # HybridEP hands each rank the pairs routed to its local experts, already
-    # permuted. Balanced routing gives local tokens x top-k, as at EP1; a
-    # pretrained CP2/EP2 run put about 1.35x that on one rank.
-    routed_allowance = _EP_ROUTED_ROW_ALLOWANCE if shape.ep > 1 else 1
+    # permuted. Balanced routing gives local tokens x top-k, as at EP1.
+    routed_allowance = _ep_routed_row_allowance(shape.ep)
     # Routed H-wide inputs held at the expert stage. The EP1 all-to-all path
     # keeps its permuted rows and their expert-sorted copy; HybridEP permutes
     # while it dispatches and returns one tensor.
@@ -1726,8 +1746,10 @@ def _moe_output_bytes_per_token(
                 # Gate-score backward saves a distinct pre-gate X. Charge it
                 # beside this layer's returned X, not another layer's maximum.
                 shared += shared
-            routed_rows = math.ceil(config.moe_router_topk * routed_allowance)
-            row_bytes = routed_rows * features * weights.element_size() + shared
+            routed_rows = config.moe_router_topk * routed_allowance
+            row_bytes = (
+                math.ceil(routed_rows * features * weights.element_size()) + shared
+            )
             coefficient = max(coefficient, row_bytes)
             storage = _expert_lora_weight_storage(lora, slot_ref)
             if converted_stages is not None and storage is not None:
@@ -1832,6 +1854,11 @@ def _moe_output_bytes_per_token(
                                 + 2 * (experts_count + 1) * 4,
                             )
                         )
+    if converted_stages is not None:
+        # The EP allowance gives fractional routed rows; round each stage up.
+        converted_stages[:] = [
+            (math.ceil(per_row), fixed) for per_row, fixed in converted_stages
+        ]
     return coefficient
 
 
@@ -4093,16 +4120,80 @@ class TrainerRank:
         ):
             return 0, 0
         retained = gradient_rows * layers * self._hidden_size * 2
-        if gradient_rows:
-            self._checkpoint_moe_bytes_per_token()
+        moe = self._checkpoint_moe_bytes_per_token() if gradient_rows else 0
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
-        mixer = self._recomputed_mixer_bytes_per_token() if gradient_rows else 0
+        # Beside the mixer, the recomputed layer keeps its post-mixer residual
+        # and pre-MLP norm output, and its MoE stage its routing state.
+        mixer = (
+            self._recomputed_mixer_bytes_per_token()
+            + (
+                2 * self._hidden_size * 2 + self._moe_checkpoint_state_bytes_per_token()
+                if moe
+                else 0
+            )
+            if gradient_rows
+            else 0
+        )
         workspace = max(
             self._moe_workspace_bytes(rows, checkpoint_grad=grad, slot_ref=ref)
             + (mixer * rows if grad else 4 * rows * self._hidden_size * 2)
             for (rows, grad), ref in zip(group_rows, refs, strict=True)
         )
+        if moe:
+            workspace += self._te_workspace_growth_bytes()
         return retained, workspace
+
+    def _te_workspace_growth_bytes(self) -> int:
+        """Transformer Engine's cuBLAS workspaces, until its GEMMs allocate them.
+
+        The first plain and grouped GEMMs allocate them during a call, and TE
+        keeps them for the process; later calls see them as used memory.
+        """
+        try:
+            from transformer_engine.pytorch.cpp_extensions import gemm
+        except ImportError:
+            return _TE_CUBLAS_WORKSPACE_BYTES
+        info = getattr(gemm.get_cublas_workspace, "cache_info", None)
+        if callable(info) and info().currsize >= 2:
+            return 0
+        return _TE_CUBLAS_WORKSPACE_BYTES
+
+    def _moe_checkpoint_state_bytes_per_token(self) -> int:
+        """Per local token beside the recomputed MoE stage's routed rows.
+
+        FP32 router scores and the boolean routing map; the dispatcher's state
+        (the EP1 permutation's int32 row-id map of 2E + 1, or HybridEP's FP32
+        probability copy and handle metadata of about 5E); and the shared
+        expert's saved FC1 gate/up and GLU outputs. Qwen3.6-35B-A3B traces:
+        3,332 and 3,593 bytes of routing state at EP1 and EP2, 3 KB shared.
+        """
+        geometry = self._geometry
+        experts = geometry.moe_experts
+        if not experts:
+            return 0
+        routing = experts * (4 + 1) + (
+            4 * (2 * experts + 1) if self._parallel_shape.ep == 1 else 9 * experts + 16
+        )
+        return routing + 3 * geometry.moe_shared_expert_ffn * self._param_dtype_size
+
+    def _checkpoint_input_gradient_bytes(
+        self, group_rows: tuple[tuple[int, bool], ...]
+    ) -> int:
+        """Gradient rows live at the recomputed layer's peak.
+
+        Backward recomputes the last layer first, so its peak meets every saved
+        boundary but only the one incoming gradient. Where the MoE stage is
+        priced (Qwen3.6-35B-A3B traces at CP1, CP2/EP1 and EP2/CP2), charge that
+        gradient. Elsewhere keep one gradient per boundary: that allowance also
+        covers dense MLP and other recompute work the floor does not price.
+        """
+        retained, _ = self._checkpoint_memory_floor(group_rows)
+        if not retained:
+            return 0
+        gradient_rows = sum(rows for rows, grad in group_rows if grad)
+        if self._checkpoint_moe_bytes_per_token():
+            return gradient_rows * self._hidden_size * 2
+        return retained
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
@@ -4161,11 +4252,9 @@ class TrainerRank:
                 checkpoint_floor[0],
             ),
         )
-        # One logical BF16 input gradient per eligible full/uniform/1 boundary.
-        # This partial peak allowance is not evidence of simultaneous distinct
-        # backing stores, nor a bound for compiler saves or other backward work.
-        # Keep it out of forward retention, including the cold fallback above.
-        gradient = checkpoint_retained
+        # Input gradients live at the recomputed layer's peak; kept out of
+        # forward retention, including the cold fallback above.
+        gradient = self._checkpoint_input_gradient_bytes(group_rows)
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
@@ -7910,7 +7999,11 @@ class TrainerRank:
             static_compute,
             max(retained, checkpoint_floor[0])
             + max(workspace, head_workspace_bytes, checkpoint_floor[1])
-            + (retained if include_checkpoint_input_gradient else 0),
+            + (
+                self._checkpoint_input_gradient_bytes(group_rows)
+                if include_checkpoint_input_gradient
+                else 0
+            ),
         )
         if signature.topology[2] > 1:
             # Local head results coexist with full CP outputs during gathering.
@@ -8031,12 +8124,13 @@ class TrainerRank:
           stage-padded Q/K/V, the stage output and a core-attention copy
           (94 KB measured at CP2, 95 KB priced). CP above 2 uses the CP2
           allowance; ranks with several remote stages may keep more.
-        - GDN: norm output, q and k, their l2norm outputs expanded to the
-          value heads, v, z, two segment-layout tensors, the gated-norm
-          output and the chunk decay matrix (75 KB measured at CP1, 74 KB
-          priced). A context-parallel rank adds its hidden-width input
-          exchange (measured) and value-width output projection (from
-          source): 84 KB measured at CP2, 86 KB priced.
+        - GDN: norm output, the projected q/k/v, their l2norm outputs
+          expanded to the value heads, five more value-width tensors (z, two
+          segment-layout tensors, the gated-norm output and its gated
+          product) and the chunk decay matrix: 80 KB measured at CP1, 82 KB
+          priced. A context-parallel rank's exchanged layout holds about 7%
+          more rows; its hidden-width input exchange and value-width output
+          allowance price that (88 KB measured at CP2, 94 KB priced).
         """
         geometry = self._geometry
         hidden = self._hidden_size
@@ -8055,7 +8149,7 @@ class TrainerRank:
             value = geometry.gdn_value_heads * geometry.gdn_value_head_dim
             normalized = 2 * geometry.gdn_value_heads * geometry.gdn_key_head_dim
             chunk = 64 * geometry.gdn_value_heads
-            gdn = hidden + (2 * key + normalized + 5 * value + chunk) / tp
+            gdn = hidden + (2 * key + normalized + 6 * value + chunk) / tp
             if cp:
                 gdn += hidden + value / tp
             widths.append(gdn)

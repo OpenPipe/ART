@@ -8,7 +8,12 @@ import pytest
 import torch
 
 from art.trainer_rank import ForwardInput, TrainerRank
-from art.trainer_rank._impl import Unset, _ForwardRefusal, _MemoryProfile
+from art.trainer_rank._impl import (
+    _TE_CUBLAS_WORKSPACE_BYTES,
+    Unset,
+    _ForwardRefusal,
+    _MemoryProfile,
+)
 
 
 def rank():
@@ -105,7 +110,9 @@ def test_required_and_learned_retained_use_max_not_sum():
     )
     cost = price(r, values)
     old = max(n * 2048 * 2 * 14, n * 188416)
-    assert cost.required == int((out + max(old, 2 * retained + work)) * 1.1)
+    gradient = r._checkpoint_input_gradient_bytes(groups)
+    assert gradient == 1024 * 2048 * 2  # The incoming gradient only.
+    assert cost.required == int((out + max(old, retained + gradient + work)) * 1.1)
     assert cost.retained == int((out + retained) * 1.1)
     r._memory_profiles[sig] = replace(
         r._memory_profiles[sig],
@@ -135,7 +142,7 @@ def test_per_group_padding_precedes_gradient_filter():
     assert values[0] == 40 and values[3] == ((16, True), (24, False))
     assert r._checkpoint_memory_floor(values[3]) == (
         16 * 40 * 4096,
-        24 * (188416 + 4 * 2048 * 2),
+        24 * (188416 + 4 * 2048 * 2) + _TE_CUBLAS_WORKSPACE_BYTES,
     )
 
 
@@ -325,7 +332,8 @@ def test_split_keeps_complete_order_and_checks_each_new_subforward():
         logical_per_packed=1,
         retained_compute_bytes_per_token=1,
     )
-    limit = 250_000_000
+    # Just below the unsplit plan's requirement: two subforwards must fit.
+    limit = r._plan_cost(flat).required - 1
     used = 0
     r._available_memory_bytes = lambda: limit - used
     result = r._find_admissible_forward(req, checkpoint=Unset, refusal_prefix="test")
@@ -431,7 +439,8 @@ def test_no_grad_enclosure_uses_max_group_and_affine_stage():
     mixed = ((3, True), (11, False))
     assert r._checkpoint_memory_floor(mixed) == (
         3 * 40 * 2048 * 2,
-        max(3 * 188416, max(11 * 188416, 11 + 1_000_000) + 4 * 11 * 2048 * 2),
+        max(3 * 188416, max(11 * 188416, 11 + 1_000_000) + 4 * 11 * 2048 * 2)
+        + _TE_CUBLAS_WORKSPACE_BYTES,
     )
 
 
@@ -526,18 +535,23 @@ def test_recomputed_attention_is_priced_beside_the_moe_stage(cp, expected):
     r._topology_key = lambda: (1, 1, cp, 1)
     assert r._recomputed_mixer_bytes_per_token() == expected
     moe = r._moe_workspace_bytes(10, checkpoint_grad=True)
-    assert r._checkpoint_memory_floor(((10, True),))[1] == moe + 10 * expected
+    # Beside the mixer: the recomputed layer's residual and pre-MLP norm rows,
+    # and Transformer Engine's cuBLAS workspaces.
+    assert (
+        r._checkpoint_memory_floor(((10, True),))[1]
+        == moe + 10 * (expected + 2 * 2048 * 2) + _TE_CUBLAS_WORKSPACE_BYTES
+    )
 
 
 @pytest.mark.parametrize(
     "cp,gdn_layers,expected",
     [
-        # Hybrid: GDN (74 KB) is larger at CP1, CP attention (95 KB) at CP2.
-        (1, 30, 73728),
+        # Hybrid: GDN (82 KB) is larger at CP1, CP attention (95 KB) at CP2.
+        (1, 30, 81920),
         (2, 30, 95232),
         # GDN only: CP exchanges add a hidden-width and a value-width row.
-        (1, 40, 73728),
-        (2, 40, 86016),
+        (1, 40, 81920),
+        (2, 40, 94208),
     ],
 )
 def test_larger_recomputed_mixer_is_priced(cp, gdn_layers, expected):
@@ -587,9 +601,41 @@ def test_gdn_width_follows_hidden_key_and_value_separately(cp):
     r._topology_key = lambda: (1, 1, cp, 1)
     key, value = 16 * 128, 48 * 128
     # q and k are l2-normalized after expansion to the 48 value heads.
-    width = 5120 + 2 * key + 2 * 48 * 128 + 5 * value + 64 * 48
+    width = 5120 + 2 * key + 2 * 48 * 128 + 6 * value + 64 * 48
     if cp > 1:
         width += 5120 + value
     assert r._recomputed_mixer_bytes_per_token() == 2 * width
     moe = r._moe_workspace_bytes(7, checkpoint_grad=True)
-    assert r._checkpoint_memory_floor(((7, True),))[1] == moe + 7 * 2 * width
+    assert (
+        r._checkpoint_memory_floor(((7, True),))[1]
+        == moe + 7 * 2 * (width + 2 * 5120) + _TE_CUBLAS_WORKSPACE_BYTES
+    )
+
+
+@pytest.mark.parametrize("ep,routing", [(1, 3332), (2, 3600)])
+def test_moe_state_beside_the_recomputed_stage(ep, routing):
+    # Qwen3.6-35B-A3B: 256 experts, 512-wide shared expert. Traces measured
+    # 3,332 (EP1) and 3,593 (EP2) bytes of routing state per local token.
+    r = rank()
+    r._geometry = replace(r._geometry, moe_experts=256, moe_shared_expert_ffn=512)
+    r._parallel_shape = replace(r._parallel_shape, ep=ep)
+    assert r._moe_checkpoint_state_bytes_per_token() == routing + 3 * 512 * 2
+    r._geometry = replace(r._geometry, moe_experts=0)
+    assert r._moe_checkpoint_state_bytes_per_token() == 0
+
+
+def test_te_workspaces_are_growth_until_allocated(monkeypatch):
+    gemm = pytest.importorskip("transformer_engine.pytorch.cpp_extensions.gemm")
+    r = rank()
+    entries = [0]
+
+    class Cached:
+        def cache_info(self):
+            return SimpleNamespace(currsize=entries[0])
+
+    monkeypatch.setattr(gemm, "get_cublas_workspace", Cached())
+    assert r._te_workspace_growth_bytes() == _TE_CUBLAS_WORKSPACE_BYTES
+    entries[0] = 1  # Plain GEMM only: the grouped streams are still to come.
+    assert r._te_workspace_growth_bytes() == _TE_CUBLAS_WORKSPACE_BYTES
+    entries[0] = 2
+    assert r._te_workspace_growth_bytes() == 0
