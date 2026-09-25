@@ -1573,6 +1573,7 @@ def _real_path_megatron_worker(
             adapter_model = load_lora_tensors_for_megatron(
                 str(adapter_path),
                 handler=runtime.model_support_handler,
+                provider=runtime.provider,
                 allow_unvalidated_arch=request.config.allow_unvalidated_arch,
             )
             megatron_train.load_adapter_into_model(

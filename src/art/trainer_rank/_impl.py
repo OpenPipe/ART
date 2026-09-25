@@ -2626,19 +2626,11 @@ class TrainerRank:
                 "adapter_config['base_model_name_or_path'] must be a string"
             )
         if base_model.startswith(("Qwen/Qwen3.5-", "Qwen/Qwen3.6-", "Qwen/Qwen3.8-")):
-            dimensions = {
-                "num_attention_heads": getattr(
-                    self.runtime.provider, "num_attention_heads", None
-                ),
-                "num_key_value_heads": getattr(
-                    self.runtime.provider, "num_query_groups", None
-                ),
-                "head_dim": getattr(self.runtime.provider, "kv_channels", None),
-                "hidden_size": getattr(self.runtime.provider, "hidden_size", None),
-            }
-            for key, value in dimensions.items():
-                if value is not None:
-                    config[key] = int(value)
+            from art.megatron.model_support.lora_disk import (
+                model_attention_dimensions,
+            )
+
+            config.update(model_attention_dimensions(self.runtime.provider))
         if not isinstance(rank, int) or isinstance(rank, bool):
             raise TypeError("adapter_config['r'] must be an integer")
         if not isinstance(config_alpha_value, int | float) or isinstance(
