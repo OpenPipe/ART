@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass, replace
 import functools
+import gc
 import importlib
 import json
 import math
@@ -77,11 +78,40 @@ def use_lora_slot(ref: LoRASlotRef | None) -> Iterator[None]:
         _CURRENT_LORA_SLOT.reset(token)
 
 
+# Dynamo compilation can leave reference cycles whose frames still hold the
+# traced call's real activations. A grad-mode recompile during backward's first
+# recompute would otherwise keep one layer's MoE tensors alive through the rest
+# of backward, until the cyclic collector happens to run.
+_COMPILE_GARBAGE = False
+
+
+def _mark_compile_garbage(_args: Any) -> None:
+    global _COMPILE_GARBAGE
+    _COMPILE_GARBAGE = True
+
+
+def _collect_compile_garbage() -> None:
+    global _COMPILE_GARBAGE
+    if _COMPILE_GARBAGE and not torch.compiler.is_compiling():
+        _COMPILE_GARBAGE = False
+        gc.collect()
+
+
+def install_compile_garbage_collection() -> None:
+    """Collect dynamo's cyclic garbage at the next checkpointed call after a compile."""
+    if os.environ.get("ART_COLLECT_COMPILE_GARBAGE", "1") in {"0", "false", "False"}:
+        return
+    handler = torch._dynamo.callback_handler
+    if _mark_compile_garbage not in handler.end_callbacks:
+        handler.register_end_callback(_mark_compile_garbage)
+
+
 def _with_captured_lora_slot(function: _F) -> _F:
     context = _CURRENT_LORA_SLOT.get()
 
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
+        _collect_compile_garbage()
         token = _CURRENT_LORA_SLOT.set(context)
         try:
             return function(*args, **kwargs)
@@ -160,6 +190,7 @@ def install_lora_checkpoint_context_hooks() -> None:
 
 
 install_lora_checkpoint_context_hooks()
+install_compile_garbage_collection()
 
 
 @dataclass(frozen=True)
