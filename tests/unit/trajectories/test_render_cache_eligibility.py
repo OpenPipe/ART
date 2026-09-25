@@ -34,7 +34,7 @@ def test_stock_render_with_local_macro_namespace_and_generation(tokenizer):
 {% generation %}{{ content(message) }}{% endgeneration %}{% endfor %}
 {% for key, value in tools[0]|items %}{{ key }}={{ value|tojson }}{% endfor %}
 {{ ns.n }}{% if add_generation_prompt %}assistant{% endif %}"""
-    tools = [{"name": "lookup"}]
+    tools: list[dict[str, object]] = [{"name": "lookup"}]
     assert eligible(tokenizer, template, tools=tools)
     assert "hello" in tokenizer.apply_chat_template(
         [{"role": "user", "content": "hello"}],
@@ -78,7 +78,7 @@ def test_non_plain_context_bypasses(tokenizer, field, value):
 
 
 def test_mutable_context_is_rechecked_and_cycles_bypass(tokenizer):
-    tools = [{"name": "lookup"}]
+    tools: list[dict[str, object]] = [{"name": "lookup"}]
     assert eligible(tokenizer, "{{ tools|tojson }}", tools=tools)
     tools[0]["callback"] = lambda: None
     assert not eligible(tokenizer, "{{ tools|tojson }}", tools=tools)
@@ -122,6 +122,57 @@ def test_mutated_compiled_environment_bypasses(tokenizer, monkeypatch):
     assert eligible(tokenizer, template)
     env = _compile_jinja_template(template).environment
     monkeypatch.setitem(env.filters, "length", lambda value: 42)
+    assert not eligible(tokenizer, template)
+
+
+def test_custom_hf_render_dispatch_bypasses_without_invoking_it(tokenizer, monkeypatch):
+    from transformers import tokenization_utils_base
+
+    assert eligible(tokenizer, "{{ messages }}")
+
+    def custom(*args, **kwargs):
+        raise AssertionError("eligibility must not invoke a custom dispatch")
+
+    monkeypatch.setattr(tokenization_utils_base, "render_jinja_template", custom)
+    assert not eligible(tokenizer, "{{ messages }}")
+
+
+def test_custom_undefined_changes_render_and_bypasses(tokenizer, monkeypatch):
+    from jinja2 import Undefined
+    from transformers.utils.chat_template_utils import _compile_jinja_template
+
+    class CountingUndefined(Undefined):
+        calls = 0
+
+        def __str__(self):
+            type(self).calls += 1
+            return str(self.calls)
+
+    template = "{{ messages[0].missing }}"
+    assert eligible(tokenizer, template)
+    env = _compile_jinja_template(template).environment
+    monkeypatch.setattr(env, "undefined", CountingUndefined)
+    assert env.from_string(template).render(messages=[{}]) == "1"
+    assert _compile_jinja_template(template).render(messages=[{}]) == "2"
+    assert not eligible(tokenizer, template)
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("finalize", lambda value: value),
+        ("context_class", object),
+        ("concat", lambda values: "".join(values)),
+        ("autoescape", True),
+        ("is_async", True),
+    ],
+)
+def test_custom_environment_configuration_bypasses(tokenizer, monkeypatch, name, value):
+    from transformers.utils.chat_template_utils import _compile_jinja_template
+
+    template = "{{ messages }}"
+    assert eligible(tokenizer, template)
+    monkeypatch.setattr(_compile_jinja_template(template).environment, name, value)
     assert not eligible(tokenizer, template)
 
 

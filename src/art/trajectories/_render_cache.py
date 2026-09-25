@@ -48,6 +48,7 @@ def cacheable_chat_template(tokenizer, template, tools, kwargs, messages) -> boo
         module = sys.modules.get(cls.__module__)
         if (
             not isinstance(tokenizer, base)
+            or base_module.render_jinja_template is not chat.render_jinja_template
             or not cls.__module__.startswith("transformers.")
             or getattr(module, cls.__name__, None) is not cls
             or type(tokenizer.chat_template) not in (str, type(None))
@@ -74,14 +75,22 @@ def cacheable_chat_template(tokenizer, template, tools, kwargs, messages) -> boo
         if type(kwargs) is not dict or kwargs.get("continue_final_message"):
             return False
 
-        from jinja2 import defaults, nodes
-        from jinja2.runtime import LoopContext
+        from jinja2 import Environment, Undefined, defaults, nodes
+        from jinja2.runtime import Context, LoopContext
         from jinja2.sandbox import ImmutableSandboxedEnvironment
         from jinja2.utils import Namespace
 
         compiled = chat._compile_jinja_template(template)
         env = compiled.environment
-        if type(env) is not ImmutableSandboxedEnvironment:
+        if (
+            type(env) is not ImmutableSandboxedEnvironment
+            or env.undefined is not Undefined
+            or env.finalize is not None
+            or env.context_class is not Context
+            or env.concat is not Environment.concat
+            or env.autoescape is not False
+            or env.is_async
+        ):
             return False
         tree = env.parse(template)  # HF's environment understands {% generation %}.
         parents = {

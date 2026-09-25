@@ -2,6 +2,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 import json
 import string
+from typing import cast
 
 from openai.types.chat import ChatCompletion
 import pytest
@@ -18,9 +19,9 @@ def restore_retokenization_warning(monkeypatch):
 def test_prefix_cache_preserves_order_types_generation_and_probe_context():
     calls = []
 
-    def render(messages, *, add_generation_prompt):
-        calls.append(deepcopy(messages))
-        return json.dumps(messages) + str(add_generation_prompt)
+    def render(selected_messages, *, add_generation_prompt):
+        calls.append(deepcopy(selected_messages))
+        return json.dumps(selected_messages) + str(add_generation_prompt)
 
     messages = [{"role": "user", "content": "snow雪"}, {"a": -0.0, "b": True}]
     cache = tokenization._PrefixChatRenderCache(render)
@@ -57,12 +58,12 @@ def test_prefix_cache_bounds_storage_and_does_not_cache_failures(monkeypatch):
     monkeypatch.setattr(tokenization._PrefixChatRenderCache, "_MAX_ENTRIES", 2)
     calls = 0
 
-    def render(messages, *, add_generation_prompt):
+    def render(selected_messages, *, add_generation_prompt):
         nonlocal calls
         calls += 1
-        if not messages:
+        if not selected_messages:
             raise ValueError("empty history")
-        return "🙂" * len(messages) + ("?" if add_generation_prompt else "")
+        return "🙂" * len(selected_messages) + ("?" if add_generation_prompt else "")
 
     messages = [{"content": str(i)} for i in range(20)]
     cache = tokenization._PrefixChatRenderCache(render)
@@ -80,8 +81,12 @@ def test_prefix_cache_bounds_storage_and_does_not_cache_failures(monkeypatch):
 def test_cache_settings_and_mutated_messages_invalidate_previous_prefixes():
     settings = {"tool": "lookup"}
 
-    def render(messages, *, add_generation_prompt):
-        return settings["tool"] + json.dumps(messages) + str(add_generation_prompt)
+    def render(selected_messages, *, add_generation_prompt):
+        return (
+            settings["tool"]
+            + json.dumps(selected_messages)
+            + str(add_generation_prompt)
+        )
 
     messages = [{"role": "user", "content": "first"}]
     cache = tokenization._PrefixChatRenderCache(render)
@@ -99,8 +104,8 @@ def test_cache_settings_and_mutated_messages_invalidate_previous_prefixes():
 
 
 def test_prefix_deltas_do_not_retain_quadratic_text():
-    def render(messages, *, add_generation_prompt):
-        return "".join(m["content"] for m in messages) + (
+    def render(selected_messages, *, add_generation_prompt):
+        return "".join(m["content"] for m in selected_messages) + (
             "?" if add_generation_prompt else ""
         )
 
@@ -117,7 +122,7 @@ def test_prefix_deltas_do_not_retain_quadratic_text():
 
 @pytest.mark.parametrize("value", [object(), float("nan"), float("inf"), {1: "x"}])
 def test_prefix_cache_bypasses_non_json_context(value):
-    def render(messages, *, add_generation_prompt):
+    def render(selected_messages, *, add_generation_prompt):
         return "unchanged"
 
     cache = tokenization._PrefixChatRenderCache(render)
@@ -132,11 +137,11 @@ def test_later_generation_split_is_recomputed_when_completed_suffix_is_equal():
         {"role": "assistant", "content": "HELLO"},
     ]
 
-    def render(selected, *, add_generation_prompt):
-        text = "".join(f"<{m['role']}>{m['content']}!" for m in selected)
+    def render(selected_messages, *, add_generation_prompt):
+        text = "".join(f"<{m['role']}>{m['content']}!" for m in selected_messages)
         if add_generation_prompt:
             text += "<assistant>"
-            if any(m["content"] == "B" for m in selected):
+            if any(m["content"] == "B" for m in selected_messages):
                 text += "H"
         return text
 
@@ -164,7 +169,7 @@ def test_later_generation_split_is_recomputed_when_completed_suffix_is_equal():
 
 
 _TEMPLATE = """{% for message in messages %}<{{ message.role }}>{{ message.content or '' }}
-{% if message.reasoning_content %}<think>{{ message.reasoning_content }}</think>{% endif %}
+{% if message.reasoning_content and (enable_thinking is not defined or enable_thinking) %}<think>{{ message.reasoning_content }}</think>{% endif %}
 {% for call in message.tool_calls or [] %}{% set tool_call = call.function %}<call>{{ tool_call.name }}({% for k, v in tool_call.arguments.items() %}{{ k }}={{ v|tojson }};{% endfor %})</call>{% endfor %}
 {% if message.role == 'assistant' %}${% else %}</{{ message.role }}>{% endif %}{% endfor %}
 {% if add_generation_prompt %}<assistant>{% endif %}"""
@@ -187,7 +192,9 @@ def _tokenizer(template):
     )
 
 
-def _history(turns, *, reasoning=False, refusal=False, length=False, tokenizer=None):
+def _history(
+    turns, *, reasoning=False, refusal=False, length=False, tokenizer=None, tools=True
+):
     messages = [{"role": "user", "content": "snow雪🙂"}]
     exchanges = []
     for i in range(turns):
@@ -206,10 +213,16 @@ def _history(turns, *, reasoning=False, refusal=False, length=False, tokenizer=N
             message["reasoning"] = "consider 雪"
         if refusal:
             message["refusal"] = "cannot do that"
+        if not tools:
+            del message["tool_calls"]
         choice = {
             "index": 0,
             "message": message,
-            "finish_reason": "length" if length and i == turns - 1 else "tool_calls",
+            "finish_reason": "length"
+            if length and i == turns - 1
+            else "tool_calls"
+            if tools
+            else "stop",
         }
         if tokenizer is not None:
 
@@ -256,8 +269,9 @@ def _history(turns, *, reasoning=False, refusal=False, length=False, tokenizer=N
         start = datetime(2026, 1, 1) + timedelta(seconds=i)
         exchanges.append(
             tr.ChatCompletionsExchange(
-                request=tr.ChatCompletionsRequest(
-                    model="test/model", messages=deepcopy(messages)
+                request=cast(
+                    tr.ChatCompletionsRequest,
+                    {"model": "test/model", "messages": deepcopy(messages)},
                 ),
                 response=response,
                 start_time=start,
@@ -265,7 +279,12 @@ def _history(turns, *, reasoning=False, refusal=False, length=False, tokenizer=N
             )
         )
         messages.extend(
-            [message, {"role": "tool", "tool_call_id": f"call-{i}", "content": "ok"}]
+            [
+                message,
+                {"role": "tool", "tool_call_id": f"call-{i}", "content": "ok"}
+                if tools
+                else {"role": "user", "content": "next"},
+            ]
         )
     return tr.Trajectory(
         exchanges=tr.TrajectoryExchanges(chat_completions=exchanges)
@@ -282,8 +301,9 @@ def _history(turns, *, reasoning=False, refusal=False, length=False, tokenizer=N
     ],
 )
 @pytest.mark.parametrize("ends_with_assistant", [False, True])
+@pytest.mark.parametrize("enable_thinking", [False, True])
 def test_cached_tool_probes_match_all_tokenized_fields(
-    monkeypatch, reasoning, refusal, length, ends_with_assistant
+    monkeypatch, reasoning, refusal, length, ends_with_assistant, enable_thinking
 ):
     history = _history(6, reasoning=reasoning, refusal=refusal, length=length)
     if not ends_with_assistant:
@@ -298,7 +318,7 @@ def test_cached_tool_probes_match_all_tokenized_fields(
         tokenizer=tokenizer,
         base_model=None,
         chat_template=_TEMPLATE,
-        chat_template_kwargs=None,
+        chat_template_kwargs={"enable_thinking": enable_thinking},
         _trace=trace,
     )
     monkeypatch.setattr(
@@ -312,7 +332,7 @@ def test_cached_tool_probes_match_all_tokenized_fields(
         tokenizer=tokenizer,
         base_model=None,
         chat_template=_TEMPLATE,
-        chat_template_kwargs=None,
+        chat_template_kwargs={"enable_thinking": enable_thinking},
         _trace=expected_trace,
     )
     assert actual.model_dump_json() == expected.model_dump_json()
@@ -339,11 +359,15 @@ def test_cached_probes_preserve_native_logprobs_stop_and_source_bindings(monkeyp
 
 
 @pytest.mark.parametrize("turns", [4, 8, 16])
-def test_tool_probe_scaling_reuses_only_unchanged_prefixes(monkeypatch, turns):
+@pytest.mark.parametrize("tools", [False, True])
+def test_probe_scaling_reuses_only_unchanged_prefixes(monkeypatch, turns, tools):
     from transformers import tokenization_utils_base
 
-    history = _history(turns)
+    history = _history(turns, tools=tools)
     tokenizer = _tokenizer(_TEMPLATE)
+    assert tokenization.cacheable_chat_template(
+        tokenizer, _TEMPLATE, history.tools, {}, history.messages
+    )
     original = tokenization_utils_base.render_jinja_template
     calls = 0
 
@@ -353,6 +377,9 @@ def test_tool_probe_scaling_reuses_only_unchanged_prefixes(monkeypatch, turns):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(tokenization_utils_base, "render_jinja_template", counted)
+    # The real gate correctly rejects custom dispatch. Admit only this test's
+    # pure counter after checking that the uninstrumented renderer is eligible.
+    monkeypatch.setattr(tokenization, "cacheable_chat_template", lambda *args: True)
     actual = history.tokenize(tokenizer=tokenizer, chat_template=_TEMPLATE)
     cached_calls = calls
     calls = 0
@@ -365,4 +392,7 @@ def test_tool_probe_scaling_reuses_only_unchanged_prefixes(monkeypatch, turns):
     assert actual.model_dump_json() == expected.model_dump_json()
     # This removes repeated unchanged prefixes, not the remaining quadratic
     # changed-prefix work. A zero-use cache must not pass this regression.
-    assert cached_calls <= calls - turns * (turns - 1)
+    if tools:
+        assert cached_calls <= calls - turns * (turns - 1)
+    else:
+        assert cached_calls == calls  # Plain text already avoids tool probes.
