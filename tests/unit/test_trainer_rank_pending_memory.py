@@ -340,9 +340,11 @@ def test_constructor_declined_moe_keeps_generic_admission(layer, unsupported):
     plan = rank._plan_flat_forward(requests)
     assert g.plan_floor(rank, plan) == (0, 0)
     required = rank._plan_cost(plan).required
-    # Generic checkpoint-input accounting still applies without a MoE component.
+    # Generic checkpoint accounting, including the recomputed layer's mixer,
+    # still applies without a MoE component.
     gradient = 50640 * 40 * 2048 * 2
-    assert required == int((plan.output_bytes + 2 * gradient) * 1.1)
+    mixer = 50640 * rank._recomputed_mixer_bytes_per_token()
+    assert required == int((plan.output_bytes + 2 * gradient + mixer) * 1.1)
     rank._available_memory_bytes = lambda: required - 1
     assert not rank._memory_check(plan).fits
     rank._available_memory_bytes = lambda: required
