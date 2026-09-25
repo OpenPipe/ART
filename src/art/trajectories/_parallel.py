@@ -536,6 +536,7 @@ class _ProcessOptions:
     chat_template: str | None
     chat_template_kwargs: Mapping[str, object] | None
     sampled: bool = False
+    native_sampled: bool = False
 
 
 class _ProcessTransferError(RuntimeError):
@@ -555,21 +556,40 @@ def _tokenize_process_payload(payload: bytes) -> bytes:
         raise _ProcessTransferError(
             f"could not deserialize process input: {type(error).__name__}: {error}"
         ) from None
-    tokenized = trajectory.tokenize(
-        multi_history=options.multi_history,
-        reconcile_text_equivalent_tokenizations=(
-            options.reconcile_text_equivalent_tokenizations
-        ),
-        model=options.model,
-        base_model=options.base_model,
-        tokenizer=None,
-        chat_template=options.chat_template,
-        chat_template_kwargs=options.chat_template_kwargs,
-    )
-    if options.sampled:
-        from ._sampled import reconcile_sampled_stops
+    if options.native_sampled:
+        if (
+            not options.sampled
+            or not options.multi_history
+            or options.reconcile_text_equivalent_tokenizations
+            or options.chat_template is not None
+            or options.chat_template_kwargs is not None
+        ):
+            raise ValueError(
+                "Native representation requires unmodified sampled options"
+            )
+        from ._sampled_native import tokenize_native
 
-        tokenized = reconcile_sampled_stops(tokenized, base_model=options.base_model)
+        tokenized = tokenize_native(
+            trajectory, model=options.model, base_model=options.base_model
+        )
+    else:
+        tokenized = trajectory.tokenize(
+            multi_history=options.multi_history,
+            reconcile_text_equivalent_tokenizations=(
+                options.reconcile_text_equivalent_tokenizations
+            ),
+            model=options.model,
+            base_model=options.base_model,
+            tokenizer=None,
+            chat_template=options.chat_template,
+            chat_template_kwargs=options.chat_template_kwargs,
+        )
+        if options.sampled:
+            from ._sampled import reconcile_sampled_stops
+
+            tokenized = reconcile_sampled_stops(
+                tokenized, base_model=options.base_model
+            )
     try:
         return pickle.dumps(tokenized, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as error:
@@ -724,7 +744,10 @@ async def transform(
     chat_template_kwargs: Mapping[str, object] | None,
     device: Any = None,
     _sampled: bool = False,
+    _native_sampled: bool = False,
 ) -> list[object]:
+    if _native_sampled and not _sampled:
+        raise ValueError("Native representation requires sampled tokenization")
     if _sampled and (
         operation != "tokenize"
         or not multi_history
@@ -745,6 +768,10 @@ async def transform(
     )
 
     def convert(trajectory: Trajectory) -> object:
+        if _native_sampled:
+            from ._sampled_native import tokenize_native
+
+            return tokenize_native(trajectory, model=model, base_model=base_model)
         tokenized = trajectory.tokenize(
             multi_history=multi_history,
             reconcile_text_equivalent_tokenizations=reconcile_text_equivalent_tokenizations,
@@ -775,7 +802,7 @@ async def transform(
             capacity=capacity,
         )
         if _sampled:
-            key = (*key, "sampled_stops")
+            key = (*key, "sampled_native" if _native_sampled else "sampled_stops")
         use_processes = _supports_processes(
             capacity=capacity, size=len(leaves), tokenizer=tokenizer
         ) and _processes_enabled(key)
@@ -790,6 +817,7 @@ async def transform(
                 chat_template=chat_template,
                 chat_template_kwargs=chat_template_kwargs,
                 sampled=_sampled,
+                native_sampled=_native_sampled,
             )
             try:
                 workers = _process_workers(key, capacity=capacity, size=len(leaves))

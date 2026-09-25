@@ -160,7 +160,7 @@ for history in histories:
 
 Use `await art.tokenize_sampled(trajectories)` (or trajectory groups) when you
 need complete native Chat Completions output with model-bound STOP flags. This
-opt-in API first performs ordinary `multi_history=True` tokenization without
+default `representation="rendered"` mode first performs ordinary `multi_history=True` tokenization without
 renderer overrides or text reconciliation. After that succeeds, it resolves the
 exact history model's tokenizer configuration, including its revision, to certify
 each selected sampled source's nonempty original conditioning, output IDs and
@@ -187,14 +187,48 @@ a different `base_model` does not supply authority.
 
 Incomplete native evidence, changed conditioning, unsupported sampled protocols,
 and extra or incorrect STOP flags raise an error, even if ordinary tokenization
-succeeded. Missing or null logprob carriers are not recorded NaNs; explicitly
-recorded raw NaNs remain valid evidence. Unsupported finish reasons such as
-`content_filter` are not certified as an absence of STOP. Nonsampled histories are retained. This API does not recover failed
+succeeded. Nonsampled histories are retained. This default mode does not recover failed
 rendering, split or join histories, or establish SFT equivalence.
 
 Generic `art.tokenize` remains unchanged: a native-only path can avoid loading a
 tokenizer, so missing STOP flags there do not prove that a terminating suffix is
 absent. Use the explicit API when that distinction matters.
+
+### Using recorded native conditioning instead of rendering
+
+For a loss defined on **SAMPLED first occurrences, selected before filtering
+nonfinite float32 logprobs**, you can explicitly select a native representation:
+
+```python
+tokenized = await art.tokenize_sampled(
+    trajectories, model="my-policy", representation="native"
+)
+```
+
+This mode never renders messages or catches an ordinary tokenizer failure. It
+requires complete original Chat Completions prompt/output tokens and logprobs,
+validates the entire selected source inventory, and uses each source model's
+resolved STOP authority. Content, literal reasoning delimiters, structured
+reasoning and tool calls remain in the original captured objects. Missing
+evidence is an error; a different renderer is not substituted.
+
+Consecutive generations share a history only when each complete earlier native
+prompt and output exactly prefixes the later request and their captured message
+views agree. Other generations retain separate histories. Source encounters
+remain in their original canonical order, including repeats across histories;
+there is no global source deduplication. Native request gaps are exact,
+**nonsampled context**, without guessed assistant/OUTPUT roles or synthetic
+renderer STOP tails. IDs, conditioning, logprobs, sampled flags and STOP ownership
+are checked again on constructed output.
+
+This preserves the ordered sampled objective, not generic OUTPUT/SFT loss,
+arbitrary per-history weighting, packing, or floating-point execution order.
+Mixed protocols, legacy/additional histories, incomplete source messages and
+edited projections are unsupported and raise errors. This includes assistant
+turns echoed without their original structured reasoning and response IDs reused
+within one model. Original trajectory/group
+metadata and source objects are retained. The same current-model-configuration
+limitation on historical STOP authority applies to both representations.
 
 ### Data Structure
 

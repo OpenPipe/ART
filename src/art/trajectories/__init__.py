@@ -1613,6 +1613,7 @@ async def tokenize_sampled(
     *,
     model: str | None = None,
     base_model: str | None = None,
+    representation: Literal["rendered", "native"] = "rendered",
 ) -> list[TokenizedMultiHistoryTrajectory]: ...
 
 
@@ -1622,6 +1623,7 @@ async def tokenize_sampled(
     *,
     model: str | None = None,
     base_model: str | None = None,
+    representation: Literal["rendered", "native"] = "rendered",
 ) -> list[TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]]: ...
 
 
@@ -1630,14 +1632,15 @@ async def tokenize_sampled(
     *,
     model: str | None = None,
     base_model: str | None = None,
+    representation: Literal["rendered", "native"] = "rendered",
 ) -> (
     list[TokenizedMultiHistoryTrajectory]
     | list[TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]]
 ):
-    """Tokenize ordinary histories, then certify native sampled output and STOP.
+    """Certify sampled output using ordinary rendering or explicit native sources.
 
-    This opt-in API uses ``multi_history=True`` without renderer overrides or
-    text reconciliation. It requires complete Chat Completions source messages,
+    The default ``representation="rendered"`` uses ``multi_history=True`` without
+    renderer overrides or text reconciliation. It requires complete Chat Completions source messages,
     nonempty original conditioning, output IDs and logprobs for every sampled span.
     Unsupported or incomplete sampled histories refuse; nonsampled histories
     are retained. Ordinary tokenization failures propagate without recovery.
@@ -1651,9 +1654,23 @@ async def tokenize_sampled(
     rendering, provide SFT equivalence or repartition histories. Generic
     :func:`tokenize` retains its native-only, no-load behavior; absent STOP flags
     there do not imply that a terminating suffix is known to be absent.
+
+    ``representation="native"`` instead constructs complete original Chat
+    Completions sources without rendering. Consecutive sources join only when
+    every earlier prompt/output is an exact prefix of the later native request;
+    otherwise they remain separate histories. Repeated encounters across
+    canonical histories remain in order. This mode preserves the objective only
+    for SAMPLED first-occurrence ownership chosen BEFORE float32 finite-logprob
+    filtering. It does not preserve OUTPUT/SFT loss, per-history weighting,
+    layout, packing or floating-point execution order. Native request gaps are
+    exact nonsampled context; synthetic renderer STOP tails are not invented.
+    Mixed protocols, additional/legacy histories, incomplete or edited sources
+    refuse. STOP authority still follows each resolved source-model configuration.
     """
     from ._parallel import transform
 
+    if representation not in {"rendered", "native"}:
+        raise ValueError("Unknown sampled representation")
     return cast(
         Any,
         await transform(
@@ -1667,6 +1684,7 @@ async def tokenize_sampled(
             chat_template=None,
             chat_template_kwargs=None,
             _sampled=True,
+            _native_sampled=representation == "native",
         ),
     )
 
