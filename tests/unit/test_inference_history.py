@@ -1,8 +1,10 @@
 import asyncio
+import copy
 import json
 from types import SimpleNamespace
 
-from pydantic import BaseModel, model_validator
+from openai.types.chat import ChatCompletionMessageToolCallParam
+from pydantic import BaseModel, TypeAdapter, model_validator
 import pytest
 
 from art_inference import vllm
@@ -396,6 +398,75 @@ def test_responses_use_the_native_renderer_and_preserve_ids(serving, legacy, str
         await server.create_responses(previous)
         assert bytes(server.engine.prompts[-1]).startswith(
             b"Uquestion;A\nthought\n#action~"
+        )
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_responses_observe_rendered_tool_history_without_rejecting_result(
+    serving, stream
+):
+    server, modules = serving
+    original_make = server._make_request
+    rendered = []
+
+    class StrictRequest(Request):
+        @model_validator(mode="after")
+        def validate_tool_arguments(self):
+            for message in self.messages:
+                for call in message.get("tool_calls", []):
+                    TypeAdapter(ChatCompletionMessageToolCallParam).validate_python(
+                        call
+                    )
+            return self
+
+    async def make_request(request, previous):
+        conversation, inputs = await original_make(request, previous)
+        conversation = copy.deepcopy(conversation)
+        # vLLM's renderer converts historical JSON argument strings to mappings.
+        function = conversation[1]["tool_calls"][0]["function"]
+        function["arguments"] = json.loads(function["arguments"])
+        rendered.append(conversation)
+        return conversation, inputs
+
+    server._make_request = make_request
+    modules[
+        "vllm.entrypoints.openai.chat_completion.protocol"
+    ].ChatCompletionRequest = StrictRequest
+    arguments = '{"query": "headphones", "max_price": 100}'
+    request = Request(
+        messages=[
+            {"role": "user", "content": "question"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "search", "arguments": arguments},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "[]"},
+        ],
+        stream=stream,
+    )
+
+    async def run():
+        response = await server.create_responses(request)
+        if stream:
+            event = await anext(response)
+            assert event.type == "response.completed"
+            await response.aclose()
+            response = event.response
+        assert response.output[0]["content"] == "action"
+        assert len(server.engine.prompts) == 1
+        assert rendered[0][1]["tool_calls"][0]["function"]["arguments"] == json.loads(
+            arguments
+        )
+        assert (
+            request.messages[1]["tool_calls"][0]["function"]["arguments"] == arguments
         )
 
     asyncio.run(run())
