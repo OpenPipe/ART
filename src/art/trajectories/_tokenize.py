@@ -479,6 +479,55 @@ def _assistant_stop_masks(
     return trimmed, stop
 
 
+def _prove_completed_sampled_stop_tail(
+    rendered: list[int],
+    completed: list[int] | None,
+    assistant_mask: list[bool],
+    bounds: tuple[int, int],
+    full_exact: list[int],
+    *,
+    source: object,
+    tokenizer: Tokenizer,
+) -> int | None:
+    """Bound a rendered closing tail by this message's completed prefix."""
+    if (
+        completed is None
+        or not 0 <= bounds[0] < bounds[1] <= len(completed) <= len(rendered)
+        or rendered[: len(completed)] != completed
+    ):
+        return None
+    count = _sampled_stop_suffix(
+        full_exact,
+        source=source,
+        source_key=_sampled_source_key(source),
+        tokenizer=tokenizer,
+    )
+    if (
+        not count
+        or count != _stop_suffix(full_exact, None, tokenizer)
+        or full_exact[:-count] != rendered[bounds[0] : bounds[1]]
+    ):
+        return None
+    mask, stops = _assistant_stop_masks(
+        completed, assistant_mask[: len(completed)], tokenizer
+    )
+    if not all(mask[bounds[0] : bounds[1]]):
+        return None
+    end = bounds[1]
+    while end < len(mask) and mask[end]:
+        end += 1
+    tail = completed[bounds[1] : end]
+    terminators = _terminator_ids(tokenizer)
+    if (
+        end == bounds[1]
+        or not stops[end - 1]
+        or tail[-count:] != full_exact[-count:]
+        or sum(token in terminators for token in tail) != count
+    ):
+        return None
+    return end
+
+
 def _translate_token_mask(
     source: Sequence[int],
     target: Sequence[int],
@@ -4057,6 +4106,7 @@ def _tokenize_exact_projected_chat_history(
     length_stop_boundaries: Mapping[_SampledSourceKey, _RenderedLengthStopBoundary]
     | None = None,
     projection_validated: bool = False,
+    _native_prompt_context: bool = False,
     _trace: _TraceBuilder | None = None,
 ) -> TokenizedHistory | None:
     if not projection_validated and not _history_matches_projection(history):
@@ -4199,6 +4249,24 @@ def _tokenize_exact_projected_chat_history(
             if boundary is not None and next_prompt is not None:
                 rendered_boundary = [*boundary.tail, *boundary.following]
                 native_boundary = next_prompt[end:]
+                if (
+                    _native_prompt_context
+                    and projection_validated is True
+                    and retained_ids == output
+                    and len(output_logprobs) == len(output)
+                    and next_prompt[:end] == [*prompt, *output]
+                    and boundary.tail
+                    and native_boundary[: len(boundary.tail)] == list(boundary.tail)
+                    and native_boundary != rendered_boundary
+                ):
+                    # The complete request prefix authenticates this non-loss
+                    # context. Keep the entire independently proved closing
+                    # tail at the exact output end; never trim a common prefix.
+                    boundary = _RenderedLengthStopBoundary(
+                        tail=boundary.tail,
+                        following=tuple(native_boundary[len(boundary.tail) :]),
+                    )
+                    rendered_boundary = [*boundary.tail, *boundary.following]
                 extra = len(native_boundary) - len(rendered_boundary)
                 decode = getattr(tokenizer, "decode", None)
                 if (
@@ -4464,6 +4532,93 @@ def _source_covers_complete_sampled_message(
     ) == normalize_chat_message(projected[0])
 
 
+def _require_exact_chat_source_edges(
+    history: ChatCompletionsHistory,
+    tokenized: TokenizedHistory,
+    trace: _HistoryTokenizationTrace | None,
+    tokenizer: Tokenizer,
+) -> None:
+    def refuse() -> None:
+        raise ValueError(
+            "Exact source boundary retry lacks complete conditioned source proof"
+        )
+
+    if (
+        trace is None
+        or tokenized.history is not history
+        or len(tokenized.tokens) != len(tokenized.logprobs)
+        or len(tokenized.tokens) != len(tokenized.flags)
+    ):
+        refuse()
+    assert trace is not None
+    trace.validate(tokenized)
+    expected = {
+        _sampled_source_key(source): source
+        for message, source in zip(
+            history.messages, history.message_sources, strict=True
+        )
+        if message.get("role") == "assistant"
+        and source is not None
+        and _source_is_sampled(source)
+    }
+    positions: dict[_SampledSourceKey, list[int]] = {}
+    for index, key in enumerate(trace.source_keys):
+        if key is not None:
+            positions.setdefault(key, []).append(index)
+    if (
+        not expected
+        or expected.keys() != positions.keys()
+        or expected.keys() != trace.sources.keys()
+    ):
+        refuse()
+    required = (
+        TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+    )
+    for key, source in expected.items():
+        indices = positions[key]
+        start, end = indices[0], indices[-1] + 1
+        prompt = _chat_source_prompt_tokens(source)
+        output = _source_output_tokens(source, key)
+        lp_ids, logprobs = _chat_source_full_tokens(source)
+        if (
+            indices != list(range(start, end))
+            or prompt is None
+            or output is None
+            or tokenized.tokens[:start] != prompt
+            or tokenized.tokens[start:end] != output
+            or lp_ids != output
+            or len(logprobs) != end - start
+            or not all(
+                a == b or (math.isnan(a) and math.isnan(b))
+                for a, b in zip(tokenized.logprobs[start:end], logprobs, strict=True)
+            )
+            or any(flag & required != required for flag in tokenized.flags[start:end])
+        ):
+            refuse()
+        assert output is not None
+        stop_count = _sampled_stop_suffix(
+            output, source=source, source_key=key, tokenizer=tokenizer
+        )
+        if (
+            any(
+                bool(tokenized.flags[index] & TokenFlag.STOP)
+                != (index >= end - stop_count)
+                for index in indices
+            )
+            or (
+                _source_stop_evidence(source, key)[0] == "length"
+                and any(tokenized.flags[index] & TokenFlag.STOP for index in indices)
+            )
+            or (
+                stop_count
+                and end < len(tokenized.tokens)
+                and tokenized.flags[end] & TokenFlag.STOP
+                and not tokenized.flags[end] & TokenFlag.SAMPLED
+            )
+        ):
+            refuse()
+
+
 def _tokenize_chat_view(
     history: ChatCompletionsHistory,
     *,
@@ -4473,7 +4628,9 @@ def _tokenize_chat_view(
     chat_template_kwargs: Mapping[str, object] | None,
     _projection_matches: bool | None = None,
     _trace: _TraceBuilder | None = None,
+    _exact_source_boundary_retry: bool = False,
 ) -> TokenizedHistory:
+    original_tokenizer = tokenizer
     _validate_history_sources(history)
     config = (
         _TokenizerConfig(base_model or history.model or "")
@@ -4510,6 +4667,12 @@ def _tokenize_chat_view(
         **default_chat_template_kwargs_for_template(template),
         **explicit_kwargs,
     }
+    if (
+        _exact_source_boundary_retry
+        and "enable_thinking" not in explicit_kwargs
+        and kwargs.get("enable_thinking") is False
+    ):
+        kwargs.pop("enable_thinking")
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
     segmented = False
 
@@ -4783,7 +4946,8 @@ def _tokenize_chat_view(
     exact_prefix_length = 0
     canonical_prefix_length = 0
     if (
-        chat_template is None
+        not _exact_source_boundary_retry
+        and chat_template is None
         and chat_template_kwargs is None
         and _projection_matches is True
     ):
@@ -4818,22 +4982,63 @@ def _tokenize_chat_view(
         canonical_assistant_mask,
         direct_bounds or None,
     )
-    assistant_mask = _translate_token_mask(
-        canonical_rendered,
-        rendered,
-        canonical_assistant_mask,
-        tokenizer=resolved_tokenizer,
-    )
-    output_mask = _translate_token_mask(
-        canonical_rendered,
-        rendered,
-        canonical_output_mask,
-        tokenizer=resolved_tokenizer,
-    )
-    stop_mask = _translate_token_mask(canonical_rendered, rendered, canonical_stop_mask)
-    length_stop_mask = _translate_token_mask(
-        canonical_rendered, rendered, canonical_length_stop_mask
-    )
+    try:
+        assistant_mask = _translate_token_mask(
+            canonical_rendered,
+            rendered,
+            canonical_assistant_mask,
+            tokenizer=resolved_tokenizer,
+        )
+        output_mask = _translate_token_mask(
+            canonical_rendered,
+            rendered,
+            canonical_output_mask,
+            tokenizer=resolved_tokenizer,
+        )
+        stop_mask = _translate_token_mask(
+            canonical_rendered, rendered, canonical_stop_mask
+        )
+        length_stop_mask = _translate_token_mask(
+            canonical_rendered, rendered, canonical_length_stop_mask
+        )
+    except ValueError as error:
+        origin = error.__traceback__
+        while origin is not None and origin.tb_next is not None:
+            origin = origin.tb_next
+        if (
+            _exact_source_boundary_retry
+            or original_tokenizer is not None
+            or _projection_matches is not True
+            or chat_template is not None
+            or chat_template_kwargs is not None
+            or not isinstance(history.model, str)
+            or not history.model.startswith("wandb-artifact:///")
+            or not _history_has_length_stop(history)
+            or type(error) is not ValueError
+            or origin is None
+            or origin.tb_frame.f_code is not _translate_token_mask.__code__
+            or str(error)
+            != "Cannot preserve assistant boundaries across exact prompt token replacement"
+        ):
+            raise
+        retry_trace = _TraceBuilder()
+        exact = _tokenize_chat_view(
+            history,
+            base_model=base_model,
+            tokenizer=original_tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+            _projection_matches=_projection_matches,
+            _trace=retry_trace,
+            _exact_source_boundary_retry=True,
+        )
+        _require_exact_chat_source_edges(
+            history, exact, retry_trace.trace, resolved_tokenizer
+        )
+        if _trace is not None:
+            assert retry_trace.trace is not None
+            _trace.set(exact, retry_trace.trace.source_keys, retry_trace.trace.sources)
+        return exact
     positions_by_first_token: dict[int, list[int]] = {}
     for index, token_id in enumerate(rendered):
         positions_by_first_token.setdefault(token_id, []).append(index)
@@ -5431,11 +5636,29 @@ def _tokenize_chat_view(
                     tokenizer=resolved_tokenizer,
                     length_stop_boundaries=length_stop_boundaries,
                     projection_validated=True,
+                    _native_prompt_context=(
+                        _exact_source_boundary_retry
+                        and _projection_matches is True
+                        and chat_template is None
+                        and chat_template_kwargs is None
+                        and all(
+                            source_matches_context(history.message_sources[index])
+                            and _source_covers_complete_sampled_message(
+                                history.messages[index], history.message_sources[index]
+                            )
+                            for index in sampled_message_indices
+                        )
+                    ),
                     _trace=_trace,
                 )
             )
         ):
             return exact
+
+    if _exact_source_boundary_retry:
+        raise ValueError(
+            "Exact source boundary retry lacks a complete renderer boundary proof"
+        )
 
     sampled_message_count = sum(
         message.get("role") == "assistant"
@@ -5467,7 +5690,10 @@ def _tokenize_chat_view(
         authoritative_prompt = (
             source_prompt_tokens(source) if sampled and source is not None else None
         )
-        initial_proven_bounds = marked_bounds.get(message_index) or probed_bounds.get(
+        initial_marked_bounds = marked_bounds.get(message_index)
+        completed_message_render: list[int] | None = None
+        recovered_stop_end: int | None = None
+        initial_proven_bounds = initial_marked_bounds or probed_bounds.get(
             message_index
         )
         exact_output_matches: list[tuple[int, int]] | None = None
@@ -5519,6 +5745,7 @@ def _tokenize_chat_view(
                 if completed is not None
                 else None
             )
+            completed_message_render = rendered_completed
             corrected_bounds = (
                 canonical_span_to_rendered(len(prefix), len(completed))
                 if prefix is not None and completed is not None
@@ -5608,6 +5835,38 @@ def _tokenize_chat_view(
                         )
                     generation_start = len(rendered_prompt)
                     sampled_bounds = (generation_start, len(rendered))
+                elif (
+                    initial_marked_bounds is not None
+                    and complete_sampled_message
+                    and full_exact
+                    and len(full_logprobs) == len(full_exact)
+                    and _projection_matches is True
+                    and source_context_matches
+                    and exact_prefix_length == 0
+                    and encoded_ids == canonical_rendered == rendered
+                    and len(parts) == 1
+                    and len(full_exact) != len(part_ids(parts[0][1]))
+                    and rendered[initial_marked_bounds[0] : initial_marked_bounds[1]]
+                    == part_ids(parts[0][1])
+                    and (
+                        recovered_stop_end := _prove_completed_sampled_stop_tail(
+                            rendered,
+                            completed_message_render,
+                            assistant_mask,
+                            initial_marked_bounds,
+                            full_exact,
+                            source=source,
+                            tokenizer=resolved_tokenizer,
+                        )
+                    )
+                    is not None
+                ):
+                    # Full-context marker offsets still prove this interval when
+                    # a truncated-prefix probe cannot extend its closing markup.
+                    # Downstream replacement uses the complete source's exact
+                    # IDs/logprobs, retaining its content/stop/overlap checks.
+                    sampled_bounds = initial_marked_bounds
+                    content_bounds_proven = True
                 else:
                     raise ValueError(
                         "Could not prove a sampled history message boundary with this "
@@ -5745,7 +6004,10 @@ def _tokenize_chat_view(
                 multi_generation_response or len(parts) != 1 or parts[0][0] != "content"
             ):
                 start = generation_start
-            if _sampled_stop_suffix(
+            if recovered_stop_end is not None:
+                # Consume exactly the independently proved current-message tail.
+                end = recovered_stop_end
+            elif _sampled_stop_suffix(
                 full_exact,
                 source=source,
                 source_key=_sampled_source_key(source),
@@ -5826,6 +6088,45 @@ def _tokenize_chat_view(
                         if match[1] <= upper
                     ]
                     if len(bounded_matches) != 1:
+                        if (
+                            not bounded_matches
+                            and not _exact_source_boundary_retry
+                            and original_tokenizer is None
+                            and _projection_matches is True
+                            and chat_template is None
+                            and chat_template_kwargs is None
+                            and isinstance(history.model, str)
+                            and history.model.startswith("wandb-artifact:///")
+                            and _history_has_length_stop(history)
+                            and complete_sampled_message
+                            and full_exact
+                            and len(full_logprobs) == len(full_exact)
+                            and len(parts) == 1
+                            and len(local) == len(full_exact)
+                            and upper - lower < len(local)
+                        ):
+                            retry_trace = _TraceBuilder()
+                            exact = _tokenize_chat_view(
+                                history,
+                                base_model=base_model,
+                                tokenizer=original_tokenizer,
+                                chat_template=chat_template,
+                                chat_template_kwargs=chat_template_kwargs,
+                                _projection_matches=_projection_matches,
+                                _trace=retry_trace,
+                                _exact_source_boundary_retry=True,
+                            )
+                            _require_exact_chat_source_edges(
+                                history, exact, retry_trace.trace, resolved_tokenizer
+                            )
+                            if _trace is not None:
+                                assert retry_trace.trace is not None
+                                _trace.set(
+                                    exact,
+                                    retry_trace.trace.source_keys,
+                                    retry_trace.trace.sources,
+                                )
+                            return exact
                         raise ValueError(
                             "Could not uniquely locate a sampled history message in "
                             "the rendered history"
@@ -6125,6 +6426,58 @@ def _tokenize_chat_view(
         flags[index] |= TokenFlag.EXACT
     if history.model is None:
         raise ValueError("History tokenization requires a model")
+    # The complete source prompt is the conditioning authority. A known
+    # mismatch must not be silently accepted by ordinary rendered assembly.
+    checked_prefixes: set[_SampledSourceKey] = set()
+    for start, source_key in enumerate(source_keys):
+        if source_key is None or source_key in checked_prefixes:
+            continue
+        checked_prefixes.add(source_key)
+        source = sources[source_key]
+        source_prompt = source_prompt_tokens(source)
+        if source_prompt is None or token_ids[:start] == source_prompt:
+            # Missing evidence is not an alignment proof; preserve the existing
+            # API path unless an actual full-prompt mismatch is established.
+            continue
+        if (
+            _exact_source_boundary_retry
+            or original_tokenizer is not None
+            or _projection_matches is not True
+            or chat_template is not None
+            or chat_template_kwargs is not None
+            or not isinstance(history.model, str)
+            or not history.model.startswith("wandb-artifact:///")
+            or not _history_has_length_stop(history)
+            or not all(
+                source_matches_context(history.message_sources[index])
+                and _source_covers_complete_sampled_message(
+                    history.messages[index], history.message_sources[index]
+                )
+                for index in sampled_message_indices
+            )
+        ):
+            raise ValueError(
+                "Exact source prefix mismatch lacks unchanged source authority"
+            )
+        retry_trace = _TraceBuilder()
+        exact = _tokenize_chat_view(
+            history,
+            base_model=base_model,
+            tokenizer=original_tokenizer,
+            chat_template=chat_template,
+            chat_template_kwargs=chat_template_kwargs,
+            _projection_matches=_projection_matches,
+            _trace=retry_trace,
+            _exact_source_boundary_retry=True,
+        )
+        _require_exact_chat_source_edges(
+            history, exact, retry_trace.trace, resolved_tokenizer
+        )
+        if _trace is not None:
+            assert retry_trace.trace is not None
+            _trace.set(exact, retry_trace.trace.source_keys, retry_trace.trace.sources)
+        return exact
+
     _mark_sampled_stops(
         token_ids,
         flags,
