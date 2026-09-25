@@ -5407,7 +5407,10 @@ class TrainerRank:
                         else 1
                         if isinstance(found, _ForwardRefusal)
                         else 3
-                        if isinstance(found[0], _FlatForwardPlan)
+                        if isinstance(
+                            cast("tuple[_AnyForwardPlan, _MemoryCheck]", found)[0],
+                            _FlatForwardPlan,
+                        )
                         else 2
                     )
                 except BaseException:

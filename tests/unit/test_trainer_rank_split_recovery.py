@@ -7,6 +7,7 @@ uses tiny CPU inputs; recovery uses the existing scalar clock/allocator facade.
 from dataclasses import replace
 import gc
 import types
+from typing import cast
 import unittest
 import weakref
 
@@ -28,7 +29,7 @@ class TestSplitRecovery(unittest.TestCase):
         value = _impl._CandidateMicroBatch(
             inputs=[["A", "B"]],
             indices=(0,),
-            plan=plan,
+            plan=cast(_impl._AnyForwardPlan, plan),
             check=check,
             stats_global_count=1,
             rejected_candidates=1,
@@ -168,7 +169,10 @@ class TestSplitRecovery(unittest.TestCase):
     def test_failed_research_never_gets_second_release(self):
         q, c, k, n = self.setup_recovery()
         refusal = _impl._ForwardRefusal(
-            types.SimpleNamespace(packed_tokens=200, logical_tokens=200),
+            cast(
+                _impl._AnyForwardPlan,
+                types.SimpleNamespace(packed_tokens=200, logical_tokens=200),
+            ),
             _impl._MemoryCheck(200, 170, False),
             "still cannot fit",
         )
@@ -314,12 +318,14 @@ def test_pure_finder_retains_exact_unsplit_plan_and_check(
         rank, "_try_cache_recovery", lambda *a, **kw: pytest.fail("impure search")
     )
     targets = []
-    plan, selected = rank._find_admissible_forward(
+    found = rank._find_admissible_forward(
         [_request(i) for i in range(4)],
         checkpoint=_impl.Unset,
         refusal_prefix="test",
         unsplit_targets=targets,
     )
+    assert not isinstance(found, _impl._ForwardRefusal)
+    plan, selected = found
     assert isinstance(plan, _impl._SplitForwardPlan)
     assert len(targets) == 1
     target, denied = targets[0]
@@ -337,6 +343,7 @@ def test_minimum_wave_hint_does_not_broaden_dp_rank_forward(
     _packed_budget(monkeypatch, rank, 20)
     inputs = [_request(i) for i in range(4)]
     candidate = rank._search_next_micro_batch([inputs], 0)
+    assert isinstance(candidate, _impl._CandidateMicroBatch)
     assert isinstance(candidate.plan, _impl._SplitForwardPlan)
     assert candidate.stats_global_count == 1
     assert candidate.recovery_target is not None
@@ -355,6 +362,7 @@ def test_profile_only_minimum_wave_has_no_recovery_hint(
     _packed_budget(monkeypatch, rank, 1000)
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **kw: False)
     candidate = rank._search_next_micro_batch([[_request(0), _request(1)]], 0)
+    assert isinstance(candidate, _impl._CandidateMicroBatch)
     assert isinstance(candidate.plan, _impl._FlatForwardPlan)
     assert candidate.recovery_target is None
 
@@ -392,6 +400,7 @@ def test_search_healthy_peer_carries_target_when_other_peer_splits(monkeypatch, 
     )
     inputs = [[_request(i) for i in range(2)], [_request(i + 2) for i in range(4)]]
     candidate = rank._search_next_micro_batch(inputs, 0)
+    assert isinstance(candidate, _impl._CandidateMicroBatch)
     assert candidate.indices == ((peer,) if peer < 2 else ())
     assert candidate.stats_global_count == 2
     assert isinstance(candidate.plan, _impl._FlatForwardPlan) == (peer != 1)
@@ -449,6 +458,7 @@ def test_existing_outcome_all_flat_does_not_request_recovery(monkeypatch):
 
     monkeypatch.setattr(rank, "_admission_outcome", outcome)
     candidate = rank._search_next_micro_batch([[_request(i) for i in range(4)]], 0)
+    assert isinstance(candidate, _impl._CandidateMicroBatch)
     assert outcomes == [3]
     assert candidate.recovery_target is None
     assert isinstance(candidate.plan, _impl._FlatForwardPlan)
