@@ -1606,9 +1606,9 @@ def _moe_output_bytes_per_token(
     # permuted. Balanced routing gives local tokens x top-k, as at EP1; a
     # pretrained CP2/EP2 run put about 1.35x that on one rank.
     routed_allowance = _EP_ROUTED_ROW_ALLOWANCE if shape.ep > 1 else 1
-    # Routed H-wide inputs held at the expert stage. The EP1 all-to-all keeps
-    # its permuted copy and the exchanged rows; HybridEP permutes while it
-    # dispatches and returns one tensor.
+    # Routed H-wide inputs held at the expert stage. The EP1 all-to-all path
+    # keeps its permuted rows and their expert-sorted copy; HybridEP permutes
+    # while it dispatches and returns one tensor.
     dispatched = 1 if shape.ep > 1 else 2
     coefficient = 0
     for chunk in model:

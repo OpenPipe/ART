@@ -216,9 +216,9 @@ def test_hybridep_prices_routed_rows_with_imbalance_allowance(layer, ep):
 
 def test_hybridep_keeps_the_enclosing_fc1_stage(layer):
     # The FC1 input and gate/up sum stay live at the FC2 sum under HybridEP
-    # too. The EP1 all-to-all holds two routed H-wide inputs (its permuted
-    # copy and the exchanged rows); HybridEP permutes while dispatching and
-    # holds one, as a Qwen3.6 CP2/EP2 allocator trace shows.
+    # too. The EP1 all-to-all path holds two routed H-wide inputs (its
+    # permuted rows and their expert-sorted copy); HybridEP permutes while
+    # dispatching and holds one, as Qwen3.6 CP2 allocator traces show.
     single = _moe_output_bytes_per_token(
         [_enclosing_moe(layer)], ParallelShape(tp=1, cp=1)
     )
