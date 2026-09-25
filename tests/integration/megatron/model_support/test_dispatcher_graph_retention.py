@@ -625,3 +625,191 @@ def test_dispatcher_custom_combine_is_preserved():
     assert dispatcher.probs.numel() == 0
     assert dispatcher.routing_map is not None
     assert dispatcher.reversed_local_input_permutation_mapping is not None
+
+
+def _hybridep_dispatch(*, x, routing_map, probs, num_local_experts, **_):
+    # CPU stand-in for HybridEP's fused dispatch: routed rows, their
+    # differentiable probabilities, per-expert counts and a combine handle.
+    rows, columns = routing_map.nonzero(as_tuple=True)
+    counts = routing_map.sum(0)
+    return x[rows], probs[rows, columns], None, counts, (rows, x.shape[0])
+
+
+def _hybridep_combine(*, x, handle, **_):
+    rows, tokens = handle
+    return x.new_zeros(tokens, x.shape[-1]).index_add(0, rows, x)
+
+
+@pytest.fixture
+def cpu_hybridep(cpu_checkpoint_rng, monkeypatch):
+    from megatron.core.transformer.moe import token_dispatcher
+
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", _hybridep_dispatch)
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_combine", _hybridep_combine)
+
+
+def _flex_dispatcher(manager: str = "hybridep") -> Any:
+    # Upstream flex dispatcher and HybridEP manager methods, with CPU fused
+    # kernels and without distributed initialization.
+    from megatron.core.transformer.moe.token_dispatcher import (
+        _DeepepManager,
+        _HybridEPManager,
+    )
+
+    config = SimpleNamespace(
+        cuda_graph_impl="none",
+        fp8=None,
+        fp4=None,
+        moe_hybridep_num_sms=1,
+        moe_router_topk=2,
+    )
+    dispatcher: Any = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.config = config
+    dispatcher.tp_size = dispatcher.ep_size = 1
+    dispatcher.num_local_experts = 4
+    comm: Any = object.__new__(
+        _HybridEPManager if manager == "hybridep" else _DeepepManager
+    )
+    comm.group = None
+    comm.num_local_experts = comm.num_experts = 4
+    comm.config = config
+    comm.drop_and_pad = False
+    comm.num_permuted_tokens = comm.pad_multiple = comm.handle = None
+    comm.token_probs = None
+    dispatcher._comm_manager = comm
+    return dispatcher
+
+
+class _FlexRouterLayer(torch.nn.Module):
+    def __init__(self, manager: str = "hybridep"):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(8, 4))
+        self.token_dispatcher = _flex_dispatcher(manager)
+
+    def forward(self, value):
+        probs = (value.reshape(-1, 8) @ self.weight).softmax(-1)
+        routing = torch.zeros_like(probs, dtype=torch.bool)
+        routing.scatter_(1, probs.topk(2, dim=-1).indices, True)
+        dispatcher = self.token_dispatcher
+        hidden, token_probs = dispatcher.dispatch_preprocess(value, routing, probs)
+        routed, routed_probs = dispatcher.token_dispatch(hidden, token_probs)
+        routed, _, routed_probs = dispatcher.dispatch_postprocess(routed, routed_probs)
+        transformed = routed.tanh() * routed_probs[:, None]
+        combined = dispatcher.token_combine(dispatcher.combine_preprocess(transformed))
+        return value + 0.2 * dispatcher.combine_postprocess(combined)
+
+
+def _run_checkpointed_flex_router(model):
+    model.zero_grad(set_to_none=True)
+    initial = torch.linspace(-1, 1, 88).reshape(1, 11, 8).requires_grad_()
+    inputs = []
+
+    def checkpointed(layer):
+        def compute(value):
+            if torch.is_grad_enabled():
+                assert value.is_leaf
+                inputs.append(weakref.ref(value))
+            return layer(value)
+
+        return compute
+
+    hidden = initial
+    for layer in model:
+        hidden = mcore_random.CheckpointFunction.apply(
+            checkpointed(layer), False, hidden
+        )
+    loss = hidden.square().sum()
+    loss.backward()
+    gc.collect()
+    assert len(inputs) == len(model)
+    alive = [reference() is not None for reference in inputs]
+    gradients = []
+    for value in [initial, *model.parameters()]:
+        assert value.grad is not None
+        gradients.append(value.grad.clone())
+    for layer in model:
+        comm = cast(Any, layer).token_dispatcher._comm_manager
+        comm.routing_map = comm.token_probs = comm.dispatched_probs = None
+    gc.collect()
+    assert all(reference() is None for reference in inputs)
+    return loss.detach(), gradients, alive
+
+
+def test_hybridep_state_releases_checkpoint_inputs(cpu_hybridep):
+    torch.manual_seed(954)
+    model = torch.nn.ModuleList([_FlexRouterLayer() for _ in range(4)])
+    original = MoEFlexTokenDispatcher.combine_postprocess
+    reference_loss, reference_grads, retained = _run_checkpointed_flex_router(model)
+    # Upstream HybridEP keeps each layer's checkpoint graph after backward.
+    assert all(retained)
+    _configure_moe_dispatcher_caches([model])
+    dispatchers = [cast(Any, layer).token_dispatcher for layer in model]
+    for dispatcher in dispatchers:
+        assert isinstance(dispatcher.combine_postprocess, partial)
+        assert dispatcher._comm_manager.token_probs is None
+    loss, gradients, retained = _run_checkpointed_flex_router(model)
+    assert not any(retained)
+    assert torch.equal(loss, reference_loss)
+    for actual, expected in zip(gradients, reference_grads, strict=True):
+        assert torch.equal(actual, expected)
+    assert MoEFlexTokenDispatcher.combine_postprocess is original
+    adapted = [dispatcher.combine_postprocess for dispatcher in dispatchers]
+    _configure_moe_dispatcher_caches([model])
+    assert [dispatcher.combine_postprocess for dispatcher in dispatchers] == adapted
+
+
+def test_hybridep_state_released_after_each_combine(cpu_hybridep):
+    layer = _FlexRouterLayer()
+    _configure_moe_dispatcher_caches([layer])
+    comm = layer.token_dispatcher._comm_manager
+    value = torch.randn(1, 11, 8, requires_grad=True)
+    output = layer(value)
+    # Backward keeps what it needs through the graph, not the manager.
+    assert comm.routing_map is None
+    assert comm.token_probs is None
+    assert comm.dispatched_probs is None
+    assert comm.handle is None
+    output.square().sum().backward()
+    assert value.grad is not None and torch.isfinite(value.grad).all()
+    assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
+
+
+@pytest.mark.parametrize("case", ["deepep", "cuda_graph", "custom_combine"])
+def test_other_flex_dispatchers_keep_their_state(cpu_hybridep, case):
+    layer = _FlexRouterLayer("deepep" if case == "deepep" else "hybridep")
+    dispatcher = layer.token_dispatcher
+    if case == "cuda_graph":
+        # CUDA graph capture reads routing inputs back from the manager.
+        dispatcher.config.cuda_graph_impl = "transformer_engine"
+    combine = dispatcher.combine_postprocess
+    if case == "custom_combine":
+        dispatcher.combine_postprocess = combine
+    probs = dispatcher._comm_manager.token_probs = torch.ones(1)
+    _configure_moe_dispatcher_caches([layer])
+    assert "combine_postprocess" not in vars(dispatcher) or (
+        dispatcher.combine_postprocess is combine
+    )
+    assert dispatcher._comm_manager.token_probs is probs
+
+
+@pytest.mark.parametrize("round_trip", ["pickle", "deepcopy"])
+def test_hybridep_adaptation_survives_serialization(cpu_hybridep, round_trip):
+    torch.manual_seed(954)
+    model = torch.nn.ModuleList([_FlexRouterLayer() for _ in range(2)])
+    expected_loss, expected_grads, retained = _run_checkpointed_flex_router(model)
+    assert all(retained)
+    _configure_moe_dispatcher_caches([model])
+    clone = (
+        pickle.loads(pickle.dumps(model)) if round_trip == "pickle" else deepcopy(model)
+    )
+    for layer in clone:
+        dispatcher: Any = cast(Any, layer).token_dispatcher
+        combine = dispatcher.combine_postprocess
+        assert isinstance(combine, partial) and combine.args[0] is dispatcher
+        _configure_moe_dispatcher_caches([clone])
+        assert dispatcher.combine_postprocess is combine
+    loss, gradients, retained = _run_checkpointed_flex_router(clone)
+    assert not any(retained)
+    assert torch.equal(loss, expected_loss)
+    for actual, expected in zip(gradients, expected_grads, strict=True):
+        assert torch.equal(actual, expected)
