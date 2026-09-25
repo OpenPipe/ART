@@ -214,6 +214,19 @@ def test_hybridep_prices_routed_rows_with_imbalance_allowance(layer, ep):
     assert single > 0 and expert == single // 8 * 12
 
 
+def test_hybridep_keeps_the_enclosing_fc1_stage(layer):
+    # The FC1 inputs and gate/up sum stay live at the FC2 sum under HybridEP
+    # too; EP1's two dispatched H-wide inputs over-count HybridEP's one.
+    single = _moe_output_bytes_per_token(
+        [_enclosing_moe(layer)], ParallelShape(tp=1, cp=1)
+    )
+    expert = _hybridep(layer, 2)
+    expert.token_dispatcher.num_local_experts = 128
+    sharded = _moe_output_bytes_per_token([expert], ParallelShape(tp=1, cp=2, ep=2))
+    assert single == 8 * (512 + 3 * 2048 + 2 * 2048 + 1024) * 2
+    assert sharded == single // 8 * 12
+
+
 @pytest.mark.parametrize(
     "manager,ep,shape_ep", [("deepep", 2, 2), ("hybridep", 2, 4), ("hybridep", 1, 1)]
 )
@@ -530,13 +543,19 @@ def test_unknown_enclosing_lifetimes_keep_previous_fc2_floor(
 
 
 def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
-    from megatron.core.transformer.moe import fused_a2a
+    fused_a2a = pytest.importorskip("megatron.core.transformer.moe.fused_a2a")
+    from art.trainer_rank._impl import _hybridep_buffer_bytes, _hybridep_rows_per_rank
 
-    from art.trainer_rank._impl import _hybridep_buffer_bytes
-
-    # Two ranks' tokens to one rank: BF16 H, FP32 probs and a routing-map byte
-    # per expert (256), and FP32 scaling factors per H/128.
-    assert _hybridep_buffer_bytes(1000, 2, 2048, 256) == 2000 * (4096 + 1280 + 64)
+    # Rows per rank are TMA-aligned, at least 512 and padded to 64-row chunks;
+    # every rank's rows land on one rank: BF16 H, FP32 probs and a routing-map
+    # byte per expert column (256), and FP32 scaling factors per H/128.
+    assert [_hybridep_rows_per_rank(n, 2) for n in (1, 512, 1000, 1025)] == [
+        512,
+        512,
+        1024,
+        1088,
+    ]
+    assert _hybridep_buffer_bytes(1000, 2, 2048, 256) == 2 * 1024 * (4096 + 1280 + 64)
     assert _hybridep_buffer_bytes(0, 2, 2048, 256) == 0
     rank = _rank()
     rank.runtime.provider.expert_model_parallel_size = 2
@@ -550,26 +569,39 @@ def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
         "art.megatron.train._hybridep_token_capacity", lambda sequence, cp: 1000
     )
 
-    def held(capacity):
-        config = SimpleNamespace(max_num_of_tokens_per_rank=capacity)
+    def held(rows):
+        config = SimpleNamespace(max_num_of_tokens_per_rank=rows)
         return SimpleNamespace(configurer=SimpleNamespace(buffer_config=config))
 
+    # The old buffer stays referenced while its replacement is allocated, so a
+    # growing plan pays the full new size.
     full = _hybridep_buffer_bytes(1000, 2, 2048, 256)
-    for current, growth in (
-        (None, full),
-        (held(400), full - _hybridep_buffer_bytes(400, 2, 2048, 256)),
-        (held(1000), 0),
-    ):
+    for current, growth in ((None, full), (held(512), full), (held(1024), 0)):
         monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", current)
         assert rank._plan_hybridep_growth_bytes(plan) == growth
-    # The growth enters required memory, not forward retention.
-    rank._update_memory_profile(plan, 10**9, retained_bytes=10**8)
+    # ETP multiplies the communication ranks and expert columns.
     monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
+    rank.runtime.provider.expert_tensor_parallel_size = 2
+    assert rank._plan_hybridep_growth_bytes(plan) == _hybridep_buffer_bytes(
+        1000, 4, 2048, 512
+    )
+    rank.runtime.provider.expert_tensor_parallel_size = 1
+    # Growth enters the forward and checkpoint peaks, not forward retention.
+    rank._update_memory_profile(plan, 10**9, retained_bytes=10**8)
+    monkeypatch.setattr(
+        rank, "_checkpoint_memory_floor", lambda rows, refs=None: (10**7, 10**6)
+    )
     grown = rank._plan_cost(plan)
     monkeypatch.setattr(rank, "_plan_hybridep_growth_bytes", lambda plan: 0)
     base = rank._plan_cost(plan)
-    assert grown.required - base.required == pytest.approx(full * 1.1, abs=2)
+    charged = int(full * 1.1)
     assert grown.retained == base.retained < base.required
+    assert grown.checkpoint_workspace - base.checkpoint_workspace == full
+    assert grown.required - base.required in (charged, charged + 1)
+    # A split pays it once, however many children would grow the buffer.
+    split = rank._split_required_memory([grown, grown, grown])
+    extra = split - rank._split_required_memory([base, base, base])
+    assert charged - 1 <= extra <= charged + 1
     rank.runtime.provider.expert_model_parallel_size = 1
     monkeypatch.undo()
     assert rank._plan_hybridep_growth_bytes(plan) == 0

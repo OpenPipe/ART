@@ -1512,18 +1512,27 @@ def _moe_dispatcher_supported(
     )
 
 
+def _hybridep_rows_per_rank(capacity: int, ranks: int) -> int:
+    """HybridEP's allocated rows per rank: TMA-aligned, at least 512, padded to
+    the 64-row combine chunk."""
+    multiple = 4 // math.gcd(4, ranks)
+    rows = max(-(-capacity // multiple) * multiple, 512)
+    return -(-rows // 64) * 64
+
+
 def _hybridep_buffer_bytes(capacity: int, ranks: int, hidden: int, experts: int) -> int:
     """Intranode HybridEP buffers for a per-rank token capacity.
 
-    Dispatch outputs alias the combine inputs (the shared-buffer default), sized
-    for every rank's tokens routed to one rank: BF16 tokens, FP32 probabilities
-    over the node's experts and FP32 FP8 scaling factors, which are allocated
-    even without FP8. The routing-map allgather keeps one byte per expert.
+    ``ranks`` is the ETPxEP communication group and ``experts`` its expert
+    columns. Dispatch outputs alias the combine inputs (the shared-buffer
+    default), sized for every rank's tokens routed to one rank: BF16 tokens,
+    FP32 probabilities over the columns and FP32 FP8 scaling factors, which are
+    allocated even without FP8. The routing-map allgather keeps one byte per
+    column.
     """
     if capacity <= 0:
         return 0
-    tokens = capacity * ranks
-    tokens += -tokens % 4
+    tokens = _hybridep_rows_per_rank(capacity, ranks) * ranks
     return tokens * (2 * hidden + 5 * experts + 4 * (hidden // 128))
 
 
@@ -1558,7 +1567,7 @@ def _moe_output_bytes_per_token(
     # HybridEP hands each rank the pairs routed to its local experts, already
     # permuted. Balanced routing gives local tokens x top-k, as at EP1; a
     # pretrained CP2/EP2 run put about 1.35x that on one rank.
-    routed_allowance = min(shape.ep, _EP_ROUTED_ROW_ALLOWANCE) if shape.ep > 1 else 1
+    routed_allowance = _EP_ROUTED_ROW_ALLOWANCE if shape.ep > 1 else 1
     coefficient = 0
     for chunk in model:
         for layer in chunk.modules():
@@ -3869,12 +3878,16 @@ class TrainerRank:
             if current is None
             else int(current.configurer.buffer_config.max_num_of_tokens_per_rank)
         )
-        if capacity <= held:
+        etp = int(getattr(provider, "expert_tensor_parallel_size", 1) or 1)
+        ranks = ep * etp
+        if _hybridep_rows_per_rank(capacity, ranks) <= held:
             return 0
-        hidden = int(provider.hidden_size)
-        experts = int(provider.num_moe_experts)
-        return _hybridep_buffer_bytes(capacity, ep, hidden, experts) - (
-            _hybridep_buffer_bytes(held, ep, hidden, experts)
+        # The old buffer stays referenced while its replacement is allocated.
+        return _hybridep_buffer_bytes(
+            capacity,
+            ranks,
+            int(provider.hidden_size),
+            int(provider.num_moe_experts) * etp,
         )
 
     def _plan_group_rows(self, plan: _FlatForwardPlan) -> tuple[tuple[int, bool], ...]:
@@ -4085,7 +4098,6 @@ class TrainerRank:
             checkpoint_floor=checkpoint_floor,
             retained_tokens=retained_tokens,
             include_checkpoint_input_gradient=False,
-            hybridep_growth_bytes=hybridep_growth_bytes,
         )
         checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
             group_rows, slot_refs
@@ -4109,9 +4121,13 @@ class TrainerRank:
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
-        checkpoint_workspace = max(
-            checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
+        # HybridEP buffer growth stays allocated through backward, but is not
+        # forward retention: split plans charge it once, via max workspace.
+        checkpoint_workspace = (
+            max(checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1])
+            + hybridep_growth_bytes
         )
+        required += int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR)
         forward_required = required
         if gradient:
             required = max(
@@ -6911,8 +6927,7 @@ class TrainerRank:
                 head_workspace_bytes=self._plan_head_workspace_bytes(forward),
                 checkpoint_floor=_gdn_memory.plan_floor(self, forward),
                 retained_tokens=self._plan_retained_tokens(forward),
-                hybridep_growth_bytes=self._plan_hybridep_growth_bytes(forward),
-            )
+            ) + int(self._plan_hybridep_growth_bytes(forward) * _MEMORY_SAFETY_FACTOR)
         return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
     def _admission_outcome(self, local: int) -> int:
@@ -7759,7 +7774,6 @@ class TrainerRank:
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         include_checkpoint_input_gradient: bool = True,
-        hybridep_growth_bytes: int = 0,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -7914,9 +7928,7 @@ class TrainerRank:
                     )
                 ),
             )
-        return int(
-            (output_bytes + compute + hybridep_growth_bytes) * _MEMORY_SAFETY_FACTOR
-        )
+        return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
     def _one_layer_recompute(self) -> bool:
         """ART's default full/uniform/1 recompute, which Megatron runs in training.
