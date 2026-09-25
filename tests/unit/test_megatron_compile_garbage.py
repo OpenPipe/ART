@@ -9,7 +9,8 @@ lora = pytest.importorskip("art.megatron.lora")
 
 
 class _Cycle:
-    pass
+    other: "_Cycle"
+    tensor: torch.Tensor
 
 
 def _garbage_holding_tensor() -> weakref.ref:
@@ -154,4 +155,26 @@ def test_checkpoint_backward_with_compile_keeps_gradients(
     out.sum().backward()
     torch.testing.assert_close(x.grad, reference_x.grad)
     torch.testing.assert_close(w.grad, reference_w.grad)
+    assert lora._COMPILE_GARBAGE is False
+
+
+def test_early_stopped_recompute_leaves_the_mark_for_the_next_call(no_automatic_gc):
+    # Non-reentrant recompute stops by raising out of the wrapped call, so a
+    # compile during it is collected at the next checkpointed call instead.
+    torch._dynamo.reset()
+    lora.install_compile_garbage_collection()
+
+    def layer(x, w):
+        return torch.tanh(x @ w).square()
+
+    compiled = torch.compile(layer, backend="eager")
+    x = torch.randn(4, 8, requires_grad=True)
+    w = torch.randn(8, 8, requires_grad=True)
+    out = torch.utils.checkpoint.checkpoint(compiled, x, w, use_reentrant=False)
+    assert lora._COMPILE_GARBAGE is False
+    torch._dynamo.reset()  # the recompute compiles again
+    with torch.utils.checkpoint.set_checkpoint_early_stop(True):
+        out.sum().backward()
+    assert x.grad is not None and lora._COMPILE_GARBAGE is True
+    lora._with_captured_lora_slot(lambda: None)()
     assert lora._COMPILE_GARBAGE is False
