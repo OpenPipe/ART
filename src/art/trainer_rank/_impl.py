@@ -1355,11 +1355,16 @@ def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
             (type(getattr(config, name, None)) is not int or getattr(config, name) != 1)
             for name in (
                 "tensor_model_parallel_size",
-                "context_parallel_size",
                 "pipeline_model_parallel_size",
-                "expert_model_parallel_size",
                 "expert_tensor_parallel_size",
             )
+        )
+        # CP shards rows and shared experts are not expert-parallel, so each
+        # local token returns the same shared output; Qwen3.6-35B-A3B traces
+        # show the same gated pair per token at CP1, CP2 and EP2.
+        or any(
+            (type(getattr(config, name, None)) is not int or getattr(config, name) < 1)
+            for name in ("context_parallel_size", "expert_model_parallel_size")
         )
     ):
         return 0

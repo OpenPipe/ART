@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
-from test_trainer_rank_moe_memory import _enclosing_moe, _rank
+from test_trainer_rank_moe_memory import _enclosing_moe, _hybridep, _rank
 from test_trainer_rank_moe_memory import layer as layer
 from test_trainer_rank_pending_memory import full_requests, module, rank_with_moe
 import torch
@@ -201,7 +201,8 @@ mutations = {
         x, "shared_experts_compute", lambda *a: None
     ),
     "topology bool": lambda x: setattr(x.config, "tensor_model_parallel_size", True),
-    "topology two": lambda x: setattr(x.config, "context_parallel_size", 2),
+    "topology two": lambda x: setattr(x.config, "pipeline_model_parallel_size", 2),
+    "topology zero": lambda x: setattr(x.config, "context_parallel_size", 0),
     "missing config": lambda x: delattr(x.shared_experts, "config"),
 }
 
@@ -383,3 +384,37 @@ def test_invalid_pre_gate_cache_stays_inside_planning_status(layer, bad):
         ValueError, match="Invalid constructor checkpoint MoE coefficient"
     ):
         rank._plan_cost(plan)
+
+
+@pytest.mark.parametrize(
+    "name", ["context_parallel_size", "expert_model_parallel_size"]
+)
+def test_shared_return_is_per_local_token_under_cp_and_ep(layer, name):
+    # CP shards rows and shared experts are not expert-parallel: each local
+    # token still returns one shared output.
+    shared_layer(layer)
+    setattr(layer.config, name, 2)
+    assert _shared_expert_output_bytes_per_token(layer) == 4096
+
+
+def test_cp_ranks_price_the_shared_return_beside_routed_rows(layer):
+    shared_layer(layer)
+    layer.config.context_parallel_size = 2
+    assert _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=2)) == 192512
+
+
+@pytest.mark.parametrize("checkpoint_grad,shared", [(False, 4096), (True, 8192)])
+def test_shared_return_escapes_the_ep_routed_allowance(layer, checkpoint_grad, shared):
+    shared_layer(layer)
+    local_experts = layer.token_dispatcher.num_local_experts
+    layer.config.context_parallel_size = layer.config.expert_model_parallel_size = 2
+    # EP2 halves the experts each rank owns.
+    _hybridep(layer, 2).token_dispatcher.num_local_experts = local_experts // 2
+    # HybridEP's 1.5x allowance turns top-k 8 into 12 routed rows; the gated
+    # shared return (doubled for checkpoint backward) is per local token.
+    assert (
+        _moe_output_bytes_per_token(
+            [layer], ParallelShape(tp=1, cp=2, ep=2), checkpoint_grad=checkpoint_grad
+        )
+        == 12 * 11776 * 2 + shared
+    )
