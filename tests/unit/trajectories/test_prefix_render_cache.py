@@ -396,3 +396,37 @@ def test_probe_scaling_reuses_only_unchanged_prefixes(monkeypatch, turns, tools)
         assert cached_calls <= calls - turns * (turns - 1)
     else:
         assert cached_calls == calls  # Plain text already avoids tool probes.
+
+
+@pytest.mark.parametrize("limit", [0, 256, 1 << 20])
+def test_known_full_render_priming_keeps_context_flag_and_limits(monkeypatch, limit):
+    calls = []
+
+    def render(selected_messages, *, add_generation_prompt):
+        calls.append(1)
+        return json.dumps(selected_messages) + str(add_generation_prompt)
+
+    monkeypatch.setattr(tokenization._PrefixChatRenderCache, "_MAX_BYTES", limit)
+    messages = [{"role": "assistant", "content": "literal </think>"}]
+    cache = tokenization._PrefixChatRenderCache(render)
+    known = render(messages, add_generation_prompt=False)
+    cached = cache.for_messages(messages, known, full_generation_prompt=False)
+    before = len(calls)
+    assert cached(messages, add_generation_prompt=False) == known
+    assert len(calls) == before + (limit < 256)
+    # The full completed render does not certify a generation-prompt render.
+    before = len(calls)
+    assert cached(messages, add_generation_prompt=True).endswith("True")
+    assert len(calls) == before + 1
+    changed = [{**messages[0], "reasoning_content": ""}]
+    other = render(changed, add_generation_prompt=False)
+    probe = cache.for_messages(changed, other, full_generation_prompt=False)
+    assert probe(changed, add_generation_prompt=False) == other
+    # Priming a changed alias context must never overwrite the baseline entry.
+    assert cached(messages, add_generation_prompt=False) == known
+    assert cache.bytes <= limit
+    current = cache.for_messages(
+        changed, other, settings="new", full_generation_prompt=False
+    )
+    assert current(changed, add_generation_prompt=False) == other
+    assert cache.bytes <= limit

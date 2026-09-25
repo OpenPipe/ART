@@ -33,6 +33,25 @@ with `chat_template_kwargs={"preserve_thinking": False}`. Additional histories
 remain useful for custom or externally managed templates that do not expose a
 prior-thinking preservation option.
 
+Captured literal text can also contain strings such as `</think>` without being
+reasoning. During offline tokenization, ART can protect that text from a
+template's inline-reasoning parser when the generation's own recorded request
+explicitly disabled thinking and its native output decodes to the complete
+content. ART tests a temporary render copy against the template's generation
+prefix and empty-message scaffold; it does not change the captured messages or
+the inference template. Explicit nonempty `reasoning` / `reasoning_content`
+fields retain their meaning, and thinking-on or unknown sources are not
+reinterpreted as literal-only generations.
+
+An accepted render adaptation must preserve the complete native conditioning,
+sampled token IDs, logprobs, source ownership and sampled STOP flags of **every**
+generation in the history, including later turns. Inconsistent native contexts
+raise an error rather than silently training a repaired rendering against a
+different sampled context. Missing native evidence or unsupported partial
+protocol projections leave the existing rendering path unchanged. This check
+does not supply missing logprobs or establish a general training contract for
+source-free SFT text.
+
 By splitting each turn into a separate history, you can preserve these tokens for training:
 
 ```python
