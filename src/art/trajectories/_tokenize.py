@@ -113,7 +113,12 @@ class _PrefixChatRenderCache:
         self.bytes = 0
 
     def for_messages(
-        self, messages: list[dict[str, Any]], text: str, *, settings: object = None
+        self,
+        messages: list[dict[str, Any]],
+        text: str,
+        *,
+        settings: object = None,
+        full_generation_prompt: bool | None = None,
     ) -> _ChatRender:
         try:
             context = tuple(_render_context_key(message) for message in messages)
@@ -129,6 +134,10 @@ class _PrefixChatRenderCache:
             if original != current:
                 break
             common += 1
+        if full_generation_prompt is not None and common == len(context) == len(
+            self.context
+        ):
+            self._remember((len(context), full_generation_prompt), text)
 
         def render(
             selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
@@ -148,16 +157,19 @@ class _PrefixChatRenderCache:
             value = self.render(
                 selected_messages, add_generation_prompt=add_generation_prompt
             )
-            if len(self.prefixes) < self._MAX_ENTRIES:
-                prefix = _common_prefix_length(self.text, value)
-                tail = value[prefix:]
-                size = 256 + 4 * len(tail)
-                if self.bytes + size <= self._MAX_BYTES:
-                    self.prefixes[key] = prefix, tail
-                    self.bytes += size
+            self._remember(key, value)
             return value
 
         return render
+
+    def _remember(self, key: tuple[int, bool], value: str) -> None:
+        if key not in self.prefixes and len(self.prefixes) < self._MAX_ENTRIES:
+            prefix = _common_prefix_length(self.text, value)
+            tail = value[prefix:]
+            size = 256 + 4 * len(tail)
+            if self.bytes + size <= self._MAX_BYTES:
+                self.prefixes[key] = prefix, tail
+                self.bytes += size
 
 
 class _TokenChatRender(Protocol):
@@ -4532,32 +4544,50 @@ def _source_covers_complete_sampled_message(
     ) == normalize_chat_message(projected[0])
 
 
+@dataclass
+class _NativeRenderSource:
+    key: _SampledSourceKey
+    prompt: list[int]
+    output: list[int]
+    logprobs: list[float]
+    stops: int
+
+
 def _preserve_literal_thinking_off_content(
     history: ChatCompletionsHistory,
     messages: list[dict[str, Any]],
-    template: object,
     kwargs: Mapping[str, object],
-) -> None:
-    # This Qwen3.5 template treats any </think> in unstructured content as a
-    # reasoning separator, even with thinking disabled. Restrict the render-copy
-    # adaptation to its exact preserved template; other templates may interpret
-    # an empty reasoning_content field differently.
+    tokenizer: Tokenizer,
+    render: _ChatRender,
+) -> list[_NativeRenderSource]:
+    """Prove a literal render view without changing captured message semantics.
+
+    Some templates parse legacy inline reasoning even for a generation recorded
+    with thinking disabled. An empty structured field is a usable escape only
+    if it preserves the empty-message scaffold and inserts the *entire* native
+    content at the generation boundary. Template identity is not this contract.
+    """
     if (
-        not isinstance(template, str)
-        or sha256(template.encode()).hexdigest()
-        != "098047d425a6673b1fe1a82a197a481616e53a283beaa8cb76cbb74d38ca6644"
-        or kwargs.get("enable_thinking") is not False
+        kwargs.get("enable_thinking") is not False
         or kwargs.get("preserve_thinking") is not True
     ):
-        return
-    for message, source in zip(messages, history.message_sources, strict=True):
+        return []
+    decode = getattr(tokenizer, "decode", None)
+    if not callable(decode):
+        return []
+    adapted = False
+    working = list(messages)
+    native: dict[int, _NativeRenderSource] = {}
+    for index, (message, source) in enumerate(
+        zip(messages, history.message_sources, strict=True)
+    ):
         if (
             source is None
             or not isinstance(source.exchange, ChatCompletionsExchange)
             or source.choice_index is None
             or message.get("role") != "assistant"
             or not isinstance(content := message.get("content"), str)
-            or "</think>" not in content
+            or not content
         ):
             continue
         request_kwargs = source.exchange.request.get("chat_template_kwargs")
@@ -4567,6 +4597,11 @@ def _preserve_literal_thinking_off_content(
         ):
             continue
         choice = _chat_choice(source)
+        if (
+            _field(choice, "prompt_token_ids") is None
+            and _field(source.exchange.response, "prompt_token_ids") is None
+        ):
+            continue
         # Visible-only histories may omit structured reasoning present in the
         # source response. Preserve both that source and normalized aliases.
         if any(
@@ -4579,9 +4614,135 @@ def _preserve_literal_thinking_off_content(
             )
         ):
             continue
-        prompt, output, _ = _chat_choice_tokens(choice, source.exchange.response)
-        if prompt is not None and output is not None:
-            message["reasoning_content"] = ""
+        prefix = working[:index]
+        try:
+            generation = render(prefix, add_generation_prompt=True)
+            completed = render([*prefix, message], add_generation_prompt=False)
+        except Exception:
+            continue
+        if completed.startswith(generation + content):
+            continue
+        prompt, output, logprobs = _chat_choice_tokens(choice, source.exchange.response)
+        if prompt is None or not output:
+            continue
+        key = _sampled_source_key(source)
+        stop_count = _sampled_stop_suffix(
+            output,
+            source=source,
+            source_key=key,
+            tokenizer=tokenizer,
+        )
+        native[id(source)] = _NativeRenderSource(
+            key, prompt, output, logprobs, stop_count
+        )
+        body = output[:-stop_count] if stop_count else output
+        # In particular, do not trim whitespace or strip arbitrary special
+        # tokens to manufacture agreement with the visible message.
+        try:
+            if (
+                decode(
+                    body, skip_special_tokens=False, clean_up_tokenization_spaces=False
+                )
+                != content
+            ):
+                continue
+            literal = {**message, "reasoning": "", "reasoning_content": ""}
+            empty = render(
+                [*prefix, {**message, "content": ""}], add_generation_prompt=False
+            )
+            literal_empty = render(
+                [*prefix, {**literal, "content": ""}], add_generation_prompt=False
+            )
+            if empty != literal_empty or not empty.startswith(generation):
+                continue
+            literal_completed = render([*prefix, literal], add_generation_prompt=False)
+            if literal_completed != generation + content + empty[len(generation) :]:
+                continue
+        except Exception:
+            # These are optional capability probes, not the actual render. A
+            # token-only tokenizer or a template that rejects an empty message
+            # must retain the original rendering/error path. Control exceptions
+            # and source-validation errors are deliberately not swallowed.
+            continue
+        working[index] = literal
+        adapted = True
+    if not adapted:
+        return []
+    # Partial protocol projections or absent native evidence cannot certify a
+    # changed render view. Decline the adaptation before committing it; leave
+    # their ordinary generic/SFT behavior to the existing tokenizer.
+    complete: dict[_SampledSourceKey, _NativeRenderSource] = {}
+    for source in history.message_sources:
+        if source is None or not _source_is_sampled(source):
+            continue
+        evidence = native.get(id(source))
+        if evidence is None:
+            prompt = _chat_source_prompt_tokens(source)
+            output, logprobs = _chat_source_full_tokens(source)
+            if prompt is None or output is None:
+                return []
+            key = _sampled_source_key(source)
+            evidence = _NativeRenderSource(
+                key,
+                prompt,
+                output,
+                logprobs,
+                _sampled_stop_suffix(
+                    output, source=source, source_key=key, tokenizer=tokenizer
+                ),
+            )
+        complete[evidence.key] = evidence
+    messages[:] = working
+    return list(complete.values())
+
+
+def _require_native_render_conditioning(
+    sources: list[_NativeRenderSource],
+    tokenized: TokenizedHistory,
+    trace: _TraceBuilder,
+) -> TokenizedHistory:
+    """A render adaptation must preserve *every* sampled generation's context.
+
+    Text equality in a probe is not token or conditioning equality. In
+    particular, changing an earlier message can invalidate a later source that
+    was generated from its lossy rendering. Generic histories without a render
+    adaptation retain their existing behavior.
+    """
+    assert trace.trace is not None
+    observed = trace.trace
+    expected_keys: list[_SampledSourceKey | None] = [None] * len(tokenized.tokens)
+    required = (
+        TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+    )
+    for source in sources:
+        prompt, output, logprobs = source.prompt, source.output, source.logprobs
+        start, end = len(prompt), len(prompt) + len(output)
+        if tokenized.tokens[:start] != prompt or tokenized.tokens[start:end] != output:
+            raise ValueError(
+                "Literal render adaptation changes native sampled conditioning"
+            )
+        key, count = source.key, source.stops
+        if len(logprobs) != len(output):
+            raise ValueError(
+                "Literal render adaptation lacks complete sampled logprobs"
+            )
+        for index, logprob in enumerate(logprobs, start):
+            actual = tokenized.logprobs[index]
+            flag = tokenized.flags[index]
+            if (
+                expected_keys[index] is not None
+                or observed.source_keys[index] != key
+                or flag & required != required
+                or bool(flag & TokenFlag.STOP) != (index >= end - count)
+                or not (actual == logprob or math.isnan(actual) and math.isnan(logprob))
+            ):
+                raise ValueError(
+                    "Literal render adaptation changes native sampled ownership, flags, or logprobs"
+                )
+            expected_keys[index] = key
+    if observed.source_keys != expected_keys:
+        raise ValueError("Literal render adaptation changes sampled source coverage")
+    return tokenized
 
 
 def _tokenize_chat_view(
@@ -4630,7 +4791,6 @@ def _tokenize_chat_view(
         **default_chat_template_kwargs_for_template(template),
         **explicit_kwargs,
     }
-    _preserve_literal_thinking_off_content(history, messages, template, kwargs)
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
     segmented = False
 
@@ -4677,6 +4837,69 @@ def _tokenize_chat_view(
         )
 
     prefix_render_cache = _PrefixChatRenderCache(render_normalized_text)
+    literal_render = render_text
+    literal_cache_primed = False
+    if (
+        kwargs.get("enable_thinking") is False
+        and kwargs.get("preserve_thinking") is True
+        and any(
+            isinstance(getattr(source, "exchange", None), ChatCompletionsExchange)
+            and isinstance(source.exchange.request.get("chat_template_kwargs"), Mapping)
+            and source.exchange.request["chat_template_kwargs"].get("enable_thinking")
+            is False
+            for source in history.message_sources
+            if source is not None
+        )
+        and cacheable_chat_template(
+            resolved_tokenizer, template, history.tools, kwargs, messages
+        )
+    ):
+        try:
+            # The same admitted cache serves behavioral and boundary probes.
+            # Changed aliases/normalization invalidate its affected prefixes;
+            # arbitrary or token-only renderers retain the uncached path.
+            proof_originals = list(messages)
+            proof_messages = normalize_tool_call_arguments_for_chat_template(
+                messages, template
+            )
+            cached_proof = prefix_render_cache.for_messages(
+                proof_messages,
+                render_normalized_text(
+                    proof_messages, add_generation_prompt=not ends_with_assistant
+                ),
+                full_generation_prompt=not ends_with_assistant,
+                settings=_render_context_key(
+                    [
+                        history.tools,
+                        kwargs,
+                        getattr(resolved_tokenizer, "special_tokens_map"),
+                    ]
+                ),
+            )
+
+            literal_cache_primed = True
+
+            def literal_render(
+                selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+            ) -> str:
+                if len(selected_messages) <= len(proof_originals) and all(
+                    current is original
+                    for current, original in zip(selected_messages, proof_originals)
+                ):
+                    return cached_proof(
+                        proof_messages[: len(selected_messages)],
+                        add_generation_prompt=add_generation_prompt,
+                    )
+                return render_text(
+                    selected_messages, add_generation_prompt=add_generation_prompt
+                )
+        except Exception:
+            pass  # Optional text proof must not block the raw-render fallback.
+    literal_sources = _preserve_literal_thinking_off_content(
+        history, messages, kwargs, resolved_tokenizer, literal_render
+    )
+    if literal_sources and _trace is None:
+        _trace = _TraceBuilder()
 
     def segmented_render(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
@@ -4690,19 +4913,25 @@ def _tokenize_chat_view(
                 selected_messages = normalize_tool_call_arguments_for_chat_template(
                     selected_messages, template
                 )
-                text = render_normalized_text(
+                settings = _render_context_key(
+                    [
+                        history.tools,
+                        kwargs,
+                        getattr(resolved_tokenizer, "special_tokens_map"),
+                    ]
+                )
+                full_render = (
+                    prefix_render_cache.for_messages(
+                        selected_messages, prefix_render_cache.text, settings=settings
+                    )
+                    if literal_cache_primed
+                    else render_normalized_text
+                )
+                text = full_render(
                     selected_messages, add_generation_prompt=add_generation_prompt
                 )
                 span_render = prefix_render_cache.for_messages(
-                    selected_messages,
-                    text,
-                    settings=_render_context_key(
-                        [
-                            history.tools,
-                            kwargs,
-                            getattr(resolved_tokenizer, "special_tokens_map"),
-                        ]
-                    ),
+                    selected_messages, text, settings=settings
                 )
             else:
                 text = render_text(
@@ -5590,6 +5819,11 @@ def _tokenize_chat_view(
                 )
             )
         ):
+            if literal_sources:
+                assert _trace is not None
+                return _require_native_render_conditioning(
+                    literal_sources, exact, _trace
+                )
             return exact
 
     sampled_message_count = sum(
@@ -6296,6 +6530,9 @@ def _tokenize_chat_view(
     )
     if _trace is not None:
         _trace.set(tokenized, source_keys, sources)
+    if literal_sources:
+        assert _trace is not None
+        return _require_native_render_conditioning(literal_sources, tokenized, _trace)
     return tokenized
 
 
