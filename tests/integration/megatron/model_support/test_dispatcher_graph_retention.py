@@ -910,11 +910,11 @@ def test_hybridep_adaptation_survives_serialization(cpu_hybridep, round_trip):
     expected_loss, expected_grads, retained = _run_checkpointed_flex_router(model)
     assert all(retained)
     _configure_moe_dispatcher_caches([model])
-    clone = (
+    clone: Any = (
         pickle.loads(pickle.dumps(model)) if round_trip == "pickle" else deepcopy(model)
     )
     for layer in clone:
-        dispatcher: Any = cast(Any, layer).token_dispatcher
+        dispatcher = layer.token_dispatcher
         combine = dispatcher.combine_postprocess
         assert isinstance(combine, partial) and combine.args[0] is dispatcher
         _configure_moe_dispatcher_caches([clone])
