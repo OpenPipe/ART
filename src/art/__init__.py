@@ -79,6 +79,7 @@ from .trajectories import (
     no_capture,
     tensorize,
     tokenize,
+    tokenize_sampled,
     trajectory,
     trajectory_group,
 )
@@ -133,6 +134,7 @@ __all__ = [
     "Trajectory",
     "TrajectoryGroup",
     "tokenize",
+    "tokenize_sampled",
     "tensorize",
     "trajectory",
     "trajectory_group",

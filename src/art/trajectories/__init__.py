@@ -1608,6 +1608,70 @@ async def tokenize(
 
 
 @overload
+async def tokenize_sampled(
+    items: Iterable[Trajectory],
+    *,
+    model: str | None = None,
+    base_model: str | None = None,
+) -> list[TokenizedMultiHistoryTrajectory]: ...
+
+
+@overload
+async def tokenize_sampled(
+    items: Iterable[TrajectoryGroup],
+    *,
+    model: str | None = None,
+    base_model: str | None = None,
+) -> list[TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]]: ...
+
+
+async def tokenize_sampled(
+    items: Iterable[Trajectory] | Iterable[TrajectoryGroup],
+    *,
+    model: str | None = None,
+    base_model: str | None = None,
+) -> (
+    list[TokenizedMultiHistoryTrajectory]
+    | list[TokenizedTrajectoryGroup[TokenizedMultiHistoryTrajectory]]
+):
+    """Tokenize ordinary histories, then certify native sampled output and STOP.
+
+    This opt-in API uses ``multi_history=True`` without renderer overrides or
+    text reconciliation. It requires complete Chat Completions source messages,
+    nonempty original conditioning, output IDs and logprobs for every sampled span.
+    Unsupported or incomplete sampled histories refuse; nonsampled histories
+    are retained. Ordinary tokenization failures propagate without recovery.
+
+    After ordinary tokenization succeeds, this may resolve metadata and load
+    tokenizer assets for each recorded source model to identify STOP suffixes.
+    Authority follows its resolved configuration, not an independent attestation
+    of a mutable selector's generation-time tokenizer revision.
+    It adds only proved STOP flags to copies, preserving tokens, logprobs,
+    all other flags, history order and the original objects. It does not change
+    rendering, provide SFT equivalence or repartition histories. Generic
+    :func:`tokenize` retains its native-only, no-load behavior; absent STOP flags
+    there do not imply that a terminating suffix is known to be absent.
+    """
+    from ._parallel import transform
+
+    return cast(
+        Any,
+        await transform(
+            items,
+            operation="tokenize",
+            multi_history=True,
+            reconcile_text_equivalent_tokenizations=False,
+            model=model,
+            base_model=base_model,
+            tokenizer=None,
+            chat_template=None,
+            chat_template_kwargs=None,
+            _sampled=True,
+        ),
+    )
+
+
+@overload
 async def tensorize(
     items: Iterable[Trajectory],
     *,
@@ -1902,6 +1966,7 @@ __all__ = [
     "trajectory",
     "trajectory_group",
     "tokenize",
+    "tokenize_sampled",
     "tensorize",
     "first_occurrence_masks",
     "get_messages",

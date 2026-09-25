@@ -535,6 +535,7 @@ class _ProcessOptions:
     base_model: str | None
     chat_template: str | None
     chat_template_kwargs: Mapping[str, object] | None
+    sampled: bool = False
 
 
 class _ProcessTransferError(RuntimeError):
@@ -565,6 +566,10 @@ def _tokenize_process_payload(payload: bytes) -> bytes:
         chat_template=options.chat_template,
         chat_template_kwargs=options.chat_template_kwargs,
     )
+    if options.sampled:
+        from ._sampled import reconcile_sampled_stops
+
+        tokenized = reconcile_sampled_stops(tokenized, base_model=options.base_model)
     try:
         return pickle.dumps(tokenized, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as error:
@@ -718,7 +723,17 @@ async def transform(
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
     device: Any = None,
+    _sampled: bool = False,
 ) -> list[object]:
+    if _sampled and (
+        operation != "tokenize"
+        or not multi_history
+        or reconcile_text_equivalent_tokenizations
+        or tokenizer is not None
+        or chat_template is not None
+        or chat_template_kwargs is not None
+    ):
+        raise ValueError("Sampled tokenization does not support renderer overrides")
     kind, materialized = _materialize(values)
     if kind is None:
         return []
@@ -739,6 +754,10 @@ async def transform(
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
         )
+        if _sampled:
+            from ._sampled import reconcile_sampled_stops
+
+            tokenized = reconcile_sampled_stops(tokenized, base_model=base_model)
         return tokenized if operation == "tokenize" else tokenized.tensorize()
 
     transformed: list[object]
@@ -755,6 +774,8 @@ async def transform(
             chat_template=chat_template,
             capacity=capacity,
         )
+        if _sampled:
+            key = (*key, "sampled_stops")
         use_processes = _supports_processes(
             capacity=capacity, size=len(leaves), tokenizer=tokenizer
         ) and _processes_enabled(key)
@@ -768,6 +789,7 @@ async def transform(
                 base_model=base_model,
                 chat_template=chat_template,
                 chat_template_kwargs=chat_template_kwargs,
+                sampled=_sampled,
             )
             try:
                 workers = _process_workers(key, capacity=capacity, size=len(leaves))

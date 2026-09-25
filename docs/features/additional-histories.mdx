@@ -156,6 +156,41 @@ for history in histories:
     # Weight is distributed across all results
 ```
 
+### Certifying native sampled output and STOP
+
+Use `await art.tokenize_sampled(trajectories)` (or trajectory groups) when you
+need complete native Chat Completions output with model-bound STOP flags. This
+opt-in API first performs ordinary `multi_history=True` tokenization without
+renderer overrides or text reconciliation. After that succeeds, it resolves the
+exact history model's tokenizer configuration, including its revision, to certify
+each selected sampled source's nonempty original conditioning, output IDs and
+logprobs.
+It may load tokenizer assets at this point; this authority does not change how
+the ordinary history was rendered. A mutable model selector is resolved using
+its current configuration; this API does not independently attest a historical
+tokenizer revision that the configuration does not record.
+
+```python
+import art
+
+tokenized = await art.tokenize_sampled(trajectories, model="my-policy")
+```
+
+Only missing, proved STOP flags are added, on copies. Tokens, logprobs, other
+flags, history order and original objects remain unchanged. `model` selects
+histories using the same selector as ordinary tokenization. An optional
+`base_model` must agree with each selected model's resolved configuration; it
+cannot substitute a different STOP authority.
+
+Incomplete native evidence, changed conditioning, unsupported sampled protocols,
+and extra or incorrect STOP flags raise an error, even if ordinary tokenization
+succeeded. Nonsampled histories are retained. This API does not recover failed
+rendering, split or join histories, or establish SFT equivalence.
+
+Generic `art.tokenize` remains unchanged: a native-only path can avoid loading a
+tokenizer, so missing STOP flags there do not prove that a terminating suffix is
+absent. Use the explicit API when that distinction matters.
+
 ### Data Structure
 
 The legacy `LegacyHistory` payload structure:
