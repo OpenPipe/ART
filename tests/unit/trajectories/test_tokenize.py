@@ -8440,8 +8440,13 @@ def test_explicit_template_override_refuses_changed_sampled_conditioning() -> No
             return [10]
 
     # The override would attach the logprob sampled after [1] to prefix [10].
-    with pytest.raises(ValueError, match="Exact source prefix mismatch"):
+    with pytest.raises(ValueError, match="Exact source prefix mismatch") as caught:
         trajectory.tokenize(tokenizer=Tokenizer(), chat_template="custom")
+    assert str(caught.value) == (
+        "Exact source prefix mismatch lacks unchanged source authority "
+        "(source_message_index=1, assembled_prefix_tokens=1, "
+        "recorded_prefix_tokens=1, first_mismatch_offset=0)"
+    )
 
     original = trajectory.tokenize(tokenizer=Tokenizer())
     assert original.tokens == [1, 2]

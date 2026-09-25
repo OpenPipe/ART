@@ -134,6 +134,45 @@ trajectory = Trajectory(
 )
 ```
 
+## Migrating captured histories with different token prefixes
+
+Tokenization now rejects a known change to the complete token prefix of a
+captured sampled response unless exact-source reconstruction preserves its
+conditioning. Earlier versions could carry the response's sampled logprobs into
+a different rendered prefix. Matching decoded text is not enough: the token
+sequence determines the conditioning. Explicit tokenizer or template overrides
+and `reconcile_text_equivalent_tokenizations=True` do not waive this check.
+
+When captured turns have different authoritative prefixes, keep separate
+histories where the protocol supports them:
+
+```python
+tokenized = trajectory.tokenize(
+    multi_history=True,
+    reconcile_text_equivalent_tokenizations=False,
+)
+```
+
+This preserves separate histories that the protocol already produces, with each
+history's original prompt, sampled outputs and logprobs. It does not automatically
+split every incompatible captured history. Every resulting history must still
+satisfy the conditioning checks; incomplete or inconsistent source evidence is
+not made valid. Remove an override that changes sampled conditioning, or supply
+matching source evidence.
+If you deliberately want to train on edited or approximate text, construct
+source-less/manual histories or use the [SFT message format](/fundamentals/sft-training#data-format)
+as a separate supervised dataset. Do not carry the old sampled logprobs or source
+references into that approximation. This is not an opt-in to recondition
+captured RL samples or a new mode that substitutes NaN logprobs.
+
+The `Exact source prefix mismatch` error reports only structural coordinates:
+the source's zero-based message index (or `None` if unavailable), assembled and
+recorded prefix lengths, and the first differing token offset. If the prefixes
+differ only in length, the offset is the shorter length. It contains no token IDs, message
+text, request IDs or prefix hashes. Use those coordinates to locate the source
+and rendering override in your own data. Missing prompt metadata still follows
+the existing fallback; absence of this error is not proof of alignment.
+
 ## How It Works
 
 ### Tokenization Process

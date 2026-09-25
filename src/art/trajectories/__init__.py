@@ -886,8 +886,10 @@ class Trajectory(_CompactModel):
 
         For divergent captured prompts, use ``multi_history=True`` with the
         default ``reconcile_text_equivalent_tokenizations=False`` to retain
-        separate authoritative histories. This does not recondition samples or
-        discard their evidence. Missing prompt metadata follows the existing
+        separate authoritative histories. This preserves existing separate
+        histories; it does not force a split, and each history must still pass
+        the conditioning checks. This does not recondition samples or discard
+        their evidence. Missing prompt metadata follows the existing
         fallback and is not certified aligned by this known-mismatch check.
         """
         from ._tokenize import tokenize_trajectory

@@ -6456,8 +6456,24 @@ def _tokenize_chat_view(
                 for index in sampled_message_indices
             )
         ):
+            message_index = next(
+                (i for i, item in enumerate(history.message_sources) if item is source),
+                None,
+            )
+            mismatch = next(
+                (
+                    i
+                    for i, (a, b) in enumerate(zip(token_ids[:start], source_prompt))
+                    if a != b
+                ),
+                min(start, len(source_prompt)),
+            )
             raise ValueError(
-                "Exact source prefix mismatch lacks unchanged source authority"
+                "Exact source prefix mismatch lacks unchanged source authority "
+                f"(source_message_index={message_index}, "
+                f"assembled_prefix_tokens={start}, "
+                f"recorded_prefix_tokens={len(source_prompt)}, "
+                f"first_mismatch_offset={mismatch})"
             )
         retry_trace = _TraceBuilder()
         exact = _tokenize_chat_view(
