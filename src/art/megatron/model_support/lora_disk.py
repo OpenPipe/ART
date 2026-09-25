@@ -127,6 +127,7 @@ def load_lora_tensors_for_megatron(
     lora_path: str | Path,
     *,
     handler: ModelSupportHandler | None = None,
+    adapter_config: dict[str, Any] | None = None,
     allow_unvalidated_arch: bool = False,
 ) -> dict[str, torch.Tensor]:
     resolved_handler = resolve_lora_handler(
@@ -136,5 +137,7 @@ def load_lora_tensors_for_megatron(
     )
     return resolved_handler.from_vllm_lora_tensors(
         load_vllm_lora_tensors(lora_path),
-        adapter_config=load_adapter_config(lora_path),
+        adapter_config=(
+            load_adapter_config(lora_path) if adapter_config is None else adapter_config
+        ),
     )
