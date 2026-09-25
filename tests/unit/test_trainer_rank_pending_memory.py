@@ -21,7 +21,7 @@ def module(cls):
     return obj
 
 
-def rank_with_moe(moe_layer, *, install_hooks=False):
+def rank_with_moe(moe_layer, *, install_hooks=False, stand_in=True):
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet
     from megatron.core.transformer.transformer_block import TransformerBlock
     from transformer_engine.pytorch import RMSNorm
@@ -96,6 +96,10 @@ def rank_with_moe(moe_layer, *, install_hooks=False):
         )
     )
     r._dp_rank_and_size = lambda: (0, 1)  # Uninitialized MCore has no CPU DP group.
+    if stand_in:
+        # The one MoE layer stands in for all 40 of Qwen3.6-35B-A3B's: recompute
+        # is covered if that layer prices its FC1 stage too.
+        r._moe_recompute_covered = r._moe_gradient_enclosed == (True,)
     return r, gd
 
 

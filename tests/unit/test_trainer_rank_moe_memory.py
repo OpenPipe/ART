@@ -706,6 +706,9 @@ def test_cp_group_total_is_its_larger_layout(monkeypatch):
     total = runtime.context_parallel_model_token_total
     assert total(**values, build_gdn_execution_spec=False) == 96794
     assert total(**values, build_gdn_execution_spec=True) == 96900
+    # An empty rank still dispatches, and routes, one padding row.
+    bundle.token_layout_index.token_counts_by_rank = (2, 0)
+    assert total(**values, build_gdn_execution_spec=False) == 3
 
 
 def test_split_charges_the_largest_hybridep_growth_beside_any_child_peak():

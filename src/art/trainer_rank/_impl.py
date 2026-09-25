@@ -1532,14 +1532,15 @@ def _expert_lora_weight_storage(
     return (transposes if a.shape[2] < 8 else 0, transposes, effective)
 
 
-# Routed rows on the most loaded rank at EP>1, relative to balanced routing.
+# Routed rows on the most loaded rank at EP>1, relative to its balanced share.
 # Expert-shard load is uneven per layer, from the router's expert preferences,
-# and larger batches do not average it away. Pretrained Qwen3.6-35B-A3B on 3.5M
-# tokens of retail agent trajectories: worst layer 1.21 at EP2, 1.41 at EP4,
-# 1.63 at EP8 (1.88 on a small rollout sample); one production EP2 run saw
-# 1.35. These samples bound what was measured, not all routing. Unmeasured EP
-# sizes use the next measured one; above EP8 the allowance grows with log2(EP)
-# up to EP itself (every pair on one rank).
+# and larger batches do not average it away. Qwen3.6-35B-A3B on 3.5M tokens of
+# retail agent trajectories, worst layer at EP2 / EP4 / EP8: pretrained 1.21 /
+# 1.41 / 1.63, a trained policy 1.24 / 1.41 / 1.61; a small rollout sample
+# reached 1.95 at EP8. One production EP2 run was inferred at 1.35. These
+# samples bound what was measured, not all routing. Unmeasured EP sizes use the
+# next measured one; above EP8 the allowance grows with log2(EP) up to EP
+# itself (every pair on one rank).
 _EP_ROUTED_ROW_ALLOWANCE = {2: 1.4, 4: 1.6, 8: 2.0}
 
 
@@ -1626,11 +1627,13 @@ def _moe_output_bytes_per_token(
     converted_stages: list[tuple[int, int]] | None = None,
     slot_ref: "LoRASlotRef | None" = None,
     shared_bytes: list[int] | None = None,
+    enclosed: list[bool] | None = None,
 ) -> int:
     """Known routed-expert working set, not a complete model/compiled bound.
 
     ``shared_bytes`` collects each layer's shared-expert part of the per-token
     coefficient and stages; that part follows local rows, not routed rows.
+    ``enclosed`` records, per MoE layer, whether its FC1 stage is priced too.
     """
     # CP shards rows, not the per-token working set. At EP>1 only ART's
     # HybridEP flex dispatcher is modeled; TP and ETP are not.
@@ -1764,6 +1767,8 @@ def _moe_output_bytes_per_token(
                     # path. This is one stage, not a backward bound.
                     features += dispatched * fc2.out_features + fc1.out_features
                     enclosing_fc1 = fc1
+            if enclosed is not None:
+                enclosed.append(enclosing_fc1 is not None)
             shared = _shared_expert_output_bytes_per_token(layer)
             if (
                 checkpoint_grad
@@ -2009,6 +2014,7 @@ class TrainerRank:
         gradient_stages: list[tuple[int, int]] = []
         forward_shared: list[int] = []
         gradient_shared: list[int] = []
+        gradient_enclosed: list[bool] = []
         self._moe_output_bytes_per_token = (
             _moe_output_bytes_per_token(
                 runtime.model,
@@ -2029,6 +2035,7 @@ class TrainerRank:
                 checkpoint_grad=True,
                 converted_stages=gradient_stages,
                 shared_bytes=gradient_shared,
+                enclosed=gradient_enclosed,
             )
             if self._moe_layers
             else 0
@@ -2048,6 +2055,17 @@ class TrainerRank:
             if self._moe_checkpoint_grad_bytes_per_token
             else 0
         )
+        # Recompute is covered only if every decoder layer is a priced MoE
+        # layer whose FC1 stage is enclosed; otherwise dense MLP or FC1 work
+        # the floor does not price keeps the per-boundary gradient allowance.
+        self._moe_gradient_enclosed = (
+            tuple(gradient_enclosed)
+            if self._moe_checkpoint_grad_bytes_per_token
+            else ()
+        )
+        self._moe_recompute_covered = len(
+            self._moe_gradient_enclosed
+        ) == self._num_layers and all(self._moe_gradient_enclosed)
         self._ep_group_is_cp_group = _ep_group_is_cp_group(self._parallel_shape)
         selection = select_scoring(
             device_capability=capability,
@@ -4273,22 +4291,46 @@ class TrainerRank:
         )
         return routing + 3 * geometry.moe_shared_expert_ffn * self._param_dtype_size
 
+    def _moe_recompute_covered_for(self, slot_ref: "LoRASlotRef | None") -> bool:
+        """Whether an explicit slot keeps the constructor's full MoE coverage."""
+        if not getattr(self, "_moe_recompute_covered", False):
+            return False
+        if slot_ref is None or slot_ref.name is None:
+            return True
+        enclosed: list[bool] = []
+        coefficient = _moe_output_bytes_per_token(
+            self.runtime.model,
+            self._parallel_shape,
+            checkpoint_grad=True,
+            slot_ref=slot_ref,
+            enclosed=enclosed,
+        )
+        return coefficient > 0 and len(enclosed) == self._num_layers and all(enclosed)
+
     def _checkpoint_input_gradient_bytes(
-        self, group_rows: tuple[tuple[int, bool], ...]
+        self,
+        group_rows: tuple[tuple[int, bool], ...],
+        slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
     ) -> int:
         """Gradient rows live at the recomputed layer's peak.
 
         Backward recomputes the last layer first, so its peak meets every saved
-        boundary but only the one incoming gradient. Where the MoE stage is
-        priced (Qwen3.6-35B-A3B traces at CP1, CP2/EP1 and EP2/CP2), charge that
-        gradient. Elsewhere keep one gradient per boundary: that allowance also
-        covers dense MLP and other recompute work the floor does not price.
+        boundary but only the one incoming gradient. Where the MoE stage covers
+        every layer's recompute, FC1 included (Qwen3.6-35B-A3B traces at CP1,
+        CP2/EP1 and EP2/CP2), charge that gradient. Elsewhere keep one gradient
+        per boundary: that allowance also covers dense MLP and other recompute
+        work the floor does not price.
         """
         retained, _ = self._checkpoint_memory_floor(group_rows)
         if not retained:
             return 0
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
-        if self._checkpoint_moe_bytes_per_token():
+        refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
+        if self._checkpoint_moe_bytes_per_token() and all(
+            self._moe_recompute_covered_for(ref)
+            for (_, grad), ref in zip(group_rows, refs, strict=True)
+            if grad
+        ):
             return gradient_rows * self._hidden_size * 2
         return retained
 
@@ -4354,7 +4396,7 @@ class TrainerRank:
         )
         # Input gradients live at the recomputed layer's peak; kept out of
         # forward retention, including the cold fallback above.
-        gradient = self._checkpoint_input_gradient_bytes(group_rows)
+        gradient = self._checkpoint_input_gradient_bytes(group_rows, slot_refs)
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
@@ -8107,7 +8149,7 @@ class TrainerRank:
             max(retained, checkpoint_floor[0])
             + max(workspace, head_workspace_bytes, checkpoint_floor[1])
             + (
-                self._checkpoint_input_gradient_bytes(group_rows)
+                self._checkpoint_input_gradient_bytes(group_rows, slot_refs)
                 if include_checkpoint_input_gradient
                 else 0
             ),

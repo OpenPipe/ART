@@ -9,8 +9,12 @@ from dataclasses import replace
 
 import pytest
 from test_trainer_rank_checkpoint_memory import price, rank, requests
-from test_trainer_rank_moe_memory import layer  # noqa: F401
-from test_trainer_rank_pending_memory import full_requests, pending_rank  # noqa: F401
+from test_trainer_rank_moe_memory import _enclosing_moe, layer  # noqa: F401
+from test_trainer_rank_pending_memory import (  # noqa: F401
+    full_requests,
+    pending_rank,
+    rank_with_moe,
+)
 import torch
 
 from art.trainer_rank import ForwardInput
@@ -43,6 +47,51 @@ def test_pending_cold_peak_does_not_become_forward_retention(pending_rank):
     warm = r._plan_cost(plan)
     assert warm.retained == int((plan.output_bytes + boundaries) * 1.1)
     assert warm.required == cost.required
+
+
+BOUNDARY_GRADIENTS = 8 * 6330 * 40 * 2048 * 2
+
+
+def test_single_gradient_needs_every_layer_priced(layer):
+    # One MoE layer among 40 dense stand-ins: the floor does not price the dense
+    # layers' recompute, so one gradient per boundary stays.
+    r = rank_with_moe(_enclosing_moe(layer), stand_in=False)[0]
+    assert r._moe_gradient_enclosed == (True,) and not r._moe_recompute_covered
+    plan = r._plan_flat_forward(full_requests())
+    assert r._plan_cost(plan).checkpoint_input_gradient == BOUNDARY_GRADIENTS
+
+
+def test_single_gradient_needs_the_fc1_stage(layer):
+    # Without permute fusion the FC1 stage is not enclosed: a positive FC2-only
+    # coefficient does not cover recompute.
+    moe = _enclosing_moe(layer)
+    moe.config.moe_permute_fusion = False
+    r = rank_with_moe(moe)[0]
+    assert r._checkpoint_moe_bytes_per_token() > 0
+    assert r._moe_gradient_enclosed == (False,) and not r._moe_recompute_covered
+    plan = r._plan_flat_forward(full_requests())
+    assert r._plan_cost(plan).checkpoint_input_gradient == BOUNDARY_GRADIENTS
+
+
+def test_a_slot_that_loses_moe_coverage_keeps_boundary_gradients(
+    pending_rank, monkeypatch
+):
+    from art.megatron.lora import LoRASlotRef
+    from art.trainer_rank import _impl
+
+    r = pending_rank
+    ref = LoRASlotRef(kind="checkpoint", name="policy")
+    groups = ((100, True),)
+    assert r._checkpoint_input_gradient_bytes(groups) == 100 * 2048 * 2
+    monkeypatch.setattr(_impl, "_moe_output_bytes_per_token", lambda *a, **k: 0)
+    assert r._checkpoint_input_gradient_bytes(groups, (ref,)) == 100 * 40 * 4096
+
+    def covered(*args, enclosed, **kwargs):
+        enclosed.extend([True] * r._num_layers)
+        return 1
+
+    monkeypatch.setattr(_impl, "_moe_output_bytes_per_token", covered)
+    assert r._checkpoint_input_gradient_bytes(groups, (ref,)) == 100 * 2048 * 2
 
 
 @pytest.mark.parametrize("moe", [True, False])

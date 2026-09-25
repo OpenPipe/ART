@@ -58,6 +58,8 @@ def rank():
     )
     result._moe_output_bytes_per_token = 188416
     result._moe_checkpoint_grad_bytes_per_token = 188416
+    # Stands in for Qwen3.6-35B-A3B, whose MoE stage prices every layer's recompute.
+    result._moe_recompute_covered = True
     return result
 
 
