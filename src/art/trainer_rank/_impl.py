@@ -8020,18 +8020,24 @@ class TrainerRank:
 
         Full recompute replays one layer with gradients, and its attention or
         GDN mixer keeps what its backward needs across that layer's MoE stage.
-        Price the larger mixer the model has, from Qwen3.6-35B-A3B allocator
-        traces on H200 (bytes per local token, at the layer's recompute peak):
+        Price the larger mixer the model has. Sites and sizes come from
+        Qwen3.6-35B-A3B allocator traces on H200, per local token at the
+        layer's recompute peak:
 
-        - attention: 66 KB at CP1, the retained width below. CP ranks also
-          keep stage-padded Q/K/V, the stage output and a core-attention copy:
-          94 KB at CP2, priced at 95 KB.
-        - GDN: 75 KB at CP1, fewer tensors than the retained width, priced at
-          74 KB. CP ranks add rank-exchange copies: 84 KB at CP2, priced at
-          86 KB.
+        - attention: the retained attention width above (66 KB measured at
+          CP1, 69 KB priced). A context-parallel rank also keeps its
+          stage-padded Q/K/V, the stage output and a core-attention copy
+          (94 KB measured at CP2, 95 KB priced). CP above 2 uses the CP2
+          allowance; ranks with several remote stages may keep more.
+        - GDN: norm output, q and k (their fp32 l2norm copies count twice),
+          v, z, two segment-layout tensors, the gated-norm output and the
+          chunk decay matrix (75 KB measured at CP1, 74 KB priced). A
+          context-parallel rank adds its hidden-width input and value-width
+          output exchanges (84 KB measured at CP2, 86 KB priced).
         """
         geometry = self._geometry
         hidden = self._hidden_size
+        tp = max(1, self._topology_key()[1])
         cp = self._topology_key()[2] > 1
         widths = []
         if self._gdn_layers < self._num_layers:
@@ -8039,14 +8045,16 @@ class TrainerRank:
             if cp:
                 q = geometry.num_attention_heads * geometry.kv_channels or hidden
                 kv = geometry.num_query_groups * geometry.kv_channels or hidden
-                attention += 3 * q + 2 * kv
+                attention += (3 * q + 2 * kv) / tp
             widths.append(attention)
         if self._gdn_layers:
             key = geometry.gdn_key_heads * geometry.gdn_key_head_dim
             value = geometry.gdn_value_heads * geometry.gdn_value_head_dim
-            widths.append(
-                2 * hidden + 4 * key + 6 * value + ((key + value) if cp else 0)
-            )
+            chunk = 64 * geometry.gdn_value_heads
+            gdn = hidden + (6 * key + 5 * value + chunk) / tp
+            if cp:
+                gdn += hidden + value / tp
+            widths.append(gdn)
         return int(max(widths, default=0) * self._param_dtype_size)
 
     def _gdn_segment_layer_bytes(self) -> float:

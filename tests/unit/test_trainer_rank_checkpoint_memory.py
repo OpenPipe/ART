@@ -517,7 +517,8 @@ def qwen36_attention(r):
 
 @pytest.mark.parametrize(
     "cp,expected",
-    # Traces measured 66 KB per token at CP1 and 94 KB at CP2.
+    # Traces measured 66 KB per token at CP1 and 94 KB at CP2. CP4 reuses the
+    # CP2 stage allowance; it is not measured.
     [(1, 2 * (2 * 2048 + 7 * 4096 + 3 * 512)), (2, 95232), (4, 95232)],
 )
 def test_recomputed_attention_is_priced_beside_the_moe_stage(cp, expected):
@@ -557,3 +558,37 @@ def test_no_grad_groups_do_not_recompute_a_mixer():
     r = qwen36_attention(rank())
     moe = r._moe_workspace_bytes(10)
     assert r._checkpoint_memory_floor(((10, False),)) == (0, moe + 4 * 10 * 2048 * 2)
+
+
+def test_ungated_attention_prices_fewer_projections():
+    r = qwen36_attention(rank())
+    r._attention_output_gate = False
+    assert r._recomputed_mixer_bytes_per_token() == 2 * (2 * 2048 + 5 * 4096 + 3 * 512)
+    r._topology_key = lambda: (1, 1, 2, 1)
+    assert r._recomputed_mixer_bytes_per_token() == 2 * (
+        2 * 2048 + 5 * 4096 + 3 * 512 + 3 * 4096 + 2 * 512
+    )
+
+
+@pytest.mark.parametrize("cp", [1, 2])
+def test_gdn_width_follows_hidden_key_and_value_separately(cp):
+    # Hidden differs from the key width, as in Qwen3.5-27B: CP exchanges
+    # carry hidden-width inputs and value-width outputs.
+    r = rank()
+    r._hidden_size = r.runtime.model[0].decoder.config.hidden_size = 5120
+    r._geometry = replace(
+        r._geometry,
+        gdn_key_heads=16,
+        gdn_key_head_dim=128,
+        gdn_value_heads=48,
+        gdn_value_head_dim=128,
+    )
+    r._gdn_layers = r._num_layers
+    r._topology_key = lambda: (1, 1, cp, 1)
+    key, value = 16 * 128, 48 * 128
+    width = 5120 + 6 * key + 5 * value + 64 * 48
+    if cp > 1:
+        width += 5120 + value
+    assert r._recomputed_mixer_bytes_per_token() == 2 * width
+    moe = r._moe_workspace_bytes(7, checkpoint_grad=True)
+    assert r._checkpoint_memory_floor(((7, True),))[1] == moe + 7 * 2 * width
