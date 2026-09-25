@@ -231,3 +231,30 @@ def test_other_structured_reasoning_condition_is_not_rewritten():
         _USER,
     ]
     assert "prior reason" not in _render(fixed, messages, preserve_thinking=False)
+
+
+def test_inline_operation_inside_quoted_expression_is_literal():
+    from art_inference.chat_template import _QWEN_INLINE_REASONING
+
+    operation = _QWEN_INLINE_REASONING.search(_TEMPLATE).group().replace("\n", " ")
+    template = '{{ "' + operation + '" }}'
+    fixed = chat_template_with_preserved_thinking(template)
+    assert fixed == template
+    assert "set reasoning_content = content.split" in _render(fixed, [])
+
+
+@pytest.mark.parametrize(
+    "wrapper", [("{% raw %}", "{% endraw %}"), ("{#", "#}"), ('{{ "', '" }}')]
+)
+def test_mixed_executable_and_literal_operations_only_changes_executable(wrapper):
+    from art_inference.chat_template import _QWEN_INLINE_REASONING
+
+    operation = _QWEN_INLINE_REASONING.search(_TEMPLATE).group().replace("\n", " ")
+    literal = wrapper[0] + operation + wrapper[1]
+    template = _TEMPLATE + literal
+    fixed = chat_template_with_preserved_thinking(template)
+    assert fixed == _FIXED + literal
+    assert "head<think>literal</think>tail" in _render(
+        fixed,
+        [_USER, {"role": "assistant", "content": "head<think>literal</think>tail"}],
+    )

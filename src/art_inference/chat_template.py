@@ -41,6 +41,47 @@ _QWEN_INLINE_REASONING = re.compile(
 )
 
 
+def _without_inline_reasoning_parser(template: str) -> str:
+    matches = list(_QWEN_INLINE_REASONING.finditer(template))
+    if not matches:
+        return template
+    from jinja2 import Environment, TemplateSyntaxError
+
+    # Only executable block tokens may be edited. The same spelling inside a
+    # quoted expression, raw block or comment is literal template data.
+    starts: set[int] = set()
+    cursor = 0
+    try:
+        for _, kind, value in Environment().lex(template):
+            start = template.find(value, cursor)
+            if start < 0 or template[cursor:start].strip():
+                return template  # Lexer normalization could not be source-joined.
+            if kind == "block_begin":
+                starts.add(start)
+            cursor = start + len(value)
+    except TemplateSyntaxError:
+        return template  # Leave invalid templates to their existing renderer.
+    edits = {
+        (match.start(), match.end()): "" for match in matches if match.start() in starts
+    }
+    if not edits:
+        return template
+    # Dropping structured reasoning must not trim the visible assistant body.
+    for content in (
+        "render_content(message.content, true)|trim",
+        "(render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
+    ):
+        statement = "{%- set content = " + content + " %}"
+        for match in re.finditer(re.escape(statement), template):
+            if match.start() in starts:
+                edits[match.span()] = (
+                    "{%- set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim) %}"
+                )
+    for (start, end), replacement in sorted(edits.items(), reverse=True):
+        template = template[:start] + replacement + template[end:]
+    return template
+
+
 def chat_template_with_preserved_thinking(chat_template: object) -> object:
     """Preserve structured reasoning without interpreting tags in plain content."""
     if isinstance(chat_template, dict):
@@ -50,22 +91,7 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
         }
     if not isinstance(chat_template, str):
         return chat_template
-    # This source rewrite is deliberately conservative, not a Jinja parser.
-    # In raw/comment-containing templates the same text might be literal data.
-    inline_parsers = 0
-    if not re.search(r"\{#|\{%[-+]?\s*raw\b", chat_template):
-        chat_template, inline_parsers = _QWEN_INLINE_REASONING.subn("", chat_template)
-    if inline_parsers:
-        # Disabling reasoning preservation may omit a structured reasoning
-        # field, but must not trim the visible assistant answer.
-        for content in (
-            "render_content(message.content, true)|trim",
-            "(render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
-        ):
-            chat_template = chat_template.replace(
-                "{%- set content = " + content + " %}",
-                "{%- set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim) %}",
-            )
+    chat_template = _without_inline_reasoning_parser(chat_template)
     replacements = (
         (
             _QWEN_DROP_PRIOR_THINKING,
