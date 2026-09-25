@@ -273,8 +273,8 @@ def test_partial_forward_does_not_learn_split_peak(monkeypatch):
 
 
 def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch):
-    # Real selection/find/rung methods with explicit scalar reductions. This is
-    # not native distributed convergence or a model-execution test.
+    # Real selection/find/rung/recovery methods with explicit peer reductions.
+    # CPU recovery declines without a release; this is not native convergence.
     traces = []
     for dp_rank in (0, 1):
         with monkeypatch.context() as patch:
@@ -291,6 +291,9 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
             )
             patch.setattr(rank, "_retained_memory_bytes", lambda *a, **k: 0)
             patch.setattr(rank, "_ensure_checkpoint_slots_for", lambda *a, **k: None)
+            patch.setattr(
+                torch.cuda, "empty_cache", lambda: pytest.fail("CPU recovery released")
+            )
 
             # Mode/profile agreements are already collective in production;
             # retain their sequence while controlling this two-rank witness.
@@ -314,9 +317,45 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
                 return result
 
             patch.setattr(rank, "_search_next_micro_batch", searched)
+            recovery_reductions = []
 
             def reduce(value, op, group=None):
                 trace.append(("global" if group is None else "local", str(op)))
+                if value.ndim:
+                    if group is not None:
+                        assert group == f"tp-cp-{dp_rank}" and not search_finished
+                        assert op == tr.dist.ReduceOp.MIN
+                        assert value.dtype == torch.float64 and value.tolist() == [0]
+                        return  # Existing local oversized-admission guard.
+                    assert group is None and search_finished
+                    assert value.dtype == torch.float64
+                    expected = [
+                        (tr.dist.ReduceOp.SUM, (2,)),
+                        (tr.dist.ReduceOp.MAX, (4,)),
+                        (tr.dist.ReduceOp.MIN, (4,)),
+                    ]
+                    assert len(recovery_reductions) < len(expected)
+                    assert (op, tuple(value.shape)) == expected[
+                        len(recovery_reductions)
+                    ]
+                    recovery_reductions.append((op, tuple(value.shape)))
+                    if op == tr.dist.ReduceOp.SUM:
+                        assert torch.isfinite(value).all() and (value >= 0).all()
+                        assert value[1].item() == 0  # No earlier recovery high-water.
+                        value.mul_(2)  # Model the peer's equal accounting cost.
+                    elif op == tr.dist.ReduceOp.MAX:
+                        assert value.tolist() == [200 if dp_rank == 0 else 0, 0, 0, 0]
+                        value[0] = 200  # The empty peer retains the global deficit.
+                    else:
+                        assert value.tolist() == [100, 0, 1, 1]
+                    return
+                if value.dtype == torch.int32:
+                    assert group is None and op == tr.dist.ReduceOp.MIN
+                    assert value.item() == (2 if dp_rank == 0 else 3)
+                    value.fill_(2)  # A peer splits even when this local rank is empty.
+                    return
+                assert value.dtype == torch.float64
+                assert op in (tr.dist.ReduceOp.MAX, tr.dist.ReduceOp.MIN)
                 if group is None:
                     value.fill_(
                         max(value.item(), 100 if search_finished else 200)
@@ -328,6 +367,10 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
             patch.setattr(tr.dist, "is_initialized", lambda: True)
             patch.setattr(tr.dist, "all_reduce", reduce)
             candidate = rank._select_next_micro_batch([_requests()], 0)
+            assert len(search_finished) == 1
+            assert len(recovery_reductions) == 3
+            assert candidate.recovery_target is None
+            assert not rank._recovery_state().first_consumed
             assert candidate.check.fits
             assert len(candidate.inputs) == (1 if dp_rank == 0 else 0)
             assert isinstance(
@@ -335,6 +378,18 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
                 tr._SplitForwardPlan if dp_rank == 0 else tr._FlatForwardPlan,
             )
             traces.append([event for event in trace if event[0] == "global"])
+            assert traces[-1][-7:] == [
+                ("global", str(op))
+                for op in (
+                    tr.dist.ReduceOp.MAX,
+                    tr.dist.ReduceOp.MIN,
+                    tr.dist.ReduceOp.SUM,
+                    tr.dist.ReduceOp.MAX,
+                    tr.dist.ReduceOp.MIN,
+                    tr.dist.ReduceOp.MAX,
+                    tr.dist.ReduceOp.MIN,
+                )
+            ]
             assert traces[-1][-2:] == [
                 ("global", str(tr.dist.ReduceOp.MAX)),
                 ("global", str(tr.dist.ReduceOp.MIN)),
