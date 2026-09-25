@@ -1606,6 +1606,10 @@ def _moe_output_bytes_per_token(
     # permuted. Balanced routing gives local tokens x top-k, as at EP1; a
     # pretrained CP2/EP2 run put about 1.35x that on one rank.
     routed_allowance = _EP_ROUTED_ROW_ALLOWANCE if shape.ep > 1 else 1
+    # Routed H-wide inputs held at the expert stage. The EP1 all-to-all keeps
+    # its permuted copy and the exchanged rows; HybridEP permutes while it
+    # dispatches and returns one tensor.
+    dispatched = 1 if shape.ep > 1 else 2
     coefficient = 0
     for chunk in model:
         for layer in chunk.modules():
@@ -1699,8 +1703,6 @@ def _moe_output_bytes_per_token(
                     and fc1.fused_gate_up
                     and not fc1.non_gated
                     and fc1.out_features == 2 * inputs.shape[-2]
-                    # HybridEP keeps one dispatched H-wide input where the
-                    # EP1 all-to-all keeps two; charging two is conservative.
                     and getattr(dispatcher, "ep_size", None) == shape.ep
                     and getattr(dispatcher, "tp_size", None) == 1
                     and getattr(dispatcher, "num_local_experts", 0) > 1
@@ -1709,10 +1711,10 @@ def _moe_output_bytes_per_token(
                     and getattr(experts, "offload_moe_act", None) is False
                     and getattr(experts, "activation_recompute", None) is False
                 ):
-                    # The two dispatched H-wide inputs and FC1 gate/up sum
-                    # remain live at the FC2 sum, including in the observed
-                    # compiled path. This is one stage, not a backward bound.
-                    features += 2 * fc2.out_features + fc1.out_features
+                    # The dispatched H-wide inputs and FC1 gate/up sum remain
+                    # live at the FC2 sum, including in the observed compiled
+                    # path. This is one stage, not a backward bound.
+                    features += dispatched * fc2.out_features + fc1.out_features
                     enclosing_fc1 = fc1
             shared = _shared_expert_output_bytes_per_token(layer)
             if (
@@ -1756,13 +1758,13 @@ def _moe_output_bytes_per_token(
                         and first_tensors[1].shape[2] == enclosing_fc1.out_features
                     ):
                         first_padding, first_transposes, first_rank = first
-                        # FC1 retains both routed H inputs and its base O1
+                        # FC1 retains the routed H inputs and its base O1
                         # while producing adapter O1. Its sum is not live yet.
                         converted_stages.append(
                             (
                                 routed_size
                                 * (
-                                    2 * fc2.out_features
+                                    dispatched * fc2.out_features
                                     + 2 * enclosing_fc1.out_features
                                     + first_rank
                                 )
@@ -1776,7 +1778,7 @@ def _moe_output_bytes_per_token(
                             (
                                 routed_size
                                 * (
-                                    2 * fc2.out_features
+                                    dispatched * fc2.out_features
                                     + 3 * enclosing_fc1.out_features
                                     + (first_rank if checkpoint_grad else 0)
                                 )

@@ -215,8 +215,10 @@ def test_hybridep_prices_routed_rows_with_imbalance_allowance(layer, ep):
 
 
 def test_hybridep_keeps_the_enclosing_fc1_stage(layer):
-    # The FC1 inputs and gate/up sum stay live at the FC2 sum under HybridEP
-    # too; EP1's two dispatched H-wide inputs over-count HybridEP's one.
+    # The FC1 input and gate/up sum stay live at the FC2 sum under HybridEP
+    # too. The EP1 all-to-all holds two routed H-wide inputs (its permuted
+    # copy and the exchanged rows); HybridEP permutes while dispatching and
+    # holds one, as a Qwen3.6 CP2/EP2 allocator trace shows.
     single = _moe_output_bytes_per_token(
         [_enclosing_moe(layer)], ParallelShape(tp=1, cp=1)
     )
@@ -224,7 +226,7 @@ def test_hybridep_keeps_the_enclosing_fc1_stage(layer):
     expert.token_dispatcher.num_local_experts = 128
     sharded = _moe_output_bytes_per_token([expert], ParallelShape(tp=1, cp=2, ep=2))
     assert single == 8 * (512 + 3 * 2048 + 2 * 2048 + 1024) * 2
-    assert sharded == single // 8 * 12
+    assert sharded == 12 * (512 + 3 * 2048 + 2048 + 1024) * 2
 
 
 @pytest.mark.parametrize(

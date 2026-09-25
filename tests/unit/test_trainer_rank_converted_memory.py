@@ -4,13 +4,17 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from test_trainer_rank_moe_memory import _enclosing_moe, _rank
+from test_trainer_rank_moe_memory import _enclosing_moe, _hybridep, _rank
 from test_trainer_rank_moe_memory import layer as layer
 from test_trainer_rank_pending_memory import module, rank_with_moe
 import torch
 
 from art.trainer_rank import ForwardInput, _gdn_memory
-from art.trainer_rank._impl import _expert_lora_weight_storage
+from art.trainer_rank._impl import (
+    _expert_lora_weight_storage,
+    _moe_output_bytes_per_token,
+)
+from art.trainer_rank._planner_cost import ParallelShape
 
 
 def weights(layer: Any, rank: int, *, fc1: bool = True, dtype=torch.bfloat16):
@@ -264,6 +268,34 @@ def test_fc1_fixed_weights_do_not_scale_with_topk(layer, topk):
         assert rank._moe_workspace_bytes(rows) == max(
             first_inner, second_inner, original
         )
+
+
+def test_hybridep_fc1_stages_hold_one_dispatched_input(layer):
+    # FC1's converted stages hold the routed H-wide inputs too: two under the
+    # EP1 all-to-all, one under HybridEP, over its 12 allowance rows.
+    weights(layer, 8)
+    single: list[tuple[int, int]] = []
+    _moe_output_bytes_per_token(
+        [layer], ParallelShape(tp=1, cp=1), checkpoint_grad=True, converted_stages=single
+    )
+    expert = _hybridep(layer, 2)
+    expert.token_dispatcher.num_local_experts = 128
+    sharded: list[tuple[int, int]] = []
+    _moe_output_bytes_per_token(
+        [expert],
+        ParallelShape(tp=1, cp=2, ep=2),
+        checkpoint_grad=True,
+        converted_stages=sharded,
+    )
+    assert [stage[0] for stage in single[:2]] == [
+        16 * (2 * 2048 + 2 * 1024 + 8),
+        16 * (2 * 2048 + 3 * 1024 + 8),
+    ]
+    assert [stage[0] for stage in sharded[:2]] == [
+        24 * (2048 + 2 * 1024 + 8),
+        24 * (2048 + 3 * 1024 + 8),
+    ]
+    assert [stage[1] for stage in sharded] == [stage[1] for stage in single]
 
 
 def test_wide_fc1_sum_is_a_separate_stage(layer):
