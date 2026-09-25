@@ -50,6 +50,7 @@ def test_root_trajectory_exports_are_minimal() -> None:
         "no_capture",
         "tensorize",
         "tokenize",
+        "tokenize_sampled",
     }
 
     assert set(art.__all__) & set(art.trajectories.__all__) == expected
