@@ -4379,6 +4379,8 @@ class TrainerRank:
         geometry = self._geometry
         if not geometry.num_attention_heads or not geometry.kv_channels:
             return False
+        if len(self.runtime.model) != 1:
+            return False
         try:
             decoder = _language_model(self.runtime.model[0]).decoder
             from art.megatron.context_parallel.core_attention import (
@@ -4386,7 +4388,10 @@ class TrainerRank:
             )
         except (AttributeError, RuntimeError, ModuleNotFoundError):
             return False
-        for layer in decoder.layers:
+        layers = getattr(decoder, "layers", None)
+        if layers is None:
+            return False
+        for layer in layers:
             boundary = getattr(layer, "_art_gdn_island_boundary", None)
             if boundary is not None and boundary.is_gdn:
                 continue
@@ -4407,8 +4412,11 @@ class TrainerRank:
     ) -> tuple[_GroupLayout, ...]:
         """Even-share layouts keeping the least attention state: a lower bound.
 
-        Some rank holds at least an even share of each layout's rows and runs
-        at least one aligned local stage over them.
+        Every rank's total grows with its own rows, and every rank keeps at
+        least an aligned local stage's state per row (each row attends to
+        itself), so the largest rank's total is at least the total at the mean
+        rows. The mean is at least the floor of an even share, which is why
+        this rounds down; rounding up can exceed a split's exact cost.
         """
         from art.megatron.context_parallel.executor import (
             minimum_retained_bytes_per_row,

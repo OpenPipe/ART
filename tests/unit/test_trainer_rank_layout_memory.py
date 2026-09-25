@@ -280,9 +280,14 @@ def test_softmax_offset_leaves_the_busiest_rank_floor(monkeypatch):
     assert r._plan_group_layouts(plan) is None
 
 
-def test_split_lower_bound_stays_below_the_layout_cost(monkeypatch):
+@pytest.mark.parametrize(
+    "lengths",
+    [(2048, 1536, 1024, 512), (4099, 3, 5, 7), (1, 2, 3, 4, 5, 6, 7), (8191,)],
+)
+def test_split_lower_bound_stays_below_the_layout_cost(monkeypatch, lengths):
+    # Even and skewed CP splits, odd row counts, and a single long sequence.
     r = art_cp(rank(), monkeypatch)
-    requests = _requests((2048, 1536, 1024, 512))
+    requests = _requests(lengths)
     plan = _plan_with(r, requests)
     lower = r._split_chunk_lower_cost(
         requests, tuple(item.input_tokens for item in requests), checkpoint=Unset
