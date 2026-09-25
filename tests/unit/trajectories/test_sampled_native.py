@@ -579,3 +579,128 @@ async def test_native_model_selection_and_empty_containers(authority: list) -> N
         )
     with pytest.raises(ValueError, match="Unknown sampled representation"):
         await art.tokenize_sampled([], representation=cast(Any, "unknown"))
+
+
+@pytest.mark.parametrize("terminal_tool", [False, True])
+@pytest.mark.parametrize("extension", [False, True])
+async def test_native_request_tools_use_canonical_normalization(
+    authority: list, terminal_tool: bool, extension: bool
+) -> None:
+    source = recorded(terminal_tool=terminal_tool)
+    tool: dict[str, Any] = {
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "Public lookup",
+            "parameters": {"type": "object", "properties": {"key": {"type": "string"}}},
+        },
+    }
+    if extension:
+        tool["x_vendor"] = {"public": True}
+        tool["function"]["x_vendor"] = "public"
+    for exchange in source.exchanges.chat_completions:
+        exchange.request["tools"] = cast(Any, deepcopy([tool]))
+    before = source.model_dump()
+    canonical = source.histories()
+    value = (await art.tokenize_sampled([source], representation="native"))[0]
+    assert len(value.histories) == 1
+    assert isinstance(value.histories[0].history, tr.ChatCompletionsHistory)
+    assert isinstance(canonical[-1], tr.ChatCompletionsHistory)
+    assert value.histories[0].history.tools == canonical[-1].tools
+    assert result_terms(value) == source_terms(source)
+    assert claims(result_terms(value)) == claims(source_terms(source))
+    assert _equal_with_nan(before, source.model_dump())
+    roundtrip = tr.compact_validate(
+        value.compact_dump(), type=tr.TokenizedMultiHistoryTrajectory
+    )
+    assert _equal_with_nan(roundtrip.model_dump(), value.model_dump())
+
+
+@pytest.mark.parametrize("terminal_tool", [False, True])
+async def test_native_string_stop_marks_complete_sampled_suffix(
+    authority: list, monkeypatch: pytest.MonkeyPatch, terminal_tool: bool
+) -> None:
+    class TextStop(StopOnly):
+        def __call__(self, text: str, **kwargs: Any) -> list[int]:
+            assert text == "END"
+            assert kwargs == {"add_special_tokens": False}
+            return [30, 31]
+
+    monkeypatch.setattr(_tokenize, "_load_tokenizer", lambda config: TextStop())
+    source = recorded(terminal_tool=terminal_tool)
+    choice = source.exchanges.chat_completions[1].response.choices[0]
+    assert choice.model_extra is not None
+    choice.model_extra["stop_reason"] = "END"
+    before = source.model_dump()
+    value = (await art.tokenize_sampled([source], representation="native"))[0]
+    assert len(value.histories) == 1
+    actual = result_terms(value)
+    assert [r[:-1] for r in actual] == [r[:-1] for r in source_terms(source)]
+    assert [r[2] for r in actual if r[-1]] == (
+        [30, 31] if terminal_tool else [30, 31, 9]
+    )
+    assert _equal_with_nan(source.model_dump(), before)
+
+
+def test_join_keeps_singletons_when_message_view_differs() -> None:
+    source = recorded()
+    history = source.histories()[0]
+    assert isinstance(history, tr.ChatCompletionsHistory)
+    sources = [
+        s
+        for s in history.message_sources
+        if s is not None and s.choice_index is not None
+    ]
+    spans = [_sampled_native._singleton(s, StopOnly()) for s in sources]
+    messages = deepcopy(history.messages)
+    messages[0]["content"] = "Different public context view"
+    other_view = history.model_copy(update={"messages": messages})
+    before = [span.value.model_dump() for span in spans]
+    assert _sampled_native._join(other_view, spans, StopOnly()) is None
+    assert _equal_with_nan([span.value.model_dump() for span in spans], before)
+    # Direct defensive join control: retaining these complete singletons keeps
+    # original sampled conditioning and encounter order without editing context.
+    singles = tr.TokenizedMultiHistoryTrajectory(
+        trajectory=source, histories=[s.value for s in spans]
+    )
+    assert result_terms(singles) == source_terms(source)
+
+
+@pytest.mark.parametrize("unexpected", [False, True])
+async def test_native_stop_loader_reports_authority_without_base_fallback(
+    authority: list, monkeypatch: pytest.MonkeyPatch, unexpected: bool
+) -> None:
+    error = (
+        RuntimeError("public unrelated failure")
+        if unexpected
+        else ValueError("pass base_model explicitly")
+    )
+
+    def fail(config: Any) -> Any:
+        raise error
+
+    monkeypatch.setattr(_tokenize, "_load_tokenizer", fail)
+    with pytest.raises(type(error)) as caught:
+        await art.tokenize_sampled([recorded()], representation="native")
+    if unexpected:
+        assert caught.value is error
+    else:
+        assert caught.value.__cause__ is error
+        assert "loadable tokenizer model ID" in str(caught.value)
+        assert "base_model" in str(caught.value)
+    assert authority == ["policy"]
+
+
+@pytest.mark.parametrize("reasoning_field", ["reasoning", "reasoning_content"])
+async def test_reasoning_stripped_followup_refuses_complete_source_certification(
+    authority: list, reasoning_field: str
+) -> None:
+    source = recorded()
+    message = source.exchanges.chat_completions[0].response.choices[0].message
+    assert message.model_extra is not None
+    message.model_extra[reasoning_field] = "Public structured reasoning"
+    before = source.model_dump()
+    with pytest.raises(ValueError, match="projection is not complete and unchanged"):
+        await art.tokenize_sampled([source], representation="native")
+    assert authority == []
+    assert _equal_with_nan(before, source.model_dump())

@@ -21,8 +21,8 @@ from . import (
     Trajectory,
 )
 from . import _tokenize as original
-from ._history import normalize_chat_message
-from ._sampled import _require_exact_chat_source_edges
+from ._history import _TOOLS, normalize_chat_message
+from ._sampled import _load_sampled_stop_tokenizer, _require_exact_chat_source_edges
 from ._serialization import _equal_with_nan
 
 
@@ -75,7 +75,7 @@ def _singleton(source: ChatCompletionsMessageSource, bound: Tokenizer) -> _Span:
             ),
             source,
         ],
-        tools=deepcopy(exchange.request.get("tools")),
+        tools=deepcopy(_TOOLS.validate_python(exchange.request.get("tools"))),
         chat_template=exchange.request.get("chat_template"),
         chat_template_kwargs=deepcopy(exchange.request.get("chat_template_kwargs")),
     )
@@ -238,15 +238,9 @@ def tokenize_native(
         selected_model = history.model
         assert selected_model is not None
         if selected_model not in resolved:
-            config = original._tokenizer_config(selected_model, None)
-            if base_model is not None and config.base_model != base_model:
-                raise ValueError(
-                    "Native STOP authority differs from the requested base model"
-                )
-            bound = original._load_tokenizer(config)
-            if bound is None:
-                raise ValueError("Native sampled STOP authority is unavailable")
-            resolved[selected_model] = bound
+            resolved[selected_model] = _load_sampled_stop_tokenizer(
+                selected_model, base_model=base_model
+            )
         bound = resolved[selected_model]
         runs: list[list[_Span]] = []
         for source in source_list:
