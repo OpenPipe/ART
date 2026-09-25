@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 import pytest
-from test_trainer_rank_moe_memory import _enclosing_moe, _rank
+from test_trainer_rank_moe_memory import _enclosing_moe, _hybridep, _rank
 from test_trainer_rank_moe_memory import layer as layer
 from test_trainer_rank_pending_memory import full_requests, module, rank_with_moe
 import torch
@@ -401,3 +401,19 @@ def test_cp_ranks_price_the_shared_return_beside_routed_rows(layer):
     shared_layer(layer)
     layer.config.context_parallel_size = 2
     assert _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=2)) == 192512
+
+
+@pytest.mark.parametrize("checkpoint_grad,shared", [(False, 4096), (True, 8192)])
+def test_shared_return_escapes_the_ep_routed_allowance(layer, checkpoint_grad, shared):
+    shared_layer(layer)
+    local_experts = layer.token_dispatcher.num_local_experts
+    layer.config.context_parallel_size = layer.config.expert_model_parallel_size = 2
+    _hybridep(layer, 2).token_dispatcher.num_local_experts = local_experts
+    # HybridEP's 1.5x allowance turns top-k 8 into 12 routed rows; the gated
+    # shared return (doubled for checkpoint backward) is per local token.
+    assert (
+        _moe_output_bytes_per_token(
+            [layer], ParallelShape(tp=1, cp=2, ep=2), checkpoint_grad=checkpoint_grad
+        )
+        == 12 * 11776 * 2 + shared
+    )
