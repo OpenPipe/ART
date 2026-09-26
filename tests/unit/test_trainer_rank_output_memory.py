@@ -40,15 +40,11 @@ def test_logical_copy_preserves_pending_restore(rank, monkeypatch, policy):
     _pending(rank, monkeypatch, SimpleNamespace(restore_workspace_bytes=100))
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 120)
     view = _view(_Executor(rank, "zero"))
-    released = []
-    monkeypatch.setattr(view, "_invoke", lambda *args: released.append(args))
     if policy == "model":
         with pytest.raises(MemoryError, match="only 20 bytes"):
             view._place_outputs([_output(policy=policy)])
-        assert released == [("release", ("new",))]
     else:
         assert view._place_outputs([_output(policy=policy)])[0].cpu == (True,)
-        assert released == []
 
 
 def test_logical_copy_reserves_distinct_checkpoints_and_standalone_heads(

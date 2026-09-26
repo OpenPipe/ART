@@ -963,15 +963,9 @@ class _RankView:
         )
         if hasattr(self._rank, "_pending_backward_memory"):
             available -= sum(self._rank._pending_backward_memory())
-        try:
-            placements = iter(
-                choose_output_placements(costs, gpu_available_bytes=available)
-            )
-        except BaseException:
-            self._invoke(
-                "release", tuple(output.packet.handle for output, _ in outputs)
-            )
-            raise
+        placements = iter(
+            choose_output_placements(costs, gpu_available_bytes=available)
+        )
         result = []
         for output, _ in outputs:
             cpu = tuple(next(placements) == "cpu" for _ in output.cpu)

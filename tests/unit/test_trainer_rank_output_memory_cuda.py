@@ -38,8 +38,6 @@ def test_logical_outputs_leave_existing_replay_backward_admissible(monkeypatch):
         0
     ]
     view = _view(_Executor(trainer, "zero"))
-    released = []
-    monkeypatch.setattr(view, "_invoke", lambda *args: released.append(args))
     gc.collect()
     torch.cuda.synchronize()
     baseline = torch.cuda.memory_allocated()
@@ -53,7 +51,6 @@ def test_logical_outputs_leave_existing_replay_backward_admissible(monkeypatch):
     large = 32 * 1024**2
     with pytest.raises(MemoryError):
         view._place_outputs([_output(large, policy="model")])
-    assert released == [("release", ("new",))]
     assert cache.handles() == (handle,)
     auto = view._attach(view._place_outputs([_output(large)])[0])
     assert auto.hidden_states.device.type == "cpu"

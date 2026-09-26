@@ -15,6 +15,7 @@ from art.trainer_rank import (
     ForwardOutput,
     MicroBatch,
     MicroBatchStats,
+    _memory_policy,
     _tensors,
 )
 from art.trainer_rank._commands import _Executor, _view
@@ -52,7 +53,7 @@ class _CachedRank(_Rank):
 
 
 def _fail_delivery(monkeypatch, executor, kind, *, packet_number=1):
-    """Fail inside the real copy or collector after physical graph registration."""
+    """Fail placement, copy, or collection after physical graph registration."""
     error = MemoryError("injected logical output delivery failure")
     packet = executor._packet
     targets, partial_outputs = set(), []
@@ -76,6 +77,12 @@ def _fail_delivery(monkeypatch, executor, kind, *, packet_number=1):
             return to(tensor, *args, **kwargs)
 
         monkeypatch.setattr(torch.Tensor, "to", fail_copy)
+    elif kind == "placement":
+
+        def fail_placement(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(_memory_policy, "choose_output_placements", fail_placement)
     else:
         managed = _tensors.managed_tensor
         calls = 0
@@ -95,7 +102,7 @@ def _fail_delivery(monkeypatch, executor, kind, *, packet_number=1):
 
 
 @pytest.mark.parametrize("mode", ["rank", "zero"])
-@pytest.mark.parametrize("kind", ["copy", "attach"])
+@pytest.mark.parametrize("kind", ["copy", "attach", "placement"])
 def test_failed_delivery_releases_registered_graph_and_native_cache(
     monkeypatch, mode, kind
 ):
@@ -214,6 +221,7 @@ def test_later_packet_failure_releases_every_physical_owner(monkeypatch, kind):
         assert rank.weight.grad.item() == 7
 
 
+@pytest.mark.parametrize("kind", ["copy", "placement"])
 @pytest.mark.parametrize(
     "delivery,close_error",
     [
@@ -225,7 +233,7 @@ def test_later_packet_failure_releases_every_physical_owner(monkeypatch, kind):
     ],
 )
 def test_failed_release_preserves_delivery_error_and_retries_without_head_flush(
-    monkeypatch, delivery, close_error
+    monkeypatch, delivery, close_error, kind
 ):
     rank: Any = _CachedRank()
     executor = _Executor(rank, "rank" if delivery == "rank" else "zero")
@@ -255,7 +263,7 @@ def test_failed_release_preserves_delivery_error_and_retries_without_head_flush(
                     raise RuntimeError("injected iterator close failure")
 
             patch.setattr(rank, "forward_batches", fail_close)
-        error, _ = _fail_delivery(patch, executor, "copy")
+        error, _ = _fail_delivery(patch, executor, kind)
         if delivery == "iterator":
             iterator = view.forward_batches([_input(3)])
             advance = lambda: next(iterator)
