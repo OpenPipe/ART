@@ -7,7 +7,7 @@ import os
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from test_parallel_tokenize import _exchange_trajectory
@@ -153,7 +153,9 @@ def test_parent_wait_has_one_total_deadline(monkeypatch: pytest.MonkeyPatch) -> 
             observed.append(timeout)
             return len(observed)
 
-    _parallel._finish_process_warmup((Ready(), Ready()), 2)  # type: ignore[arg-type]
+    _parallel._finish_process_warmup(
+        cast(tuple[Future[int], ...], (Ready(), Ready())), 2
+    )
     assert observed == [4.0, 1.0]
 
 
@@ -243,6 +245,6 @@ def test_failed_pool_cleanup_does_not_release_replacement(
         def shutdown(self, **kwargs: bool) -> None:
             closed.append(kwargs)
 
-    _parallel._shutdown_process_executor(0, Failed())  # type: ignore[arg-type]
+    _parallel._shutdown_process_executor(0, cast(ProcessPoolExecutor, Failed()))
     assert _parallel._PROCESS_EXECUTOR is replacement
     assert closed == [{"wait": False, "cancel_futures": True}]
