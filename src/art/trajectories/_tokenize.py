@@ -36,6 +36,7 @@ from . import (
     AnthropicMessageSource,
     ChatCompletionsExchange,
     ChatCompletionsHistory,
+    ChatCompletionsMessageSource,
     CompletionsExchange,
     CompletionsSource,
     CompletionsStringHistory,
@@ -7363,6 +7364,7 @@ def _tokenize_history(
     _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
     _projection_validated: bool = False,
     _copied_context: bool = False,
+    _allow_native_streams: bool = False,
 ) -> TokenizedHistory:
     if isinstance(history, LegacyHistory):
         if model is None:
@@ -7464,6 +7466,8 @@ def _tokenize_history(
             )
         ):
             return exact
+        if _allow_native_streams and not override_requires_render:
+            _request_native_streams(history)
         return _tokenize_chat_view(
             history,
             base_model=base_model,
@@ -7560,7 +7564,28 @@ def tokenize_history(
     _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
     _projection_validated: bool = False,
     _context_sources: Sequence[object] | None = None,
+    _native_stream: bool = False,
+    _allow_native_streams: bool = False,
 ) -> TokenizedHistory:
+    if _native_stream:
+        assert isinstance(history, ChatCompletionsHistory)
+        _validate_history_sources(history)
+        builder = _trace or _TraceBuilder()
+        # The scope owns the final request, including any historical assistant
+        # turns. Prove their generic role flags; native IDs alone cannot do so.
+        tokenized = _tokenize_chat_view(
+            history,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            chat_template=None,
+            chat_template_kwargs=None,
+            _projection_matches=True,
+            _recorded_boundaries=True,
+            _trace=builder,
+            _prior=_prior,
+        )
+        _require_native_stream(history, tokenized, builder)
+        return tokenized
     copied = (
         list(_context_sources)
         if _context_sources is not None
@@ -7598,6 +7623,8 @@ def tokenize_history(
                     source, prompt, output, logprobs, _prior
                 )
             ):
+                if _allow_native_streams and not override:
+                    _request_native_streams(history)
                 raise ValueError(
                     "A copied response suffix requires its complete original sampled occurrence in the selected trajectory"
                 )
@@ -7613,6 +7640,7 @@ def tokenize_history(
         _prior=_prior,
         _projection_validated=_projection_validated,
         _copied_context=bool(copied),
+        _allow_native_streams=_allow_native_streams,
     )
     if copied:
         if trace_builder is None or trace_builder.trace is None:
@@ -7642,6 +7670,255 @@ def tokenize_history(
         raise TypeError(f"Unsupported history type: {type(history).__name__}")
     tokenized.history = history
     return tokenized
+
+
+class _NativeHistoryStreams(Exception):
+    def __init__(self, histories: Sequence[History | LegacyHistory]) -> None:
+        self.histories = list(histories)
+        self.keys = {
+            id(history): {
+                _sampled_source_key(source)
+                for source in cast(ChatCompletionsHistory, history).message_sources
+                if source is not None and _source_is_sampled(source)
+            }
+            for history in histories
+        }
+        self.contexts = {
+            id(history): _native_stream_context(cast(ChatCompletionsHistory, history))
+            for history in histories
+        }
+
+
+def _native_stream_context(history: ChatCompletionsHistory) -> object:
+    """Keep request order, original source identities and scoped role inputs."""
+    return _render_context_key(
+        [
+            history.model,
+            history.messages,
+            history.tools,
+            history.chat_template,
+            history.chat_template_kwargs,
+            [
+                None
+                if source is None
+                else [
+                    id(type(source)),
+                    id(source.exchange),
+                    source.request_index,
+                    source.choice_index,
+                    list(_source_stop_evidence(source, _sampled_source_key(source)))
+                    if _source_is_sampled(source)
+                    else None,
+                ]
+                for source in history.message_sources
+            ],
+            [dict(exchange.request) for exchange in _unique_exchanges(history)],
+        ]
+    )
+
+
+def _request_native_streams(history: History | LegacyHistory) -> None:
+    streams = _native_history_streams(history)
+    if len(streams) > 1:
+        raise _NativeHistoryStreams(streams)
+
+
+def _native_history_streams(
+    history: History | LegacyHistory,
+) -> list[History | LegacyHistory]:
+    """Split only complete unchanged Chat sources at incompatible native edges.
+
+    A stream uses its last source's actual request. Sources outside that run are
+    request context, not newly sampled output. Single-history APIs never call
+    this helper, and unproved scopes retain the original rendering/refusal path.
+    """
+    from ._history import normalize_chat_message
+
+    if not isinstance(history, ChatCompletionsHistory):
+        return [history]
+    _validate_history_sources(history)
+    state = _history_render_state(history)
+    if state.context_changed or state.projection_matches is not True:
+        return [history]
+    rows = []
+    seen = set()
+    for index, (message, source) in enumerate(
+        zip(history.messages, history.message_sources, strict=True)
+    ):
+        if source is None or not _source_is_sampled(source):
+            continue
+        if (
+            not isinstance(source, ChatCompletionsMessageSource)
+            or not isinstance(source.exchange, ChatCompletionsExchange)
+            or not _source_covers_complete_sampled_message(message, source)
+        ):
+            return [history]
+        key = _sampled_source_key(source)
+        prompt, output, logprobs = _chat_source_record(source)
+        choice = _chat_choice(source)
+        recorded_logprobs = (
+            choice_completion_logprobs(choice)
+            if COMPLETION_LOGPROBS_KEY in (choice.model_extra or {})
+            else _logprob_values(_chat_logprob_entries(choice))
+        )
+        if (
+            key in seen
+            or not prompt
+            or not output
+            or len(output) != len(logprobs)
+            or recorded_logprobs is None
+            or len(recorded_logprobs) != len(output)
+            or _source_stop_evidence(source, key)[0] not in {"stop", "length"}
+        ):
+            return [history]
+        seen.add(key)
+        rows.append((index, source, prompt, output))
+    runs: list[
+        list[tuple[int, ChatCompletionsMessageSource, list[int], list[int]]]
+    ] = []
+    for row in rows:
+        if runs:
+            _, _, prompt, output = runs[-1][-1]
+            body = [*prompt, *output]
+            if row[2][: len(body)] == body:
+                runs[-1].append(row)
+                continue
+        runs.append([row])
+    if len(runs) < 2:
+        return [history]
+    streams: list[History | LegacyHistory] = []
+    for run in runs:
+        end, last, _, _ = run[-1]
+        exchange = last.exchange
+        assert isinstance(exchange, ChatCompletionsExchange)
+        request = exchange.request
+        messages = [
+            *(
+                normalize_chat_message(message)
+                for message in request.get("messages", [])
+            ),
+            normalize_chat_message(
+                _chat_choice(last).message.model_dump(mode="python", exclude_none=True)
+            ),
+        ]
+        if (
+            messages != history.messages[: end + 1]
+            or history.tools != request.get("tools")
+            or history.chat_template != request.get("chat_template")
+            or history.chat_template_kwargs != request.get("chat_template_kwargs")
+        ):
+            return [history]
+        sources = [
+            ChatCompletionsMessageSource(exchange=exchange, request_index=index)
+            for index in range(end)
+        ] + [last]
+        for index, source, _, _ in run:
+            sources[index] = source
+        scoped = history.model_copy(
+            update={
+                "messages": deepcopy(messages),
+                "message_sources": sources,
+                "tools": deepcopy(history.tools),
+                "chat_template_kwargs": deepcopy(history.chat_template_kwargs),
+            }
+        )
+        try:
+            _native_stream_context(scoped)
+        except (TypeError, RecursionError):
+            return [history]
+        streams.append(scoped)
+    return streams
+
+
+def _require_native_stream(
+    history: History | LegacyHistory,
+    value: TokenizedHistory,
+    builder: _TraceBuilder,
+    expected_keys: set[_SampledSourceKey] | None = None,
+    expected_context: object = None,
+) -> None:
+    """Certify all scoped sources again after any renderer/tokenizer callbacks."""
+    assert isinstance(history, ChatCompletionsHistory)
+    _validate_history_sources(history)
+    state = _history_render_state(history)
+    if state.context_changed or state.projection_matches is not True:
+        raise ValueError("Native stream request context changed")
+    context = _native_stream_context(history)
+    if expected_context is not None and context != expected_context:
+        raise ValueError("Native stream request context changed")
+    trace = builder.trace
+    if trace is None:
+        raise ValueError("Native stream requires complete sampled source provenance")
+    trace.validate(value)
+    sources = [
+        source
+        for source in history.message_sources
+        if source is not None and _source_is_sampled(source)
+    ]
+    keys = {_sampled_source_key(source) for source in sources}
+    if (
+        set(trace.sources) != keys
+        or expected_keys is not None
+        and keys != expected_keys
+    ):
+        raise ValueError("Native stream sampled source inventory changed")
+    expected: list[_SampledSourceKey | None] = [None] * len(value.tokens)
+    for source in sources:
+        prompt, output, logprobs = _chat_source_record(source)
+        if (
+            prompt is None
+            or output is None
+            or not _complete_source_is_represented(
+                source, prompt, output, logprobs, [(value, trace)]
+            )
+        ):
+            raise ValueError(
+                "Native stream does not preserve complete original conditioning"
+            )
+        key = _sampled_source_key(source)
+        for index in range(len(prompt), len(prompt) + len(output)):
+            if expected[index] is not None:
+                raise ValueError("Native stream sampled source spans overlap")
+            expected[index] = key
+        suffix = _sampled_stop_suffix(
+            output, source=source, source_key=key, tokenizer=builder.tokenizer
+        )
+        observed = [
+            index
+            for index in range(len(output))
+            if value.flags[len(prompt) + index] & TokenFlag.STOP
+        ]
+        if observed != list(range(len(output) - suffix, len(output))):
+            raise ValueError("Native stream sampled STOP differs from source authority")
+    if trace.source_keys != expected:
+        raise ValueError("Native stream has sampled tokens outside original sources")
+    prompt, output, _ = _chat_source_record(sources[-1])
+    if prompt is None or output is None or value.tokens != [*prompt, *output]:
+        raise ValueError("Native stream must end at its final recorded output")
+    # A string stop reason may invoke an encoder while checking its suffix.
+    if keys != {_sampled_source_key(source) for source in sources}:
+        raise ValueError("Native stream source changed while proving STOP")
+    if context != _native_stream_context(history):
+        raise ValueError("Native stream context changed while proving STOP")
+
+
+def _require_native_streams_unchanged(
+    scopes: Sequence[tuple[History | LegacyHistory, bool]],
+    keys: Mapping[int, set[_SampledSourceKey]],
+    contexts: Mapping[int, object],
+) -> None:
+    # A later scope's STOP encoder can change an earlier, already checked source.
+    # This final barrier invokes no tokenizer/renderer callbacks.
+    for history, scoped in scopes:
+        if not scoped:
+            continue
+        assert isinstance(history, ChatCompletionsHistory)
+        if keys[id(history)] != {
+            _sampled_source_key(source)
+            for source in history.message_sources
+            if source is not None and _source_is_sampled(source)
+        } or contexts[id(history)] != _native_stream_context(history):
+            raise ValueError("Native stream changed during final STOP validation")
 
 
 def _materialize_trajectory(
@@ -7716,32 +7993,78 @@ def tokenize_trajectory(
             raise ValueError(
                 f"Trajectory tokenization requires exactly one history; found {len(histories)}"
             )
+    allow_streams = (
+        multi_history
+        and not reconcile_text_equivalent_tokenizations
+        and chat_template is None
+        and chat_template_kwargs is None
+    )
     context_sources = [_partial_native_context(history) for history in histories]
     track_context = len(histories) > 1 and any(context_sources)
     prior: list[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = []
     tokenized = []
     stop_builders: list[_TraceBuilder | None] = []
     collect_stops = tokenizer is None and len(histories) > 1
-    for history, copied in zip(histories, context_sources, strict=True):
-        trace = _TraceBuilder() if track_context or collect_stops else None
-        result = tokenize_history(
-            history,
-            model=model if isinstance(history, LegacyHistory) else history.model,
-            base_model=base_model,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-            _projection_validated=not isinstance(history, LegacyHistory),
-            _trace=trace,
-            _prior=prior,
-            _context_sources=copied,
+    scopes: list[tuple[History | LegacyHistory, bool]] = [
+        (history, False) for history in histories
+    ]
+    scoped_keys: dict[int, set[_SampledSourceKey]] = {}
+    scoped_contexts: dict[int, object] = {}
+    index = 0
+    while index < len(scopes):
+        history, scoped = scopes[index]
+        trace = (
+            _TraceBuilder()
+            if scoped or allow_streams or track_context or collect_stops
+            else None
         )
+        try:
+            result = tokenize_history(
+                history,
+                model=model if isinstance(history, LegacyHistory) else history.model,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                _projection_validated=not isinstance(history, LegacyHistory),
+                _trace=trace,
+                _prior=prior,
+                _native_stream=scoped,
+                _allow_native_streams=allow_streams and not scoped,
+            )
+        except _NativeHistoryStreams as planned:
+            leaf = planned.__traceback__
+            while leaf is not None and leaf.tb_next is not None:
+                leaf = leaf.tb_next
+            if (
+                leaf is None
+                or leaf.tb_frame.f_code is not _request_native_streams.__code__
+            ):
+                raise
+            scoped_keys.update(planned.keys)
+            scoped_contexts.update(planned.contexts)
+            scopes[index : index + 1] = [(stream, True) for stream in planned.histories]
+            continue
         tokenized.append(result)
         stop_builders.append(trace)
-        if track_context and trace is not None and trace.trace is not None:
+        if trace is not None and trace.trace is not None:
             prior.append((result, trace.trace))
-    if collect_stops:
+        index += 1
+    if tokenizer is None and len(tokenized) > 1:
         _complete_resolved_sampled_stops(tokenized, stop_builders)
+    for (history, scoped), value, builder in zip(
+        scopes, tokenized, stop_builders, strict=True
+    ):
+        if scoped:
+            assert builder is not None
+            _require_native_stream(
+                history,
+                value,
+                builder,
+                scoped_keys[id(history)],
+                scoped_contexts[id(history)],
+            )
+    _require_native_streams_unchanged(scopes, scoped_keys, scoped_contexts)
     if not multi_history:
         return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
@@ -7765,33 +8088,71 @@ def _tokenize_trajectory_with_trace(
     if not trajectory.exchanges:
         raise ValueError("Private exchange tokenization trace requires exchanges")
     histories = trajectory.histories(model=model)
+    scopes: list[tuple[History | LegacyHistory, bool]] = [
+        (history, False) for history in histories
+    ]
+    scoped_keys: dict[int, set[_SampledSourceKey]] = {}
+    scoped_contexts: dict[int, object] = {}
     tokenized_histories: list[TokenizedHistory] = []
     traces: list[_HistoryTokenizationTrace] = []
     builders: list[_TraceBuilder] = []
-    for history in histories:
+    index = 0
+    while index < len(scopes):
+        history, scoped = scopes[index]
         if isinstance(history, LegacyHistory):
             raise AssertionError(
                 "Exchange trajectories cannot produce legacy histories"
             )
         trace_builder = _TraceBuilder()
-        tokenized = tokenize_history(
-            history,
-            model=history.model,
-            base_model=base_model,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-            _trace=trace_builder,
-            _projection_validated=True,
-            _prior=list(zip(tokenized_histories, traces, strict=True)),
-        )
+        try:
+            tokenized = tokenize_history(
+                history,
+                model=history.model,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                _trace=trace_builder,
+                _projection_validated=True,
+                _prior=list(zip(tokenized_histories, traces, strict=True)),
+                _native_stream=scoped,
+                _allow_native_streams=not scoped
+                and chat_template is None
+                and chat_template_kwargs is None,
+            )
+        except _NativeHistoryStreams as planned:
+            leaf = planned.__traceback__
+            while leaf is not None and leaf.tb_next is not None:
+                leaf = leaf.tb_next
+            if (
+                leaf is None
+                or leaf.tb_frame.f_code is not _request_native_streams.__code__
+            ):
+                raise
+            scoped_keys.update(planned.keys)
+            scoped_contexts.update(planned.contexts)
+            scopes[index : index + 1] = [(stream, True) for stream in planned.histories]
+            continue
         if trace_builder.trace is None:
             raise AssertionError("Exchange tokenization did not produce a source trace")
         tokenized_histories.append(tokenized)
         traces.append(trace_builder.trace)
         builders.append(trace_builder)
+        index += 1
     if tokenizer is None:
         _complete_resolved_sampled_stops(tokenized_histories, builders)
+    for (history, scoped), value, builder in zip(
+        scopes, tokenized_histories, builders, strict=True
+    ):
+        if scoped:
+            _require_native_stream(
+                history,
+                value,
+                builder,
+                scoped_keys[id(history)],
+                scoped_contexts[id(history)],
+            )
+    _require_native_streams_unchanged(scopes, scoped_keys, scoped_contexts)
     return (
         TokenizedMultiHistoryTrajectory(
             trajectory=trajectory,
