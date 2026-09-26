@@ -161,7 +161,15 @@ existing protocol-specific projection rules; no separate tokenization API or
 native-representation option is needed. `multi_history=True` preserves the
 histories selected by the trajectory, including their order and model selection.
 
-Templates still own unrecorded separators, role masks, and synthetic stop tokens.
+Complete unchanged Chat histories end at the final recorded response token,
+including tool responses and responses stopped by a length limit. ART does not
+reconstruct that sampled body from its text or structured tool projection, or add
+an unobserved terminal footer. This deliberately excludes synthetic terminal
+tokens from `OUTPUT`/SFT masks; recorded sampled tokens and logprobs are unchanged.
+Explicit template overrides and incomplete or edited histories retain rendering.
+
+Templates still prove nonterminal separators, role masks, and synthetic stop
+tokens against the next recorded prompt.
 If tokenizing another history in the same trajectory already resolves a tokenizer
 for the same model, ART reuses that authority to label recorded sampled stop
 tokens. This does not trigger a new tokenizer load or change rendering. Complete

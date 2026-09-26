@@ -200,7 +200,9 @@ def test_recorded_tool_boundaries_preserve_native_conditioning(
             flag & TokenFlag.SAMPLED
             for flag in tokenized.flags[len(prompt) : len(prompt) + len(output)]
         )
-    assert sum(bool(flag & TokenFlag.STOP) for flag in tokenized.flags) == 2
+    assert sum(bool(flag & TokenFlag.STOP) for flag in tokenized.flags) == 2 - (
+        tool_position == 1
+    )
     assert trajectory.model_dump(mode="python") == before
     monkeypatch.setattr(
         module, "_tokenize_recorded_chat_boundaries", lambda *args, **kwargs: None
@@ -217,12 +219,13 @@ def test_recorded_tool_boundaries_preserve_native_conditioning(
             prompt, _ = expected_spans[1]
             assert old.tokens[: len(prompt)] != prompt
         else:
-            # The template owns this EOS; it must not become a sampled token.
-            assert old.tokens == tokenized.tokens[:-1]
-        tool_prompt, tool_output = expected_spans[tool_position]
-        stop_position = len(tool_prompt) + len(tool_output)
-        assert tokenized.flags[stop_position] & TokenFlag.STOP
-        assert not tokenized.flags[stop_position] & TokenFlag.SAMPLED
+            # A complete terminal native output owns the end of the history.
+            assert old.tokens == tokenized.tokens
+        if tool_position == 0:
+            tool_prompt, tool_output = expected_spans[tool_position]
+            stop_position = len(tool_prompt) + len(tool_output)
+            assert tokenized.flags[stop_position] & TokenFlag.STOP
+            assert not tokenized.flags[stop_position] & TokenFlag.SAMPLED
 
 
 @pytest.mark.parametrize("footer", ["footer§", "user-owned footer"])
@@ -365,7 +368,7 @@ def test_length_copy_keeps_proven_synthetic_boundary_flags() -> None:
     result = trajectory.tokenize(tokenizer=tokenizer, multi_history=True)
     assert len(result.histories) == 2
     original, copied = result.histories
-    assert original.tokens == tokenizer._encode("turn 0ranswer§")
+    assert original.tokens == tokenizer._encode("turn 0ranswer")
     assert copied.tokens == tokenizer._encode("turn 0answer§turn 1answer§")
     copy_start, copy_end = len(prompt), len(prompt) + len("answer")
     assert copied.flags[copy_start:copy_end] == [

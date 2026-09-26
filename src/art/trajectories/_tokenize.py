@@ -4869,7 +4869,9 @@ def _tokenize_recorded_chat_boundaries(
     terminators = _terminator_ids(tokenizer)
     if not terminators:
         return None
-    for ordinal, (index, source, prompt, output, _) in enumerate(entries):
+    # The last native output ends the recorded history. No later prompt proves
+    # an additional footer, so do not reconstruct one from a lossy projection.
+    for ordinal, (index, source, prompt, output, _) in enumerate(entries[:-1]):
         key = _sampled_source_key(source)
         stop, _ = _source_stop_evidence(source, key)
         if stop not in {"stop", "length"}:
@@ -6144,6 +6146,9 @@ def _tokenize_chat_view(
             assert source is not None
             source_key = _sampled_source_key(source)
             stop_reason = _source_stop_evidence(source, source_key)[0]
+            if _recorded_boundaries and position + 1 == len(sampled_message_indices):
+                length_stop_count += stop_reason == "length"
+                continue
             output = _source_output_tokens(source, source_key)
             synthetic_stop = (
                 stop_reason == "stop"
@@ -6250,7 +6255,7 @@ def _tokenize_chat_view(
                 continue
             length_stop_boundaries[source_key] = boundary
         if (
-            length_stop_count
+            (length_stop_count or _recorded_boundaries)
             and length_stop_boundaries_complete
             and (
                 exact := _tokenize_exact_projected_chat_history(
@@ -7424,7 +7429,22 @@ def _tokenize_history(
             return exact
     if isinstance(history, ChatCompletionsHistory):
         if (
-            not has_length_stop
+            (
+                not has_length_stop
+                or not _copied_context
+                and sum(
+                    message.get("role") == "assistant" for message in history.messages
+                )
+                == 1
+                and all(
+                    message.get("role") != "assistant"
+                    or source is not None
+                    and _source_is_sampled(source)
+                    for message, source in zip(
+                        history.messages, history.message_sources, strict=True
+                    )
+                )
+            )
             and not needs_synthetic_stop
             and not override_requires_render
             and not render_state.context_changed

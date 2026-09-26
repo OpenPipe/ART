@@ -413,7 +413,7 @@ def test_exact_sampled_tool_stop_is_stop_when_tokenizer_identifies_it() -> None:
     assert tokenized.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP)
 
 
-def test_length_stop_keeps_sampled_content_and_adds_synthetic_stop() -> None:
+def test_length_stop_ends_at_complete_native_output() -> None:
     exchange = _chat_exchange([1], [2])
     exchange.response.choices[0].finish_reason = "length"
 
@@ -421,11 +421,10 @@ def test_length_stop_keeps_sampled_content_and_adds_synthetic_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[exchange])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 2, 9]
+    assert tokenized.tokens == [1, 2]
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
         _SAMPLED_ASSISTANT_OUTPUT,
-        tr.TokenFlag.STOP,
     ]
 
 
@@ -547,7 +546,7 @@ def test_length_stop_mapping_allows_another_assistant_without_a_stop() -> None:
     assert tokenized.flags[-1] == tr.TokenFlag.STOP
 
 
-def test_terminal_length_with_sampled_eos_still_adds_synthetic_stop() -> None:
+def test_terminal_length_does_not_duplicate_or_relabel_sampled_eos() -> None:
     exchange = _chat_exchange([1], [2, 9])
     exchange.response.choices[0].finish_reason = "length"
 
@@ -555,10 +554,10 @@ def test_terminal_length_with_sampled_eos_still_adds_synthetic_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[exchange])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 2, 9, 9]
+    assert tokenized.tokens == [1, 2, 9]
     assert tokenized.flags[-2:] == [
         _SAMPLED_ASSISTANT_OUTPUT,
-        tr.TokenFlag.STOP,
+        _SAMPLED_ASSISTANT_OUTPUT,
     ]
 
 
@@ -928,7 +927,7 @@ def test_public_exact_chain_preserves_raw_drift_across_proven_length_boundary() 
 
 
 @pytest.mark.parametrize("finish_reason", ["stop", "tool_calls"])
-def test_length_chain_retains_exact_prefix_with_terminal_synthetic_stop(
+def test_length_chain_retains_exact_prefix_without_terminal_footer(
     finish_reason: Literal["stop", "tool_calls"],
 ) -> None:
     history, tokenizer, captured = _character_template_history(
@@ -941,11 +940,9 @@ def test_length_chain_retains_exact_prefix_with_terminal_synthetic_stop(
 
     tokenized = history.tokenize(tokenizer=tokenizer)
 
-    assert tokenized.tokens == [*captured, 9]
-    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags[:-1])
-    assert tokenized.flags[-1] == (
-        tr.TokenFlag.STOP | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
-    )
+    assert tokenized.tokens == captured
+    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags)
+    assert tokenized.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT)
     assert sum(bool(flag & tr.TokenFlag.SAMPLED) for flag in tokenized.flags) == 19
 
 
@@ -1038,15 +1035,12 @@ def test_length_boundary_ends_before_next_assistant_tool_prefix(
     if mismatch:
         assert tokenized.tokens != expected
         return
-    assert tokenized.tokens == expected
+    assert tokenized.tokens == [*next_prompt, *tool_output]
     assert all(
         flag & tr.TokenFlag.EXACT
         for flag in tokenized.flags[: len(next_prompt) + len(tool_output)]
     )
-    assert (
-        tokenized.flags[-1]
-        == tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP
-    )
+    assert tokenized.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
     sampled = [
         index
         for index, flag in enumerate(tokenized.flags)
@@ -1487,7 +1481,7 @@ def test_metadata_only_final_token_is_preserved_as_sampled_stop() -> None:
     assert tokenized.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP)
 
 
-def test_empty_output_materializes_a_synthetic_stop() -> None:
+def test_recorded_empty_output_does_not_invent_a_response_token() -> None:
     exchange = _chat_exchange([1], [])
     exchange.response.choices[0].message.content = ""
 
@@ -1495,10 +1489,9 @@ def test_empty_output_materializes_a_synthetic_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[exchange])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 9]
+    assert tokenized.tokens == [1]
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP,
     ]
 
 
