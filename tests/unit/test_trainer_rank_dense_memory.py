@@ -406,6 +406,25 @@ def test_dense_widths_apply_only_at_cp2(topology):
     assert price(r, values).checkpoint_input_gradient == 67 * LAYERS * HIDDEN * 2
 
 
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.parametrize("tp", [2, 4])
+def test_dense_widths_stay_at_tp1(monkeypatch, tp, sequence_parallel):
+    """Even where a TP x SP floor prices CP2, the CP2 dense trace stays TP1."""
+    r = _dense_rank()
+    values = r._estimate_flat_forward(requests(67, 16))
+    r._topology_key = lambda: (1, tp, 2, 1)
+    decoder = _impl._language_model(r.runtime.model[0]).decoder
+    decoder.config.sequence_parallel = sequence_parallel
+    monkeypatch.setattr(r, "_sequence_parallel_floor_covered", lambda *_: True)
+    assert r._checkpoint_floor_decoder() is None
+    assert r._dense_mlp_widths() == (0, 0)
+    if sequence_parallel:
+        assert r._checkpoint_floor_decoder(sequence_parallel=True) is decoder
+        # The floor prices it, but with one gradient per sharded boundary.
+        rows = -(-67 // tp)
+        assert price(r, values).checkpoint_input_gradient == rows * LAYERS * HIDDEN * 2
+
+
 @pytest.mark.parametrize("gdn", [False, True])
 def test_layout_floor_prices_the_dense_stage_per_layer_type(gdn):
     r = _at_cp2(_dense_rank())
