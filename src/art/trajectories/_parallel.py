@@ -248,6 +248,7 @@ def _shutdown_process_executor(
     if grace is None:
         grace = _PROCESS_EXIT_GRACE_SECONDS
     workers = _process_executor_workers(executor)
+    manager = getattr(executor, "_executor_manager_thread", None)
     executor.shutdown(wait=False, cancel_futures=True)
     deadline = time.monotonic() + max(0.0, grace)
     for worker in workers:
@@ -257,10 +258,15 @@ def _shutdown_process_executor(
             worker.terminate()
     for worker in workers:
         worker.join(1.0)
+    deadline = time.monotonic() + 1.0
     for worker in workers:
         if worker.is_alive():
             worker.kill()
-            worker.join(1.0)
+            worker.join(max(0.0, deadline - time.monotonic()))
+    # The manager may reap a child concurrently with the joins above. Wait for
+    # it to publish the exit status before returning ownership to the caller.
+    if manager is not None and manager is not threading.current_thread():
+        manager.join(max(0.0, deadline - time.monotonic()))
 
 
 def _register_process_exit_hook() -> None:

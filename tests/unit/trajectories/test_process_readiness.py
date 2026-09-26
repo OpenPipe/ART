@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from multiprocessing.process import BaseProcess
 import os
 import threading
 import time
@@ -232,6 +233,70 @@ def test_partial_submit_failure_stops_unpublished_pool(
     assert _parallel._PROCESS_EXECUTOR is None
 
 
+def test_cleanup_joins_manager_before_reporting_reaped_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _parallel._shutdown_process_executor(grace=0)
+    original_submit = _parallel._submit_process_warmup
+    original_waitpid = os.waitpid
+    original_join = BaseProcess.join
+    original_thread_join = threading.Thread.join
+    workers: list[Any] = []
+    managers: list[Any] = []
+    reaped = threading.Event()
+    publish = threading.Event()
+    failure = RuntimeError("public partial submission during manager reaping")
+
+    def waitpid(pid: int, flags: int) -> tuple[int, int]:
+        result = original_waitpid(pid, flags)
+        if threading.current_thread() in managers and result[0] and not reaped.is_set():
+            reaped.set()
+            assert publish.wait(10)
+        return result
+
+    def join(process: Any, timeout: float | None = None) -> None:
+        if (
+            threading.current_thread() is threading.main_thread()
+            and process in workers
+            and timeout == 1.0
+        ):
+            assert reaped.wait(5)
+        original_join(process, timeout)
+
+    def thread_join(thread: Any, timeout: float | None = None) -> None:
+        if thread in managers and threading.current_thread() is threading.main_thread():
+            assert timeout is not None and 0 <= timeout <= 1.0
+            publish.set()
+        original_thread_join(thread, timeout)
+
+    def submit(pool: Any, capacity: int) -> Any:
+        original_submit(pool, capacity)
+        workers.extend(pool._processes.values())
+        managers.append(pool._executor_manager_thread)
+        raise failure
+
+    monkeypatch.setattr(os, "waitpid", waitpid)
+    monkeypatch.setattr(BaseProcess, "join", join)
+    monkeypatch.setattr(threading.Thread, "join", thread_join)
+    monkeypatch.setattr(_parallel, "_submit_process_warmup", submit)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            _parallel._start_process_executor(2)
+        assert caught.value is failure
+        assert reaped.is_set() and publish.is_set()
+        assert len(workers) == 2 and all(not p.is_alive() for p in workers)
+        assert all(not manager.is_alive() for manager in managers)
+    finally:
+        publish.set()
+        monkeypatch.undo()
+        for manager in managers:
+            manager.join(10)
+        for worker in workers:
+            if worker.is_alive():
+                worker.kill()
+            worker.join(2)
+
+
 def test_failed_pool_cleanup_does_not_release_replacement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -248,3 +313,56 @@ def test_failed_pool_cleanup_does_not_release_replacement(
     _parallel._shutdown_process_executor(0, cast(ProcessPoolExecutor, Failed()))
     assert _parallel._PROCESS_EXECUTOR is replacement
     assert closed == [{"wait": False, "cancel_futures": True}]
+
+
+def test_manager_wait_shares_final_reap_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter([100.0, 100.0, 101.0, 101.8, 102.0])
+    monkeypatch.setattr(
+        _parallel, "time", SimpleNamespace(monotonic=lambda: next(clock))
+    )
+    joins: list[tuple[str, float | None]] = []
+
+    class Worker:
+        def join(self, timeout: float | None = None) -> None:
+            joins.append(("worker", timeout))
+
+        def is_alive(self) -> bool:
+            return True
+
+        def terminate(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+    class Manager:
+        def join(self, timeout: float | None = None) -> None:
+            joins.append(("manager", timeout))
+
+    class Pool:
+        _processes = {1: Worker()}
+        _executor_manager_thread = Manager()
+
+        def shutdown(self, **kwargs: bool) -> None:
+            pass
+
+    _parallel._shutdown_process_executor(0, cast(ProcessPoolExecutor, Pool()))
+    assert joins == [
+        ("worker", 0),
+        ("worker", 1.0),
+        ("worker", pytest.approx(0.2)),
+        ("manager", 0),
+    ]
+
+
+def test_cleanup_does_not_join_current_manager() -> None:
+    class Pool:
+        _processes: dict[int, Any] = {}
+        _executor_manager_thread = threading.current_thread()
+
+        def shutdown(self, **kwargs: bool) -> None:
+            pass
+
+    _parallel._shutdown_process_executor(0, cast(ProcessPoolExecutor, Pool()))
