@@ -4668,35 +4668,7 @@ class _ChatViewTokenizer:
         self._render_canonical_masks()
         self._substitute_exact_prefix()
         self._translate_masks()
-        self.positions_by_first_token: dict[int, list[int]] = {}
-        for index, token_id in enumerate(self.rendered):
-            self.positions_by_first_token.setdefault(token_id, []).append(index)
-        self.locations_by_needle: dict[tuple[int, ...], list[tuple[int, int]]] = {}
-        self.replacements: list[
-            tuple[
-                int,
-                int,
-                list[int],
-                list[float],
-                bool,
-                _SampledSourceKey,
-                object,
-                int | None,
-            ]
-        ] = []
-        self.search_cursor = 0
-        self.sampled_texts = {
-            text
-            for message, source in zip(
-                self.messages, self.history.message_sources, strict=True
-            )
-            if message.get("role") == "assistant"
-            and source is not None
-            and _source_is_sampled(source)
-            for _, text in _chat_message_parts(message)
-        }
-        if self.rendered != self.canonical_rendered:
-            self.direct_bounds = []
+        self._prepare_span_search()
         self.marked_bounds: dict[int, tuple[int, int]] = {}
         self.marked_part_bounds: dict[int, list[tuple[int, int]]] = {}
         if not self.direct_bounds:
@@ -6341,6 +6313,37 @@ class _ChatViewTokenizer:
         self.length_stop_mask = _translate_token_mask(
             self.canonical_rendered, self.rendered, canonical_length_stop_mask
         )
+
+    def _prepare_span_search(self) -> None:
+        self.positions_by_first_token: dict[int, list[int]] = {}
+        for index, token_id in enumerate(self.rendered):
+            self.positions_by_first_token.setdefault(token_id, []).append(index)
+        self.locations_by_needle: dict[tuple[int, ...], list[tuple[int, int]]] = {}
+        self.replacements: list[
+            tuple[
+                int,
+                int,
+                list[int],
+                list[float],
+                bool,
+                _SampledSourceKey,
+                object,
+                int | None,
+            ]
+        ] = []
+        self.search_cursor = 0
+        self.sampled_texts = {
+            text
+            for message, source in zip(
+                self.messages, self.history.message_sources, strict=True
+            )
+            if message.get("role") == "assistant"
+            and source is not None
+            and _source_is_sampled(source)
+            for _, text in _chat_message_parts(message)
+        }
+        if self.rendered != self.canonical_rendered:
+            self.direct_bounds = []
 
     def _locations(self, needle: Sequence[int], start: int) -> list[tuple[int, int]]:
         if not needle:
