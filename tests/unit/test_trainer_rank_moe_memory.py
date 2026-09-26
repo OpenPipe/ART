@@ -8,7 +8,7 @@ import weakref
 import pytest
 import torch
 
-from art.trainer_rank import ForwardInput, TrainerRank
+from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank
 from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
     _MemoryProfile,
@@ -778,6 +778,48 @@ def test_hybridep_high_water_needs_a_live_larger_graph(
     before = tuple(refs)
     assert rank._checkpoint_memory_floor(groups) == baseline
     assert tuple(refs) == before and rank._pending_hybridep_graphs is refs
+
+
+def test_hybridep_admission_ignores_consumed_graph_with_retained_sibling(
+    hybrid_checkpoint_rank,
+):
+    rank = hybrid_checkpoint_rank
+    values = dict(
+        packed_tokens=2,
+        logical_tokens=2,
+        output_bytes=8,
+        signature=replace(_signature(), topology=(1, 1, 2, 1)),
+        group_rows=((2, True),),
+    )
+    baseline = rank._subforward_cost(**values)
+    rank._available_memory_bytes = lambda: 600000000
+    assert rank._memory_check_required(baseline.required).fits
+    rank._hybridep_rows_high_water = 218751
+    rank._hybridep_graph_tracking = True
+    value = torch.tensor(2.0, requires_grad=True)
+    (output,) = rank._track_slot_graph_outputs(
+        None, [ForwardOutput(None, None, value.square(), value.pow(3))]
+    )
+    refs = rank._pending_hybridep_graphs
+    (marker_ref,) = refs
+    assert marker_ref() is not None and not marker_ref().item()
+    live = rank._subforward_cost(**values)
+    assert live.checkpoint_workspace == 218752 * 2048 * 2
+    assert not rank._memory_check_required(live.required).fits
+
+    assert output.hidden_states is not None
+    output.hidden_states.backward()
+    assert output.logits is not None and output.logits.grad_fn is not None
+    assert marker_ref() is not None and marker_ref().item()
+    # The unused sibling retains the consumed marker. Price and admit before
+    # any execution helper prunes it or resets the communication high-water.
+    consumed = rank._subforward_cost(**values)
+    assert consumed == baseline
+    assert rank._memory_check_required(consumed.required).fits
+    assert rank._pending_hybridep_graphs is refs and refs == [marker_ref]
+    assert marker_ref() is not None and marker_ref().item()
+    assert rank._hybridep_rows_high_water == 218751
+    assert rank._hybridep_graph_tracking and rank._hybridep_buffer_id is None
 
 
 @pytest.mark.parametrize(

@@ -4585,7 +4585,7 @@ class TrainerRank:
             # this is separate from already-held native buffer capacity. Do not
             # prune graph references or reset execution state while estimating.
             rows = max(rows for rows, _ in group_rows)
-            if any(ref() is not None for ref in self._pending_hybridep_graphs):
+            if any(_graph_marker_is_live(ref) for ref in self._pending_hybridep_graphs):
                 rows = max(rows, self._hybridep_rows_high_water)
             workspace = max(workspace, -(-rows // 4) * 4 * self._hidden_size * 2)
         return retained, workspace
