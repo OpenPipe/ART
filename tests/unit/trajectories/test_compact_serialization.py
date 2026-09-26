@@ -745,3 +745,52 @@ def test_cloudpickle_preserves_shared_references() -> None:
     tr.compact_memory(trajectory)
     cloud_restored = cloudpickle.loads(cloudpickle.dumps(trajectory))
     assert cloud_restored.metadata["items"][0] is cloud_restored.metadata["items"][1]
+
+
+def test_compaction_scans_shared_numeric_lists_once_per_graph() -> None:
+    class CountedList(list):
+        visits = 0
+
+        def __iter__(self):
+            self.visits += 1
+            return super().__iter__()
+
+    numeric = CountedList([None, False, 0, -1, 2.5, float("nan"), float("inf")])
+    trajectory = art.Trajectory()
+    trajectory.metadata["aliases"] = [numeric] * 64
+    tr.compact_memory(trajectory)
+    assert numeric.visits == 1
+    assert all(value is numeric for value in trajectory.metadata["aliases"])
+
+    # The memo is local to this traversal: later edits still get compacted.
+    repeated = _long()
+    numeric[:] = [_fresh(repeated), _fresh(repeated)]
+    tr.compact_memory(trajectory)
+    assert numeric[0] is numeric[1]
+    assert all(value is numeric for value in trajectory.metadata["aliases"])
+
+
+@pytest.mark.parametrize("serializer", ["pickle", "cloudpickle"])
+def test_numeric_aliases_cycles_and_values_survive_callback_serialization(
+    serializer: str,
+) -> None:
+    codec = pickle if serializer == "pickle" else pytest.importorskip("cloudpickle")
+    numeric = [None, True, -7, 0.0, -0.0, float("nan"), float("inf")]
+    repeated = _long()
+    mixed: list[object] = [numeric, _fresh(repeated), _fresh(repeated)]
+    mixed.append(mixed)
+    trajectory = art.Trajectory()
+    trajectory.metadata.update({"first": numeric, "second": numeric, "mixed": mixed})
+    group = art.TrajectoryGroup([trajectory, trajectory])
+    payload = codec.dumps(group)
+    restored = codec.loads(payload)
+    a, b = restored.trajectories
+    assert a is b
+    assert a.metadata["first"] is a.metadata["second"] is a.metadata["mixed"][0]
+    assert a.metadata["mixed"][3] is a.metadata["mixed"]
+    assert a.metadata["mixed"][1] is a.metadata["mixed"][2]
+    values = a.metadata["first"]
+    assert values[:4] == [None, True, -7, 0.0]
+    assert repr(values[4]) == "-0.0" and values[5] != values[5]
+    assert values[6] == float("inf")
+    assert trajectory.metadata["first"] is numeric and mixed[3] is mixed
