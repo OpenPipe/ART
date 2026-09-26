@@ -4052,6 +4052,7 @@ class TrainerRank:
             geometry.gdn_key_head_dim,
             geometry.gdn_value_heads,
             geometry.gdn_value_head_dim,
+            geometry.gdn_conv_kernel,  # Prices each segment's conv history.
         )
         if self._gdn_layers and min(gdn_widths) <= 0:
             return False
@@ -5275,7 +5276,7 @@ class TrainerRank:
                         signature=signature,
                         logical_tokens=logical_tokens,
                         # Gradient groups' segments: exact layouts' counts, else
-                        # an upper bound (see _estimate_flat_forward).
+                        # a bound matching the estimate's (_estimate_flat_forward).
                         gdn_segments=gdn_segments,
                         group_rows=group_rows,
                         head_workspace_bytes=head_workspace_bytes,
@@ -6003,7 +6004,8 @@ class TrainerRank:
         content) and is used only inside the band where those bounds disagree.
         Under CP it returns None: per-rank floors need materialized layouts.
         ``gdn_segments`` receives each gradient group's segment count: exact
-        layouts' actual counts, else twice its requests (a radix tree has fewer).
+        layouts' actual counts; in cheap mode, the same kind of bound as the
+        token count (twice the requests, as a radix tree has fewer, or one).
         """
 
         if sync_planning_errors:
@@ -6114,7 +6116,10 @@ class TrainerRank:
                 packed_tokens += physical_rows
                 group_rows.append((physical_rows, grad_enabled))
                 if grad_enabled and gdn_segments is not None:
-                    gdn_segments.append(2 * len(group_indices))
+                    # Bounds like the token counts: at most twice the requests
+                    # without sharing (acceptance), at least one with full
+                    # sharing (rejection); exact pricing counts the rest.
+                    gdn_segments.append(1 if memory_minimal else 2 * len(group_indices))
                 head_workspace_bytes = max(
                     head_workspace_bytes,
                     self._group_head_workspace_bytes(

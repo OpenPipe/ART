@@ -151,6 +151,7 @@ def test_rows_are_sharded_with_ceiling_and_only_gradient_groups_save_them():
         "moe_geometry",
         "replicated_qkv",
         "missing_attention_geometry",
+        "missing_conv_kernel",
         "shallow",
         "wide_ffn",
     ],
@@ -168,6 +169,7 @@ def test_unproven_shapes_keep_todays_pricing(case):
         "moe_geometry": dict(),
         "replicated_qkv": dict(),
         "missing_attention_geometry": dict(),
+        "missing_conv_kernel": dict(),
         "shallow": dict(layers=48),
         "wide_ffn": dict(ffn=4 * F),
     }
@@ -182,6 +184,8 @@ def test_unproven_shapes_keep_todays_pricing(case):
         "moe_geometry": dict(moe_experts=8),
         "replicated_qkv": dict(num_query_groups=2),
         "missing_attention_geometry": dict(kv_channels=0),
+        # Unread conv history would leave each segment's price short.
+        "missing_conv_kernel": dict(gdn_conv_kernel=0),
     }
     if case in edits:
         r._geometry = replace(r._geometry, **edits[case])
@@ -241,6 +245,12 @@ def test_width_probes_count_only_gradient_segments():
     cheap: list[int] = []
     assert r._estimate_flat_forward(requests(), gdn_segments=cheap) is not None
     assert cheap == [2]  # A radix tree has fewer than twice its requests.
+    # The full-sharing estimate rejects widths, so it takes a lower bound.
+    minimal: list[int] = []
+    assert r._estimate_flat_forward(
+        requests(), memory_minimal=True, gdn_segments=minimal
+    )
+    assert minimal == [1]
     exact: list[int] = []
     assert r._estimate_flat_forward(requests(), exact=True, gdn_segments=exact)
     assert exact == [1]  # The selected layout's actual segments.
