@@ -113,7 +113,12 @@ class _PrefixChatRenderCache:
         self.bytes = 0
 
     def for_messages(
-        self, messages: list[dict[str, Any]], text: str, *, settings: object = None
+        self,
+        messages: list[dict[str, Any]],
+        text: str,
+        *,
+        settings: object = None,
+        add_generation_prompt: bool | None = None,
     ) -> _ChatRender:
         try:
             context = tuple(_render_context_key(message) for message in messages)
@@ -130,10 +135,23 @@ class _PrefixChatRenderCache:
                 break
             common += 1
 
+        rendered_generation_prompt = add_generation_prompt
+
         def render(
             selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
         ) -> str:
             count = len(selected_messages)
+            # This exact full-context render was just evaluated by the caller.
+            # A changed probe still proves every other generation/completion.
+            if (
+                count == len(messages)
+                and add_generation_prompt == rendered_generation_prompt
+                and all(
+                    original is current
+                    for original, current in zip(messages, selected_messages)
+                )
+            ):
+                return text
             if count > common or any(
                 original is not current
                 for original, current in zip(messages, selected_messages)
@@ -5277,6 +5295,7 @@ def _tokenize_chat_view(
                 span_render = prefix_render_cache.for_messages(
                     selected_messages,
                     text,
+                    add_generation_prompt=add_generation_prompt,
                     settings=_render_context_key(
                         [
                             history.tools,
