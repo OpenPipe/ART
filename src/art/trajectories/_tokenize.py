@@ -4664,18 +4664,22 @@ class _ChatViewTokenizer:
         self.output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
 
     def run(self) -> TokenizedHistory:
-        self._render_messages()
-        self._render_canonical_masks()
-        self._substitute_exact_prefix()
-        self._translate_masks()
-        self._prepare_span_search()
-        self._prove_marked_bounds()
-        self._prove_probed_bounds()
-        exact = self._tokenize_exact_length_stops()
-        if exact is not None:
-            return exact
-        self._collect_replacements()
-        return self._assemble()
+        try:
+            self._render_messages()
+            self._render_canonical_masks()
+            self._substitute_exact_prefix()
+            self._translate_masks()
+            self._prepare_span_search()
+            self._prove_marked_bounds()
+            self._prove_probed_bounds()
+            exact = self._tokenize_exact_length_stops()
+            if exact is not None:
+                return exact
+            self._collect_replacements()
+            return self._assemble()
+        finally:
+            # break self -> cache -> bound method -> self so the state is refcount-freed
+            del self.prefix_render_cache
 
     def _raw_render(
         self, selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
