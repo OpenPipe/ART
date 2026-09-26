@@ -154,6 +154,13 @@ native-representation option is needed. `multi_history=True` preserves the
 histories selected by the trajectory, including their order and model selection.
 
 Templates still own unrecorded separators, role masks, and synthetic stop tokens.
+If tokenizing another history in the same trajectory already resolves a tokenizer
+for the same model, ART reuses that authority to label recorded sampled stop
+tokens. This does not trigger a new tokenizer load or change rendering. Complete
+native histories still work offline without a tokenizer; when neither recorded
+stop metadata nor resolved tokenizer authority identifies a stop, ART leaves that
+label unknown rather than guessing from the final token.
+
 For supported Chat boundaries, ART decodes the recorded body and encodes only the
 unrecorded separator instead of re-tokenizing the whole conversation. It checks
 that the separator reproduces the next recorded prompt exactly. Edited contexts,

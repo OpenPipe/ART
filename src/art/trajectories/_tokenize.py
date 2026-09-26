@@ -553,6 +553,7 @@ def _translate_token_mask(
     mask: Sequence[bool],
     *,
     tokenizer: Tokenizer | None = None,
+    _opcodes: list[tuple[str, int, int, int, int]] | None = None,
 ) -> list[bool]:
     """Translate a token mask across a prefix replacement without guessing."""
 
@@ -563,9 +564,12 @@ def _translate_token_mask(
     translated = [False] * len(target)
     mapped = [False] * len(source)
     decode = getattr(tokenizer, "decode", None)
-    for tag, start, end, target_start, target_end in SequenceMatcher(
-        None, source, target, autojunk=False
-    ).get_opcodes():
+    opcodes = (
+        _opcodes or SequenceMatcher(None, source, target, autojunk=False).get_opcodes()
+    )
+    if _opcodes is not None and not _opcodes:
+        _opcodes.extend(opcodes)
+    for tag, start, end, target_start, target_end in opcodes:
         if tag == "equal":
             translated[target_start:target_end] = mask[start:end]
             mapped[start:end] = [True] * (end - start)
@@ -809,6 +813,7 @@ def _require_causal_predecessor(trainable: Sequence[bool]) -> None:
 @dataclass
 class _TraceBuilder:
     trace: _HistoryTokenizationTrace | None = None
+    tokenizer: Tokenizer | None = None
     rendered_outputs: tuple[tuple[int, int, object], ...] = ()
 
     def set(
@@ -817,7 +822,10 @@ class _TraceBuilder:
         source_keys: list[_SampledSourceKey | None],
         sources: dict[_SampledSourceKey, object],
         rendered_outputs: tuple[tuple[int, int, object], ...] = (),
+        *,
+        tokenizer: Tokenizer | None = None,
     ) -> None:
+        self.tokenizer = tokenizer
         trace = _HistoryTokenizationTrace(source_keys=source_keys, sources=sources)
         trace.validate(tokenized)
         self.trace = trace
@@ -2752,7 +2760,7 @@ def _tokenize_exchange_trajectory(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
 
 
@@ -3772,7 +3780,7 @@ def _tokenize_exact_responses_history(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
 
 
@@ -4620,7 +4628,7 @@ def _tokenize_exact_projected_chat_history(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
 
 
@@ -5365,22 +5373,32 @@ def _tokenize_chat_view(
         canonical_assistant_mask,
         direct_bounds or None,
     )
+    # These four masks translate the same pair of token sequences.
+    mask_opcodes: list[tuple[str, int, int, int, int]] = []
     assistant_mask = _translate_token_mask(
         canonical_rendered,
         rendered,
         canonical_assistant_mask,
         tokenizer=resolved_tokenizer,
+        _opcodes=mask_opcodes,
     )
     output_mask = _translate_token_mask(
         canonical_rendered,
         rendered,
         canonical_output_mask,
         tokenizer=resolved_tokenizer,
+        _opcodes=mask_opcodes,
     )
-    stop_mask = _translate_token_mask(canonical_rendered, rendered, canonical_stop_mask)
+    stop_mask = _translate_token_mask(
+        canonical_rendered, rendered, canonical_stop_mask, _opcodes=mask_opcodes
+    )
     length_stop_mask = _translate_token_mask(
-        canonical_rendered, rendered, canonical_length_stop_mask
+        canonical_rendered,
+        rendered,
+        canonical_length_stop_mask,
+        _opcodes=mask_opcodes,
     )
+    mask_opcodes.clear()
     positions_by_first_token: dict[int, list[int]] = {}
     for index, token_id in enumerate(rendered):
         positions_by_first_token.setdefault(token_id, []).append(index)
@@ -6692,7 +6710,13 @@ def _tokenize_chat_view(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources, tuple(rendered_outputs))
+        _trace.set(
+            tokenized,
+            source_keys,
+            sources,
+            tuple(rendered_outputs),
+            tokenizer=resolved_tokenizer,
+        )
     return tokenized
 
 
@@ -6770,7 +6794,7 @@ def _tokenize_completions_token_history(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
 
 
@@ -6960,7 +6984,7 @@ def _tokenize_completions_string_history(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
 
 
@@ -7323,6 +7347,36 @@ def _materialize_trajectory(
     )
 
 
+def _complete_resolved_sampled_stops(
+    tokenized: Sequence[TokenizedHistory], builders: Sequence[_TraceBuilder | None]
+) -> None:
+    """Reuse only authority actually resolved for this model in this call.
+
+    Do not load a tokenizer or feed it back into renderer selection. Conflicting
+    tokenizer objects leave that model's unknown STOP labels unchanged.
+    """
+    resolved: dict[str, Tokenizer | None] = {}
+    for value, builder in zip(tokenized, builders, strict=True):
+        if builder is not None and builder.tokenizer is not None:
+            previous = resolved.setdefault(value.model, builder.tokenizer)
+            if previous is not builder.tokenizer:
+                resolved[value.model] = None
+    for value, builder in zip(tokenized, builders, strict=True):
+        if (
+            builder is not None
+            and builder.tokenizer is None
+            and builder.trace is not None
+            and (tokenizer := resolved.get(value.model)) is not None
+        ):
+            _mark_sampled_stops(
+                value.tokens,
+                value.flags,
+                builder.trace.source_keys,
+                builder.trace.sources,
+                tokenizer=tokenizer,
+            )
+
+
 def tokenize_trajectory(
     trajectory: Trajectory,
     *,
@@ -7356,8 +7410,10 @@ def tokenize_trajectory(
     track_context = len(histories) > 1 and any(context_sources)
     prior: list[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = []
     tokenized = []
+    stop_builders: list[_TraceBuilder | None] = []
+    collect_stops = tokenizer is None and len(histories) > 1
     for history, copied in zip(histories, context_sources, strict=True):
-        trace = _TraceBuilder() if track_context else None
+        trace = _TraceBuilder() if track_context or collect_stops else None
         result = tokenize_history(
             history,
             model=model if isinstance(history, LegacyHistory) else history.model,
@@ -7371,8 +7427,11 @@ def tokenize_trajectory(
             _context_sources=copied,
         )
         tokenized.append(result)
-        if trace is not None and trace.trace is not None:
+        stop_builders.append(trace)
+        if track_context and trace is not None and trace.trace is not None:
             prior.append((result, trace.trace))
+    if collect_stops:
+        _complete_resolved_sampled_stops(tokenized, stop_builders)
     if not multi_history:
         return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
@@ -7398,6 +7457,7 @@ def _tokenize_trajectory_with_trace(
     histories = trajectory.histories(model=model)
     tokenized_histories: list[TokenizedHistory] = []
     traces: list[_HistoryTokenizationTrace] = []
+    builders: list[_TraceBuilder] = []
     for history in histories:
         if isinstance(history, LegacyHistory):
             raise AssertionError(
@@ -7419,6 +7479,9 @@ def _tokenize_trajectory_with_trace(
             raise AssertionError("Exchange tokenization did not produce a source trace")
         tokenized_histories.append(tokenized)
         traces.append(trace_builder.trace)
+        builders.append(trace_builder)
+    if tokenizer is None:
+        _complete_resolved_sampled_stops(tokenized_histories, builders)
     return (
         TokenizedMultiHistoryTrajectory(
             trajectory=trajectory,
