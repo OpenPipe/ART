@@ -43,14 +43,17 @@ def _adapter(lora_module, inputs: int, outputs: int, rank: int = RANK):
     return lora
 
 
-def _dense_layer() -> Any:
+def _dense_layer(gdn: bool = False) -> Any:
     """The traced gated MLP, from the real owner types."""
     pytest.importorskip("art.megatron.lora")
     from megatron.core.extensions.transformer_engine import (
         TELayerNormColumnParallelLinear,
         TERowParallelLinear,
     )
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.mlp import MLP
+    from megatron.core.transformer.transformer_layer import TransformerLayer
 
     from art.megatron import lora as lora_module
 
@@ -88,10 +91,25 @@ def _dense_layer() -> Any:
     fc2.row_parallel_lora = row
     mlp.linear_fc1 = fc1
     mlp.linear_fc2 = fc2
-    layer = torch.nn.Module()
-    layer.self_attention = torch.nn.Module()
+    layer = _module(TransformerLayer)
+    layer.self_attention = _module(GatedDeltaNet if gdn else SelfAttention)
     layer.mlp = mlp
     return layer
+
+
+def _wrap_like_art(layer: Any) -> None:
+    """ART's GDN island and prefix-tree wrappers, as the traced run had them."""
+    from art.megatron.gdn.operator import (
+        _gdn_island_layer_forward,
+        _prefix_tree_forward,
+    )
+
+    layer._art_gdn_island_physical_forward = layer.forward
+    layer.forward = MethodType(_gdn_island_layer_forward, layer)
+    mixer = layer.self_attention
+    if type(mixer).__name__ == "GatedDeltaNet":
+        mixer._art_physical_forward = mixer.forward
+        mixer.forward = MethodType(_prefix_tree_forward, mixer)
 
 
 def _dense_model(layers: list[Any]) -> Any:
@@ -121,16 +139,10 @@ def _at_cp2(r):
 
 
 def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
-    from art.megatron.gdn.operator import (
-        _gdn_island_layer_forward,
-        _prefix_tree_forward,
-    )
-
-    layers = [_dense_layer() for _ in range(3)]
-    # ART's own GDN layer and mixer wrappers were part of the traced run.
-    layers[0].forward = MethodType(_gdn_island_layer_forward, layers[0])
-    mixer = layers[0].self_attention
-    mixer.forward = MethodType(_prefix_tree_forward, mixer)
+    # A GDN/attention hybrid with ART's wrappers, as traced.
+    layers = [_dense_layer(gdn=index != 2) for index in range(3)]
+    for layer in layers:
+        _wrap_like_art(layer)
     model = _dense_model(layers)
     assert _dense_mlp_recompute_bytes_per_token([model]) == (STAGE, NO_GRAD)
     assert _dense_mlp_recompute_bytes_per_token([model], hidden_size=HIDDEN + 1) == (
@@ -150,6 +162,10 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "base_hook",
         "layer_hook",
         "layer_forward",
+        "layer_delegate",
+        "layer_type",
+        "mixer_delegate",
+        "mixer_class_forward",
         "mixer_hook",
         "mixer_forward",
         "no_mixer",
@@ -180,13 +196,18 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
 )
 def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+    from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.transformer_block import TransformerBlock
+    from megatron.core.transformer.transformer_layer import TransformerLayer
 
     from art.megatron import lora as lora_module
 
-    layers = [_dense_layer() for _ in range(3)]
+    layers = [_dense_layer(gdn=index != 1) for index in range(3)]
+    for wrapped in layers:
+        _wrap_like_art(wrapped)
     model = _dense_model(layers)
     layer = layers[1]
+    gdn_layer = layers[0]
     mlp = layer.mlp
     config = mlp.config
 
@@ -196,6 +217,15 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     class Block(TransformerBlock):
         pass
 
+    class Layer(TransformerLayer):
+        pass
+
+    class Attention(SelfAttention):
+        def forward(self, *args, **kwargs):  # A class-level override.
+            return super().forward(*args, **kwargs)
+
+    custom = MethodType(lambda self, *a, **k: None, layer)
+
     edits = {
         "fc1_hook": hook(mlp.linear_fc1),
         "row_hook": hook(mlp.linear_fc2.row_parallel_lora),
@@ -204,6 +234,18 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         "layer_hook": lambda: layer.register_forward_pre_hook(lambda *args: None),
         "layer_forward": lambda: setattr(
             layer, "forward", MethodType(lambda self, *a: None, layer)
+        ),
+        "layer_delegate": lambda: setattr(
+            layer, "_art_gdn_island_physical_forward", custom
+        ),
+        "layer_type": lambda: setattr(layer, "__class__", Layer),
+        "mixer_delegate": lambda: setattr(
+            gdn_layer.self_attention,
+            "_art_physical_forward",
+            MethodType(lambda self, *a: None, gdn_layer.self_attention),
+        ),
+        "mixer_class_forward": lambda: setattr(
+            layer.self_attention, "__class__", Attention
         ),
         "mixer_hook": hook(layer.self_attention),
         "mixer_forward": lambda: setattr(
@@ -379,14 +421,16 @@ def test_no_grad_groups_price_the_largest_groups_own_rows():
     dense, plain = _at_cp2(_dense_rank()), _at_cp2(_dense_rank(0, 0))
     # Today's floor: H bytes per packed token times the layer-count factor.
     per_token = HIDDEN * 2 * min(16, LAYERS // 4 + 4)
+    te = dense._te_workspace_growth_bytes()
     # One group: today's per-packed-token floor, unchanged.
     assert _no_grad_required(dense, (12_000,)) == _no_grad_required(plain, (12_000,))
     for groups, packed in (((12_000, 8_000), 40_000), ((58_240, 29_120), 119_119)):
         largest = max(groups)
-        # The largest group's own physical rows at the traced width, and at
-        # least its share of today's per-packed-token floor.
+        # The largest group's own physical rows at the traced width (with
+        # TE's workspace growth), and at least its share of today's
+        # per-packed-token floor.
         expected = max(
-            largest * NO_GRAD, -(-packed * per_token * largest // sum(groups))
+            largest * NO_GRAD + te, -(-packed * per_token * largest // sum(groups))
         )
         assert _no_grad_required(dense, groups, packed=packed) == int(expected * 1.1)
         assert _no_grad_required(dense, groups, packed=packed) < _no_grad_required(
@@ -394,7 +438,7 @@ def test_no_grad_groups_price_the_largest_groups_own_rows():
         )
     # A narrow structural width never drops below the rows' traced need.
     wide = _at_cp2(_dense_rank(STAGE, 10**6))
-    assert _no_grad_required(wide, (12_000, 8_000)) == int(12_000 * 10**6 * 1.1)
+    assert _no_grad_required(wide, (12_000, 8_000)) == int((12_000 * 10**6 + te) * 1.1)
 
 
 @pytest.mark.parametrize("case", ["cp1", "cp4", "unsupported"])
@@ -407,3 +451,32 @@ def test_no_grad_group_floor_needs_the_traced_shape(case):
     assert _no_grad_required(
         dense, (12_000, 8_000), topology=topology
     ) == _no_grad_required(plain, (12_000, 8_000), topology=topology)
+
+
+def test_one_unsupported_slot_keeps_both_allowances(monkeypatch):
+    """A no-grad reference slot outside the priced rank must not leave the
+    gradient group's boundaries on one gradient without the dense stage."""
+    r = _at_cp2(_dense_rank())
+    policy, reference = r._slot_ref("policy"), r._slot_ref("reference")
+    monkeypatch.setattr(
+        _impl,
+        "_dense_mlp_recompute_bytes_per_token",
+        lambda model, ref, **k: (0, 0) if ref == reference else (STAGE, NO_GRAD),
+    )
+    groups = ((1000, True), (3000, False))
+    both = (policy, reference)
+    assert (
+        r._checkpoint_input_gradient_bytes(groups, both) == 1000 * LAYERS * HIDDEN * 2
+    )
+    retained, workspace = r._checkpoint_memory_floor(groups, both)
+    assert workspace < 3000 * NO_GRAD  # the dense widths fell back together
+    supported = (policy, policy)
+    assert r._checkpoint_input_gradient_bytes(groups, supported) == 1000 * HIDDEN * 2
+
+
+def test_no_grad_only_waves_charge_te_workspace_growth():
+    r = _at_cp2(_dense_rank())
+    _, dense = r._checkpoint_memory_floor(((500, False),))
+    _, plain = _at_cp2(_dense_rank(0, 0))._checkpoint_memory_floor(((500, False),))
+    assert dense == 500 * NO_GRAD + r._te_workspace_growth_bytes()
+    assert plain == 500 * 4 * HIDDEN * 2

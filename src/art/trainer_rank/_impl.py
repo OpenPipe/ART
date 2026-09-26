@@ -1670,8 +1670,11 @@ def _dense_mlp_recompute_bytes_per_token(
             TELayerNormColumnParallelLinear,
             TERowParallelLinear,
         )
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+        from megatron.core.transformer.attention import SelfAttention
         from megatron.core.transformer.mlp import MLP
         from megatron.core.transformer.transformer_block import TransformerBlock
+        from megatron.core.transformer.transformer_layer import TransformerLayer
 
         from art.megatron.gdn.operator import (
             _gdn_island_layer_forward,
@@ -1687,19 +1690,29 @@ def _dense_mlp_recompute_bytes_per_token(
         # Without the traced owner types nothing can match; keep the allowance.
         return 0, 0
 
-    def plain(module: Any, *wrappers: Any) -> bool:
-        """No hooks, and no forward override but ART's traced wrappers."""
+    def plain(module: Any, wrapper: Any = None, delegate: str = "") -> bool:
+        """No hooks, and no forward but the class's or ART's traced wrapper,
+        which must still call the class's own forward."""
         forward = vars(module).get("forward")
+        if module._forward_hooks or module._forward_pre_hooks:
+            return False
+        if forward is None:
+            return True
+        inner = vars(module).get(delegate)
         return (
-            not module._forward_hooks
-            and not module._forward_pre_hooks
-            and (
-                forward is None
-                or type(forward) is MethodType
-                and forward.__self__ is module
-                and forward.__func__ in wrappers
-            )
+            wrapper is not None
+            and type(forward) is MethodType
+            and forward.__self__ is module
+            and forward.__func__ is wrapper
+            and type(inner) is MethodType
+            and inner.__self__ is module
+            and inner.__func__ is type(module).forward
         )
+
+    mixers = {
+        SelfAttention: SelfAttention.forward,
+        GatedDeltaNet: GatedDeltaNet.forward,
+    }
 
     if type(decoder) is not TransformerBlock or not plain(decoder):
         return 0, 0
@@ -1739,10 +1752,17 @@ def _dense_mlp_recompute_bytes_per_token(
         size = getattr(config, "hidden_size", None)
         mixer = getattr(layer, "self_attention", None)
         if (
-            not isinstance(layer, torch.nn.Module)
-            or not plain(layer, _gdn_island_layer_forward)
-            or not isinstance(mixer, torch.nn.Module)
-            or not plain(mixer, _prefix_tree_forward)
+            type(layer) is not TransformerLayer
+            or not plain(
+                layer, _gdn_island_layer_forward, "_art_gdn_island_physical_forward"
+            )
+            # Attention or GDN, with its base class's forward (Qwen subclasses
+            # keep it).
+            or not any(
+                isinstance(mixer, base) and type(mixer).forward is forward
+                for base, forward in mixers.items()
+            )
+            or not plain(mixer, _prefix_tree_forward, "_art_physical_forward")
             or any(type(site) is not cls for site, cls in sites)
             or not all(plain(site) for site, _ in sites)
             or type(ffn) is not int
@@ -4474,7 +4494,7 @@ class TrainerRank:
                 group_rows, refs, routed, strict=True
             )
         )
-        if moe or dense:
+        if moe or dense or no_grad:
             workspace += self._te_workspace_growth_bytes()
         return retained, workspace
 
@@ -4776,9 +4796,9 @@ class TrainerRank:
             return 0
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
-        if self._dense_mlp_widths(
-            tuple(ref for (_, grad), ref in zip(group_rows, refs, strict=True) if grad)
-        )[0] or (
+        # The same slots as the floor: if any group's slot falls back there,
+        # the per-boundary allowance must stay here too.
+        if self._dense_mlp_widths(refs)[0] or (
             self._checkpoint_moe_bytes_per_token()
             and all(
                 self._moe_recompute_covered_for(ref)
