@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 import json
 import re
 from typing import Any
@@ -117,29 +118,159 @@ def _without_inline_reasoning_parser(template: str) -> str:
             continue
     if not edits:
         return template
-    # Dropping structured reasoning must not trim the visible assistant body.
+
+    def apply_edits() -> str:
+        result = template
+        for (start, end), replacement in sorted(edits.items(), reverse=True):
+            result = result[:start] + replacement + result[end:]
+        return result
+
+    # Only the content assignment consumed by a recognized parser may lose
+    # its trim. Independent preview macros/branches have their own bindings.
+    try:
+        tree = WithoutWhitespace().visit(env.parse(template))
+    except TemplateSyntaxError:
+        # Optional binding analysis must not undo independently proved parser
+        # edits when the renderer supports extensions absent from this parser.
+        return apply_edits()
+    assignments = list(tree.find_all(nodes.Assign))
+    locations = []
+    parsed_assignments = []
+    for block in blocks:
+        start, body_start, body_end, end = block
+        if template[body_start:body_end].split(None, 1)[:1] != ["set"]:
+            continue
+        try:
+            body = env.parse(template[start:end]).body
+        except TemplateSyntaxError:
+            continue
+        if len(body) == 1 and isinstance(body[0], nodes.Assign):
+            locations.append(block)
+            parsed_assignments.append(body[0])
+    if assignments != parsed_assignments:
+        return apply_edits()  # Do not guess an assignment's source span.
+    # An AST-equivalent block with comments/data between its tags may not be
+    # one of the source spans removed above. Join If nodes in source order too.
+    conditions = []
+    for block in blocks:
+        statement = template[block[1] : block[2]].strip()
+        keyword = statement.split(None, 1)[:1]
+        if keyword not in (["if"], ["elif"]):
+            continue
+        try:
+            parsed = env.parse(
+                "{% if " + statement.split(None, 1)[1] + " %}{% endif %}"
+            )
+        except TemplateSyntaxError:
+            return apply_edits()
+        if len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.If):
+            return apply_edits()
+        conditions.append((block, parsed.body[0].test))
+    branches = list(tree.find_all(nodes.If))
+    if [node.test for node in branches] != [test for _, test in conditions]:
+        return apply_edits()
+    edited_parsers = {
+        id(node)
+        for node, (block, _) in zip(branches, conditions, strict=True)
+        if any(start == block[0] for start, _ in edits)
+    }
+    selected = set()
+    shared = set()
+
+    def writes_content(node: nodes.Assign | nodes.AssignBlock) -> bool:
+        target = node.target
+        return (
+            isinstance(target, nodes.Name)
+            and target.name == "content"
+            or any(n.name == "content" for n in target.find_all(nodes.Name))
+        )
+
+    def reads_content(node: nodes.Node) -> bool:
+        return (
+            isinstance(node, nodes.Name)
+            and node.name == "content"
+            and node.ctx == "load"
+        ) or any(
+            n.name == "content" and n.ctx == "load" for n in node.find_all(nodes.Name)
+        )
+
+    def assistant_condition(test: nodes.Node) -> bool | None:
+        # The rewrite changes assistant content only. Ignore paths proved to
+        # handle a different role, but inspect every unknown branch for users
+        # of the original trimmed value before the destructive parser.
+        if (
+            isinstance(test, nodes.Compare)
+            and test.expr
+            == nodes.Getattr(nodes.Name("message", "load"), "role", "load")
+            and len(test.ops) == 1
+            and test.ops[0].op in ("eq", "ne")
+            and isinstance(test.ops[0].expr, nodes.Const)
+        ):
+            equal = test.ops[0].expr.value == "assistant"
+            return equal if test.ops[0].op == "eq" else not equal
+        return None
+
+    def visit(body: Sequence[nodes.Node], binding: nodes.Assign | None = None) -> None:
+        for node in body:
+            if isinstance(node, nodes.If):
+                if id(node) in edited_parsers and node == operation[0]:
+                    if binding is not None:
+                        selected.add(id(binding))
+                    binding = None
+                    continue
+                if binding is not None and reads_content(node.test):
+                    shared.add(id(binding))
+                condition = assistant_condition(node.test)
+                if condition is not False:
+                    visit(node.body, binding)
+                if condition is not True:
+                    # elif_ is a list of If nodes whose else is stored on the
+                    # outer If. Stop following it once a role match is proved.
+                    for branch in node.elif_:
+                        visit([branch], binding)
+                        if assistant_condition(branch.test) is True:
+                            break
+                    else:
+                        visit(node.else_, binding)
+                if any(
+                    writes_content(n)
+                    for n in node.find_all((nodes.Assign, nodes.AssignBlock))
+                ):
+                    binding = None
+            else:
+                if binding is not None and reads_content(node):
+                    shared.add(id(binding))
+                if isinstance(node, nodes.Assign):
+                    if writes_content(node):
+                        binding = node
+                else:
+                    # Macro/loop/with/block bodies have independent bindings.
+                    for _, value in node.iter_fields():
+                        if isinstance(value, list) and all(
+                            isinstance(n, nodes.Node) for n in value
+                        ):
+                            visit(value)
+                    if isinstance(node, nodes.AssignBlock) and writes_content(node):
+                        binding = None
+
+    visit(tree.body)
     trims = [
-        env.parse("{% set content = " + content + " %}").body
+        env.parse("{% set content = " + content + " %}").body[0]
         for content in (
             "render_content(message.content, true)|trim",
             "(render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
         )
     ]
-    for start, body_start, body_end, end in blocks:
-        if "render_content" not in template[body_start:body_end]:
-            continue
-        try:
-            if env.parse(template[start:end]).body in trims:
-                edits[start, end] = (
-                    template[start:body_start]
-                    + " set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim) "
-                    + template[body_end:end]
-                )
-        except TemplateSyntaxError:
-            continue
-    for (start, end), replacement in sorted(edits.items(), reverse=True):
-        template = template[:start] + replacement + template[end:]
-    return template
+    for node, (start, body_start, body_end, end) in zip(
+        assignments, locations, strict=True
+    ):
+        if id(node) in selected - shared and node in trims:
+            edits[start, end] = (
+                template[start:body_start]
+                + " set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim) "
+                + template[body_end:end]
+            )
+    return apply_edits()
 
 
 def chat_template_with_preserved_thinking(chat_template: object) -> object:
@@ -151,7 +282,9 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
         }
     if not isinstance(chat_template, str):
         return chat_template
-    chat_template = _without_inline_reasoning_parser(chat_template)
+    literal_template = _without_inline_reasoning_parser(chat_template)
+    inline_parser_removed = literal_template != chat_template
+    chat_template = literal_template
     replacements = (
         (
             _QWEN_DROP_PRIOR_THINKING,
@@ -233,10 +366,13 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
             "reasoning_content + '\\n</think>\\n\\n'",
             "reasoning_content + ('</think>\\n\\n' if preserve_thinking and message.reasoning_content is string and reasoning_content else '\\n</think>\\n\\n')",
         )
-        chat_template = chat_template.replace(
-            "set content = render_content(message.content, true)|trim",
-            "set content = (render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
-        )
+        if not inline_parser_removed:
+            # The recognized parser path already preserved its own input. Do
+            # not apply the legacy template-wide trim rewrite to other macros.
+            chat_template = chat_template.replace(
+                "set content = render_content(message.content, true)|trim",
+                "set content = (render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
+            )
     if "clear_thinking" in chat_template:
         chat_template = chat_template.replace(
             "{{ content.strip() }}",

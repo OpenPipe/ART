@@ -430,3 +430,95 @@ def test_unproved_historical_offset_declines(
         )
         is None
     )
+
+
+@pytest.mark.parametrize("offsets", [False, True])
+def test_interior_historical_parser_cannot_change_sample_conditioning(
+    monkeypatch, offsets
+):
+    from openai.types.chat import ChatCompletion
+    from test_literal_thinking_off import _TemplateTokenizer
+    from test_tokenize import _chat_exchange
+
+    from art_inference.chat_template import _QWEN_INLINE_STATEMENTS
+
+    template = (
+        "{% for message in messages %}{% set content = message.content %}"
+        + "".join("{% " + part + " %}" for part in _QWEN_INLINE_STATEMENTS)
+        + "{{ content }}{% if message.role == 'assistant' %}§{% endif %}{% endfor %}"
+    )
+
+    class Tokenizer(_TemplateTokenizer):
+        eos_token_id = ord("§")
+
+        def __call__(self, text, **kwargs):
+            if kwargs.get("return_offsets_mapping") and not offsets:
+                raise NotImplementedError("No public offsets")
+            return super().__call__(text, **kwargs)
+
+    tokenizer = Tokenizer()
+    tokenizer.chat_template = template
+    messages = [{"role": "user", "content": "first query"}]
+    exchanges = []
+    records = []
+    for index in range(2):
+        prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        assert isinstance(prompt, list)
+        output = list(map(ord, f"answer{index}§"))
+        exchange = _chat_exchange(prompt, output, offset=index)
+        exchange.request["messages"] = cast(
+            list[ChatCompletionMessageParam], deepcopy(messages)
+        )
+        exchange.request["chat_template"] = template
+        payload = exchange.response.model_dump(mode="python")
+        payload["choices"][0]["message"]["content"] = f"answer{index}"
+        exchange.response = ChatCompletion.model_validate(payload)
+        exchanges.append(exchange)
+        records.append((prompt, output))
+        messages.extend(
+            [
+                {"role": "assistant", "content": f"answer{index}"},
+                {"role": "user", "content": "middle query"},
+                {"role": "assistant", "content": "x</think>y"},
+                {"role": "user", "content": "next query"},
+            ]
+        )
+    value = tr.Trajectory(exchanges=tr.TrajectoryExchanges(chat_completions=exchanges))
+    original = value.model_dump()
+    if not offsets:
+        with pytest.raises(ValueError, match="Cannot preserve request roles"):
+            value.tokenize(tokenizer=tokenizer, multi_history=True)
+        assert value.model_dump() == original
+        return
+    actual = value.tokenize(tokenizer=tokenizer, multi_history=True)
+    assert len(actual.histories) == 1
+    result = actual.histories[0]
+    assert result.tokens == records[-1][0] + records[-1][1]
+    for prompt, output in records:
+        assert result.tokens[: len(prompt)] == prompt
+        assert result.tokens[len(prompt) : len(prompt) + len(output)] == output
+        assert all(
+            flag & tr.TokenFlag.SAMPLED
+            for flag in result.flags[len(prompt) : len(prompt) + len(output)]
+        )
+    assert value.model_dump() == original
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            module, "chat_template_with_preserved_thinking", lambda value: value
+        )
+        expected = value.tokenize(tokenizer=tokenizer, multi_history=True)
+    assert result.flags == expected.histories[0].flags
+    assert all(
+        a == b or math.isnan(a) and math.isnan(b)
+        for a, b in zip(result.logprobs, expected.histories[0].logprobs, strict=True)
+    )
+    for flag in (
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.OUTPUT,
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.STOP,
+    ):
+        assert tr.first_occurrence_masks(
+            actual.histories, where=flag
+        ) == tr.first_occurrence_masks(expected.histories, where=flag)

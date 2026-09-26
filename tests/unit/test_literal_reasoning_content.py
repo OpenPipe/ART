@@ -419,3 +419,202 @@ def test_plain_block_whitespace_keeps_prior_inline_parser_coverage(separator, qu
     content = "HEAD<think>literal</think>TAIL"
     assert content in _render(fixed, [_USER, {"role": "assistant", "content": content}])
     assert chat_template_with_preserved_thinking(fixed) == fixed
+
+
+@pytest.mark.parametrize("preserve", [False, True])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("layout", ["macros", "same_line", "branches"])
+def test_content_trim_is_scoped_to_the_recognized_parser(preserve, newline, layout):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    parser = match.group()
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    render = "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+    preview = "{% macro preview(message) %}" + trim + "[{{ content }}]{% endmacro %}"
+    main = (
+        "{% macro answer(message) %}" + trim + parser + "[{{ content }}]{% endmacro %}"
+    )
+    if layout == "branches":
+        main = (
+            "{% macro answer(message) %}{% if message.role == 'assistant' %}"
+            + trim
+            + parser
+            + "[{{ content }}]{% else %}"
+            + trim
+            + "[{{ content }}]{% endif %}{% endmacro %}"
+        )
+    separator = "" if layout == "same_line" else newline
+    template = separator.join(
+        [render, preview, main, "{{ answer(message) }}|{{ preview(message) }}"]
+    )
+    fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
+    assert preview in fixed
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    kwargs = dict(
+        message={"role": "assistant", "content": "  answer  "},
+        preserve_thinking=preserve,
+    )
+    assert env.from_string(fixed).render(**kwargs).endswith("[  answer  ]|[answer]")
+    kwargs["message"]["content"] = "  before<think>literal</think>after  "
+    assert (
+        env.from_string(fixed)
+        .render(**kwargs)
+        .endswith(
+            "[  before<think>literal</think>after  ]|[before<think>literal</think>after]"
+        )
+    )
+    assert chat_template_with_preserved_thinking(fixed) == fixed
+    if layout == "branches":
+        kwargs["message"] = {"role": "user", "content": "  answer  "}
+        assert env.from_string(fixed).render(**kwargs).endswith("[answer]|[answer]")
+
+
+@pytest.mark.parametrize("preserve", [False, True])
+@pytest.mark.parametrize("raw", [False, True])
+def test_qwen_content_preview_macro_is_unchanged(preserve, raw):
+    preview = "{% macro preview(message) %}{% set content = render_content(message.content, true)|trim %}[{{ content }}]{% endmacro %}"
+    body = _TEMPLATE
+    if raw:
+        body = body.replace(
+            "{%- if not preserve_thinking or message.reasoning_content is not string %}{%- set reasoning_content = reasoning_content|trim %}{%- endif %}",
+            "{%- set reasoning_content = reasoning_content|trim %}",
+        )
+    template = preview + body + "{{ preview(messages[-1]) }}"
+    fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
+    assert preview in fixed
+    content = "  before<think>literal</think>after  "
+    rendered = _render(
+        fixed,
+        [_USER, {"role": "assistant", "content": content}],
+        preserve_thinking=preserve,
+    )
+    assert content + "<|im_end|>\n" in rendered
+    assert rendered.endswith("[before<think>literal</think>after]")
+
+
+@pytest.mark.parametrize("shadow", ["assignment", "conditional", "scope"])
+def test_content_trim_requires_a_proven_local_binding(shadow):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    parser = match.group()
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    render = "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+    if shadow == "assignment":
+        template = render + trim + "{% set content = 'replacement' %}" + parser
+    elif shadow == "conditional":
+        template = (
+            render
+            + trim
+            + "{% if custom %}{% set content = 'replacement' %}{% endif %}"
+            + parser
+        )
+    else:
+        template = (
+            render
+            + trim
+            + "{% macro nested() %}"
+            + parser
+            + "{{ content }}{% endmacro %}{{ nested() }}"
+        )
+    fixed = _without_inline_reasoning_parser(template)
+    assert trim in fixed
+    assert not _QWEN_INLINE_REASONING.search(fixed)
+    assert _without_inline_reasoning_parser(fixed) == fixed
+
+
+@pytest.mark.parametrize("extension", ["loopcontrols", "generation"])
+def test_optional_trim_binding_parse_keeps_proven_parser_removal(extension):
+    from jinja2 import nodes
+    from jinja2.ext import Extension
+
+    class Generation(Extension):
+        tags = {"generation"}
+
+        def parse(self, parser):
+            next(parser.stream)
+            body = parser.parse_statements(["name:endgeneration"], drop_needle=True)
+            return nodes.Scope(body)
+
+    env = ImmutableSandboxedEnvironment(
+        extensions=["jinja2.ext.loopcontrols", Generation],
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    parser = match.group()
+    prefix = (
+        "{% for item in [1] %}{% break %}{% endfor %}"
+        if extension == "loopcontrols"
+        else "{% generation %}PUBLIC{% endgeneration %}"
+    )
+    template = prefix + "{% set content = message.content %}" + parser + "{{ content }}"
+    content = "HEAD<think>literal</think>TAIL"
+    kwargs = {"message": {"role": "assistant", "content": content}}
+    assert env.from_string(template).render(**kwargs).endswith("TAIL")
+    fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
+    assert prefix in fixed
+    assert env.from_string(fixed).render(**kwargs).endswith(content)
+    assert chat_template_with_preserved_thinking(fixed) == fixed
+
+
+@pytest.mark.parametrize("consumer", ["output", "alias", "condition", "other_branch"])
+def test_shared_content_preview_prevents_ambiguous_trim_rewrite(consumer):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    parser = match.group()
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    render = "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+    if consumer == "output":
+        body = "[{{ content }}]" + parser + "[{{ content }}]"
+    elif consumer == "alias":
+        body = "{% set preview = content %}" + parser + "[{{ preview }}][{{ content }}]"
+    elif consumer == "condition":
+        body = "{% if content %}PREVIEW{% endif %}" + parser + "[{{ content }}]"
+    else:
+        body = (
+            "{% if preview_only %}[{{ content }}]{% else %}"
+            + parser
+            + "[{{ content }}]{% endif %}"
+        )
+    template = render + trim + body
+    fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
+    assert trim in fixed
+    assert not _QWEN_INLINE_REASONING.search(fixed)
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    kwargs = dict(message={"role": "assistant", "content": "   "}, preview_only=True)
+    assert env.from_string(fixed).render(**kwargs) == env.from_string(template).render(
+        **kwargs
+    )
+
+
+def test_only_source_edited_parser_authorizes_its_content_trim():
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    parser = match.group()
+    unedited = parser.replace("%}", "%}{# preserve this custom block #}", 1)
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    render = "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+    preview = (
+        "{% macro preview(message) %}"
+        + trim
+        + unedited
+        + "[{{ content }}]{% endmacro %}"
+    )
+    answer = (
+        "{% macro answer(message) %}" + trim + parser + "[{{ content }}]{% endmacro %}"
+    )
+    template = (
+        render + preview + answer + "{{ answer(message) }}|{{ preview(message) }}"
+    )
+    fixed = _without_inline_reasoning_parser(template)
+    assert preview in fixed
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    rendered = env.from_string(fixed).render(
+        message={"role": "assistant", "content": "  HEAD<think>literal</think>TAIL  "}
+    )
+    assert rendered == "[  HEAD<think>literal</think>TAIL  ]|[TAIL]"

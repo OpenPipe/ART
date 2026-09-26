@@ -191,15 +191,21 @@ assembly; it does not restore destructive parsing for new response content.
 With a supplied renderer, request-owned assistant roles are proved throughout
 the native stream, including between sampled responses. A request whose text
 disagrees with its recorded assistant tokens can still use the offline native
-path, but cannot claim a complete rendered role mask. Unproved role mappings
-use the strict existing fallback and may be refused.
+path, but cannot claim a complete rendered role mask. When literal-content
+normalization changes historical rendering, ART requires the original request
+to reproduce the complete recorded prompt before recovering those roles. If
+that proof fails, ART refuses to attach recorded logprobs to a changed prompt.
 
 Custom STOP encoders and terminator decoders must not change already-consumed
 source tokens, logprobs, model or stop evidence. ART checks each source around its
 STOP callback and checks all consumed evidence before returning. Multi-history
 tokenization also checks completed histories after later renderer callbacks.
+Ordered original requests and history context, including roles, tools, render
+settings and protocol selectors, are captured before callbacks and checked
+before reuse. Unexpected callback exceptions keep their original identity.
 These checks refuse stale results; they do not make callbacks or source objects
-immutable. Callback-free native assembly retains its bounded evidence reuse.
+immutable. Context snapshots reuse shared containers only within one observation;
+callback-free native assembly retains its bounded response-evidence reuse.
 
 A response copied into a later, shortened prompt is output provenance, but it is
 not a fresh sample under that new prompt. ART keeps its `OUTPUT`, `ASSISTANT`,
