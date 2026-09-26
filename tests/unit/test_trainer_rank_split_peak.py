@@ -7,10 +7,18 @@ from itertools import permutations
 from typing import Any
 
 import pytest
-from test_trainer_rank_active_memory import _rank
+from test_trainer_rank_active_memory import _rank as _active_rank
 import torch
 
 from art.trainer_rank import _impl as tr
+
+
+def _rank():
+    rank = _active_rank()
+    # Preserve this module's original recompute mode: packed pricing would
+    # overwhelm the synthetic budgets and bypass the split-floor oracles.
+    rank._recompute_method = rank._recompute_num_layers = None
+    return rank
 
 
 def _requests(count=2, length=100):
@@ -130,6 +138,10 @@ def test_profile_order_change_cannot_drop_completed_split_floor(monkeypatch):
     assert rank._plan_cost(b).ephemeral > rank._plan_cost(a).ephemeral
     before = dict(rank._memory_profiles)
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 10_000)
+    assert (
+        rank._split_required_memory([rank._plan_cost(p) for p in plan.subforwards])
+        < 10_000
+    )
     accepted, check = rank._admit_split_rung(
         ((0,), (1,)),
         requests,
@@ -143,9 +155,6 @@ def test_profile_order_change_cannot_drop_completed_split_floor(monkeypatch):
 
 def _counter_split(monkeypatch):
     rank = _rank()
-    # Preserve this fixture's original recompute mode: one-layer packed pricing
-    # adds 6 KiB per token, dwarfing the synthetic 10,000-byte split budget.
-    rank._recompute_method = rank._recompute_num_layers = None
     # This executor injects allocator counters without creating cached graphs.
     monkeypatch.setattr(rank, "_graph_memory_policy_enabled", lambda: False)
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))

@@ -4,15 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import gc
-import sys
-from types import ModuleType, SimpleNamespace
 from typing import Any, Literal, cast
 import weakref
 
 import pytest
 import torch
-import torch.distributed as dist
-from trainer_rank_test_support import gloo_group, spawn_and_join
+from trainer_rank_test_support import gloo_group, megatron_topology, spawn_and_join
 
 from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank
 from art.trainer_rank._commands import _Command, _encode_command, _Executor
@@ -129,16 +126,10 @@ def _transport_worker(physical: int, rendezvous: str, cuda: bool) -> None:
     device = torch.device(f"cuda:{1 - physical}" if cuda else "cpu")
     if cuda:
         torch.cuda.set_device(device)
-    with gloo_group(physical, f"file://{rendezvous}"):
-        ps = SimpleNamespace(
-            get_tensor_model_parallel_rank=lambda: physical,
-            get_context_parallel_rank=lambda: 0,
-            get_tensor_and_context_parallel_group=lambda **kwargs: dist.group.WORLD,
-        )
-        core, megatron = ModuleType("megatron.core"), ModuleType("megatron")
-        setattr(core, "parallel_state", ps)
-        setattr(megatron, "core", core)
-        sys.modules.update({"megatron": megatron, "megatron.core": core})
+    with (
+        gloo_group(physical, f"file://{rendezvous}"),
+        megatron_topology(physical, dp_size=1, tp_size=2),
+    ):
         runtime = _runtime(torch.nn.Linear(1, 1).to(device))
         runtime.rank, runtime.world_size = physical, 2
         rank: Any = TrainerRank(runtime)
