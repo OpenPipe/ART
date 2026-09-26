@@ -2276,6 +2276,12 @@ def _checkpoint_load_failure_worker(
             assert completed.item() == world_size
             return
 
+        parameter = torch.nn.Parameter(torch.tensor([rank + 1.0]))
+        gradient = torch.tensor([rank + 3.0])
+        parameter.grad = gradient
+        retained = _CheckpointSlot((parameter,), revision=3, generation=7)
+        trainer._checkpoint_slots["retained"] = retained
+
         optimizer = (
             OptimizerConfig(
                 learning_rate=1e-3,
@@ -2312,6 +2318,43 @@ def _checkpoint_load_failure_worker(
             manifest,
             "digest",
         )
+        copy_failure = RuntimeError("injected custom payload tensor-copy failure")
+        if phase == "custom-copy":
+            tensor = torch.ones(1)
+            custom = checkpoint_module.PreparedCustomPayload(
+                {
+                    "p": {
+                        "kind": "parameter",
+                        "tensor_keys": ["p"],
+                        "trainable_keys": ["p"],
+                        "parameter_aliases": [["p"]],
+                        "buffer_aliases": [],
+                        "persistent_buffer_keys": [],
+                    }
+                },
+                {"p": tensor},
+                {},
+            )
+            assert source.manifest is not None
+            source = replace(
+                source,
+                custom=custom,
+                manifest={
+                    **source.manifest,
+                    "format_version": 3,
+                    "custom_tensors": custom.records,
+                },
+            )
+            original_copy = torch.Tensor.__deepcopy__
+
+            def copy_tensor(
+                value: torch.Tensor, memo: dict[int, object]
+            ) -> torch.Tensor:
+                if rank == 0 and value is tensor:
+                    raise copy_failure
+                return original_copy(value, memo)
+
+            monkeypatch.setattr(torch.Tensor, "__deepcopy__", copy_tensor)
 
         monkeypatch.setattr(
             checkpoint_module,
@@ -2349,18 +2392,39 @@ def _checkpoint_load_failure_worker(
             ),
         )
 
-        with pytest.raises(RuntimeError, match="injected|Another rank failed"):
-            checkpoint_module.load_checkpoint(trainer, source, "student")
+        with pytest.raises(
+            RuntimeError, match="injected|Another rank failed"
+        ) as caught:
+            checkpoint_module.load_checkpoint(
+                trainer, source, "student", forward_only=phase == "custom-copy"
+            )
+        if phase == "custom-copy":
+            if rank == 0:
+                assert caught.value is copy_failure
+            else:
+                assert "validate loaded checkpoint config" in str(caught.value)
         assert "student" not in trainer._checkpoint_slots
         assert not any(
             name.startswith("__art_loading_") for name in trainer._checkpoint_slots
         )
+        assert set(trainer._checkpoint_slots) == {"retained"}
+        assert trainer._checkpoint_slots["retained"] is retained
+        assert (retained.generation, retained.revision) == (7, 3)
+        assert retained.params[0] is parameter
+        assert parameter.requires_grad
+        assert parameter.grad is gradient
+        torch.testing.assert_close(
+            parameter, torch.tensor([rank + 1.0]), atol=0, rtol=0
+        )
+        torch.testing.assert_close(gradient, torch.tensor([rank + 3.0]), atol=0, rtol=0)
         completed = torch.tensor(1)
         dist.all_reduce(completed)
         assert completed.item() == world_size
 
 
-@pytest.mark.parametrize("phase", ("read", "optimizer", "commit", "export"))
+@pytest.mark.parametrize(
+    "phase", ("read", "optimizer", "commit", "export", "custom-copy")
+)
 def test_checkpoint_load_failure_is_collective_and_transactional(
     tmp_path: Path, phase: str
 ) -> None:

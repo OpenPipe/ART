@@ -1912,26 +1912,26 @@ def load_checkpoint(
             "validate staged checkpoint",
             group,
         )
-        if forward_only:
-            for param in params:
-                param.requires_grad_(False)
-        from art.trainer_rank._impl import _CheckpointSlot
 
-        trainer._checkpoint_slots[temporary] = _CheckpointSlot(
-            params,
-            config,
-            custom_payload=(
-                _forward_custom_payload(source.custom)
-                if forward_only
-                else source.custom
-            ),
-            snapshot=forward_only,
-        )
-        _phase(
-            lambda: trainer._validate_loaded_checkpoint_config(temporary, config),
-            "validate loaded checkpoint config",
-            group,
-        )
+        def validate_loaded() -> None:
+            if forward_only:
+                for param in params:
+                    param.requires_grad_(False)
+            from art.trainer_rank._impl import _CheckpointSlot
+
+            trainer._checkpoint_slots[temporary] = _CheckpointSlot(
+                params,
+                config,
+                custom_payload=(
+                    _forward_custom_payload(source.custom)
+                    if forward_only
+                    else source.custom
+                ),
+                snapshot=forward_only,
+            )
+            trainer._validate_loaded_checkpoint_config(temporary, config)
+
+        _phase(validate_loaded, "validate loaded checkpoint config", group)
         if (
             not forward_only
             and source.manifest is not None
