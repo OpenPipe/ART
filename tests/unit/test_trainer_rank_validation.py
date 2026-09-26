@@ -1712,6 +1712,38 @@ def test_checkpoint_manifest_semantics_are_authenticated(
         prepare_checkpoint(str(root))
 
 
+@pytest.mark.parametrize("artifact_entries", (False, True))
+@pytest.mark.parametrize(
+    "step", (-1, -1.0, -0.5, 0.5, float("nan"), float("inf"), -float("inf"), True)
+)
+def test_checkpoint_rejects_invalid_optimizer_counter(
+    tmp_path: Path, step: float, artifact_entries: bool
+) -> None:
+    root = tmp_path / "checkpoint"
+    manifest = _canonical_checkpoint(root)
+    manifest["steps"][next(iter(manifest["steps"]))] = step
+    # A valid digest authenticates the bytes, not the counter's semantics.
+    manifest["digest"] = _manifest_digest(manifest)
+    (root / "checkpoint.json").write_text(json.dumps(manifest))
+    entries = [*manifest["files"], "checkpoint.json"] if artifact_entries else None
+
+    with pytest.raises(RuntimeError, match="optimizer steps are invalid"):
+        prepare_checkpoint(str(root), artifact_entries=entries)
+
+
+@pytest.mark.parametrize("step", (0, 0.0, -0.0, 50, 50.0, 2**53 + 1))
+def test_checkpoint_preserves_valid_optimizer_counter(
+    tmp_path: Path, step: float
+) -> None:
+    root = tmp_path / "checkpoint"
+    manifest = _canonical_checkpoint(root)
+    manifest["steps"][next(iter(manifest["steps"]))] = step
+    manifest["digest"] = _manifest_digest(manifest)
+    (root / "checkpoint.json").write_text(json.dumps(manifest))
+
+    assert prepare_checkpoint(str(root)).manifest == manifest
+
+
 @pytest.mark.parametrize("extra", (True, False))
 def test_checkpoint_optimizer_mapping_must_match_adapter(
     tmp_path: Path, extra: bool
@@ -3602,17 +3634,19 @@ def test_forward_micro_batches_profiles_caller_peak_after_yield(
     trainer = TrainerRank(_runtime())
     _stub_forward(monkeypatch, trainer, profiled=True)
     plan = trainer._plan_flat_forward([_target_request(1)])
-    monkeypatch.setattr(
-        trainer,
-        "_run_flat_plan_with_memory_tracking",
-        lambda *_args, **_kwargs: (_empty_outputs(plan), 123),
-    )
-    profiles: list[tuple[int, int | None]] = []
+
+    def run(*_args, **_kwargs):
+        # The forward's peak interval, which the caller phase continues.
+        trainer._peak_reading = (7, 99)
+        return _empty_outputs(plan), 123
+
+    monkeypatch.setattr(trainer, "_run_flat_plan_with_memory_tracking", run)
+    profiles: list[tuple[int, int | None, bool, object]] = []
     monkeypatch.setattr(
         trainer,
         "_update_peak_memory_profile",
-        lambda candidate, baseline: profiles.append(
-            (candidate.packed_tokens, baseline)
+        lambda candidate, baseline, caller_phase=False, interval=None: profiles.append(
+            (candidate.packed_tokens, baseline, caller_phase, interval)
         ),
     )
 
@@ -3622,7 +3656,9 @@ def test_forward_micro_batches_profiles_caller_peak_after_yield(
     assert profiles == []
     with pytest.raises(StopIteration):
         next(batches)
-    assert profiles == [(plan.packed_tokens, 123)]
+    # The caller phase continues the wave's own interval: it may feed the
+    # warm fit if no other reset interrupted it.
+    assert profiles == [(plan.packed_tokens, 123, True, (7, 99))]
 
 
 @pytest.mark.parametrize("no_grad", [False, True])
@@ -3652,7 +3688,7 @@ def test_forward_micro_batches_releases_completed_wave_before_planning(
     monkeypatch.setattr(trainer, "_select_next_micro_batch", select_after_release)
     profiled: list[bool] = []
 
-    def profile(*_args):
+    def profile(*_args, **_kwargs):
         # Keep the completed wave through its caller peak observation.
         profiled.append(tensors[-1]() is not None)
 
