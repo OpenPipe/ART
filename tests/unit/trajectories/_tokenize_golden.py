@@ -21,14 +21,18 @@ FIELDS = ("model", "tokens", "logprobs", "flags")
 
 
 def mode() -> str:
-    """``""`` (inactive), ``"check"`` or ``"update"``."""
+    """``""`` (inactive), ``"check"`` or ``"update"``.
+
+    Any other non-empty value (``1``, ``true``, ...) means ``check`` so a loose
+    shell export never aborts collection.
+    """
 
     value = os.environ.get(MODE_ENV, "").strip().lower()
-    if value in ("", "0", "off", "false"):
+    if value in ("", "0", "off", "false", "no"):
         return ""
-    if value in ("check", "update"):
+    if value == "update":
         return value
-    raise ValueError(f"{MODE_ENV} must be 'check' or 'update', not {value!r}")
+    return "check"
 
 
 def _hex_float(value: float) -> str:
