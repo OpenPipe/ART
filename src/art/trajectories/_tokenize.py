@@ -1155,6 +1155,7 @@ class _TraceBuilder:
     validate_context: Callable[[bool], None] | None = None
     track_sources: bool = True
     rendered_evidence: bool = False
+    callback_authority: bool = False
     auxiliary_evidence: dict[object, tuple[Callable[[], object], object]] = field(
         default_factory=dict
     )
@@ -1217,6 +1218,7 @@ class _TraceBuilder:
                 )
 
     def checked(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        self.callback_authority = True
         if self.validate_context is not None:
             self.validate_context(True)
         if self.validate_sources is not None:
@@ -1239,6 +1241,7 @@ class _TraceBuilder:
         *,
         tokenizer: Tokenizer | None = None,
     ) -> None:
+        self.callback_authority |= _tokenizer_requires_context(tokenizer)
         if type(tokenizer) is _RenderingTokenizer:
             tokenizer.guard.check()
         if self.track_sources:
@@ -8517,6 +8520,9 @@ def _tokenize_history(
         return _legacy_tokenize(history, model=model)
     if model is None:
         raise ValueError("History tokenization requires a model")
+    if _trace is not None:
+        # Remember authority before a callback can change its own capabilities.
+        _trace.callback_authority |= _tokenizer_requires_context(tokenizer)
     if isinstance(history, CompletionsTokenHistory):
         return _tokenize_completions_token_history(
             history,
@@ -9097,10 +9103,7 @@ def _materialize_trajectory(
 
 
 def _validate_completed_sources(builders: Sequence[_TraceBuilder | None]) -> None:
-    if any(
-        builder is not None and _tokenizer_requires_context(builder.tokenizer)
-        for builder in builders
-    ):
+    if any(builder is not None and builder.callback_authority for builder in builders):
         # Later callbacks may edit an earlier completed history. Check its
         # original source keys and stop evidence without calling a tokenizer.
         for builder in builders:

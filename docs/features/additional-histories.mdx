@@ -226,6 +226,8 @@ already-consumed source tokens, logprobs, model or stop evidence. ART checks eac
 STOP callback and checks all consumed evidence before returning, including
 logprobs used only by the rendered fallback. Multi-history
 tokenization also checks completed histories after later renderer callbacks.
+That callback authority is retained even if a callback later removes the
+tokenizer methods that made it callback-capable.
 Evidence is bound when first read, including a later Responses generation read
 to prove a copied suffix, rendered item IDs and logprobs, and text used for prefix
 repair. STOP admission also retains the source keys read before its encoder.
