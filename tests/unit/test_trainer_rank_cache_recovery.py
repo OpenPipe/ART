@@ -174,7 +174,7 @@ class TestRecovery(unittest.TestCase):
         q = object.__new__(_impl.TrainerRank)
         q.device = types.SimpleNamespace(type="cuda")
         q._graph_memory_policy_enabled = lambda: False
-        q._update_peak_memory_profile = lambda *a: None
+        q._update_peak_memory_profile = lambda *a, **k: None
         q._record_graph_forward_time = lambda *a: None
         q._execute_flat_plan = lambda p: [object() for _ in range(p.request_count)]
         q._telemetry_signature = lambda p: {}
