@@ -824,26 +824,63 @@ def _local_state(
             for module in chunk.modules():
                 if not isinstance(module, LoRA):
                     continue
-                for key, param, expert in module._export_items(ref):
+                exports = module._export_items(ref)
+                copied_param = None
+                packed = False
+                values: tuple[torch.Tensor | None, ...] = ()
+                for position, (key, param, expert) in enumerate(exports):
                     item = by_key.get(key)
                     if item is None:
                         continue
-                    master = masters[id(param)]
-                    state = dynamic.optimizer.state.get(master, {})
-                    values = (
-                        master,
-                        cast(torch.Tensor | None, state.get("exp_avg")),
-                        cast(torch.Tensor | None, state.get("exp_avg_sq")),
-                    )
+                    if param is not copied_param:
+                        master = masters[id(param)]
+                        state = dynamic.optimizer.state.get(master, {})
+                        values = (
+                            master,
+                            cast(torch.Tensor | None, state.get("exp_avg")),
+                            cast(torch.Tensor | None, state.get("exp_avg_sq")),
+                        )
+                        packed = (
+                            master.ndim == 3
+                            and all(
+                                value is None or value.shape == master.shape
+                                for value in values
+                            )
+                            and all(
+                                exported is param
+                                and index == offset
+                                and export_key in by_key
+                                for offset, (export_key, exported, index) in enumerate(
+                                    exports[position : position + master.shape[0]]
+                                )
+                            )
+                            and len(exports) - position >= master.shape[0]
+                        )
+                        # Coalesce only complete packed exports, without copying
+                        # unselected rows. Own CPU storage inside the same fence;
+                        # cache only the current parameter's three buffers.
+                        if packed:
+                            values = tuple(
+                                (torch.zeros_like(master) if value is None else value)
+                                .detach()
+                                .float()
+                                .to(device="cpu", copy=True)
+                                for value in values
+                            )
+                        step = state.get("step", 0.0)
+                        if packed:
+                            step = float(step)
+                        copied_param = param
                     for component, value in zip(
                         ("master", "exp_avg", "exp_avg_sq"), values, strict=True
                     ):
                         value = torch.zeros_like(master) if value is None else value
                         local = value if expert is None else value[expert]
                         payloads[item.block][f"{component}/{key}"] = (
-                            local.T.float().cpu().contiguous()
+                            local.T.contiguous()
+                            if packed
+                            else local.T.float().cpu().contiguous()
                         )
-                    step = state.get("step", 0.0)
                     payloads[item.block][f"step/{key}"] = torch.tensor(float(step))
     records: list[_LocalShard] = []
     for index, block in enumerate(sorted(payloads)):
