@@ -599,3 +599,33 @@ def test_named_selection_preserves_implicit_generation_mode(selection):
     assert actual == expected
     assert "enable_thinking" not in tokenizer.settings[-1]
     assert "preserve_thinking" not in tokenizer.settings[-1]
+
+
+def test_unchanged_selected_body_is_not_selected_again_as_a_name():
+    tokenizer = _NamedTemplateTokenizer()
+    tokenizer.chat_template = {"default": "named", "named": "DIFFERENT"}
+    history = tr.ChatCompletionsHistory(
+        model="public/qwen35",
+        messages=[{"role": "user", "content": "question"}],
+        message_sources=[None],
+    )
+    before = deepcopy(tokenizer.chat_template)
+    assert tokenizer.decode(history.tokenize(tokenizer=tokenizer).tokens) == "named"
+    assert tokenizer.chat_template == before
+
+
+def test_changed_body_colliding_with_a_name_refuses_before_wrong_renderer():
+    tokenizer = _NamedTemplateTokenizer()
+    normalized = chat_template_with_preserved_thinking(_TEMPLATE)
+    assert isinstance(normalized, str) and normalized != _TEMPLATE
+    tokenizer.chat_template = {"default": _TEMPLATE, normalized: "DIFFERENT"}
+    before = deepcopy(tokenizer.chat_template)
+    history = tr.ChatCompletionsHistory(
+        model="public/qwen35",
+        messages=[{"role": "assistant", "content": _LITERAL}],
+        message_sources=[None],
+    )
+    with pytest.raises(ValueError, match="also a template name"):
+        history.tokenize(tokenizer=tokenizer)
+    assert not tokenizer.calls
+    assert tokenizer.chat_template == before

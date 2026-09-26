@@ -45,14 +45,28 @@ _QWEN_INLINE_REASONING = re.compile(
 def _without_inline_reasoning_parser(template: str) -> str:
     if "reasoning_content" not in template or "split" not in template:
         return template
-    from jinja2 import Environment, TemplateSyntaxError
+    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from jinja2.visitor import NodeTransformer
 
     # Compare parsed operations, not quote/spacing choices or a template hash.
     # Only executable block tokens may be edited; quoted/raw/comment data stays.
+    class WithoutWhitespace(NodeTransformer):
+        def visit_Output(self, node: nodes.Output, *args: Any, **kwargs: Any):
+            if all(
+                isinstance(child, nodes.TemplateData) and not child.data.strip()
+                for child in node.nodes
+            ):
+                return None
+            return node
+
     env = Environment()
-    operation = env.parse(
+
+    def operations(text: str):
+        return WithoutWhitespace().visit(env.parse(text)).body
+
+    operation = operations(
         "".join("{% " + statement + " %}" for statement in _QWEN_INLINE_STATEMENTS)
-    ).body
+    )
     normalized = re.sub(r"\r\n?", "\n", template)
     offsets = [
         i
@@ -89,7 +103,7 @@ def _without_inline_reasoning_parser(template: str) -> str:
             continue
         end = selected[-1][3]
         try:
-            if env.parse(template[start:end]).body == operation:
+            if operations(template[start:end]) == operation:
                 edits[start, end] = ""
         except TemplateSyntaxError:
             continue

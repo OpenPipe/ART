@@ -48,6 +48,8 @@ explicitly selected template before applying the same correction. The correction
 recognizes the known inline-content parsing operations, including equivalent
 quoting and spacing; it does not reinterpret arbitrary custom template logic.
 This also preserves literal content when no recorded token IDs are available.
+If a corrected template body is itself another dictionary entry’s name, ART
+refuses that ambiguous selection rather than rendering a different template.
 
 By splitting each turn into a separate history, you can preserve these tokens for training:
 

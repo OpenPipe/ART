@@ -2080,12 +2080,25 @@ def _resolved_chat_template(
     if isinstance(getattr(tokenizer, "chat_template", None), dict):
         select = getattr(tokenizer, "get_chat_template", None)
         if callable(select):
-            configured = chat_template_with_preserved_thinking(
-                select(
-                    chat_template=template if isinstance(template, str) else None,
-                    tools=tools,
-                )
+            selected = select(
+                chat_template=template if isinstance(template, str) else None,
+                tools=tools,
             )
+            configured = chat_template_with_preserved_thinking(selected)
+            if configured == selected:
+                # apply_chat_template resolves names itself. Forwarding an
+                # unchanged body could accidentally select a second named entry.
+                return template, defaults
+            templates = getattr(tokenizer, "chat_template", None)
+            if (
+                isinstance(configured, str)
+                and isinstance(templates, dict)
+                and configured in templates
+            ):
+                raise ValueError(
+                    "The normalized chat template is also a template name; "
+                    "cannot preserve the selected renderer without ambiguity"
+                )
     return configured, defaults
 
 

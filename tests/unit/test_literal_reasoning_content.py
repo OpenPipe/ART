@@ -373,3 +373,20 @@ def test_distinct_custom_content_operations_are_not_inferred(change):
         )
     assert operation != match.group()
     assert _without_inline_reasoning_parser(operation) == operation
+
+
+@pytest.mark.parametrize("separator", ["\n", " ", "\r\n"])
+@pytest.mark.parametrize("quoted", [False, True])
+def test_plain_block_whitespace_keeps_prior_inline_parser_coverage(separator, quoted):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    # The prior regex admitted whitespace-only separators without trim dashes.
+    operation = match.group().replace("{%-", "{%").replace("-%}", "%}")
+    operation = operation.replace("\n", separator)
+    if quoted:
+        operation = operation.replace("'", '"')
+    template = _TEMPLATE[: match.start()] + operation + _TEMPLATE[match.end() :]
+    fixed = chat_template_with_preserved_thinking(template)
+    content = "HEAD<think>literal</think>TAIL"
+    assert content in _render(fixed, [_USER, {"role": "assistant", "content": content}])
+    assert chat_template_with_preserved_thinking(fixed) == fixed
