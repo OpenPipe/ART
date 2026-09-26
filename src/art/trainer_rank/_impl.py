@@ -1630,6 +1630,92 @@ def _hybridep_buffer_bytes(capacity: int, ranks: int, hidden: int, experts: int)
     return tokens * (2 * hidden + 5 * experts + 4 * (hidden // 128))
 
 
+def _dense_mlp_recompute_bytes_per_token(model: Sequence[torch.nn.Module]) -> int:
+    """The dense MLP stage live at a recomputed layer's backward peak, per row.
+
+    Qwen3.8-27B allocator traces at CP2 (dense, gated SwiGLU, LoRA on FC1 and
+    FC2): the peak sits in the recomputed layer's FC1 stage, holding the FC1
+    base output, the LoRA gate/up output and their sum (2F each) plus one
+    F-wide tensor: 7F elements per row (238 KB measured, 244 KB priced at
+    F = 17,408). Every decoder layer must be this exact supported MLP;
+    otherwise 0 keeps the per-boundary gradient allowance.
+    """
+    if len(model) != 1:
+        return 0
+    try:
+        decoder = _language_model(model[0]).decoder
+    except (AttributeError, RuntimeError):
+        return 0
+    layers = getattr(decoder, "layers", None)
+    if not layers or not all(hasattr(layer, "mlp") for layer in layers):
+        return 0
+    try:
+        from megatron.core.extensions.transformer_engine import (
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
+            TERowParallelLinear,
+        )
+        from megatron.core.transformer.mlp import MLP
+        from megatron.core.transformer.transformer_block import TransformerBlock
+
+        from art.megatron.lora import (
+            LoRA,
+            SelfAttentionLinearProjLoRA,
+            SharedExpertsLinearFC1LoRA,
+            SharedExpertsLinearFC2LoRA,
+        )
+    except ImportError:
+        # Without the traced owner types nothing can match; keep the allowance.
+        return 0
+    if type(decoder) is not TransformerBlock:
+        return 0
+    stage = 0
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        config = getattr(mlp, "config", None)
+        fc1, fc2 = getattr(mlp, "linear_fc1", None), getattr(mlp, "linear_fc2", None)
+        row = getattr(fc2, "row_parallel_lora", None)
+        base1 = getattr(fc1, "linear_fc1", None)
+        sites = (
+            (mlp, MLP),
+            (fc1, SharedExpertsLinearFC1LoRA),
+            (fc2, SharedExpertsLinearFC2LoRA),
+            (row, SelfAttentionLinearProjLoRA),
+            (getattr(row, "lora", None), LoRA),
+            (getattr(row, "linear_proj", None), TERowParallelLinear),
+            (getattr(fc1, "gate_lora", None), LoRA),
+            (getattr(fc1, "up_lora", None), LoRA),
+        )
+        ffn = getattr(config, "ffn_hidden_size", None)
+        if (
+            type(base1) not in (TEColumnParallelLinear, TELayerNormColumnParallelLinear)
+            or any(type(site) is not cls for site, cls in sites)
+            or any(
+                "forward" in vars(site)
+                or cast(Any, site)._forward_hooks
+                or cast(Any, site)._forward_pre_hooks
+                for site in (base1, *(site for site, _ in sites))
+            )
+            or type(ffn) is not int
+            or ffn <= 0
+            or getattr(fc1, "non_gated", None) is not False
+            or getattr(fc1, "out_features", None) != 2 * ffn
+            or getattr(config, "gated_linear_unit", None) is not True
+            or getattr(config, "params_dtype", None) is not torch.bfloat16
+            or getattr(config, "add_bias_linear", None) is not False
+            or getattr(config, "sequence_parallel", None) is not False
+            or getattr(config, "fp8", None)
+            or getattr(config, "fp4", None)
+            or getattr(config, "cuda_graph_impl", "none") != "none"
+            or getattr(config, "tensor_model_parallel_size", None) != 1
+            or getattr(config, "pipeline_model_parallel_size", None) != 1
+            or getattr(mlp, "activation_func", None) is not torch.nn.functional.silu
+        ):
+            return 0
+        stage = max(stage, 7 * ffn * 2)
+    return stage
+
+
 def _moe_output_bytes_per_token(
     model: Sequence[torch.nn.Module],
     shape: ParallelShape,
@@ -2089,6 +2175,13 @@ class TrainerRank:
         self._moe_recompute_covered = len(
             self._moe_gradient_enclosed
         ) == self._num_layers and all(self._moe_gradient_enclosed)
+        # Dense models whose every layer is the traced gated MLP price that
+        # stage instead, and with it one input gradient.
+        self._dense_recompute_bytes_per_token = (
+            0
+            if self._moe_layers
+            else _dense_mlp_recompute_bytes_per_token(runtime.model)
+        )
         self._ep_group_is_cp_group = _ep_group_is_cp_group(self._parallel_shape)
         selection = select_scoring(
             device_capability=capability,
@@ -4276,13 +4369,17 @@ class TrainerRank:
             return self._layout_checkpoint_floor(decoder.layers, refs, routed, layouts)
         retained = gradient_rows * layers * self._hidden_size * 2
         moe = self._checkpoint_moe_bytes_per_token() if gradient_rows else 0
+        dense = self._dense_recompute_stage_bytes() if gradient_rows else 0
         # Beside the mixer, the recomputed layer keeps its post-mixer residual
-        # and pre-MLP norm output, and its MoE stage its routing state.
+        # and pre-MLP norm output, and its MoE stage its routing state; a
+        # covered dense layer keeps its MLP stage.
         mixer = (
             self._recomputed_mixer_bytes_per_token()
             + (
                 2 * self._hidden_size * 2 + self._moe_checkpoint_state_bytes_per_token()
                 if moe
+                else 2 * self._hidden_size * 2 + dense
+                if dense
                 else 0
             )
             if gradient_rows
@@ -4331,7 +4428,14 @@ class TrainerRank:
         attention_inputs = len(layers) - gdn_inputs
         widths = self._recomputed_mixer_widths(stage_buffers=False)
         moe = self._checkpoint_moe_bytes_per_token()
-        beside = 2 * hidden + self._moe_checkpoint_state_bytes_per_token() if moe else 0
+        dense = self._dense_recompute_stage_bytes()
+        beside = (
+            2 * hidden + self._moe_checkpoint_state_bytes_per_token()
+            if moe
+            else 2 * hidden + dense
+            if dense
+            else 0
+        )
         retained_by_rank: list[int] = []
         totals: list[int] = []
         for rank in range(len(layouts[0].attention_rows)):
@@ -4583,20 +4687,37 @@ class TrainerRank:
         every layer's recompute, FC1 included (Qwen3.6-35B-A3B traces at CP1,
         CP2/EP1 and EP2/CP2), charge that gradient. Elsewhere keep one gradient
         per boundary: that allowance also covers dense MLP and other recompute
-        work the floor does not price.
+        work the floor does not price. A covered dense model (every layer the
+        traced gated MLP, ``_dense_recompute_stage_bytes``) also holds one:
+        Qwen3.8-27B CP2 traces show one H-wide input gradient at the peak.
         """
         retained, _ = self._checkpoint_memory_floor(group_rows)
         if not retained:
             return 0
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
-        if self._checkpoint_moe_bytes_per_token() and all(
-            self._moe_recompute_covered_for(ref)
-            for (_, grad), ref in zip(group_rows, refs, strict=True)
-            if grad
+        if self._dense_recompute_stage_bytes() or (
+            self._checkpoint_moe_bytes_per_token()
+            and all(
+                self._moe_recompute_covered_for(ref)
+                for (_, grad), ref in zip(group_rows, refs, strict=True)
+                if grad
+            )
         ):
             return gradient_rows * self._hidden_size * 2
         return retained
+
+    def _dense_recompute_stage_bytes(self) -> int:
+        """The covered dense MLP stage per recomputed row, where it was traced.
+
+        Only up to CP2: at higher CP a rank's remote attention stages may keep
+        more than the CP2 allowance, which the per-boundary gradient allowance
+        still covers there.
+        """
+        stage = getattr(self, "_dense_recompute_bytes_per_token", 0)
+        if type(stage) is not int or stage <= 0 or self._topology_key()[2] > 2:
+            return 0
+        return stage
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
@@ -6787,6 +6908,7 @@ class TrainerRank:
                     "gdn_layers",
                     "checkpointed_moe_layers",
                     "moe_output_bytes_per_token",
+                    "dense_recompute_bytes_per_token",
                 )
             }
             rank_fields["recompute_modules"] = sorted(self._recompute_modules)
@@ -8334,8 +8456,21 @@ class TrainerRank:
             return output_bytes
         profiled = self._memory_profiles.get(signature)
         activation_factor = max(4, min(16, self._num_layers // 4 + 4))
+        floor_tokens = packed_tokens
+        if (
+            not signature.grad_enabled
+            and signature.topology[2] == 2
+            and len(group_rows) > 1
+            and self._dense_recompute_stage_bytes()
+        ):
+            # No-grad groups run one after another and keep nothing but their
+            # outputs (charged below), so only the largest group's transient
+            # is live. Qwen3.8-27B CP2 traces: 263 KB per busiest-rank row of
+            # one group, which this floor matches for a single group.
+            rows = [rows for rows, _ in group_rows]
+            floor_tokens = -(-packed_tokens * max(rows) // max(1, sum(rows)))
         static_compute = (
-            packed_tokens
+            floor_tokens
             * self._hidden_size
             * self._param_dtype_size
             * activation_factor

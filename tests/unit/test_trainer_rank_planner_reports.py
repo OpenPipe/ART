@@ -235,7 +235,8 @@ def test_spool_symlink_refuses(tmp_path):
     assert not list(target.iterdir())
 
 
-def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
+@pytest.mark.parametrize("dense_field", [False, True])
+def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path, dense_field):
     from art.trainer_rank._prefix_tree_planner import (
         build_canonical_prefix_tree,
         plan_prefix_tree_layout,
@@ -259,6 +260,8 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
             "recompute_modules": [],
             "moe_output_bytes_per_token": 0,
             "moe_forward_stages": [],
+            # Reports from before the dense stage field replay without it.
+            **({"dense_recompute_bytes_per_token": 0} if dense_field else {}),
             "geometry": {
                 "hidden_size": 8,
                 "ffn_hidden_size": 32,

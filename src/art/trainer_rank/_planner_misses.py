@@ -526,6 +526,8 @@ _RANK_FIELDS = frozenset(
     "checkpointed_moe_layers recompute_modules moe_output_bytes_per_token "
     "moe_forward_stages".split()
 )
+# Recorded by newer ranks; reports from before it replay with 0 (no dense stage).
+_OPTIONAL_RANK_FIELDS = frozenset({"dense_recompute_bytes_per_token"})
 
 
 def _signature_values(values: dict[str, Any]) -> dict[str, Any]:
@@ -587,13 +589,15 @@ def replay(
     if not state["estimates"]:
         raise ValueError("memory replay has no candidate estimates")
     values = state["rank"]
-    if set(values) != _RANK_FIELDS | {"geometry", "topology"}:
+    if set(values) - _OPTIONAL_RANK_FIELDS != _RANK_FIELDS | {"geometry", "topology"}:
         raise ValueError(
             "incomplete replay: immutable rank fields differ (including MoE stages)"
         )
     rank = _impl.TrainerRank.__new__(_impl.TrainerRank)
     for name in _RANK_FIELDS - {"one_layer_recompute"}:
         setattr(rank, "_" + name, values[name])
+    for name in _OPTIONAL_RANK_FIELDS:
+        setattr(rank, "_" + name, values.get(name, 0))
     if type(values["one_layer_recompute"]) is not bool:
         raise ValueError("incomplete replay: recompute mode is not recorded")
     rank._recorded_one_layer_recompute = values["one_layer_recompute"]
