@@ -1699,6 +1699,10 @@ def _dense_mlp_recompute_bytes_per_token(
         if forward is None:
             return True
         inner = vars(module).get(delegate)
+        # Training compile replaces the delegate with Dynamo's wrapper (the
+        # traced run was compiled); judge the callable it wraps.
+        while hasattr(inner, "_torchdynamo_orig_callable"):
+            inner = inner._torchdynamo_orig_callable
         return (
             wrapper is not None
             and type(forward) is MethodType

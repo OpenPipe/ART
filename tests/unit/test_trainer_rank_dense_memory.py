@@ -104,7 +104,8 @@ def _wrap_like_art(layer: Any) -> None:
         _prefix_tree_forward,
     )
 
-    layer._art_gdn_island_physical_forward = layer.forward
+    # Training compile then wraps the delegate (training/compile.py).
+    layer._art_gdn_island_physical_forward = torch.compile(layer.forward)
     layer.forward = MethodType(_gdn_island_layer_forward, layer)
     mixer = layer.self_attention
     if type(mixer).__name__ == "GatedDeltaNet":
@@ -163,6 +164,7 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "layer_hook",
         "layer_forward",
         "layer_delegate",
+        "compiled_custom_delegate",
         "layer_type",
         "mixer_delegate",
         "mixer_class_forward",
@@ -237,6 +239,9 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         ),
         "layer_delegate": lambda: setattr(
             layer, "_art_gdn_island_physical_forward", custom
+        ),
+        "compiled_custom_delegate": lambda: setattr(
+            layer, "_art_gdn_island_physical_forward", torch.compile(custom)
         ),
         "layer_type": lambda: setattr(layer, "__class__", Layer),
         "mixer_delegate": lambda: setattr(
