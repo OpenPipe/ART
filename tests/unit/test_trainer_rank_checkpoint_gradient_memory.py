@@ -94,6 +94,17 @@ def test_a_slot_that_loses_moe_coverage_keeps_boundary_gradients(
     assert r._checkpoint_input_gradient_bytes(groups, (ref,)) == 100 * 2048 * 2
 
 
+@pytest.mark.parametrize("cp", [1, 2, 4])
+def test_one_moe_gradient_only_up_to_the_traced_cp2(pending_rank, monkeypatch, cp):
+    """Above CP2 a rank runs more remote attention stages than the mixer's CP2
+    allowance prices; the per-boundary gradient allowance must cover them."""
+    r = pending_rank
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, cp, 1))
+    groups = ((100, True),)
+    one, every = 100 * 2048 * 2, 100 * 40 * 4096
+    assert r._checkpoint_input_gradient_bytes(groups) == (one if cp <= 2 else every)
+
+
 @pytest.mark.parametrize("moe", [True, False])
 @pytest.mark.parametrize("rows", [1, 67, 1024])
 def test_attention_only_extent_scales_with_gradient_rows(rows, moe):
