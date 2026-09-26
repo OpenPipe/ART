@@ -4,24 +4,19 @@ import gc
 import json
 
 import pytest
-from test_trainer_rank_custom_tensors import _trainer
+from test_trainer_rank_live_heads import TiedHead, _live_head, _native_head
 import torch
 
 from art.trainer_rank import ModuleHandle
-from art.trainer_rank._heads import LiveHead, export_head, head_gradient_targets
+from art.trainer_rank._heads import export_head, head_gradient_targets
 from art.trainer_rank._tensors import CotangentCollector
 
 
 def setup(client, values=None):
-    trainer, rank = _trainer("student")
     factory = lambda: torch.tensor(2.0) if values is None else values.clone()
-    native = rank.parameter("p", factory, checkpoint="student")
+    trainer, native = _native_head("parameter", "p", factory)
     collector = CotangentCollector()
-    live = LiveHead(
-        export_head(trainer, "student", "p"),
-        factory() if values is None else values,
-        collector,
-    )
+    live = _live_head(trainer, "p", factory() if values is None else values, collector)
     parameter = live.value if client else native
     assert isinstance(parameter, torch.Tensor)
 
@@ -110,7 +105,7 @@ def test_hook_failure_leaves_all_authoritative_gradients_unchanged(client, bad_r
     trainer, native, parameter, _, collector, backward = setup(client)
     rank = trainer
     other = rank.parameter("q", lambda: torch.tensor(3.0), checkpoint="student")
-    qlive = LiveHead(export_head(trainer, "student", "q"), torch.tensor(3.0), collector)
+    qlive = _live_head(trainer, "q", torch.tensor(3.0), collector)
     q = qlive.value if client else other
     native.grad, other.grad = torch.tensor(5.0), torch.tensor(6.0)
     parameter.register_hook(lambda gradient: gradient * 0)
@@ -180,12 +175,9 @@ def test_sparse_hook_gradients_preserve_layout_and_mix_with_dense(
 
 @pytest.mark.parametrize("client", (False, True))
 def test_tied_module_parameter_hook_sums_all_calls(client):
-    from test_trainer_rank_live_heads import TiedHead
-
-    trainer, rank = _trainer("student")
-    native = rank.module("head", TiedHead, checkpoint="student")
+    trainer, native = _native_head(factory=TiedHead)
     collector = CotangentCollector()
-    live = LiveHead(export_head(trainer, "student", "head"), TiedHead(), collector)
+    live = _live_head(trainer, "head", TiedHead(), collector)
     head = live.value if client else native
     assert isinstance(head, ModuleHandle)
     seen = []

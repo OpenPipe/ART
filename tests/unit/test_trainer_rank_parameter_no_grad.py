@@ -4,11 +4,11 @@ import asyncio
 
 import pytest
 from test_trainer_rank_custom_tensors import _trainer
-from test_trainer_rank_live_heads import _step
+from test_trainer_rank_live_heads import _live_head, _native_head, _step
 import torch
 
 from art.trainer_rank._commands import run_rank_callback
-from art.trainer_rank._heads import LiveHead, export_head
+from art.trainer_rank._heads import export_head
 from art.trainer_rank._tensors import CotangentCollector
 
 
@@ -29,11 +29,10 @@ def _read(parameter, operation):
 def test_no_grad_parameter_reads_preserve_saved_loss_after_optimizer_step(
     monkeypatch, surface, operation
 ):
-    trainer, rank = _trainer("student")
     initial = torch.tensor([[2.0, 3.0], [4.0, 5.0]])
-    native = rank.parameter("p", lambda: initial.clone(), checkpoint="student")
+    trainer, native = _native_head("parameter", "p", lambda: initial.clone())
     collector = CotangentCollector()
-    live = LiveHead(export_head(trainer, "student", "p"), initial, collector)
+    live = _live_head(trainer, "p", initial, collector)
 
     def capture(parameter):
         with torch.no_grad():

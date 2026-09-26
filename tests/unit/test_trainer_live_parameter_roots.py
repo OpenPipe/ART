@@ -6,7 +6,7 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
-from test_trainer_rank_custom_tensors import _trainer
+from test_trainer_rank_live_heads import _live_head, _native_head
 import torch
 
 from art.trainer_rank import TrainerRank
@@ -17,12 +17,9 @@ from art.trainer_rank._tensors import CotangentCollector
 def _live_parameter(
     factory=lambda: torch.tensor(2.0),
 ) -> tuple[TrainerRank, torch.nn.Parameter, CotangentCollector, LiveHead]:
-    trainer, rank = _trainer("student")
-    parameter = rank.parameter("weight", factory, checkpoint="student")
+    trainer, parameter = _native_head("parameter", "weight", factory)
     collector = CotangentCollector()
-    live = LiveHead(
-        export_head(trainer, "student", "weight"), parameter.detach(), collector
-    )
+    live = _live_head(trainer, "weight", parameter.detach(), collector)
     return trainer, parameter, collector, live
 
 
@@ -38,10 +35,7 @@ class _FailBackward(torch.autograd.Function):
 
 @pytest.mark.parametrize("existing", [False, True])
 def test_native_direct_root_does_not_publish_when_another_root_fails(existing):
-    trainer, rank = _trainer("student")
-    parameter = rank.parameter(
-        "weight", lambda: torch.tensor(2.0), checkpoint="student"
-    )
+    trainer, parameter = _native_head("parameter", "weight", lambda: torch.tensor(2.0))
     if existing:
         parameter.grad = torch.tensor(7.0)
     original = parameter.grad
