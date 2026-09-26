@@ -332,14 +332,11 @@ def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
         if sum(s.length for s in group.packed.segments) != rows:
             raise ValueError("GDN packed rows disagree with segment geometry")
         retained += rows * layers * rank._hidden_size * 2
+        moe = rank._moe_workspace_bytes(
+            rows, checkpoint_grad=True, slot_ref=group.slot_ref
+        )
         workspace = max(
             workspace,
-            *(
-                rank._moe_workspace_bytes(
-                    rows, checkpoint_grad=True, slot_ref=group.slot_ref
-                )
-                + s.pending(rows, buckets)
-                for s in shapes
-            ),
+            *(moe + s.pending(rows, buckets) for s in shapes),
         )
     return retained, workspace
