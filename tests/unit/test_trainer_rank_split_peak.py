@@ -158,6 +158,11 @@ def _counter_split(monkeypatch):
     counters: dict[str, Any] = dict(allocated=100, peak=100, resets=[], executed=0)
     monkeypatch.setattr(tr, "_telemetry_phase", lambda *a, **k: nullcontext())
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    # This fixture's 10,000-byte admission budget is synthetic, not a physical
+    # deficit. Keep its learned-floor refusal independent of cache recovery.
+    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (1_000_000, 1_000_000))
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _: counters["allocated"])
     monkeypatch.setattr(torch.cuda, "synchronize", lambda _: None)
     monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _: counters["allocated"])
     monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _: counters["peak"])
@@ -186,10 +191,6 @@ def _counter_split(monkeypatch):
 
 def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch):
     rank, requests, counters = _counter_split(monkeypatch)
-    # This fixture's 10,000-byte admission budget is synthetic, not a physical
-    # deficit. Keep its learned-floor refusal independent of cache recovery.
-    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native")
-    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (1_000_000, 1_000_000))
     releases = []
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: releases.append(True))
     iterator = rank.forward_batches([requests], yield_empty=True)

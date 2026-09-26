@@ -15,7 +15,6 @@ from art.trainer_rank import (
     AdapterSelection,
     ForwardInput,
     ForwardOutput,
-    TopK,
     TrainerRank,
     TrainerRankMemoryError,
     Unset,
@@ -225,10 +224,12 @@ def test_planner_handles_vineppo_nested_shape_and_request_mix() -> None:
     estimate = rank._estimate_flat_forward(flat)
 
     assert estimate is not None
-    packed_tokens, output_bytes, signature = estimate
+    packed_tokens, output_bytes, signature, group_rows, head_workspace_bytes = estimate
     assert packed_tokens == plan.packed_tokens
     assert output_bytes == plan.output_bytes
     assert signature == plan.signature
+    assert group_rows == rank._plan_group_rows(plan)
+    assert head_workspace_bytes == rank._plan_head_workspace_bytes(plan)
     assert plan.request_count == 12
     assert plan.signature.request_mix == (
         "target:(2,)",
@@ -781,7 +782,8 @@ def test_adaptive_planner_globally_falls_back_when_one_rank_cannot_estimate(
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 2))
     # Planning succeeds; only estimator availability and profile trust are false.
-    outcomes = iter((True, False, True, True, True, False))
+    # The last outcome says no profile exists, so full sharing is not retried.
+    outcomes = iter((True, False, True, True, True, False, False))
     monkeypatch.setattr(rank, "_all_ranks_true", lambda _local: next(outcomes))
     plans = 0
     original = rank._plan_flat_forward
@@ -806,11 +808,6 @@ def test_adaptive_planner_probes_new_heterogeneous_signatures(
 ) -> None:
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        rank,
-        "_resolve_slot_ref",
-        lambda request, **_kwargs: request.checkpoint,
-    )
     for index in range(4):
         rank._checkpoint_slots.setdefault(f"S{index}", _CheckpointSlot()).params = ()
     inputs = [
@@ -847,9 +844,6 @@ def test_adaptive_planner_does_not_reuse_wide_window_for_cold_signature(
 ) -> None:
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        rank, "_resolve_slot_ref", lambda request, **_kwargs: request.checkpoint
-    )
     for name in ("policy", "adversary", "third"):
         rank._checkpoint_slots.setdefault(name, _CheckpointSlot()).params = ()
     inputs = [
@@ -1001,10 +995,12 @@ def test_heterogeneous_slots_split_packing_without_losing_output_estimates(
     estimate = rank._estimate_flat_forward(requests)
 
     assert estimate is not None
-    packed_tokens, output_bytes, signature = estimate
+    packed_tokens, output_bytes, signature, group_rows, head_workspace_bytes = estimate
     assert packed_tokens == plan.packed_tokens
     assert output_bytes == plan.output_bytes
     assert signature == plan.signature
+    assert group_rows == rank._plan_group_rows(plan)
+    assert head_workspace_bytes == rank._plan_head_workspace_bytes(plan)
     assert plan.signature.slot_group_count == 4
     assert {group.slot_ref for group in plan.groups} == {
         "student",

@@ -22,6 +22,10 @@ from openai.types.chat.chat_completion import Choice
 from openai.types.responses import Response
 from pydantic import BaseModel
 
+from ..preprocessing.dynamo_tokens import (
+    COMPLETION_LOGPROBS_KEY,
+    choice_completion_logprobs,
+)
 from ..utils.chat_template import (
     chat_template_with_preserved_thinking,
     default_chat_template_kwargs_for_template,
@@ -55,6 +59,7 @@ from . import (
 )
 from ._history import _model_matches
 from ._protocols import Exchange
+from ._render_cache import _render_context_key, cacheable_chat_template
 
 _TOKEN_ID = re.compile(r"token_id:(\d+)$")
 _WARNED_PREFIX_RETOKENIZATION = False
@@ -86,6 +91,73 @@ class _ChatRender(Protocol):
         *,
         add_generation_prompt: bool,
     ) -> str: ...
+
+
+class _PrefixChatRenderCache:
+    """Reuse exact baseline prefixes within one history's rendering context.
+
+    Probes still locate every assistant span. Equal completed text does not prove
+    equal generation prompts, so changed prefixes never reuse baseline renders.
+    Keep one baseline plus bounded prefix deltas, not quadratic rendered strings.
+    """
+
+    _MAX_BYTES = 8 * 1024 * 1024
+    _MAX_ENTRIES = 1024
+
+    def __init__(self, render: _ChatRender) -> None:
+        self.render = render
+        self.context: tuple[object, ...] | None = None
+        self.settings: object = None
+        self.text = ""
+        self.prefixes: dict[tuple[int, bool], tuple[int, str]] = {}
+        self.bytes = 0
+
+    def for_messages(
+        self, messages: list[dict[str, Any]], text: str, *, settings: object = None
+    ) -> _ChatRender:
+        try:
+            context = tuple(_render_context_key(message) for message in messages)
+        except (TypeError, RecursionError):
+            return self.render
+        if self.context is None or settings != self.settings:
+            self.context, self.text = context, text
+            self.settings = settings
+            self.prefixes.clear()
+            self.bytes = 0
+        common = 0
+        for original, current in zip(self.context, context):
+            if original != current:
+                break
+            common += 1
+
+        def render(
+            selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+        ) -> str:
+            count = len(selected_messages)
+            if count > common or any(
+                original is not current
+                for original, current in zip(messages, selected_messages)
+            ):
+                return self.render(
+                    selected_messages, add_generation_prompt=add_generation_prompt
+                )
+            key = count, add_generation_prompt
+            if key in self.prefixes:
+                prefix, tail = self.prefixes[key]
+                return self.text[:prefix] + tail
+            value = self.render(
+                selected_messages, add_generation_prompt=add_generation_prompt
+            )
+            if len(self.prefixes) < self._MAX_ENTRIES:
+                prefix = _common_prefix_length(self.text, value)
+                tail = value[prefix:]
+                size = 256 + 4 * len(tail)
+                if self.bytes + size <= self._MAX_BYTES:
+                    self.prefixes[key] = prefix, tail
+                    self.bytes += size
+            return value
+
+        return render
 
 
 class _TokenChatRender(Protocol):
@@ -816,6 +888,11 @@ def _sampled_evidence_fingerprint(
             "prompt_token_ids": prompt,
             "token_ids": choice_extra.get("token_ids"),
             "logprobs": _chat_logprob_fingerprint_evidence(choice),
+            **(
+                {COMPLETION_LOGPROBS_KEY: choice_completion_logprobs(choice)}
+                if COMPLETION_LOGPROBS_KEY in choice_extra
+                else {}
+            ),
             "finish_reason": choice.finish_reason,
         }
     elif protocol == "completions":
@@ -1097,6 +1174,11 @@ def _chat_choice_output_tokens(
         _field(choice, "token_ids"),
         field="Chat Completions token_ids",
     )
+    exact_logprobs = choice_completion_logprobs(choice)
+    if COMPLETION_LOGPROBS_KEY in (choice.model_extra or {}):
+        return token_ids, exact_logprobs if exact_logprobs is not None else [
+            math.nan
+        ] * len(token_ids or [])
     values = _chat_logprob_entries(choice)
     if token_ids == [] and (
         values
@@ -4450,6 +4532,58 @@ def _source_covers_complete_sampled_message(
     ) == normalize_chat_message(projected[0])
 
 
+def _preserve_literal_thinking_off_content(
+    history: ChatCompletionsHistory,
+    messages: list[dict[str, Any]],
+    template: object,
+    kwargs: Mapping[str, object],
+) -> None:
+    # This Qwen3.5 template treats any </think> in unstructured content as a
+    # reasoning separator, even with thinking disabled. Restrict the render-copy
+    # adaptation to its exact preserved template; other templates may interpret
+    # an empty reasoning_content field differently.
+    if (
+        not isinstance(template, str)
+        or sha256(template.encode()).hexdigest()
+        != "098047d425a6673b1fe1a82a197a481616e53a283beaa8cb76cbb74d38ca6644"
+        or kwargs.get("enable_thinking") is not False
+        or kwargs.get("preserve_thinking") is not True
+    ):
+        return
+    for message, source in zip(messages, history.message_sources, strict=True):
+        if (
+            source is None
+            or not isinstance(source.exchange, ChatCompletionsExchange)
+            or source.choice_index is None
+            or message.get("role") != "assistant"
+            or not isinstance(content := message.get("content"), str)
+            or "</think>" not in content
+        ):
+            continue
+        request_kwargs = source.exchange.request.get("chat_template_kwargs")
+        if (
+            not isinstance(request_kwargs, Mapping)
+            or request_kwargs.get("enable_thinking") is not False
+        ):
+            continue
+        choice = _chat_choice(source)
+        # Visible-only histories may omit structured reasoning present in the
+        # source response. Preserve both that source and normalized aliases.
+        if any(
+            value is not None and not (isinstance(value, str) and value == "")
+            for value in (
+                message.get("reasoning"),
+                message.get("reasoning_content"),
+                _field(choice.message, "reasoning"),
+                _field(choice.message, "reasoning_content"),
+            )
+        ):
+            continue
+        prompt, output, _ = _chat_choice_tokens(choice, source.exchange.response)
+        if prompt is not None and output is not None:
+            message["reasoning_content"] = ""
+
+
 def _tokenize_chat_view(
     history: ChatCompletionsHistory,
     *,
@@ -4496,6 +4630,7 @@ def _tokenize_chat_view(
         **default_chat_template_kwargs_for_template(template),
         **explicit_kwargs,
     }
+    _preserve_literal_thinking_off_content(history, messages, template, kwargs)
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
     segmented = False
 
@@ -4516,13 +4651,11 @@ def _tokenize_chat_view(
             )
         )
 
-    def render_text(
+    def render_normalized_text(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> str:
         value = resolved_tokenizer.apply_chat_template(
-            normalize_tool_call_arguments_for_chat_template(
-                selected_messages, template
-            ),
+            selected_messages,
             tools=history.tools,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
@@ -4533,17 +4666,53 @@ def _tokenize_chat_view(
             raise TypeError("Chat template did not render text")
         return value
 
+    def render_text(
+        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ) -> str:
+        return render_normalized_text(
+            normalize_tool_call_arguments_for_chat_template(
+                selected_messages, template
+            ),
+            add_generation_prompt=add_generation_prompt,
+        )
+
+    prefix_render_cache = _PrefixChatRenderCache(render_normalized_text)
+
     def segmented_render(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> tuple[list[int], list[bool]]:
         try:
-            text = render_text(
-                selected_messages, add_generation_prompt=add_generation_prompt
-            )
+            if cacheable_chat_template(
+                resolved_tokenizer, template, history.tools, kwargs, selected_messages
+            ):
+                # Normalization is message-local. Only the admitted nonmutating
+                # renderer may share its normalized messages between prefixes.
+                selected_messages = normalize_tool_call_arguments_for_chat_template(
+                    selected_messages, template
+                )
+                text = render_normalized_text(
+                    selected_messages, add_generation_prompt=add_generation_prompt
+                )
+                span_render = prefix_render_cache.for_messages(
+                    selected_messages,
+                    text,
+                    settings=_render_context_key(
+                        [
+                            history.tools,
+                            kwargs,
+                            getattr(resolved_tokenizer, "special_tokens_map"),
+                        ]
+                    ),
+                )
+            else:
+                text = render_text(
+                    selected_messages, add_generation_prompt=add_generation_prompt
+                )
+                span_render = render_text
             spans = _assistant_char_spans(
                 selected_messages,
                 text,
-                render_text,
+                span_render,
                 add_generation_prompt=add_generation_prompt,
             )
         except (TypeError, KeyError):
@@ -4847,6 +5016,7 @@ def _tokenize_chat_view(
             bool,
             _SampledSourceKey,
             object,
+            int | None,
         ]
     ] = []
     search_cursor = 0
@@ -5457,6 +5627,7 @@ def _tokenize_chat_view(
         )
         exact_output_matches: list[tuple[int, int]] | None = None
         exact_output_span: tuple[int, int] | None = None
+        corrected_message_end: int | None = None
         if (
             complete_sampled_message
             and source is not None
@@ -5518,8 +5689,12 @@ def _tokenize_chat_view(
                 and rendered[: len(rendered_completed)] == rendered_completed
             ):
                 marked_bounds[message_index] = corrected_bounds
-                # The marker-derived per-part offsets describe the old render.
-                marked_part_bounds.pop(message_index, None)
+                corrected_message_end = corrected_bounds[1]
+                if any(
+                    not corrected_bounds[0] <= start <= end <= corrected_bounds[1]
+                    for start, end in marked_part_bounds.get(message_index, ())
+                ):
+                    marked_part_bounds.pop(message_index, None)
             else:
                 marked_bounds.pop(message_index, None)
                 marked_part_bounds.pop(message_index, None)
@@ -5642,6 +5817,7 @@ def _tokenize_chat_view(
                     True,
                     _sampled_source_key(source),
                     source,
+                    None,
                 )
             )
             search_cursor = end
@@ -5675,6 +5851,7 @@ def _tokenize_chat_view(
                     False,
                     _sampled_source_key(source),
                     source,
+                    None,
                 )
             )
             search_cursor = end
@@ -5764,6 +5941,7 @@ def _tokenize_chat_view(
                     True,
                     _sampled_source_key(source),
                     source,
+                    None,
                 )
             )
             if (
@@ -5819,9 +5997,60 @@ def _tokenize_chat_view(
                 part=part,
                 full_tokens=(full_exact, full_logprobs),
             )
+            if (
+                exact is None
+                and corrected_message_end is not None
+                and proven_part_bounds is not None
+            ):
+                raise ValueError(
+                    "Could not preserve exact sampled tokens for a corrected history part"
+                )
+            if (
+                exact is not None
+                and corrected_message_end is not None
+                and proven_part_bounds is not None
+                and sampled_bounds is not None
+                and start != sampled_bounds[0]
+            ):
+                raise ValueError("Could not prove the complete sampled part start")
             if exact is not None and rendered[start : start + len(exact)] == exact:
                 end = start + len(exact)
+                if corrected_message_end is not None and end > corrected_message_end:
+                    raise ValueError(
+                        "Exact sampled tokens extend beyond their proven message bounds"
+                    )
                 search_cursor = end
+            elif (
+                exact is not None
+                and corrected_message_end is not None
+                and _sampled_stop_suffix(
+                    exact,
+                    source=source,
+                    source_key=_sampled_source_key(source),
+                    tokenizer=resolved_tokenizer,
+                )
+            ):
+                # Use the proven message end to replace its rendered stop,
+                # just as the whole-message path does for sampled stops.
+                tail_mask, tail_stops = _assistant_stop_masks(
+                    rendered[:corrected_message_end],
+                    assistant_mask[:corrected_message_end],
+                    resolved_tokenizer,
+                )
+                tail_end = end
+                while tail_end < len(tail_mask) and tail_mask[tail_end]:
+                    tail_end += 1
+                if tail_end > end and tail_stops[tail_end - 1]:
+                    end = tail_end
+                    search_cursor = end
+            if (
+                exact is not None
+                and corrected_message_end is not None
+                and _source_stop_evidence(source, _sampled_source_key(source))[0]
+                != "length"
+            ):
+                # Source evidence assigns STOP; retain synthetic length boundaries.
+                stop_mask[start:end] = [False] * (end - start)
             replacement = exact if exact is not None else rendered[start:end]
             if exact is None and not logprobs:
                 exchange = getattr(source, "exchange", None)
@@ -5859,6 +6088,10 @@ def _tokenize_chat_view(
                     exact is not None,
                     _sampled_source_key(source),
                     source,
+                    span[1]
+                    if corrected_message_end is not None
+                    and proven_part_bounds is not None
+                    else None,
                 )
             )
         message_replacements = replacements[replacement_start:]
@@ -5890,6 +6123,7 @@ def _tokenize_chat_view(
                     False,
                     message_replacements[0][5],
                     message_replacements[0][6],
+                    None,
                 )
             )
         if sampled and not parts and full_exact is not None:
@@ -5911,13 +6145,24 @@ def _tokenize_chat_view(
         exact,
         source_key,
         source,
+        part_end,
     ) in sorted(replacements, key=lambda item: (item[0], item[1])):
+        synthetic_stop_token: int | None = None
         if exact and _source_stop_evidence(source, source_key)[0] == "length":
             synthetic_stop = next(
                 (index for index in range(start, end) if stop_mask[index]), None
             )
             if synthetic_stop is not None:
-                end = synthetic_stop
+                if part_end is not None and synthetic_stop + 1 < part_end:
+                    if end < part_end:
+                        raise ValueError(
+                            "Exact sampled tokens do not cover the proven history part"
+                        )
+                    # Keep the boundary without replaying replaced visible content.
+                    synthetic_stop_token = rendered[synthetic_stop]
+                    end = part_end
+                else:
+                    end = synthetic_stop
         if start < cursor:
             raise ValueError("Rendered assistant source spans overlap")
         token_ids.extend(rendered[cursor:start])
@@ -5943,20 +6188,35 @@ def _tokenize_chat_view(
             )
         except ValueError:
             replacement_stop_mask = [False] * len(replacement)
-        replacement_length_stop_mask = _translate_token_mask(
-            rendered[start:end], replacement, length_stop_mask[start:end]
+        if synthetic_stop_token is not None:
+            replacement_stop_mask = [False] * len(replacement)
+        replacement_length_stop_mask = (
+            [False] * len(replacement)
+            if synthetic_stop_token is not None
+            else _translate_token_mask(
+                rendered[start:end], replacement, length_stop_mask[start:end]
+            )
         )
         if exact:
             token_ids.extend(replacement)
             logprobs.extend(replacement_logprobs)
-            flags.extend(
+            replacement_flags = [
                 TokenFlag.EXACT
                 | TokenFlag.SAMPLED
                 | TokenFlag.ASSISTANT
                 | TokenFlag.OUTPUT
                 | (TokenFlag.STOP if stop else TokenFlag(0))
                 for stop in replacement_stop_mask
-            )
+            ]
+            if part_end is not None:
+                _mark_sampled_stops(
+                    replacement,
+                    replacement_flags,
+                    [source_key] * len(replacement),
+                    {source_key: source},
+                    tokenizer=resolved_tokenizer,
+                )
+            flags.extend(replacement_flags)
             source_keys.extend([source_key] * len(replacement))
             sources[source_key] = source
         else:
@@ -5979,6 +6239,11 @@ def _tokenize_chat_view(
                 )
             )
             source_keys.extend([None] * len(replacement))
+        if synthetic_stop_token is not None:
+            token_ids.append(synthetic_stop_token)
+            logprobs.append(math.nan)
+            flags.append(TokenFlag.STOP)
+            source_keys.append(None)
         cursor = end
     token_ids.extend(rendered[cursor:])
     logprobs.extend([math.nan] * (len(rendered) - cursor))

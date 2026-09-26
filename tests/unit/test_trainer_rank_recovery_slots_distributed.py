@@ -11,7 +11,9 @@ import pytest
 HEAD = Path(__file__).resolve().parents[2] / "src"
 
 
-@pytest.mark.parametrize("mode", ("fit", "both", "asymmetric"))
+@pytest.mark.parametrize(
+    "mode", ("fit", "both", "asymmetric", "handoff", "handoff-error", "handoff-cancel")
+)
 def test_native_checkpoint_gather_after_recovery(tmp_path, mode):
     selected = HEAD
     children = []
@@ -52,7 +54,8 @@ def test_native_checkpoint_gather_after_recovery(tmp_path, mode):
     ]
     assert all(row["error"] is None for row in rows), rows
     assert all(row["barrier_error"] is None for row in rows), rows
-    assert all(row["ensures"] == 1 for row in rows), rows
+    expected = 0 if mode.startswith("handoff") else 1
+    assert all(row["ensures"] == expected for row in rows), rows
 
 
 def worker(index, mode, directory):
@@ -70,6 +73,45 @@ def worker(index, mode, directory):
     with gloo_group(index, f"file://{directory}/rendezvous", timeout=3):
         rank = TrainerRank.__new__(TrainerRank)
         rank.device = torch.device("cpu")
+        if mode.startswith("handoff"):
+            # The second real peer has no local groups, but must join every phase.
+            plan = SimpleNamespace(
+                groups=[SimpleNamespace(grad_enabled=True)] if index == 0 else []
+            )
+            original = (
+                KeyboardInterrupt("original forward cancellation")
+                if mode == "handoff-cancel"
+                else RuntimeError("original forward failure")
+            )
+            error = barrier_error = None
+            caught = None
+            try:
+                rank._release_cached_memory_for_backward(
+                    plan, error=original if index == 0 and mode != "handoff" else None
+                )
+            except BaseException as exc:
+                caught = exc
+            if mode == "handoff":
+                valid = caught is None
+            else:
+                valid = (
+                    caught is original
+                    if index == 0
+                    else (
+                        isinstance(caught, RuntimeError)
+                        and "another rank" in str(caught)
+                    )
+                )
+            if not valid or rank._recovery_state().owner is not None:
+                error = "handoff disposition or owner differs"
+            try:
+                dist.barrier()
+            except BaseException as exc:
+                barrier_error = {"type": type(exc).__name__, "message": str(exc)}
+            (directory / f"rank-{index}.json").write_text(
+                json.dumps(dict(error=error, barrier_error=barrier_error, ensures=0))
+            )
+            return
         rank._checkpoint_mutation_lock = threading.RLock()
         rank._checkpoint_prefetch_lock = threading.Lock()
         rank._checkpoint_slots = {}
@@ -87,6 +129,7 @@ def worker(index, mode, directory):
         ]
         rank._forward_memory_group = lambda: groups[index]
         plan = SimpleNamespace(
+            groups=(),  # This slot-only fixture has no retained/head/GDN groups.
             packed_tokens=1,
             logical_tokens=1,
             active_logical_tokens=1,

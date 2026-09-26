@@ -49,8 +49,10 @@ from art.trainer_rank import (
     TrainerRankMemoryError,
     TrainerRankPartialExecutionError,
     TrainerRankSlotStateError,
+    _impl,
 )
 from art.trainer_rank._impl import (
+    _PACKED_PRICED_LOGICAL_ROW_BYTES,
     Unset,
     _FlatForwardPlan,
     _MemoryCheck,
@@ -84,7 +86,11 @@ def _runtime() -> "TrainingRuntime":
         model=[_FakeGPT()],
         optimizer=None,
         provider=SimpleNamespace(
-            hidden_size=8, num_layers=4, recompute_granularity="full"
+            hidden_size=8,
+            num_layers=4,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
         ),
         model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
     )  # type: ignore
@@ -531,8 +537,13 @@ def test_changed_output_allocation_does_not_inflate_retained_compute() -> None:
     [(800, 800, True), (801, 801, False), (100, 800, True), (100, 801, False)],
 )
 def test_retained_compute_keeps_growth_and_sharing_trust_limits(
-    packed_tokens: int, logical_tokens: int, trusted: bool
+    monkeypatch: pytest.MonkeyPatch,
+    packed_tokens: int,
+    logical_tokens: int,
+    trusted: bool,
 ) -> None:
+    # Price the short test request as a packed-priced one.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
     rank = TrainerRank(_runtime())
     plan = replace(
         rank._plan_flat_forward([_request(0)]),
@@ -549,10 +560,14 @@ def test_retained_compute_keeps_growth_and_sharing_trust_limits(
     rank._update_memory_profile(plan, 100_000, retained_bytes=None)
     unknown = rank._plan_cost(candidate)
     assert unknown.retained == unknown.required
-    rank._update_memory_profile(plan, 100_000, retained_bytes=60_000)
+    rate = 260
+    rank._update_memory_profile(
+        plan, 40_000 + 200 * rate, retained_bytes=40_000 + 100 * rate
+    )
     observed = rank._plan_cost(candidate)
     if trusted:
-        assert observed.retained == 220_000
+        rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
+        assert observed.retained == int((40_000 + rate * packed_tokens + rows) * 1.1)
         assert observed.retained < observed.required
     else:
         assert observed.retained == observed.required
@@ -652,15 +667,17 @@ def test_retained_ratio_lower_bound_reaches_exact_split_admission(
     assert lower.fits == (not admit or profile_packed == 8000)
     assert exact.fits == (admit and profile_packed == 8000)
     if not exact.fits:
-        # Reject this rung, at the lower bound or exact pricing; a later rung
-        # with smaller chunks may still fit this same budget.
+        # Otherwise reject this rung; a later rung with smaller chunks may still
+        # fit. Just under the untrusted 1000-row exact rung, the grad child's
+        # full-sharing layout (priced by packed rows) rescues the rung itself.
         split, rejected = rank._admit_split_rung(
             [tuple(range(16)), tuple(range(16, 32))],
             requests,
             [request.input_tokens for request in requests],
             checkpoint=Unset,
         )
-        assert split is None and not rejected.fits
+        rescued = not admit and profile_packed == 1000
+        assert (split is not None) == rejected.fits == rescued
 
 
 @pytest.mark.parametrize(
@@ -1014,6 +1031,8 @@ def test_split_subforwards_track_independent_slot_graphs(
 def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
     monkeypatch: pytest.MonkeyPatch, direction: float | None
 ) -> None:
+    # Price the short test requests as packed-priced ones.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
     rank = _retained_ratio_rank(monkeypatch)
 
     def request(tokens: list[int]) -> ForwardInput:
@@ -1088,6 +1107,8 @@ def test_retained_ratio_bound_uses_original_guard_at_trusted_endpoint(
 def test_warm_rounding_preserves_native_split_bound_and_exact_budget(
     monkeypatch: pytest.MonkeyPatch, retained: int | None, admit: bool
 ) -> None:
+    # Price the short test requests as packed-priced ones.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
     rank = _retained_ratio_rank(monkeypatch)
     tokens = torch.arange(3)
     part = [ForwardInput(input_tokens=tokens, target_tokens=tokens) for _ in range(5)]
@@ -1102,7 +1123,13 @@ def test_warm_rounding_preserves_native_split_bound_and_exact_budget(
         rank._update_memory_profile(
             plan, peak_delta_bytes=7_864_390, retained_bytes=retained
         )
-    costs = [rank._plan_cost(plan) for plan in children]
+    # Full sharing is the cheapest layout, so it sets the exact budget.
+    costs = [
+        rank._plan_cost(
+            rank._plan_flat_forward(requests[a : a + 5], memory_minimal=True)
+        )
+        for a in (0, 5)
+    ]
     lower = [
         rank._split_chunk_lower_cost(
             requests[a : a + 5], rows[a : a + 5], checkpoint=Unset
@@ -1120,16 +1147,18 @@ def test_warm_rounding_preserves_native_split_bound_and_exact_budget(
 
 
 @pytest.mark.parametrize("retained", (None, 0, 7864321 / 15))
-def test_normalized_warm_profile_is_monotone_through_ratio_floor(
+def test_normalized_warm_profile_is_monotone_in_packed_tokens(
     monkeypatch: pytest.MonkeyPatch, retained: float | None
 ) -> None:
+    # Price the short test request as a packed-priced one.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
     rank = _retained_ratio_rank(monkeypatch)
     signature = rank._plan_flat_forward([_request(0)]).signature
     rank._memory_profiles[signature] = _MemoryProfile(
         7864330 / 15, 1000, 15 / 13, retained_compute_bytes_per_token=retained
     )
-    # All counts satisfy the retained guard. The logical term dominates until
-    # N=104, then packed-token growth dominates. Check every integer count.
+    # All counts satisfy the retained guard; the logical charge does not depend
+    # on layout, so cost must grow monotonically with packed rows. Check each.
     costs = [
         rank._subforward_cost(
             packed_tokens=packed,

@@ -1,6 +1,7 @@
 """Actual admission methods with scalar allocator/search/clock facades, no CUDA."""
 
 from contextlib import nullcontext
+from dataclasses import replace
 import math
 import os
 import types
@@ -8,7 +9,7 @@ from typing import cast
 import unittest
 from unittest.mock import patch
 
-from art.trainer_rank import _impl
+from art.trainer_rank import ForwardOptions, _backward_work, _impl
 
 Refusal = _impl.TrainerRankMemoryError
 Partial = _impl.TrainerRankPartialExecutionError
@@ -76,6 +77,12 @@ class CUDA:
     def memory_reserved(self, device):
         return self.allocated
 
+    def memory_stats(self, device):
+        return {
+            "allocated_bytes.all.current": self.memory_allocated(device),
+            "reserved_bytes.all.current": self.memory_reserved(device),
+        }
+
     def empty_cache(self):
         self.events.append("release")
         if self.failure is not None:
@@ -87,6 +94,14 @@ class Clock:
     def __init__(self):
         self.value = 0.0
         self.next = None
+        self.nanoseconds = 0
+        self.observer_step_ns = 0
+
+    def perf_counter_ns(self):
+        # Existing recovery cases isolate O=0; imported-module cases opt in to
+        # positive observer cost without changing the original episode clock.
+        self.nanoseconds += self.observer_step_ns
+        return self.nanoseconds
 
     def perf_counter(self):
         if self.next is not None:
@@ -153,6 +168,9 @@ class TestRecovery(unittest.TestCase):
             patcher = patch.object(_impl, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        observer_clock = patch.object(_backward_work, "time", clock)
+        observer_clock.start()
+        self.addCleanup(observer_clock.stop)
         q = object.__new__(_impl.TrainerRank)
         q.device = types.SimpleNamespace(type="cuda")
         q._graph_memory_policy_enabled = lambda: False
@@ -575,6 +593,9 @@ class TestRecovery(unittest.TestCase):
                     return False
 
             state.lock = Lock()
+            # This case injects faults by original recovery-lock ordinal;
+            # observer cancellation/depth has separate actual helper controls.
+            q._backward_work = lambda: None
             _, error, _ = run(q, [fail(n), success(n)])
             self.assertIs(error, original)
             self.assertEqual(state.lock.calls, 4)
@@ -600,6 +621,7 @@ class TestRecovery(unittest.TestCase):
                 return False
 
         state.lock = Lock()
+        q._backward_work = lambda: None  # Isolate original recovery-lock ordinals.
         _, error, _ = run(q, [fail(n), success(n)])
         self.assertIs(error, original)
         self.assertEqual(state.lock.calls, 4)
@@ -621,6 +643,7 @@ class TestRecovery(unittest.TestCase):
                 return False
 
         state.lock = Lock()
+        q._backward_work = lambda: None  # Isolate original recovery-lock ordinals.
         value, error, _ = run(q, [fail(n), success(n)])
         self.assertIsNone(error)
         self.assertTrue(value[1].fits)
@@ -898,3 +921,116 @@ def test_dense_cp_exact_demand_fits_after_recovery(monkeypatch):
 
 def test_dense_cp_exact_demand_refuses_after_recovery(monkeypatch):
     _check_dense_cp_exact_demand_recovery(monkeypatch, fits_after_release=False)
+
+
+def _check_component_demand_recovery(
+    monkeypatch, rank, requests, *, fits_after, after_available=None
+):
+    """Real pricing/search/recovery, CPU plans and scalar CUDA counters only."""
+    import pytest
+
+    assert not _impl.dist.is_initialized() and not _impl.torch.cuda.is_initialized()
+    # Hold placement fixed: automatic offload can legitimately lower demand.
+    requests = [
+        replace(
+            request, options=ForwardOptions(backward_state="gpu", output_device="model")
+        )
+        for request in requests
+    ]
+    plan = rank._plan_flat_forward(requests)
+    model_required = rank._memory_check(plan).estimated_required_bytes
+    required = rank._admit_graph_memory(plan)[1].estimated_required_bytes
+    assert required >= model_required  # Includes v1's detached caller outputs.
+    profiles = dict(rank._memory_profiles)
+    groups = rank._plan_group_rows(plan)
+    head = rank._plan_head_workspace_bytes(plan)
+    total = 10 * required
+    reserve = int(total * _impl._MEMORY_RESERVE_FRACTION)
+    free, phase = reserve + 1, 0
+    searches, demands, outcomes, releases, errors = [], [], [], [], []
+    estimate = rank._estimate_required_memory_bytes_from_values
+    search = rank._search_next_micro_batch
+    outcome = rank._admission_outcome
+    error_factory = _impl._ForwardRefusal.error
+
+    def observed_estimate(**kwargs):
+        value = estimate(**kwargs)
+        if (
+            kwargs.get("group_rows") == groups
+            and kwargs.get("head_workspace_bytes") == head
+        ):
+            demands.append((phase, value))
+        return value
+
+    def observed_search(*args, **kwargs):
+        nonlocal phase
+        phase += 1
+        value = search(*args, **kwargs)
+        searches.append(value)
+        return value
+
+    def observed_outcome(local):
+        value = outcome(local)
+        outcomes.append((local, value))
+        return value
+
+    def release():
+        nonlocal free
+        releases.append(phase)
+        free = reserve + (
+            after_available
+            if after_available is not None
+            else required
+            if fits_after
+            else 1
+        )
+
+    def observed_error(refused, context):
+        error = error_factory(refused, context)
+        errors.append(error)
+        return error
+
+    monkeypatch.delenv(_impl._TEST_HOOKS_ENV, raising=False)
+    # Inert CPU fixture, not an initialized MCore/distributed topology.
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "device", _impl.torch.device("cuda"))
+    monkeypatch.setattr(_impl.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(_impl.torch.cuda, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(_impl.torch.cuda, "mem_get_info", lambda device: (free, total))
+    monkeypatch.setattr(_impl.torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(_impl.torch.cuda, "memory_reserved", lambda device: total)
+    monkeypatch.setattr(_impl.torch.cuda, "empty_cache", release)
+    monkeypatch.setattr(
+        _impl.torch.cuda, "synchronize", lambda *a: pytest.fail("No CUDA work")
+    )
+    monkeypatch.setattr(
+        rank, "_estimate_required_memory_bytes_from_values", observed_estimate
+    )
+    monkeypatch.setattr(rank, "_search_next_micro_batch", observed_search)
+    monkeypatch.setattr(rank, "_admission_outcome", observed_outcome)
+    monkeypatch.setattr(_impl._ForwardRefusal, "error", observed_error)
+    monkeypatch.setattr(rank, "_snapshot_planning_telemetry", lambda *args: None)
+    monkeypatch.setattr(
+        rank, "_execute_flat_plan", lambda *a, **kw: pytest.fail("No model execution")
+    )
+    # Cached bytes exceed demand, but are not physical-free admission credit.
+    assert rank._available_memory_bytes() == 1 < required < total
+    if fits_after:
+        selected = rank._select_next_micro_batch([requests], 0)
+        assert selected.check.fits and selected.check.available_bytes == required
+        assert selected.check.estimated_required_bytes == required
+        assert rank._plan_group_rows(selected.plan) == groups
+        assert rank._plan_head_workspace_bytes(selected.plan) == head
+        assert len(errors) == 1
+    else:
+        with pytest.raises(Refusal) as captured:
+            rank._select_next_micro_batch([requests], 0)
+        assert len(errors) == 2 and captured.value is errors[1]
+        assert captured.value.__cause__ is errors[0]
+    assert len(searches) == 2 and isinstance(searches[0], _impl._ForwardRefusal)
+    assert releases == [1] and outcomes[0] == (1, 1)
+    assert (1, model_required) in demands and (2, model_required) in demands
+    assert rank._recovery_state().first_consumed
+    assert rank._recovery_state().owner is None
+    assert rank._memory_profiles == profiles
+    assert not _impl.torch.cuda.is_initialized()

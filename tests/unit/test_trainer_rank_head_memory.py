@@ -1,192 +1,413 @@
-"""Registered head admission and the real native/remote gradient transaction."""
+"""Standard BF16 head capacity: CPU/source pricing, not a native peak bound."""
 
 from dataclasses import replace
-import weakref
+import importlib.util
+from pathlib import Path
 
 import pytest
-from test_trainer_rank_memory_admission import _requests, rank  # noqa: F401
 import torch
 
-from art.trainer_rank import ForwardOptions, TrainerRankMemoryError, _impl
-from art.trainer_rank._commands import _Executor
-from art.trainer_rank._heads import LiveHead, export_head
-from art.trainer_rank._tensors import CotangentCollector, detach_tree
+from art.trainer_rank import ForwardInput
+from art.trainer_rank._impl import (
+    _PACKED_PRICED_LOGICAL_ROW_BYTES,
+    Unset,
+    _MemoryProfile,
+)
 
 
-class _Head(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(4, 4))
-        self.tied = self.weight
-        self.frozen = torch.nn.Parameter(torch.ones(16), requires_grad=False)
-        self.register_buffer("buffer", torch.ones(16))
+def rank():
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 
-    def forward(self, inputs):
-        return inputs @ self.weight
+    spec = importlib.util.spec_from_file_location(
+        "checkpoint_memory_tests",
+        Path(__file__).with_name("test_trainer_rank_checkpoint_memory.py"),
+    )
+    assert spec is not None and spec.loader is not None
+    source = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(source)
+    r = source.rank()
+    model = r.runtime.model[0]
+    head = ColumnParallelLinear.__new__(ColumnParallelLinear)
+    torch.nn.Module.__init__(head)
+    head.weight = torch.nn.Parameter(
+        torch.empty(248320, 2048, device="meta", dtype=torch.bfloat16)
+    )
+    head.input_size = 2048
+    head.output_size = head.output_size_per_partition = 248320
+    model.output_layer = head
+    model.share_embeddings_and_output_weights = False
+    from types import MethodType
+
+    from megatron.core.models.common.language_module.language_module import (
+        LanguageModule,
+    )
+
+    model._scale_logits = MethodType(LanguageModule._scale_logits, model)
+    model.config.use_mup = False
+    model.config.padded_vocab_size = 248320
+    r._padded_vocab_size = 248320
+    return r
 
 
-def _register(rank, kind="module"):
-    rank._checkpoint_slots["student"] = _impl._CheckpointSlot()
-    if kind == "module":
-        return rank.module("head", _Head, checkpoint="student")
-    return rank.parameter("head", lambda: torch.ones(4, 4), checkpoint="student")
+def request(rows=512, *, grad=False, hidden=False, ignored=False):
+    return ForwardInput(
+        input_tokens=torch.arange(rows),
+        target_tokens=torch.full((rows,), -100) if ignored else torch.arange(rows),
+        no_grad=not grad,
+        hidden_states=hidden,
+    )
 
 
-def _plan(rank):
-    requests = _requests(ForwardOptions(backward_state="replay", output_device="cpu"))[
-        :1
+@pytest.mark.parametrize("grad,budget", [(False, 128 * 1024**2), (True, 220 * 1024**2)])
+def test_actual_admission_rejects_below_dense_head_tensor(grad, budget):
+    r = rank()
+    plan = r._plan_flat_forward([request(grad=grad)])
+    r._available_memory_bytes = lambda: budget
+    assert not r._memory_check(plan).fits
+
+
+@pytest.mark.parametrize("fits_after", (False, True))
+def test_mixed_checkpoint_head_demand_survives_recovery(monkeypatch, fits_after):
+    from test_trainer_rank_cache_recovery import _check_component_demand_recovery
+
+    r = rank()
+    requests = [request(8, grad=True), request(16, grad=False, hidden=True)]
+    values = r._estimate_flat_forward(requests, exact=True)
+    assert values[3] == ((8, True), (16, False))
+    assert r._checkpoint_memory_floor(values[3])[0] == 8 * 40 * 2048 * 2
+    assert values[4] == 3 * 8 * 248320 * 2
+    _check_component_demand_recovery(monkeypatch, r, requests, fits_after=fits_after)
+
+
+def test_recovery_keeps_profile_demand_above_cold_head_floor(monkeypatch):
+    from test_trainer_rank_cache_recovery import _check_component_demand_recovery
+
+    r = rank()
+    requests = [request(1, grad=True)]  # One row cannot be split smaller.
+    plan = r._plan_flat_forward(requests)
+    cold = r._memory_check(plan).estimated_required_bytes
+    r._update_memory_profile(plan, 4 * cold, retained_bytes=plan.output_bytes)
+    assert r._memory_check(plan).estimated_required_bytes > cold
+    _check_component_demand_recovery(
+        monkeypatch, r, requests, fits_after=False, after_available=cold
+    )
+
+
+def test_real_head_split_fits_before_cache_recovery(monkeypatch):
+    from test_trainer_rank_split import _recording_executor
+
+    from art.trainer_rank import TrainerRank, _impl
+
+    r = rank()
+    monkeypatch.setattr(r, "_dp_rank_and_size", lambda: (0, 1))
+    requests = [
+        replace(request(8), input_tokens=torch.arange(8) + 100 * i) for i in range(4)
     ]
-    plan = rank._plan_flat_forward(requests)
-    return replace(
-        plan, groups=(replace(plan.groups[0], slot_ref=rank._slot_ref("student")),)
+    whole = r._plan_flat_forward(requests)
+    r._update_memory_profile(
+        whole, r._plan_cost(whole).required, retained_bytes=whole.output_bytes
     )
-
-
-@pytest.mark.parametrize("kind", ["module", "parameter"])
-@pytest.mark.parametrize("existing_gradient", [False, True])
-def test_registered_head_forward_admission_and_native_backward(
-    rank, monkeypatch, kind, existing_gradient
-):
-    head = _register(rank, kind)
-    parameter = rank._checkpoint_slots["student"].params[0]
-    if existing_gradient:
-        parameter.grad = torch.zeros_like(parameter)
-    expected = 64 * (2 if existing_gradient else 3)
-    assert rank._lora_gradient_staging_bytes(rank._slot_ref("student")) == expected
-    assert rank._lora_version_capture_bytes(rank._slot_ref("student")) == 0
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 150)
-    _, check = rank._admit_graph_memory(_plan(rank))
-    assert not check.fits and check.estimated_required_bytes == 100 + expected
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 100 + expected)
-    assert all(rank._admit_graph_memory(_plan(rank))[1].fits for _ in range(2))
-    cache = rank._forward_graph_cache()
-    losses = []
-    for factor in (2, 3):
-        handle, tensors = cache.run(
-            lambda inputs: (inputs.sin(),),
-            torch.ones(4, requires_grad=True),
-            retention="replay",
-        )
-        value = rank._forward_cotangent_collector().attach(
-            detach_tree(handle, tensors)
-        )[0]
-        result = head(value) if kind == "module" else value @ head
-        losses.append(result.sum() * factor)
-    for loss in losses:
-        rank.backward(loss)
-    torch.testing.assert_close(
-        parameter.grad,
-        torch.full_like(parameter, 5 * torch.sin(torch.tensor(1.0)).item()),
+    children = [r._plan_flat_forward(requests[i : i + 2]) for i in (0, 2)]
+    left, right = [r._plan_cost(child) for child in children]
+    budget = max(left.required, left.retained + right.required)
+    assert 0 < left.retained and budget < r._plan_cost(whole).required
+    total = 10 * r._plan_cost(whole).required
+    free = budget + int(total * _impl._MEMORY_RESERVE_FRACTION)
+    probe = TrainerRank.__new__(TrainerRank)
+    probe.device = torch.device("cuda")
+    monkeypatch.delenv(_impl._TEST_HOOKS_ENV, raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_allocator_backend", lambda: "native")
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (free, total))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda device: total)
+    monkeypatch.setattr(
+        r, "_available_memory_bytes", lambda: TrainerRank._available_memory_bytes(probe)
     )
-    assert not cache.handles()
-
-
-def test_late_registration_admits_known_staging_and_preserves_old_graph(
-    rank, monkeypatch
-):
-    rank._checkpoint_slots["student"] = _impl._CheckpointSlot()
-    cache = rank._forward_graph_cache()
-    handle, outputs = cache.run(
-        lambda value: (value.sin(),),
-        torch.ones(4, requires_grad=True),
-        retention="replay",
-        execution_peak_bytes=100,
-        checkpoint_versions=(rank._capture_checkpoint_version("student"),),
+    monkeypatch.setattr(
+        r, "_try_cache_recovery", lambda *a, **kw: pytest.fail("Split already fits")
     )
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 250)
-    references = []
-    tag = rank._tag_custom_parameters
+    executed = _recording_executor(monkeypatch, r)
+    batches = list(r.forward_batches([requests]))
+    assert len(batches) == 1 and batches[0].stats.subforward_count == 2
+    assert batches[0].stats.global_count == 1 and len(executed) == 2
+    assert [
+        [int(output.target_logprobs.item()) for output in group]
+        for group in batches[0].outputs
+    ] == [[7, 107, 207, 307]]
+    assert r.last_forward_telemetry()["subforward_request_indices"] == ((0, 1), (2, 3))
+    assert not torch.cuda.is_initialized()
 
-    def watch(parameters):
-        references.extend(weakref.ref(parameter) for parameter in parameters)
-        tag(parameters)
 
-    monkeypatch.setattr(rank, "_tag_custom_parameters", watch)
-    with pytest.raises(TrainerRankMemoryError, match="292 GPU bytes") as failure:
-        rank.module("head", _Head, checkpoint="student")
-    assert failure.value is not None
-    assert all(reference() is None for reference in references)
-    assert rank._checkpoint_slots["student"].params == ()
-    assert not rank._checkpoint_slots["student"].custom
-    assert cache.handles() == (handle,)
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 292)
-    head = rank.module("head", _Head, checkpoint="student")
-    value = rank._forward_cotangent_collector().attach(detach_tree(handle, outputs))[0]
-    rank.backward(head(value).sum())
-    torch.testing.assert_close(
-        head.weight.grad,
-        torch.full_like(head.weight, torch.sin(torch.tensor(1.0)).item()),
+def test_outputs_retention_and_empirical_peak_are_counted_once():
+    r = rank()
+    plan = r._plan_flat_forward([request(grad=True)])
+    retained = 512 * 40 * 2048 * 2
+    gradient = 512 * 40 * 2048 * 2
+    head = 3 * 512 * 248320 * 2
+    cost = r._plan_cost(plan)
+    assert cost.retained == int((plan.output_bytes + retained + head) * 1.1)
+    assert cost.required == int((plan.output_bytes + retained + gradient + head) * 1.1)
+    r._memory_profiles[plan.signature] = _MemoryProfile(
+        bytes_per_token=2_000_000,
+        packed_tokens=512,
+        logical_per_packed=1,
+        retained_compute_bytes_per_token=1,
     )
+    cost = r._plan_cost(plan)
+    # Packed pricing adds head and caller memory for every logical row.
+    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * 512
+    assert cost.required == int((plan.output_bytes + 512 * 2_000_000 + rows) * 1.1)
+    assert cost.retained == int((plan.output_bytes + retained) * 1.1)
 
 
-def test_remote_repeated_head_targets_stream_and_preserve_source_packets(
-    rank, monkeypatch
-):
-    _register(rank, "parameter")
-    parameter = rank._checkpoint_slots["student"].params[0]
-    collector = CotangentCollector()
-    live = LiveHead(export_head(rank, "student", "head"), torch.ones(4, 4), collector)
-    assert isinstance(live.value, torch.Tensor)
-    packets = collector.backward(
-        torch.stack([(live.value * factor).sum() for factor in (2, 3, 4)]).sum()
+def test_ignored_targets_hidden_only_and_tiny_target_group():
+    r = rank()
+    ignored = request(ignored=True)
+    hidden = ForwardInput(
+        input_tokens=torch.arange(10000), hidden_states=True, no_grad=True
     )
-    sources = tuple(
-        g.clone() for packet in packets if (g := packet.gradients[0]) is not None
+    target = request(1, grad=True)
+    assert r._head_projection_rows([ignored, hidden]) == 0
+    assert r._plan_head_workspace_bytes(r._plan_flat_forward([ignored, hidden])) == 0
+    plan = r._plan_flat_forward([hidden, target])
+    assert r._plan_head_workspace_bytes(plan) == 3 * 248320 * 2
+    assert r._estimate_flat_forward([hidden, target])[-1] == 3 * 248320 * 2
+    assert r._estimate_flat_forward([hidden, target], exact=True)[-1] == 3 * 248320 * 2
+
+
+def test_multilabel_row_validity_matches_projection():
+    r = rank()
+    item = replace(
+        request(4),
+        target_tokens=torch.tensor([[-100, -100], [-100, 2], [3, -100], [-100, -100]]),
     )
-    assert len(sources) == len(packets)
-    commit = rank._commit_versioned_gradients
-    sizes = []
-
-    def record(gradients):
-        sizes.append(len(gradients))
-        commit(gradients)
-
-    monkeypatch.setattr(rank, "_commit_versioned_gradients", record)
-    _Executor(rank, "zero")._backward(packets, retain_graph=False)
-    assert sizes == [1, 1, 1]
-    torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 9))
-    for packet, source in zip(packets, sources, strict=True):
-        torch.testing.assert_close(packet.gradients[0], source)
+    assert r._head_projection_rows([item]) == 2
+    assert r._plan_head_workspace_bytes(r._plan_flat_forward([item])) == 2 * 248320 * 2
 
 
-def test_frozen_and_buffer_only_registration_needs_no_gradient_reserve(
-    rank, monkeypatch
-):
-    rank._checkpoint_slots["student"] = _impl._CheckpointSlot()
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 0)
-    rank.buffer("buffer", lambda: torch.ones(16), checkpoint="student")
-    rank.module("frozen", lambda: _Head().requires_grad_(False), checkpoint="student")
-    assert rank._checkpoint_slots["student"].params == ()
-
-
-@pytest.mark.parametrize("kind", ["buffer", "frozen"])
-def test_nontrainable_registration_preserves_pending_graph_workspace(
-    rank, monkeypatch, kind
-):
-    rank._checkpoint_slots["student"] = _impl._CheckpointSlot()
-    cache = rank._forward_graph_cache()
-    handle, outputs = cache.run(
-        lambda value: (value.sin(),),
-        torch.ones(4, requires_grad=True),
-        retention="replay",
-        execution_peak_bytes=100,
-        checkpoint_versions=(rank._capture_checkpoint_version("student"),),
+def test_shared_rows_use_lower_upper_and_exact_layout_union():
+    r = rank()
+    a = replace(request(2), target_tokens=torch.tensor([1, -100]))
+    b = replace(a, target_tokens=torch.tensor([-100, 1]))
+    req = [a, a, b, b]
+    assert r._head_projection_rows(req, lower_bound=True) == 1
+    assert r._head_projection_rows(req) == 4
+    exact = r._estimate_flat_forward(req, exact=True, memory_minimal=True)
+    plan = r._plan_flat_forward(req, memory_minimal=True)
+    assert exact[-1] == r._plan_head_workspace_bytes(plan) == 2 * 248320 * 2
+    lower = r._split_chunk_lower_cost(
+        req, tuple(x.input_tokens for x in req), checkpoint=Unset
     )
+    assert lower.required <= r._plan_cost(plan).required
+    assert r._estimate_flat_forward(req, memory_minimal=True)[-1] == 248320 * 2
 
-    def register():
-        if kind == "buffer":
-            return rank.buffer("head", lambda: torch.ones(16), checkpoint="student")
-        return rank.module(
-            "head", lambda: _Head().requires_grad_(False), checkpoint="student"
+
+def test_exact_selector_estimate_matches_executed_layout():
+    r = rank()
+    req = [replace(request(2), target_tokens=torch.tensor([1, -100])) for _ in range(4)]
+    for minimal in (False, True):
+        values = r._estimate_flat_forward(req, exact=True, memory_minimal=minimal)
+        plan = r._plan_flat_forward(req, memory_minimal=minimal)
+        assert values[-1] == r._plan_head_workspace_bytes(plan)
+        n, out, sig, groups, head = values
+        assert (
+            r._estimate_required_memory_bytes_from_values(
+                packed_tokens=n,
+                output_bytes=out,
+                signature=sig,
+                logical_tokens=plan.active_logical_tokens,
+                group_rows=groups,
+                head_workspace_bytes=head,
+            )
+            == r._memory_check(plan).estimated_required_bytes
         )
 
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 99)
-    with pytest.raises(TrainerRankMemoryError, match="100 GPU bytes"):
-        register()
-    assert not rank._checkpoint_slots["student"].custom
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 100)
-    register()
-    assert rank._checkpoint_slots["student"].params == ()
-    value = rank._forward_cotangent_collector().attach(detach_tree(handle, outputs))[0]
-    rank.backward(value.sum())
-    assert not cache.handles()
+
+def test_device_labels_use_capacity_without_reading_values():
+    r = rank()
+    item = replace(
+        request(128), target_tokens=torch.empty(128, device="meta", dtype=torch.long)
+    )
+    assert r._head_projection_rows([item]) == 128
+    assert r._head_projection_rows([item], lower_bound=True) == 0
+    assert r._head_projection_rows([item], positions=(torch.arange(128),)) == 128
+
+
+def test_topk_and_logits_project_ignored_rows_and_chunk_cap():
+    r = rank()
+    ignored = request(2048, ignored=True)
+    assert r._head_projection_rows([replace(ignored, top_k=2)]) == 512
+    assert r._head_projection_rows([replace(ignored, logits=True)]) == 512
+    assert r._head_workspace_bytes(4096) == 512 * 248320 * 2
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "dtype",
+        "tp",
+        "head_hook",
+        "head_override",
+        "head_dispatch_override",
+        "vocab_shape",
+        "quantized",
+        "missing_weight",
+        "unknown_vocab",
+    ],
+)
+def test_unsupported_head_scope_does_not_claim_dense_bf16_component(mutation):
+    r = rank()
+    head = r.runtime.model[0].output_layer
+    assert r._head_workspace_bytes(512) > 0
+    if mutation == "dtype":
+        head.weight = torch.nn.Parameter(head.weight.float())
+    elif mutation == "tp":
+        r._topology_key = lambda: (1, 2, 1, 1)
+    elif mutation == "head_hook":
+        head.register_forward_hook(lambda *args: None)
+    elif mutation == "head_override":
+        head.forward = lambda *args, **kwargs: None
+    elif mutation == "head_dispatch_override":
+        head._forward_impl = lambda *args, **kwargs: None
+    elif mutation == "vocab_shape":
+        head.output_size_per_partition -= 1
+    elif mutation == "missing_weight":
+        head.weight = None
+    elif mutation == "unknown_vocab":
+        r._padded_vocab_size = None
+    else:
+        r.runtime.model[0].config.fp8 = "hybrid"
+    assert r._head_workspace_bytes(512) == 0
+
+
+def test_device_positions_preserve_capacity_without_read():
+    r = rank()
+    item = request(128)
+    assert (
+        r._head_projection_rows(
+            [item], positions=(torch.empty(128, device="meta", dtype=torch.long),)
+        )
+        == 128
+    )
+
+
+def test_tied_standard_head_weight_uses_the_same_capacity():
+    r = rank()
+    model = r.runtime.model[0]
+    head = model.output_layer
+    weight = head.weight
+    head.weight = None
+    model.share_embeddings_and_output_weights = True
+    model.embedding = torch.nn.Module()
+    model.embedding.word_embeddings = torch.nn.Module()
+    model.embedding.word_embeddings.weight = weight
+    assert r._head_workspace_bytes(512) == 512 * 248320 * 2
+
+
+@pytest.mark.parametrize("rows", [128, 512])
+def test_target_backward_refuses_budget_below_logits_and_both_gradients(rows):
+    r = rank()
+    plan = r._plan_flat_forward([request(rows, grad=True)])
+    retained, _ = r._checkpoint_memory_floor(r._plan_group_rows(plan))
+    gradient = rows * 40 * 2048 * 2
+    dense = min(rows, 512) * 248320 * 2
+    before = int((plan.output_bytes + retained + gradient + 2 * dense) * 1.1)
+    expected = int((plan.output_bytes + retained + gradient + 3 * dense) * 1.1)
+    r._available_memory_bytes = lambda: (before + expected) // 2
+    check = r._memory_check(plan)
+    assert check.estimated_required_bytes == expected
+    assert not check.fits
+
+
+@pytest.mark.parametrize("gradient_rows,reference_rows", [(1, 512), (512, 1)])
+def test_group_head_workspace_keeps_gradient_mode_with_its_rows(
+    gradient_rows, reference_rows
+):
+    r = rank()
+    requests = [request(gradient_rows, grad=True), request(reference_rows)]
+    expected = max(3 * gradient_rows, reference_rows) * 248320 * 2
+    plan = r._plan_flat_forward(requests)
+    assert r._plan_head_workspace_bytes(plan) == expected
+    for exact in (False, True):
+        for minimal in (False, True):
+            assert (
+                r._estimate_flat_forward(requests, exact=exact, memory_minimal=minimal)[
+                    -1
+                ]
+                == expected
+            )
+
+
+@pytest.mark.parametrize(
+    "mutation", ["custom", "other_model", "forged", "mup", "missing"]
+)
+def test_gradient_statistics_floor_requires_exact_effective_scaling(mutation):
+    from types import MethodType, SimpleNamespace
+
+    from megatron.core.models.common.language_module.language_module import (
+        LanguageModule,
+    )
+
+    r = rank()
+    model = r.runtime.model[0]
+    req = [request(128, grad=True)]
+    assert (
+        r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 3 * 128 * 248320 * 2
+    )
+    if mutation == "custom":
+        model._scale_logits = lambda logits: logits
+    elif mutation == "other_model":
+        model._scale_logits = MethodType(
+            LanguageModule._scale_logits,
+            SimpleNamespace(config=SimpleNamespace(use_mup=True, mup_output_mult=2)),
+        )
+    elif mutation == "forged":
+
+        class Forged:
+            __self__ = model
+            __func__ = LanguageModule._scale_logits
+
+            def __call__(self, logits):
+                return logits[..., :1]
+
+        model._scale_logits = Forged()
+    elif mutation == "mup":
+        model.config.use_mup = True
+    else:
+        del model._scale_logits
+    # The standard head still allocates its original one-buffer component.
+    assert r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 128 * 248320 * 2
+
+
+@pytest.mark.parametrize("extra", [{"logits": True}, {"top_k": 2}])
+def test_gradient_statistics_floor_survives_additional_output_modes(extra):
+    r = rank()
+    req = [replace(request(128, grad=True), **extra)]
+    assert (
+        r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 3 * 128 * 248320 * 2
+    )
+
+
+def test_gradient_shared_rows_price_same_union_in_exact_and_split_lower_cost():
+    r = rank()
+    a = replace(request(2, grad=True), target_tokens=torch.tensor([1, -100]))
+    b = replace(a, target_tokens=torch.tensor([-100, 1]))
+    requests = [a, a, b, b]
+    plan = r._plan_flat_forward(requests, memory_minimal=True)
+    expected = 3 * 2 * 248320 * 2
+    exact = r._estimate_flat_forward(requests, exact=True, memory_minimal=True)
+    assert exact[-1] == r._plan_head_workspace_bytes(plan) == expected
+    assert r._estimate_flat_forward(requests, memory_minimal=True)[-1] == expected // 2
+    lower = r._split_chunk_lower_cost(
+        requests, tuple(x.input_tokens for x in requests), checkpoint=Unset
+    )
+    assert lower.required <= r._plan_cost(plan).required
+
+
+def test_later_sparse_loss_does_not_reduce_6330_projected_targets():
+    r = rank()
+    item = request(6330, grad=True)
+    plan = r._plan_flat_forward([item])
+    assert item.target_tokens.numel() == 6330
+    assert r._plan_head_workspace_bytes(plan) == 3 * 512 * 248320 * 2

@@ -4,6 +4,7 @@ from copy import deepcopy
 from functools import partial
 import gc
 import pickle
+import threading
 from types import SimpleNamespace
 from typing import Any, cast
 import weakref
@@ -11,6 +12,7 @@ import weakref
 import pytest
 import torch
 from torch._dynamo.testing import CompileCounterWithBackend
+import torch.utils.checkpoint as torch_checkpoint
 
 pytest.importorskip("megatron.bridge")
 
@@ -21,7 +23,9 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoEFlexTokenDispatcher,
 )
 
+from art.megatron import lora as lora_module
 from art.trainer_rank import TrainerRank
+from art.trainer_rank._backward_work import BackwardWork
 from art.trainer_rank._impl import _configure_moe_dispatcher_caches
 
 
@@ -123,6 +127,251 @@ def cpu_checkpoint_rng(monkeypatch):
     monkeypatch.setattr(
         mcore_random, "_set_all_rng_states", lambda state: torch.set_rng_state(state)
     )
+
+
+@pytest.fixture
+def cpu_backward_events(cpu_checkpoint_rng, monkeypatch):
+    # Synthetic readiness tests engine bookkeeping, not CUDA completion. Keep
+    # production's CPU-disabled default unless a case explicitly enables it.
+    assert not torch.cuda.is_initialized()
+    assert getattr(mcore_random.checkpoint, "_art_lora_slot_context_patch", False)
+    assert getattr(torch_checkpoint.checkpoint, "_art_lora_slot_context_patch", False)
+    events = []
+    stream = object()
+
+    class ReadyEvent:
+        def __init__(self, *, enable_timing):
+            assert not enable_timing
+            events.append(self)
+
+        def record(self, actual_stream):
+            assert actual_stream is stream
+            self.task = torch._C._current_graph_task_id()
+
+        def query(self):
+            return True
+
+    monkeypatch.setattr(torch.cuda, "Event", ReadyEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: stream)
+    # MCore leaves this flag set when recomputation raises. Restore the caller's
+    # original state at fixture teardown, without changing that failure path.
+    monkeypatch.setattr(mcore_random, "IS_CHECKPOINTING", False)
+    yield events
+    assert not torch.cuda.is_initialized()
+
+
+def _backward_inputs():
+    x = (
+        torch.linspace(-0.5, 0.5, 24, dtype=torch.float64)
+        .reshape(4, 6)
+        .requires_grad_()
+    )
+    params = [
+        torch.linspace(-0.2 + i * 0.03, 0.2 + i * 0.03, 12, dtype=torch.float64)
+        .reshape(6, 2)
+        .requires_grad_()
+        for i in range(4)
+    ]
+    return x, params
+
+
+def _backward_layer(value, a, b):
+    return torch.tanh(value + 0.25 * ((value @ a) @ b.T))
+
+
+def _backward_outputs(hidden, head):
+    output = SimpleNamespace(
+        target_logprobs=head[:, 0],
+        logits=head[:, :3],
+        hidden_states=hidden,
+        top_k=SimpleNamespace(logprobs=head[:, 3:]),
+    )
+    fields = (output.target_logprobs, output.logits, hidden, output.top_k.logprobs)
+    return output, sum(t.square().mean() + 0.07 * t.sum() for t in fields)
+
+
+@pytest.mark.parametrize(
+    "enabled", [False, True], ids=["cpu-disabled", "cpu-ready-facade"]
+)
+def test_backward_work_mixed_checkpoint(cpu_backward_events, enabled):
+    work = BackwardWork(threading.RLock(), torch.device("cpu"))
+    assert work.disabled
+    if enabled:
+        work.disabled = False
+    owned = lora_module.LoRASlotRef("lora", "owned")
+    ambient = lora_module.LoRASlotRef("lora", "ambient")
+
+    def iteration():
+        x, params = _backward_inputs()
+        reference_x, reference_params = _backward_inputs()
+        calls, inner_tasks, recomputed = [], [], []
+
+        def layer(index):
+            a, b = params[index * 2 : index * 2 + 2]
+
+            def compute(value, context):
+                assert lora_module._CURRENT_LORA_SLOT.get() is owned
+                calls.append(torch.is_grad_enabled())
+                result = _backward_layer(value, a, b)
+                if torch.is_grad_enabled():
+                    recomputed.append(weakref.ref(value))
+                    result.register_hook(
+                        lambda grad: inner_tasks.append(
+                            torch._C._current_graph_task_id()
+                        )
+                    )
+                return result, context
+
+            return compute
+
+        with lora_module.use_lora_slot(owned):
+            hidden = x
+            for i in range(2):
+                hidden, _ = mcore_random.checkpoint(layer(i), False, hidden, None)
+            head = torch_checkpoint.checkpoint(
+                lambda z: z.sin().square(),
+                hidden,
+                use_reentrant=False,
+            )
+        output, loss = _backward_outputs(hidden, head)
+        expected = reference_x
+        for i in range(2):
+            expected = _backward_layer(expected, *reference_params[i * 2 : i * 2 + 2])
+        _, reference_loss = _backward_outputs(expected, expected.sin().square())
+        work.attach([output, output])
+        assert len(work.outputs) == (4 if enabled else 0)
+        outer_tasks = []
+        for attempt in range(2):
+            before, event_count = work.work_ns, len(cpu_backward_events)
+            with lora_module.use_lora_slot(ambient):
+                loss.backward(retain_graph=attempt == 0)
+                assert lora_module._CURRENT_LORA_SLOT.get() is ambient
+            reference_loss.backward(retain_graph=attempt == 0)
+            for actual, expected_grad in zip(
+                (x, *params), (reference_x, *reference_params), strict=True
+            ):
+                assert actual.grad is not None and expected_grad.grad is not None
+                torch.testing.assert_close(
+                    actual.grad, expected_grad.grad, rtol=1e-12, atol=1e-12
+                )
+            assert work.work_ns == before
+            if enabled:
+                assert (
+                    len(work.rows) == 1 and len(cpu_backward_events) == event_count + 1
+                )
+                task, row = next(iter(work.rows.items()))
+                assert row.ended is not None and row.ended > row.started
+                assert not row.blocked and row.tail.task == task
+                outer_tasks.append(task)
+                before += row.ended - row.started
+            else:
+                assert not work.rows and len(cpu_backward_events) == event_count
+            work.harvest()
+            assert work.work_ns == before and not work.rows
+            work.harvest()
+            assert work.work_ns == before
+        assert len(calls) == 6 and sum(calls) == 4
+        assert len(inner_tasks) == 4 and not set(inner_tasks).intersection(outer_tasks)
+        assert all(type(task) is int and task >= 0 for task in inner_tasks)
+        assert len(set(outer_tasks)) == (2 if enabled else 0)
+        assert not mcore_random.is_checkpointing() and not work.invalid
+        assert work.cost_ns > 0
+        return recomputed + [
+            weakref.ref(t)
+            for t in (
+                x,
+                *params,
+                hidden,
+                head,
+                output.target_logprobs,
+                output.logits,
+                output.top_k.logprobs,
+            )
+        ]
+
+    try:
+        for _ in range(2):
+            refs = iteration()
+            gc.collect()
+            assert all(ref() is None for ref in refs)
+            work.attach([])
+            assert not work.outputs and not work.rows
+    finally:
+        work.close()
+    owner = weakref.ref(work)
+    del work
+    gc.collect()
+    assert owner() is None
+
+
+def test_backward_work_checkpoint_failure_lifetime(cpu_backward_events):
+    work = BackwardWork(threading.RLock(), torch.device("cpu"))
+    work.disabled = False  # Test-only CPU readiness facade.
+
+    def failed_iteration():
+        original = RuntimeError("checkpoint recomputation failed")
+        cause = ValueError("original cause")
+        x, params = _backward_inputs()
+        owned = lora_module.LoRASlotRef("lora", "owned")
+        ambient = lora_module.LoRASlotRef("lora", "ambient")
+
+        def compute(value, context):
+            assert lora_module._CURRENT_LORA_SLOT.get() is owned
+            if torch.is_grad_enabled():
+                raise original from cause
+            return _backward_layer(value, *params[:2]), context
+
+        with lora_module.use_lora_slot(owned):
+            hidden, _ = mcore_random.checkpoint(compute, False, x, None)
+            head = torch_checkpoint.checkpoint(
+                lambda z: z.sin().square(),
+                hidden,
+                use_reentrant=False,
+            )
+        output, loss = _backward_outputs(hidden, head)
+        work.attach([output])
+        with lora_module.use_lora_slot(ambient):
+            try:
+                loss.backward()
+            except RuntimeError as error:
+                assert error is original and error.__cause__ is cause
+            else:
+                pytest.fail("Expected the original recomputation error")
+            assert lora_module._CURRENT_LORA_SLOT.get() is ambient
+        assert len(work.rows) == 1
+        assert all(row.ended is None and row.tail is None for row in work.rows.values())
+        work.harvest()
+        assert work.work_ns == 0 and not cpu_backward_events
+        work.close()
+        assert work.closed and not work.rows and not work.outputs
+        # This fixture owns the pre-created exception captured by compute.
+        # Its traceback can retain this frame/graph. Dispose of it only after
+        # error/cause assertions; production must preserve the original error.
+        original.__traceback__ = None
+        assert original.__cause__ is cause
+        return [
+            weakref.ref(t)
+            for t in (
+                x,
+                *params,
+                hidden,
+                head,
+                output.target_logprobs,
+                output.logits,
+                output.top_k.logprobs,
+            )
+        ]
+
+    try:
+        refs = failed_iteration()
+        gc.collect()
+        assert all(ref() is None for ref in refs)
+    finally:
+        work.close()
+    owner = weakref.ref(work)
+    del work
+    gc.collect()
+    assert owner() is None
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -376,3 +625,302 @@ def test_dispatcher_custom_combine_is_preserved():
     assert dispatcher.probs.numel() == 0
     assert dispatcher.routing_map is not None
     assert dispatcher.reversed_local_input_permutation_mapping is not None
+
+
+def _hybridep_dispatch(*, x, routing_map, probs, num_local_experts, **_):
+    # CPU stand-in for HybridEP's fused dispatch: routed rows, their
+    # differentiable probabilities, per-expert counts and a combine handle.
+    rows, columns = routing_map.nonzero(as_tuple=True)
+    counts = routing_map.sum(0)
+    return x[rows], probs[rows, columns], None, counts, (rows, x.shape[0])
+
+
+def _hybridep_combine(*, x, handle, **_):
+    rows, tokens = handle
+    return x.new_zeros(tokens, x.shape[-1]).index_add(0, rows, x)
+
+
+@pytest.fixture
+def cpu_hybridep(cpu_checkpoint_rng, monkeypatch):
+    from megatron.core.transformer.moe import token_dispatcher
+
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_dispatch", _hybridep_dispatch)
+    monkeypatch.setattr(token_dispatcher, "hybrid_ep_combine", _hybridep_combine)
+
+
+def _flex_dispatcher(manager: str = "hybridep") -> Any:
+    # Upstream flex dispatcher and HybridEP manager methods, with CPU fused
+    # kernels and without distributed initialization.
+    from megatron.core.transformer.moe.token_dispatcher import (
+        _DeepepManager,
+        _HybridEPManager,
+    )
+
+    config = SimpleNamespace(
+        cuda_graph_impl="none",
+        fp8=None,
+        fp4=None,
+        moe_hybridep_num_sms=1,
+        moe_router_topk=2,
+    )
+    dispatcher: Any = object.__new__(MoEFlexTokenDispatcher)
+    dispatcher.config = config
+    dispatcher.tp_size = dispatcher.ep_size = 1
+    dispatcher.num_local_experts = 4
+    comm: Any = object.__new__(
+        _HybridEPManager if manager == "hybridep" else _DeepepManager
+    )
+    comm.group = None
+    comm.num_local_experts = comm.num_experts = 4
+    comm.config = config
+    comm.drop_and_pad = False
+    comm.num_permuted_tokens = comm.pad_multiple = comm.handle = None
+    comm.token_probs = None
+    dispatcher._comm_manager = comm
+    return dispatcher
+
+
+class _FlexRouterLayer(torch.nn.Module):
+    def __init__(self, manager: str = "hybridep"):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(8, 4))
+        self.token_dispatcher = _flex_dispatcher(manager)
+
+    def forward(self, value):
+        probs = (value.reshape(-1, 8) @ self.weight).softmax(-1)
+        routing = torch.zeros_like(probs, dtype=torch.bool)
+        routing.scatter_(1, probs.topk(2, dim=-1).indices, True)
+        dispatcher = self.token_dispatcher
+        hidden, token_probs = dispatcher.dispatch_preprocess(value, routing, probs)
+        routed, routed_probs = dispatcher.token_dispatch(hidden, token_probs)
+        routed, _, routed_probs = dispatcher.dispatch_postprocess(routed, routed_probs)
+        transformed = routed.tanh() * routed_probs[:, None]
+        combined = dispatcher.token_combine(dispatcher.combine_preprocess(transformed))
+        return value + 0.2 * dispatcher.combine_postprocess(combined)
+
+
+def _run_checkpointed_flex_router(model, *, install_before_backward=False):
+    model.zero_grad(set_to_none=True)
+    initial = torch.linspace(-1, 1, 88).reshape(1, 11, 8).requires_grad_()
+    inputs = []
+
+    def checkpointed(layer):
+        def compute(value):
+            if torch.is_grad_enabled():
+                assert value.is_leaf
+                inputs.append(weakref.ref(value))
+            return layer(value)
+
+        return compute
+
+    hidden = initial
+    for layer in model:
+        hidden = mcore_random.CheckpointFunction.apply(
+            checkpointed(layer), False, hidden
+        )
+    loss = hidden.square().sum()
+    if install_before_backward:
+        # This forward ran unadapted; installation must release its state.
+        _configure_moe_dispatcher_caches([model])
+    loss.backward()
+    gc.collect()
+    assert len(inputs) == len(model)
+    alive = [reference() is not None for reference in inputs]
+    gradients = []
+    for value in [initial, *model.parameters()]:
+        assert value.grad is not None
+        gradients.append(value.grad.clone())
+    for layer in model:
+        comm = cast(Any, layer).token_dispatcher._comm_manager
+        comm.routing_map = comm.token_probs = comm.dispatched_probs = None
+    gc.collect()
+    assert all(reference() is None for reference in inputs)
+    return loss.detach(), gradients, alive
+
+
+@pytest.mark.parametrize("pending_graph", [False, True])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_hybridep_state_releases_checkpoint_inputs(
+    cpu_hybridep, compiled, pending_graph
+):
+    torch.manual_seed(954)
+    model = torch.nn.ModuleList([_FlexRouterLayer() for _ in range(4)])
+    backend = CompileCounterWithBackend("aot_eager") if compiled else None
+    if backend is not None:
+        model = torch.nn.ModuleList(
+            [
+                cast(torch.nn.Module, torch.compile(layer, backend=backend))
+                for layer in model
+            ]
+        )
+    original = MoEFlexTokenDispatcher.combine_postprocess
+    try:
+        reference_loss, reference_grads, retained = _run_checkpointed_flex_router(model)
+        # Upstream HybridEP keeps each layer's checkpoint graph after backward.
+        assert all(retained)
+        # Install into the already-warmed (compiled) model without a reset.
+        if not pending_graph:
+            _configure_moe_dispatcher_caches([model])
+        loss, gradients, retained = _run_checkpointed_flex_router(
+            model, install_before_backward=pending_graph
+        )
+        assert not any(retained)
+        assert torch.equal(loss, reference_loss)
+        for actual, expected in zip(gradients, reference_grads, strict=True):
+            assert torch.equal(actual, expected)
+        dispatchers = [cast(Any, layer).token_dispatcher for layer in model]
+        for dispatcher in dispatchers:
+            assert isinstance(dispatcher.combine_postprocess, partial)
+            assert dispatcher._comm_manager.token_probs is None
+        assert MoEFlexTokenDispatcher.combine_postprocess is original
+        adapted = [dispatcher.combine_postprocess for dispatcher in dispatchers]
+        _configure_moe_dispatcher_caches([model])
+        assert [d.combine_postprocess for d in dispatchers] == adapted
+        if backend is not None:
+            assert backend.frame_count > 0
+    finally:
+        torch.compiler.reset()
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_hybridep_state_allows_outstanding_forwards_and_repeated_backward(
+    cpu_hybridep, compiled, checkpointed
+):
+    torch.manual_seed(848)
+    reference = torch.nn.Sequential(_FlexRouterLayer(), _FlexRouterLayer())
+    adapted = deepcopy(reference)
+    _configure_moe_dispatcher_caches([adapted])
+    if compiled:
+        reference = cast(torch.nn.Module, torch.compile(reference, backend="aot_eager"))
+        adapted = cast(torch.nn.Module, torch.compile(adapted, backend="aot_eager"))
+
+    def run(model):
+        inputs = [
+            torch.linspace(-1 + offset, 1 + offset, 88)
+            .reshape(1, 11, 8)
+            .requires_grad_()
+            for offset in (0, 0.3)
+        ]
+        outputs = [
+            mcore_random.CheckpointFunction.apply(model, False, value)
+            if checkpointed
+            else model(value)
+            for value in inputs
+        ]
+        losses = [output.square().sum() for output in outputs]
+        losses[1].backward(retain_graph=True)
+        losses[0].backward()
+        losses[1].backward()
+        gradients = []
+        for tensor in [*inputs, *model.parameters()]:
+            assert tensor.grad is not None
+            gradients.append(tensor.grad.clone())
+        return [output.detach() for output in outputs], gradients
+
+    try:
+        expected_outputs, expected_grads = run(reference)
+        outputs, grads = run(adapted)
+        for actual, expected in zip(
+            [*outputs, *grads], [*expected_outputs, *expected_grads], strict=True
+        ):
+            assert torch.equal(actual, expected)
+        for module in adapted.modules():
+            if isinstance(module, _FlexRouterLayer):
+                comm = module.token_dispatcher._comm_manager
+                assert comm.routing_map is None
+                assert comm.token_probs is None
+                assert comm.dispatched_probs is None
+    finally:
+        torch.compiler.reset()
+
+
+def test_hybridep_state_released_after_each_combine(cpu_hybridep):
+    layer = _FlexRouterLayer()
+    _configure_moe_dispatcher_caches([layer])
+    comm = layer.token_dispatcher._comm_manager
+    value = torch.randn(1, 11, 8, requires_grad=True)
+    output = layer(value)
+    # Backward keeps what it needs through the graph, not the manager.
+    assert comm.routing_map is None
+    assert comm.token_probs is None
+    assert comm.dispatched_probs is None
+    assert comm.handle is None
+    output.square().sum().backward()
+    assert value.grad is not None and torch.isfinite(value.grad).all()
+    assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
+
+
+def test_hybridep_install_releases_existing_state(cpu_hybridep):
+    # A forward that ran before installation leaves its state on the manager;
+    # installation itself must drop it, not only later combines.
+    layer = _FlexRouterLayer()
+    value = torch.randn(1, 11, 8, requires_grad=True)
+    output = layer(value)
+    comm = layer.token_dispatcher._comm_manager
+    held = weakref.ref(comm.dispatched_probs)
+    assert comm.routing_map is not None and comm.token_probs is not None
+    _configure_moe_dispatcher_caches([layer])
+    assert comm.routing_map is None
+    assert comm.token_probs is None
+    assert comm.dispatched_probs is None
+    output.square().sum().backward()
+    assert value.grad is not None and torch.isfinite(value.grad).all()
+    del output
+    gc.collect()
+    assert held() is None
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "deepep",
+        "cuda_graph",
+        "custom_combine",
+        "dispatcher_subclass",
+        "manager_subclass",
+    ],
+)
+def test_other_flex_dispatchers_keep_their_state(cpu_hybridep, case):
+    layer = _FlexRouterLayer("deepep" if case == "deepep" else "hybridep")
+    dispatcher = layer.token_dispatcher
+    if case == "dispatcher_subclass":
+        dispatcher.__class__ = type("CustomFlex", (MoEFlexTokenDispatcher,), {})
+    if case == "manager_subclass":
+        manager_type = type(dispatcher._comm_manager)
+        dispatcher._comm_manager.__class__ = type("CustomManager", (manager_type,), {})
+    if case == "cuda_graph":
+        # CUDA graph capture reads routing inputs back from the manager.
+        dispatcher.config.cuda_graph_impl = "transformer_engine"
+    combine = dispatcher.combine_postprocess
+    if case == "custom_combine":
+        dispatcher.combine_postprocess = combine
+    probs = dispatcher._comm_manager.token_probs = torch.ones(1)
+    _configure_moe_dispatcher_caches([layer])
+    assert "combine_postprocess" not in vars(dispatcher) or (
+        dispatcher.combine_postprocess is combine
+    )
+    assert dispatcher._comm_manager.token_probs is probs
+
+
+@pytest.mark.parametrize("round_trip", ["pickle", "deepcopy"])
+def test_hybridep_adaptation_survives_serialization(cpu_hybridep, round_trip):
+    torch.manual_seed(954)
+    model = torch.nn.ModuleList([_FlexRouterLayer() for _ in range(2)])
+    expected_loss, expected_grads, retained = _run_checkpointed_flex_router(model)
+    assert all(retained)
+    _configure_moe_dispatcher_caches([model])
+    clone: Any = (
+        pickle.loads(pickle.dumps(model)) if round_trip == "pickle" else deepcopy(model)
+    )
+    for layer in clone:
+        dispatcher = layer.token_dispatcher
+        combine = dispatcher.combine_postprocess
+        assert isinstance(combine, partial) and combine.args[0] is dispatcher
+        _configure_moe_dispatcher_caches([clone])
+        assert dispatcher.combine_postprocess is combine
+    loss, gradients, retained = _run_checkpointed_flex_router(clone)
+    assert not any(retained)
+    assert torch.equal(loss, expected_loss)
+    for actual, expected in zip(gradients, expected_grads, strict=True):
+        assert torch.equal(actual, expected)

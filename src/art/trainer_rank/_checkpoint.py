@@ -1495,7 +1495,9 @@ def _load_adapter(
         )
 
         loaded = load_lora_tensors_for_megatron(
-            source.path, handler=trainer.runtime.model_support_handler
+            source.path,
+            handler=trainer.runtime.model_support_handler,
+            provider=getattr(trainer.runtime, "provider", None),
         )
         return {key: value for key, value in loaded.items() if key in set(keys)}
     safe_open = importlib.import_module("safetensors").safe_open

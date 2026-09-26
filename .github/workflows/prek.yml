@@ -223,11 +223,27 @@ jobs:
             tests/unit/test_prefix_tree_attention_builder.py \
             tests/unit/test_prefix_tree_grad_parity.py \
             tests/unit/test_prefix_tree_packing.py \
+            tests/unit/test_trainer_rank_handoff_budget.py \
+            tests/unit/test_qwen35_adapter_config.py \
+            tests/unit/test_trainer_rank_physical_reserve.py \
             tests/unit/test_trainer_rank_validation.py \
             tests/unit/test_trainer_rank_weird_shapes.py \
             tests/unit/test_trainer_rank_slot_graph_lifetime.py \
             tests/unit/test_trainer_rank_commands.py::test_gloo_dp2_tp2_participation_and_gradients \
+            tests/unit/test_trainer_rank_admission_inputs.py \
+            tests/unit/test_trainer_rank_checkpoint_memory.py \
+            tests/unit/test_trainer_rank_tp_floor.py \
+            tests/unit/test_trainer_rank_checkpoint_gradient_memory.py \
+            tests/unit/test_trainer_rank_slot_memory.py \
+            tests/unit/test_trainer_rank_moe_memory.py \
+            tests/unit/test_trainer_rank_head_memory.py \
+            tests/unit/test_trainer_rank_mixed_head_memory.py \
+            tests/unit/test_trainer_rank_ignored_mixed_head.py \
+            tests/unit/test_trainer_rank_pending_memory.py \
+            tests/unit/test_trainer_rank_shared_memory.py \
+            tests/unit/test_trainer_rank_converted_memory.py \
             tests/unit/test_trainer_rank_split.py \
+            tests/unit/test_megatron_compile_garbage.py \
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
             tests/acceptance/trainer_rank_planner \
@@ -255,6 +271,22 @@ jobs:
             --ignore=tests/unit/test_prefix_tree_attention_builder.py \
             --ignore=tests/unit/test_prefix_tree_grad_parity.py \
             --ignore=tests/unit/test_prefix_tree_packing.py \
+            --ignore=tests/unit/test_trainer_rank_handoff_budget.py \
+            --ignore=tests/unit/test_qwen35_adapter_config.py \
+            --ignore=tests/unit/test_trainer_rank_physical_reserve.py \
             --ignore=tests/unit/test_trainer_rank_validation.py \
             --ignore=tests/unit/test_trainer_rank_weird_shapes.py \
-            --ignore=tests/unit/test_trainer_rank_slot_graph_lifetime.py
+            --ignore=tests/unit/test_trainer_rank_slot_graph_lifetime.py \
+            --ignore=tests/unit/test_trainer_rank_admission_inputs.py \
+            --ignore=tests/unit/test_trainer_rank_checkpoint_memory.py \
+            --ignore=tests/unit/test_trainer_rank_tp_floor.py \
+            --ignore=tests/unit/test_trainer_rank_checkpoint_gradient_memory.py \
+            --ignore=tests/unit/test_trainer_rank_slot_memory.py \
+            --ignore=tests/unit/test_trainer_rank_moe_memory.py \
+            --ignore=tests/unit/test_trainer_rank_head_memory.py \
+            --ignore=tests/unit/test_trainer_rank_mixed_head_memory.py \
+            --ignore=tests/unit/test_trainer_rank_ignored_mixed_head.py \
+            --ignore=tests/unit/test_trainer_rank_pending_memory.py \
+            --ignore=tests/unit/test_trainer_rank_shared_memory.py \
+            --ignore=tests/unit/test_megatron_compile_garbage.py \
+            --ignore=tests/unit/test_trainer_rank_converted_memory.py

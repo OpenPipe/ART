@@ -201,7 +201,11 @@ def test_equal_resolved_policies_still_pack_together(rank):
     assert len(rank._plan_flat_forward(requests).groups) == 1
 
 
-def test_cpu_shortage_is_not_overwritten_by_fresh_gpu_check(rank, monkeypatch):
+@pytest.mark.parametrize("allow_oversized", [False, True])
+def test_cpu_shortage_is_not_overwritten_by_fresh_gpu_check(
+    rank, monkeypatch, allow_oversized
+):
+    rank._allow_oversized_batches = allow_oversized
     monkeypatch.setattr(rank, "_available_cpu_memory_bytes", lambda: 0)
     plan = rank._plan_flat_forward(_requests()[:1])
     selected, check = rank._admit_graph_memory(plan)
@@ -214,6 +218,7 @@ def test_cpu_shortage_is_not_overwritten_by_fresh_gpu_check(rank, monkeypatch):
             lambda value, check: (value[0], check),
             context="test",
             sync_across_dp=True,
+            admit_refusal=lambda refused: (refused.plan, refused.check),
         )
     assert "CPU retained" in str(refusal.error("test"))
 

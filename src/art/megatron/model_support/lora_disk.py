@@ -19,6 +19,32 @@ safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
 
 
+def model_attention_dimensions(provider: Any) -> dict[str, int]:
+    """The running model's attention shape, in adapter-config keys."""
+    dimensions = {
+        "num_attention_heads": getattr(provider, "num_attention_heads", None),
+        "num_key_value_heads": getattr(provider, "num_query_groups", None),
+        "head_dim": getattr(provider, "kv_channels", None),
+        "hidden_size": getattr(provider, "hidden_size", None),
+    }
+    return {key: int(value) for key, value in dimensions.items() if value is not None}
+
+
+def with_model_attention_dimensions(
+    adapter_config: dict[str, Any], provider: Any
+) -> dict[str, Any]:
+    """Fill attention dimensions the adapter config omits or nulls from the model.
+
+    Values the adapter sets win. The handler resolves anything still missing
+    from the base model's config at the adapter's revision.
+    """
+    config = dict(adapter_config)
+    for key, value in model_attention_dimensions(provider).items():
+        if config.get(key) is None:
+            config[key] = value
+    return config
+
+
 def _jsonable_config(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _jsonable_config(item) for key, item in value.items()}
@@ -127,14 +153,24 @@ def load_lora_tensors_for_megatron(
     lora_path: str | Path,
     *,
     handler: ModelSupportHandler | None = None,
+    provider: Any = None,
     allow_unvalidated_arch: bool = False,
 ) -> dict[str, torch.Tensor]:
+    """Load an adapter in Megatron layout.
+
+    With the running model's ``provider``, conversion uses its attention shape
+    wherever the adapter config lacks one, instead of looking the base model
+    up again by name.
+    """
     resolved_handler = resolve_lora_handler(
         lora_path,
         handler,
         allow_unvalidated_arch=allow_unvalidated_arch,
     )
+    adapter_config = load_adapter_config(lora_path)
+    if provider is not None:
+        adapter_config = with_model_attention_dimensions(adapter_config, provider)
     return resolved_handler.from_vllm_lora_tensors(
         load_vllm_lora_tensors(lora_path),
-        adapter_config=load_adapter_config(lora_path),
+        adapter_config=adapter_config,
     )

@@ -421,27 +421,28 @@ def test_cp_prices_uneven_local_tokens_and_preserves_segment_states(
 
 
 @pytest.mark.parametrize("kind", ("full", "no_grad", "moe"))
-def test_cp_keeps_existing_full_no_grad_and_moe_costs(monkeypatch, kind):
+def test_cp_prices_group_rows_at_the_most_loaded_rank(monkeypatch, kind):
     rank = _rank(
         "full" if kind == "full" else "selective",
         **({"num_moe_experts": 64} if kind == "moe" else {}),
     )
 
     monkeypatch.setattr(rank, "_topology_key", lambda: (1, 1, 2, 1))
+    monkeypatch.setattr(rank, "_topology", lambda: SimpleNamespace(cp=2, tp=1))
     monkeypatch.setattr(
-        rank,
-        "_max_rank_model_tokens",
-        lambda *a, **kw: pytest.fail("unexpected CP plan"),
+        rank, "_max_rank_model_tokens", lambda batch, **_: batch.tokens.numel() - 1
     )
     plan = _plan(rank, no_grad=kind == "no_grad")
+    # Global counts cannot price per-rank floors: width probes defer to plans.
+    request = ForwardInput(
+        input_tokens=torch.tensor([1, 2]), hidden_states=True, no_grad=kind == "no_grad"
+    )
+    assert rank._estimate_flat_forward([request]) is None
+    # Retention stays global for these kinds; floors use the most loaded rank.
     assert rank._plan_retained_tokens(plan) == plan.packed_tokens
-    assert rank._memory_check(plan).estimated_required_bytes == (
-        rank._estimate_required_memory_bytes_from_values(
-            packed_tokens=plan.packed_tokens,
-            output_bytes=plan.output_bytes,
-            signature=plan.signature,
-            gdn_segments=plan.grad_segment_count,
-        )
+    assert rank._plan_group_rows(plan) == tuple(
+        (int(group.packed.tokens.numel()) - 1, group.grad_enabled)
+        for group in plan.groups
     )
 
 

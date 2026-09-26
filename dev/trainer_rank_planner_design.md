@@ -846,3 +846,94 @@ Head chunking and memory margins as data-dependent planner decisions;
 cost-model recalibration (including TP terms). Not planned: infeasibility
 proofs, all-rank planning/digest agreement, HybridEP/CUDA instrumentation from
 the research diff.
+
+### Opt-in scalar decision evidence
+
+The existing planner miss threshold also enables format-2 admission evidence.
+Completed measurements still report only when their absolute error exceeds the
+threshold. Final admission refusals and errors escaping the admission/recovery
+boundary report independently of that percentage; neither claims an observed
+execution peak. Errors before this boundary and uncaught process termination are
+not covered. Normal splitting/replanning, oversized admission, cache budgets,
+and original errors/cancellation remain authoritative.
+
+Each local admission attempt keeps its first and selected immutable memory
+samples separately from a 64-entry trace. Samples distinguish actual local
+required/available bytes from the existing reduced MAX-required/MIN-available
+result and record that reduction scope. Native allocator facts reuse the stats
+read underlying `memory_allocated`; no extra CUDA query, synchronization,
+collective, peak reset, or cache release is introduced. Other allocators retain
+their previous policy and leave unavailable fields null. A sample and attempt ID
+are local evidence, not a shared wave, limiting-peer identity, capacity reservation,
+or a guarantee that peers completed.
+
+A refresh retains its possibly already-reduced `required_operand_bytes`
+separately. The earlier local requirement is joined by same-attempt sample
+ordinal, or left null when unavailable; it is not a new local estimate at the
+refresh timestamp. Admission is not repriced to fill this evidence.
+
+The trace retains existing cache-recovery budget operands and decisions, release
+attempt/completion and before/after availability. The delta is an observation,
+not a causal measurement of reclaimed/reusable capacity. Nonfinite budget inputs
+are null with named unavailable fields. First/selected samples survive optional
+trace trimming; the core is bounded to 64KiB. Failure stacks retain at most the
+32 innermost module/function/line frames within 8KiB (unknown line numbers are
+null), eagerly copied without
+exception text, paths, locals or frame objects. OOM allocator counters are labelled
+post-unwind and remain separate from an incomplete peak.
+
+Successful admitted attempts attach this evidence to the existing report context;
+they do not publish a new event by themselves. Reporting disabled adds no sampling,
+source hashing, tensor copying or transport. Full immutable input capture, shared
+wave/participant identities, execution breadcrumbs, reserved summary storage,
+exact delivery ACKs, and aggregate spool budgets remain follow-up work. Current
+spool-full/process-loss limits still apply. The selected-plan replay keeps its
+existing completeness limits; this is not a full GPU failure reproduction claim.
+Planning-event reports cap size at 256KiB. Oversized replay drops bulk request
+and layout arrays first, retaining whole compact source, rank/device, model and
+estimator fields that fit. Omission names and optional field inspection are
+bounded too; `omitted_fields`, `unlisted_fields` and
+`omitted_field_names_truncated` disclose that coverage.
+Such reports remain explicitly incomplete, including when an individual compact
+field itself exceeds the cap. This does not add a second capture or upload.
+After an exhausted split ladder, the ordinary refusal may retain an unsplit
+context plan but the final split-rung check. Its report labels
+`candidate_matches_check=false`, leaves the denied candidate prediction unknown,
+and refuses complete replay; it never attributes that check to the context plan.
+No extra rejected plan is materialized and admission behavior is unchanged.
+Ordinary
+refusals/planning errors can use only the first 64 entries/16MiB of the rank spool,
+counting all existing entries. Thus they cannot alone consume the original
+1024-entry/256MiB allowance used by misses and OOMs (including a planning event
+whose recorded failure type is `OutOfMemoryError`). Beyond the smaller cap,
+planning reports are dropped with the existing warning/failure counter. Driver
+delivery retains its original limits; this is not a cross-process storage quota.
+
+An execution owner can explicitly assign `RetentionLimits` using
+`report_retention_scope`. This chooses a private spool and cumulative report/byte
+allowance before emission; no scope keeps standalone behavior. An explicit
+`capture=False` suppresses report creation before replay/source hashing or I/O,
+including during construction before a rank can be bound. It differs from `None`
+(standalone retention) and a zero grant (which still accounts for omitted attempts).
+Suppression survives nested retention scopes and restores on exit; it follows
+ordinary ContextVar propagation, including `asyncio.to_thread`, but not arbitrary
+new threads. It does not disable the planner or change admission/training.
+An atomic, fsynced
+charge ledger precedes each payload write. Exact duplicate bytes cost nothing new,
+but deletion, failed payload writes and process restart never replenish the grant.
+Changed execution, producer or allowance identity refuses. Exhaustion keeps bounded
+omitted-attempt/byte counters, including a zero allowance and ordinary failures
+following a charge, without another spool. These count failed persistence attempts,
+not unique lost reports or certain payload absence. Counter writes are best effort:
+an unreadable ledger, disk failure or process death can leave coverage incomplete.
+Unknown crash leftovers are retained and count against occupancy; a first ledger
+write interrupted before publication requires owner reconciliation, not automatic
+cleanup or a new grant. Enter the context in the actual reporting thread: plain
+threads and `run_in_executor` do not inherit it. Spools belong to one producer;
+the file lock can block if that contract is violated or storage stalls.
+Ledger/lock metadata needs a separate owner reservation. This hook neither reserves
+capacity across producers nor acknowledges transport: those are the execution
+owner's responsibilities. It adds no GPU operation or full-input capture.
+
+Caladan's format-2 reader must land before this producer is enabled, and both
+rank and driver need the updated ART validator. Old format-1 JSON remains readable.

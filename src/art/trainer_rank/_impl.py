@@ -13,9 +13,10 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import asdict, dataclass, fields, is_dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import lru_cache, partial
 import hashlib
@@ -27,7 +28,7 @@ import struct
 import threading
 import time
 import traceback
-from types import TracebackType
+from types import MethodType, TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -54,6 +55,9 @@ from art.megatron.prefix_tree_packing import (
     _local_position_pairs,
     estimate_prefix_tree_packed_tokens,
 )
+from art.trainer_rank import _gdn_memory, _planner_evidence, _planner_misses
+from art.trainer_rank._backward_work import BackwardWork
+from art.trainer_rank._backward_work import region as _backward_region
 from art.trainer_rank._memory_policy import (
     ForwardMemoryCost,
     MemoryPlacement,
@@ -616,7 +620,12 @@ class _CacheRecoveryState:
     first_consumed: bool = False
     invalid: bool = False
     owner: object | None = None
-    lock: Any = dataclass_field(default_factory=threading.Lock)
+    backward: BackwardWork | None = None
+    lock: Any = dataclass_field(default_factory=threading.RLock)
+
+
+class _PlannerObservation(dict[str, Any]):
+    """Weakly track retained execution/OOM context until execution cleanup."""
 
 
 @dataclass(frozen=True)
@@ -628,6 +637,12 @@ class _MemoryCheck:
     cpu_available_bytes: int = 0
     cpu_fits: bool = True
     fallback_costs: dict[str, Any] | None = None
+    sample: _planner_evidence.MemorySample | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
+    decision: dict[str, Any] | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
 
 
 @dataclass(frozen=True)
@@ -654,6 +669,7 @@ class _CandidateMicroBatch(Generic[ForwardInputsT]):
     stats_global_count: int
     rejected_candidates: int
     cold_start: bool
+    fallback: _CandidateMicroBatch[ForwardInputsT] | None = None
 
 
 class _GatherContextParallelRows(torch.autograd.Function):
@@ -978,6 +994,10 @@ class _MemorySignature:
     grad_enabled: bool
     grad_modes: tuple[bool, ...]
     memory_placement: tuple[tuple[str, str], ...] = ()
+    slot_shapes: tuple[tuple[bool, tuple[tuple[int, ...], ...]], ...] = ()
+    # Short single-target requests keep the logical extrapolation, but share
+    # the profile learned from longer requests of the same signature.
+    short_requests: bool = dataclass_field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -988,6 +1008,7 @@ class _ForwardGroupPlan:
     items: tuple[_ForwardItem, ...]
     packed: PrefixTreePack
     memory_placement: MemoryPlacement | None = None
+    layout: PrefixTreeLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -1076,6 +1097,15 @@ class _SubforwardCost:
 
     required: int
     retained: int
+    # Before the safety factor, separate from observed forward retention.
+    checkpoint_retained: int = 0
+    checkpoint_workspace: int = 0
+    checkpoint_input_gradient: int = 0
+    # Already in required; backward allowance must not reorder forward execution.
+    checkpoint_peak_increment: int = 0
+    # HybridEP buffer growth before the safety factor. It is in required, not
+    # retained, and persists across a split, which charges the largest once.
+    hybridep_growth: int = 0
 
     @property
     def ephemeral(self) -> int:
@@ -1122,6 +1152,9 @@ class _ForwardRefusal:
     plan: _AnyForwardPlan
     check: _MemoryCheck
     message: str
+    overridable: bool = True
+    candidate: Any = None
+    check_matches_plan: bool = True
 
     def error(self, context: str) -> TrainerRankMemoryError:
         return _memory_error(
@@ -1278,6 +1311,19 @@ def _moe_combine_postprocess(dispatcher: Any, hidden_states: torch.Tensor):
     return result
 
 
+def _release_hybridep_state(manager: Any) -> None:
+    # The dispatched probabilities hold this layer's checkpoint graph, with its
+    # recomputed input and that input's gradient, until the next dispatch.
+    manager.routing_map = manager.token_probs = manager.dispatched_probs = None
+
+
+def _hybridep_combine_postprocess(dispatcher: Any, hidden_states: torch.Tensor):
+    result = type(dispatcher).combine_postprocess(dispatcher, hidden_states)
+    # Backward saves its own; the next setup and dispatch recreate these.
+    _release_hybridep_state(dispatcher._comm_manager)
+    return result
+
+
 def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
     for chunk in model:
         for module in chunk.modules():
@@ -1286,8 +1332,25 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
                 continue
             from megatron.core.transformer.moe.token_dispatcher import (
                 MoEAlltoAllTokenDispatcher,
+                MoEFlexTokenDispatcher,
+                _HybridEPManager,
             )
 
+            if (
+                type(dispatcher) is MoEFlexTokenDispatcher
+                and type(getattr(dispatcher, "_comm_manager", None)) is _HybridEPManager
+                and "combine_postprocess" not in vars(dispatcher)
+                and getattr(dispatcher.config, "cuda_graph_impl", "none") == "none"
+            ):
+                # HybridEP keeps its routing inputs and dispatched probabilities
+                # after combine; CUDA graph capture reads them back instead.
+                setattr(
+                    dispatcher,
+                    "combine_postprocess",
+                    partial(_hybridep_combine_postprocess, dispatcher),
+                )
+                _release_hybridep_state(dispatcher._comm_manager)
+                continue
             if type(dispatcher) is not MoEAlltoAllTokenDispatcher or (
                 "dispatch_preprocess" in vars(dispatcher)
             ):
@@ -1314,22 +1377,296 @@ def _configure_moe_dispatcher_caches(model: Sequence[torch.nn.Module]) -> None:
                 )
 
 
+def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
+    """One supported shared return held across routed compute, not all saves.
+
+    Gated backward can also save a distinct pre-gate result. This mode-neutral
+    component intentionally omits that separate term; compiled storage may alias.
+    """
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+    from art.megatron.lora import (
+        LoRA,
+        SelfAttentionLinearProjLoRA,
+        SharedExpertsLinearFC1LoRA,
+        SharedExpertsLinearFC2LoRA,
+    )
+
+    shared = getattr(layer, "shared_experts", None)
+    if shared is None or type(shared) is not SharedExpertMLP:
+        return 0
+    config = getattr(layer, "config", None)
+    shared_config = getattr(shared, "config", None)
+    expected = {
+        "params_dtype": torch.bfloat16,
+        "moe_shared_expert_overlap": False,
+        "sequence_parallel": False,
+        "fp32_residual_connection": False,
+        "add_bias_linear": False,
+        "use_te_activation_func": False,
+        "bias_activation_fusion": False,
+        "gated_linear_unit": True,
+        "cuda_graph_impl": "none",
+    }
+    if (
+        getattr(layer, "use_shared_expert", None) is not True
+        or getattr(layer, "shared_expert_overlap", None) is not False
+        or getattr(layer, "shared_experts_recompute", None) is not False
+        or getattr(layer, "moe_layer_recompute", None) is not False
+        or getattr(layer, "fwd_execution_map", None)
+        != ["route", "expert_compute", "postprocess"]
+        or any(
+            name in vars(layer)
+            for name in (
+                "shared_experts_compute",
+                "route",
+                "preprocess",
+                "dispatch",
+                "routed_experts_compute",
+                "combine",
+                "postprocess",
+            )
+        )
+        or any(
+            type(getattr(c, name, None)) is not type(value) or getattr(c, name) != value
+            for c in (config, shared_config)
+            for name, value in expected.items()
+        )
+        or any(
+            getattr(c, name, None)
+            for c in (config, shared_config)
+            for name in ("fp8", "fp4", "moe_latent_size")
+        )
+        or any(
+            (type(getattr(config, name, None)) is not int or getattr(config, name) != 1)
+            for name in (
+                "tensor_model_parallel_size",
+                "pipeline_model_parallel_size",
+                "expert_tensor_parallel_size",
+            )
+        )
+        # CP shards rows and shared experts are not expert-parallel, so each
+        # local token returns the same shared output; Qwen3.6-35B-A3B traces
+        # show the same gated pair per token at CP1, CP2 and EP2.
+        or any(
+            (type(getattr(config, name, None)) is not int or getattr(config, name) < 1)
+            for name in ("context_parallel_size", "expert_model_parallel_size")
+        )
+    ):
+        return 0
+    hidden = getattr(config, "hidden_size", None)
+    width = getattr(config, "moe_shared_expert_intermediate_size", None)
+    if (
+        type(hidden) is not int
+        or hidden <= 0
+        or type(width) is not int
+        or width <= 0
+        or getattr(shared_config, "hidden_size", None) != hidden
+        or getattr(shared_config, "ffn_hidden_size", None) != width
+        or getattr(shared_config, "moe_shared_expert_intermediate_size", None) != width
+        or getattr(shared_config, "activation_func", None)
+        is not torch.nn.functional.silu
+        or getattr(shared, "activation_func", None) is not torch.nn.functional.silu
+        or type(getattr(shared, "use_shared_expert_gate", None)) is not bool
+    ):
+        return 0
+    fc1, fc2 = getattr(shared, "linear_fc1", None), getattr(shared, "linear_fc2", None)
+    row = getattr(fc2, "row_parallel_lora", None)
+    lora = getattr(row, "lora", None)
+    base1, base2 = getattr(fc1, "linear_fc1", None), getattr(row, "linear_proj", None)
+    sites = (
+        (shared, SharedExpertMLP),
+        (fc1, SharedExpertsLinearFC1LoRA),
+        (fc2, SharedExpertsLinearFC2LoRA),
+        (row, SelfAttentionLinearProjLoRA),
+        (lora, LoRA),
+        (base2, TERowParallelLinear),
+        (getattr(fc1, "gate_lora", None), LoRA),
+        (getattr(fc1, "up_lora", None), LoRA),
+    )
+    if (
+        type(base1) not in (TEColumnParallelLinear, TELayerNormColumnParallelLinear)
+        or any(type(site) is not cls for site, cls in sites)
+        or any(
+            "forward" in vars(site)
+            or cast(Any, site)._forward_hooks
+            or cast(Any, site)._forward_pre_hooks
+            for site in (base1, *(site for site, _ in sites))
+        )
+        or getattr(fc1, "non_gated", None) is not False
+        or getattr(fc1, "out_features", None) != 2 * width
+        or getattr(getattr(row, "provider", None), "tensor_model_parallel_size", None)
+        != 1
+        or getattr(getattr(row, "provider", None), "sequence_parallel", None)
+        is not False
+    ):
+        return 0
+    weights = (
+        (getattr(base1, "weight", None), (2 * width, hidden)),
+        (getattr(base2, "weight", None), (hidden, width)),
+    )
+    for adapter, inputs, outputs in (
+        (cast(Any, fc1).gate_lora, hidden, width),
+        (cast(Any, fc1).up_lora, hidden, width),
+        (lora, width, hidden),
+    ):
+        a, b = getattr(adapter, "A_T", None), getattr(adapter, "B_T", None)
+        if (
+            not isinstance(a, torch.Tensor)
+            or not isinstance(b, torch.Tensor)
+            or a.ndim != 2
+            or b.ndim != 2
+            or a.shape[1] <= 0
+            or a.shape[1] != b.shape[0]
+        ):
+            return 0
+        weights += ((a, (inputs, a.shape[1])), (b, (a.shape[1], outputs)))
+    if shared.use_shared_expert_gate:
+        weights += ((getattr(shared, "gate_weight", None), (1, hidden)),)
+    if any(
+        not isinstance(weight, torch.Tensor)
+        or weight.dtype is not torch.bfloat16
+        or tuple(weight.shape) != shape
+        for weight, shape in weights
+    ):
+        return 0
+    return hidden * 2
+
+
+def _slot_lora_tensors(
+    lora: Any, slot_ref: "LoRASlotRef | None" = None
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Read the selected owner directly, without changing the execution context."""
+    if slot_ref is None:
+        return lora.A_T, lora.B_T
+    if slot_ref.name is None:
+        return None
+    from art.megatron.lora import LoRA
+
+    slot = LoRA._slot(lora, slot_ref)
+    return None if slot is None else (slot.A_T, slot.B_T)
+
+
+def _expert_lora_weight_storage(
+    lora: Any, slot_ref: "LoRASlotRef | None" = None
+) -> tuple[int, int, int] | None:
+    """New padded weights, transposes and effective rank for the Quack path.
+
+    Original contiguous parameters are already in the allocator baseline. This
+    excludes padding-concatenation temporaries and all backward GEMM workspace.
+    """
+    from art.megatron.lora import LoRA
+
+    if type(lora) is not LoRA or "_slot" in vars(lora):
+        return None
+    tensors = _slot_lora_tensors(lora, slot_ref)
+    if tensors is None:
+        return None
+    a, b = tensors
+    if (
+        "forward" in vars(lora)
+        or "active_lora_tensors" in vars(lora)
+        or lora._forward_hooks
+        or lora._forward_pre_hooks
+        or not isinstance(a, torch.Tensor)
+        or not isinstance(b, torch.Tensor)
+        or a.ndim != 3
+        or b.ndim != 3
+        or a.dtype not in (torch.float16, torch.bfloat16)
+        or b.dtype != a.dtype
+        or not a.is_contiguous()
+        or not b.is_contiguous()
+        or a.shape[0] != b.shape[0]
+        or a.shape[2] != b.shape[1]
+        or min(*a.shape, *b.shape) <= 0
+        or min(a.shape[1], b.shape[2]) <= 1
+        or (a.shape[2] >= 8 and a.shape[2] % 8)
+    ):
+        return None
+    effective = max(8, a.shape[2])
+    transposes = a.shape[0] * effective * (a.shape[1] + b.shape[2]) * a.element_size()
+    return (transposes if a.shape[2] < 8 else 0, transposes, effective)
+
+
+# Routed rows per rank at EP>1, relative to balanced routing (see below).
+_EP_ROUTED_ROW_ALLOWANCE = 1.5
+
+
+def _moe_dispatcher_supported(
+    dispatcher: Any, ep: int, *, alltoall: type, flex: type, hybridep: type
+) -> bool:
+    """EP1 all-to-all, or ART's HybridEP flex dispatcher across the EP group."""
+    if ep == 1:
+        return type(dispatcher) is alltoall
+    return (
+        type(dispatcher) is flex
+        and type(getattr(dispatcher, "_comm_manager", None)) is hybridep
+        and getattr(dispatcher, "ep_size", None) == ep
+        and getattr(dispatcher, "tp_size", None) == 1
+    )
+
+
+def _hybridep_rows_per_rank(capacity: int, ranks: int) -> int:
+    """HybridEP's allocated rows per rank: TMA-aligned, at least 512, padded to
+    the 64-row combine chunk."""
+    multiple = 4 // math.gcd(4, ranks)
+    rows = max(-(-capacity // multiple) * multiple, 512)
+    return -(-rows // 64) * 64
+
+
+def _hybridep_buffer_bytes(capacity: int, ranks: int, hidden: int, experts: int) -> int:
+    """Intranode HybridEP buffers for a per-rank token capacity.
+
+    ``ranks`` is the ETPxEP communication group and ``experts`` its expert
+    columns. Dispatch outputs alias the combine inputs (the shared-buffer
+    default), sized for every rank's tokens routed to one rank: BF16 tokens,
+    FP32 probabilities over the columns and FP32 FP8 scaling factors, which are
+    allocated even without FP8. The routing-map allgather keeps one byte per
+    column.
+    """
+    if capacity <= 0:
+        return 0
+    tokens = _hybridep_rows_per_rank(capacity, ranks) * ranks
+    return tokens * (2 * hidden + 5 * experts + 4 * (hidden // 128))
+
+
 def _moe_output_bytes_per_token(
-    model: Sequence[torch.nn.Module], shape: ParallelShape
+    model: Sequence[torch.nn.Module],
+    shape: ParallelShape,
+    *,
+    checkpoint_grad: bool = False,
+    converted_stages: list[tuple[int, int]] | None = None,
+    slot_ref: "LoRASlotRef | None" = None,
 ) -> int:
     """Known routed-expert working set, not a complete model/compiled bound."""
-    if shape != ParallelShape(tp=1, cp=1):
+    # CP shards rows, not the per-token working set. At EP>1 only ART's
+    # HybridEP flex dispatcher is modeled; TP and ETP are not.
+    if (shape.tp, shape.etp) != (1, 1):
         return 0
-    from megatron.core.extensions.transformer_engine import TERowParallelGroupedLinear
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelGroupedLinear,
+        TERowParallelGroupedLinear,
+    )
     from megatron.core.transformer.moe.experts import TEGroupedMLP
     from megatron.core.transformer.moe.moe_layer import BaseMoELayer, MoELayer
     from megatron.core.transformer.moe.router import TopKRouter
     from megatron.core.transformer.moe.token_dispatcher import (
         MoEAlltoAllTokenDispatcher,
+        MoEFlexTokenDispatcher,
+        _HybridEPManager,
     )
 
     from art.megatron.lora import LoRA, MLPExpertsLinearFC1LoRA, MLPExpertsLinearFC2LoRA
 
+    # HybridEP hands each rank the pairs routed to its local experts, already
+    # permuted. Balanced routing gives local tokens x top-k, as at EP1; a
+    # pretrained CP2/EP2 run put about 1.35x that on one rank.
+    routed_allowance = _EP_ROUTED_ROW_ALLOWANCE if shape.ep > 1 else 1
     coefficient = 0
     for chunk in model:
         for layer in chunk.modules():
@@ -1338,7 +1675,7 @@ def _moe_output_bytes_per_token(
             experts = getattr(layer, "experts", None)
             fc2: Any = getattr(experts, "linear_fc2", None)
             lora: Any = getattr(fc2, "lora", None)
-            dispatcher = getattr(layer, "token_dispatcher", None)
+            dispatcher: Any = getattr(layer, "token_dispatcher", None)
             sites = (
                 (layer, MoELayer),
                 (experts, TEGroupedMLP),
@@ -1347,15 +1684,18 @@ def _moe_output_bytes_per_token(
                 (getattr(fc2, "linear_fc2", None), TERowParallelGroupedLinear),
                 (getattr(layer, "router", None), TopKRouter),
             )
-            if (
-                any(
-                    type(site) is not expected
-                    or "forward" in vars(site)
-                    or getattr(site, "_forward_hooks", None)
-                    or getattr(site, "_forward_pre_hooks", None)
-                    for site, expected in sites
-                )
-                or type(dispatcher) is not MoEAlltoAllTokenDispatcher
+            if any(
+                type(site) is not expected
+                or "forward" in vars(site)
+                or getattr(site, "_forward_hooks", None)
+                or getattr(site, "_forward_pre_hooks", None)
+                for site, expected in sites
+            ) or not _moe_dispatcher_supported(
+                dispatcher,
+                shape.ep,
+                alltoall=MoEAlltoAllTokenDispatcher,
+                flex=MoEFlexTokenDispatcher,
+                hybridep=_HybridEPManager,
             ):
                 return 0
             config = layer.config
@@ -1369,16 +1709,27 @@ def _moe_output_bytes_per_token(
                 or config.cuda_graph_impl != "none"
                 or any(
                     name in vars(dispatcher)
-                    for name in (
-                        "preprocess",
-                        "dispatch_preprocess",
-                        "dispatch_postprocess",
+                    for name in ("preprocess", "dispatch_postprocess")
+                )
+                or (
+                    "dispatch_preprocess" in vars(dispatcher)
+                    and not (
+                        slot_ref is not None
+                        and slot_ref.name is not None
+                        and type(dispatcher.dispatch_preprocess) is partial
+                        and dispatcher.dispatch_preprocess.func
+                        is _moe_dispatch_preprocess
+                        and dispatcher.dispatch_preprocess.args == (dispatcher,)
+                        and not dispatcher.dispatch_preprocess.keywords
                     )
                 )
                 or "routing" in vars(layer.router)
             ):
                 return 0
-            weights = lora.B_T
+            tensors = _slot_lora_tensors(lora, slot_ref)
+            # Enclosing row storage is still charged for an inactive adapter;
+            # only selected tensors create converted weights.
+            inputs, weights = tensors if tensors is not None else (lora.A_T, lora.B_T)
             if (
                 weights.dtype not in (torch.float16, torch.bfloat16)
                 or weights.shape[-1] != fc2.out_features
@@ -1387,7 +1738,7 @@ def _moe_output_bytes_per_token(
             ):
                 return 0
             features = 2 * fc2.out_features
-            inputs = getattr(lora, "A_T", None)
+            enclosing_fc1 = None
             if (
                 isinstance(inputs, torch.Tensor)
                 and inputs.ndim == weights.ndim == 3
@@ -1409,7 +1760,9 @@ def _moe_output_bytes_per_token(
                     and fc1.fused_gate_up
                     and not fc1.non_gated
                     and fc1.out_features == 2 * inputs.shape[-2]
-                    and getattr(dispatcher, "ep_size", None) == 1
+                    # HybridEP keeps one dispatched H-wide input where the
+                    # EP1 all-to-all keeps two; charging two is conservative.
+                    and getattr(dispatcher, "ep_size", None) == shape.ep
                     and getattr(dispatcher, "tp_size", None) == 1
                     and getattr(dispatcher, "num_local_experts", 0) > 1
                     and getattr(config, "moe_permute_fusion", False)
@@ -1421,10 +1774,123 @@ def _moe_output_bytes_per_token(
                     # remain live at the FC2 sum, including in the observed
                     # compiled path. This is one stage, not a backward bound.
                     features += 2 * fc2.out_features + fc1.out_features
-            coefficient = max(
-                coefficient,
-                config.moe_router_topk * features * weights.element_size(),
-            )
+                    enclosing_fc1 = fc1
+            shared = _shared_expert_output_bytes_per_token(layer)
+            if (
+                checkpoint_grad
+                and shared
+                and getattr(layer.shared_experts, "use_shared_expert_gate", False)
+                is True
+            ):
+                # Gate-score backward saves a distinct pre-gate X. Charge it
+                # beside this layer's returned X, not another layer's maximum.
+                shared += shared
+            routed_rows = math.ceil(config.moe_router_topk * routed_allowance)
+            row_bytes = routed_rows * features * weights.element_size() + shared
+            coefficient = max(coefficient, row_bytes)
+            storage = _expert_lora_weight_storage(lora, slot_ref)
+            if converted_stages is not None and storage is not None:
+                padded, transposes, effective = storage
+                saved_fc1, rank_fc1 = 0, 0
+                routed_size = routed_rows * weights.element_size()
+                if enclosing_fc1 is not None:
+                    adapter = getattr(enclosing_fc1, "lora", None)
+                    base = getattr(enclosing_fc1, "linear_fc1", None)
+                    first = _expert_lora_weight_storage(adapter, slot_ref)
+                    first_tensors = (
+                        _slot_lora_tensors(adapter, slot_ref)
+                        if first is not None
+                        else None
+                    )
+                    if (
+                        first is not None
+                        and adapter is not None
+                        and base is not None
+                        and type(base) is TEColumnParallelGroupedLinear
+                        and "forward" not in vars(base)
+                        and not base._forward_hooks
+                        and not base._forward_pre_hooks
+                        and first_tensors is not None
+                        and first_tensors[0].dtype == weights.dtype
+                        and first_tensors[0].shape[:2]
+                        == (weights.shape[0], fc2.out_features)
+                        and first_tensors[1].shape[2] == enclosing_fc1.out_features
+                    ):
+                        first_padding, first_transposes, first_rank = first
+                        # FC1 retains both routed H inputs and its base O1
+                        # while producing adapter O1. Its sum is not live yet.
+                        converted_stages.append(
+                            (
+                                routed_size
+                                * (
+                                    2 * fc2.out_features
+                                    + 2 * enclosing_fc1.out_features
+                                    + first_rank
+                                )
+                                + shared,
+                                first_padding + first_transposes,
+                            )
+                        )
+                        # At the subsequent sum, only grad-enabled execution
+                        # retains padding/tmp; the two transposes have died.
+                        converted_stages.append(
+                            (
+                                routed_size
+                                * (
+                                    2 * fc2.out_features
+                                    + 3 * enclosing_fc1.out_features
+                                    + (first_rank if checkpoint_grad else 0)
+                                )
+                                + shared,
+                                first_padding if checkpoint_grad else 0,
+                            )
+                        )
+                        if checkpoint_grad:
+                            saved_fc1, _, rank_fc1 = first
+                # At the second GEMM, the FC2 sum does not exist yet: replace
+                # that H with tmp. Both weight transposes are still local.
+                converted_stages.append(
+                    (
+                        row_bytes
+                        + routed_size * (effective + rank_fc1 - fc2.out_features),
+                        padded + transposes + saved_fc1,
+                    )
+                )
+                if checkpoint_grad:
+                    # The transposes die at return, but padding/tmp are saved
+                    # through backward. Exact fused FC1 saves also remain live.
+                    converted_stages.append(
+                        (
+                            row_bytes + routed_size * (effective + rank_fc1),
+                            padded + saved_fc1,
+                        )
+                    )
+                    if rank_fc1 and inputs is not None and inputs.shape[2] < effective:
+                        # At FC2 backward return, nominal gradient copies
+                        # coexist with effective gradients and FC1 saves.
+                        # Unpadded returns alias; original parameters are not
+                        # new storage. This is a checkpoint eager-stage floor.
+                        experts_count, input_width, rank = inputs.shape
+                        nominal = experts_count * rank * weights.element_size()
+                        copies = nominal * (
+                            input_width + (fc2.out_features if experts_count > 1 else 0)
+                        )
+                        converted_stages.append(
+                            (
+                                routed_size
+                                * (
+                                    2 * input_width
+                                    + 2 * fc2.out_features
+                                    + 2 * effective
+                                    + rank_fc1
+                                ),
+                                padded
+                                + transposes
+                                + copies
+                                + saved_fc1
+                                + 2 * (experts_count + 1) * 4,
+                            )
+                        )
     return coefficient
 
 
@@ -1432,6 +1898,18 @@ class TrainerRank:
     def __init__(
         self, runtime: TrainingRuntime, *, options: ForwardOptions | None = None
     ) -> None:
+        planner_options = _planner_misses.parse_options(os.environ)
+        self._allow_oversized_batches = planner_options.allow_oversized_batches
+        self._planner_reporter = _planner_misses.Reporter(planner_options.threshold_pct)
+        self._planner_observation_context: ContextVar[dict[str, Any] | None] = (
+            ContextVar("trainer_rank_planner_observation", default=None)
+        )
+        self._planner_observation_generation = 0
+        self._planner_active_observations: weakref.WeakValueDictionary[
+            int, _PlannerObservation
+        ] = weakref.WeakValueDictionary()
+        self._planner_overlap_generation = 0
+        self._planner_observation: dict[str, Any] | None = None
         pp_size = int(getattr(runtime.provider, "pipeline_model_parallel_size", 1) or 1)
         if pp_size > 1 or len(runtime.model) > 1:
             raise TrainerRankRuntimeSupportError(
@@ -1472,6 +1950,8 @@ class TrainerRank:
             )
 
         self._recompute_granularity = memory_field("recompute_granularity", None)
+        self._recompute_method = memory_field("recompute_method", None)
+        self._recompute_num_layers = memory_field("recompute_num_layers", None)
         self._recompute_modules: frozenset[str] = frozenset(
             memory_field("recompute_modules", ()) or ()
         )
@@ -1504,6 +1984,12 @@ class TrainerRank:
             device_memory = int(
                 torch.cuda.get_device_properties(parameter.device).total_memory
             )
+        self._planner_device_identity = {
+            "capability": capability,
+            "total_memory_bytes": device_memory,
+            "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+        }
         spec = getattr(runtime, "model_support_spec", None)
         self._moe_layers = _moe_layer_count(runtime.model[0])
         self._checkpointed_moe_layers = sum(
@@ -1525,10 +2011,34 @@ class TrainerRank:
         self._parallel_shape = ParallelShape(
             tp=tp_size, cp=cp_size, ep=ep_size, etp=etp_size
         )
+        forward_stages: list[tuple[int, int]] = []
+        gradient_stages: list[tuple[int, int]] = []
         self._moe_output_bytes_per_token = (
-            _moe_output_bytes_per_token(runtime.model, self._parallel_shape)
+            _moe_output_bytes_per_token(
+                runtime.model, self._parallel_shape, converted_stages=forward_stages
+            )
             if self._moe_layers
             else 0
+        )
+        # A declined component is distinct from a qualified cache later damaged.
+        self._moe_memory_supported = self._moe_output_bytes_per_token > 0
+        # Both modes inspect original owners before dispatcher caches are installed.
+        self._moe_checkpoint_grad_bytes_per_token = (
+            _moe_output_bytes_per_token(
+                runtime.model,
+                self._parallel_shape,
+                checkpoint_grad=True,
+                converted_stages=gradient_stages,
+            )
+            if self._moe_layers
+            else 0
+        )
+        # Discard partial walks if a later layer has an unsupported owner.
+        self._moe_forward_stages = (
+            tuple(forward_stages) if self._moe_output_bytes_per_token else ()
+        )
+        self._moe_gradient_stages = (
+            tuple(gradient_stages) if self._moe_checkpoint_grad_bytes_per_token else ()
         )
         selection = select_scoring(
             device_capability=capability,
@@ -2410,19 +2920,11 @@ class TrainerRank:
                 "adapter_config['base_model_name_or_path'] must be a string"
             )
         if base_model.startswith(("Qwen/Qwen3.5-", "Qwen/Qwen3.6-", "Qwen/Qwen3.8-")):
-            dimensions = {
-                "num_attention_heads": getattr(
-                    self.runtime.provider, "num_attention_heads", None
-                ),
-                "num_key_value_heads": getattr(
-                    self.runtime.provider, "num_query_groups", None
-                ),
-                "head_dim": getattr(self.runtime.provider, "kv_channels", None),
-                "hidden_size": getattr(self.runtime.provider, "hidden_size", None),
-            }
-            for key, value in dimensions.items():
-                if value is not None:
-                    config[key] = int(value)
+            from art.megatron.model_support.lora_disk import (
+                model_attention_dimensions,
+            )
+
+            config.update(model_attention_dimensions(self.runtime.provider))
         if not isinstance(rank, int) or isinstance(rank, bool):
             raise TypeError("adapter_config['r'] must be an integer")
         if not isinstance(config_alpha_value, int | float) or isinstance(
@@ -2581,6 +3083,14 @@ class TrainerRank:
         iterator before making collective calls after an early exit. Guards apply
         on the iterator's thread; raw torch.distributed calls are not guarded.
         Collective calls must still match across ranks.
+
+        Admission learns each call's whole peak, including the caller's loss
+        and backward. For grad-enabled single-target requests of at least 64
+        tokens under one-layer full recompute, it prices model memory by packed
+        rows and charges 6 KiB per logical token for the head plus the caller's
+        loss saves and backward transients. A caller whose per-token head and
+        loss memory peaks above that is unsupported: shared plans can exceed
+        their estimate.
         """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
@@ -2676,6 +3186,9 @@ class TrainerRank:
         checkpoint: AdapterSelection,
         yield_empty: bool,
     ) -> Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None]:
+        backward = self._backward_work()
+        if backward is not None:
+            backward.harvest()
         items = [_materialize(item) for item in inputs]
         requests = list(_flatten(items))
         self._validate_replicated_top_level_count(len(items), yield_empty=yield_empty)
@@ -2695,24 +3208,39 @@ class TrainerRank:
                     items, start, checkpoint=checkpoint
                 )
             self._snapshot_planning_telemetry(candidate.plan, candidate.check)
-            if isinstance(candidate.plan, _FlatForwardPlan):
-                tracked_outputs, memory_baseline = (
-                    self._run_flat_plan_with_memory_tracking(
-                        candidate.plan,
-                        check=candidate.check,
-                        context="forward_batches",
-                    )
-                )
-            else:
-                tracked_outputs, memory_baseline, forward_peak = (
-                    self._execute_split_plan_with_memory_tracking(
-                        candidate.plan,
-                        check=candidate.check,
-                        context="forward_batches",
-                    )
-                )
+            tracked_outputs: list[AnyForwardOutput] = []
+            outputs: list[Any] = []
             flat_outputs = iter(tracked_outputs)
-            outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
+            error: BaseException | None = None
+            try:
+                if isinstance(candidate.plan, _FlatForwardPlan):
+                    tracked_outputs, memory_baseline = (
+                        self._run_flat_plan_with_memory_tracking(
+                            candidate.plan,
+                            check=candidate.check,
+                            context="forward_batches",
+                        )
+                    )
+                else:
+                    tracked_outputs, memory_baseline, forward_peak = (
+                        self._execute_split_plan_with_memory_tracking(
+                            candidate.plan,
+                            check=candidate.check,
+                            context="forward_batches",
+                        )
+                    )
+                flat_outputs = iter(tracked_outputs)
+                outputs = [_unflatten(item, flat_outputs) for item in candidate.inputs]
+            except BaseException as exc:
+                error = exc
+            try:
+                self._release_cached_memory_for_backward(candidate.plan, error=error)
+            except BaseException:
+                # Do not retain our completed graph through a new handoff traceback.
+                del tracked_outputs, flat_outputs, outputs
+                raise
+            if backward is not None:
+                backward.attach(tracked_outputs)
             stop = start + candidate.stats_global_count
             if stop < len(items):
                 self._last_global_micro_batch_size = max(
@@ -2751,6 +3279,8 @@ class TrainerRank:
                         subforward_count=candidate.plan.subforward_count,
                     ),
                 )
+            if backward is not None:
+                backward.harvest()
             # The caller normally runs backward while the micro-batch is yielded.
             # Include that peak in future planning; forward-only profiling can
             # otherwise admit a later micro-batch that leaves no collective or
@@ -2763,8 +3293,44 @@ class TrainerRank:
                     candidate.plan, memory_baseline, forward_peak
                 )
             # Only the caller may retain completed outputs into the next wave.
+            self._complete_planner_observation()
             del tracked_outputs, flat_outputs, outputs
             start = stop
+
+    @_backward_region
+    def _release_cached_memory_for_backward(
+        self, plan: _AnyForwardPlan, *, error: BaseException | None = None
+    ) -> None:
+        # Every WORLD wave reaches this before the public iterator skips empty
+        # outputs. Forward has already executed: never replan or retry here.
+        with self._cache_recovery_episode(error=error) as (owner, started):
+            exchange_error: BaseException | None = None
+            try:
+                failed, gradients = self._recovery_reduce(
+                    [
+                        float(error is not None),
+                        float(any(group.grad_enabled for group in plan.groups)),
+                    ],
+                    op="MAX",
+                    sync_across_dp=True,
+                )
+            except BaseException as exc:
+                if error is None:
+                    raise
+                exchange_error = exc
+            if error is not None:
+                raise self._memory_error_with_reduction_note(error, exchange_error)
+            if failed:
+                raise RuntimeError("Forward failed on another rank before handoff")
+            if not gradients:
+                return
+            self._try_cache_recovery(
+                None,
+                sync_across_dp=True,
+                owner=owner,
+                started=started,
+                handoff_grad=any(group.grad_enabled for group in plan.groups),
+            )
 
     @overload
     def forward(
@@ -2855,6 +3421,9 @@ class TrainerRank:
         the caller-owned `ForwardInput` objects.
         """
         self._guard_forward_collective("forward")
+        backward = self._backward_work()
+        if backward is not None:
+            backward.harvest()
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         with torch.set_grad_enabled(enabled):
             self._reset_planning_telemetry()
@@ -2866,6 +3435,8 @@ class TrainerRank:
             tracked_outputs = self._execute_admitted_plan(
                 plan, check=check, context="forward"
             )
+            if backward is not None:
+                backward.attach(tracked_outputs)
             return _unflatten(materialized, iter(tracked_outputs))
 
     def _execute_admitted_plan(
@@ -2875,17 +3446,22 @@ class TrainerRank:
             outputs, _baseline = self._run_flat_plan_with_memory_tracking(
                 plan, check=check, context=context
             )
-            return outputs
-        outputs, _baseline, _peak = self._execute_split_plan_with_memory_tracking(
-            plan, check=check, context=context
-        )
+        else:
+            outputs, _baseline, _peak = self._execute_split_plan_with_memory_tracking(
+                plan, check=check, context=context
+            )
+        # This API calibrates only forward, unlike the yielded microbatch API.
+        self._complete_planner_observation(phase="forward")
         return outputs
 
+    @_backward_region
     def _execute_split_plan_with_memory_tracking(
         self, plan: _SplitForwardPlan, *, check: _MemoryCheck, context: str
     ) -> tuple[list[AnyForwardOutput], int | None, int]:
         state = self._recovery_state()
         work_before = state.work
+        self._begin_planner_observation(plan, check)
+        self._planner_observing_split = True
         try:
             baseline, peak = None, 0
             merged: list[AnyForwardOutput | None] = [None] * plan.request_count
@@ -2921,6 +3497,8 @@ class TrainerRank:
         except BaseException:
             state.work = work_before
             raise
+        finally:
+            self._planner_observing_split = False
 
     def _plan_admissible_forward(
         self,
@@ -2942,6 +3520,7 @@ class TrainerRank:
             lambda value, check: (value[0], check),
             context=context,
             sync_across_dp=False,
+            admit_refusal=lambda refusal: (refusal.plan, refusal.check),
         )
         self._snapshot_planning_telemetry(*result)
         return result
@@ -2981,6 +3560,7 @@ class TrainerRank:
             check = self._memory_check(plan)
         if check.fits:
             return plan, check
+        best = (plan, check)
         # Best effort before splitting: the memory-minimal (full sharing)
         # layouts may fit where the cost-optimal ones do not.
         plan = self._plan_flat_forward(
@@ -2992,10 +3572,17 @@ class TrainerRank:
             check = self._memory_check(plan)
         if check.fits:
             return plan, check
+        if check.estimated_required_bytes < best[1].estimated_required_bytes:
+            best = (plan, check)
         request_count = len(requests)
         if request_count == 1:
             return _ForwardRefusal(
-                plan, check, f"{refusal_prefix}; a single request cannot be split"
+                *(
+                    best
+                    if getattr(self, "_allow_oversized_batches", False)
+                    else (plan, check)
+                ),
+                f"{refusal_prefix}; a single request cannot be split",
             )
         if self._expert_parallel_active():
             return _ForwardRefusal(
@@ -3003,7 +3590,19 @@ class TrainerRank:
                 check,
                 f"{refusal_prefix}; unable to find a feasible split: internal "
                 "splitting is disabled under expert parallelism in this release",
+                overridable=False,
             )
+        # A rejected lower bound normally avoids materializing the rung. If
+        # ranks disagree on the opt-in, keep that original behavior everywhere
+        # so the exact-pricing collectives cannot diverge within TP x CP.
+        keep_rejected = (
+            self._recovery_reduce(
+                [float(getattr(self, "_allow_oversized_batches", False))],
+                op="MIN",
+                sync_across_dp=False,
+            )[0]
+            == 1
+        )
         rows = tuple(
             request.input_tokens.detach().reshape(-1).to("cpu", torch.long)
             for request in requests
@@ -3013,20 +3612,35 @@ class TrainerRank:
         while True:
             chunks = _split_chunks(order, requests, subforward_count)
             split, check = self._admit_split_rung(
-                chunks, requests, rows, checkpoint=checkpoint
+                chunks,
+                requests,
+                rows,
+                checkpoint=checkpoint,
+                keep_rejected=keep_rejected,
             )
-            if split is not None:
+            if split is not None and check.fits:
                 return split, check
+            if (
+                split is not None
+                and check.estimated_required_bytes < best[1].estimated_required_bytes
+            ):
+                best = (split, check)
             if subforward_count >= request_count:
                 break
             subforward_count = min(request_count, subforward_count * 2)
         return _ForwardRefusal(
-            plan,
-            check,
+            *(
+                best
+                if getattr(self, "_allow_oversized_batches", False)
+                else (plan, check)
+            ),
             f"{refusal_prefix}; unable to find a feasible split: every rung of "
             "the bounded ladder (2, 4, ..., one request per subforward) is "
             "predicted to exceed available memory once all returned graphs are "
             "live together",
+            # Without the override the rejected rung is not retained. Its
+            # check must not be attributed to the unsplit context plan.
+            check_matches_plan=getattr(self, "_allow_oversized_batches", False),
         )
 
     def _expert_parallel_active(self) -> bool:
@@ -3044,6 +3658,7 @@ class TrainerRank:
         rows: Sequence[torch.Tensor],
         *,
         checkpoint: AdapterSelection,
+        keep_rejected: bool | None = None,
     ) -> tuple[_SplitForwardPlan | None, _MemoryCheck]:
         """Admit one rung of the ladder, or return its binding memory check.
 
@@ -3066,6 +3681,8 @@ class TrainerRank:
         """
 
         managed = self._graph_memory_policy_enabled()
+        if keep_rejected is None:
+            keep_rejected = getattr(self, "_allow_oversized_batches", False)
         if not managed:
             lower = [
                 self._split_chunk_lower_cost(
@@ -3076,8 +3693,9 @@ class TrainerRank:
                 for chunk in chunks
             ]
             check = self._split_rung_check(lower)
-            if not check.fits:
+            if not check.fits and not keep_rejected:
                 return None, check
+        best: tuple[_SplitForwardPlan, _MemoryCheck] | None = None
         for memory_minimal in (False, True):
             plans = [
                 self._plan_flat_forward(
@@ -3090,7 +3708,13 @@ class TrainerRank:
             ]
             costs = [self._plan_cost(plan) for plan in plans]
             # Bind original request mappings; floor keys normalize execution order.
-            order = sorted(range(len(plans)), key=lambda i: (-costs[i].ephemeral, i))
+            order = sorted(
+                range(len(plans)),
+                key=lambda i: (
+                    -(costs[i].ephemeral - costs[i].checkpoint_peak_increment),
+                    i,
+                ),
+            )
             split = _SplitForwardPlan(
                 subforwards=tuple(plans[i] for i in order),
                 request_indices=tuple(tuple(chunks[i]) for i in order),
@@ -3102,12 +3726,43 @@ class TrainerRank:
                 check = self._split_plan_memory_check(split, costs)
             if check.fits:
                 return split, check
-        return None, check
+            if (
+                best is None
+                or check.estimated_required_bytes < best[1].estimated_required_bytes
+            ):
+                best = (split, check)
+        assert best is not None
+        return best if keep_rejected else (None, check)
 
     def _split_rung_check(self, costs: Sequence[_SubforwardCost]) -> _MemoryCheck:
-        return self._memory_check_required(
-            sum(cost.retained for cost in costs) + max(cost.ephemeral for cost in costs)
+        return self._memory_check_required(self._split_required_memory(costs))
+
+    @staticmethod
+    def _split_required_memory(costs: Sequence[_SubforwardCost]) -> int:
+        # A grown HybridEP buffer persists into later children: charge the
+        # largest growth once, beside whichever child peaks highest.
+        growth = max(cost.hybridep_growth for cost in costs)
+        required = (
+            sum(cost.retained for cost in costs)
+            + max(
+                cost.ephemeral - int(cost.hybridep_growth * _MEMORY_SAFETY_FACTOR)
+                for cost in costs
+            )
+            + int(growth * _MEMORY_SAFETY_FACTOR)
         )
+        if any(cost.checkpoint_input_gradient for cost in costs):
+            # The caller owns all returned graphs. A calibrated forward-retained
+            # discount cannot replace the sum of their input-gradient extents.
+            checkpoint = (
+                sum(
+                    cost.checkpoint_retained + cost.checkpoint_input_gradient
+                    for cost in costs
+                )
+                + max(cost.checkpoint_workspace for cost in costs)
+                + growth
+            )
+            required = max(required, int(checkpoint * _MEMORY_SAFETY_FACTOR))
+        return required
 
     @staticmethod
     def _split_memory_key(plan: _SplitForwardPlan) -> bytes | None:
@@ -3164,6 +3819,8 @@ class TrainerRank:
                         signature.grad_enabled,
                         signature.grad_modes,
                         signature.memory_placement,
+                        signature.slot_shapes,
+                        signature.short_requests,
                         p.packed_tokens,
                         p.logical_tokens,
                         p.inactive_logical_tokens,
@@ -3251,9 +3908,7 @@ class TrainerRank:
     def _split_plan_memory_check(
         self, plan: _SplitForwardPlan, costs: Sequence[_SubforwardCost]
     ) -> _MemoryCheck:
-        required = sum(cost.retained for cost in costs) + max(
-            cost.ephemeral for cost in costs
-        )
+        required = self._split_required_memory(costs)
         key = self._split_memory_key(plan)
         empirical = (
             0
@@ -3278,13 +3933,29 @@ class TrainerRank:
         )
         packed_tokens = 0
         unshared_packed_tokens = 0
-        for _, group_indices in groups:
+        head_workspace_bytes = 0
+        group_rows: list[tuple[int, bool]] = []
+        for (_slot, grad_enabled), group_indices in groups:
             estimated = estimate_prefix_tree_packed_tokens(
                 (rows[index] for index in group_indices),
                 max_depth=len(group_indices),
             )
             assert estimated is not None  # rows are CPU copies
-            packed_tokens += self._physical_tokens(estimated)
+            physical_rows = self._physical_tokens(estimated)
+            packed_tokens += physical_rows
+            # The most loaded CP rank holds at least an even share.
+            cp = max(1, self._topology_key()[2])
+            group_rows.append((-(-physical_rows // cp), grad_enabled))
+            head_requests = tuple(requests[index] for index in group_indices)
+            head_workspace_bytes = max(
+                head_workspace_bytes,
+                self._group_head_workspace_bytes(
+                    self._head_projection_rows(head_requests, lower_bound=True),
+                    head_requests,
+                    grad_enabled=grad_enabled,
+                    lower_bound=True,
+                ),
+            )
             unshared_packed_tokens += self._physical_tokens(
                 sum(int(rows[index].numel()) for index in group_indices)
             )
@@ -3293,6 +3964,7 @@ class TrainerRank:
             requests,
             slot_group_count=len(groups),
             grad_modes=tuple(mode for (_, mode), _ in groups),
+            slot_groups=tuple(key for key, _ in groups),
         )
         logical_tokens = _active_logical_tokens(requests)
         cost = self._subforward_cost(
@@ -3300,6 +3972,9 @@ class TrainerRank:
             output_bytes=output_bytes,
             signature=signature,
             logical_tokens=logical_tokens,
+            group_rows=tuple(group_rows),
+            slot_refs=tuple(ref for (ref, _), _ in groups),
+            head_workspace_bytes=head_workspace_bytes,
             # The average CP load is an optimistic bound, not an admission cost.
             retained_tokens=(packed_tokens + signature.topology[2] - 1)
             // signature.topology[2],
@@ -3322,12 +3997,553 @@ class TrainerRank:
         ):
             # A larger layout may trust retained compute where full sharing
             # cannot. Its full-required retention is not a pruning lower bound.
-            # Charge only outputs here; exact plan costs keep both trust guards.
-            return _SubforwardCost(
-                required=cost.required,
-                retained=min(cost.retained, int(output_bytes * _MEMORY_SAFETY_FACTOR)),
+            # Keep outputs and the independent source retention floor; exact
+            # plan costs keep both trust guards.
+            return replace(
+                cost,
+                retained=min(
+                    cost.retained,
+                    int(
+                        (
+                            output_bytes
+                            + self._checkpoint_memory_floor(tuple(group_rows))[0]
+                        )
+                        * _MEMORY_SAFETY_FACTOR
+                    ),
+                ),
             )
         return cost
+
+    def _head_workspace_bytes(self, rows: int) -> int:
+        """One dense BF16 head tensor, not complete statistics/backward memory."""
+        if (
+            rows <= 0
+            or self._padded_vocab_size is None
+            or len(self.runtime.model) != 1
+            or self._topology_key()[1::2] != (1, 1)
+        ):
+            return 0
+        try:
+            model = _language_model(self.runtime.model[0])
+        except (AttributeError, RuntimeError):
+            return 0
+        try:
+            from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+        except ModuleNotFoundError as error:
+            if error.name != "megatron":
+                raise
+            return 0
+
+        head = getattr(model, "output_layer", None)
+        if head is None or type(head) is not ColumnParallelLinear:
+            return 0
+        weight = head.weight
+        if (
+            weight is None
+            and getattr(model, "share_embeddings_and_output_weights", False) is True
+        ):
+            weight = getattr(
+                getattr(getattr(model, "embedding", None), "word_embeddings", None),
+                "weight",
+                None,
+            )
+        if weight is None:
+            return 0
+        config = getattr(model, "config", None)
+        if (
+            type(weight) not in (torch.Tensor, torch.nn.Parameter)
+            or weight.dtype is not torch.bfloat16
+            or tuple(weight.shape) != (self._padded_vocab_size, self._hidden_size)
+            or head.output_size_per_partition != self._padded_vocab_size
+            or head.output_size != self._padded_vocab_size
+            or head.input_size != self._hidden_size
+            or getattr(config, "params_dtype", None) is not torch.bfloat16
+            or getattr(config, "fp32_residual_connection", None) is not False
+            or getattr(config, "fp8", None)
+            or getattr(config, "fp4", None)
+            or "forward" in vars(head)
+            or "_forward_impl" in vars(head)
+            or getattr(head, "_forward_hooks", None)
+            or getattr(head, "_forward_pre_hooks", None)
+            or any(
+                name in vars(self)
+                for name in (
+                    "_project_head",
+                    "_project_vocab_parallel",
+                    "_local_head_stats",
+                    "_local_logits_from_hidden_rows",
+                )
+            )
+        ):
+            return 0
+        return min(rows, _HEAD_CHUNK_TOKENS) * int(self._padded_vocab_size) * 2
+
+    def _head_projection_rows(
+        self,
+        requests: Sequence[AnyForwardInput],
+        *,
+        positions: Sequence[torch.Tensor] | None = None,
+        lower_bound: bool = False,
+    ) -> int:
+        """Per-group logical bounds or exact packed union; no device-label read.
+
+        A single sequence's valid rows cannot alias each other. Across requests
+        they may share: max is a lower bound, sum an upper bound. Ignore labels
+        only when every label on that input row is -100, as projection does.
+        Device-label validity is unknown: use all rows for capacity, zero only
+        for the rejection lower bound; never copy labels from the device here.
+        """
+        if not self._head_workspace_bytes(1):
+            return 0
+        if positions is not None and any(row.device.type != "cpu" for row in positions):
+            positions = None  # Capacity bound without reading device positions.
+        counts: list[int] = []
+        projected: set[int] = set()
+        for index, request in enumerate(requests):
+            offsets = None
+            if request.logits or request.top_k is not None:
+                count = int(request.input_tokens.numel())
+            elif request.target_tokens is not None:
+                count = int(request.input_tokens.numel())
+                if request.target_tokens.device.type != "cpu":
+                    if lower_bound:
+                        count = 0
+                else:
+                    labels = request.target_tokens.to(dtype=torch.long)
+                    valid = (labels != -100).reshape(count, -1).any(dim=1)
+                    offsets = torch.nonzero(valid, as_tuple=False).reshape(-1)
+                    count = int(offsets.numel())
+            else:
+                continue
+            if positions is None:
+                counts.append(count)
+            else:
+                row = positions[index]
+                if offsets is not None:
+                    row = row.index_select(0, offsets)
+                for position in row.tolist():
+                    projected.add(int(position))
+                    if len(projected) >= _HEAD_CHUNK_TOKENS:
+                        return _HEAD_CHUNK_TOKENS
+        return min(
+            _HEAD_CHUNK_TOKENS,
+            (max(counts, default=0) if lower_bound else sum(counts))
+            if positions is None
+            else len(projected),
+        )
+
+    def _head_target_chunk_rows(
+        self,
+        requests: Sequence[AnyForwardInput],
+        *,
+        positions: Sequence[torch.Tensor] | None = None,
+        lower_bound: bool = False,
+    ) -> int:
+        """Largest projected chunk reached by labelled rows, or row bounds.
+
+        Mixed outputs do not remove target backward. Its dense indexing result
+        spans the whole projected chunk, including rows requested only as logits
+        or top-k. Ignored labels still execute backward if another output
+        projects their rows. Without a layout, valid rows give a rejection lower
+        bound; possible overlap with any labelled request gives capacity.
+        """
+        targets = tuple(
+            replace(request, logits=False, top_k=None) for request in requests
+        )
+        if positions is None or any(row.device.type != "cpu" for row in positions):
+            if lower_bound:
+                return self._head_projection_rows(targets, lower_bound=True)
+            return (
+                self._head_projection_rows(requests)
+                if any(
+                    request.target_tokens is not None and request.input_tokens.numel()
+                    for request in requests
+                )
+                else 0
+            )
+        projected: set[int] = set()
+        labelled: set[int] = set()
+        for request, row in zip(requests, positions, strict=True):
+            target_row = row[:0]
+            if request.target_tokens is not None and int(row.numel()):
+                labelled.update(row.tolist())
+                labels = request.target_tokens
+                if labels.device.type == "cpu":
+                    valid = (
+                        (labels.to(dtype=torch.long) != -100)
+                        .reshape(len(row), -1)
+                        .any(dim=1)
+                    )
+                    target_row = row.index_select(
+                        0, torch.nonzero(valid, as_tuple=False).reshape(-1)
+                    )
+                elif not lower_bound:
+                    target_row = row
+            projected.update(
+                (
+                    row if request.logits or request.top_k is not None else target_row
+                ).tolist()
+            )
+        targeted = labelled & projected
+        if not targeted:
+            return 0
+        first_target = min(targeted)
+        first_index = sum(position < first_target for position in projected)
+        chunk_start = first_index // _HEAD_CHUNK_TOKENS * _HEAD_CHUNK_TOKENS
+        return min(_HEAD_CHUNK_TOKENS, len(projected) - chunk_start)
+
+    def _group_head_workspace_bytes(
+        self,
+        rows: int,
+        requests: Sequence[AnyForwardInput],
+        *,
+        grad_enabled: bool,
+        positions: Sequence[torch.Tensor] | None = None,
+        lower_bound: bool = False,
+    ) -> int:
+        """One logits buffer, or logits + both dense target-backward gradients.
+
+        The supported head path overlaps indexing and statistics gradients
+        with recomputed logits; cold library workspaces remain outside this
+        component. Pair each group's mode with its own projected rows.
+        """
+        dense = self._head_workspace_bytes(rows)
+        if (
+            not dense
+            or not grad_enabled
+            or not any(request.target_tokens is not None for request in requests)
+        ):
+            return dense
+        from megatron.core.models.common.language_module.language_module import (
+            LanguageModule,
+        )
+
+        model = _language_model(self.runtime.model[0])
+        scale = getattr(model, "_scale_logits", None)
+        if (
+            type(scale) is MethodType
+            and scale.__self__ is model
+            and scale.__func__ is LanguageModule._scale_logits
+            and getattr(model.config, "use_mup", None) is False
+        ):
+            # IndexBackward's dense result overlaps saved logits and grad_logits.
+            # The FP32 fallback already exceeds this three-buffer component.
+            target_dense = (
+                self._head_workspace_bytes(
+                    self._head_target_chunk_rows(
+                        requests, positions=positions, lower_bound=lower_bound
+                    )
+                )
+                if any(
+                    request.logits or request.top_k is not None for request in requests
+                )
+                else dense
+            )
+            return max(dense, 3 * target_dense)
+        return dense
+
+    def _plan_head_workspace_bytes(self, plan: _FlatForwardPlan) -> int:
+        peak = 0
+        for group in plan.groups:
+            requests = tuple(item.request for item in group.items)
+            peak = max(
+                peak,
+                self._group_head_workspace_bytes(
+                    self._head_projection_rows(
+                        requests, positions=group.packed.positions_by_sequence
+                    ),
+                    requests,
+                    grad_enabled=group.grad_enabled,
+                    positions=group.packed.positions_by_sequence,
+                ),
+            )
+        return peak
+
+    def _plan_hybridep_growth_bytes(self, plan: _FlatForwardPlan) -> int:
+        """HybridEP buffer growth this plan triggers before its forward.
+
+        The buffer is allocated outside the PyTorch allocator after admission,
+        so neither the free-memory sample nor a learned peak includes it.
+        """
+        provider: Any = getattr(getattr(self, "runtime", None), "provider", None)
+        ep = int(getattr(provider, "expert_model_parallel_size", 1) or 1)
+        if ep <= 1 or not plan.groups:
+            return 0
+        from megatron.core.transformer.moe import fused_a2a
+
+        from art.megatron.train import _hybridep_token_capacity
+
+        topology = self._topology()
+        sequence = max(
+            int(
+                _pad_packed_batch(group.packed, multiple=int(topology.tp)).tokens.shape[
+                    1
+                ]
+            )
+            for group in plan.groups
+        )
+        rows = max(rows for rows, _ in self._plan_group_rows(plan))
+        capacity = max(_hybridep_token_capacity(sequence, int(topology.cp)), rows)
+        current = fused_a2a._hybrid_ep_buffer
+        held = (
+            0
+            if current is None
+            else int(current.configurer.buffer_config.max_num_of_tokens_per_rank)
+        )
+        etp = int(getattr(provider, "expert_tensor_parallel_size", 1) or 1)
+        ranks = ep * etp
+        if _hybridep_rows_per_rank(capacity, ranks) <= held:
+            return 0
+        # The old buffer stays referenced while its replacement is allocated.
+        return _hybridep_buffer_bytes(
+            capacity,
+            ranks,
+            int(provider.hidden_size),
+            int(provider.num_moe_experts) * etp,
+        )
+
+    def _plan_group_rows(self, plan: _FlatForwardPlan) -> tuple[tuple[int, bool], ...]:
+        """Physical rows per group on the most loaded context-parallel rank."""
+        topology = self._topology() if plan.signature.topology[2] > 1 else None
+        return tuple(
+            (
+                self._physical_tokens(
+                    int(group.packed.tokens.numel())
+                    if topology is None
+                    else max(
+                        1,
+                        self._max_rank_model_tokens(
+                            _pad_packed_batch(group.packed, multiple=int(topology.tp)),
+                            topology=topology,
+                        ),
+                    )
+                ),
+                group.grad_enabled,
+            )
+            for group in plan.groups
+        )
+
+    def _checkpoint_moe_bytes_per_token(self) -> int:
+        forward = self._moe_output_bytes_per_token
+        gradient = self._moe_checkpoint_grad_bytes_per_token
+        if (
+            type(forward) is not int
+            or forward < 0
+            or type(gradient) is not int
+            or gradient < forward
+        ):
+            raise ValueError("Invalid constructor checkpoint MoE coefficient")
+        return gradient
+
+    def _moe_workspace_bytes(
+        self,
+        rows: int,
+        *,
+        checkpoint_grad: bool = False,
+        slot_ref: "LoRASlotRef | None" = None,
+    ) -> int:
+        """Maximum of same-layer affine stages, not a retained multi-layer bank.
+
+        The constructor cache covers original tensors. Explicit slots are
+        repriced from their tensor metadata and original owners, including
+        this rank's exact dispatcher wrapper. Ordinary non-checkpoint gradients
+        retain only forward-stage coverage.
+        """
+        coefficient = (
+            self._checkpoint_moe_bytes_per_token()
+            if checkpoint_grad
+            else self._moe_output_bytes_per_token
+        )
+        stages = getattr(
+            self,
+            "_moe_gradient_stages" if checkpoint_grad else "_moe_forward_stages",
+            (),
+        )
+        if slot_ref is not None and slot_ref.name is not None:
+            selected: list[tuple[int, int]] = []
+            coefficient = (
+                _moe_output_bytes_per_token(
+                    self.runtime.model,
+                    self._parallel_shape,
+                    checkpoint_grad=checkpoint_grad,
+                    converted_stages=selected,
+                    slot_ref=slot_ref,
+                )
+                if self._moe_layers
+                else 0
+            )
+            stages = tuple(selected) if coefficient else ()
+        if type(stages) is not tuple or any(
+            type(stage) is not tuple
+            or len(stage) != 2
+            or any(type(value) is not int or value < 0 for value in stage)
+            for stage in stages
+        ):
+            raise ValueError("Invalid constructor converted-weight stages")
+        return (
+            max(
+                rows * coefficient,
+                *(rows * per_row + fixed for per_row, fixed in stages),
+            )
+            if stages and rows > 0
+            else rows * coefficient
+        )
+
+    def _sequence_parallel_floor_covered(self, layers: int, tp: int, cp: int) -> bool:
+        """Whether the checkpoint floor covers a dense TP x SP recompute peak.
+
+        Traced once: dense Qwen3.8-27B (64 layers) at TP4 with sequence
+        parallelism and CP1. Over the gathered rows, the recomputed layer's peak
+        held its SP-gathered norm input (2H per row), the MLP FC1 stage (6F/TP),
+        the recomputed mixer (within its projection widths / TP), norm outputs
+        and other workspace (each under H), plus one input gradient per
+        sharded row. The floor repeats the sharded boundaries as the
+        input-gradient term, so that repeat must cover this workspace; GDN
+        segment states grow with segments instead and are priced separately.
+        Other TP sizes, CP, MoE, replicated QKV (KV groups below TP), missing
+        geometry and models too shallow or wide for the bound keep today's
+        pricing.
+        """
+        geometry = self._geometry
+        if tp != 4 or cp != 1 or self._moe_layers or geometry.moe_experts:
+            return False
+        hidden = self._hidden_size
+        ffn = geometry.ffn_hidden_size or 4 * hidden
+        attention_layers = self._num_layers > self._gdn_layers
+        if attention_layers and (
+            geometry.num_attention_heads <= 0
+            or geometry.kv_channels <= 0
+            # Replicated QKV keeps a global QKV output on every rank.
+            or not tp <= geometry.num_query_groups
+        ):
+            return False
+        gdn_widths = (
+            geometry.gdn_key_heads,
+            geometry.gdn_key_head_dim,
+            geometry.gdn_value_heads,
+            geometry.gdn_value_head_dim,
+            geometry.gdn_conv_kernel,  # Prices each segment's conv history.
+        )
+        if self._gdn_layers and min(gdn_widths) <= 0:
+            return False
+        attention = (
+            (7 if self._attention_output_gate else 5)
+            * geometry.num_attention_heads
+            * geometry.kv_channels
+            + 3 * geometry.num_query_groups * geometry.kv_channels
+            if attention_layers
+            else 0
+        )
+        gdn = (
+            4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+            + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+            if self._gdn_layers
+            else 0
+        )
+        # Per gathered row, times TP: the repeat is layers x H; the workspace is
+        # 2H + the FC1 stage (6F/TP, or the SwiGLU live set if wider) +
+        # mixer/TP + H of norms + H of other workspace, and the gradient H/TP.
+        stage = max(6, self._mlp_activation_factor) * ffn
+        workspace = 2 * hidden * tp + stage + max(attention, gdn) + 2 * hidden * tp
+        return layers * hidden >= workspace + hidden
+
+    def _checkpoint_memory_floor(
+        self,
+        group_rows: tuple[tuple[int, bool], ...],
+        slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+        gdn_segments: int = 0,
+    ) -> tuple[int, int]:
+        """Conservative saved-boundary charge and one disjoint MoE workspace.
+
+        Count actual local full/uniform/1 boundaries, including aliases, rather
+        than claiming measured distinct storage. Only this call's new groups
+        enter the term; already-live graphs remain in the availability baseline.
+        No-grad groups also keep decoder input, current layer input, its MLP
+        residual and norm output across the MoE stage. Count these four row
+        tensors separately from returned outputs, allowing storage aliases.
+        This is not a bound for custom preprocessing, attention, or all backward.
+        With sequence parallelism a rank saves only its shard of each boundary;
+        that is priced only where ``_sequence_parallel_floor_covered`` holds,
+        and there, for gradient waves, the recomputed GDN layer's recurrent
+        states for ``gdn_segments`` (gradient groups' segments) plus padding.
+        """
+        gradient_rows = sum(rows for rows, grad in group_rows if grad)
+        if not group_rows or len(self.runtime.model) != 1:
+            return 0, 0
+        try:
+            decoder = _language_model(self.runtime.model[0]).decoder
+        except (AttributeError, RuntimeError):
+            return 0, 0
+        try:
+            from megatron.core.transformer.transformer_block import TransformerBlock
+        except ModuleNotFoundError as error:
+            if error.name != "megatron":
+                raise
+            return 0, 0
+
+        if type(decoder) is not TransformerBlock:
+            return 0, 0
+        config = decoder.config
+        layers = len(decoder.layers)
+        _, tp, cp, pp = self._topology_key()
+        expected = {
+            "recompute_granularity": "full",
+            "recompute_method": "uniform",
+            "recompute_num_layers": 1,
+            "distribute_saved_activations": False,
+            "sequence_parallel": tp > 1,
+            "fp32_residual_connection": False,
+            "cpu_offloading": False,
+            "cuda_graph_impl": "none",
+        }
+        if (
+            decoder.training is not True
+            or layers <= 0
+            or layers != decoder.num_layers_per_pipeline_rank
+            or layers != config.num_layers
+            or config.hidden_size != self._hidden_size
+            or config.params_dtype is not torch.bfloat16
+            or self._param_dtype_size != 2
+            or next(self.runtime.model[0].parameters()).dtype is not torch.bfloat16
+            or pp != 1
+            or (tp > 1 and not self._sequence_parallel_floor_covered(layers, tp, cp))
+            or any(
+                type(getattr(config, name, None)) is not type(value)
+                or getattr(config, name) != value
+                for name, value in expected.items()
+            )
+            or getattr(config, "fp8", None)
+            or getattr(config, "fp4", None)
+            or any(
+                name in vars(decoder)
+                for name in ("forward", "_checkpointed_forward", "_get_layer")
+            )
+            or getattr(decoder, "_forward_hooks", None)
+            or getattr(decoder, "_forward_pre_hooks", None)
+        ):
+            return 0, 0
+        # Physical rows are padded to a multiple of TP; each rank saves its shard.
+        retained = (
+            sum(-(-rows // tp) for rows, grad in group_rows if grad)
+            * layers
+            * self._hidden_size
+            * 2
+        )
+        if gradient_rows:
+            self._checkpoint_moe_bytes_per_token()
+        refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
+        workspace = max(
+            self._moe_workspace_bytes(rows, checkpoint_grad=grad, slot_ref=ref)
+            + (0 if grad else 4 * rows * self._hidden_size * 2)
+            for (rows, grad), ref in zip(group_rows, refs, strict=True)
+        )
+        if tp > 1 and self._gdn_layers and gradient_rows:
+            # Recurrent states grow with segments, not rows; backward recomputes
+            # one layer at a time. Padding to TP adds up to TP - 1 one-token
+            # roots per group. Kernel-internal chunk states are not bounded here.
+            roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
+            workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
+        return retained, workspace
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
@@ -3336,7 +4552,12 @@ class TrainerRank:
             signature=plan.signature,
             logical_tokens=plan.active_logical_tokens,
             gdn_segments=plan.grad_segment_count,
+            group_rows=self._plan_group_rows(plan),
+            slot_refs=tuple(g.slot_ref for g in plan.groups),
+            head_workspace_bytes=self._plan_head_workspace_bytes(plan),
+            checkpoint_floor=_gdn_memory.plan_floor(self, plan),
             retained_tokens=self._plan_retained_tokens(plan),
+            hybridep_growth_bytes=self._plan_hybridep_growth_bytes(plan),
         )
 
     def _subforward_cost(
@@ -3347,7 +4568,12 @@ class TrainerRank:
         signature: _MemorySignature,
         logical_tokens: int,
         gdn_segments: int = 0,
+        group_rows: tuple[tuple[int, bool], ...] = (),
+        slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+        head_workspace_bytes: int = 0,
+        checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
+        hybridep_growth_bytes: int = 0,
     ) -> _SubforwardCost:
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
@@ -3355,7 +4581,15 @@ class TrainerRank:
             signature=signature,
             logical_tokens=logical_tokens,
             gdn_segments=gdn_segments,
+            group_rows=group_rows,
+            slot_refs=slot_refs,
+            head_workspace_bytes=head_workspace_bytes,
+            checkpoint_floor=checkpoint_floor,
             retained_tokens=retained_tokens,
+            include_checkpoint_input_gradient=False,
+        )
+        checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
+            group_rows, slot_refs, gdn_segments
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -3363,8 +4597,42 @@ class TrainerRank:
             logical_tokens=logical_tokens,
             output_bytes=output_bytes,
             required=required,
+            checkpoint_retained_bytes=max(
+                checkpoint_retained,
+                checkpoint_floor[0],
+            ),
         )
-        return _SubforwardCost(required=required, retained=retained)
+        # One logical BF16 input gradient per eligible full/uniform/1 boundary.
+        # This partial peak allowance is not evidence of simultaneous distinct
+        # backing stores, nor a bound for compiler saves or other backward work.
+        # Keep it out of forward retention, including the cold fallback above.
+        gradient = checkpoint_retained
+        checkpoint_retained = output_bytes + max(
+            checkpoint_retained, checkpoint_floor[0]
+        )
+        checkpoint_workspace = max(
+            checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
+        )
+        forward_required = required
+        if gradient:
+            required = max(
+                required,
+                int(
+                    (checkpoint_retained + checkpoint_workspace + gradient)
+                    * _MEMORY_SAFETY_FACTOR
+                ),
+            )
+        # HybridEP buffer growth stays allocated through the forward and
+        # backward peaks, but is not forward retention.
+        return _SubforwardCost(
+            required=required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR),
+            retained=retained,
+            checkpoint_retained=checkpoint_retained,
+            checkpoint_workspace=checkpoint_workspace,
+            checkpoint_input_gradient=gradient,
+            checkpoint_peak_increment=required - forward_required,
+            hybridep_growth=hybridep_growth_bytes,
+        )
 
     def _retained_memory_bytes(
         self,
@@ -3374,6 +4642,7 @@ class TrainerRank:
         logical_tokens: int,
         output_bytes: int,
         required: int,
+        checkpoint_retained_bytes: int = 0,
     ) -> int:
         """Forward-retained bytes, independent of a later backward peak.
 
@@ -3389,9 +4658,18 @@ class TrainerRank:
         ratio = logical_tokens / max(1, packed_tokens)
         if ratio > profile.logical_per_packed * _MEMORY_PROFILE_TRUST_GROWTH:
             return required
-        retained = output_bytes + profile.retained_compute_bytes_per_token * max(
-            packed_tokens, logical_tokens / profile.logical_per_packed
-        )
+        rate = profile.retained_compute_bytes_per_token
+        if _packed_priced(signature, self._one_layer_recompute()):
+            # Saved head indices, masks and caller saves stay live until
+            # backward. The ratio window above bounds the sharing extrapolation.
+            retained_compute = (
+                rate * packed_tokens + _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
+            )
+        else:
+            retained_compute = rate * max(
+                packed_tokens, logical_tokens / profile.logical_per_packed
+            )
+        retained = output_bytes + max(checkpoint_retained_bytes, retained_compute)
         return min(required, int(retained * _MEMORY_SAFETY_FACTOR))
 
     def _split_request_order(
@@ -4346,12 +5624,27 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
     ) -> _CandidateMicroBatch[ForwardInputsT]:
+        def admit(refusal: _ForwardRefusal) -> _CandidateMicroBatch[ForwardInputsT]:
+            dp_rank, dp_size = self._dp_rank_and_size()
+            width = min(len(items) - start, dp_size)
+            indices = _local_wave_indices(start, width, dp_rank, dp_size)
+            return _CandidateMicroBatch(
+                inputs=[items[index] for index in indices],
+                indices=indices,
+                plan=refusal.plan,
+                check=refusal.check,
+                stats_global_count=width,
+                rejected_candidates=1,
+                cold_start=True,
+            )
+
         return self._recover_admission(
             lambda: self._search_next_micro_batch(items, start, checkpoint=checkpoint),
             lambda value: (value.plan, value.check),
             lambda value, check: replace(value, check=check),
             context="forward_batches",
             sync_across_dp=True,
+            admit_refusal=admit,
         )
 
     def _search_next_micro_batch(
@@ -4375,6 +5668,7 @@ class TrainerRank:
 
         estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
         plans: dict[int, _FlatForwardPlan] = {}
+        checked_plans: dict[int, _MemoryCheck] = {}
         # Per-width layout mode chosen by admission: False = cost-optimal,
         # True = memory-minimal (full sharing). Materialization must build the
         # same layouts the admitted estimate priced.
@@ -4388,8 +5682,12 @@ class TrainerRank:
                 return estimates[width]
             indices, local_inputs = local_slice(width)
             local_requests = list(_flatten(local_inputs))
+            cheap_segments: list[int] = []
             values = self._estimate_flat_forward(
-                local_requests, checkpoint=checkpoint, sync_planning_errors=True
+                local_requests,
+                checkpoint=checkpoint,
+                sync_planning_errors=True,
+                gdn_segments=cheap_segments,
             )
             if not self._all_ranks_true(values is not None):
                 estimates[width] = None
@@ -4401,6 +5699,10 @@ class TrainerRank:
                 packed_tokens: int,
                 output_bytes: int,
                 signature: _MemorySignature,
+                group_rows: tuple[tuple[int, bool], ...],
+                head_workspace_bytes: int,
+                *,
+                gdn_segments: int,
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature]:
                 with self._planning_status(True):
                     required = self._estimate_required_memory_bytes_from_values(
@@ -4408,12 +5710,11 @@ class TrainerRank:
                         output_bytes=output_bytes,
                         signature=signature,
                         logical_tokens=logical_tokens,
-                        # A radix tree has fewer than twice as many segments as
-                        # active requests; the exact plan uses its actual count.
-                        gdn_segments=2
-                        * sum(
-                            _request_mix_key(r) != "inactive" for r in local_requests
-                        ),
+                        # Gradient groups' segments: exact layouts' counts, else
+                        # a bound matching the estimate's (_estimate_flat_forward).
+                        gdn_segments=gdn_segments,
+                        group_rows=group_rows,
+                        head_workspace_bytes=head_workspace_bytes,
                     )
                 return (
                     self._memory_check_required(required, sync_across_dp=True),
@@ -4425,14 +5726,20 @@ class TrainerRank:
             def priced_estimate(
                 *, exact: bool, memory_minimal: bool
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature] | None:
+                segments: list[int] = []
                 estimated = self._estimate_flat_forward(
                     local_requests,
                     checkpoint=checkpoint,
                     exact=exact,
                     memory_minimal=memory_minimal,
                     sync_planning_errors=True,
+                    gdn_segments=segments,
                 )
-                return None if estimated is None else priced(*estimated)
+                return (
+                    None
+                    if estimated is None
+                    else priced(*estimated, gdn_segments=sum(segments))
+                )
 
             def trusted(packed_tokens: int, signature: _MemorySignature) -> bool:
                 return self._all_ranks_have_memory_profile(
@@ -4445,7 +5752,7 @@ class TrainerRank:
             # reject on memory, or when it would reject on profile trust while
             # a profile exists — the selected layout may be far smaller than
             # the bound and squarely inside the profiled regime.
-            selected = priced(*values)
+            selected = priced(*values, gdn_segments=sum(cheap_segments))
             profiled = self._all_ranks_true(selected[3] in self._memory_profiles)
             needs_exact = not selected[0].fits or (
                 profiled and not trusted(selected[1], selected[3])
@@ -4500,27 +5807,36 @@ class TrainerRank:
             width = normalize(width)
             result = estimate(width)
             if result is None:
-                # Estimator unavailable (device inputs): admit on the
-                # materialized plan, trying the cost-optimal layouts first and
-                # the memory-minimal layouts if those do not fit.
-                plan = materialize(width)
-                check = self._memory_check(
-                    plan, sync_across_dp=True, sync_planning_errors=True
-                )
-                if not check.fits and not layout_modes.get(width, False):
-                    layout_modes[width] = True
-                    plans.pop(width, None)
-                    plan = materialize(width)
+                # Estimator unavailable (device inputs, or CP per-rank floors):
+                # admit on the materialized plan, trying the cost-optimal
+                # layouts first and the memory-minimal layouts if those do not
+                # fit or fall outside the profile's trust window.
+                def price(plan: _FlatForwardPlan) -> tuple[_MemoryCheck, bool, bool]:
                     check = self._memory_check(
                         plan, sync_across_dp=True, sync_planning_errors=True
                     )
-                trusted = self._all_ranks_have_memory_profile(
-                    packed_tokens=plan.packed_tokens,
-                    signature=plan.signature,
-                )
-                profiled = self._all_ranks_true(plan.signature in self._memory_profiles)
+                    trusted = self._all_ranks_have_memory_profile(
+                        packed_tokens=plan.packed_tokens,
+                        signature=plan.signature,
+                    )
+                    profiled = self._all_ranks_true(
+                        plan.signature in self._memory_profiles
+                    )
+                    return check, trusted, profiled
+
+                plan = materialize(width)
+                check, trusted, profiled = price(plan)
+                if (
+                    not check.fits or (profiled and not trusted)
+                ) and not layout_modes.get(width, False):
+                    layout_modes[width] = True
+                    plans.pop(width, None)
+                    plan = materialize(width)
+                    check, trusted, profiled = price(plan)
             else:
                 check, trusted, profiled = result
+            if width in plans:
+                checked_plans[width] = check
             if not check.fits:
                 rejected_widths.add(width)
             return check.fits and (trusted or not profiled), trusted
@@ -4560,7 +5876,7 @@ class TrainerRank:
                 packed_tokens=plan.packed_tokens,
                 signature=plan.signature,
             )
-            return _CandidateMicroBatch(
+            selected = _CandidateMicroBatch(
                 inputs=local_inputs,
                 indices=indices,
                 plan=plan,
@@ -4569,10 +5885,44 @@ class TrainerRank:
                 rejected_candidates=len(rejected_widths),
                 cold_start=cold_start,
             )
+            checked_plans[width] = check
+            if getattr(self, "_allow_oversized_batches", False):
+                smallest = min(
+                    checked_plans,
+                    key=lambda w: (checked_plans[w].estimated_required_bytes, w),
+                )
+                if smallest != width:
+                    fallback_indices, fallback_inputs = local_slice(smallest)
+                    selected = replace(
+                        selected,
+                        fallback=_CandidateMicroBatch(
+                            inputs=fallback_inputs,
+                            indices=fallback_indices,
+                            plan=plans[smallest],
+                            check=checked_plans[smallest],
+                            stats_global_count=smallest,
+                            rejected_candidates=len(rejected_widths),
+                            cold_start=True,
+                        ),
+                    )
+            return selected
 
         first_estimate = estimate(min_width)
         if first_estimate is None or not (first_estimate[0].fits and first_estimate[1]):
             first = candidate(min_width)
+            if (
+                first_estimate is None
+                and first.check.fits
+                and first.cold_start
+                and not layout_modes.get(min_width, False)
+                and self._all_ranks_true(first.plan.signature in self._memory_profiles)
+            ):
+                # Materialized pricing (DP-uniform): a profiled cost-optimal
+                # layout outside trust; full sharing may be trusted, as the
+                # estimator path would find.
+                layout_modes[min_width] = True
+                plans.pop(min_width, None)
+                first = candidate(min_width)
             if not first.check.fits:
                 # The smallest wave cannot run unsplit: best effort is the
                 # bounded split ladder. Each DP rank runs it on its own share,
@@ -5037,6 +6387,14 @@ class TrainerRank:
                         request_indices=tuple(group_indices),
                         items=items,
                         packed=packed,
+                        layout=layout
+                        if getattr(
+                            getattr(self, "_planner_reporter", None),
+                            "threshold_pct",
+                            None,
+                        )
+                        is not None
+                        else None,
                     )
                 )
 
@@ -5057,6 +6415,7 @@ class TrainerRank:
                     requests,
                     slot_group_count=len(plans),
                     grad_modes=tuple(mode for (_, mode), _ in groups),
+                    slot_groups=tuple(key for key, _ in groups),
                 ),
                 selected_max_depth=selected_max_depth,
                 inactive_logical_tokens=logical_tokens
@@ -5071,7 +6430,8 @@ class TrainerRank:
         exact: bool = False,
         memory_minimal: bool = False,
         sync_planning_errors: bool = False,
-    ) -> tuple[int, int, _MemorySignature] | None:
+        gdn_segments: list[int] | None = None,
+    ) -> tuple[int, int, _MemorySignature, tuple[tuple[int, bool], ...], int] | None:
         """Estimate packed tokens for width probing.
 
         Cheap mode (``exact=False``) is one O(tokens) CPU walk of the packing
@@ -5082,6 +6442,10 @@ class TrainerRank:
         whose feasibility is monotone in width (valid for rejecting one).
         ``exact=True`` prices the planner's actual layouts (memoized by
         content) and is used only inside the band where those bounds disagree.
+        Under CP it returns None: per-rank floors need materialized layouts.
+        ``gdn_segments`` receives each gradient group's segment count: exact
+        layouts' actual counts; in cheap mode, the same kind of bound as the
+        token count (twice the requests, as a radix tree has fewer, or one).
         """
 
         if sync_planning_errors:
@@ -5092,19 +6456,33 @@ class TrainerRank:
                 checkpoint=checkpoint,
                 ensure_slots=not sync_planning_errors,
             )
-            if (
-                self._topology_key()[2] > 1
-                and self._recompute_granularity != "full"
-                and not self._geometry.moe_experts
-                and any(grad for (_, grad), _ in groups)
+            if self._moe_layers and any(
+                ref is not None and ref.name is not None for (ref, _), _ in groups
             ):
-                # CP token ownership can be uneven. Use the existing exact-plan
-                # fallback; a global token count alone cannot price its peak.
+                # This cheap return type has no slot metadata. Materialize the
+                # exact plan instead of admitting with the constructor rank.
+                return None
+            if (
+                any(mode for (_, mode), _ in groups)
+                and _gdn_memory.model_shapes(self) is not None
+            ):
+                # Pending saves require the actual bucket/replayed-tail geometry.
+                # Existing unavailable handling materializes before admission.
+                return None
+            if self._topology_key()[2] > 1:
+                # CP token ownership can be uneven and memory floors are priced
+                # per rank. Use the existing exact-plan fallback; a global token
+                # count alone cannot price its peak.
                 return None
             packed_tokens = 0
+            head_workspace_bytes = 0
+            group_rows: list[tuple[int, bool]] = []
             for (_slot, grad_enabled), group_indices in groups:
+                head_requests = tuple(requests[index] for index in group_indices)
+                lower = self._head_projection_rows(head_requests, lower_bound=True)
+                upper = self._head_projection_rows(head_requests)
                 if exact:
-                    _, layout = self._select_group_layout(
+                    tree, layout = self._select_group_layout(
                         tuple(
                             requests[index]
                             .input_tokens.reshape(-1)
@@ -5114,7 +6492,53 @@ class TrainerRank:
                         memory_minimal=memory_minimal,
                         grad_enabled=grad_enabled,
                     )
-                    packed_tokens += self._physical_tokens(layout.packed_tokens)
+                    physical_rows = self._physical_tokens(layout.packed_tokens)
+                    packed_tokens += physical_rows
+                    group_rows.append((physical_rows, grad_enabled))
+                    if grad_enabled and gdn_segments is not None:
+                        gdn_segments.append(len(layout.segments))
+                    projected = upper
+                    positions = None
+                    mixed_targets = (
+                        grad_enabled
+                        and any(
+                            request.target_tokens is not None
+                            for request in head_requests
+                        )
+                        and any(
+                            request.logits or request.top_k is not None
+                            for request in head_requests
+                        )
+                    )
+                    if lower != upper or (
+                        mixed_targets
+                        and self._head_target_chunk_rows(
+                            head_requests, lower_bound=True
+                        )
+                        != self._head_target_chunk_rows(head_requests)
+                    ):
+                        packed = materialize_prefix_tree_layout(
+                            tuple(
+                                request.input_tokens.reshape(-1).to(dtype=torch.long)
+                                for request in head_requests
+                            ),
+                            tree,
+                            layout,
+                            verify_shared_tokens=False,
+                        )
+                        projected = self._head_projection_rows(
+                            head_requests, positions=packed.positions_by_sequence
+                        )
+                        positions = packed.positions_by_sequence
+                    head_workspace_bytes = max(
+                        head_workspace_bytes,
+                        self._group_head_workspace_bytes(
+                            projected,
+                            head_requests,
+                            grad_enabled=grad_enabled,
+                            positions=positions,
+                        ),
+                    )
                     continue
                 # Radix depth is bounded by the number of rows, so ``len(group)``
                 # is an unlimited-sharing depth for this group; it is a bound for
@@ -5128,7 +6552,23 @@ class TrainerRank:
                 )
                 if group_packed_tokens is None:
                     return None
-                packed_tokens += self._physical_tokens(group_packed_tokens)
+                physical_rows = self._physical_tokens(group_packed_tokens)
+                packed_tokens += physical_rows
+                group_rows.append((physical_rows, grad_enabled))
+                if grad_enabled and gdn_segments is not None:
+                    # Bounds like the token counts: at most twice the requests
+                    # without sharing (acceptance), at least one with full
+                    # sharing (rejection); exact pricing counts the rest.
+                    gdn_segments.append(1 if memory_minimal else 2 * len(group_indices))
+                head_workspace_bytes = max(
+                    head_workspace_bytes,
+                    self._group_head_workspace_bytes(
+                        lower if memory_minimal else upper,
+                        head_requests,
+                        grad_enabled=grad_enabled,
+                        lower_bound=memory_minimal,
+                    ),
+                )
 
             return (
                 packed_tokens,
@@ -5137,7 +6577,10 @@ class TrainerRank:
                     requests,
                     slot_group_count=len(groups),
                     grad_modes=tuple(mode for (_, mode), _ in groups),
+                    slot_groups=tuple(key for key, _ in groups),
                 ),
+                tuple(group_rows),
+                head_workspace_bytes,
             )
 
     def _ensure_checkpoint_slots_for(
@@ -5202,6 +6645,7 @@ class TrainerRank:
             for (slot_ref, grad, _options), indices in groups.items()
         )
 
+    @_backward_region
     def _run_flat_plan_with_memory_tracking(
         self,
         plan: _FlatForwardPlan,
@@ -5209,12 +6653,19 @@ class TrainerRank:
         check: _MemoryCheck,
         context: str,
     ) -> tuple[list[AnyForwardOutput], int | None]:
+        if not getattr(self, "_planner_observing_split", False):
+            self._begin_planner_observation(plan, check)
         if torch.cuda.is_available() and self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
             baseline = int(torch.cuda.memory_allocated(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
         else:
             baseline = None
+        observation = getattr(self, "_planner_observation", None)
+        if observation is not None:
+            if observation["baseline"] is None:
+                observation["baseline"] = baseline
+            observation["phase"] = "forward"
         started = self._recovery_clock() if baseline is not None else None
         try:
             with _telemetry_phase(
@@ -5227,6 +6678,7 @@ class TrainerRank:
                 if torch.cuda.is_available() and self.device.type == "cuda":
                     torch.cuda.synchronize(self.device)
         except torch.cuda.OutOfMemoryError as exc:
+            self.report_planner_oom(exc)
             raise _memory_error(
                 context=context,
                 message="CUDA OOM occurred despite the planner estimate",
@@ -5249,6 +6701,8 @@ class TrainerRank:
                 self._record_recovery_work(context, seconds)
             except Exception:
                 self._recovery_state().invalid = True
+        if observation is not None:
+            observation["phase"] = "forward_and_caller"
         return outputs, baseline
 
     def _update_peak_memory_profile(
@@ -5260,6 +6714,9 @@ class TrainerRank:
         if baseline is None:
             return
         peak = int(torch.cuda.max_memory_allocated(self.device))
+        observation = getattr(self, "_planner_observation", None)
+        if observation is not None:
+            observation["peak"] = max(observation["peak"], peak)
         self._update_memory_profile(
             plan,
             max(0, peak - baseline),
@@ -5267,6 +6724,450 @@ class TrainerRank:
                 None if retained_after is None else max(0, retained_after - baseline)
             ),
         )
+
+    def _begin_planner_observation(
+        self, plan: _AnyForwardPlan, check: _MemoryCheck
+    ) -> None:
+        reporter = getattr(self, "_planner_reporter", None)
+        if reporter is None or reporter.threshold_pct is None:
+            return
+        self.finish_planner_observation()
+        self._planner_observation_generation += 1
+        if self._planner_active_observations:
+            # Both the suspended caller and the newly entered forward share
+            # allocator counters; neither interval may claim a completed peak.
+            self._planner_overlap_generation = self._planner_observation_generation
+        # A snapshot failure must still leave a durable minimal OOM report.
+        observation = _PlannerObservation(
+            {
+                "predicted": check.estimated_required_bytes,
+                "admission": check.estimated_required_bytes,
+                "replay": lambda: {
+                    "incomplete_reasons": ["planner_snapshot_unavailable"]
+                },
+                "baseline": None,
+                "peak": 0,
+                "phase": "forward",
+                "comparable": False,
+                "generation": self._planner_observation_generation,
+                "window_open": True,
+                "decision": check.decision,
+            }
+        )
+        self._planner_observation = observation
+        self._planner_active_observations[observation["generation"]] = observation
+        self._fill_planner_snapshot(plan, check, observation)
+
+    def _fill_planner_snapshot(
+        self, plan: _AnyForwardPlan, check: _MemoryCheck, observation: dict[str, Any]
+    ) -> None:
+        """Freeze the selected estimator without opening a measurement window."""
+        try:
+            children = (
+                plan.subforwards if isinstance(plan, _SplitForwardPlan) else (plan,)
+            )
+            # Freeze scalar calibration before forward updates it. Keep owned
+            # request references, not new token copies or autograd outputs.
+            costs = [self._plan_cost(child) for child in children]
+            estimates: list[dict[str, Any]] = []
+            for child, cost in zip(children, costs, strict=True):
+                estimates.append(
+                    {
+                        "signature": asdict(child.signature),
+                        "profile": asdict(profile)
+                        if (profile := self._memory_profiles.get(child.signature))
+                        else None,
+                        "arguments": {
+                            "packed_tokens": child.packed_tokens,
+                            "output_bytes": child.output_bytes,
+                            "logical_tokens": child.active_logical_tokens,
+                            "gdn_segments": child.grad_segment_count,
+                            "retained_tokens": self._plan_retained_tokens(child),
+                            "group_rows": self._plan_group_rows(child),
+                            "hybridep_growth_bytes": (
+                                self._plan_hybridep_growth_bytes(child)
+                            ),
+                        },
+                        "expected_required_bytes": cost.required,
+                        "retained_bytes": cost.retained,
+                        "cost_components": asdict(cost),
+                        # Observed costs do not reconstruct model/slot eligibility
+                        # or the head/GDN/checkpoint inputs used to derive them.
+                        "missing_inputs": [
+                            "immutable runtime group/slot, head, checkpoint and GDN facts"
+                        ]
+                        if child.groups
+                        else [],
+                    }
+                )
+            floor = 0
+            if isinstance(plan, _SplitForwardPlan):
+                key = self._split_memory_key(plan)
+                floor = self._split_memory_floors.get(key, 0) if key is not None else 0
+            local_required = max(
+                self._split_required_memory(costs),
+                int(floor * _MEMORY_SAFETY_FACTOR),
+            )
+            if any(group.memory_placement is not None for group in plan.groups):
+                # Placement also prices version snapshots and outstanding graphs;
+                # the unplaced model estimate cannot recreate that admission.
+                if check.sample is None or check.sample.local_required_bytes is None:
+                    raise ValueError("graph placement admission sample unavailable")
+                local_required = check.sample.local_required_bytes
+            rank_fields = {
+                name: getattr(self, "_" + name)
+                for name in (
+                    "num_layers",
+                    "hidden_size",
+                    "param_dtype_size",
+                    "recompute_granularity",
+                    "sequence_parallel",
+                    "attention_output_gate",
+                    "mlp_activation_factor",
+                    "gdn_layers",
+                    "checkpointed_moe_layers",
+                    "moe_output_bytes_per_token",
+                )
+            }
+            rank_fields["recompute_modules"] = sorted(self._recompute_modules)
+            rank_fields["one_layer_recompute"] = self._one_layer_recompute()
+            rank_fields["moe_forward_stages"] = getattr(self, "_moe_forward_stages", ())
+            rank_fields["geometry"] = asdict(self._geometry)
+            rank_fields["topology"] = list(plan.signature.topology)
+
+            def version(tensor: torch.Tensor | None) -> int | None:
+                try:
+                    return None if tensor is None else tensor._version
+                except RuntimeError:
+                    return None
+
+            tensors = [
+                (
+                    item,
+                    version(item.input_ids),
+                    version(item.labels),
+                    {
+                        "top_k": item.request.top_k,
+                        "logits": item.request.logits,
+                        "hidden_states": item.request.hidden_states,
+                        "no_grad": item.request.no_grad,
+                        "checkpoint": str(item.request.checkpoint),
+                        "options": asdict(
+                            _resolved_request_policy(item.request.options)
+                        ),
+                    },
+                )
+                for group in plan.groups
+                for item in group.items
+            ]
+            slots = [str(group.slot_ref) for group in plan.groups]
+            selected_names = {
+                getattr(group.slot_ref, "name", None) for group in plan.groups
+            }
+            checkpoint_sources = {
+                name: self._checkpoint_prefetch_sources[name]
+                for name in selected_names
+                if name in self._checkpoint_prefetch_sources
+            }
+            spec = getattr(self.runtime, "model_support_spec", None)
+            bridge = getattr(
+                getattr(self.runtime, "provider_bundle", None), "bridge", None
+            )
+            pretrained = getattr(bridge, "hf_pretrained", None)
+            config = getattr(pretrained, "config", pretrained)
+            model = {
+                "support_key": getattr(spec, "key", None),
+                "name_or_path": getattr(config, "_name_or_path", None),
+                "revision": getattr(config, "_commit_hash", None),
+                "dtype": str(next(self.runtime.model[0].parameters()).dtype),
+            }
+
+            def replay() -> dict[str, Any]:
+                remaining = 1_000_000
+                incomplete = {
+                    reason for item in estimates for reason in item["missing_inputs"]
+                }
+
+                def tensor_data(
+                    tensor: torch.Tensor | None, original_version: int | None
+                ) -> Any:
+                    nonlocal remaining
+                    if tensor is None:
+                        return None
+                    reason = None
+                    if (
+                        tensor.device.type != "cpu"
+                        or original_version is None
+                        or version(tensor) != original_version
+                    ):
+                        reason = "device_or_modified_input"
+                    elif tensor.numel() > remaining:
+                        reason = "token_inventory_over_limit"
+                    if reason is not None:
+                        incomplete.add(reason)
+                        return {
+                            "unavailable": reason,
+                            "shape": list(tensor.shape),
+                            "dtype": str(tensor.dtype),
+                        }
+                    remaining -= tensor.numel()
+                    return tensor.tolist()
+
+                requests = [
+                    {
+                        **options,
+                        "input_tokens": tensor_data(item.input_ids, input_version),
+                        "target_tokens": tensor_data(item.labels, label_version),
+                    }
+                    for item, input_version, label_version, options in tensors
+                ]
+                layouts = []
+                cursor = 0
+                for group in plan.groups:
+                    rows = [
+                        item["input_tokens"]
+                        for item in requests[cursor : cursor + len(group.items)]
+                    ]
+                    cursor += len(group.items)
+                    if group.layout is None:
+                        incomplete.add("selected_layout_unavailable")
+                    elif not all(isinstance(row, list) for row in rows):
+                        incomplete.add("layout_inputs_unavailable")
+                    else:
+                        layouts.append(
+                            {
+                                "input_tokens": rows,
+                                "selected_decisions": sorted(
+                                    group.layout.selected_decisions
+                                ),
+                                "expected_fingerprint": group.layout.fingerprint,
+                                "expected_packed_tokens": group.layout.packed_tokens,
+                            }
+                        )
+                return {
+                    "memory_replay": {"rank": rank_fields, "estimates": estimates},
+                    "layouts": layouts,
+                    "incomplete_reasons": sorted(incomplete),
+                    "model": model["name_or_path"],
+                    "model_identity": model,
+                    "requests": requests,
+                    "plan": self._telemetry_signature(plan),
+                    "subforward_request_indices": list(plan.request_indices)
+                    if isinstance(plan, _SplitForwardPlan)
+                    else [list(range(plan.request_count))],
+                    "group_request_indices": [
+                        list(group.request_indices) for group in plan.groups
+                    ],
+                    "subforward_group_counts": [
+                        len(child.groups) for child in children
+                    ],
+                    "checkpoint_slots": slots,
+                    "checkpoint_sources": checkpoint_sources,
+                    "split_memory_floor_bytes": floor,
+                    "local_admission_peak_bytes": local_required,
+                    "reduced_admission_peak_bytes": check.estimated_required_bytes,
+                    "available_bytes": check.available_bytes,
+                    "safety_factor": _MEMORY_SAFETY_FACTOR,
+                    "rank": dist.get_rank()
+                    if dist.is_available() and dist.is_initialized()
+                    else 0,
+                    "device": {
+                        "device": str(self.device),
+                        **self._planner_device_identity,
+                    },
+                }
+
+            observation.update(
+                {
+                    "predicted": round(local_required / _MEMORY_SAFETY_FACTOR),
+                    "admission": check.estimated_required_bytes,
+                    "replay": replay,
+                    "comparable": True,
+                }
+            )
+        except Exception:
+            # Reporting is auxiliary; a diagnostic failure cannot change the
+            # model's ordinary execution or replace an OOM.
+            _planner_misses._warn("could not prepare planner-miss observation")
+
+    def _complete_planner_observation(self, *, phase: str | None = None) -> None:
+        """Close at the existing profiling boundary, retaining only OOM context."""
+        try:
+            observation = getattr(self, "_planner_observation", None)
+            if observation is None or not observation["window_open"]:
+                return
+            observation["window_open"] = False
+            # Later caller/backward work can still perturb another execution's
+            # allocator window, so retain weak overlap custody until cleanup.
+            phase = observation["phase"] if phase is None else phase
+            observation["phase"] = "caller_after_profile"
+            if observation["baseline"] is None or not observation["comparable"]:
+                return
+            if observation["generation"] <= self._planner_overlap_generation:
+                _planner_misses._warn(
+                    "overlapping forwards invalidated the allocator peak interval"
+                )
+                return
+            peak = max(
+                observation["peak"], int(torch.cuda.max_memory_allocated(self.device))
+            )
+            self._planner_reporter.report(
+                predicted_peak_bytes=observation["predicted"],
+                observed_peak_bytes=max(0, peak - observation["baseline"]),
+                phase=phase,
+                replay_factory=observation["replay"],
+                admission_peak_bytes=observation["admission"],
+                decision=observation.get("decision"),
+            )
+        except Exception:
+            _planner_misses._warn("could not finish planner-miss observation")
+
+    def finish_planner_observation(self) -> None:
+        """Release execution context without sampling an unbounded caller peak.
+
+        ART compares completed peaks at its existing profiling boundaries:
+        forward's return or forward_batches' iterator resume.
+        Caladan calls this at execution end. Direct callers can report a caught
+        caller OOM before cleanup, then call this method to release the context.
+        An abandoned microbatch iterator cannot mint a completed comparison.
+        """
+        try:
+            self.discard_planner_observation()
+        except Exception:
+            _planner_misses._warn("could not finish planner-miss execution")
+
+    def report_planner_oom(self, error: BaseException) -> None:
+        """Persist a caught CUDA OOM before caller cleanup, then leave it alone.
+
+        This does not suppress, retry, or recover the original failure. An OOM
+        after the profiled window retains inputs but cannot claim a partial peak
+        for that window, let alone a completed error percentage.
+        """
+        try:
+            original: BaseException | None = error
+            seen: set[int] = set()
+            while original is not None and id(original) not in seen:
+                if (
+                    getattr(original, "_art_planner_admission_attempt", None)
+                    is not None
+                ):
+                    # This error escaped planning, before a new forward window.
+                    # A prior caller context cannot supply its input/peak facts.
+                    return
+                if isinstance(original, torch.cuda.OutOfMemoryError):
+                    break
+                seen.add(id(original))
+                original = original.__cause__
+            observation = getattr(self, "_planner_observation", None)
+            if (
+                original is None
+                or not isinstance(original, torch.cuda.OutOfMemoryError)
+                or observation is None
+            ):
+                return
+            self.discard_planner_observation()
+            reasons = []
+            if observation["generation"] <= self._planner_overlap_generation:
+                reasons.append("overlapping_forward_memory_window")
+            if not observation["window_open"]:
+                reasons.append("oom_after_profiled_window")
+            partial = None
+            try:
+                if observation["baseline"] is not None and not reasons:
+                    partial = max(
+                        0,
+                        max(
+                            observation["peak"],
+                            int(torch.cuda.max_memory_allocated(self.device)),
+                        )
+                        - observation["baseline"],
+                    )
+            except Exception:
+                pass
+            oom_facts: dict[str, Any] = {
+                "type": type(original).__name__,
+                "message": str(original)[:4096],
+                "baseline_bytes": observation["baseline"],
+            }
+            try:
+                stats = torch.cuda.memory_stats(self.device)
+                oom_facts["allocator"] = {
+                    key: stats[key]
+                    for key in (
+                        "allocated_bytes.all.current",
+                        "reserved_bytes.all.current",
+                        "active_bytes.all.current",
+                        "num_ooms",
+                        "num_alloc_retries",
+                    )
+                    if key in stats
+                }
+                oom_facts["allocator_phase"] = "post_unwind"
+            except Exception:
+                oom_facts["allocator"] = None
+
+            def replay() -> dict[str, Any]:
+                return {
+                    **observation["replay"](),
+                    "oom": oom_facts,
+                    "measurement_valid": not reasons,
+                    "window_reasons": reasons,
+                }
+
+            self._planner_reporter.report(
+                predicted_peak_bytes=observation["predicted"],
+                observed_peak_bytes=None,
+                oom=True,
+                phase=observation["phase"],
+                replay_factory=replay,
+                admission_peak_bytes=observation["admission"],
+                partial_peak_bytes=partial,
+                decision=observation.get("decision"),
+                failure=_planner_evidence.failure(original, phase=observation["phase"]),
+            )
+        except Exception:
+            _planner_misses._warn("could not persist planner OOM report")
+
+    def discard_planner_observation(self) -> None:
+        try:
+            observation = getattr(self, "_planner_observation", None)
+            if observation is not None:
+                self._planner_active_observations.pop(observation["generation"], None)
+            self._planner_observation = None
+        except Exception:
+            _planner_misses._warn("could not discard planner-miss observation")
+
+    @property
+    def _planner_observation(self) -> dict[str, Any] | None:
+        variable = getattr(self, "_planner_observation_context", None)
+        context = None if variable is None else variable.get()
+        return (
+            getattr(self, "_planner_unscoped_observation", None)
+            if context is None
+            else context.get("observation")
+        )
+
+    @_planner_observation.setter
+    def _planner_observation(self, value: dict[str, Any] | None) -> None:
+        variable = getattr(self, "_planner_observation_context", None)
+        context = None if variable is None else variable.get()
+        if context is None:
+            self._planner_unscoped_observation = value
+        else:
+            context["observation"] = value
+
+    @contextmanager
+    def planner_observation_scope(self, context: dict[str, Any]) -> Iterator[None]:
+        """Use one holder per execution, retaining it across async-generator steps.
+
+        A scope changes only diagnostic ownership. It does not serialize model
+        work or make the process-wide CUDA peak counter execution-local.
+        """
+        token = self._planner_observation_context.set(context)
+        try:
+            yield
+        finally:
+            self._planner_observation_context.reset(token)
 
     @staticmethod
     def _telemetry_plan_signature(plan: _AnyForwardPlan) -> dict[str, object]:
@@ -5703,8 +7604,12 @@ class TrainerRank:
         *,
         slot_group_count: int,
         grad_modes: Iterable[bool],
+        slot_groups: Iterable[tuple["LoRASlotRef | None", bool]] = (),
     ) -> _MemorySignature:
         modes = tuple(sorted(grad_modes))
+        shapes = tuple(
+            sorted((grad, self._slot_memory_shapes(ref)) for ref, grad in slot_groups)
+        )
         return _MemorySignature(
             topology=self._topology_key(),
             planner_coefficients=(self._coefficient_version, self._coefficient_table),
@@ -5714,7 +7619,36 @@ class TrainerRank:
             ),
             grad_enabled=any(modes),
             grad_modes=modes,
+            slot_shapes=shapes if any(any(shape) for _, shape in shapes) else (),
+            short_requests=any(_short_request(request) for request in requests),
         )
+
+    def _slot_memory_shapes(
+        self, ref: "LoRASlotRef | None"
+    ) -> tuple[tuple[int, ...], ...]:
+        """Separate empirical trust across actual selected adapter layouts."""
+        if (
+            ref is None
+            or ref.name is None
+            or isinstance(ref, _LocalLoRASlotRef)
+            or not (getattr(self, "_moe_layers", 0) or getattr(self, "_gdn_layers", 0))
+        ):
+            # Generic/no-component planning must not import Megatron or walk
+            # model owners just to construct its existing memory signature.
+            return ()
+        from art.megatron.lora import LoRA
+
+        shapes = []
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                if type(module) is LoRA:
+                    tensors = _slot_lora_tensors(module, ref)
+                    shapes.append(
+                        ()
+                        if tensors is None
+                        else (tensors[0].ndim, *tensors[0].shape, *tensors[1].shape)
+                    )
+        return tuple(shapes)
 
     def _topology_key(self) -> tuple[int, int, int, int]:
         try:
@@ -5847,6 +7781,9 @@ class TrainerRank:
                             requests,
                             slot_group_count=len(groups),
                             grad_modes=tuple(g.grad_enabled for g in groups),
+                            slot_groups=tuple(
+                                (g.slot_ref, g.grad_enabled) for g in groups
+                            ),
                         ),
                     )
                 )
@@ -6134,8 +8071,12 @@ class TrainerRank:
                 signature=forward.signature,
                 logical_tokens=forward.active_logical_tokens,
                 gdn_segments=forward.grad_segment_count,
+                group_rows=self._plan_group_rows(forward),
+                slot_refs=tuple(g.slot_ref for g in forward.groups),
+                head_workspace_bytes=self._plan_head_workspace_bytes(forward),
+                checkpoint_floor=_gdn_memory.plan_floor(self, forward),
                 retained_tokens=self._plan_retained_tokens(forward),
-            )
+            ) + int(self._plan_hybridep_growth_bytes(forward) * _MEMORY_SAFETY_FACTOR)
         return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
     def _admission_outcome(self, local: int) -> int:
@@ -6220,6 +8161,7 @@ class TrainerRank:
             )[0]
         )
 
+    @_backward_region
     def _recover_admission(
         self,
         search: Callable[[], Any],
@@ -6228,32 +8170,221 @@ class TrainerRank:
         *,
         context: str,
         sync_across_dp: bool,
+        admit_refusal: Callable[[_ForwardRefusal], Any] | None = None,
+    ) -> Any:
+        reporter = getattr(self, "_planner_reporter", None)
+        if reporter is None or reporter.threshold_pct is None:
+            return self._recover_admission_impl(
+                search,
+                describe,
+                update,
+                context=context,
+                sync_across_dp=sync_across_dp,
+                admit_refusal=admit_refusal,
+            )
+        try:
+            decision = _planner_evidence.Decision(
+                context, sync_across_dp=sync_across_dp, owner=self
+            )
+        except Exception:
+            return self._recover_admission_impl(
+                search,
+                describe,
+                update,
+                context=context,
+                sync_across_dp=sync_across_dp,
+                admit_refusal=admit_refusal,
+            )
+        with _planner_evidence.scope(decision):
+            try:
+                result = self._recover_admission_impl(
+                    search,
+                    describe,
+                    update,
+                    context=context,
+                    sync_across_dp=sync_across_dp,
+                    admit_refusal=admit_refusal,
+                )
+            except BaseException as error:
+                # Cancellation/termination keeps its original behavior. Do not
+                # turn abandoned planning into a fabricated completed event.
+                if isinstance(error, Exception):
+                    try:
+                        setattr(error, "_art_planner_admission_attempt", decision.id)
+                    except Exception:
+                        pass
+                    self._report_planning_failure(decision, error)
+                raise
+            try:
+                _, check = describe(result)
+                decision.selected = check.sample
+                if decision.outcome == "planning":
+                    decision.outcome = "admitted"
+                return update(result, replace(check, decision=decision.snapshot()))
+            except Exception:
+                _planner_misses._warn("could not retain admission decision")
+                return result
+
+    def _report_planning_failure(
+        self, decision: _planner_evidence.Decision, error: Exception
+    ) -> None:
+        try:
+            refusal = decision.refusal
+            refused = decision.outcome == "refused" and refusal is not None
+            decision.outcome = "refused" if refused else "planning_error"
+            observation: dict[str, Any] = {
+                "predicted": None,
+                "admission": None,
+                "replay": lambda: {"incomplete_reasons": ["no_selected_plan"]},
+            }
+            if refused:
+                decision.selected = refusal.check.sample
+                observation.update(
+                    admission=refusal.check.estimated_required_bytes,
+                    replay=lambda: {
+                        "incomplete_reasons": ["planner_snapshot_unavailable"]
+                    },
+                )
+                self._fill_planner_snapshot(refusal.plan, refusal.check, observation)
+                snapshot = observation["replay"]
+
+                def replay() -> dict[str, Any]:
+                    payload = snapshot()
+                    return {
+                        **payload,
+                        "candidate_matches_check": refusal.check_matches_plan,
+                        "incomplete_reasons": [
+                            *payload.get("incomplete_reasons", []),
+                            *(
+                                []
+                                if refusal.check_matches_plan
+                                else ["candidate does not describe denying check"]
+                            ),
+                        ],
+                    }
+
+                observation["replay"] = replay
+                if not refusal.check_matches_plan:
+                    observation["predicted"] = None
+            self._planner_reporter.report(
+                predicted_peak_bytes=observation["predicted"],
+                observed_peak_bytes=None,
+                admission_peak_bytes=observation["admission"],
+                phase="planning",
+                event="admission_refused" if refused else "planning_error",
+                decision=decision.snapshot(),
+                failure=_planner_evidence.failure(error, phase="planning"),
+                replay_factory=observation["replay"],
+            )
+        except Exception:
+            _planner_misses._warn("could not retain planning failure")
+
+    def _recover_admission_impl(
+        self,
+        search: Callable[[], Any],
+        describe: Callable[[Any], tuple[_AnyForwardPlan, _MemoryCheck]],
+        update: Callable[[Any, _MemoryCheck], Any],
+        *,
+        context: str,
+        sync_across_dp: bool,
+        admit_refusal: Callable[[_ForwardRefusal], Any] | None = None,
     ) -> Any:
         """Pure search, at most one smaller-plan refresh, then one recovery."""
         original: TrainerRankMemoryError | None = None
         refused: _ForwardRefusal | None = None
+        best: _ForwardRefusal | None = None
+
+        def reject() -> Any:
+            assert refused is not None
+            if admit_refusal is not None:
+                # Only the exhausted memory-refusal path changes. Every peer
+                # must have a supported candidate; never override an EP or
+                # failed planning/runtime capability guard or host placement budget.
+                allowed = (
+                    getattr(self, "_allow_oversized_batches", False)
+                    and refused.overridable
+                    and best is not None
+                    and best.check.cpu_fits
+                )
+                selected = None
+                if allowed:
+                    assert best is not None
+                    selected = (
+                        update(best.candidate, best.check)
+                        if best.candidate is not None
+                        else admit_refusal(best)
+                    )
+                width = (
+                    selected.stats_global_count
+                    if isinstance(selected, _CandidateMicroBatch)
+                    else 0
+                )
+                agreed = self._recovery_reduce(
+                    [float(allowed), float(width), -float(width)],
+                    op="MIN",
+                    sync_across_dp=sync_across_dp,
+                )
+                if agreed[0] == 1 and agreed[1] == -agreed[2]:
+                    decision = _planner_evidence.current(self)
+                    if decision is not None:
+                        decision.outcome = "admitted_oversized"
+                    return selected
+            decision = _planner_evidence.current(self)
+            if decision is not None:
+                decision.outcome, decision.refusal = "refused", refused
+            raise refused.error(context) from original
 
         def finish(value: Any) -> Any:
-            nonlocal refused
+            nonlocal refused, best
             if isinstance(value, _ForwardRefusal):
+                if sync_across_dp and admit_refusal is not None:
+                    # Minimum-wave split checks are TP x CP-local. Compare
+                    # them against larger world-priced waves on the same basis
+                    # so every DP rank retains the same logical wave width.
+                    value = replace(
+                        value,
+                        check=self._refresh_memory_check(
+                            value.check,
+                            sync_across_dp=True,
+                        ),
+                    )
                 refused = value
+                if value.overridable and (
+                    best is None
+                    or value.check.estimated_required_bytes
+                    < best.check.estimated_required_bytes
+                ):
+                    best = value
                 return None
             plan, check = describe(value)
             if sync_across_dp:
-                refreshed = self._memory_check_required(
-                    check.estimated_required_bytes, sync_across_dp=True
-                )
-                check = replace(
-                    check,
-                    estimated_required_bytes=refreshed.estimated_required_bytes,
-                    available_bytes=refreshed.available_bytes,
-                    fits=refreshed.fits and check.cpu_fits,
-                )
+                check = self._refresh_memory_check(check, sync_across_dp=True)
             if check.fits:
                 return update(value, check)
             refused = _ForwardRefusal(
-                plan, check, "selected plan exceeds freshly sampled available memory"
+                plan,
+                check,
+                "selected plan exceeds freshly sampled available memory",
+                candidate=value,
             )
+            if (
+                best is None
+                or check.estimated_required_bytes < best.check.estimated_required_bytes
+            ):
+                best = refused
+            if isinstance(value, _CandidateMicroBatch) and value.fallback is not None:
+                fallback = value.fallback
+                if (
+                    best is None
+                    or fallback.check.estimated_required_bytes
+                    < best.check.estimated_required_bytes
+                ):
+                    best = _ForwardRefusal(
+                        fallback.plan,
+                        fallback.check,
+                        refused.message,
+                        candidate=fallback,
+                    )
             return None
 
         value = search()
@@ -6262,14 +8393,7 @@ class TrainerRank:
             return result
         assert refused is not None
         original = refused.error(context)
-        state = self._recovery_state()
-        started = self._recovery_clock()
-        owner = object()
-        with state.lock:
-            if state.owner is None:
-                state.owner = owner
-        primary: BaseException | None = None
-        try:
+        with self._cache_recovery_episode() as (owner, started):
             if not isinstance(value, _ForwardRefusal):
                 # A formerly fitting width is not proof that the minimum cannot fit.
                 value = search()
@@ -6280,7 +8404,7 @@ class TrainerRank:
                     # Counters moved again: do not loop or reclaim for a large width.
                     assert refused is not None
                     self._snapshot_planning_telemetry(refused.plan, refused.check)
-                    raise refused.error(context) from original
+                    return reject()
             assert refused is not None
             reclaimed = self._reclaim_graph_memory(
                 refused.check, sync_across_dp=sync_across_dp
@@ -6298,47 +8422,87 @@ class TrainerRank:
                     return result
             assert refused is not None
             self._snapshot_planning_telemetry(refused.plan, refused.check)
-            latest = refused.error(context)
-            raise latest from original
+            return reject()
+
+    @contextmanager
+    def _cache_recovery_episode(
+        self, *, error: BaseException | None = None
+    ) -> Iterator[tuple[object, float | None]]:
+        state = None
+        started = None
+        owner = None
+        primary = error
+        try:
+            try:
+                state = self._recovery_state()
+                started = self._recovery_clock()
+                owner = object()
+                with state.lock:
+                    if state.owner is None:
+                        state.owner = owner
+            except BaseException:
+                # A saved forward failure must still reach the WORLD status
+                # vote. Unknown accounting cost cannot enable later recovery.
+                if state is None:
+                    state = getattr(self, "_cache_recovery_state", None)
+                    if state is None:
+                        state = self._cache_recovery_state = _CacheRecoveryState()
+                state.invalid = True
+                if error is None:
+                    raise
+            yield owner, started
         except BaseException as exc:
             primary = exc
             raise
         finally:
-            # Includes control, release, resample and repeated search; no idle.
-            try:
-                finished = self._recovery_clock()
-                elapsed = (
-                    None if started is None or finished is None else finished - started
-                )
-                with state.lock:
-                    if (
-                        elapsed is None
-                        or not math.isfinite(elapsed)
-                        or elapsed <= 0
-                        or not math.isfinite(state.cost + elapsed)
-                    ):
-                        state.invalid = True
-                    else:
-                        state.cost += elapsed
-                        state.high = max(state.high, elapsed)
-            except Exception:
-                state.invalid = True
-            except BaseException as exc:
-                state.invalid = True
-                if primary is None:
-                    primary = exc
-                    raise
-            finally:
+            if state is not None:
+                # Includes control, release, resample and repeated search; no idle.
                 try:
+                    finished = self._recovery_clock()
+                    elapsed = (
+                        None
+                        if started is None or finished is None
+                        else finished - started
+                    )
                     with state.lock:
-                        if state.owner is owner:
-                            state.owner = None
+                        if (
+                            elapsed is None
+                            or not math.isfinite(elapsed)
+                            or elapsed <= 0
+                            or not math.isfinite(state.cost + elapsed)
+                        ):
+                            state.invalid = True
+                        else:
+                            state.cost += elapsed
+                            state.high = max(state.high, elapsed)
+                        _planner_evidence.record(
+                            self,
+                            "recovery",
+                            "accounted",
+                            elapsed_seconds=elapsed,
+                            local_cumulative_seconds=state.cost,
+                            local_forward_work_seconds=state.work,
+                            local_high_seconds=state.high,
+                            invalid=state.invalid,
+                        )
                 except Exception:
                     state.invalid = True
-                except BaseException:
+                except BaseException as exc:
                     state.invalid = True
                     if primary is None:
+                        primary = exc
                         raise
+                finally:
+                    try:
+                        with state.lock:
+                            if state.owner is owner:
+                                state.owner = None
+                    except Exception:
+                        state.invalid = True
+                    except BaseException:
+                        state.invalid = True
+                        if primary is None:
+                            raise
 
     def _recovery_clock(self) -> float | None:
         try:
@@ -6372,6 +8536,35 @@ class TrainerRank:
         if state is None:
             state = self._cache_recovery_state = _CacheRecoveryState()
         return state
+
+    def _backward_work(self) -> BackwardWork | None:
+        state = None
+        started = None
+        primary = False
+        try:
+            state = self._recovery_state()
+            started = time.perf_counter_ns()
+            with state.lock:
+                if state.backward is None and not state.invalid:
+                    state.backward = BackwardWork(state.lock, self.device)
+                return state.backward
+        except BaseException as exc:
+            # Unknown accounting cost must never become free recovery budget,
+            # including a failure before state lookup returned.
+            if state is None:
+                state = getattr(self, "_cache_recovery_state", None)
+                if state is None:
+                    state = self._cache_recovery_state = _CacheRecoveryState()
+            state.invalid = True
+            if isinstance(exc, Exception):
+                return None
+            primary = True
+            raise
+        finally:
+            if state is not None and state.backward is not None:
+                # Includes lazy setup and lock wait; constructor overlap is an
+                # intentional conservative charge, not an exact subtraction.
+                state.backward._charge(started, primary=primary)
 
     def _recovery_reduce(
         self,
@@ -6414,34 +8607,47 @@ class TrainerRank:
 
     def _try_cache_recovery(
         self,
-        check: _MemoryCheck,
+        check: _MemoryCheck | None,
         *,
         sync_across_dp: bool,
         owner: object,
         started: float | None,
+        handoff_grad: bool = False,
     ) -> bool:
         state = self._recovery_state()
+        backward = self._backward_work()
+        if backward is not None:
+            backward.harvest()
         now = self._recovery_clock()
         elapsed = None if now is None or started is None else now - started
         with state.lock:
             invalid = (
                 state.invalid
+                or (backward is not None and backward.invalid)
                 or state.owner is not owner
                 or elapsed is None
                 or not math.isfinite(elapsed)
                 or elapsed < 0
             )
             projected = state.cost if elapsed is None else state.cost + elapsed
+            # B survives forward rollback. O deliberately includes observer spans
+            # also covered by recovery; reductions retain the original topology.
+            work = state.work + (0.0 if backward is None else backward.work_ns / 1e9)
+            accounted_cost = projected + (
+                0.0 if backward is None else backward.cost_ns / 1e9
+            )
             invalid |= any(
                 not math.isfinite(value) or value < 0
                 for value in (
                     projected,
                     state.work,
+                    work,
                     state.high,
                     projected + state.high,
+                    accounted_cost + state.high,
                 )
             )
-            local_cost = [0.0, 0.0] if invalid else [projected, state.high]
+            local_cost = [0.0, 0.0] if invalid else [accounted_cost, state.high]
         # SUM costs deliberately overcharges parallel ranks; unlike MAX of
         # lifetime costs, it cannot miss episodes with different slow ranks.
         costs = self._recovery_reduce(
@@ -6450,8 +8656,8 @@ class TrainerRank:
         invalid |= any(not math.isfinite(value) for value in (*costs, sum(costs)))
         values = self._recovery_reduce(
             [
-                float(check.estimated_required_bytes),
-                0.0 if invalid else state.work,
+                float(check.estimated_required_bytes) if check is not None else 0.0,
+                0.0 if invalid else work,
                 float(state.first_consumed),
                 float(invalid),
             ],
@@ -6461,22 +8667,46 @@ class TrainerRank:
         required = int(values[0])
         state.first_consumed = bool(values[2])
         state.invalid |= bool(values[3])
+        _planner_evidence.record(
+            self,
+            "recovery",
+            "budget_observed",
+            local_projected_seconds=accounted_cost,
+            local_high_seconds=state.high,
+            local_work_seconds=work,
+            local_recovery_seconds=projected,
+            local_forward_work_seconds=state.work,
+            reduced_cost_seconds=costs[0],
+            reduced_high_seconds=costs[1],
+            reduced_work_seconds=values[1],
+            required_bytes=required,
+            first_consumed=state.first_consumed,
+            budget_fraction=0.05,
+            invalid=state.invalid,
+        )
         if state.invalid:
+            _planner_evidence.record(
+                self, "recovery", "skipped", reason="invalid_budget_or_owner"
+            )
             return False
         error: BaseException | None = None
         needed = False
         cap_blocks = False
         try:
-            available = self._available_memory_bytes()
+            available = self._available_memory_bytes() if check is not None else 0
             if (
-                available < required
+                (available < required if check is not None else handoff_grad)
                 and self.device.type == "cuda"
                 and torch.cuda.is_available()
                 and torch.cuda.get_allocator_backend() == "native"
             ):
                 free, total = torch.cuda.mem_get_info(self.device)
                 needed = int(free) < required + int(total * _MEMORY_RESERVE_FRACTION)
-                if os.environ.get(_TEST_HOOKS_ENV) == "1":
+                if check is None:
+                    needed &= int(torch.cuda.memory_reserved(self.device)) > int(
+                        torch.cuda.memory_allocated(self.device)
+                    )
+                elif os.environ.get(_TEST_HOOKS_ENV) == "1":
                     limit = os.environ.get(_TEST_MEMORY_LIMIT_ENV)
                     if limit:
                         cap_blocks = required > max(
@@ -6502,31 +8732,94 @@ class TrainerRank:
                 raise
             exchange_error = exc
         if error is not None:
+            _planner_evidence.record(
+                self, "recovery", "failed", reason="sampling_or_reduction"
+            )
             raise self._memory_error_with_reduction_note(error, exchange_error)
         if sampled[0] < 0:
             raise RuntimeError("Memory recovery sampling failed on another rank")
         state.invalid |= not bool(sampled[3])
-        if required <= sampled[0]:
+        _planner_evidence.record(
+            self,
+            "recovery",
+            "sampled",
+            local_available_bytes=available if check is not None else None,
+            reduced_available_bytes=sampled[0] if check is not None else None,
+            local_needed=needed,
+            any_needed=bool(-sampled[1]),
+            local_cap_blocks=cap_blocks,
+            cap_permits=bool(sampled[2]),
+            invalid=state.invalid,
+        )
+        if check is not None and required <= sampled[0]:
+            _planner_evidence.record(
+                self, "recovery", "skipped", reason="fresh_sample_fits"
+            )
             return True
         if sampled[1] == 0 or sampled[2] == 0 or state.invalid:
+            _planner_evidence.record(
+                self, "recovery", "skipped", reason="native_recovery_not_permitted"
+            )
             return False
         if state.first_consumed and not (
             costs[1] > 0 and sum(costs) <= 0.05 * values[1]
         ):
+            _planner_evidence.record(
+                self, "recovery", "refused", reason="recovery_budget"
+            )
             return False
         # Every peer enters this block. Only locally deficient native ranks call
         # the process-wide allocator operation. Test-only caps cannot trigger it.
         state.first_consumed = True
         attempted = False
+        before_available = available
         try:
             if needed:
                 # The control exchange can change allocator state. Check the
                 # physical condition again immediately before the sole call.
                 free, total = torch.cuda.mem_get_info(self.device)
                 if int(free) < required + int(total * _MEMORY_RESERVE_FRACTION):
-                    attempted = True
-                    torch.cuda.empty_cache()
-            available = self._available_memory_bytes()
+                    if check is not None:
+                        attempted = True
+                        _planner_evidence.record(
+                            self,
+                            "cache_release",
+                            "attempted",
+                            physical_free_bytes=int(free),
+                            physical_total_bytes=int(total),
+                            required_bytes=required,
+                            reserve_bytes=int(total * _MEMORY_RESERVE_FRACTION),
+                        )
+                        torch.cuda.empty_cache()
+                        _planner_evidence.record(self, "cache_release", "completed")
+                    else:
+                        allocated = int(torch.cuda.memory_allocated(self.device))
+                        reserved = int(torch.cuda.memory_reserved(self.device))
+                        if reserved > allocated:
+                            # A soft trigger, not calibrated library demand. The
+                            # native release affects unused caches process-wide.
+                            evidence = dict(
+                                device=str(self.device),
+                                reserve_trigger_bytes=int(
+                                    total * _MEMORY_RESERVE_FRACTION
+                                ),
+                                physical_free_before_bytes=int(free),
+                                allocated_bytes=allocated,
+                                reserved_before_bytes=reserved,
+                            )
+                            with _telemetry_phase(
+                                "gradient_handoff_cache_release", evidence
+                            ):
+                                attempted = True
+                                with torch.cuda.device(self.device):
+                                    torch.cuda.empty_cache()
+                                evidence["physical_free_after_bytes"] = int(
+                                    torch.cuda.mem_get_info(self.device)[0]
+                                )
+                                evidence["reserved_after_bytes"] = int(
+                                    torch.cuda.memory_reserved(self.device)
+                                )
+            available = self._available_memory_bytes() if check is not None else 0
         except BaseException as exc:
             error, available = exc, -1
         exchange_error: BaseException | None = None
@@ -6543,11 +8836,54 @@ class TrainerRank:
         else:
             state.first_consumed |= bool(sampled[1])
         if error is not None:
+            _planner_evidence.record(
+                self,
+                "recovery",
+                "failed",
+                reason="release_or_resample",
+                attempted=attempted,
+            )
             raise self._memory_error_with_reduction_note(error, exchange_error)
         if sampled[0] < 0:
             raise RuntimeError("Memory recovery failed on another rank")
-        # Rebuild pure search caches even when this fresh sample decreased.
+        # Admission rebuilds pure search caches even when the sample decreased.
+        # Handoff ignores this return: denied/insufficient recovery still yields
+        # the completed outputs, with no claim that backward will fit.
+        _planner_evidence.record(
+            self,
+            "recovery",
+            "completed",
+            attempted=attempted,
+            local_before_available_bytes=before_available
+            if check is not None
+            else None,
+            local_after_available_bytes=available if check is not None else None,
+            observed_available_delta_bytes=(
+                available - before_available if check is not None else None
+            ),
+            reduced_available_bytes=sampled[0] if check is not None else None,
+        )
         return True
+
+    def _refresh_memory_check(
+        self, check: _MemoryCheck, *, sync_across_dp: bool
+    ) -> _MemoryCheck:
+        decision = _planner_evidence.current(self)
+        # The existing admission operand can already be a cross-rank maximum.
+        # Preserve its local producer separately; never price the plan again.
+        with (
+            decision.refresh_of(check.sample) if decision is not None else nullcontext()
+        ):
+            refreshed = self._memory_check_required(
+                check.estimated_required_bytes, sync_across_dp=sync_across_dp
+            )
+        return replace(
+            check,
+            estimated_required_bytes=refreshed.estimated_required_bytes,
+            available_bytes=refreshed.available_bytes,
+            fits=refreshed.fits and check.cpu_fits,
+            sample=refreshed.sample,
+        )
 
     def _memory_check_required(
         self,
@@ -6555,8 +8891,12 @@ class TrainerRank:
         *,
         sync_across_dp: bool = False,
     ) -> _MemoryCheck:
+        decision = _planner_evidence.current(self)
+        details: dict[str, Any] | None = {} if decision is not None else None
+        local_required, scope = required, "local"
         if dist.is_available() and dist.is_initialized():
             group = None if sync_across_dp else self._forward_memory_group()
+            scope = "world" if group is None else "tp_cp"
             values = torch.tensor(
                 [float(required), 0.0],
                 device=self.device if self.device.type == "cuda" else "cpu",
@@ -6566,7 +8906,12 @@ class TrainerRank:
             required = int(values[0].item())
             error: BaseException | None = None
             try:
-                available = self._available_memory_bytes()
+                available = (
+                    self._available_memory_bytes()
+                    if details is None
+                    else self._available_memory_bytes(details)
+                )
+                local_available = available
             except BaseException as exc:
                 error, available = exc, -1
             exchange_error: BaseException | None = None
@@ -6585,11 +8930,32 @@ class TrainerRank:
             if available < 0:
                 raise RuntimeError("Memory admission failed on another rank")
         else:
-            available = self._available_memory_bytes()
+            available = (
+                self._available_memory_bytes()
+                if details is None
+                else self._available_memory_bytes(details)
+            )
+            local_available = available
+        sample = None
+        if decision is not None:
+            try:
+                sample = decision.observe(
+                    scope=scope,
+                    local_required_bytes=local_required,
+                    local_available_bytes=local_available,
+                    reduced_required_bytes=required,
+                    reduced_available_bytes=available,
+                    safety_factor=_MEMORY_SAFETY_FACTOR,
+                    reserve_fraction=_MEMORY_RESERVE_FRACTION,
+                    **(details or {}),
+                )
+            except Exception:
+                _planner_misses._warn("could not retain admission sample")
         return _MemoryCheck(
             estimated_required_bytes=required,
             available_bytes=available,
             fits=required <= available,
+            sample=sample,
         )
 
     @staticmethod
@@ -6633,7 +8999,12 @@ class TrainerRank:
         signature: _MemorySignature,
         logical_tokens: int | None = None,
         gdn_segments: int = 0,
+        group_rows: tuple[tuple[int, bool], ...] = (),
+        slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+        head_workspace_bytes: int = 0,
+        checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
+        include_checkpoint_input_gradient: bool = True,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -6709,22 +9080,7 @@ class TrainerRank:
             # state (fp32), plus convolution history. Unlike token activations,
             # these do not shrink with segment length.
             gdn_state_bytes = (
-                2
-                * gdn_segments
-                * gdn_layers
-                / tp
-                * (
-                    4
-                    * geometry.gdn_value_heads
-                    * geometry.gdn_key_head_dim
-                    * geometry.gdn_value_head_dim
-                    + self._param_dtype_size
-                    * (
-                        2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
-                        + geometry.gdn_value_heads * geometry.gdn_value_head_dim
-                    )
-                    * max(0, geometry.gdn_conv_kernel - 1)
-                )
+                gdn_segments * gdn_layers * self._gdn_segment_layer_bytes()
             )
             static_compute = max(
                 static_compute,
@@ -6743,21 +9099,47 @@ class TrainerRank:
         # Groups execute sequentially: summed packed rows conservatively bound
         # this FC2 component, not all workspace or retained graphs.
         static_compute = max(
-            static_compute, packed_tokens * self._moe_output_bytes_per_token
+            static_compute,
+            *(
+                self._moe_workspace_bytes(
+                    sum(rows for rows, _ in group_rows)
+                    if signature.topology[2] > 1 and group_rows
+                    else packed_tokens,
+                    slot_ref=ref,
+                )
+                for ref in (slot_refs or (None,))
+            ),
+        )
+        retained, workspace = self._checkpoint_memory_floor(
+            group_rows, slot_refs, gdn_segments
+        )
+        static_compute = max(
+            static_compute,
+            max(retained, checkpoint_floor[0])
+            + max(workspace, head_workspace_bytes, checkpoint_floor[1])
+            + (retained if include_checkpoint_input_gradient else 0),
         )
         if signature.topology[2] > 1:
             # Local head results coexist with full CP outputs during gathering.
             # Uneven rank plans can assign all of an item's rows to one rank.
             static_compute += output_bytes
-        # A profile learned under lighter sharing (lower logical/packed ratio)
-        # underestimates the per-packed-token footprint of a deeper-shared
-        # plan; scale the trusted estimate up by the ratio gap.
-        # Normalize before multiplying: cancelling packed tokens through two
-        # float operations can otherwise make a larger warm layout cheaper.
+        # Memory that grows with logical rows makes a profile learned under
+        # lighter sharing underestimate a deeper-shared plan; scale the trusted
+        # estimate up by the ratio gap. Packed pricing instead charges head and
+        # caller memory per logical row and extrapolates the rest at most the
+        # usual trust growth. Normalize before multiplying: cancelling packed
+        # tokens through two float operations can otherwise make a larger warm
+        # layout cheaper.
         profiled_tokens: int | float = packed_tokens
+        packed_priced = profiled is not None and _packed_priced(
+            signature, self._one_layer_recompute()
+        )
         if profiled is not None and logical_tokens is not None:
             profiled_tokens = max(
-                packed_tokens, logical_tokens / profiled.logical_per_packed
+                packed_tokens,
+                logical_tokens
+                / profiled.logical_per_packed
+                / (_MEMORY_PROFILE_TRUST_GROWTH if packed_priced else 1),
             )
         # The trust window limits calibration growth, not the empirical floor.
         # Dropping that floor beyond the window can admit a larger request that
@@ -6767,18 +9149,83 @@ class TrainerRank:
         else:
             compute = max(
                 static_compute,
-                int(profiled.bytes_per_token * profiled_tokens),
+                int(
+                    profiled.bytes_per_token * profiled_tokens
+                    + (
+                        _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
+                        # Branch states grow with segments, not packed rows;
+                        # backward recomputes one layer at a time.
+                        + gdn_segments * self._gdn_segment_layer_bytes()
+                        if packed_priced and logical_tokens is not None
+                        else 0
+                    )
+                ),
             )
         return int((output_bytes + compute) * _MEMORY_SAFETY_FACTOR)
 
-    def _available_memory_bytes(self) -> int:
+    def _one_layer_recompute(self) -> bool:
+        """ART's default full/uniform/1 recompute, which Megatron runs in training.
+
+        Forward keeps only layer inputs and backward recomputes one layer at a
+        time. Megatron checks the decoder's own mode and config, and eval mode
+        skips recompute even with gradients enabled, so read both live.
+        """
+        recorded = self.__dict__.get("_recorded_one_layer_recompute")
+        if recorded is not None:
+            return recorded  # Planner-report replay has no live model.
+        target = ("full", "uniform", 1)
+        names = ("recompute_granularity", "recompute_method", "recompute_num_layers")
+
+        def active(chunk: torch.nn.Module) -> bool:
+            try:
+                decoder = _language_model(chunk).decoder
+                config = decoder.config
+            except (AttributeError, RuntimeError):
+                # No decoder config (stub or non-GPT chunk): stored settings,
+                # and every module must be training.
+                stored = tuple(getattr(self, "_" + name) for name in names)
+                return stored == target and all(m.training for m in chunk.modules())
+            settings = tuple(getattr(config, name, None) for name in names)
+            return settings == target and decoder.training is True
+
+        return all(active(chunk) for chunk in self.runtime.model)
+
+    def _gdn_segment_layer_bytes(self) -> float:
+        """Initial and final fp32 recurrent states plus convolution history."""
+        geometry = self._geometry
+        return (
+            2
+            / max(1, self._topology_key()[1])
+            * (
+                4
+                * geometry.gdn_value_heads
+                * geometry.gdn_key_head_dim
+                * geometry.gdn_value_head_dim
+                + self._param_dtype_size
+                * (
+                    2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+                    + geometry.gdn_value_heads * geometry.gdn_value_head_dim
+                )
+                * max(0, geometry.gdn_conv_kernel - 1)
+            )
+        )
+
+    def _available_memory_bytes(self, sample: dict[str, Any] | None = None) -> int:
         if not (torch.cuda.is_available() and self.device.type == "cuda"):
             return 1 << 60
         free, total = torch.cuda.mem_get_info(self.device)
-        if torch.cuda.get_allocator_backend() == "native":
+        allocator = torch.cuda.get_allocator_backend()
+        stats = None
+        if allocator == "native":
             # Cached bytes are not physical free memory. This sample does not
             # reserve memory for execution or the caller's later backward.
-            allocated = int(torch.cuda.memory_allocated(self.device))
+            if sample is None:
+                allocated = int(torch.cuda.memory_allocated(self.device))
+            else:
+                # memory_allocated uses this same stats read. Retain its other
+                # already-returned fields without another allocator query.
+                stats = torch.cuda.memory_stats(self.device)
+                allocated = int(stats.get("allocated_bytes.all.current", 0))
             reusable_reserved = 0
         else:
             # Preserve the previous, unqualified policy for other backends.
@@ -6787,13 +9234,39 @@ class TrainerRank:
             reusable_reserved = max(0, reserved - allocated)
         reserve = int(total * _MEMORY_RESERVE_FRACTION)
         available = max(0, int(free) + reusable_reserved - reserve)
+        test_cap = None
         if os.environ.get(_TEST_HOOKS_ENV) == "1":
             limit = os.environ.get(_TEST_MEMORY_LIMIT_ENV)
             if limit:
+                test_cap = int(limit)
                 # Test-only: cap the usable budget relative to the current
                 # allocation so acceptance cells can induce split/decline
                 # behavior deterministically without ballast tensors.
                 available = min(available, max(0, int(limit) - allocated))
+        if sample is not None:
+            try:
+                sample.update(
+                    allocator=allocator,
+                    physical_free_bytes=int(free),
+                    physical_total_bytes=int(total),
+                    allocated_bytes=allocated,
+                    reserve_bytes=reserve,
+                    test_cap_bytes=test_cap,
+                    reserved_bytes=(
+                        stats.get("reserved_bytes.all.current")
+                        if stats is not None
+                        else reserved
+                        if allocator != "native"
+                        else None
+                    ),
+                    inactive_split_bytes=(
+                        stats.get("inactive_split_bytes.all.current")
+                        if stats is not None
+                        else None
+                    ),
+                )
+            except Exception:
+                sample.clear()
         return available
 
     def _all_ranks_have_memory_profile(
@@ -7643,11 +10116,45 @@ def _active_logical_tokens(requests: Sequence[AnyForwardInput]) -> int:
     )
 
 
+# Grad-enabled single-target training measured flat per packed row across
+# sharing ratios. Wide labels, dense or top-k outputs and no_grad forwards (whose
+# GDN branch states are uncharged) keep the logical/packed ratio extrapolation.
+_PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
+# Packed pricing charges head and caller memory per active logical row: label
+# copies, positions, row-match vectors, saved masks and the caller's loss saves
+# and backward transients. Each request's buffers are separate allocations
+# rounded up to 512 B blocks; on an H200, a fully shared one-token request's
+# head peaked at nine blocks plus 8 B (4,616 B). Callers whose head and loss
+# memory peaks above this charge per token are unsupported.
+_PACKED_PRICED_LOGICAL_ROW_BYTES = 12 * 512
+# Shorter single-target requests keep the logical extrapolation, so each
+# packed-priced request brings at least 384 KiB for per-request constants.
+_PACKED_PRICED_MIN_REQUEST_TOKENS = 64
+
+
+def _packed_priced(signature: "_MemorySignature", one_layer_recompute: bool) -> bool:
+    # Measured only under one-layer full recompute: other recompute modes keep
+    # more GDN states and activations live per segment and logical row.
+    return (
+        one_layer_recompute
+        and bool(signature.grad_modes)
+        and all(signature.grad_modes)
+        and _PACKED_PRICED_MIXES.issuperset(signature.request_mix)
+        and not signature.short_requests
+    )
+
+
 def _request_mix_key(request: AnyForwardInput) -> str:
     parts = []
     if request.target_tokens is not None:
-        target = request.target_tokens
-        tail_shape = tuple(target.shape[request.input_tokens.ndim :])
+        target, inputs = request.target_tokens, request.input_tokens
+        # Match _forward_item: trailing target dims follow the input shape or a
+        # flattened token axis.
+        tail_shape = tuple(
+            target.shape[inputs.ndim :]
+            if target.shape[: inputs.ndim] == inputs.shape
+            else target.shape[1:]
+        )
         parts.append(f"target:{tail_shape or 'single'}")
     if request.top_k is not None:
         parts.append(f"topk:{int(request.top_k)}")
@@ -7656,6 +10163,15 @@ def _request_mix_key(request: AnyForwardInput) -> str:
     if request.hidden_states:
         parts.append("hidden")
     return "+".join(parts) if parts else "inactive"
+
+
+def _short_request(request: AnyForwardInput) -> bool:
+    """Too short for packed pricing: a duplicate adds no packed row, and caller
+    memory per request can outgrow its few logical-row charges."""
+    return (
+        _request_mix_key(request) == "target:single"
+        and int(request.input_tokens.numel()) < _PACKED_PRICED_MIN_REQUEST_TOKENS
+    )
 
 
 def _pad_packed_batch(

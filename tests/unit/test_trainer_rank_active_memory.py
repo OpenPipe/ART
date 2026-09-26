@@ -1,5 +1,6 @@
 """CPU admission contracts; injected observations are not GPU peak measurements."""
 
+import builtins
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
@@ -13,7 +14,19 @@ from art.trainer_rank import (
     TrainerRank,
     TrainerRankMemoryError,
     Unset,
+    _impl,
 )
+from art.trainer_rank._impl import (
+    _PACKED_PRICED_LOGICAL_ROW_BYTES,
+    _packed_priced,
+    _request_mix_key,
+)
+
+
+@pytest.fixture(autouse=True)
+def _price_short_requests(monkeypatch):
+    # These fixtures use short requests; the short-request gate has its own tests.
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 1)
 
 
 class _Model(torch.nn.Module):
@@ -35,7 +48,11 @@ def _rank():
                 model=[_Model()],
                 optimizer=None,
                 provider=SimpleNamespace(
-                    hidden_size=8, num_layers=4, recompute_granularity="full"
+                    hidden_size=8,
+                    num_layers=4,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
                 ),
                 model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
             ),
@@ -255,7 +272,7 @@ def test_direct_forward_does_not_drop_observed_peak_outside_trust(monkeypatch, n
 def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
     rank = _rank()
     observed = rank._plan_flat_forward(_requests("target_tokens"))
-    rank._update_memory_profile(observed, 10_000, retained_bytes=1000)
+    rank._update_memory_profile(observed, 100_000, retained_bytes=1000)
     estimate = rank._estimate_required_memory_bytes_from_values
     values = [
         estimate(
@@ -267,8 +284,291 @@ def test_empirical_estimate_survives_packed_trust_boundary(logical_ratio):
         for count in (8, 63, 64, 65, 800)
     ]
     assert values == sorted(values)
-    rate = rank._memory_profiles[observed.signature].bytes_per_token
-    assert values[-1] == int((800 * 4 + rate * 800 * logical_ratio) * 1.1)
+    profile = rank._memory_profiles[observed.signature]
+    logical = 800 * logical_ratio
+    packed = max(800, logical / profile.logical_per_packed / 8)
+    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * logical
+    assert values[-1] == int((800 * 4 + profile.bytes_per_token * packed + rows) * 1.1)
     assert not rank._all_ranks_have_memory_profile(
         packed_tokens=800, signature=observed.signature
     )
+
+
+def test_packed_pricing_covers_allocator_blocks_of_fully_shared_requests():
+    # A duplicate one-token request adds no packed row but still allocates its
+    # head buffers, each rounded up to a 512 B block: nine at the measured peak.
+    # (The short-request gate keeps such requests out; the charge covers them.)
+    rank = _rank()
+    observed = rank._plan_flat_forward(_requests("target_tokens"))
+    rank._update_memory_profile(observed, 100_000, retained_bytes=1000)
+    profile = rank._memory_profiles[observed.signature]
+    assert _packed_priced(observed.signature, rank._one_layer_recompute())
+    duplicates = 100_000
+
+    def estimate(logical_tokens: int) -> int:
+        return rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=1,
+            logical_tokens=logical_tokens,
+            output_bytes=0,
+            signature=observed.signature,
+        )
+
+    base = profile.logical_per_packed
+    assert estimate(base + duplicates) - estimate(base) >= duplicates * 9 * 512
+
+
+@pytest.mark.parametrize("shape", ["flat", "row"])
+def test_short_single_target_requests_keep_logical_pricing(monkeypatch, shape):
+    monkeypatch.setattr(_impl, "_PACKED_PRICED_MIN_REQUEST_TOKENS", 64)
+
+    def request(length: int) -> ForwardInput:
+        tokens = torch.arange(length)
+        if shape == "row":
+            tokens = tokens[None]
+        return ForwardInput(input_tokens=tokens, target_tokens=tokens + 1)
+
+    assert [_impl._short_request(request(n)) for n in (63, 64, 65)] == [
+        True,
+        False,
+        False,
+    ]
+    assert not _impl._short_request(ForwardInput(input_tokens=torch.arange(3)))
+    rank = _rank()
+    recompute = rank._one_layer_recompute()
+    # Calibrate on a 64-token request, then price a short one: the short batch
+    # shares the calibrated profile (no cold start) but keeps main's pricing.
+    long_plan = rank._plan_flat_forward([request(64)])
+    rank._update_memory_profile(long_plan, 64 * 100_000, retained_bytes=None)
+    for requests in ([request(63)], [request(64), request(63)]):
+        short = rank._plan_flat_forward(requests)
+        assert short.signature.short_requests and short.signature == long_plan.signature
+        assert _packed_priced(long_plan.signature, recompute)
+        assert not _packed_priced(short.signature, recompute)
+        profile = rank._memory_profiles[short.signature]
+        cost = rank._plan_cost(short)
+        extrapolated = profile.bytes_per_token * max(
+            short.packed_tokens,
+            short.active_logical_tokens / profile.logical_per_packed,
+        )
+        assert cost.required >= int((short.output_bytes + extrapolated) * 1.1)
+
+
+def test_packed_sharing_clamp_is_monotone_and_learning_sharing_never_cheapens():
+    rank = _rank()
+    observed = rank._plan_flat_forward(_requests("target_tokens"))
+    rank._update_memory_profile(observed, 100_000, retained_bytes=1000)
+    single = observed.signature
+    rank._memory_profiles[single] = replace(
+        rank._memory_profiles[single], bytes_per_token=50_000, logical_per_packed=1
+    )
+
+    def cost(packed: int, logical: int = 8_000):
+        return rank._subforward_cost(
+            packed_tokens=packed,
+            logical_tokens=logical,
+            output_bytes=0,
+            signature=single,
+        ).required
+
+    # Fixed logical rows; packed rows sweep across L / 8r = 1000.
+    sweep = [cost(packed) for packed in (1, 500, 999, 1000, 1001, 4000, 8000)]
+    assert sweep == sorted(sweep)
+    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * 8_000
+    assert sweep[0] == sweep[3] == int((50_000 * 1000 + rows) * 1.1)
+    assert sweep[4] == int((50_000 * 1001 + rows) * 1.1)
+    # Learning more sharing at a lower rate max-merges both; plans at
+    # or below the older ratio never get cheaper.
+    before = [cost(packed, logical) for packed, logical in ((100, 100), (50, 100))]
+    wider = replace(observed, packed_tokens=1, logical_tokens=8)
+    rank._update_memory_profile(wider, 1_000, retained_bytes=None)
+    profile = rank._memory_profiles[single]
+    assert profile.logical_per_packed > 1 and profile.bytes_per_token == 50_000
+    after = [cost(packed, logical) for packed, logical in ((100, 100), (50, 100))]
+    assert all(b >= a for a, b in zip(before, after, strict=True))
+
+
+@pytest.mark.parametrize(
+    "method,argument,fallback",
+    [
+        ("_head_workspace_bytes", 8, 0),
+        ("_checkpoint_memory_floor", ((8, True),), (0, 0)),
+    ],
+)
+@pytest.mark.parametrize(
+    "error,unavailable",
+    [
+        (ModuleNotFoundError("absent package", name="megatron"), True),
+        (ModuleNotFoundError("missing dependency", name="transformer_engine"), False),
+        (ModuleNotFoundError("partial installation", name="megatron.core"), False),
+        (ModuleNotFoundError("unspecified missing module"), False),
+        (ImportError("missing imported class"), False),
+        (RuntimeError("module initialization failed"), False),
+    ],
+    ids=["absent", "transitive", "partial", "unspecified", "class", "runtime"],
+)
+def test_optional_megatron_memory_guards(
+    monkeypatch, method, argument, fallback, error, unavailable
+):
+    rank = _rank()
+    original_import = builtins.__import__
+
+    def importing(name, *args, **kwargs):
+        if name.partition(".")[0] == "megatron":
+            raise error
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", importing)
+    if unavailable:
+        assert getattr(rank, method)(argument) == fallback
+    else:
+        with pytest.raises(type(error)) as caught:
+            getattr(rank, method)(argument)
+        assert caught.value is error
+
+
+def test_packed_pricing_is_limited_to_grad_single_target_mixes():
+    rank = _rank()
+    observed = rank._plan_flat_forward(_requests("target_tokens"))
+    rank._update_memory_profile(observed, 10_000, retained_bytes=1000)
+    single = observed.signature
+    assert single.grad_modes == (True,)
+    profile = replace(
+        rank._memory_profiles[single],
+        bytes_per_token=100_000,
+        retained_compute_bytes_per_token=50_000,
+        logical_per_packed=2,
+    )
+    signatures = {
+        "single": single,
+        "multi_grad": replace(single, grad_modes=(True, True)),
+        "no_grad": replace(single, grad_modes=(False,)),
+        "mixed_grad": replace(single, grad_modes=(False, True)),
+        "hidden": replace(single, request_mix=("hidden",)),
+        "wide": replace(single, request_mix=("target:(2,)",)),
+    }
+    for signature in signatures.values():
+        rank._memory_profiles[signature] = profile
+
+    def estimate(name):
+        return rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=8,
+            logical_tokens=64,
+            output_bytes=0,
+            signature=signatures[name],
+        )
+
+    # Packed rows plus head and caller memory for every logical row.
+    rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * 64
+    assert (
+        estimate("single") == estimate("multi_grad") == int((100_000 * 8 + rows) * 1.1)
+    )
+    retained = rank._retained_memory_bytes(
+        single, packed_tokens=8, logical_tokens=64, output_bytes=0, required=1 << 40
+    )
+    assert retained == int((50_000 * 8 + rows) * 1.1)
+    # Others keep the logical/packed extrapolation: 64 / 2 profiled rows.
+    for name in ("no_grad", "mixed_grad", "hidden", "wide"):
+        assert estimate(name) == int(100_000 * 32 * 1.1)
+    # Beyond 8x the profile's sharing, packed rows are priced as if sharing
+    # were 8x: 64 logical rows at ratio 2 x 8 = 16 is 4 rows, not 1.
+    clamped = rank._estimate_required_memory_bytes_from_values(
+        packed_tokens=1, logical_tokens=64, output_bytes=0, signature=single
+    )
+    assert clamped == int((100_000 * 4 + rows) * 1.1)
+    # The logical charge does not depend on layout, so at any rate (none gates
+    # eligibility) cost never falls as packed rows grow.
+    for rate in (1, 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES * 2 - 1, 100_000):
+        rank._memory_profiles[single] = replace(
+            profile, bytes_per_token=rate, retained_compute_bytes_per_token=rate
+        )
+        costs = [
+            rank._subforward_cost(
+                packed_tokens=packed,
+                logical_tokens=64,
+                output_bytes=0,
+                signature=single,
+            )
+            for packed in range(1, 65)
+        ]
+        assert all(a.required <= b.required for a, b in zip(costs, costs[1:]))
+        assert all(a.retained <= b.retained for a, b in zip(costs, costs[1:]))
+    # GDN branch states grow with segments, not packed rows.
+    rank._memory_profiles[single] = profile
+    rank._geometry = replace(
+        rank._geometry,
+        gdn_key_heads=1,
+        gdn_key_head_dim=4,
+        gdn_value_heads=2,
+        gdn_value_head_dim=4,
+        gdn_conv_kernel=4,
+    )
+    # 2 states x 4 B x Hv=2 x dk=4 x dv=4, plus 2 B conv history of 16 rows x 3.
+    assert rank._gdn_segment_layer_bytes() == 2 * (4 * 2 * 4 * 4 + 2 * 16 * 3)
+    live = 1
+
+    def segments(count):
+        return rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=8,
+            logical_tokens=64,
+            output_bytes=0,
+            signature=single,
+            gdn_segments=count,
+        )
+
+    assert segments(3) - segments(0) == pytest.approx(
+        3 * live * rank._gdn_segment_layer_bytes() * 1.1, abs=1
+    )
+    # Other recompute modes, and eval mode (which skips recompute), keep more
+    # live per segment and row: extrapolate.
+    for setting in (
+        ("selective", "uniform", 1),
+        (None, None, None),
+        ("full", "block", 1),
+        ("full", "uniform", 2),
+        ("full", None, None),
+    ):
+        (
+            rank._recompute_granularity,
+            rank._recompute_method,
+            rank._recompute_num_layers,
+        ) = setting
+        assert not rank._one_layer_recompute()
+        assert estimate("single") == estimate("hidden")
+    rank._recompute_granularity, rank._recompute_method = "full", "uniform"
+    rank._recompute_num_layers = 1
+    assert rank._one_layer_recompute()
+    rank.runtime.model[0].eval()
+    assert not rank._one_layer_recompute()
+    assert estimate("single") == estimate("hidden")
+    rank.runtime.model[0].train()
+    # Megatron checks the decoder's own mode, which can diverge from the chunk.
+    rank.runtime.model[0].decoder = torch.nn.Module()
+    rank.runtime.model[0].decoder.eval()
+    assert rank.runtime.model[0].training and not rank._one_layer_recompute()
+    assert estimate("single") == estimate("hidden")
+    rank.runtime.model[0].decoder.train()
+    assert rank._one_layer_recompute()
+    # With a decoder config, its live settings and the decoder's mode decide.
+    decoder = rank.runtime.model[0].decoder
+    decoder.config = SimpleNamespace(
+        recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1
+    )
+    rank.runtime.model[0].eval()
+    decoder.train()
+    assert rank._one_layer_recompute()
+    rank.runtime.model[0].train()
+    decoder.config.recompute_num_layers = 2
+    assert not rank._one_layer_recompute()
+    decoder.config.recompute_num_layers = 1
+    assert rank._one_layer_recompute()
+    # Replay trusts the recorded mode instead of a live model.
+    packed = estimate("single")
+    rank._recorded_one_layer_recompute = False
+    assert estimate("single") == estimate("hidden") != packed
+    rank._recorded_one_layer_recompute = True
+    assert estimate("single") == packed
+    del rank._recorded_one_layer_recompute
+    # Flattened-axis wide labels are not single-target.
+    tokens = torch.arange(4).reshape(1, 4)
+    wide = ForwardInput(input_tokens=tokens, target_tokens=torch.zeros(4, 3).long())
+    assert _request_mix_key(wide) == "target:(3,)"

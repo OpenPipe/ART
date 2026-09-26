@@ -249,6 +249,14 @@ class ChatCompletionsExchange(_Exchange):
     request: _Preserved[ChatCompletionsRequest]
     response: ChatCompletion
 
+    @pydantic.field_validator("response")
+    @classmethod
+    def attach_training_tokens(cls, response: ChatCompletion) -> ChatCompletion:
+        from ..preprocessing.dynamo_tokens import attach_dynamo_token_metadata
+
+        attach_dynamo_token_metadata(response)
+        return response
+
     @pydantic.field_serializer("response", when_used="json")
     def serialize_response(self, response: ChatCompletion) -> dict[str, Any]:
         return serialize_chat_completion(response)
@@ -274,6 +282,21 @@ class CompletionsExchange(_Exchange):
 class ResponsesExchange(_Exchange):
     request: _Preserved[ResponsesRequest]
     response: Response
+
+    @pydantic.field_serializer("response")
+    def serialize_response(
+        self, response: Response, info: pydantic.SerializationInfo
+    ) -> dict[str, Any]:
+        # Provider omissions and explicit nulls must survive compact/full replay.
+        return response.model_dump(
+            mode=info.mode,
+            include=info.include,
+            exclude=info.exclude,
+            context=info.context,
+            by_alias=info.by_alias,
+            exclude_unset=True,
+            exclude_none=info.exclude_none,
+        )
 
     @pydantic.computed_field
     @property

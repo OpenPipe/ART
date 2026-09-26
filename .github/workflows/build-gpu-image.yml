@@ -72,6 +72,7 @@ jobs:
     env:
       SKY_INFRA: k8s/cks-wb3
       BUILD_CLUSTER_NAME: art-gpu-build-${{ github.run_id }}-${{ github.run_attempt }}
+      PREWARM_RUN_UID: ${{ github.run_id }}-${{ github.run_attempt }}
       PREWARM_INFRAS: ${{ inputs.prewarm_infras || 'k8s/cks-wb3 k8s/ext-collab2 k8s/serverless-training-central' }}
 
     steps:
@@ -219,11 +220,23 @@ jobs:
 
           bash scripts/build-gpu-image.sh "${args[@]}"
 
-      - name: Remove temporary image builder
+      - name: Remove temporary image builder and prewarm pods
         if: ${{ always() }}
         run: |
+          prewarm_selector="art.openpipe/prewarm-name=art-gpu-image-prewarm,art.openpipe/prewarm-run=${PREWARM_RUN_UID}"
           kubectl --context cks-wb3 delete pod -n default "${BUILD_CLUSTER_NAME}" \
-            --ignore-not-found --wait=false
+            --ignore-not-found --wait=false --request-timeout=30s || true
+          while IFS= read -r infra; do
+            case "${infra}" in
+              k8s/*) context="${infra#k8s/}" ;;
+              kubernetes/*) context="${infra#kubernetes/}" ;;
+              *) continue ;;
+            esac
+            kubectl --context "${context}" delete pod -n default \
+              -l "${prewarm_selector}" \
+              --ignore-not-found --wait=false --request-timeout=30s || true
+          done < <(printf '%s\n' "${PREWARM_INFRAS}" \
+            | awk 'BEGIN { RS = "[[:space:],]+" } NF { print }')
 
       - name: Smoke launch prewarmed image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}

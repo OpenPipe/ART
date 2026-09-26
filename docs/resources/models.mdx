@@ -7,12 +7,25 @@ icon: "robot"
 
 ## Serverless Models
 
-We currently only support the following model for serverless training. We are actively adding support for both larger and smaller models. If there's a particular model you'd like to see serverless support for, please send a request to support@wandb.com.
+The serverless examples use **Qwen 3.8 27B** (`Qwen/Qwen3.8-27B`) with
+ART main (pinned to `88d3df2`). Install the pinned main revision and use `ServerlessBackend`
+with your `WANDB_API_KEY`; no local GPU is required.
 
-- [OpenPipe Qwen 3 14B Instruct](https://huggingface.co/OpenPipe/Qwen3-14B-Instruct)
-  - Good balance of performance and size. Has support for tool calling and generally trains well. This is our recommended model for users new to RL.
-- [Qwen 3 30B A3B Instruct](https://huggingface.co/Qwen/Qwen3-30B-A3B)
-  - More capable than 14B while still being efficient. Good choice when you need stronger reasoning capabilities.
+<Note>
+  ART 0.5.20 from PyPI does not yet read W&B Inference's exact Dynamo token
+  metadata. Use the pinned main revision below for these serverless examples.
+</Note>
+
+```bash
+pip install "openpipe-art @ git+https://github.com/OpenPipe/ART.git@88d3df23285f56fbcbb4629768ba0fc17ebe2d27"
+```
+
+Use `model.openai_client()` for training rollouts so ART captures the token IDs
+and log probabilities returned by inference. Select a completed checkpoint explicitly
+with `model.get_inference_name(await model.get_step())`.
+
+For other available models, check the W&B Training model catalog or contact
+support@wandb.com.
 
 
 ## Recommended Local Models

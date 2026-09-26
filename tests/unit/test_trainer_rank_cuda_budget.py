@@ -363,7 +363,9 @@ def test_final_selection_uses_pure_fresh_budget_and_original_demand(
     monkeypatch.setattr(
         _impl.dist,
         "all_reduce",
-        lambda value, op, group: calls.append((op, value.item(), group)),
+        lambda value, op, group: calls.append(
+            (op, value.tolist() if value.numel() > 1 else value.item(), group)
+        ),
     )
     if available < 192:
         with pytest.raises(_impl.TrainerRankMemoryError) as caught:
@@ -382,6 +384,12 @@ def test_final_selection_uses_pure_fresh_budget_and_original_demand(
             (_impl.dist.ReduceOp.MIN, available, None),
         ]
         * (2 if available < 192 else 1)
+        # Only the final refusal enters the option/selected-wave agreement.
+        + (
+            [(_impl.dist.ReduceOp.MIN, [0.0, 0.0, 0.0], None)]
+            if available < 192
+            else []
+        )
         if distributed
         else []
     )
