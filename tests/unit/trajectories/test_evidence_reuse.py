@@ -105,6 +105,7 @@ def test_supplied_tokenizer_stop_probe_cannot_lend_stale_evidence(monkeypatch):
 def test_render_fallback_does_not_receive_decision_evidence(monkeypatch, override):
     from test_tokenize import _character_template_history
 
+    monkeypatch.setattr(module, "_WARNED_PREFIX_RETOKENIZATION", False)
     history, tokenizer, _ = _character_template_history()
     first_source = sources(history)[0]
     exchange = first_source.exchange
