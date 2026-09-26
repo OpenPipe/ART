@@ -1713,10 +1713,17 @@ def _dense_mlp_recompute_bytes_per_token(
             and inner.__func__ is type(module).forward
         )
 
-    mixers = {
-        SelfAttention: SelfAttention.forward,
-        GatedDeltaNet: GatedDeltaNet.forward,
-    }
+    # The traced hybrid's exact mixer types (Qwen3.5-family attention is
+    # Megatron Bridge's Qwen3VLSelfAttention); subclasses are unmeasured.
+    mixers: set[type] = {SelfAttention, GatedDeltaNet}
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import (
+            Qwen3VLSelfAttention,
+        )
+    except ImportError:
+        pass
+    else:
+        mixers.add(Qwen3VLSelfAttention)
 
     if type(decoder) is not TransformerBlock or not plain(decoder):
         return 0, 0
@@ -1725,7 +1732,9 @@ def _dense_mlp_recompute_bytes_per_token(
         "params_dtype": torch.bfloat16,
         "add_bias_linear": False,
         "sequence_parallel": False,
-        "bias_activation_fusion": False,
+        # Fused SwiGLU (bias_swiglu_impl), as Megatron Bridge's Qwen3.5
+        # providers configure it and the traced run executed.
+        "bias_activation_fusion": True,
         "use_te_activation_func": False,
         "cpu_offloading": False,
         "cuda_graph_impl": "none",
@@ -1760,12 +1769,7 @@ def _dense_mlp_recompute_bytes_per_token(
             or not plain(
                 layer, _gdn_island_layer_forward, "_art_gdn_island_physical_forward"
             )
-            # Attention or GDN, with its base class's forward (Qwen subclasses
-            # keep it).
-            or not any(
-                isinstance(mixer, base) and type(mixer).forward is forward
-                for base, forward in mixers.items()
-            )
+            or type(mixer) not in mixers
             or not plain(mixer, _prefix_tree_forward, "_art_physical_forward")
             or any(type(site) is not cls for site, cls in sites)
             or not all(plain(site) for site, _ in sites)

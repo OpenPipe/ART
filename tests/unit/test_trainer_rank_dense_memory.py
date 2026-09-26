@@ -65,7 +65,7 @@ def _dense_layer(gdn: bool = False) -> Any:
         params_dtype=torch.bfloat16,
         add_bias_linear=False,
         sequence_parallel=False,
-        bias_activation_fusion=False,
+        bias_activation_fusion=True,  # Bridge's Qwen3.5 providers fuse SwiGLU.
         use_te_activation_func=False,
         cpu_offloading=False,
         cuda_graph_impl="none",
@@ -178,7 +178,7 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "config_activation",
         "clamp",
         "linear_offset",
-        "fused_activation",
+        "unfused_activation",
         "te_activation",
         "fp8",
         "fp4",
@@ -266,7 +266,7 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         ),
         "clamp": lambda: setattr(config, "activation_func_clamp_value", 7.0),
         "linear_offset": lambda: setattr(config, "glu_linear_offset", 1.0),
-        "fused_activation": lambda: setattr(config, "bias_activation_fusion", True),
+        "unfused_activation": lambda: setattr(config, "bias_activation_fusion", False),
         "te_activation": lambda: setattr(config, "use_te_activation_func", True),
         "fp8": lambda: setattr(config, "fp8", "hybrid"),
         "fp4": lambda: setattr(config, "fp4", "nvfp4"),
@@ -485,3 +485,18 @@ def test_no_grad_only_waves_charge_te_workspace_growth():
     _, plain = _at_cp2(_dense_rank(0, 0))._checkpoint_memory_floor(((500, False),))
     assert dense == 500 * NO_GRAD + r._te_workspace_growth_bytes()
     assert plain == 500 * 4 * HIDDEN * 2
+
+
+def test_the_traced_qwen_attention_mixer_is_accepted():
+    bridge = pytest.importorskip(
+        "megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention"
+    )
+    layers = [_dense_layer(gdn=index != 1) for index in range(3)]
+    qwen = _module(bridge.Qwen3VLSelfAttention)
+    layers[1].self_attention = qwen  # Overrides forward, as traced.
+    for layer in layers:
+        _wrap_like_art(layer)
+    assert _dense_mlp_recompute_bytes_per_token([_dense_model(layers)]) == (
+        STAGE,
+        NO_GRAD,
+    )
