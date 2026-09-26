@@ -164,6 +164,59 @@ def test_existing_native_shortcut_precedes_stream_refinement(
     assert trajectory.model_dump_json() == before
 
 
+def test_existing_late_native_role_proof_precedes_stream_refinement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer = _CharacterTemplateTokenizer()
+    messages = [
+        {"role": "user", "content": "intro"},
+        {"role": "assistant", "content": "history"},
+        {"role": "user", "content": "turn0"},
+    ]
+    prompt = "introhistory§turn0"
+    first = _chat_exchange(tokenizer._encode(prompt), tokenizer._encode("rawanswer§"))
+    first.request["messages"] = deepcopy(messages)
+    record(first).message.content = "answer"
+    second = _chat_exchange(
+        tokenizer._encode(prompt + "answer§turn1"),
+        tokenizer._encode("terminal§"),
+        offset=1,
+    )
+    second.request["messages"] = [
+        *deepcopy(messages),
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "turn1"},
+    ]
+    record(second).message.content = "terminal"
+    for exchange in (first, second):
+        record(exchange).finish_reason = "stop"
+        record(exchange).model_extra["stop_reason"] = tokenizer.eos_token_id
+    trajectory = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(chat_completions=[first, second]), reward=2.0
+    )
+    render = tokenizer.apply_chat_template
+
+    def changed_renderer(selected: Any, **kwargs: Any) -> Any:
+        copied = deepcopy(selected)
+        for message in copied:
+            if (
+                message.get("role") == "assistant"
+                and message.get("content") == "answer"
+            ):
+                message["content"] = "!answer"
+        return render(copied, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "apply_chat_template", changed_renderer)
+    before = trajectory.model_dump_json()
+    with monkeypatch.context() as old_route:
+        old_route.setattr(module, "_native_history_streams", lambda history: [history])
+        existing = trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+    result = trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+    assert result.model_dump_json() == existing.model_dump_json()
+    assert result_terms(result) == native_terms(trajectory)
+    assert trajectory.model_dump_json() == before
+
+
 @pytest.mark.parametrize("middle_kind", ["tool", "reasoning"])
 def test_native_stream_keeps_complete_nonterminal_structured_output(
     middle_kind: str,

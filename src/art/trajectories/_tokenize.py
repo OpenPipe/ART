@@ -5476,9 +5476,6 @@ def _tokenize_chat_view(
         ):
             return recorded
 
-    if _allow_native_streams:
-        _request_native_streams(history)
-
     prefix_render_cache = _PrefixChatRenderCache(render_normalized_text)
 
     def segmented_render(
@@ -6562,6 +6559,9 @@ def _tokenize_chat_view(
                 raise ValueError(
                     "Cannot preserve request roles across exact native prompt replacement"
                 )
+
+    if _allow_native_streams:
+        _request_native_streams(history)
 
     sampled_message_count = sum(
         message.get("role") == "assistant"
