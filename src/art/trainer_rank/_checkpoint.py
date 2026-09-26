@@ -1022,11 +1022,30 @@ def prepare_checkpoint_save(
 
 
 def _read_snapshot(
-    prepared: _PreparedSave, relative: str, prefix: str, keys: Iterable[str]
+    prepared: _PreparedSave,
+    relative: str,
+    prefix: str,
+    keys: Iterable[str] | None = None,
 ) -> dict[str, torch.Tensor]:
-    load = importlib.import_module("safetensors.torch").load_file
-    payload = load(prepared.snapshot / relative)
-    return {key: payload[f"{prefix}/{key}"] for key in keys}
+    safe_open = importlib.import_module("safetensors").safe_open
+    with safe_open(
+        prepared.snapshot / relative, framework="pt", device="cpu"
+    ) as payload:
+        names = payload.offset_keys()
+        if keys is None:
+            keys = [
+                key.removeprefix(f"{prefix}/")
+                for key in names
+                if key.startswith(f"{prefix}/")
+            ]
+        available = set(names)
+        tensors = {}
+        for key in keys:
+            name = f"{prefix}/{key}"
+            if name not in available:
+                raise KeyError(name)
+            tensors[key] = payload.get_tensor(name)
+        return tensors
 
 
 def _matching_shards(
@@ -1226,12 +1245,11 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
                     for records in _matching_shards(prepared, owned).values()
                     for record in records
                 }:
-                    load = importlib.import_module("safetensors.torch").load_file
-                    payload = load(prepared.snapshot / relative)
                     local_steps.update(
-                        (key.removeprefix("step/"), float(value.item()))
-                        for key, value in payload.items()
-                        if key.startswith("step/")
+                        (key, float(value.item()))
+                        for key, value in _read_snapshot(
+                            prepared, relative, "step"
+                        ).items()
                     )
             except BaseException as exc:
                 error = exc
