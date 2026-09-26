@@ -29,7 +29,7 @@ never traced. Tests absent from the golden are listed at session end, not failed
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 import os
 from pathlib import Path
 import tempfile
@@ -105,16 +105,14 @@ def _part_path(config: pytest.Config) -> Path:
     return _part_dir(config) / f"{GOLDEN_TRACE.stem}.{worker}.part.json"
 
 
-@pytest.hookimpl(hookwrapper=True)
+@pytest.hookimpl(wrapper=True)
 def pytest_runtest_makereport(
     item: pytest.Item, call: pytest.CallInfo[None]
-) -> Iterator[None]:
-    outcome = yield
-    if not _MODE:
-        return
-    report = outcome.get_result()  # type: ignore[attr-defined]
-    if report.when == "call" and report.passed:
+) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+    report = yield
+    if _MODE and report.when == "call" and report.passed:
         _PASSED.add(item.nodeid)
+    return report
 
 
 def _digest(raw: _RawCall) -> Digest:
