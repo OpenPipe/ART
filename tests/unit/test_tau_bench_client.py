@@ -1079,3 +1079,117 @@ async def test_rollout_stops_before_next_turn_exceeds_context(
     assert trajectory.metrics["num_turns"] == 1
     assert client.steps == 1
     assert client.deleted == ["env-1"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_primary", [False, True])
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_environment_joins_cooperative_delete_despite_repeated_parent_cancel(
+    cancel_primary: bool,
+    cleanup_fails: bool,
+) -> None:
+    before = asyncio.all_tasks()
+    entered, release, closed = (asyncio.Event() for _ in range(3))
+    primary = (
+        asyncio.CancelledError("original") if cancel_primary else ValueError("original")
+    )
+
+    class Client(FakeTauBenchClient):
+        async def delete_environment(self, env_id: str) -> DeleteEnvironmentResponse:
+            entered.set()
+            try:
+                await release.wait()
+                if cleanup_fails:
+                    raise RuntimeError("public deletion failure")
+                return await super().delete_environment(env_id)
+            finally:
+                closed.set()
+
+    client = Client()
+
+    async def owner() -> None:
+        async with client.environment(domain="telecom", task_id="task_001"):
+            raise primary
+
+    task = asyncio.create_task(owner())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done() and not closed.is_set()
+        release.set()
+        with pytest.raises(BaseException) as caught:
+            await task
+        if cancel_primary:
+            assert caught.value is primary
+        else:
+            assert isinstance(caught.value, BaseExceptionGroup)
+            assert primary in caught.value.exceptions
+            assert any(
+                isinstance(e, asyncio.CancelledError) for e in caught.value.exceptions
+            )
+        assert closed.is_set()
+        assert bool(getattr(primary, "__notes__", [])) == cleanup_fails
+        assert client.deleted == ([] if cleanup_fails else ["env-1"])
+    finally:
+        release.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert asyncio.all_tasks() == before
+
+
+@pytest.mark.asyncio
+async def test_environment_parent_cancel_does_not_renew_delete_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before = asyncio.all_tasks()
+    monkeypatch.setattr(client_module, "DEFAULT_CLEANUP_TIMEOUT", 0.03)
+    entered, closed = asyncio.Event(), asyncio.Event()
+    timeouts: list[float] = []
+    real_wait = asyncio.wait
+
+    async def observe_wait(*args: Any, **kwargs: Any) -> Any:
+        timeouts.append(kwargs["timeout"])
+        return await real_wait(*args, **kwargs)
+
+    monkeypatch.setattr(client_module.asyncio, "wait", observe_wait)
+
+    class Client(FakeTauBenchClient):
+        async def delete_environment(self, env_id: str) -> DeleteEnvironmentResponse:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+            raise AssertionError("unreachable")
+
+    primary = ValueError("original")
+
+    async def owner() -> None:
+        async with Client().environment(domain="telecom", task_id="task_001"):
+            raise primary
+
+    task = asyncio.create_task(owner())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        for _ in range(2):
+            task.cancel()
+            await asyncio.sleep(0)
+        with pytest.raises(BaseExceptionGroup) as caught:
+            await asyncio.wait_for(task, 1)
+        assert primary in caught.value.exceptions
+        assert any(
+            isinstance(e, asyncio.CancelledError) for e in caught.value.exceptions
+        )
+        assert any("TimeoutError" in note for note in primary.__notes__)
+        assert len(timeouts) >= 3 and 0 < timeouts[-1] < timeouts[0] <= 0.03
+        assert timeouts == sorted(timeouts, reverse=True)
+        await asyncio.wait_for(closed.wait(), 1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert asyncio.all_tasks() == before

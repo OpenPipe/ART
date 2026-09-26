@@ -386,9 +386,21 @@ class TauBenchClient:
         self, env_id: str, primary_error: BaseException
     ) -> None:
         cleanup = asyncio.create_task(self.delete_environment(env_id))
+        deadline = asyncio.get_running_loop().time() + DEFAULT_CLEANUP_TIMEOUT
+        interrupted: asyncio.CancelledError | None = None
         try:
-            async with asyncio.timeout(DEFAULT_CLEANUP_TIMEOUT):
-                await asyncio.shield(cleanup)
+            while not cleanup.done():
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError
+                try:
+                    done, _ = await asyncio.wait({cleanup}, timeout=remaining)
+                except asyncio.CancelledError as error:
+                    interrupted = error
+                    continue
+                if not done:
+                    raise TimeoutError
+            cleanup.result()
         except BaseException as cleanup_error:
             if not cleanup.done():
                 cleanup.cancel()
@@ -401,6 +413,13 @@ class TauBenchClient:
                 env_id,
                 exc_info=True,
             )
+        if interrupted is not None:
+            if isinstance(primary_error, asyncio.CancelledError):
+                raise primary_error
+            raise BaseExceptionGroup(
+                "Tau environment failure during cancelled cleanup",
+                [primary_error, interrupted],
+            ) from None
 
     def _auth_headers(self) -> dict[str, str]:
         if self.api_key is None:
