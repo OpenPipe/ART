@@ -47,7 +47,7 @@ def test_gpu_image_node_prewarm_reuses_an_existing_digest(tmp_path: Path) -> Non
     digest = "sha256:" + "a" * 64
     env = {
         **os.environ,
-        "HOME": str(tmp_path),
+        "DOCKER_CONFIG_PATH": str(tmp_path / "missing-docker-config.json"),
         "KUBECTL_LOG": str(kubectl_log),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "REGISTRY_AUTH_JSON_B64": base64.b64encode(b"{}").decode(),
