@@ -413,7 +413,7 @@ def test_exact_sampled_tool_stop_is_stop_when_tokenizer_identifies_it() -> None:
     assert tokenized.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP)
 
 
-def test_length_stop_keeps_sampled_content_and_adds_synthetic_stop() -> None:
+def test_length_stop_ends_at_complete_native_output() -> None:
     exchange = _chat_exchange([1], [2])
     exchange.response.choices[0].finish_reason = "length"
 
@@ -421,11 +421,10 @@ def test_length_stop_keeps_sampled_content_and_adds_synthetic_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[exchange])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 2, 9]
+    assert tokenized.tokens == [1, 2]
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
         _SAMPLED_ASSISTANT_OUTPUT,
-        tr.TokenFlag.STOP,
     ]
 
 
@@ -547,7 +546,7 @@ def test_length_stop_mapping_allows_another_assistant_without_a_stop() -> None:
     assert tokenized.flags[-1] == tr.TokenFlag.STOP
 
 
-def test_terminal_length_with_sampled_eos_still_adds_synthetic_stop() -> None:
+def test_terminal_length_does_not_duplicate_or_relabel_sampled_eos() -> None:
     exchange = _chat_exchange([1], [2, 9])
     exchange.response.choices[0].finish_reason = "length"
 
@@ -555,10 +554,10 @@ def test_terminal_length_with_sampled_eos_still_adds_synthetic_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[exchange])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 2, 9, 9]
+    assert tokenized.tokens == [1, 2, 9]
     assert tokenized.flags[-2:] == [
         _SAMPLED_ASSISTANT_OUTPUT,
-        tr.TokenFlag.STOP,
+        _SAMPLED_ASSISTANT_OUTPUT,
     ]
 
 
@@ -766,6 +765,113 @@ def test_merged_whitespace_token_inherits_mask_of_its_characters(
     assert _translate_token_mask([1, 2], [3], mask, tokenizer=tokenizer) == [any(mask)]
 
 
+def test_chat_prefix_masks_share_one_alignment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from difflib import SequenceMatcher
+
+    from art.trajectories._tokenize import _translate_token_mask
+
+    original = SequenceMatcher.get_opcodes
+    searches = 0
+
+    def get_opcodes(self):
+        nonlocal searches
+        frame = sys._getframe(1)
+        if frame.f_code is _translate_token_mask.__code__:
+            searches += 1
+        return original(self)
+
+    monkeypatch.setattr(SequenceMatcher, "get_opcodes", get_opcodes)
+    # Real history rendering changes the first prompt token and translates all
+    # four masks. Its exact outputs, logprobs and stop flags must still agree.
+    test_exact_output_boundaries_survive_prefix_order_drift_and_length_stop()
+    assert searches == 1
+
+
+def test_reused_mask_alignment_preserves_decoder_order() -> None:
+    from art.trajectories._tokenize import _translate_token_mask
+
+    source, target = [1, 2], [3]
+    masks = [[False, False], [True, False], [False, True], [True, True]]
+
+    def translate(shared: bool):
+        events: list[object] = []
+        opcodes: list[tuple[str, int, int, int, int]] = []
+
+        class Tokenizer:
+            @property
+            def decode(self):
+                events.append("lookup")
+
+                def decode(tokens, **kwargs):
+                    events.append((tokens.copy(), kwargs))
+                    return "\n\n"
+
+                return decode
+
+        outputs = [
+            _translate_token_mask(
+                source,
+                target,
+                mask,
+                tokenizer=cast(tr.Tokenizer, Tokenizer()),
+                _opcodes=opcodes if shared else None,
+            )
+            for mask in masks
+        ]
+        return outputs, events
+
+    cached = translate(True)
+    assert cached == translate(False)
+    assert cached[0] == [[False], [True], [True], [True]]
+    assert source == [1, 2] and target == [3]
+    assert masks == [[False, False], [True, False], [False, True], [True, True]]
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError("decode"), KeyboardInterrupt(), SystemExit(7)]
+)
+def test_reused_mask_alignment_preserves_decoder_exception(
+    error: BaseException,
+) -> None:
+    from art.trajectories._tokenize import _translate_token_mask
+
+    opcodes: list[tuple[str, int, int, int, int]] = []
+
+    def decode(tokens, **kwargs):
+        raise error
+
+    tokenizer = cast(tr.Tokenizer, SimpleNamespace(decode=decode))
+    for mask in ([False, False], [True, False]):
+        if any(mask):
+            with pytest.raises(type(error)) as caught:
+                _translate_token_mask(
+                    [1, 2], [3], mask, tokenizer=tokenizer, _opcodes=opcodes
+                )
+            assert caught.value is error
+        else:
+            assert _translate_token_mask(
+                [1, 2], [3], mask, tokenizer=tokenizer, _opcodes=opcodes
+            ) == [False]
+
+
+def test_equal_mask_alignment_does_not_compute_opcodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import difflib
+
+    from art.trajectories._tokenize import _translate_token_mask
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("equal tokens need no alignment")
+
+    monkeypatch.setattr(difflib, "SequenceMatcher", unexpected)
+    opcodes: list[tuple[str, int, int, int, int]] = []
+    mask = [True, False]
+    actual = _translate_token_mask([1, 2], [1, 2], mask, _opcodes=opcodes)
+    assert actual == mask and actual is not mask
+    assert opcodes == []
+
+
 def test_exact_length_boundary_with_multiple_parts_and_prefix_drift() -> None:
     first = _chat_exchange([1], [2, 9])
     second = _chat_exchange([1, 2, 9, 3], [4, 5], offset=1)
@@ -821,7 +927,7 @@ def test_public_exact_chain_preserves_raw_drift_across_proven_length_boundary() 
 
 
 @pytest.mark.parametrize("finish_reason", ["stop", "tool_calls"])
-def test_length_chain_retains_exact_prefix_with_terminal_synthetic_stop(
+def test_length_chain_retains_exact_prefix_without_terminal_footer(
     finish_reason: Literal["stop", "tool_calls"],
 ) -> None:
     history, tokenizer, captured = _character_template_history(
@@ -834,11 +940,9 @@ def test_length_chain_retains_exact_prefix_with_terminal_synthetic_stop(
 
     tokenized = history.tokenize(tokenizer=tokenizer)
 
-    assert tokenized.tokens == [*captured, 9]
-    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags[:-1])
-    assert tokenized.flags[-1] == (
-        tr.TokenFlag.STOP | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
-    )
+    assert tokenized.tokens == captured
+    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags)
+    assert tokenized.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT)
     assert sum(bool(flag & tr.TokenFlag.SAMPLED) for flag in tokenized.flags) == 19
 
 
@@ -931,15 +1035,12 @@ def test_length_boundary_ends_before_next_assistant_tool_prefix(
     if mismatch:
         assert tokenized.tokens != expected
         return
-    assert tokenized.tokens == expected
+    assert tokenized.tokens == [*next_prompt, *tool_output]
     assert all(
         flag & tr.TokenFlag.EXACT
         for flag in tokenized.flags[: len(next_prompt) + len(tool_output)]
     )
-    assert (
-        tokenized.flags[-1]
-        == tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP
-    )
+    assert tokenized.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
     sampled = [
         index
         for index, flag in enumerate(tokenized.flags)
@@ -1380,7 +1481,7 @@ def test_metadata_only_final_token_is_preserved_as_sampled_stop() -> None:
     assert tokenized.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP)
 
 
-def test_empty_output_materializes_a_synthetic_stop() -> None:
+def test_recorded_empty_output_does_not_invent_a_response_token() -> None:
     exchange = _chat_exchange([1], [])
     exchange.response.choices[0].message.content = ""
 
@@ -1388,10 +1489,9 @@ def test_empty_output_materializes_a_synthetic_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[exchange])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 9]
+    assert tokenized.tokens == [1]
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP,
     ]
 
 
@@ -3698,19 +3798,32 @@ def test_reasoning_stripped_messages_history_preserves_exact_tokens(
             }
             return by_length[len(messages)]
 
-    history = art.Trajectory(
-        exchanges=TrajectoryExchanges(messages=[first, second])
-    ).anthropic_messages_histories()[1]
-    tokenized = history.tokenize(tokenizer=Tokenizer())
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(messages=[first, second]))
+    history = trajectory.anthropic_messages_histories()[1]
+    if top_level_only:
+        with pytest.raises(ValueError, match="complete original sampled occurrence"):
+            history.tokenize(tokenizer=Tokenizer())
+        original, tokenized = trajectory.tokenize(
+            multi_history=True, tokenizer=Tokenizer()
+        ).histories
+        assert original.tokens == [10, 90, 101, 102]
+        assert original.logprobs[1:] == pytest.approx([-9.0, -10.1, -10.2])
+        assert original.flags[1:] == [_SAMPLED_ASSISTANT_OUTPUT] * 3
+        assert all(math.isnan(value) for value in tokenized.logprobs[1:3])
+        assert (
+            tokenized.flags[1:3]
+            == [tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT] * 2
+        )
+    else:
+        # Block-level output evidence has no native prompt. Preserve this
+        # existing generic rendered path rather than invent conditioning.
+        tokenized = history.tokenize(tokenizer=Tokenizer())
+        assert tokenized.logprobs[1:3] == pytest.approx([-10.1, -10.2])
+        assert tokenized.flags[1:3] == [_SAMPLED_ASSISTANT_OUTPUT] * 2
 
     assert tokenized.tokens == [10, 101, 102, 11, 91, 201]
-    assert tokenized.logprobs[1:3] == pytest.approx([-10.1, -10.2])
     assert tokenized.logprobs[-2] == pytest.approx(-10.0)
     assert tokenized.logprobs[-1] == pytest.approx(-20.1)
-    assert tokenized.flags[1:3] == [
-        _SAMPLED_ASSISTANT_OUTPUT,
-        _SAMPLED_ASSISTANT_OUTPUT,
-    ]
     assert tokenized.flags[-2:] == [
         _SAMPLED_ASSISTANT_OUTPUT,
         _SAMPLED_ASSISTANT_OUTPUT,
@@ -4624,12 +4737,14 @@ def test_cross_exchange_responses_reasoning_split_uses_later_prompt_backbone() -
         [1, 3, 4, 5],
     ]
     assert math.isnan(tokenized.histories[1].logprobs[0])
-    assert tokenized.histories[1].logprobs[1] == -0.3
+    # The copied 3 was sampled after [1, 2], never after [1].
+    assert tokenized.histories[0].logprobs[1:] == [-0.2, -0.3]
+    assert math.isnan(tokenized.histories[1].logprobs[1])
     assert math.isnan(tokenized.histories[1].logprobs[2])
     assert tokenized.histories[1].logprobs[3] == -0.1
     assert tokenized.histories[1].flags == [
         tr.TokenFlag.EXACT,
-        _SAMPLED_ASSISTANT_OUTPUT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT,
         tr.TokenFlag.EXACT,
         _SAMPLED_ASSISTANT_OUTPUT,
     ]
@@ -7215,13 +7330,19 @@ def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> Non
         [1, 2, 101, 102, 9],
         [1, 101, 102, 9, 4, 5, 6, 9],
     ]
-    assert tokenized.histories[1].flags[1] & tr.TokenFlag.SAMPLED
+    assert not tokenized.histories[1].flags[1] & tr.TokenFlag.SAMPLED
+    assert tokenized.histories[1].flags[1] & tr.TokenFlag.OUTPUT
+    assert tokenized.histories[0].logprobs[2:4] == [-10.1, -10.2]
     assert tokenized.histories[1].flags[1] & tr.TokenFlag.EXACT
-    assert tokenized.histories[1].logprobs[1:3] == [-10.1, -10.2]
+    assert all(math.isnan(value) for value in tokenized.histories[1].logprobs[1:3])
     assert tokenized.histories[1].flags[3] == (
-        _SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.OUTPUT
+        | tr.TokenFlag.STOP
     )
-    assert tokenized.histories[1].logprobs[3] == -0.9
+    assert math.isnan(tokenized.histories[1].logprobs[3])
+    assert tokenized.histories[0].logprobs[4] == -0.9
     assert 2 not in tokenized.histories[1].tokens
     assert 500 not in tokenized.histories[1].tokens
 
@@ -7381,13 +7502,21 @@ def test_reasoning_stripped_tool_call_keeps_exact_evidence_for_strict_training(
         multi_history=True,
         tokenizer=Tokenizer(),
     )
-    second_history = tokenized.histories[1]
+    first_history, second_history = tokenized.histories
+    assert first_history.tokens == [1, 2, 7, 8]
+    assert first_history.logprobs[1:] == [-0.2, -0.7, -0.8]
+    assert first_history.flags[1:] == [_SAMPLED_ASSISTANT_OUTPUT] * 3
     assert second_history.tokens == [1, 7, 8, 4, 5]
-    assert second_history.logprobs[1:3] == [-0.7, -0.8]
-    assert second_history.flags[1:3] == [
-        _SAMPLED_ASSISTANT_OUTPUT,
-        _SAMPLED_ASSISTANT_OUTPUT,
-    ]
+    assert all(math.isnan(lp) for lp in second_history.logprobs[1:3])
+    assert (
+        second_history.flags[1:3]
+        == [
+            tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT,
+        ]
+        * 2
+    )
+    assert second_history.logprobs[-1] == -0.5
+    assert second_history.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
 
     preprocessing = list(
         tokenize_trajectory_groups(
@@ -8964,7 +9093,16 @@ def test_length_boundary_preserves_output_despite_probe_suffix_collision(
             _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
         return
 
-    tokenized, traces = _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
+    if corruption == "changed_sampled_token":
+        # The later request text disagrees with its recorded assistant token.
+        # A supplied renderer cannot prove that request's full role mask.
+        with pytest.raises(ValueError, match="Cannot preserve assistant boundaries"):
+            _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
+        tokenized, traces = _tokenize_trajectory_with_trace(trajectory, tokenizer=None)
+    else:
+        tokenized, traces = _tokenize_trajectory_with_trace(
+            trajectory, tokenizer=tokenizer
+        )
     assert len(tokenized.histories) == (
         2 if corruption == "changed_sampled_token" else 1
     )

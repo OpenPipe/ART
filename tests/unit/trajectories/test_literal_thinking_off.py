@@ -12,12 +12,14 @@ import pytest
 
 import art.trajectories as tr
 from art.trajectories import _tokenize
+from art_inference.chat_template import chat_template_with_preserved_thinking
 
 # Public Qwen3.5 template after ART's existing thinking-preservation rewrite.
 _TEMPLATE = (
     Path(__file__).parents[2] / "fixtures/qwen35_preserved_thinking.jinja"
 ).read_text()
 _LITERAL = "HEAD\n</think>DISCARDED_PUBLIC_SEGMENT</think>\n\nTAIL"
+_RENDER_OVERRIDE = _TEMPLATE + "{# explicit rendering #}"
 
 
 class _TemplateTokenizer:
@@ -125,10 +127,10 @@ def _history(
 
 
 def _outcome(
-    history: tr.ChatCompletionsHistory, tokenizer: _TemplateTokenizer
+    history: tr.ChatCompletionsHistory, tokenizer: _TemplateTokenizer, **kwargs: Any
 ) -> object:
     try:
-        value = history.tokenize(tokenizer=tokenizer)
+        value = history.tokenize(tokenizer=tokenizer, **kwargs)
     except ValueError as error:
         return type(error), str(error)
     return value.tokens, value.flags, [None if x != x else x for x in value.logprobs]
@@ -137,23 +139,25 @@ def _outcome(
 @pytest.mark.parametrize(
     "content", [_LITERAL, "literal </think> text", "π<think>one<think>two</think>end"]
 )
+@pytest.mark.parametrize("rendered", [False, True])
 def test_native_thinking_off_retains_literal_content(
-    content: str, monkeypatch: pytest.MonkeyPatch
+    content: str, rendered: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     history, tokenizer = _history(content=content)
     original = history.model_dump(mode="python")
-    # The pre-fix history path misrenders literal content even when later native
-    # token splicing can recover the terminal output.
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
-        )
-        _outcome(history, tokenizer)
-    assert content not in tokenizer.rendered[0]
-    tokenizer.calls.clear()
-    tokenizer.rendered.clear()
-    tokenized = history.tokenize(tokenizer=tokenizer)
-    assert content in tokenizer.rendered[0]
+    # Explicit rendering still needs literal-content normalization. Complete
+    # native output needs no rendering, even for a length-limited response.
+    override = _RENDER_OVERRIDE if rendered else None
+    if rendered:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                _tokenize, "chat_template_with_preserved_thinking", lambda value: value
+            )
+            _outcome(history, tokenizer, chat_template=override)
+        assert content not in tokenizer.rendered[0]
+        tokenizer.calls.clear()
+        tokenizer.rendered.clear()
+    tokenized = history.tokenize(tokenizer=tokenizer, chat_template=override)
     sampled = [
         i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED
     ]
@@ -162,8 +166,19 @@ def test_native_thinking_off_retains_literal_content(
     required = tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
     assert all(tokenized.flags[i] & required == required for i in sampled)
     assert not any(flag & tr.TokenFlag.STOP for flag in tokenized.flags)
-    assert tokenizer.calls[0][-1]["reasoning_content"] == ""
-    assert tokenizer.calls[0][-1]["content"] == content
+    if rendered:
+        assert content in tokenizer.rendered[0]
+        assert tokenizer.calls[0][-1].get("reasoning_content", "") == ""
+        assert tokenizer.calls[0][-1]["content"] == content
+    else:
+        assert not tokenizer.calls and not tokenizer.rendered
+        source = history.message_sources[-1]
+        assert source is not None and isinstance(
+            source.exchange, tr.ChatCompletionsExchange
+        )
+        recorded = source.exchange.response.choices[0].model_extra
+        assert recorded is not None
+        assert tokenized.tokens == recorded["prompt_token_ids"] + recorded["token_ids"]
     assert history.model_dump(mode="python") == original
 
 
@@ -183,9 +198,7 @@ def test_native_thinking_off_retains_literal_content(
         "visible_only",
     ],
 )
-def test_unrelated_histories_keep_original_rendering(
-    case: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_literal_content_is_not_inferred_from_source_thinking_mode(case: str) -> None:
     history, tokenizer = _history(
         thinking=True
         if case == "source_on"
@@ -222,25 +235,31 @@ def test_unrelated_histories_keep_original_rendering(
     if case == "visible_only":
         cast(dict[str, Any], history.messages[-1]).pop("reasoning")
     original = history.model_dump(mode="python")
-    candidate = _outcome(history, tokenizer)
-    calls = deepcopy(tokenizer.calls)
-    tokenizer.calls.clear()
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
+    _outcome(history, tokenizer, chat_template=_RENDER_OVERRIDE)
+    # Exercise rendering explicitly even when complete native output can bypass
+    # it. Plain content stays literal independently of recorded/current thinking mode
+    # and whether the message has complete native token metadata. Structured
+    # reasoning remains a separate field on the render copy.
+    assert tokenizer.calls[0][-1]["content"] == _LITERAL
+    assert _LITERAL in tokenizer.rendered[0]
+    if case in {"structured", "alias"}:
+        assert (
+            tokenizer.calls[0][-1].get(
+                "reasoning_content", tokenizer.calls[0][-1].get("reasoning")
+            )
+            == "explicit reasoning"
         )
-        baseline = _outcome(history, tokenizer)
-    assert candidate == baseline
-    assert len(calls) == len(tokenizer.calls)
-    assert calls[0] == tokenizer.calls[0]
     assert history.model_dump(mode="python") == original
 
 
 @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
-def test_explicit_empty_reasoning_is_preserved(field: str) -> None:
+@pytest.mark.parametrize("rendered", [False, True])
+def test_explicit_empty_reasoning_is_preserved(field: str, rendered: bool) -> None:
     history, tokenizer = _history(reasoning="", reasoning_field=field)
     original = history.model_dump(mode="python")
-    tokenized = history.tokenize(tokenizer=tokenizer)
+    tokenized = history.tokenize(
+        tokenizer=tokenizer, chat_template=_RENDER_OVERRIDE if rendered else None
+    )
     assert (
         "".join(
             chr(token)
@@ -249,7 +268,10 @@ def test_explicit_empty_reasoning_is_preserved(field: str) -> None:
         )
         == _LITERAL
     )
-    assert tokenizer.calls[0][-1]["reasoning_content"] == ""
+    if rendered:
+        assert tokenizer.calls[0][-1].get("reasoning_content", "") == ""
+    else:
+        assert not tokenizer.calls and not tokenizer.rendered
     assert history.model_dump(mode="python") == original
 
 
@@ -278,7 +300,8 @@ def test_mixed_history_uses_each_generations_own_request(
     _outcome(history, tokenizer)
     rendered_messages = tokenizer.calls[0]
     assert "reasoning_content" not in rendered_messages[1]
-    assert rendered_messages[3]["reasoning_content"] == ""
+    assert "reasoning_content" not in rendered_messages[3]
+    assert _LITERAL in tokenizer.rendered[0]
     assert [message["content"] for message in rendered_messages] == [
         message["content"] for message in history.messages
     ]
@@ -403,21 +426,21 @@ def test_literal_next_turn_preserves_preceding_length_stop_boundary(
     monkeypatch.setattr(_tokenize, "_tokenize_exact_projected_chat_history", observe)
     with monkeypatch.context() as patch:
         patch.setattr(
-            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
+            _tokenize, "chat_template_with_preserved_thinking", lambda value: value
         )
         _outcome(history, tokenizer)
     boundary, old_exact = observed[0]
-    stored = list(boundary.tail + boundary.following)
-    assert old_exact is None
-    assert len(native_boundary) - len(stored) == 2
-    assert stored[:-1] == native_boundary[:-3]
-    assert tokenizer.decode(stored[-1:]) == "\n"
-    assert tokenizer.decode(native_boundary[-3:]) == "\n\n</think>\n\n"
+    # The final recorded body no longer needs a reconstructed terminal tail.
+    # Disabling literal normalization cannot invalidate the proved earlier gap.
+    assert old_exact is not None
+    assert list(boundary.tail + boundary.following) == native_boundary
     observed.clear()
 
     value = history.tokenize(tokenizer=tokenizer)
     fixed_boundary, fixed_exact = observed[0]
     assert fixed_exact is value
+    assert value.tokens == old_exact.tokens
+    assert value.flags == old_exact.flags
     assert list(fixed_boundary.tail + fixed_boundary.following) == native_boundary
     assert (
         value.tokens[: len(last["prompt_token_ids"]) + len(last["token_ids"])]
@@ -441,3 +464,189 @@ def test_literal_next_turn_preserves_preceding_length_stop_boundary(
             for flag in value.flags[start:stop]
         )
     assert history.model_dump(mode="python") == original
+
+
+class _NamedTemplateTokenizer(_TemplateTokenizer):
+    chat_template: Any
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.chat_template = {
+            "default": _TEMPLATE,
+            "tool_use": _TEMPLATE + "TOOL_TEMPLATE",
+            "named": _TEMPLATE + "NAMED_TEMPLATE",
+        }
+        self.selected: list[str] = []
+        self.settings: list[dict[str, Any]] = []
+
+    def get_chat_template(self, chat_template=None, tools=None):
+        # Transformers' named/default/tool selection contract, before rendering.
+        templates = self.chat_template
+        if chat_template is not None:
+            return templates.get(chat_template, chat_template)
+        if tools is not None and "tool_use" in templates:
+            return templates["tool_use"]
+        if "default" in templates:
+            return templates["default"]
+        raise ValueError("No default template")
+
+    def apply_chat_template(self, messages, **kwargs):
+        template = self.get_chat_template(
+            kwargs.pop("chat_template", None), kwargs.get("tools")
+        )
+        self.selected.append(template)
+        self.settings.append(deepcopy(kwargs))
+        return super().apply_chat_template(messages, chat_template=template, **kwargs)
+
+
+@pytest.mark.parametrize("selection", ["default", "tools", "named", "literal_override"])
+@pytest.mark.parametrize("route", ["history", "exchange"])
+def test_unconfigured_named_template_preserves_unrecorded_literal_content(
+    selection, route
+):
+    tokenizer = _NamedTemplateTokenizer()
+    templates_before = deepcopy(tokenizer.chat_template)
+    history, _ = _history()
+    source = history.message_sources[-1]
+    assert source is not None
+    exchange = source.exchange.model_copy(deep=True)
+    assert isinstance(exchange, tr.ChatCompletionsExchange)
+    exchange.request.pop("chat_template", None)
+    override = (
+        "named"
+        if selection == "named"
+        else _TEMPLATE + "OVERRIDE_TEMPLATE"
+        if selection == "literal_override"
+        else None
+    )
+    tools: list[Any] | None = (
+        [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ]
+        if selection == "tools"
+        else None
+    )
+    if route == "history":
+        # No native tokens: preservation must come from rendering itself.
+        history = tr.ChatCompletionsHistory(
+            model="public/qwen35",
+            messages=deepcopy(history.messages),
+            message_sources=[None] * len(history.messages),
+            tools=tools,
+        )
+        before = history.model_dump()
+        result = history.tokenize(
+            tokenizer=tokenizer,
+            chat_template=override,
+            chat_template_kwargs={"enable_thinking": True, "preserve_thinking": False},
+        )
+        assert _LITERAL in tokenizer.decode(result.tokens)
+        assert not any(flag & tr.TokenFlag.SAMPLED for flag in result.flags)
+        assert history.model_dump() == before
+    else:
+        if tools is not None:
+            exchange.request["tools"] = tools
+        before = exchange.model_dump()
+        result = _tokenize._template_ids(
+            tokenizer,
+            exchange,
+            completed=True,
+            config=_tokenize._TokenizerConfig(base_model="public/qwen35"),
+            chat_template=override,
+            chat_template_kwargs={"enable_thinking": True, "preserve_thinking": False},
+        )
+        assert _LITERAL in tokenizer.decode(result)
+        assert exchange.model_dump() == before
+    assert tokenizer.chat_template == templates_before
+    assert tokenizer.selected
+    expected = (
+        templates_before["named"]
+        if selection == "named"
+        else override
+        if selection == "literal_override"
+        else templates_before["tool_use"]
+        if selection == "tools"
+        else templates_before["default"]
+    )
+    assert all(
+        selected == chat_template_with_preserved_thinking(expected)
+        for selected in tokenizer.selected
+    )
+    assert all(
+        settings["enable_thinking"] is True and settings["preserve_thinking"] is False
+        for settings in tokenizer.settings
+    )
+
+
+def test_named_template_selection_failure_keeps_original_error():
+    tokenizer = _NamedTemplateTokenizer()
+    del tokenizer.chat_template["default"]
+    with pytest.raises(ValueError, match="No default template"):
+        _tokenize._resolved_chat_template(tokenizer, None, None)
+    # Explicit unrelated templates are selected unchanged, not rewritten merely
+    # because this tokenizer also has a known Qwen template in its dictionary.
+    custom = "{% for message in messages %}{{ message.content }}{% endfor %}"
+    assert _tokenize._resolved_chat_template(tokenizer, custom, None) == (custom, {})
+
+
+@pytest.mark.parametrize("selection", [None, "named"])
+def test_named_selection_preserves_implicit_generation_mode(selection):
+    tokenizer = _NamedTemplateTokenizer()
+    history, _ = _history()
+    source = history.message_sources[-1]
+    assert source is not None
+    exchange = source.exchange.model_copy(deep=True)
+    assert isinstance(exchange, tr.ChatCompletionsExchange)
+    exchange.request.pop("chat_template", None)
+    exchange.request.pop("chat_template_kwargs", None)
+    expected = tokenizer.apply_chat_template(
+        exchange.request["messages"],
+        chat_template=selection,
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    tokenizer.settings.clear()
+    actual = _tokenize._template_ids(
+        tokenizer,
+        exchange,
+        completed=False,
+        config=_tokenize._TokenizerConfig(base_model="public/qwen35"),
+        chat_template=selection,
+        chat_template_kwargs=None,
+    )
+    assert actual == expected
+    assert "enable_thinking" not in tokenizer.settings[-1]
+    assert "preserve_thinking" not in tokenizer.settings[-1]
+
+
+def test_unchanged_selected_body_is_not_selected_again_as_a_name():
+    tokenizer = _NamedTemplateTokenizer()
+    tokenizer.chat_template = {"default": "named", "named": "DIFFERENT"}
+    history = tr.ChatCompletionsHistory(
+        model="public/qwen35",
+        messages=[{"role": "user", "content": "question"}],
+        message_sources=[None],
+    )
+    before = deepcopy(tokenizer.chat_template)
+    assert tokenizer.decode(history.tokenize(tokenizer=tokenizer).tokens) == "named"
+    assert tokenizer.chat_template == before
+
+
+def test_changed_body_colliding_with_a_name_refuses_before_wrong_renderer():
+    tokenizer = _NamedTemplateTokenizer()
+    normalized = chat_template_with_preserved_thinking(_TEMPLATE)
+    assert isinstance(normalized, str) and normalized != _TEMPLATE
+    tokenizer.chat_template = {"default": _TEMPLATE, normalized: "DIFFERENT"}
+    before = deepcopy(tokenizer.chat_template)
+    history = tr.ChatCompletionsHistory(
+        model="public/qwen35",
+        messages=[{"role": "assistant", "content": _LITERAL}],
+        message_sources=[None],
+    )
+    with pytest.raises(ValueError, match="also a template name"):
+        history.tokenize(tokenizer=tokenizer)
+    assert not tokenizer.calls
+    assert tokenizer.chat_template == before

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from bisect import bisect_left
 import codecs
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum
 from functools import lru_cache
 from hashlib import sha256
 import json
@@ -553,6 +554,7 @@ def _translate_token_mask(
     mask: Sequence[bool],
     *,
     tokenizer: Tokenizer | None = None,
+    _opcodes: list[tuple[str, int, int, int, int]] | None = None,
 ) -> list[bool]:
     """Translate a token mask across a prefix replacement without guessing."""
 
@@ -563,9 +565,12 @@ def _translate_token_mask(
     translated = [False] * len(target)
     mapped = [False] * len(source)
     decode = getattr(tokenizer, "decode", None)
-    for tag, start, end, target_start, target_end in SequenceMatcher(
-        None, source, target, autojunk=False
-    ).get_opcodes():
+    opcodes = (
+        _opcodes or SequenceMatcher(None, source, target, autojunk=False).get_opcodes()
+    )
+    if _opcodes is not None and not _opcodes:
+        _opcodes.extend(opcodes)
+    for tag, start, end, target_start, target_end in opcodes:
         if tag == "equal":
             translated[target_start:target_end] = mask[start:end]
             mapped[start:end] = [True] * (end - start)
@@ -589,6 +594,118 @@ def _translate_token_mask(
             "Cannot preserve assistant boundaries across exact prompt token replacement"
         )
     return translated
+
+
+def _recorded_prompt_role_masks(
+    messages: list[dict[str, Any]],
+    sources: Sequence[object | None],
+    prompt: list[int],
+    *,
+    tokenizer: Tokenizer,
+    template: object,
+    tools: object,
+    kwargs: Mapping[str, object],
+) -> tuple[list[bool], list[bool]] | None:
+    """Prove roles in recorded request context with its original renderer.
+
+    Normalizing a template corrects future literal-content rendering; it does
+    not change an already served prompt. Only request context is admitted here:
+    sampled outputs retain their separate exact conditioning/ownership proofs.
+    """
+    if len(messages) != len(sources) or any(
+        source is not None and _source_is_sampled(source) for source in sources
+    ):
+        return None
+    if not any(message.get("role") == "assistant" for message in messages):
+        return None
+    messages, tools, kwargs = deepcopy((messages, tools, dict(kwargs)))
+    original_context = _render_context_key([messages, tools, dict(kwargs)])
+
+    def check_context() -> None:
+        if _render_context_key([messages, tools, dict(kwargs)]) != original_context:
+            raise ValueError(
+                "Renderer changed context while proving recorded request roles"
+            )
+
+    normalization_template = template
+    if isinstance(getattr(tokenizer, "chat_template", None), dict) and callable(
+        select := getattr(tokenizer, "get_chat_template", None)
+    ):
+        normalization_template = select(
+            chat_template=template if isinstance(template, str) else None,
+            tools=tools,
+        )
+        check_context()
+
+    def render(selected: list[dict[str, Any]], *, add_generation_prompt: bool) -> str:
+        value = tokenizer.apply_chat_template(
+            normalize_tool_call_arguments_for_chat_template(
+                selected, normalization_template
+            ),
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            **({"chat_template": template} if template is not None else {}),
+            **kwargs,
+        )
+        check_context()
+        if not isinstance(value, str):
+            raise TypeError("Historical chat template did not render text")
+        return value
+
+    rendered_prompt = render(messages, add_generation_prompt=True)
+    encoded = cast(_OffsetTokenizer, tokenizer)(
+        rendered_prompt, add_special_tokens=False, return_offsets_mapping=True
+    )
+    check_context()
+    if _ids(encoded) != prompt:
+        return None
+    offsets = _field(encoded, "offset_mapping")
+    if not isinstance(offsets, list) or len(offsets) != len(prompt):
+        return None
+    characters = [False] * len(rendered_prompt)
+    previous_end = 0
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant":
+            continue
+        prior = render(messages[:index], add_generation_prompt=False)
+        generation = render(messages[:index], add_generation_prompt=True)
+        completed = render(messages[: index + 1], add_generation_prompt=False)
+        start = _common_prefix_length(generation, completed)
+        if (
+            start < len(prior)
+            or generation[: len(prior)] != prior
+            or completed[: len(prior)] != prior
+            or rendered_prompt[: len(completed)] != completed
+            or start < previous_end
+        ):
+            return None
+        characters[start : len(completed)] = [True] * (len(completed) - start)
+        previous_end = len(completed)
+    assistant = []
+    previous_start = 0
+    for offset in offsets:
+        if (
+            not isinstance(offset, (list, tuple))
+            or len(offset) != 2
+            or any(type(value) is not int for value in offset)
+        ):
+            return None
+        start, end = cast(tuple[int, int], offset)
+        if not previous_start <= start < end <= len(characters):
+            return None
+        selected = characters[start:end]
+        if (
+            any(selected)
+            and not all(selected)
+            and not rendered_prompt[start:end].isspace()
+        ):
+            return None
+        assistant.append(any(selected))
+        previous_start = start
+    masks = _assistant_stop_masks(prompt, assistant, tokenizer)
+    check_context()
+    return masks
 
 
 def _prove_exact_sampled_assistant_span(
@@ -640,6 +757,34 @@ def _rendered_flag(assistant: bool, output: bool, stop: bool) -> TokenFlag:
     if output:
         flag |= TokenFlag.OUTPUT
     return flag | TokenFlag.STOP if stop else flag
+
+
+def _merge_recorded_request_roles(
+    exact: TokenizedHistory,
+    rendered: Sequence[int],
+    assistant_mask: Sequence[bool],
+    output_mask: Sequence[bool],
+    stop_mask: Sequence[bool],
+    length_stop_mask: Sequence[bool],
+) -> bool:
+    # Sampled responses own their native flags. Request-only assistant roles
+    # must retain a complete prefix proof, including roles between responses.
+    roles = [
+        (index, _rendered_flag(assistant, False, stop))
+        for index, (assistant, output, stop, length_stop) in enumerate(
+            zip(assistant_mask, output_mask, stop_mask, length_stop_mask, strict=True)
+        )
+        if not output and not length_stop and (assistant or stop)
+    ]
+    end = roles[-1][0] + 1 if roles else 0
+    if exact.tokens[:end] != list(rendered[:end]) or any(
+        exact.flags[index] & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
+        for index, _ in roles
+    ):
+        return False
+    for index, flags in roles:
+        exact.flags[index] |= flags
+    return True
 
 
 def _synthetic_length_stop_mask(
@@ -809,16 +954,30 @@ def _require_causal_predecessor(trainable: Sequence[bool]) -> None:
 @dataclass
 class _TraceBuilder:
     trace: _HistoryTokenizationTrace | None = None
+    tokenizer: Tokenizer | None = None
+    rendered_outputs: tuple[tuple[int, int, object], ...] = ()
+    validate_sources: Callable[[_SampledSourceKey | None], None] | None = None
+    validate_context: Callable[[bool], None] | None = None
+    track_sources: bool = True
 
     def set(
         self,
         tokenized: TokenizedHistory,
         source_keys: list[_SampledSourceKey | None],
         sources: dict[_SampledSourceKey, object],
+        rendered_outputs: tuple[tuple[int, int, object], ...] = (),
+        *,
+        tokenizer: Tokenizer | None = None,
     ) -> None:
+        if self.validate_sources is not None:
+            self.validate_sources(None)
+        self.tokenizer = tokenizer
         trace = _HistoryTokenizationTrace(source_keys=source_keys, sources=sources)
         trace.validate(tokenized)
         self.trace = trace
+        self.rendered_outputs = rendered_outputs
+        if self.track_sources:
+            self.validate_sources = _sampled_source_validator(sources)
 
 
 def _fingerprint(value: object) -> str:
@@ -859,7 +1018,17 @@ def _sampled_evidence_fingerprint(
     *,
     protocol: Literal["chat_completions", "responses", "messages", "completions"],
     index: int,
+    _cache: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
 ) -> str:
+    if _cache is not None:
+        key = (id(exchange), protocol, index)
+        cached = _cache.get(key)
+        if cached is not None and cached[0] is exchange:
+            return cached[1]
+        value = _sampled_evidence_fingerprint(exchange, protocol=protocol, index=index)
+        if len(_cache) < 256:
+            _cache[key] = (exchange, value)
+        return value
     if protocol == "chat_completions":
         if not isinstance(exchange, ChatCompletionsExchange):
             raise TypeError("Chat source has the wrong exchange type")
@@ -956,6 +1125,7 @@ def _source_key(
     protocol: Literal["chat_completions", "responses", "messages", "completions"],
     index: int,
     prompt_index: int | None = None,
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
 ) -> _SampledSourceKey:
     return _SampledSourceKey(
         protocol=protocol,
@@ -970,27 +1140,40 @@ def _source_key(
         # IDs remain part of the identity: equal output evidence can have
         # different causal contexts even when response IDs are reused.
         evidence_fingerprint=_sampled_evidence_fingerprint(
-            exchange, protocol=protocol, index=index
+            exchange, protocol=protocol, index=index, _cache=_fingerprints
         ),
     )
 
 
-def _sampled_source_key(source: object) -> _SampledSourceKey:
+def _sampled_source_key(
+    source: object,
+    *,
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
+) -> _SampledSourceKey:
     exchange = getattr(source, "exchange", None)
     if isinstance(exchange, ChatCompletionsExchange):
         index = getattr(source, "choice_index", None)
         if not isinstance(index, int) or isinstance(index, bool):
             raise ValueError("Sampled Chat source has no choice index")
-        return _source_key(exchange, protocol="chat_completions", index=index)
+        return _source_key(
+            exchange,
+            protocol="chat_completions",
+            index=index,
+            _fingerprints=_fingerprints,
+        )
     if isinstance(exchange, ResponsesExchange):
         index = getattr(source, "generation_index", None)
         if index is None and not _response_generations(exchange.response):
             index = 0
         if not isinstance(index, int) or isinstance(index, bool):
             raise ValueError("Sampled Responses source has no generation identity")
-        return _source_key(exchange, protocol="responses", index=index)
+        return _source_key(
+            exchange, protocol="responses", index=index, _fingerprints=_fingerprints
+        )
     if isinstance(exchange, MessagesExchange):
-        return _source_key(exchange, protocol="messages", index=0)
+        return _source_key(
+            exchange, protocol="messages", index=0, _fingerprints=_fingerprints
+        )
     if isinstance(exchange, CompletionsExchange):
         index = getattr(source, "choice_index", None)
         prompt_index = getattr(source, "prompt_index", None)
@@ -1003,6 +1186,7 @@ def _sampled_source_key(source: object) -> _SampledSourceKey:
             protocol="completions",
             index=index,
             prompt_index=prompt_index,
+            _fingerprints=_fingerprints,
         )
     raise ValueError("Sampled token source has an unsupported exchange")
 
@@ -2059,6 +2243,38 @@ def _response_message(
     raise TypeError("Completions responses do not use chat templates")
 
 
+def _resolved_chat_template(
+    tokenizer: Tokenizer, template: object, tools: object
+) -> tuple[object, dict[str, Any]]:
+    # Preserve preselection defaults: resolving a named template must not
+    # silently change its generation mode. Explicit kwargs still override these.
+    configured = chat_template_with_preserved_thinking(template)
+    defaults = default_chat_template_kwargs_for_template(configured)
+    if isinstance(getattr(tokenizer, "chat_template", None), dict):
+        select = getattr(tokenizer, "get_chat_template", None)
+        if callable(select):
+            selected = select(
+                chat_template=template if isinstance(template, str) else None,
+                tools=tools,
+            )
+            configured = chat_template_with_preserved_thinking(selected)
+            if configured == selected:
+                # apply_chat_template resolves names itself. Forwarding an
+                # unchanged body could accidentally select a second named entry.
+                return template, defaults
+            templates = getattr(tokenizer, "chat_template", None)
+            if (
+                isinstance(configured, str)
+                and isinstance(templates, dict)
+                and configured in templates
+            ):
+                raise ValueError(
+                    "The normalized chat template is also a template name; "
+                    "cannot preserve the selected renderer without ambiguity"
+                )
+    return configured, defaults
+
+
 def _template_ids(
     tokenizer: Tokenizer,
     exchange: Exchange,
@@ -2106,9 +2322,9 @@ def _template_ids(
         or config.chat_template
         or getattr(tokenizer, "chat_template", None)
     )
-    template = chat_template_with_preserved_thinking(template)
+    template, defaults = _resolved_chat_template(tokenizer, template, tools)
     kwargs = {
-        **default_chat_template_kwargs_for_template(template),
+        **defaults,
         **explicit_kwargs,
     }
     result = tokenizer.apply_chat_template(
@@ -2749,7 +2965,7 @@ def _tokenize_exchange_trajectory(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
 
 
@@ -3225,7 +3441,11 @@ def _last_source_exchange(sources: Sequence[object]) -> Exchange | None:
     return None
 
 
-def _history_has_length_stop(history: History) -> bool:
+def _history_has_length_stop(
+    history: History,
+    *,
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
+) -> bool:
     sources: Sequence[object]
     if isinstance(history, (ChatCompletionsHistory, AnthropicMessagesHistory)):
         sources = history.message_sources
@@ -3237,13 +3457,35 @@ def _history_has_length_stop(history: History) -> bool:
     for source in sources:
         if source is None or not _source_is_sampled(source):
             continue
-        source_key = _sampled_source_key(source)
+        source_key = _sampled_source_key(source, _fingerprints=_fingerprints)
         if source_key in seen:
             continue
         seen.add(source_key)
         if _source_stop_evidence(source, source_key)[0] == "length":
             return True
     return False
+
+
+def _native_nonterminal_stops_known(
+    history: ChatCompletionsHistory,
+    *,
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
+) -> bool:
+    sources: dict[_SampledSourceKey, object] = {}
+    for message, source in zip(history.messages, history.message_sources, strict=True):
+        if message.get("role") != "assistant":
+            continue
+        if source is None or not _source_is_sampled(source):
+            return False
+        sources[_sampled_source_key(source, _fingerprints=_fingerprints)] = source
+    for key, source in list(sources.items())[:-1]:
+        kind, reason = _source_stop_evidence(source, key)
+        if kind != "stop" or not isinstance(reason, int) or isinstance(reason, bool):
+            return False
+        output = _source_output_tokens(source, key)
+        if not output or output[-1] != reason:
+            return False
+    return bool(sources)
 
 
 def _history_needs_synthetic_stop(
@@ -3399,7 +3641,11 @@ def _history_render_state(history: History) -> _HistoryRenderState:
     return _HistoryRenderState(needs_render=False)
 
 
-def _source_signature(source: object) -> tuple[object, ...] | None:
+def _source_signature(
+    source: object,
+    *,
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
+) -> tuple[object, ...] | None:
     if source is None:
         return None
     exchange = getattr(source, "exchange", None)
@@ -3419,18 +3665,21 @@ def _source_signature(source: object) -> tuple[object, ...] | None:
     evidence_fingerprint: str | None = None
     if isinstance(exchange, ChatCompletionsExchange) and isinstance(choice_index, int):
         evidence_fingerprint = _sampled_evidence_fingerprint(
-            exchange, protocol="chat_completions", index=choice_index
+            exchange,
+            protocol="chat_completions",
+            index=choice_index,
+            _cache=_fingerprints,
         )
     elif isinstance(exchange, ResponsesExchange) and isinstance(generation_index, int):
         evidence_fingerprint = _sampled_evidence_fingerprint(
-            exchange, protocol="responses", index=generation_index
+            exchange, protocol="responses", index=generation_index, _cache=_fingerprints
         )
     elif isinstance(exchange, MessagesExchange) and (
         getattr(source, "output_index", None) == 0
         or _chat_output_indices(source) == (0,)
     ):
         evidence_fingerprint = _sampled_evidence_fingerprint(
-            exchange, protocol="messages", index=0
+            exchange, protocol="messages", index=0, _cache=_fingerprints
         )
     return (
         type(source),
@@ -3449,8 +3698,9 @@ def _source_signature(source: object) -> tuple[object, ...] | None:
 
 
 def _sources_match(left: Sequence[object], right: Sequence[object]) -> bool:
-    return [_source_signature(item) for item in left] == [
-        _source_signature(item) for item in right
+    fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] = {}
+    return [_source_signature(item, _fingerprints=fingerprints) for item in left] == [
+        _source_signature(item, _fingerprints=fingerprints) for item in right
     ]
 
 
@@ -3588,6 +3838,7 @@ def _tokenize_exact_responses_history(
     base_model: str | None,
     tokenizer: Tokenizer | None,
     _trace: _TraceBuilder | None = None,
+    _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
 ) -> TokenizedHistory | None:
     generation_keys: list[tuple[ResponsesExchange, int]] = []
     retained_output_indices: dict[tuple[int, int], set[int]] = {}
@@ -3619,8 +3870,29 @@ def _tokenize_exact_responses_history(
         output = generation.output_token_ids
         if prompt is None or output is None:
             return None
+        source = next(
+            item
+            for item in history.input_sources
+            if item is not None
+            and item.exchange is exchange
+            and item.generation_index == generation_index
+        )
+        context_only = False
         retained = retained_output_indices.get((id(exchange), generation_index), set())
-        if retained != set(generation.output_indices):
+        following_prompt = None
+        if position + 1 < len(generation_keys):
+            following_exchange, following_index = generation_keys[position + 1]
+            following_prompt = _response_generations(following_exchange.response)[
+                following_index
+            ].prompt_token_ids
+        from ._history import _retains_output_suffix
+
+        copied_suffix = (
+            following_prompt is not None
+            and following_prompt[: len(prompt) + len(output)] != [*prompt, *output]
+            and _retains_output_suffix(prompt, output, following_prompt)
+        )
+        if retained != set(generation.output_indices) or copied_suffix:
             if position + 1 >= len(generation_keys):
                 return None
             next_exchange, next_generation_index = generation_keys[position + 1]
@@ -3638,7 +3910,16 @@ def _tokenize_exact_responses_history(
             )
             if retained_suffix is None:
                 return None
+            context_only = retained_suffix[0] != output
+            if context_only and not _complete_source_is_represented(
+                source, prompt, output, generation.output_logprobs, _prior
+            ):
+                raise ValueError(
+                    "A copied Responses suffix requires its complete original sampled occurrence in the selected trajectory"
+                )
             output, output_logprobs = retained_suffix
+            if context_only:
+                output_logprobs = [math.nan] * len(output)
             output_text = None
         else:
             output_logprobs = generation.output_logprobs
@@ -3682,7 +3963,7 @@ def _tokenize_exact_responses_history(
         flags.extend(
             [
                 TokenFlag.EXACT
-                | TokenFlag.SAMPLED
+                | (TokenFlag(0) if context_only else TokenFlag.SAMPLED)
                 | TokenFlag.ASSISTANT
                 | TokenFlag.OUTPUT
             ]
@@ -3701,15 +3982,28 @@ def _tokenize_exact_responses_history(
         if source is None:
             raise AssertionError("Responses generation has no history source")
         source_key = _sampled_source_key(source)
-        source_keys.extend([source_key] * len(output))
+        source_keys.extend([None if context_only else source_key] * len(output))
         sources[source_key] = source
-        sampled_outputs.append(
-            _SampledOutput(
-                text=output_text,
-                token_ids=list(output),
-                start=len(token_ids) - len(output),
+        if context_only:
+            stop_count = _sampled_stop_suffix(
+                generation.output_token_ids or [],
+                source=source,
+                source_key=source_key,
+                tokenizer=tokenizer,
             )
-        )
+            for offset in range(
+                max(len(token_ids) - len(output), len(token_ids) - stop_count),
+                len(token_ids),
+            ):
+                flags[offset] |= TokenFlag.STOP
+        else:
+            sampled_outputs.append(
+                _SampledOutput(
+                    text=output_text,
+                    token_ids=list(output),
+                    start=len(token_ids) - len(output),
+                )
+            )
     _mark_sampled_stops(
         token_ids,
         flags,
@@ -3725,7 +4019,7 @@ def _tokenize_exact_responses_history(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
 
 
@@ -3849,6 +4143,15 @@ def _chat_source_prompt_tokens(source: object) -> list[int] | None:
             return None
         return _messages_tokens(exchange.response)[0]
     return None
+
+
+def _chat_source_record(
+    source: object,
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
+    exchange = getattr(source, "exchange", None)
+    if isinstance(exchange, ChatCompletionsExchange):
+        return _chat_choice_tokens(_chat_choice(source), exchange.response)
+    return _chat_source_prompt_tokens(source), *_chat_source_full_tokens(source)
 
 
 def _source_is_sampled(source: object) -> bool:
@@ -4031,6 +4334,138 @@ def _source_has_no_materialized_output(
     return False
 
 
+def _tokenization_context(value: object) -> object:
+    """Snapshot ordered semantic inputs without serializing sampled responses.
+
+    History and source fields remain typed, including protocol selectors and
+    request-owned context. Sampled response evidence has its own source-key
+    validator; retaining entire response objects here would duplicate it.
+    """
+    # Shared message dictionaries occur in many recorded request prefixes.
+    # Intern only within this one observation, never across callback checks.
+    observed: dict[int, tuple[object, object]] = {}
+
+    def snapshot(item: object) -> object:
+        kind = type(item)
+        if kind in (str, int, bool, bytes, type(None), datetime):
+            return kind, item
+        if kind is float:
+            return kind, repr(item)
+        if isinstance(item, Enum):
+            if getattr(item, "__objclass__", kind) is not kind:
+                raise TypeError("Unsupported enum tokenization context")
+            return kind, snapshot(
+                {
+                    key: child
+                    for key, child in vars(item).items()
+                    if key != "__objclass__"
+                }
+            )
+        if isinstance(item, (str, int, float, bytes)):
+            if isinstance(item, str):
+                scalar = str.__str__(item)
+            elif isinstance(item, int):
+                scalar = int.__int__(item)
+            elif isinstance(item, float):
+                scalar = repr(float.__float__(item))
+            else:
+                scalar = bytes.__bytes__(item)
+            return kind, scalar, snapshot(getattr(item, "__dict__", None))
+        previous = observed.get(id(item))
+        if previous is not None and previous[0] is item:
+            return previous[1]
+        if kind in (list, tuple):
+            result = kind, tuple(snapshot(child) for child in cast(Sequence, item))
+        elif isinstance(item, Mapping):
+            result = (
+                kind,
+                tuple((snapshot(key), snapshot(child)) for key, child in item.items()),
+            )
+        elif isinstance(item, Exchange):
+            result = kind, id(item), item.model, snapshot(item.request)
+        elif isinstance(item, BaseModel):
+            result = (
+                kind,
+                tuple(
+                    (name, snapshot(getattr(item, name)))
+                    for name in type(item).model_fields
+                ),
+                snapshot(item.model_extra),
+            )
+        else:
+            raise TypeError("Unsupported mutable tokenization context")
+        observed[id(item)] = item, result
+        return result
+
+    return snapshot(value)
+
+
+def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
+    try:
+        expected = _tokenization_context(value)
+    except TypeError:
+        # An opaque, complete native history still works without a tokenizer.
+        # A callback-bearing path cannot claim an uncheckable context proof.
+        expected = None
+
+    def validate(require_supported: bool) -> None:
+        if expected is None and not require_supported:
+            return
+        if expected is None:
+            raise ValueError("Tokenization context cannot be checked for callbacks")
+        if _tokenization_context(value) != expected:
+            raise ValueError(
+                "Tokenization context changed during tokenization callback"
+            )
+
+    return validate
+
+
+def _sampled_source_validator(
+    sources: Mapping[_SampledSourceKey, object],
+) -> Callable[[_SampledSourceKey | None], None]:
+    expected = {}
+    for key, source in sources.items():
+        exchange = _source_exchange(source)
+        if exchange is None:
+            raise ValueError("Sampled source has no exchange")
+        expected[key] = (
+            source,
+            exchange,
+            exchange.model,
+            _source_stop_evidence(source, key),
+            _tokenization_context_validator(exchange.request),
+        )
+
+    def validate(selected: _SampledSourceKey | None) -> None:
+        for key in expected if selected is None else (selected,):
+            source, exchange, model, stop, validate_request = expected[key]
+            current = (
+                _exchange_sampled_source_key(source)
+                if isinstance(source, Exchange)
+                else _sampled_source_key(source)
+            )
+            if (
+                current != key
+                or _source_exchange(source) is not exchange
+                or exchange.model != model
+                or _source_stop_evidence(source, key) != stop
+            ):
+                raise ValueError("Sampled source changed during tokenization callback")
+            validate_request(True)
+
+    return validate
+
+
+def _stop_uses_callback(reason: int | str | None, tokenizer: Tokenizer | None) -> bool:
+    return tokenizer is not None and (
+        isinstance(reason, str)
+        and bool(reason)
+        or not (isinstance(reason, int) and not isinstance(reason, bool))
+        and callable(getattr(tokenizer, "convert_tokens_to_ids", None))
+    )
+
+
 def _mark_sampled_stops(
     token_ids: Sequence[int],
     flags: list[TokenFlag],
@@ -4039,13 +4474,17 @@ def _mark_sampled_stops(
     *,
     tokenizer: Tokenizer | None,
 ) -> None:
+    validate_sources = None
     positions: dict[_SampledSourceKey, list[int]] = {}
     for index, source_key in enumerate(source_keys):
         if source_key is not None:
             positions.setdefault(source_key, []).append(index)
     for source_key, indices in positions.items():
+        if validate_sources is not None:
+            validate_sources(source_key)
         source = sources[source_key]
-        if _source_stop_evidence(source, source_key)[0] != "stop":
+        kind, reason = _source_stop_evidence(source, source_key)
+        if kind != "stop":
             continue
         selected = [token_ids[index] for index in indices]
         complete = _source_output_tokens(source, source_key)
@@ -4053,14 +4492,24 @@ def _mark_sampled_stops(
             continue
         if selected != complete[-len(selected) :]:
             continue
+        callback_used = _stop_uses_callback(reason, tokenizer)
+        if callback_used and validate_sources is None:
+            validate_sources = _sampled_source_validator(sources)
         count = _sampled_stop_suffix(
             selected,
             source=source,
             source_key=source_key,
             tokenizer=tokenizer,
         )
+        if callback_used:
+            assert validate_sources is not None
+            validate_sources(source_key)
         for index in indices[-count:] if count else ():
             flags[index] |= TokenFlag.STOP
+    if validate_sources is not None:
+        # Later callbacks may edit an already-marked source. Check all consumed
+        # evidence once before return, without rehashing every source per stop.
+        validate_sources(None)
 
 
 @dataclass(frozen=True)
@@ -4118,6 +4567,182 @@ def _next_assistant_span_start(
     )
 
 
+def _complete_source_is_represented(
+    source: object,
+    prompt: list[int],
+    output: list[int],
+    logprobs: list[float],
+    prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]],
+) -> bool:
+    """Prove ownership of the original edge before treating a copy as context."""
+    key = _sampled_source_key(source)
+    exchange = _source_exchange(source)
+    required = (
+        TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+    )
+    expected_lp = logprobs if len(logprobs) == len(output) else [math.nan] * len(output)
+    end = len(prompt) + len(output)
+    for previous, trace in prior:
+        owner = trace.sources.get(key)
+        if (
+            previous.model != getattr(exchange, "model", None)
+            or _source_exchange(owner) is not exchange
+            or getattr(owner, "choice_index", None)
+            != getattr(source, "choice_index", None)
+            or trace.source_keys[len(prompt) : end] != [key] * len(output)
+            or previous.tokens[:end] != [*prompt, *output]
+            or any(
+                flag & required != required
+                for flag in previous.flags[len(prompt) : end]
+            )
+        ):
+            continue
+        if all(
+            left == right or math.isnan(left) and math.isnan(right)
+            for left, right in zip(
+                previous.logprobs[len(prompt) : end], expected_lp, strict=True
+            )
+        ):
+            return True
+    return False
+
+
+def _source_native_record(
+    source: object,
+) -> tuple[list[int] | None, list[int] | None, list[float]]:
+    exchange = _source_exchange(source)
+    if isinstance(exchange, MessagesExchange) and (
+        isinstance(source, MessagesExchange)
+        or isinstance(source, AnthropicMessageSource)
+        and source.request_index is None
+    ):
+        return _messages_tokens(exchange.response)
+    if isinstance(exchange, ResponsesExchange):
+        index = getattr(source, "generation_index", None)
+        generations = _response_generations(exchange.response)
+        if isinstance(index, int) and 0 <= index < len(generations):
+            generation = generations[index]
+            return (
+                generation.prompt_token_ids,
+                generation.output_token_ids,
+                generation.output_logprobs,
+            )
+    return _chat_source_record(source)
+
+
+def _source_native_prefix(source: object) -> tuple[list[int] | None, list[int] | None]:
+    # A capability preflight only: the normal source readers still validate the
+    # records before assembly. Avoid decoding LP carriers just to detect copies.
+    exchange = getattr(source, "exchange", None)
+    if isinstance(exchange, ChatCompletionsExchange):
+        choice = _chat_choice(source)
+        prompt = (choice.model_extra or {}).get("prompt_token_ids")
+        if prompt is None:
+            prompt = (exchange.response.model_extra or {}).get("prompt_token_ids")
+        output = (choice.model_extra or {}).get("token_ids")
+        if (
+            isinstance(prompt, list)
+            and prompt
+            and isinstance(output, list)
+            and output
+            and all(type(value) is int and value >= 0 for value in prompt)
+            and all(type(value) is int and value >= 0 for value in output)
+        ):
+            return prompt, output
+    prompt, output, _ = _source_native_record(source)
+    return prompt, output
+
+
+def _partial_native_context(history: History | LegacyHistory) -> list[object]:
+    from ._history import _retains_output_suffix
+
+    if isinstance(history, (ChatCompletionsHistory, AnthropicMessagesHistory)):
+        sources: Sequence[object] = history.message_sources
+    elif isinstance(history, ResponsesHistory):
+        sources = history.input_sources
+    else:
+        return []
+    sampled = [
+        source
+        for source in sources
+        if source is not None and _source_is_sampled(source)
+    ]
+    if len(sampled) < 2:
+        return []
+    final_prompt, _ = _source_native_prefix(sampled[-1])
+    if final_prompt is None:
+        return []
+    partial = []
+    for source in sampled[:-1]:
+        prompt, output = _source_native_prefix(source)
+        if prompt is None or output is None:
+            continue
+        if (
+            final_prompt[: len(prompt)] == prompt
+            and final_prompt[len(prompt) : len(prompt) + len(output)] == output
+        ):
+            continue
+        if _retains_output_suffix(prompt, output, final_prompt):
+            partial.append(source)
+    return partial
+
+
+def _certify_copied_context(
+    tokenized: TokenizedHistory,
+    trace: _HistoryTokenizationTrace,
+    copied: Sequence[object],
+    prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]],
+    rendered_outputs: Sequence[tuple[int, int, object]] = (),
+) -> None:
+    """A rendered copy may keep output provenance, never its old prediction LP."""
+    copied_keys = {_sampled_source_key(source) for source in copied}
+    # Visible logprob replacements need not be sampled. Keep their output
+    # provenance separate from the trace's strictly sampled-token ownership.
+    for start, end, source in rendered_outputs:
+        if _sampled_source_key(source) not in copied_keys:
+            continue
+        prompt, output, logprobs = _source_native_record(source)
+        if (
+            prompt is None
+            or output is None
+            or not _complete_source_is_represented(
+                source, prompt, output, logprobs, prior
+            )
+        ):
+            raise ValueError(
+                "Copied rendered output has no complete original sampled occurrence"
+            )
+        tokenized.logprobs[start:end] = [math.nan] * (end - start)
+    positions: dict[_SampledSourceKey, list[int]] = {}
+    for index, key in enumerate(trace.source_keys):
+        if key is not None:
+            positions.setdefault(key, []).append(index)
+    for key, offsets in positions.items():
+        source = trace.sources[key]
+        prompt, output, logprobs = _source_native_record(source)
+        if prompt is None or output is None:
+            continue
+        end = len(prompt) + len(output)
+        complete = offsets == list(range(len(prompt), end)) and tokenized.tokens[
+            :end
+        ] == [*prompt, *output]
+        if complete:
+            continue
+        if key not in copied_keys or not _complete_source_is_represented(
+            source, prompt, output, logprobs, prior
+        ):
+            raise ValueError(
+                "Recorded sampled tokens do not retain their original native conditioning"
+            )
+        # The unchanged original source remains trainable in an earlier result;
+        # these tokens are a copy under a different prompt, not another draw.
+        for index in offsets:
+            tokenized.flags[index] &= ~TokenFlag.SAMPLED
+            tokenized.logprobs[index] = math.nan
+            trace.source_keys[index] = None
+    trace.validate(tokenized)
+
+
 def _tokenize_exact_projected_chat_history(
     history: ChatCompletionsHistory,
     *,
@@ -4126,13 +4751,20 @@ def _tokenize_exact_projected_chat_history(
     | None = None,
     projection_validated: bool = False,
     _trace: _TraceBuilder | None = None,
+    _strict_sources: bool = False,
+    _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
 ) -> TokenizedHistory | None:
     if not projection_validated and not _history_matches_projection(history):
         return None
+    # Reuse evidence only in this callback-free phase, never across render/decode.
+    fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] = (
+        {} if _fingerprints is None else _fingerprints
+    )
     sampled_sources: list[object] = []
     seen: set[tuple[object, ...]] = set()
     for message, source in zip(history.messages, history.message_sources, strict=True):
-        signature = _source_signature(source)
+        signature = _source_signature(source, _fingerprints=fingerprints)
         if (
             message.get("role") == "assistant"
             and source is not None
@@ -4145,12 +4777,22 @@ def _tokenize_exact_projected_chat_history(
     if not sampled_sources:
         return None
 
+    # A later-prompt lookup must not repeatedly decode that source's output LPs.
+    # Keep validated records only for this assembly; never across render calls.
+    records: dict[int, tuple[list[int] | None, list[int] | None, list[float]]] = {}
+
+    def record(
+        source: object,
+    ) -> tuple[list[int] | None, list[int] | None, list[float]]:
+        if id(source) not in records:
+            records[id(source)] = _chat_source_record(source)
+        return records[id(source)]
+
     final_source = sampled_sources[-1]
-    final_prompt = _chat_source_prompt_tokens(final_source)
-    final_output, final_logprobs = _chat_source_full_tokens(final_source)
+    final_prompt, final_output, final_logprobs = record(final_source)
     if final_prompt is None or final_output is None:
         return None
-    final_key = _sampled_source_key(final_source)
+    final_key = _sampled_source_key(final_source, _fingerprints=fingerprints)
     final_stop_reason = _source_stop_evidence(final_source, final_key)[0]
     # A terminal synthetic stop can accompany an earlier length-stop boundary;
     # neither tail is sampled, and both must retain their renderer proof.
@@ -4223,8 +4865,7 @@ def _tokenize_exact_projected_chat_history(
     ]
     sources: dict[_SampledSourceKey, object] = {final_key: final_source}
     for index, source in enumerate(sampled_sources[:-1]):
-        prompt = _chat_source_prompt_tokens(source)
-        output, output_logprobs = _chat_source_full_tokens(source)
+        prompt, output, output_logprobs = record(source)
         if (
             prompt is None
             or output is None
@@ -4235,8 +4876,7 @@ def _tokenize_exact_projected_chat_history(
             (
                 evidence
                 for later_source in sampled_sources[index + 1 :]
-                if (later_prompt := _chat_source_prompt_tokens(later_source))
-                is not None
+                if (later_prompt := record(later_source)[0]) is not None
                 and (
                     evidence := _retained_output_suffix(
                         prompt=prompt,
@@ -4260,10 +4900,65 @@ def _tokenize_exact_projected_chat_history(
             TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
         ] * len(retained_ids)
         logprobs[start:end] = retained_logprobs
-        source_key = _sampled_source_key(source)
-        if _source_stop_evidence(source, source_key)[0] == "length":
+        source_key = _sampled_source_key(source, _fingerprints=fingerprints)
+        if _strict_sources and retained_ids != output:
+            if not _complete_source_is_represented(
+                source, prompt, output, output_logprobs, _prior
+            ):
+                raise ValueError(
+                    "A copied response suffix has different native conditioning; "
+                    "its complete original sampled occurrence must be represented "
+                    "in the selected trajectory before it can be used as context"
+                )
+            flags[start:end] = [
+                TokenFlag.EXACT | TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+            ] * len(retained_ids)
+            logprobs[start:end] = [math.nan] * len(retained_ids)
+            records.clear()  # A custom STOP decoder may change source objects.
+            fingerprints.clear()
+            reason = _source_stop_evidence(source, source_key)[1]
+            validate_sources = (
+                _sampled_source_validator({**sources, source_key: source})
+                if _stop_uses_callback(reason, tokenizer)
+                else None
+            )
+            stop_count = _sampled_stop_suffix(
+                output, source=source, source_key=source_key, tokenizer=tokenizer
+            )
+            if validate_sources is not None:
+                validate_sources(None)
+            for offset in range(max(start, end - stop_count), end):
+                flags[offset] |= TokenFlag.STOP
             boundary = (length_stop_boundaries or {}).get(source_key)
-            next_prompt = _chat_source_prompt_tokens(sampled_sources[index + 1])
+            if boundary is not None:
+                tail_end = end + len(boundary.tail)
+                next_prompt = record(sampled_sources[index + 1])[0]
+                if not boundary.tail or next_prompt != [
+                    *final_prompt[:end],
+                    *boundary.tail,
+                    *boundary.following,
+                ]:
+                    return None
+                stop_kind = _source_stop_evidence(source, source_key)[0]
+                boundary_flags = TokenFlag.EXACT | TokenFlag.ASSISTANT
+                if stop_kind == "stop":
+                    boundary_flags |= TokenFlag.OUTPUT
+                flags[end:tail_end] = [boundary_flags] * len(boundary.tail)
+                flags[tail_end - 1] = (
+                    TokenFlag.EXACT
+                    | TokenFlag.STOP
+                    | (
+                        TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+                        if stop_kind == "stop"
+                        else TokenFlag(0)
+                    )
+                )
+            sources[source_key] = source
+            continue
+        stop_kind = _source_stop_evidence(source, source_key)[0]
+        if stop_kind == "length" or source_key in (length_stop_boundaries or {}):
+            boundary = (length_stop_boundaries or {}).get(source_key)
+            next_prompt = record(sampled_sources[index + 1])[0]
             if boundary is not None and next_prompt is not None:
                 rendered_boundary = [*boundary.tail, *boundary.following]
                 native_boundary = next_prompt[end:]
@@ -4273,14 +4968,21 @@ def _tokenize_exact_projected_chat_history(
                     extra > 0
                     and native_boundary[extra:] == rendered_boundary
                     and callable(decode)
-                    and decode(native_boundary[:extra]).isspace()
                 ):
-                    # Services may insert whitespace before a truncated turn's
-                    # proven stop tail. Keep those served, nonsampled tokens.
-                    boundary = _RenderedLengthStopBoundary(
-                        tail=(*native_boundary[:extra], *boundary.tail),
-                        following=boundary.following,
+                    records.clear()  # Never reuse records across user callbacks.
+                    fingerprints.clear()
+                    validate_sources = _sampled_source_validator(
+                        {**sources, source_key: source}
                     )
+                    whitespace = decode(native_boundary[:extra]).isspace()
+                    validate_sources(None)
+                    if whitespace:
+                        # Services may insert whitespace before a truncated turn's
+                        # proven stop tail. Keep those served, nonsampled tokens.
+                        boundary = _RenderedLengthStopBoundary(
+                            tail=(*native_boundary[:extra], *boundary.tail),
+                            following=boundary.following,
+                        )
             boundary_end = (
                 end + len(boundary.tail) + len(boundary.following)
                 if boundary is not None
@@ -4299,10 +5001,19 @@ def _tokenize_exact_projected_chat_history(
                 # output and renderer-proven boundary, render the stop.
                 return None
             tail_end = end + len(boundary.tail)
-            flags[end:tail_end] = [TokenFlag.EXACT | TokenFlag.ASSISTANT] * len(
-                boundary.tail
+            boundary_flags = TokenFlag.EXACT | TokenFlag.ASSISTANT
+            if stop_kind == "stop":
+                boundary_flags |= TokenFlag.OUTPUT
+            flags[end:tail_end] = [boundary_flags] * len(boundary.tail)
+            flags[tail_end - 1] = (
+                TokenFlag.EXACT
+                | TokenFlag.STOP
+                | (
+                    TokenFlag.ASSISTANT | TokenFlag.OUTPUT
+                    if stop_kind == "stop"
+                    else TokenFlag(0)
+                )
             )
-            flags[tail_end - 1] = TokenFlag.EXACT | TokenFlag.STOP
         source_keys[start:end] = [source_key] * len(retained_ids)
         sources[source_key] = source
     if history.model is None:
@@ -4322,8 +5033,191 @@ def _tokenize_exact_projected_chat_history(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
+
+
+def _tokenize_recorded_chat_boundaries(
+    history: ChatCompletionsHistory,
+    messages: list[dict[str, Any]],
+    *,
+    tokenizer: Tokenizer,
+    render: _ChatRender,
+    _trace: _TraceBuilder | None,
+    _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
+) -> TokenizedHistory | None:
+    """Reuse complete native spans; encode only unrecorded turn boundaries.
+
+    This does not repartition histories or infer flags for request-owned assistant
+    messages. Unsupported render/decode capabilities retain the ordinary path.
+    """
+    decode = getattr(tokenizer, "decode", None)
+    if not callable(decode) or not messages or messages[-1].get("role") != "assistant":
+        return None
+    entries: list[tuple[int, object, list[int], list[int], list[float]]] = []
+    sources: dict[_SampledSourceKey, object] = {}
+    for index, (message, source) in enumerate(
+        zip(messages, history.message_sources, strict=True)
+    ):
+        if message.get("role") != "assistant":
+            continue
+        if source is None or not _source_is_sampled(source):
+            return None
+        key = _sampled_source_key(source)
+        prompt, output, logprobs = _chat_source_record(source)
+        if key in sources or prompt is None or output is None:
+            return None
+        sources[key] = source
+        entries.append((index, source, prompt, output, logprobs))
+    if not entries:
+        return None
+    final_prompt = entries[-1][2]
+    for ordinal, (index, source, prompt, output, logprobs) in enumerate(entries[:-1]):
+        retained = _retained_output_suffix(
+            prompt=prompt, output=output, logprobs=logprobs, later_prompt=final_prompt
+        )
+        if retained is not None and retained[0] != output:
+            if not _complete_source_is_represented(
+                source, prompt, output, logprobs, _prior
+            ):
+                raise ValueError(
+                    "A copied response suffix requires its complete original sampled occurrence in the selected trajectory"
+                )
+            entries[ordinal] = (index, source, prompt, retained[0], retained[1])
+    # The same canonical history must contain every original conditioning edge.
+    # Text equivalence is insufficient: these comparisons are exact native IDs.
+    for (_, _, prompt, output, _), (_, _, next_prompt, _, _) in zip(
+        entries, entries[1:]
+    ):
+        if (
+            next_prompt[: len(prompt)] != prompt
+            or next_prompt[len(prompt) : len(prompt) + len(output)] != output
+        ):
+            return None
+    boundaries: dict[_SampledSourceKey, _RenderedLengthStopBoundary] = {}
+    # Entries already consumed every native record. No callback may replace
+    # that evidence before a later source or the final assembler reads it again.
+    validate_sources = _sampled_source_validator(sources)
+    validate_context = _tokenization_context_validator(history)
+    keys = tuple(sources)
+    selected_key: _SampledSourceKey | None = None
+
+    def checked(call: Callable[[], Any], *, optional_decode: bool = False) -> Any:
+        try:
+            value = call()
+        except (TypeError, KeyError, NotImplementedError):
+            # These capability failures are caught by the caller and may
+            # resume tokenization. A changed source must not reach fallback.
+            validate_sources(selected_key)
+            validate_context(True)
+            raise
+        except ValueError:
+            if not optional_decode:
+                raise
+            value = None
+        # Other callback exceptions propagate unchanged; no result or fallback
+        # can consume their potentially changed inputs.
+        validate_sources(selected_key)
+        validate_context(True)
+        return value
+
+    def decline() -> None:
+        validate_sources(None)
+        validate_context(True)
+
+    terminators = checked(lambda: _terminator_ids(tokenizer))
+    if not terminators:
+        return decline()
+    # The last native output ends the recorded history. No later prompt proves
+    # an additional footer, so do not reconstruct one from a lossy projection.
+    for ordinal, (index, source, prompt, output, _) in enumerate(entries[:-1]):
+        selected_key = key = keys[ordinal]
+        validate_sources(key)
+        stop, _ = _source_stop_evidence(source, key)
+        if stop not in {"stop", "length"}:
+            return decline()
+        if stop == "stop" and checked(
+            lambda: _sampled_stop_suffix(
+                output, source=source, source_key=key, tokenizer=tokenizer
+            )
+        ):
+            continue
+        try:
+            body = checked(
+                lambda: decode(
+                    output,
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
+                optional_decode=True,
+            )
+            if body is None:
+                return decline()
+            generation = checked(
+                lambda: render(messages[:index], add_generation_prompt=True)
+            )
+            completed = checked(
+                lambda: render(messages[: index + 1], add_generation_prompt=False)
+            )
+            # Only the actually sampled body anchors the tail. Literal content,
+            # tool JSON and reasoning are never searched for or re-tokenized.
+            if not isinstance(body, str) or not completed.startswith(generation + body):
+                return decline()
+            suffix = completed[len(generation) + len(body) :]
+            tail = (
+                _ids(checked(lambda: tokenizer(suffix, add_special_tokens=False)))
+                if suffix
+                else []
+            )
+            stops = [i for i, token in enumerate(tail) if token in terminators]
+            if len(stops) != 1:
+                return decline()
+            terminator = stops[0]
+            trailing = checked(
+                lambda: decode(
+                    tail[terminator + 1 :],
+                    skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                ),
+                optional_decode=True,
+            )
+            if not isinstance(trailing, str) or trailing and not trailing.isspace():
+                return decline()
+            following: list[int] = []
+            if ordinal + 1 < len(entries):
+                next_index, _, next_prompt, _, _ = entries[ordinal + 1]
+                next_generation = checked(
+                    lambda: render(messages[:next_index], add_generation_prompt=True)
+                )
+                if not next_generation.startswith(completed):
+                    return decline()
+                gap = suffix + next_generation[len(completed) :]
+                gap_ids = _ids(
+                    checked(lambda: tokenizer(gap, add_special_tokens=False))
+                )
+                if (
+                    gap_ids[: len(tail)] != tail
+                    or next_prompt[len(prompt) + len(output) :] != gap_ids
+                ):
+                    return decline()
+                following = gap_ids[len(tail) :]
+            boundaries[key] = _RenderedLengthStopBoundary(
+                tail=tuple(tail[: terminator + 1]),
+                following=tuple([*tail[terminator + 1 :], *following]),
+            )
+        except (TypeError, KeyError, NotImplementedError):
+            return decline()
+    validate_sources(None)
+    validate_context(True)
+    return _tokenize_exact_projected_chat_history(
+        history,
+        tokenizer=tokenizer,
+        length_stop_boundaries=boundaries,
+        projection_validated=True,
+        _trace=_trace,
+        _strict_sources=True,
+        _prior=_prior,
+    )
 
 
 def _chat_message_parts(message: Mapping[str, object]) -> list[tuple[str, str]]:
@@ -4532,58 +5426,6 @@ def _source_covers_complete_sampled_message(
     ) == normalize_chat_message(projected[0])
 
 
-def _preserve_literal_thinking_off_content(
-    history: ChatCompletionsHistory,
-    messages: list[dict[str, Any]],
-    template: object,
-    kwargs: Mapping[str, object],
-) -> None:
-    # This Qwen3.5 template treats any </think> in unstructured content as a
-    # reasoning separator, even with thinking disabled. Restrict the render-copy
-    # adaptation to its exact preserved template; other templates may interpret
-    # an empty reasoning_content field differently.
-    if (
-        not isinstance(template, str)
-        or sha256(template.encode()).hexdigest()
-        != "098047d425a6673b1fe1a82a197a481616e53a283beaa8cb76cbb74d38ca6644"
-        or kwargs.get("enable_thinking") is not False
-        or kwargs.get("preserve_thinking") is not True
-    ):
-        return
-    for message, source in zip(messages, history.message_sources, strict=True):
-        if (
-            source is None
-            or not isinstance(source.exchange, ChatCompletionsExchange)
-            or source.choice_index is None
-            or message.get("role") != "assistant"
-            or not isinstance(content := message.get("content"), str)
-            or "</think>" not in content
-        ):
-            continue
-        request_kwargs = source.exchange.request.get("chat_template_kwargs")
-        if (
-            not isinstance(request_kwargs, Mapping)
-            or request_kwargs.get("enable_thinking") is not False
-        ):
-            continue
-        choice = _chat_choice(source)
-        # Visible-only histories may omit structured reasoning present in the
-        # source response. Preserve both that source and normalized aliases.
-        if any(
-            value is not None and not (isinstance(value, str) and value == "")
-            for value in (
-                message.get("reasoning"),
-                message.get("reasoning_content"),
-                _field(choice.message, "reasoning"),
-                _field(choice.message, "reasoning_content"),
-            )
-        ):
-            continue
-        prompt, output, _ = _chat_choice_tokens(choice, source.exchange.response)
-        if prompt is not None and output is not None:
-            message["reasoning_content"] = ""
-
-
 def _tokenize_chat_view(
     history: ChatCompletionsHistory,
     *,
@@ -4592,8 +5434,14 @@ def _tokenize_chat_view(
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
     _projection_matches: bool | None = None,
+    _recorded_boundaries: bool = False,
     _trace: _TraceBuilder | None = None,
+    _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
 ) -> TokenizedHistory:
+    if _trace is not None:
+        # Rendering may continue after exact assembly to prove historical roles.
+        # Keep every consumed source bound even for a standalone/single history.
+        _trace.track_sources = True
     _validate_history_sources(history)
     config = (
         _TokenizerConfig(base_model or history.model or "")
@@ -4625,12 +5473,14 @@ def _tokenize_chat_view(
         tokenizer_template = getattr(resolved_tokenizer, "chat_template", None)
         if isinstance(tokenizer_template, str):
             template = tokenizer_template
-    template = chat_template_with_preserved_thinking(template)
+    original_template = template
+    template, defaults = _resolved_chat_template(
+        resolved_tokenizer, template, history.tools
+    )
     kwargs = {
-        **default_chat_template_kwargs_for_template(template),
+        **defaults,
         **explicit_kwargs,
     }
-    _preserve_literal_thinking_off_content(history, messages, template, kwargs)
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
     segmented = False
 
@@ -4675,6 +5525,48 @@ def _tokenize_chat_view(
             ),
             add_generation_prompt=add_generation_prompt,
         )
+
+    if _recorded_boundaries:
+        if recorded := _tokenize_recorded_chat_boundaries(
+            history,
+            messages,
+            tokenizer=resolved_tokenizer,
+            render=render_text,
+            _trace=_trace,
+            _prior=_prior,
+        ):
+            return recorded
+
+    # Generic rendering consumes the complete projected response set. Retain
+    # that evidence before callbacks, rather than blessing fresh keys afterward.
+    consumed_keys = {
+        id(source): _sampled_source_key(source)
+        for source in history.message_sources
+        if source is not None and _source_is_sampled(source)
+    }
+    consumed_sources = {
+        consumed_keys[id(source)]: source
+        for source in history.message_sources
+        if id(source) in consumed_keys
+    }
+    validate_consumed = _sampled_source_validator(consumed_sources)
+    if _trace is not None:
+        if _trace.validate_sources is not None:
+            _trace.validate_sources(None)
+        _trace.validate_sources = validate_consumed
+
+    def consumed_source_key(source: object) -> _SampledSourceKey:
+        key = consumed_keys[id(source)]
+        validate_consumed(key)
+        return key
+
+    def sampled_stop_suffix(tokens: Sequence[int], source: object) -> int:
+        key = consumed_source_key(source)
+        count = _sampled_stop_suffix(
+            tokens, source=source, source_key=key, tokenizer=resolved_tokenizer
+        )
+        validate_consumed(key)
+        return count
 
     prefix_render_cache = _PrefixChatRenderCache(render_normalized_text)
 
@@ -4894,6 +5786,8 @@ def _tokenize_chat_view(
     output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
 
     def source_prompt_tokens(source: object) -> list[int] | None:
+        if id(source) in consumed_keys:
+            consumed_source_key(source)
         key = id(source)
         if key not in prompt_cache:
             prompt_cache[key] = _chat_source_prompt_tokens(source)
@@ -4902,6 +5796,8 @@ def _tokenize_chat_view(
     def source_output_tokens(
         source: object,
     ) -> tuple[list[int] | None, list[float]]:
+        if id(source) in consumed_keys:
+            consumed_source_key(source)
         key = id(source)
         if key not in output_cache:
             output_cache[key] = _chat_source_full_tokens(source)
@@ -4937,6 +5833,7 @@ def _tokenize_chat_view(
     canonical_rendered = rendered
     exact_prefix_length = 0
     canonical_prefix_length = 0
+    recorded_prompt_masks = None
     if (
         chat_template is None
         and chat_template_kwargs is None
@@ -4959,8 +5856,75 @@ def _tokenize_chat_view(
                     rendered = [*source_prompt, *rendered[len(rendered_prompt) :]]
                     exact_prefix_length = len(source_prompt)
                     canonical_prefix_length = len(rendered_prompt)
+                    if (
+                        original_template != template
+                        and source_prompt != rendered_prompt
+                    ):
+                        signature = _source_signature(source)
+                        request_context = None
+                        try:
+                            # Canonical tool validation may reorder JSON keys.
+                            # Prove the historical prompt with the recorded
+                            # request's own serialization inputs, not a view.
+                            exchange = getattr(source, "exchange", None)
+                            assert isinstance(
+                                exchange,
+                                (
+                                    ChatCompletionsExchange,
+                                    MessagesExchange,
+                                    ResponsesExchange,
+                                ),
+                            )
+                            request_messages, request_tools = _request_messages(
+                                exchange
+                            )
+                            request_context = _render_context_key(
+                                [request_messages, request_tools]
+                            )
+                            recorded_prompt_masks = _recorded_prompt_role_masks(
+                                request_messages,
+                                history.message_sources[:message_index],
+                                source_prompt,
+                                tokenizer=resolved_tokenizer,
+                                template=original_template,
+                                tools=request_tools,
+                                kwargs=kwargs,
+                            )
+                        except (TypeError, KeyError, NotImplementedError):
+                            # Optional historical prefix rendering may be
+                            # unsupported although the selected renderer works.
+                            recorded_prompt_masks = None
+                        # These optional renderer calls must not turn cached
+                        # native evidence into authority for a changed source.
+                        prompt_cache.clear()
+                        output_cache.clear()
+                        _validate_history_sources(history)
+                        if (
+                            _source_signature(source) != signature
+                            or not source_matches_context(source)
+                            or (
+                                request_context is not None
+                                and _render_context_key(
+                                    list(
+                                        _request_messages(
+                                            cast(
+                                                ChatCompletionsExchange
+                                                | MessagesExchange
+                                                | ResponsesExchange,
+                                                exchange,
+                                            )
+                                        )
+                                    )
+                                )
+                                != request_context
+                            )
+                        ):
+                            raise ValueError(
+                                "Sampled source changed while proving recorded request roles"
+                            )
                     break
 
+    validate_consumed(None)
     canonical_length_stop_mask = _synthetic_length_stop_mask(
         messages,
         history.message_sources,
@@ -4973,22 +5937,48 @@ def _tokenize_chat_view(
         canonical_assistant_mask,
         direct_bounds or None,
     )
-    assistant_mask = _translate_token_mask(
-        canonical_rendered,
-        rendered,
-        canonical_assistant_mask,
-        tokenizer=resolved_tokenizer,
-    )
-    output_mask = _translate_token_mask(
-        canonical_rendered,
-        rendered,
-        canonical_output_mask,
-        tokenizer=resolved_tokenizer,
-    )
-    stop_mask = _translate_token_mask(canonical_rendered, rendered, canonical_stop_mask)
-    length_stop_mask = _translate_token_mask(
-        canonical_rendered, rendered, canonical_length_stop_mask
-    )
+    if recorded_prompt_masks is not None and not any(
+        canonical_output_mask[:canonical_prefix_length]
+        + canonical_length_stop_mask[:canonical_prefix_length]
+    ):
+        assistant_prefix, stop_prefix = recorded_prompt_masks
+        assistant_mask = (
+            assistant_prefix + canonical_assistant_mask[canonical_prefix_length:]
+        )
+        stop_mask = stop_prefix + canonical_stop_mask[canonical_prefix_length:]
+        output_mask = [False] * exact_prefix_length + canonical_output_mask[
+            canonical_prefix_length:
+        ]
+        length_stop_mask = [False] * exact_prefix_length + canonical_length_stop_mask[
+            canonical_prefix_length:
+        ]
+    else:
+        # These four masks translate the same pair of token sequences.
+        mask_opcodes: list[tuple[str, int, int, int, int]] = []
+        assistant_mask = _translate_token_mask(
+            canonical_rendered,
+            rendered,
+            canonical_assistant_mask,
+            tokenizer=resolved_tokenizer,
+            _opcodes=mask_opcodes,
+        )
+        output_mask = _translate_token_mask(
+            canonical_rendered,
+            rendered,
+            canonical_output_mask,
+            tokenizer=resolved_tokenizer,
+            _opcodes=mask_opcodes,
+        )
+        stop_mask = _translate_token_mask(
+            canonical_rendered, rendered, canonical_stop_mask, _opcodes=mask_opcodes
+        )
+        length_stop_mask = _translate_token_mask(
+            canonical_rendered,
+            rendered,
+            canonical_length_stop_mask,
+            _opcodes=mask_opcodes,
+        )
+        mask_opcodes.clear()
     positions_by_first_token: dict[int, list[int]] = {}
     for index, token_id in enumerate(rendered):
         positions_by_first_token.setdefault(token_id, []).append(index)
@@ -5470,19 +6460,17 @@ def _tokenize_chat_view(
         for position, message_index in enumerate(sampled_message_indices):
             source = history.message_sources[message_index]
             assert source is not None
-            source_key = _sampled_source_key(source)
+            source_key = consumed_source_key(source)
             stop_reason = _source_stop_evidence(source, source_key)[0]
+            if _recorded_boundaries and position + 1 == len(sampled_message_indices):
+                length_stop_count += stop_reason == "length"
+                continue
             output = _source_output_tokens(source, source_key)
             synthetic_stop = (
                 stop_reason == "stop"
                 and bool(_terminator_ids(resolved_tokenizer))
                 and output is not None
-                and not _sampled_stop_suffix(
-                    output,
-                    source=source,
-                    source_key=source_key,
-                    tokenizer=resolved_tokenizer,
-                )
+                and not sampled_stop_suffix(output, source)
             )
             if synthetic_stop and position + 1 < len(sampled_message_indices):
                 length_stop_boundaries_complete = False
@@ -5578,7 +6566,7 @@ def _tokenize_chat_view(
                 continue
             length_stop_boundaries[source_key] = boundary
         if (
-            length_stop_count
+            (length_stop_count or _recorded_boundaries)
             and length_stop_boundaries_complete
             and (
                 exact := _tokenize_exact_projected_chat_history(
@@ -5590,7 +6578,79 @@ def _tokenize_chat_view(
                 )
             )
         ):
-            return exact
+            if _merge_recorded_request_roles(
+                exact,
+                rendered,
+                assistant_mask,
+                output_mask,
+                stop_mask,
+                length_stop_mask,
+            ):
+                return exact
+            if (
+                _recorded_boundaries
+                and chat_template is None
+                and chat_template_kwargs is None
+            ):
+                # Later request-only assistants can have historical rendering
+                # different from today's normalized template too. Prove the
+                # entire final recorded request, not only the first prompt.
+                source = history.message_sources[sampled_message_indices[-1]]
+                assert source is not None
+                exchange = _source_exchange(source)
+                assert isinstance(
+                    exchange,
+                    (ChatCompletionsExchange, MessagesExchange, ResponsesExchange),
+                )
+                prompt = source_prompt_tokens(source)
+                signature = _source_signature(source)
+                validate_context = _tokenization_context_validator(history)
+                masks = None
+                if prompt and exact.tokens[: len(prompt)] == prompt:
+                    request_messages, request_tools = _request_messages(exchange)
+                    try:
+                        masks = _recorded_prompt_role_masks(
+                            request_messages,
+                            [None] * len(request_messages),
+                            prompt,
+                            tokenizer=resolved_tokenizer,
+                            template=original_template,
+                            tools=request_tools,
+                            kwargs=kwargs,
+                        )
+                    except (TypeError, KeyError, NotImplementedError):
+                        pass
+                validate_context(True)
+                prompt_cache.clear()
+                output_cache.clear()
+                if _source_signature(source) != signature:
+                    raise ValueError(
+                        "Sampled source changed while proving recorded request roles"
+                    )
+                if (
+                    masks is not None
+                    and all(
+                        flag & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
+                        or not (flag & TokenFlag.ASSISTANT)
+                        or assistant
+                        for flag, assistant in zip(exact.flags, masks[0])
+                    )
+                    and all(
+                        flag & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
+                        or not (flag & TokenFlag.STOP)
+                        or stop
+                        for flag, stop in zip(exact.flags, masks[1])
+                    )
+                ):
+                    for index, (assistant, stop) in enumerate(zip(*masks, strict=True)):
+                        if not exact.flags[index] & (
+                            TokenFlag.SAMPLED | TokenFlag.OUTPUT
+                        ):
+                            exact.flags[index] |= _rendered_flag(assistant, False, stop)
+                    return exact
+                raise ValueError(
+                    "Cannot preserve request roles across exact native prompt replacement"
+                )
 
     sampled_message_count = sum(
         message.get("role") == "assistant"
@@ -5636,7 +6696,7 @@ def _tokenize_chat_view(
             and chat_template is None
             and chat_template_kwargs is None
             and source_matches_context(source)
-            and _source_stop_evidence(source, _sampled_source_key(source))[0]
+            and _source_stop_evidence(source, consumed_source_key(source))[0]
             != "length"
         ):
             exact_output_matches = locations(full_exact, search_cursor)
@@ -5815,7 +6875,7 @@ def _tokenize_chat_view(
                     if len(full_logprobs) == len(full_exact)
                     else [math.nan] * len(full_exact),
                     True,
-                    _sampled_source_key(source),
+                    consumed_source_key(source),
                     source,
                     None,
                 )
@@ -5849,7 +6909,7 @@ def _tokenize_chat_view(
                     rendered[start:end],
                     [math.nan] * (end - start),
                     False,
-                    _sampled_source_key(source),
+                    consumed_source_key(source),
                     source,
                     None,
                 )
@@ -5900,12 +6960,7 @@ def _tokenize_chat_view(
                 multi_generation_response or len(parts) != 1 or parts[0][0] != "content"
             ):
                 start = generation_start
-            if _sampled_stop_suffix(
-                full_exact,
-                source=source,
-                source_key=_sampled_source_key(source),
-                tokenizer=resolved_tokenizer,
-            ):
+            if sampled_stop_suffix(full_exact, source):
                 # Adjacent assistants can share a role mask. Prove this message's
                 # end before replacing its rendered closing markup and stop.
                 completed = probe_render(
@@ -5939,7 +6994,7 @@ def _tokenize_chat_view(
                     if len(full_logprobs) == len(full_exact)
                     else [math.nan] * len(full_exact),
                     True,
-                    _sampled_source_key(source),
+                    consumed_source_key(source),
                     source,
                     None,
                 )
@@ -6023,12 +7078,7 @@ def _tokenize_chat_view(
             elif (
                 exact is not None
                 and corrected_message_end is not None
-                and _sampled_stop_suffix(
-                    exact,
-                    source=source,
-                    source_key=_sampled_source_key(source),
-                    tokenizer=resolved_tokenizer,
-                )
+                and sampled_stop_suffix(exact, source)
             ):
                 # Use the proven message end to replace its rendered stop,
                 # just as the whole-message path does for sampled stops.
@@ -6046,7 +7096,7 @@ def _tokenize_chat_view(
             if (
                 exact is not None
                 and corrected_message_end is not None
-                and _source_stop_evidence(source, _sampled_source_key(source))[0]
+                and _source_stop_evidence(source, consumed_source_key(source))[0]
                 != "length"
             ):
                 # Source evidence assigns STOP; retain synthetic length boundaries.
@@ -6086,7 +7136,7 @@ def _tokenize_chat_view(
                     if len(logprobs) == len(replacement)
                     else [math.nan] * len(replacement),
                     exact is not None,
-                    _sampled_source_key(source),
+                    consumed_source_key(source),
                     source,
                     span[1]
                     if corrected_message_end is not None
@@ -6137,6 +7187,7 @@ def _tokenize_chat_view(
     source_keys: list[_SampledSourceKey | None] = []
     sources: dict[_SampledSourceKey, object] = {}
     cursor = 0
+    rendered_outputs: list[tuple[int, int, object]] = []
     for (
         start,
         end,
@@ -6220,6 +7271,10 @@ def _tokenize_chat_view(
             source_keys.extend([source_key] * len(replacement))
             sources[source_key] = source
         else:
+            if _trace is not None:
+                rendered_outputs.append(
+                    (len(token_ids), len(token_ids) + len(replacement), source)
+                )
             token_ids.extend(replacement)
             logprobs.extend(
                 replacement_logprobs
@@ -6280,6 +7335,7 @@ def _tokenize_chat_view(
         flags[index] |= TokenFlag.EXACT
     if history.model is None:
         raise ValueError("History tokenization requires a model")
+    validate_consumed(None)
     _mark_sampled_stops(
         token_ids,
         flags,
@@ -6295,7 +7351,13 @@ def _tokenize_chat_view(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(
+            tokenized,
+            source_keys,
+            sources,
+            tuple(rendered_outputs),
+            tokenizer=resolved_tokenizer,
+        )
     return tokenized
 
 
@@ -6373,7 +7435,7 @@ def _tokenize_completions_token_history(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
 
 
@@ -6563,7 +7625,7 @@ def _tokenize_completions_string_history(
         flags=flags,
     )
     if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
+        _trace.set(tokenized, source_keys, sources, tokenizer=tokenizer)
     return tokenized
 
 
@@ -6655,7 +7717,9 @@ def _tokenize_history(
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
     _trace: _TraceBuilder | None = None,
+    _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
     _projection_validated: bool = False,
+    _copied_context: bool = False,
 ) -> TokenizedHistory:
     if isinstance(history, LegacyHistory):
         if model is None:
@@ -6677,6 +7741,14 @@ def _tokenize_history(
             _trace=_trace,
         )
     _validate_history_sources(history)
+    can_render = tokenizer is None or callable(
+        getattr(tokenizer, "apply_chat_template", None)
+    )
+    needs_synthetic_stop = _history_needs_synthetic_stop(history, tokenizer)
+    if tokenizer is not None and can_render:
+        # STOP discovery can call a supplied tokenizer before native assembly.
+        # Its result cannot lend an old model/view proof to changed sources.
+        _validate_history_sources(history)
     override_requires_render = (
         chat_template is not None
         and chat_template != getattr(history, "chat_template", None)
@@ -6690,11 +7762,17 @@ def _tokenize_history(
         if _projection_validated
         else _history_render_state(history)
     )
-    can_render = tokenizer is None or callable(
-        getattr(tokenizer, "apply_chat_template", None)
+    # Without a tokenizer, the stop decision and first exact assembly have no
+    # user callback between them. Keep their evidence in one bounded phase;
+    # never carry it into a rendered or tokenizer-supplied path.
+    fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = (
+        {}
+        if tokenizer is None and isinstance(history, ChatCompletionsHistory)
+        else None
     )
-    has_length_stop = can_render and _history_has_length_stop(history)
-    needs_synthetic_stop = _history_needs_synthetic_stop(history, tokenizer)
+    has_length_stop = can_render and _history_has_length_stop(
+        history, _fingerprints=fingerprints
+    )
     needs_render = (
         render_state.needs_render
         or override_requires_render
@@ -6703,12 +7781,32 @@ def _tokenize_history(
     )
     if isinstance(history, ResponsesHistory) and not needs_render:
         if exact := _tokenize_exact_responses_history(
-            history, base_model=base_model, tokenizer=tokenizer, _trace=_trace
+            history,
+            base_model=base_model,
+            tokenizer=tokenizer,
+            _trace=_trace,
+            _prior=_prior,
         ):
             return exact
     if isinstance(history, ChatCompletionsHistory):
+        needs_request_roles = (
+            tokenizer is not None
+            and can_render
+            and any(
+                message.get("role") == "assistant"
+                and (source is None or not _source_is_sampled(source))
+                for message, source in zip(
+                    history.messages, history.message_sources, strict=True
+                )
+            )
+        )
         if (
-            not has_length_stop
+            (
+                not has_length_stop
+                or not _copied_context
+                and _native_nonterminal_stops_known(history, _fingerprints=fingerprints)
+            )
+            and not needs_request_roles
             and not needs_synthetic_stop
             and not override_requires_render
             and not render_state.context_changed
@@ -6721,6 +7819,9 @@ def _tokenize_history(
                         _projection_validated or render_state.projection_matches is True
                     ),
                     _trace=_trace,
+                    _strict_sources=True,
+                    _prior=_prior,
+                    _fingerprints=fingerprints,
                 )
             )
         ):
@@ -6734,9 +7835,18 @@ def _tokenize_history(
             _projection_matches=(
                 True if _projection_validated else render_state.projection_matches
             ),
+            _prior=_prior,
+            _recorded_boundaries=(
+                (has_length_stop or needs_synthetic_stop or needs_request_roles)
+                and not override_requires_render
+                and not render_state.context_changed
+                and (_projection_validated or render_state.projection_matches is True)
+            ),
             _trace=_trace,
         )
-    if isinstance(history, AnthropicMessagesHistory) and needs_render:
+    if isinstance(history, AnthropicMessagesHistory) and (
+        needs_render or _copied_context
+    ):
         converted = history.as_chat_completions_history()
         if (
             not has_length_stop
@@ -6754,18 +7864,22 @@ def _tokenize_history(
                     tokenizer=tokenizer,
                     projection_validated=True,
                     _trace=_trace,
+                    _strict_sources=True,
+                    _prior=_prior,
                 )
             )
         ):
             return exact
-        return _tokenize_chat_view(
-            converted,
-            base_model=base_model,
-            tokenizer=tokenizer,
-            chat_template=chat_template,
-            chat_template_kwargs=chat_template_kwargs,
-            _trace=_trace,
-        )
+        if needs_render:
+            return _tokenize_chat_view(
+                converted,
+                base_model=base_model,
+                tokenizer=tokenizer,
+                chat_template=chat_template,
+                chat_template_kwargs=chat_template_kwargs,
+                _trace=_trace,
+                _prior=_prior,
+            )
     if isinstance(history, ResponsesHistory) and needs_render:
         return _tokenize_chat_view(
             history.as_chat_completions_history(),
@@ -6805,8 +7919,58 @@ def tokenize_history(
     chat_template: str | None,
     chat_template_kwargs: Mapping[str, object] | None,
     _trace: _TraceBuilder | None = None,
+    _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
     _projection_validated: bool = False,
+    _context_sources: Sequence[object] | None = None,
 ) -> TokenizedHistory:
+    trace_builder = _trace or _TraceBuilder(track_sources=False)
+    if trace_builder.validate_context is None:
+        trace_builder.validate_context = _tokenization_context_validator(
+            [history, chat_template, chat_template_kwargs]
+        )
+    else:
+        trace_builder.validate_context(False)
+    copied = (
+        list(_context_sources)
+        if _context_sources is not None
+        else _partial_native_context(history)
+    )
+    if copied:
+        trace_builder.track_sources = True
+        history = cast(History, history)
+        _validate_history_sources(history)
+        state = None if _projection_validated else _history_render_state(history)
+        unchanged = _projection_validated or (
+            state is not None
+            and not state.context_changed
+            and (
+                state.projection_matches is True
+                or state.projection_matches is None
+                and _history_matches_projection(history)
+            )
+        )
+        override = (
+            chat_template is not None
+            and chat_template != getattr(history, "chat_template", None)
+        ) or (
+            chat_template_kwargs is not None
+            and dict(chat_template_kwargs)
+            != (getattr(history, "chat_template_kwargs", None) or {})
+        )
+        if not unchanged or override:
+            copied = []
+        for source in copied:
+            prompt, output, logprobs = _source_native_record(source)
+            if (
+                prompt is None
+                or output is None
+                or not _complete_source_is_represented(
+                    source, prompt, output, logprobs, _prior
+                )
+            ):
+                raise ValueError(
+                    "A copied response suffix requires its complete original sampled occurrence in the selected trajectory"
+                )
     tokenized = _tokenize_history(
         history,
         model=model,
@@ -6814,9 +7978,24 @@ def tokenize_history(
         tokenizer=tokenizer,
         chat_template=chat_template,
         chat_template_kwargs=chat_template_kwargs,
-        _trace=_trace,
+        _trace=trace_builder,
+        _prior=_prior,
         _projection_validated=_projection_validated,
+        _copied_context=bool(copied),
     )
+    _validate_completed_sources([trace_builder])
+    if copied:
+        if trace_builder is None or trace_builder.trace is None:
+            raise ValueError(
+                "Copied native context requires a complete tokenization source trace"
+            )
+        _certify_copied_context(
+            tokenized,
+            trace_builder.trace,
+            copied,
+            _prior,
+            trace_builder.rendered_outputs,
+        )
     # Internal protocol conversion is an implementation detail. The source is
     # always the public history view the caller asked to tokenize.
     if not isinstance(
@@ -6848,6 +8027,55 @@ def _materialize_trajectory(
     )
 
 
+def _validate_completed_sources(builders: Sequence[_TraceBuilder | None]) -> None:
+    if any(
+        builder is not None and builder.tokenizer is not None for builder in builders
+    ):
+        # Later callbacks may edit an earlier completed history. Check its
+        # original source keys and stop evidence without calling a tokenizer.
+        for builder in builders:
+            if builder is not None:
+                if builder.validate_context is not None:
+                    builder.validate_context(True)
+                if builder.validate_sources is not None:
+                    builder.validate_sources(None)
+
+
+def _complete_resolved_sampled_stops(
+    tokenized: Sequence[TokenizedHistory], builders: Sequence[_TraceBuilder | None]
+) -> None:
+    """Reuse only authority actually resolved for this model in this call.
+
+    Do not load a tokenizer or feed it back into renderer selection. Conflicting
+    tokenizer objects leave that model's unknown STOP labels unchanged.
+    """
+    resolved: dict[str, Tokenizer | None] = {}
+    for value, builder in zip(tokenized, builders, strict=True):
+        if builder is not None and builder.tokenizer is not None:
+            previous = resolved.setdefault(value.model, builder.tokenizer)
+            if previous is not builder.tokenizer:
+                resolved[value.model] = None
+    for value, builder in zip(tokenized, builders, strict=True):
+        if (
+            builder is not None
+            and builder.tokenizer is None
+            and builder.trace is not None
+            and (tokenizer := resolved.get(value.model)) is not None
+        ):
+            assert builder.validate_sources is not None
+            if builder.validate_context is not None:
+                builder.validate_context(True)
+            builder.validate_sources(None)
+            _mark_sampled_stops(
+                value.tokens,
+                value.flags,
+                builder.trace.source_keys,
+                builder.trace.sources,
+                tokenizer=tokenizer,
+            )
+    _validate_completed_sources(builders)
+
+
 def tokenize_trajectory(
     trajectory: Trajectory,
     *,
@@ -6877,8 +8105,23 @@ def tokenize_trajectory(
             raise ValueError(
                 f"Trajectory tokenization requires exactly one history; found {len(histories)}"
             )
-    tokenized = [
-        tokenize_history(
+    context_sources = [_partial_native_context(history) for history in histories]
+    track_context = len(histories) > 1 and any(context_sources)
+    prior: list[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = []
+    tokenized = []
+    stop_builders = [
+        _TraceBuilder(
+            track_sources=len(histories) > 1,
+            validate_context=_tokenization_context_validator(
+                [history, chat_template, chat_template_kwargs]
+            ),
+        )
+        for history in histories
+    ]
+    for history, copied, trace in zip(
+        histories, context_sources, stop_builders, strict=True
+    ):
+        result = tokenize_history(
             history,
             model=model if isinstance(history, LegacyHistory) else history.model,
             base_model=base_model,
@@ -6886,9 +8129,14 @@ def tokenize_trajectory(
             chat_template=chat_template,
             chat_template_kwargs=chat_template_kwargs,
             _projection_validated=not isinstance(history, LegacyHistory),
+            _trace=trace,
+            _prior=prior,
+            _context_sources=copied,
         )
-        for history in histories
-    ]
+        tokenized.append(result)
+        if track_context and trace is not None and trace.trace is not None:
+            prior.append((result, trace.trace))
+    _complete_resolved_sampled_stops(tokenized, stop_builders)
     if not multi_history:
         return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
@@ -6914,12 +8162,19 @@ def _tokenize_trajectory_with_trace(
     histories = trajectory.histories(model=model)
     tokenized_histories: list[TokenizedHistory] = []
     traces: list[_HistoryTokenizationTrace] = []
-    for history in histories:
+    builders = [
+        _TraceBuilder(
+            validate_context=_tokenization_context_validator(
+                [history, chat_template, chat_template_kwargs]
+            )
+        )
+        for history in histories
+    ]
+    for history, trace_builder in zip(histories, builders, strict=True):
         if isinstance(history, LegacyHistory):
             raise AssertionError(
                 "Exchange trajectories cannot produce legacy histories"
             )
-        trace_builder = _TraceBuilder()
         tokenized = tokenize_history(
             history,
             model=history.model,
@@ -6929,11 +8184,13 @@ def _tokenize_trajectory_with_trace(
             chat_template_kwargs=chat_template_kwargs,
             _trace=trace_builder,
             _projection_validated=True,
+            _prior=list(zip(tokenized_histories, traces, strict=True)),
         )
         if trace_builder.trace is None:
             raise AssertionError("Exchange tokenization did not produce a source trace")
         tokenized_histories.append(tokenized)
         traces.append(trace_builder.trace)
+    _complete_resolved_sampled_stops(tokenized_histories, builders)
     return (
         TokenizedMultiHistoryTrajectory(
             trajectory=trajectory,

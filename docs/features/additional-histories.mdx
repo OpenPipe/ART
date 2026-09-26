@@ -33,6 +33,24 @@ with `chat_template_kwargs={"preserve_thinking": False}`. Additional histories
 remain useful for custom or externally managed templates that do not expose a
 prior-thinking preservation option.
 
+For supported Qwen templates, reasoning belongs in the structured
+`reasoning_content` field. Assistant `content` remains literal, including
+`<think>` and `</think>` anywhere in that content; ART does not infer reasoning
+from those strings. This also applies when the next response has thinking
+enabled or when prior reasoning is explicitly omitted. A legacy adapter that
+knows its response uses a leading reasoning envelope should split that known
+format into `reasoning_content` and `content` before rendering. A leading tag
+pair alone cannot establish that format. Structured reasoning and the template's
+generation-prompt defaults retain their existing behavior.
+
+For named template dictionaries, ART uses the tokenizer’s default, tool, or
+explicitly selected template before applying the same correction. The correction
+recognizes the known inline-content parsing operations, including equivalent
+quoting and spacing; it does not reinterpret arbitrary custom template logic.
+This also preserves literal content when no recorded token IDs are available.
+If a corrected template body is itself another dictionary entry’s name, ART
+refuses that ambiguous selection rather than rendering a different template.
+
 By splitting each turn into a separate history, you can preserve these tokens for training:
 
 ```python
@@ -44,7 +62,7 @@ trajectory = Trajectory(
     messages_and_choices=[
         # First turn with thinking
         {"role": "user", "content": "What is 2+2?"},
-        {"role": "assistant", "content": "<think>I need to add 2 and 2</think>4"}
+        {"role": "assistant", "reasoning_content": "I need to add 2 and 2", "content": "4"}
     ],
     additional_histories=[
         LegacyHistory(
@@ -53,7 +71,7 @@ trajectory = Trajectory(
                 {"role": "user", "content": "What is 2+2?"},
                 {"role": "assistant", "content": "4"},
                 {"role": "user", "content": "What is 3+3?"},
-                {"role": "assistant", "content": "<think>I need to add 3 and 3</think>6"}
+                {"role": "assistant", "reasoning_content": "I need to add 3 and 3", "content": "6"}
             ]
         )
     ]
@@ -133,6 +151,72 @@ trajectory = Trajectory(
     ]
 )
 ```
+
+## Recorded exchange histories
+
+`art.tokenize` and `trajectory.tokenize` use recorded prompt and response token IDs
+for unchanged, complete exchange histories. Recorded logprobs belong to those
+exact conditioned tokens. Chat, Responses, Messages, and Completions keep their
+existing protocol-specific projection rules; no separate tokenization API or
+native-representation option is needed. `multi_history=True` preserves the
+histories selected by the trajectory, including their order and model selection.
+
+Complete unchanged Chat histories end at the final recorded response token,
+including tool responses and responses stopped by a length limit. ART does not
+reconstruct that sampled body from its text or structured tool projection, or add
+an unobserved terminal footer. This deliberately excludes synthetic terminal
+tokens from `OUTPUT`/SFT masks; recorded sampled tokens and logprobs are unchanged.
+Explicit template overrides and incomplete or edited histories retain rendering.
+
+Templates still prove nonterminal separators, role masks, and synthetic stop
+tokens against the next recorded prompt.
+If tokenizing another history in the same trajectory already resolves a tokenizer
+for the same model, ART reuses that authority to label recorded sampled stop
+tokens. This does not trigger a new tokenizer load or change rendering. Complete
+native histories still work offline without a tokenizer; when neither recorded
+stop metadata nor resolved tokenizer authority identifies a stop, ART leaves that
+label unknown rather than guessing from the final token.
+
+For supported Chat boundaries, ART decodes the recorded body and encodes only the
+unrecorded separator instead of re-tokenizing the whole conversation. It checks
+that the separator reproduces the next recorded prompt exactly. Edited contexts,
+explicit template overrides, incomplete projections, and unsupported templates
+continue through the generic rendering path and its source validation.
+
+Correcting literal-content rendering does not rewrite a recorded request. When
+the original request and template reproduce its complete native prompt, ART can
+recover historical assistant roles from that rendering. This uses the original
+tool serialization order and preserves role labels through exact length-stop
+assembly; it does not restore destructive parsing for new response content.
+With a supplied renderer, request-owned assistant roles are proved throughout
+the native stream, including between sampled responses. This requirement applies
+even when template normalization makes no change. A request whose text
+disagrees with its recorded assistant tokens can still use the offline native
+path, but cannot claim a complete rendered role mask. When literal-content
+normalization changes historical rendering, ART requires the original request
+to reproduce the complete recorded prompt before recovering those roles. If
+that proof fails, ART refuses to attach recorded logprobs to a changed prompt.
+
+Custom STOP encoders and terminator decoders must not change already-consumed
+source tokens, logprobs, model or stop evidence. ART checks each source around its
+STOP callback and checks all consumed evidence before returning. Multi-history
+tokenization also checks completed histories after later renderer callbacks.
+Ordered original requests and history context, including roles, tools, render
+settings and protocol selectors, are captured before callbacks and checked
+before reuse. Unexpected callback exceptions keep their original identity.
+These checks refuse stale results; they do not make callbacks or source objects
+immutable. Context snapshots reuse shared containers only within one observation;
+callback-free native assembly retains its bounded response-evidence reuse.
+
+A response copied into a later, shortened prompt is output provenance, but it is
+not a fresh sample under that new prompt. ART keeps its `OUTPUT`, `ASSISTANT`,
+`EXACT`, and proven `STOP` flags while removing `SAMPLED` and the old conditional
+logprob. This requires the complete original sampled occurrence to remain in an
+earlier selected history; otherwise unchanged native replay is refused. The
+original occurrence retains its logprobs and ownership, including recorded NaNs
+before finite-value filtering. Tokenizing only the shortened view cannot prove
+that coverage; tokenize the containing trajectory instead. This correction does
+not change how generic output/SFT masks include copied assistant content.
 
 ## How It Works
 
