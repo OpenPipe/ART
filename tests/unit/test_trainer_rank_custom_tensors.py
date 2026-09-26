@@ -1055,10 +1055,11 @@ def test_prepared_forward_snapshot_restores_frozen_custom_tensors(
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
+@pytest.mark.parametrize("step,valid", [(0.5, False), (1.0, True)])
 def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: float, valid: bool
 ) -> None:
-    from safetensors.torch import load_file
+    from safetensors.torch import load_file, save_file
 
     from art.trainer_rank import _checkpoint
 
@@ -1070,6 +1071,15 @@ def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_
     _step_custom_tensors(original, original_head, original_temperature, monkeypatch)
     saved = tmp_path / "saved"
     original.save_checkpoint(str(saved), "student")
+
+    relative = "optimizer/custom.safetensors"
+    payload = load_file(saved / relative)
+    payload["step/value_head.proj.bias"].fill_(step)
+    save_file(payload, saved / relative)
+    manifest = json.loads((saved / "checkpoint.json").read_text())
+    manifest["files"][relative] = _file_digest(saved / relative)
+    manifest["digest"] = _manifest_digest(manifest)
+    (saved / "checkpoint.json").write_text(json.dumps(manifest))
 
     restored, restored_api = _empty_real_lora_trainer()
 
@@ -1097,6 +1107,27 @@ def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_
         nonlocal calls
         calls += 1
         return _ValueHead(3)
+
+    if not valid:
+        slot = restored._checkpoint_slots["student"]
+        params, optimizer = slot.params, slot.optimizer
+        assert optimizer is not None
+        before = copy.deepcopy((params, optimizer.optimizer.state_dict()))
+        with pytest.raises(
+            TrainerRankSlotStateError,
+            match="value_head.proj.bias.*nonnegative finite integer step.*step=0.5",
+        ):
+            restored_api.module("value_head", head_factory, checkpoint="student")
+        assert calls == 1 and not slot.custom
+        assert slot.params is params and slot.optimizer is optimizer
+        torch.testing.assert_close(
+            (params, optimizer.optimizer.state_dict()), before, atol=0, rtol=0
+        )
+        temperature = restored_api.parameter(
+            "temperature", lambda: torch.tensor(-99.0), checkpoint="student"
+        )
+        torch.testing.assert_close(temperature, original_temperature, atol=0, rtol=0)
+        return
 
     restored_head = restored_api.module(
         "value_head", head_factory, checkpoint="student"
