@@ -4667,36 +4667,7 @@ class _ChatViewTokenizer:
         self._render_messages()
         self._render_canonical_masks()
         self._substitute_exact_prefix()
-        canonical_length_stop_mask = _synthetic_length_stop_mask(
-            self.messages,
-            self.history.message_sources,
-            self.canonical_assistant_mask,
-            self.canonical_stop_mask,
-        )
-        canonical_output_mask = _response_output_mask(
-            self.messages,
-            self.history.message_sources,
-            self.canonical_assistant_mask,
-            self.direct_bounds or None,
-        )
-        self.assistant_mask = _translate_token_mask(
-            self.canonical_rendered,
-            self.rendered,
-            self.canonical_assistant_mask,
-            tokenizer=self.tokenizer,
-        )
-        self.output_mask = _translate_token_mask(
-            self.canonical_rendered,
-            self.rendered,
-            canonical_output_mask,
-            tokenizer=self.tokenizer,
-        )
-        self.stop_mask = _translate_token_mask(
-            self.canonical_rendered, self.rendered, self.canonical_stop_mask
-        )
-        self.length_stop_mask = _translate_token_mask(
-            self.canonical_rendered, self.rendered, canonical_length_stop_mask
-        )
+        self._translate_masks()
         self.positions_by_first_token: dict[int, list[int]] = {}
         for index, token_id in enumerate(self.rendered):
             self.positions_by_first_token.setdefault(token_id, []).append(index)
@@ -6338,6 +6309,38 @@ class _ChatViewTokenizer:
                         self.exact_prefix_length = len(source_prompt)
                         self.canonical_prefix_length = len(rendered_prompt)
                         break
+
+    def _translate_masks(self) -> None:
+        canonical_length_stop_mask = _synthetic_length_stop_mask(
+            self.messages,
+            self.history.message_sources,
+            self.canonical_assistant_mask,
+            self.canonical_stop_mask,
+        )
+        canonical_output_mask = _response_output_mask(
+            self.messages,
+            self.history.message_sources,
+            self.canonical_assistant_mask,
+            self.direct_bounds or None,
+        )
+        self.assistant_mask = _translate_token_mask(
+            self.canonical_rendered,
+            self.rendered,
+            self.canonical_assistant_mask,
+            tokenizer=self.tokenizer,
+        )
+        self.output_mask = _translate_token_mask(
+            self.canonical_rendered,
+            self.rendered,
+            canonical_output_mask,
+            tokenizer=self.tokenizer,
+        )
+        self.stop_mask = _translate_token_mask(
+            self.canonical_rendered, self.rendered, self.canonical_stop_mask
+        )
+        self.length_stop_mask = _translate_token_mask(
+            self.canonical_rendered, self.rendered, canonical_length_stop_mask
+        )
 
     def _locations(self, needle: Sequence[int], start: int) -> list[tuple[int, int]]:
         if not needle:
