@@ -4670,137 +4670,7 @@ class _ChatViewTokenizer:
         self._translate_masks()
         self._prepare_span_search()
         self._prove_marked_bounds()
-        self.probed_bounds: dict[int, tuple[int, int]] = {}
-        if not self.direct_bounds:
-            for message_index, (message, source) in enumerate(
-                zip(self.messages, self.history.message_sources, strict=True)
-            ):
-                if (
-                    message_index in self.marked_bounds
-                    or message.get("role") != "assistant"
-                    or source is None
-                    or not _source_is_sampled(source)
-                ):
-                    continue
-                parts = _chat_message_parts(message)
-                if not parts:
-                    exact_output, _ = self._source_output_tokens(source)
-                    if exact_output:
-                        try:
-                            prefix = self._render(
-                                self.messages[:message_index],
-                                add_generation_prompt=True,
-                            )
-                            completed = self._render(
-                                self.messages[: message_index + 1],
-                                add_generation_prompt=False,
-                            )
-                        except Exception:
-                            continue
-                        rendered_prefix = self._canonical_render_to_rendered(prefix)
-                        rendered_completed = self._canonical_render_to_rendered(
-                            completed
-                        )
-                        if (
-                            completed[: len(prefix)] == prefix
-                            and rendered_prefix is not None
-                            and rendered_completed is not None
-                            and self.rendered[: len(rendered_completed)]
-                            == rendered_completed
-                        ):
-                            self.probed_bounds[message_index] = (
-                                len(rendered_prefix),
-                                len(rendered_prefix),
-                            )
-                    continue
-                if any(part == "tool_call" for part, _ in parts):
-                    probe_messages = deepcopy(self.messages)
-                    for part_index, slots in enumerate(
-                        _chat_message_text_slot_groups(probe_messages[message_index])
-                    ):
-                        for slot_index, (container, key) in enumerate(slots):
-                            original = str(container[key])
-                            leading = original[: len(original) - len(original.lstrip())]
-                            trailing = original[len(original.rstrip()) :]
-                            marker = (
-                                f"art_trajectory_probe_{id(probe_messages):x}_"
-                                f"{part_index}_{slot_index}"
-                            )
-                            replacement = (
-                                json.dumps({marker: True})
-                                if key == "arguments"
-                                else marker
-                            )
-                            container[key] = leading + replacement + trailing
-                    probe = self._probe_render(
-                        probe_messages,
-                        add_generation_prompt=not self.ends_with_assistant,
-                    )
-                    if probe is not None and (span := self._differing_span(probe)):
-                        self.probed_bounds[message_index] = span
-                        continue
-                if len(parts) == 1:
-                    try:
-                        prefix = self._render(
-                            self.messages[:message_index], add_generation_prompt=True
-                        )
-                    except Exception:
-                        prefix = []
-                    local = self._part_ids(parts[0][1])
-                    rendered_prefix = self._canonical_render_to_rendered(prefix)
-                    if rendered_prefix is not None and self.rendered == [
-                        *rendered_prefix,
-                        *local,
-                    ]:
-                        self.probed_bounds[message_index] = (
-                            len(rendered_prefix),
-                            len(self.rendered),
-                        )
-                        continue
-                    try:
-                        completed = self._render(
-                            self.messages[: message_index + 1],
-                            add_generation_prompt=False,
-                        )
-                    except Exception:
-                        completed = []
-                    rendered_completed = self._canonical_render_to_rendered(completed)
-                    if (
-                        completed == [*prefix, *local]
-                        and rendered_prefix is not None
-                        and rendered_completed is not None
-                        and self.rendered[: len(rendered_completed)]
-                        == rendered_completed
-                    ):
-                        self.probed_bounds[message_index] = (
-                            len(rendered_prefix),
-                            len(rendered_completed),
-                        )
-                        continue
-                probe_messages = deepcopy(self.messages)
-                slot_groups = _chat_message_text_slot_groups(
-                    probe_messages[message_index]
-                )
-                if not slot_groups:
-                    continue
-                for part_index, slots in enumerate(slot_groups):
-                    for slot_index, (container, key) in enumerate(slots):
-                        original = str(container[key])
-                        leading = original[: len(original) - len(original.lstrip())]
-                        trailing = original[len(original.rstrip()) :]
-                        container[key] = (
-                            leading + f"ART_TRAJECTORY_{id(probe_messages):x}_"
-                            f"PROBE_{part_index}_{slot_index}" + trailing
-                        )
-                try:
-                    probe = self._render(
-                        probe_messages,
-                        add_generation_prompt=not self.ends_with_assistant,
-                    )
-                except Exception:
-                    continue
-                if span := self._differing_span(probe):
-                    self.probed_bounds[message_index] = span
+        self._prove_probed_bounds()
         if (
             self.projection_matches is True
             and self.chat_template is None
@@ -6405,6 +6275,139 @@ class _ChatViewTokenizer:
                         break
                     bounds[part_index] = span
                     self.marked_bounds[message_index] = (bounds[0][0], bounds[-1][1])
+
+    def _prove_probed_bounds(self) -> None:
+        self.probed_bounds: dict[int, tuple[int, int]] = {}
+        if not self.direct_bounds:
+            for message_index, (message, source) in enumerate(
+                zip(self.messages, self.history.message_sources, strict=True)
+            ):
+                if (
+                    message_index in self.marked_bounds
+                    or message.get("role") != "assistant"
+                    or source is None
+                    or not _source_is_sampled(source)
+                ):
+                    continue
+                parts = _chat_message_parts(message)
+                if not parts:
+                    exact_output, _ = self._source_output_tokens(source)
+                    if exact_output:
+                        try:
+                            prefix = self._render(
+                                self.messages[:message_index],
+                                add_generation_prompt=True,
+                            )
+                            completed = self._render(
+                                self.messages[: message_index + 1],
+                                add_generation_prompt=False,
+                            )
+                        except Exception:
+                            continue
+                        rendered_prefix = self._canonical_render_to_rendered(prefix)
+                        rendered_completed = self._canonical_render_to_rendered(
+                            completed
+                        )
+                        if (
+                            completed[: len(prefix)] == prefix
+                            and rendered_prefix is not None
+                            and rendered_completed is not None
+                            and self.rendered[: len(rendered_completed)]
+                            == rendered_completed
+                        ):
+                            self.probed_bounds[message_index] = (
+                                len(rendered_prefix),
+                                len(rendered_prefix),
+                            )
+                    continue
+                if any(part == "tool_call" for part, _ in parts):
+                    probe_messages = deepcopy(self.messages)
+                    for part_index, slots in enumerate(
+                        _chat_message_text_slot_groups(probe_messages[message_index])
+                    ):
+                        for slot_index, (container, key) in enumerate(slots):
+                            original = str(container[key])
+                            leading = original[: len(original) - len(original.lstrip())]
+                            trailing = original[len(original.rstrip()) :]
+                            marker = (
+                                f"art_trajectory_probe_{id(probe_messages):x}_"
+                                f"{part_index}_{slot_index}"
+                            )
+                            replacement = (
+                                json.dumps({marker: True})
+                                if key == "arguments"
+                                else marker
+                            )
+                            container[key] = leading + replacement + trailing
+                    probe = self._probe_render(
+                        probe_messages,
+                        add_generation_prompt=not self.ends_with_assistant,
+                    )
+                    if probe is not None and (span := self._differing_span(probe)):
+                        self.probed_bounds[message_index] = span
+                        continue
+                if len(parts) == 1:
+                    try:
+                        prefix = self._render(
+                            self.messages[:message_index], add_generation_prompt=True
+                        )
+                    except Exception:
+                        prefix = []
+                    local = self._part_ids(parts[0][1])
+                    rendered_prefix = self._canonical_render_to_rendered(prefix)
+                    if rendered_prefix is not None and self.rendered == [
+                        *rendered_prefix,
+                        *local,
+                    ]:
+                        self.probed_bounds[message_index] = (
+                            len(rendered_prefix),
+                            len(self.rendered),
+                        )
+                        continue
+                    try:
+                        completed = self._render(
+                            self.messages[: message_index + 1],
+                            add_generation_prompt=False,
+                        )
+                    except Exception:
+                        completed = []
+                    rendered_completed = self._canonical_render_to_rendered(completed)
+                    if (
+                        completed == [*prefix, *local]
+                        and rendered_prefix is not None
+                        and rendered_completed is not None
+                        and self.rendered[: len(rendered_completed)]
+                        == rendered_completed
+                    ):
+                        self.probed_bounds[message_index] = (
+                            len(rendered_prefix),
+                            len(rendered_completed),
+                        )
+                        continue
+                probe_messages = deepcopy(self.messages)
+                slot_groups = _chat_message_text_slot_groups(
+                    probe_messages[message_index]
+                )
+                if not slot_groups:
+                    continue
+                for part_index, slots in enumerate(slot_groups):
+                    for slot_index, (container, key) in enumerate(slots):
+                        original = str(container[key])
+                        leading = original[: len(original) - len(original.lstrip())]
+                        trailing = original[len(original.rstrip()) :]
+                        container[key] = (
+                            leading + f"ART_TRAJECTORY_{id(probe_messages):x}_"
+                            f"PROBE_{part_index}_{slot_index}" + trailing
+                        )
+                try:
+                    probe = self._render(
+                        probe_messages,
+                        add_generation_prompt=not self.ends_with_assistant,
+                    )
+                except Exception:
+                    continue
+                if span := self._differing_span(probe):
+                    self.probed_bounds[message_index] = span
 
 
 def _tokenize_chat_view(
