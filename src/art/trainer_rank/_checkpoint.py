@@ -1121,13 +1121,7 @@ def _rank_zero_phase(
     phase: str,
     group: dist.ProcessGroup | None,
 ) -> None:
-    error: BaseException | None = None
-    if _rank() == 0:
-        try:
-            action()
-        except BaseException as exc:
-            error = exc
-    raise_distributed(error, phase, group)
+    _phase(action if _rank() == 0 else lambda: None, phase, group)
 
 
 def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
