@@ -4025,23 +4025,42 @@ class TrainerRank:
         Traced once: dense Qwen3.8-27B (64 layers) at TP4 with sequence
         parallelism and CP1. Over the gathered rows, the recomputed layer's peak
         held its SP-gathered norm input (2H per row), the MLP FC1 stage (6F/TP),
-        the recomputed mixer (within its projection widths / TP) and norm
-        outputs (under H), plus one input gradient per sharded row. The floor
-        repeats the sharded boundaries as the input-gradient term, so that
-        repeat must cover this workspace. Other TP sizes, CP, MoE and models too
-        shallow or wide for the bound keep today's pricing.
+        the recomputed mixer (within its projection widths / TP), norm outputs
+        and other workspace (each under H), plus one input gradient per
+        sharded row. The floor repeats the sharded boundaries as the
+        input-gradient term, so that repeat must cover this workspace; GDN
+        segment states grow with segments instead and are priced separately.
+        Other TP sizes, CP, MoE, replicated QKV (KV groups below TP), missing
+        geometry and models too shallow or wide for the bound keep today's
+        pricing.
         """
         geometry = self._geometry
         if tp != 4 or cp != 1 or self._moe_layers or geometry.moe_experts:
             return False
         hidden = self._hidden_size
         ffn = geometry.ffn_hidden_size or 4 * hidden
+        attention_layers = self._num_layers > self._gdn_layers
+        if attention_layers and (
+            geometry.num_attention_heads <= 0
+            or geometry.kv_channels <= 0
+            # Replicated QKV keeps a global QKV output on every rank.
+            or not tp <= geometry.num_query_groups
+        ):
+            return False
+        gdn_widths = (
+            geometry.gdn_key_heads,
+            geometry.gdn_key_head_dim,
+            geometry.gdn_value_heads,
+            geometry.gdn_value_head_dim,
+        )
+        if self._gdn_layers and min(gdn_widths) <= 0:
+            return False
         attention = (
             (7 if self._attention_output_gate else 5)
             * geometry.num_attention_heads
             * geometry.kv_channels
             + 3 * geometry.num_query_groups * geometry.kv_channels
-            if self._num_layers > self._gdn_layers
+            if attention_layers
             else 0
         )
         gdn = (
@@ -4051,14 +4070,17 @@ class TrainerRank:
             else 0
         )
         # Per gathered row, times TP: the repeat is layers x H; the workspace is
-        # 2H + 6F/TP + mixer/TP + H, and the gradient H/TP.
-        workspace = 2 * hidden * tp + 6 * ffn + max(attention, gdn) + hidden * tp
+        # 2H + the FC1 stage (6F/TP, or the SwiGLU live set if wider) +
+        # mixer/TP + H of norms + H of other workspace, and the gradient H/TP.
+        stage = max(6, self._mlp_activation_factor) * ffn
+        workspace = 2 * hidden * tp + stage + max(attention, gdn) + 2 * hidden * tp
         return layers * hidden >= workspace + hidden
 
     def _checkpoint_memory_floor(
         self,
         group_rows: tuple[tuple[int, bool], ...],
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+        gdn_segments: int = 0,
     ) -> tuple[int, int]:
         """Conservative saved-boundary charge and one disjoint MoE workspace.
 
@@ -4070,7 +4092,8 @@ class TrainerRank:
         tensors separately from returned outputs, allowing storage aliases.
         This is not a bound for custom preprocessing, attention, or all backward.
         With sequence parallelism a rank saves only its shard of each boundary;
-        that is priced only where ``_sequence_parallel_floor_covered`` holds.
+        that is priced only where ``_sequence_parallel_floor_covered`` holds,
+        and there the recomputed GDN layer's ``gdn_segments`` recurrent states.
         """
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
         if not group_rows or len(self.runtime.model) != 1:
@@ -4111,7 +4134,6 @@ class TrainerRank:
             or self._param_dtype_size != 2
             or next(self.runtime.model[0].parameters()).dtype is not torch.bfloat16
             or pp != 1
-            or tp < 1
             or (tp > 1 and not self._sequence_parallel_floor_covered(layers, tp, cp))
             or any(
                 type(getattr(config, name, None)) is not type(value)
@@ -4143,6 +4165,10 @@ class TrainerRank:
             + (0 if grad else 4 * rows * self._hidden_size * 2)
             for (rows, grad), ref in zip(group_rows, refs, strict=True)
         )
+        if tp > 1 and self._gdn_layers:
+            # Recurrent states grow with segments, not rows; backward recomputes
+            # one layer at a time.
+            workspace += math.ceil(gdn_segments * self._gdn_segment_layer_bytes())
         return retained, workspace
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
@@ -4189,7 +4215,7 @@ class TrainerRank:
             include_checkpoint_input_gradient=False,
         )
         checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
-            group_rows, slot_refs
+            group_rows, slot_refs, gdn_segments
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -7967,7 +7993,9 @@ class TrainerRank:
                 for ref in (slot_refs or (None,))
             ),
         )
-        retained, workspace = self._checkpoint_memory_floor(group_rows, slot_refs)
+        retained, workspace = self._checkpoint_memory_floor(
+            group_rows, slot_refs, gdn_segments
+        )
         static_compute = max(
             static_compute,
             max(retained, checkpoint_floor[0])
