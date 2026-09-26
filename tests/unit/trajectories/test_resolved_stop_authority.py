@@ -16,12 +16,19 @@ def branch(index: int, *, length: bool, model: str = "test/model", eos: int = 9)
     output = _CharacterTemplateTokenizer._encode("answer")
     if not length:
         output.append(eos)
-    exchange = _chat_exchange(
-        _CharacterTemplateTokenizer._encode(text), output, model=model, offset=index
-    )
-    exchange.request["messages"] = cast(
-        list[ChatCompletionMessageParam], [{"role": "user", "content": text}]
-    )
+    messages: list[dict[str, str]] = [{"role": "user", "content": text}]
+    prompt = _CharacterTemplateTokenizer._encode(text)
+    if length:
+        # Loading is needed to prove request-owned assistant roles, independently
+        # of the final length stop, which now ends at its recorded output.
+        messages.insert(0, {"role": "assistant", "content": "historical context"})
+        prompt = [
+            *_CharacterTemplateTokenizer._encode("historical context"),
+            eos,
+            *prompt,
+        ]
+    exchange = _chat_exchange(prompt, output, model=model, offset=index)
+    exchange.request["messages"] = cast(list[ChatCompletionMessageParam], messages)
     exchange.response.choices[0].finish_reason = "length" if length else "stop"
     return exchange
 
@@ -138,19 +145,29 @@ def test_each_model_uses_its_own_resolved_tokenizer(monkeypatch):
     )
     result = trajectory(
         branch(0, length=True, model="model/a"),
-        branch(1, length=True, model="model/b"),
+        branch(1, length=True, model="model/b", eos=8),
         branch(2, length=False, model="model/a"),
         branch(3, length=False, model="model/b", eos=8),
     ).tokenize(multi_history=True)
     assert loads == ["model/a", "model/b"]
-    assert all(h.flags[-1] & tr.TokenFlag.STOP for h in result.histories)
+    assert [bool(h.flags[-1] & tr.TokenFlag.STOP) for h in result.histories] == [
+        False,
+        True,
+        False,
+        True,
+    ]
     assert [h.model for h in result.histories] == [
         "model/a",
         "model/a",
         "model/b",
         "model/b",
     ]
-    assert [h.tokens[-1] for h in result.histories] == [9, 9, 8, 8]
+    assert [h.tokens[-1] for h in result.histories] == [
+        ord("r") + 100,
+        9,
+        ord("r") + 100,
+        8,
+    ]
 
 
 def test_conflicting_resolved_tokenizers_do_not_authorize_another_history(monkeypatch):
@@ -158,7 +175,7 @@ def test_conflicting_resolved_tokenizers_do_not_authorize_another_history(monkey
     tokenizers = iter([_CharacterTemplateTokenizer(), OtherTokenizer()])
     monkeypatch.setattr(module, "_load_tokenizer", lambda config: next(tokenizers))
     result = trajectory(
-        branch(0, length=True), branch(1, length=True), branch(2, length=False)
+        branch(0, length=True), branch(1, length=True, eos=8), branch(2, length=False)
     ).tokenize(multi_history=True)
     assert not result.histories[-1].flags[-1] & tr.TokenFlag.STOP
 
@@ -287,7 +304,7 @@ def test_marker_encoding_failure_keeps_exception_identity(monkeypatch):
     assert caught.value is failure
 
 
-def test_stop_postpass_keeps_copied_context_and_synthetic_tail_roles(monkeypatch):
+def test_stop_postpass_keeps_copied_context_and_historical_roles(monkeypatch):
     bind(monkeypatch, {"test/model": _CharacterTemplateTokenizer()})
     first = _chat_exchange([1], [2, 9])
     second = _chat_exchange([1, 9, 4], [5, 9], offset=1)
@@ -302,7 +319,16 @@ def test_stop_postpass_keeps_copied_context_and_synthetic_tail_roles(monkeypatch
         == tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
     )
     assert math.isnan(copied.logprobs[1])
-    assert length.flags[-1] == tr.TokenFlag.STOP
+    assert length.flags[-1] == (
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.SAMPLED
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.OUTPUT
+    )
+    assert any(
+        flag & tr.TokenFlag.STOP and not flag & tr.TokenFlag.SAMPLED
+        for flag in length.flags
+    )
     monkeypatch.setattr(module, "_complete_resolved_sampled_stops", lambda *args: None)
     baseline = value.tokenize(multi_history=True)
     same_except_stop(result, baseline)
