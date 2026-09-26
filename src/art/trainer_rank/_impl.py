@@ -4019,6 +4019,42 @@ class TrainerRank:
             else rows * coefficient
         )
 
+    def _sequence_parallel_floor_covered(self, layers: int, tp: int, cp: int) -> bool:
+        """Whether the checkpoint floor covers a dense TP x SP recompute peak.
+
+        Traced once: dense Qwen3.8-27B (64 layers) at TP4 with sequence
+        parallelism and CP1. Over the gathered rows, the recomputed layer's peak
+        held its SP-gathered norm input (2H per row), the MLP FC1 stage (6F/TP),
+        the recomputed mixer (within its projection widths / TP) and norm
+        outputs (under H), plus one input gradient per sharded row. The floor
+        repeats the sharded boundaries as the input-gradient term, so that
+        repeat must cover this workspace. Other TP sizes, CP, MoE and models too
+        shallow or wide for the bound keep today's pricing.
+        """
+        geometry = self._geometry
+        if tp != 4 or cp != 1 or self._moe_layers or geometry.moe_experts:
+            return False
+        hidden = self._hidden_size
+        ffn = geometry.ffn_hidden_size or 4 * hidden
+        attention = (
+            (7 if self._attention_output_gate else 5)
+            * geometry.num_attention_heads
+            * geometry.kv_channels
+            + 3 * geometry.num_query_groups * geometry.kv_channels
+            if self._num_layers > self._gdn_layers
+            else 0
+        )
+        gdn = (
+            4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+            + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+            if self._gdn_layers
+            else 0
+        )
+        # Per gathered row, times TP: the repeat is layers x H; the workspace is
+        # 2H + 6F/TP + mixer/TP + H, and the gradient H/TP.
+        workspace = 2 * hidden * tp + 6 * ffn + max(attention, gdn) + hidden * tp
+        return layers * hidden >= workspace + hidden
+
     def _checkpoint_memory_floor(
         self,
         group_rows: tuple[tuple[int, bool], ...],
@@ -4033,6 +4069,8 @@ class TrainerRank:
         residual and norm output across the MoE stage. Count these four row
         tensors separately from returned outputs, allowing storage aliases.
         This is not a bound for custom preprocessing, attention, or all backward.
+        With sequence parallelism a rank saves only its shard of each boundary;
+        that is priced only where ``_sequence_parallel_floor_covered`` holds.
         """
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
         if not group_rows or len(self.runtime.model) != 1:
@@ -4052,12 +4090,13 @@ class TrainerRank:
             return 0, 0
         config = decoder.config
         layers = len(decoder.layers)
+        _, tp, cp, pp = self._topology_key()
         expected = {
             "recompute_granularity": "full",
             "recompute_method": "uniform",
             "recompute_num_layers": 1,
             "distribute_saved_activations": False,
-            "sequence_parallel": False,
+            "sequence_parallel": tp > 1,
             "fp32_residual_connection": False,
             "cpu_offloading": False,
             "cuda_graph_impl": "none",
@@ -4071,7 +4110,9 @@ class TrainerRank:
             or config.params_dtype is not torch.bfloat16
             or self._param_dtype_size != 2
             or next(self.runtime.model[0].parameters()).dtype is not torch.bfloat16
-            or self._topology_key()[1::2] != (1, 1)
+            or pp != 1
+            or tp < 1
+            or (tp > 1 and not self._sequence_parallel_floor_covered(layers, tp, cp))
             or any(
                 type(getattr(config, name, None)) is not type(value)
                 or getattr(config, name) != value
@@ -4087,7 +4128,13 @@ class TrainerRank:
             or getattr(decoder, "_forward_pre_hooks", None)
         ):
             return 0, 0
-        retained = gradient_rows * layers * self._hidden_size * 2
+        # Physical rows are padded to a multiple of TP; each rank saves its shard.
+        retained = (
+            sum(-(-rows // tp) for rows, grad in group_rows if grad)
+            * layers
+            * self._hidden_size
+            * 2
+        )
         if gradient_rows:
             self._checkpoint_moe_bytes_per_token()
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
