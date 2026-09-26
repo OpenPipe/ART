@@ -366,9 +366,15 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
             "reasoning_content + '\\n</think>\\n\\n'",
             "reasoning_content + ('</think>\\n\\n' if preserve_thinking and message.reasoning_content is string and reasoning_content else '\\n</think>\\n\\n')",
         )
-        if not inline_parser_removed:
+        if (
+            not inline_parser_removed
+            and "{%- set reasoning_content = reasoning_content|trim %}"
+            in literal_template
+        ):
             # The recognized parser path already preserved its own input. Do
-            # not apply the legacy template-wide trim rewrite to other macros.
+            # not apply the legacy trim rewrite without its recognized
+            # reasoning assignment: an unrelated inline filter can survive
+            # parser removal and must not activate this on a second call.
             chat_template = chat_template.replace(
                 "set content = render_content(message.content, true)|trim",
                 "set content = (render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",

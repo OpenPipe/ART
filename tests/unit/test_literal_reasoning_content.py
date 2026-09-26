@@ -424,10 +424,15 @@ def test_plain_block_whitespace_keeps_prior_inline_parser_coverage(separator, qu
 @pytest.mark.parametrize("preserve", [False, True])
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 @pytest.mark.parametrize("layout", ["macros", "same_line", "branches"])
-def test_content_trim_is_scoped_to_the_recognized_parser(preserve, newline, layout):
+@pytest.mark.parametrize("inline_structured_reasoning", [False, True])
+def test_content_trim_is_scoped_to_the_recognized_parser(
+    preserve, newline, layout, inline_structured_reasoning
+):
     match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
     assert match is not None
     parser = match.group()
+    if inline_structured_reasoning:
+        parser += "<think>{{ reasoning_content|trim }}</think>"
     trim = "{% set content = render_content(message.content, true)|trim %}"
     render = "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
     preview = "{% macro preview(message) %}" + trim + "[{{ content }}]{% endmacro %}"
@@ -465,6 +470,12 @@ def test_content_trim_is_scoped_to_the_recognized_parser(preserve, newline, layo
         )
     )
     assert chat_template_with_preserved_thinking(fixed) == fixed
+    assert (
+        chat_template_with_preserved_thinking(
+            chat_template_with_preserved_thinking(fixed)
+        )
+        == fixed
+    )
     if layout == "branches":
         kwargs["message"] = {"role": "user", "content": "  answer  "}
         assert env.from_string(fixed).render(**kwargs).endswith("[answer]|[answer]")
