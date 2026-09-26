@@ -10,6 +10,7 @@ from functools import lru_cache
 import math
 import multiprocessing
 from multiprocessing.process import BaseProcess
+from multiprocessing.synchronize import Barrier
 import os
 from pathlib import Path
 import pickle
@@ -38,6 +39,7 @@ _PROCESS_MAX_WORKERS = 4
 _PROCESS_MIN_ITEMS = 4
 _PROCESS_MIN_THREAD_SECONDS = 1.0
 _PROCESS_EXIT_GRACE_SECONDS = 5.0
+_PROCESS_STARTUP_TIMEOUT_SECONDS = 60.0
 
 
 def _cgroup_cpu_limit() -> int | None:
@@ -94,15 +96,24 @@ _PROCESS_EXECUTOR_PID: int | None = None
 _PROCESS_EXECUTOR_CAPACITY = 0
 _PROCESS_STARTUP: tuple[Future[int], ...] = ()
 _PROCESS_BACKEND_DISABLED = False
+_PROCESS_READY_BARRIER: Barrier | None = None
 
 
 def _process_context() -> multiprocessing.context.BaseContext:
     return multiprocessing.get_context("spawn")
 
 
+def _initialize_process_worker(barrier: Barrier) -> None:
+    global _PROCESS_READY_BARRIER
+    _PROCESS_READY_BARRIER = barrier
+
+
 def _process_identity() -> int:
-    # Keep every submitted warmup occupied until the bounded pool is started.
-    time.sleep(0.25)
+    # A task cannot finish and be reused by the same worker until every worker
+    # has entered this bounded handshake, regardless of import/startup skew.
+    if _PROCESS_READY_BARRIER is None:
+        raise RuntimeError("process worker readiness barrier is missing")
+    _PROCESS_READY_BARRIER.wait()
     return os.getpid()
 
 
@@ -123,7 +134,11 @@ def _submit_process_warmup(
 def _finish_process_warmup(futures: tuple[Future[int], ...], capacity: int) -> None:
     if not futures:
         return
-    worker_pids = {future.result() for future in futures}
+    deadline = time.monotonic() + _PROCESS_STARTUP_TIMEOUT_SECONDS
+    worker_pids = {
+        future.result(timeout=max(0.0, deadline - time.monotonic()))
+        for future in futures
+    }
     if len(worker_pids) != capacity:
         raise RuntimeError(
             f"started {len(worker_pids)} process workers, expected {capacity}"
@@ -144,14 +159,20 @@ def _start_process_executor(
             or _PROCESS_EXECUTOR_CAPACITY < process_capacity
         ):
             previous = _PROCESS_EXECUTOR if _PROCESS_EXECUTOR_PID == pid else None
+            context = _process_context()
+            barrier = context.Barrier(
+                process_capacity, timeout=_PROCESS_STARTUP_TIMEOUT_SECONDS
+            )
             executor = ProcessPoolExecutor(
                 max_workers=process_capacity,
-                mp_context=_process_context(),
+                mp_context=context,
+                initializer=_initialize_process_worker,
+                initargs=(barrier,),
             )
             try:
                 startup = _submit_process_warmup(executor, process_capacity)
             except BaseException:
-                executor.shutdown(wait=False, cancel_futures=True)
+                _shutdown_process_executor(0, executor)
                 raise
             _PROCESS_EXECUTOR = executor
             _PROCESS_EXECUTOR_PID = pid
@@ -177,7 +198,11 @@ def _complete_process_warmup(
 
 def _process_executor(capacity: int) -> ProcessPoolExecutor:
     executor, process_capacity, startup = _start_process_executor(capacity)
-    _finish_process_warmup(startup, process_capacity)
+    try:
+        _finish_process_warmup(startup, process_capacity)
+    except (OSError, RuntimeError):
+        _shutdown_process_executor(0, executor)
+        raise
     _complete_process_warmup(executor, startup)
     return executor
 
@@ -206,7 +231,9 @@ def _process_executor_workers(executor: ProcessPoolExecutor) -> list[BaseProcess
     return list(processes.values()) if processes else []
 
 
-def _shutdown_process_executor(grace: float | None = None) -> None:
+def _shutdown_process_executor(
+    grace: float | None = None, executor: ProcessPoolExecutor | None = None
+) -> None:
     """Stop the shared process pool within a bounded time.
 
     Runs before concurrent.futures joins its workers at interpreter exit. Idle
@@ -214,7 +241,8 @@ def _shutdown_process_executor(grace: float | None = None) -> None:
     with tensorization nobody can consume anymore are terminated after ``grace``
     seconds so the interpreter never waits on them indefinitely.
     """
-    executor = _release_process_executor()
+    if executor is None:
+        executor = _release_process_executor()
     if executor is None:
         return
     if grace is None:
@@ -598,6 +626,7 @@ async def _ordered_process_map(
 ) -> list[TokenizedTrajectory | TokenizedMultiHistoryTrajectory]:
     loop = asyncio.get_running_loop()
     thread_executor = _executor(capacity)
+    executor: ProcessPoolExecutor | None = None
     try:
         executor, process_capacity, startup = _start_process_executor(capacity)
         await loop.run_in_executor(
@@ -607,9 +636,13 @@ async def _ordered_process_map(
             process_capacity,
         )
         _complete_process_warmup(executor, startup)
-    except BrokenProcessPool:
-        raise
-    except (OSError, RuntimeError) as error:
+    except (BrokenProcessPool, OSError, RuntimeError) as error:
+        if executor is not None:
+            await loop.run_in_executor(
+                thread_executor, _shutdown_process_executor, 0, executor
+            )
+        if isinstance(error, BrokenProcessPool):
+            raise
         raise _ProcessBackendError(
             f"could not start process workers: {type(error).__name__}: {error}"
         ) from None
