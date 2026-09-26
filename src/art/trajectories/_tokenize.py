@@ -4,7 +4,7 @@ from bisect import bisect_left
 import codecs
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from functools import lru_cache
@@ -597,6 +597,43 @@ def _translate_token_mask(
     return translated
 
 
+def _recorded_prompt_tokens(
+    messages: list[dict[str, Any]],
+    *,
+    tokenizer: Tokenizer,
+    template: object,
+    tools: object,
+    kwargs: Mapping[str, object],
+) -> list[int]:
+    messages, tools, kwargs = deepcopy((messages, tools, dict(kwargs)))
+    context = _render_context_key([messages, tools, kwargs])
+
+    def check() -> None:
+        if _render_context_key([messages, tools, kwargs]) != context:
+            raise ValueError(
+                "Renderer changed context while proving recorded request roles"
+            )
+
+    body = template
+    if isinstance(getattr(tokenizer, "chat_template", None), dict) and callable(
+        select := getattr(tokenizer, "get_chat_template", None)
+    ):
+        body = select(
+            chat_template=template if isinstance(template, str) else None, tools=tools
+        )
+        check()
+    result = tokenizer.apply_chat_template(
+        normalize_tool_call_arguments_for_chat_template(messages, body),
+        tools=tools,
+        tokenize=True,
+        add_generation_prompt=True,
+        **({"chat_template": template} if template is not None else {}),
+        **kwargs,
+    )
+    check()
+    return _ids(result)
+
+
 def _recorded_prompt_role_masks(
     messages: list[dict[str, Any]],
     sources: Sequence[object | None],
@@ -960,6 +997,28 @@ class _TraceBuilder:
     validate_sources: Callable[[_SampledSourceKey | None], None] | None = None
     validate_context: Callable[[bool], None] | None = None
     track_sources: bool = True
+    consumed_sources: dict[_SampledSourceKey, object] = field(default_factory=dict)
+
+    def consume_sources(
+        self,
+        sources: Mapping[_SampledSourceKey, object],
+        *,
+        selected_request_fields: tuple[str, ...] | None = None,
+    ) -> None:
+        # Keep every consumed source, including rendered-only logprobs that do
+        # not appear in the sampled-token trace. Validate before extending it.
+        if self.validate_sources is not None:
+            self.validate_sources(None)
+        added = {
+            key: source
+            for key, source in sources.items()
+            if key not in self.consumed_sources
+        }
+        if added or self.validate_sources is None:
+            self.consumed_sources.update(added)
+            self.validate_sources = _sampled_source_validator(
+                self.consumed_sources, selected_request_fields=selected_request_fields
+            )
 
     def set(
         self,
@@ -970,15 +1029,15 @@ class _TraceBuilder:
         *,
         tokenizer: Tokenizer | None = None,
     ) -> None:
-        if self.validate_sources is not None:
+        if self.track_sources:
+            self.consume_sources(sources)
+        elif self.validate_sources is not None:
             self.validate_sources(None)
         self.tokenizer = tokenizer
         trace = _HistoryTokenizationTrace(source_keys=source_keys, sources=sources)
         trace.validate(tokenized)
         self.trace = trace
         self.rendered_outputs = rendered_outputs
-        if self.track_sources:
-            self.validate_sources = _sampled_source_validator(sources)
 
 
 def _fingerprint(value: object) -> str:
@@ -2246,7 +2305,7 @@ def _response_message(
 
 def _resolved_chat_template(
     tokenizer: Tokenizer, template: object, tools: object
-) -> tuple[object, dict[str, Any]]:
+) -> tuple[object, object, dict[str, Any]]:
     # Preserve preselection defaults: resolving a named template must not
     # silently change its generation mode. Explicit kwargs still override these.
     configured = chat_template_with_preserved_thinking(template)
@@ -2262,7 +2321,7 @@ def _resolved_chat_template(
             if configured == selected:
                 # apply_chat_template resolves names itself. Forwarding an
                 # unchanged body could accidentally select a second named entry.
-                return template, defaults
+                return template, configured, defaults
             templates = getattr(tokenizer, "chat_template", None)
             if (
                 isinstance(configured, str)
@@ -2273,7 +2332,7 @@ def _resolved_chat_template(
                     "The normalized chat template is also a template name; "
                     "cannot preserve the selected renderer without ambiguity"
                 )
-    return configured, defaults
+    return configured, configured, defaults
 
 
 def _template_ids(
@@ -2323,13 +2382,17 @@ def _template_ids(
         or config.chat_template
         or getattr(tokenizer, "chat_template", None)
     )
-    template, defaults = _resolved_chat_template(tokenizer, template, tools)
+    template, normalization_template, defaults = _resolved_chat_template(
+        tokenizer, template, tools
+    )
     kwargs = {
         **defaults,
         **explicit_kwargs,
     }
     result = tokenizer.apply_chat_template(
-        normalize_tool_call_arguments_for_chat_template(messages, template),
+        normalize_tool_call_arguments_for_chat_template(
+            messages, normalization_template
+        ),
         tools=tools,
         tokenize=True,
         add_generation_prompt=not completed,
@@ -2715,6 +2778,22 @@ def _tokenize_exchange_trajectory(
     selected_model = exchanges[0].model
     if selected_model is None:
         raise AssertionError("_exchange_list returned an exchange without a model")
+    consumed_sources = {
+        _exchange_sampled_source_key(exchange): exchange for exchange in exchanges
+    }
+    if _trace is not None:
+        _trace.consume_sources(consumed_sources)
+        assert _trace.validate_sources is not None
+        validate_consumed = _trace.validate_sources
+    else:
+        validate_consumed = _sampled_source_validator(consumed_sources)
+
+    def checked(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        validate_consumed(None)
+        result = function(*args, **kwargs)
+        validate_consumed(None)
+        return result
+
     exact_tokens = [_exchange_tokens(exchange) for exchange in exchanges]
     config = (
         _TokenizerConfig(base_model if base_model is not None else selected_model)
@@ -2741,7 +2820,7 @@ def _tokenize_exchange_trajectory(
     def fallback_config() -> _TokenizerConfig:
         nonlocal config
         if config is None:
-            config = _tokenizer_config(selected_model, base_model)
+            config = checked(_tokenizer_config, selected_model, base_model)
         return config
 
     for exchange, (prompt, completion, completion_logprobs) in zip(
@@ -2801,8 +2880,9 @@ def _tokenize_exchange_trajectory(
         if prompt is None:
             resolved_config = fallback_config()
             if tokenizer is None:
-                tokenizer = _load_tokenizer(resolved_config)
-            prompt = _template_ids(
+                tokenizer = checked(_load_tokenizer, resolved_config)
+            prompt = checked(
+                _template_ids,
                 tokenizer,
                 exchange,
                 completed=False,
@@ -2814,9 +2894,10 @@ def _tokenize_exchange_trajectory(
         if completion is None:
             resolved_config = fallback_config()
             if tokenizer is None:
-                tokenizer = _load_tokenizer(resolved_config)
+                tokenizer = checked(_load_tokenizer, resolved_config)
             rendered_prompt = (
-                _template_ids(
+                checked(
+                    _template_ids,
                     tokenizer,
                     exchange,
                     completed=False,
@@ -2828,7 +2909,8 @@ def _tokenize_exchange_trajectory(
                 if prompt_is_exact
                 else prompt
             )
-            completed = _template_ids(
+            completed = checked(
+                _template_ids,
                 tokenizer,
                 exchange,
                 completed=True,
@@ -2842,8 +2924,8 @@ def _tokenize_exchange_trajectory(
                     "Completed response does not extend its generation prompt"
                 )
             completion = completed[len(rendered_prompt) :]
-            completion_logprobs = _align_visible_logprobs(
-                tokenizer, completion, exchange
+            completion_logprobs = checked(
+                _align_visible_logprobs, tokenizer, completion, exchange
             ) or [math.nan] * len(completion)
         if not token_ids:
             token_ids.extend(prompt)
@@ -2855,8 +2937,9 @@ def _tokenize_exchange_trajectory(
         elif len(prompt) < len(token_ids) or prompt[: len(token_ids)] != token_ids:
             resolved_config = fallback_config()
             if tokenizer is None:
-                tokenizer = _load_tokenizer(resolved_config)
-            repaired = _preserve_sampled_prefix(
+                tokenizer = checked(_load_tokenizer, resolved_config)
+            repaired = checked(
+                _preserve_sampled_prefix,
                 prompt,
                 token_ids,
                 sampled_outputs,
@@ -2867,7 +2950,8 @@ def _tokenize_exchange_trajectory(
                     raise ValueError(
                         "Inference prompts do not form one append-only history"
                     )
-                current_render = _template_ids(
+                current_render = checked(
+                    _template_ids,
                     tokenizer,
                     exchange,
                     completed=False,
@@ -2877,7 +2961,8 @@ def _tokenize_exchange_trajectory(
                     messages_override=messages_override,
                 )
                 previous_exchange, previous_messages = previous_render_state
-                previous_render = _template_ids(
+                previous_render = checked(
+                    _template_ids,
                     tokenizer,
                     previous_exchange,
                     completed=True,
@@ -2886,7 +2971,8 @@ def _tokenize_exchange_trajectory(
                     chat_template_kwargs=chat_template_kwargs,
                     messages_override=previous_messages,
                 )
-                previous_canonical = _preserve_sampled_prefix(
+                previous_canonical = checked(
+                    _preserve_sampled_prefix,
                     previous_render,
                     token_ids,
                     sampled_outputs,
@@ -2905,7 +2991,7 @@ def _tokenize_exchange_trajectory(
                 ]
             prompt = repaired
             prompt_is_exact = False
-            _warn_prefix_retokenization()
+            checked(_warn_prefix_retokenization)
             suffix = prompt[len(token_ids) :]
             token_ids.extend(suffix)
             logprobs.extend([math.nan] * len(suffix))
@@ -2922,8 +3008,8 @@ def _tokenize_exchange_trajectory(
             )
             source_keys.extend([None] * len(suffix))
         if len(completion_logprobs) != len(completion):
-            completion_logprobs = _align_visible_logprobs(
-                tokenizer, completion, exchange
+            completion_logprobs = checked(
+                _align_visible_logprobs, tokenizer, completion, exchange
             ) or [math.nan] * len(completion)
         token_ids.extend(completion)
         logprobs.extend(completion_logprobs)
@@ -2958,6 +3044,7 @@ def _tokenize_exchange_trajectory(
         sources,
         tokenizer=tokenizer,
     )
+    validate_consumed(None)
     tokenized = TokenizedHistory(
         history=history,
         model=selected_model,
@@ -4335,7 +4422,11 @@ def _source_has_no_materialized_output(
     return False
 
 
-def _tokenization_context(value: object) -> object:
+def _tokenization_context(
+    value: object,
+    *,
+    _observed: dict[int, tuple[object, object]] | None = None,
+) -> object:
     """Snapshot ordered semantic inputs without serializing sampled responses.
 
     History and source fields remain typed, including protocol selectors and
@@ -4344,7 +4435,7 @@ def _tokenization_context(value: object) -> object:
     """
     # Shared message dictionaries occur in many recorded request prefixes.
     # Intern only within this one observation, never across callback checks.
-    observed: dict[int, tuple[object, object]] = {}
+    observed: dict[int, tuple[object, object]] = {} if _observed is None else _observed
 
     def snapshot(item: object) -> object:
         kind = type(item)
@@ -4424,23 +4515,38 @@ def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
 
 def _sampled_source_validator(
     sources: Mapping[_SampledSourceKey, object],
+    *,
+    selected_request_fields: tuple[str, ...] | None = None,
 ) -> Callable[[_SampledSourceKey | None], None]:
     expected = {}
+    observed: dict[int, tuple[object, object]] = {}
     for key, source in sources.items():
         exchange = _source_exchange(source)
         if exchange is None:
             raise ValueError("Sampled source has no exchange")
+        try:
+            request = _tokenization_context(exchange.request, _observed=observed)
+        except TypeError:
+            request = None
         expected[key] = (
             source,
             exchange,
             exchange.model,
             _source_stop_evidence(source, key),
-            _tokenization_context_validator(exchange.request),
+            request,
+            _tokenization_context(
+                {name: exchange.request.get(name) for name in selected_request_fields}
+            )
+            if selected_request_fields is not None
+            else None,
         )
 
     def validate(selected: _SampledSourceKey | None) -> None:
+        # This observation is callback-free. Share aliased context containers
+        # across its sources, never across separate validations/callbacks.
+        observed: dict[int, tuple[object, object]] = {}
         for key in expected if selected is None else (selected,):
-            source, exchange, model, stop, validate_request = expected[key]
+            source, exchange, model, stop, request, selected_request = expected[key]
             current = (
                 _exchange_sampled_source_key(source)
                 if isinstance(source, Exchange)
@@ -4453,7 +4559,18 @@ def _sampled_source_validator(
                 or _source_stop_evidence(source, key) != stop
             ):
                 raise ValueError("Sampled source changed during tokenization callback")
-            validate_request(True)
+            if request is None:
+                raise ValueError("Tokenization context cannot be checked for callbacks")
+            current_request = exchange.request
+            if selected is not None and selected_request_fields is not None:
+                current_request = {
+                    name: exchange.request.get(name) for name in selected_request_fields
+                }
+                request = selected_request
+            if _tokenization_context(current_request, _observed=observed) != request:
+                raise ValueError(
+                    "Tokenization context changed during tokenization callback"
+                )
 
     return validate
 
@@ -5476,7 +5593,7 @@ def _tokenize_chat_view(
         if isinstance(tokenizer_template, str):
             template = tokenizer_template
     original_template = template
-    template, defaults = _resolved_chat_template(
+    template, normalization_template, defaults = _resolved_chat_template(
         resolved_tokenizer, template, history.tools
     )
     kwargs = {
@@ -5490,7 +5607,7 @@ def _tokenize_chat_view(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> list[int]:
         render_messages = normalize_tool_call_arguments_for_chat_template(
-            selected_messages, template
+            selected_messages, normalization_template
         )
         return _ids(
             resolved_tokenizer.apply_chat_template(
@@ -5523,7 +5640,7 @@ def _tokenize_chat_view(
     ) -> str:
         return render_normalized_text(
             normalize_tool_call_arguments_for_chat_template(
-                selected_messages, template
+                selected_messages, normalization_template
             ),
             add_generation_prompt=add_generation_prompt,
         )
@@ -5551,11 +5668,18 @@ def _tokenize_chat_view(
         for source in history.message_sources
         if id(source) in consumed_keys
     }
-    validate_consumed = _sampled_source_validator(consumed_sources)
     if _trace is not None:
-        if _trace.validate_sources is not None:
-            _trace.validate_sources(None)
-        _trace.validate_sources = validate_consumed
+        _trace.consume_sources(
+            consumed_sources,
+            selected_request_fields=("tools", "chat_template", "chat_template_kwargs"),
+        )
+        assert _trace.validate_sources is not None
+        validate_consumed = _trace.validate_sources
+    else:
+        validate_consumed = _sampled_source_validator(
+            consumed_sources,
+            selected_request_fields=("tools", "chat_template", "chat_template_kwargs"),
+        )
 
     def consumed_source_key(source: object) -> _SampledSourceKey:
         key = consumed_keys[id(source)]
@@ -5582,7 +5706,7 @@ def _tokenize_chat_view(
                 # Normalization is message-local. Only the admitted nonmutating
                 # renderer may share its normalized messages between prefixes.
                 selected_messages = normalize_tool_call_arguments_for_chat_template(
-                    selected_messages, template
+                    selected_messages, normalization_template
                 )
                 text = render_normalized_text(
                     selected_messages, add_generation_prompt=add_generation_prompt
@@ -5858,12 +5982,23 @@ def _tokenize_chat_view(
                     rendered = [*source_prompt, *rendered[len(rendered_prompt) :]]
                     exact_prefix_length = len(source_prompt)
                     canonical_prefix_length = len(rendered_prompt)
-                    if (
-                        original_template != template
-                        and source_prompt != rendered_prompt
+                    needs_request_roles = any(
+                        prior_message.get("role") == "assistant"
+                        and (
+                            prior_source is None or not _source_is_sampled(prior_source)
+                        )
+                        for prior_message, prior_source in zip(
+                            history.messages[:message_index],
+                            history.message_sources[:message_index],
+                            strict=True,
+                        )
+                    )
+                    if source_prompt != rendered_prompt and (
+                        original_template != template or needs_request_roles
                     ):
                         signature = _source_signature(source)
                         request_context = None
+                        full_prompt_proven = False
                         try:
                             # Canonical tool validation may reorder JSON keys.
                             # Prove the historical prompt with the recorded
@@ -5896,6 +6031,34 @@ def _tokenize_chat_view(
                             # Optional historical prefix rendering may be
                             # unsupported although the selected renderer works.
                             recorded_prompt_masks = None
+                        if needs_request_roles and recorded_prompt_masks is None:
+                            try:
+                                raw_prompt = _recorded_prompt_tokens(
+                                    request_messages,
+                                    tokenizer=resolved_tokenizer,
+                                    template=original_template,
+                                    tools=request_tools,
+                                    kwargs=kwargs,
+                                )
+                                # Whole-prompt correspondence is mandatory even
+                                # if offsets/prefix probes are unsupported. The
+                                # existing translator admits only exact IDs or
+                                # proved whitespace retokenization, both ways.
+                                _translate_token_mask(
+                                    raw_prompt,
+                                    source_prompt,
+                                    [True] * len(raw_prompt),
+                                    tokenizer=resolved_tokenizer,
+                                )
+                                _translate_token_mask(
+                                    source_prompt,
+                                    raw_prompt,
+                                    [True] * len(source_prompt),
+                                    tokenizer=resolved_tokenizer,
+                                )
+                                full_prompt_proven = True
+                            except (TypeError, KeyError, NotImplementedError):
+                                pass
                         # These optional renderer calls must not turn cached
                         # native evidence into authority for a changed source.
                         prompt_cache.clear()
@@ -5923,6 +6086,14 @@ def _tokenize_chat_view(
                         ):
                             raise ValueError(
                                 "Sampled source changed while proving recorded request roles"
+                            )
+                        if (
+                            needs_request_roles
+                            and recorded_prompt_masks is None
+                            and not full_prompt_proven
+                        ):
+                            raise ValueError(
+                                "Cannot preserve request roles without full recorded prompt proof"
                             )
                     break
 
@@ -6121,7 +6292,7 @@ def _tokenize_chat_view(
             try:
                 marked_text = resolved_tokenizer.apply_chat_template(
                     normalize_tool_call_arguments_for_chat_template(
-                        marked_messages, template
+                        marked_messages, normalization_template
                     ),
                     tools=history.tools,
                     tokenize=False,
