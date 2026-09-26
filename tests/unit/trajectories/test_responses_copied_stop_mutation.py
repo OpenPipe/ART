@@ -13,8 +13,9 @@ from art.trajectories import _tokenize as module
 
 
 @pytest.mark.parametrize("mutate", [False, True])
+@pytest.mark.parametrize("changed_generation", [0, 2])
 def test_copied_responses_stop_cannot_return_stale_prior_logprobs(
-    monkeypatch: pytest.MonkeyPatch, mutate: bool
+    monkeypatch: pytest.MonkeyPatch, mutate: bool, changed_generation: int
 ) -> None:
     exchange = _response_exchange("three-generations", 2, prompt_token_ids=[1])
     payload = exchange.response.model_dump(mode="python")
@@ -52,9 +53,9 @@ def test_copied_responses_stop_cannot_return_stale_prior_logprobs(
                 self.copied_callback = True
                 if mutate:
                     assert exchange.response.model_extra is not None
-                    exchange.response.model_extra["token_generations"][0][
-                        "output_tokens"
-                    ][0]["logprob"] = -9.5
+                    exchange.response.model_extra["token_generations"][
+                        changed_generation
+                    ]["output_tokens"][0]["logprob"] = -9.5
 
         def apply_chat_template(self, *args: Any, **kwargs: Any) -> Any:
             raise AssertionError("complete native records must not render")
@@ -65,7 +66,8 @@ def test_copied_responses_stop_cannot_return_stale_prior_logprobs(
     def observe(history: Any, **kwargs: Any) -> Any:
         # Arm only after preflight and entry to the history containing generation
         # 2. Its first converter callback is the copied generation-1 STOP probe.
-        # This spy preserves the real callback and avoids global call ordinals.
+        # Generation 2's prompt has already been read as a suffix witness, so
+        # that record is consumed too. Preserve real callbacks without ordinals.
         tokenizer.armed = any(
             source is not None and source.generation_index == 2
             for source in history.input_sources
@@ -79,9 +81,9 @@ def test_copied_responses_stop_cannot_return_stale_prior_logprobs(
         assert tokenizer.copied_callback
         assert exchange.response.model_extra is not None
         assert (
-            exchange.response.model_extra["token_generations"][0]["output_tokens"][0][
-                "logprob"
-            ]
+            exchange.response.model_extra["token_generations"][changed_generation][
+                "output_tokens"
+            ][0]["logprob"]
             == -9.5
         )
     else:

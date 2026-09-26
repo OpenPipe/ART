@@ -1005,6 +1005,10 @@ class _TraceBuilder:
     validate_sources: _SampledSourceValidator | None = None
     validate_context: Callable[[bool], None] | None = None
     track_sources: bool = True
+    rendered_evidence: bool = False
+    auxiliary_evidence: dict[object, tuple[Callable[[], object], object]] = field(
+        default_factory=dict
+    )
     consumed_sources: dict[
         tuple[_SampledSourceKey, int], tuple[_SampledSourceKey, object]
     ] = field(default_factory=dict)
@@ -1016,6 +1020,7 @@ class _TraceBuilder:
         *,
         selected_request_fields: tuple[str, ...] | None = None,
         require_supported_context: bool = True,
+        rendered_evidence: bool = False,
     ) -> None:
         # Semantic keys survive protocol copies. Retain every consumed object,
         # including aliases and rendered-only sources absent from the trace.
@@ -1033,12 +1038,48 @@ class _TraceBuilder:
             for key, source in items
             if (key, id(source)) not in self.consumed_sources
         }
-        if added or self.validate_sources is None:
+        if (
+            added
+            or self.validate_sources is None
+            or rendered_evidence
+            and not self.rendered_evidence
+        ):
             self.consumed_sources.update(added)
+            self.rendered_evidence |= rendered_evidence
             self.validate_sources = _sampled_source_validator(
                 list(self.consumed_sources.values()),
                 selected_request_fields=selected_request_fields,
+                rendered_evidence=self.rendered_evidence,
             )
+
+    def consume_auxiliary(
+        self, identity: object, read: Callable[[], object], value: object
+    ) -> None:
+        if identity in self.auxiliary_evidence:
+            self.validate_auxiliary()
+        else:
+            self.auxiliary_evidence[identity] = read, _tokenization_context(value)
+
+    def validate_auxiliary(self) -> None:
+        for read, expected in self.auxiliary_evidence.values():
+            if _tokenization_context(read()) != expected:
+                raise ValueError(
+                    "Consumed source text changed during tokenization callback"
+                )
+
+    def checked(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        if self.validate_context is not None:
+            self.validate_context(True)
+        if self.validate_sources is not None:
+            self.validate_sources(None)
+        self.validate_auxiliary()
+        result = function(*args, **kwargs)
+        if self.validate_sources is not None:
+            self.validate_sources(None)
+        if self.validate_context is not None:
+            self.validate_context(True)
+        self.validate_auxiliary()
+        return result
 
     def set(
         self,
@@ -2803,25 +2844,18 @@ def _tokenize_exchange_trajectory(
     consumed_sources = [
         (_exchange_sampled_source_key(exchange), exchange) for exchange in exchanges
     ]
-    if _trace is not None:
-        _trace.consume_sources(
-            consumed_sources,
-            require_supported_context=tokenizer_instance is not None,
-        )
-        assert _trace.validate_sources is not None
-        validate_consumed = _trace.validate_sources
-    else:
-        validate_consumed = _sampled_source_validator(consumed_sources)
-
+    ledger = _trace or _TraceBuilder(track_sources=False)
+    ledger.consume_sources(
+        consumed_sources, require_supported_context=tokenizer_instance is not None
+    )
     callback_used = False
 
     def checked(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         nonlocal callback_used
+        if not callback_used:
+            ledger.consume_sources([], rendered_evidence=True)
         callback_used = True
-        validate_consumed(None)
-        result = function(*args, **kwargs)
-        validate_consumed(None)
-        return result
+        return ledger.checked(function, *args, **kwargs)
 
     exact_tokens = [_exchange_tokens(exchange) for exchange in exchanges]
     config = (
@@ -3073,7 +3107,8 @@ def _tokenize_exchange_trajectory(
         sources,
         tokenizer=tokenizer,
     )
-    validate_consumed(
+    assert ledger.validate_sources is not None
+    ledger.validate_sources(
         None, require_supported_context=callback_used or tokenizer is not None
     )
     tokenized = TokenizedHistory(
@@ -3980,7 +4015,54 @@ def _tokenize_exact_responses_history(
     source_keys: list[_SampledSourceKey | None] = []
     sources: dict[_SampledSourceKey, object] = {}
     sampled_outputs: list[_SampledOutput] = []
+    ledger = _trace or _TraceBuilder(track_sources=False)
+    pending: list[tuple[_SampledSourceKey, object]] = []
+
+    def checked(
+        function: Callable[..., Any], *args: Any, _callbacks: bool = True, **kwargs: Any
+    ) -> Any:
+        # Keys bind records at first use. Before a callout, register the records
+        # read since the last callback-free boundary; never reuse past a callout.
+        if _callbacks:
+            ledger.consume_sources(pending)
+            pending.clear()
+        return (
+            ledger.checked(function, *args, **kwargs)
+            if _callbacks
+            else function(*args, **kwargs)
+        )
+
+    observed: dict[tuple[int, int], tuple[_SampledSourceKey, object]] = {}
+
+    def decline() -> None:
+        # A later rendered fallback must retain the evidence already inspected
+        # here, even if this pure native attempt could not assemble a stream.
+        if pending:
+            ledger.consume_sources(pending, require_supported_context=False)
+            pending.clear()
+
+    def observe(
+        exchange: ResponsesExchange, generation_index: int
+    ) -> tuple[_SampledSourceKey, object]:
+        identity = id(exchange), generation_index
+        if identity not in observed:
+            source = next(
+                item
+                for item in history.input_sources
+                if item is not None
+                and item.exchange is exchange
+                and item.generation_index == generation_index
+            )
+            observed[identity] = _sampled_source_key(source), source
+            pending.append(observed[identity])
+        key, source = observed[identity]
+        if (key, id(source)) in ledger.consumed_sources:
+            assert ledger.validate_sources is not None
+            ledger.validate_sources(key)
+        return key, source
+
     for position, (exchange, generation_index) in enumerate(generation_keys):
+        source_key, source = observe(exchange, generation_index)
         generations = _response_generations(exchange.response)
         if not 0 <= generation_index < len(generations):
             raise ValueError("Responses source generation index is out of bounds")
@@ -3988,19 +4070,13 @@ def _tokenize_exact_responses_history(
         prompt = generation.prompt_token_ids
         output = generation.output_token_ids
         if prompt is None or output is None:
-            return None
-        source = next(
-            item
-            for item in history.input_sources
-            if item is not None
-            and item.exchange is exchange
-            and item.generation_index == generation_index
-        )
+            return decline()
         context_only = False
         retained = retained_output_indices.get((id(exchange), generation_index), set())
         following_prompt = None
         if position + 1 < len(generation_keys):
             following_exchange, following_index = generation_keys[position + 1]
+            observe(following_exchange, following_index)
             following_prompt = _response_generations(following_exchange.response)[
                 following_index
             ].prompt_token_ids
@@ -4013,14 +4089,14 @@ def _tokenize_exact_responses_history(
         )
         if retained != set(generation.output_indices) or copied_suffix:
             if position + 1 >= len(generation_keys):
-                return None
+                return decline()
             next_exchange, next_generation_index = generation_keys[position + 1]
             next_generations = _response_generations(next_exchange.response)
             if not 0 <= next_generation_index < len(next_generations):
                 raise ValueError("Responses source generation index is out of bounds")
             next_prompt = next_generations[next_generation_index].prompt_token_ids
             if next_prompt is None:
-                return None
+                return decline()
             retained_suffix = _retained_output_suffix(
                 prompt=prompt,
                 output=output,
@@ -4028,7 +4104,7 @@ def _tokenize_exact_responses_history(
                 later_prompt=next_prompt,
             )
             if retained_suffix is None:
-                return None
+                return decline()
             context_only = retained_suffix[0] != output
             if context_only and not _complete_source_is_represented(
                 source, prompt, output, generation.output_logprobs, _prior
@@ -4042,9 +4118,17 @@ def _tokenize_exact_responses_history(
             output_text = None
         else:
             output_logprobs = generation.output_logprobs
-            output_text = generation.output_text or _response_generation_text(
-                exchange.response, generation
-            )
+
+            def read_text(
+                exchange: ResponsesExchange = exchange,
+                generation: _ResponseGeneration = generation,
+            ) -> str | None:
+                return generation.output_text or _response_generation_text(
+                    exchange.response, generation
+                )
+
+            output_text = read_text()
+            ledger.consume_auxiliary((source_key, id(source)), read_text, output_text)
         if not token_ids:
             token_ids.extend(prompt)
             logprobs.extend([math.nan] * len(prompt))
@@ -4059,11 +4143,18 @@ def _tokenize_exact_responses_history(
             source_keys.extend([None] * len(suffix))
         else:
             if tokenizer is None and sampled_outputs:
-                tokenizer = _load_tokenizer(
-                    _tokenizer_config(history.model, base_model)
+                tokenizer = checked(
+                    _load_tokenizer,
+                    checked(_tokenizer_config, history.model, base_model),
                 )
             repaired = (
-                _preserve_sampled_prefix(prompt, token_ids, sampled_outputs, tokenizer)
+                checked(
+                    _preserve_sampled_prefix,
+                    prompt,
+                    token_ids,
+                    sampled_outputs,
+                    tokenizer,
+                )
                 if tokenizer is not None
                 else None
             )
@@ -4071,7 +4162,7 @@ def _tokenize_exact_responses_history(
                 raise ValueError(
                     "Responses token generations do not form one append-only history"
                 )
-            _warn_prefix_retokenization()
+            checked(_warn_prefix_retokenization)
             suffix = repaired[len(token_ids) :]
             token_ids.extend(suffix)
             logprobs.extend([math.nan] * len(suffix))
@@ -4088,27 +4179,16 @@ def _tokenize_exact_responses_history(
             ]
             * len(output)
         )
-        source = next(
-            (
-                item
-                for item in history.input_sources
-                if item is not None
-                and item.exchange is exchange
-                and item.generation_index == generation_index
-            ),
-            None,
-        )
-        if source is None:
-            raise AssertionError("Responses generation has no history source")
-        source_key = _sampled_source_key(source)
         source_keys.extend([None if context_only else source_key] * len(output))
         sources[source_key] = source
         if context_only:
-            stop_count = _sampled_stop_suffix(
+            stop_count = checked(
+                _sampled_stop_suffix,
                 generation.output_token_ids or [],
                 source=source,
                 source_key=source_key,
                 tokenizer=tokenizer,
+                _callbacks=tokenizer is not None,
             )
             for offset in range(
                 max(len(token_ids) - len(output), len(token_ids) - stop_count),
@@ -4123,13 +4203,19 @@ def _tokenize_exact_responses_history(
                     start=len(token_ids) - len(output),
                 )
             )
-    _mark_sampled_stops(
+    checked(
+        _mark_sampled_stops,
         token_ids,
         flags,
         source_keys,
         sources,
         tokenizer=tokenizer,
+        _callbacks=tokenizer is not None,
     )
+    if pending and (ledger.track_sources or ledger.validate_sources is not None):
+        ledger.consume_sources(pending, require_supported_context=tokenizer is not None)
+    if ledger.validate_sources is not None:
+        ledger.validate_sources(None, require_supported_context=tokenizer is not None)
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
@@ -4549,6 +4635,7 @@ def _sampled_source_validator(
     | Sequence[tuple[_SampledSourceKey, object]],
     *,
     selected_request_fields: tuple[str, ...] | None = None,
+    rendered_evidence: bool = False,
 ) -> _SampledSourceValidator:
     expected = {}
     observed: dict[int, tuple[object, object]] = {}
@@ -4580,6 +4667,14 @@ def _sampled_source_validator(
                 )
                 if selected_request_fields is not None
                 else None,
+                _tokenization_context(
+                    _visible_logprobs(
+                        exchange,
+                        source=None if isinstance(source, Exchange) else source,
+                    )
+                )
+                if rendered_evidence and isinstance(exchange, ResponsesExchange)
+                else None,
             )
         )
 
@@ -4592,9 +4687,15 @@ def _sampled_source_validator(
         # across its sources, never across separate validations/callbacks.
         observed: dict[int, tuple[object, object]] = {}
         for key in expected if selected is None else (selected,):
-            for source, exchange, model, stop, request, selected_request in expected[
-                key
-            ]:
+            for (
+                source,
+                exchange,
+                model,
+                stop,
+                request,
+                selected_request,
+                visible,
+            ) in expected[key]:
                 current = (
                     _exchange_sampled_source_key(source)
                     if isinstance(source, Exchange)
@@ -4608,6 +4709,19 @@ def _sampled_source_validator(
                 ):
                     raise ValueError(
                         "Sampled source changed during tokenization callback"
+                    )
+                if (
+                    visible is not None
+                    and _tokenization_context(
+                        _visible_logprobs(
+                            exchange,
+                            source=None if isinstance(source, Exchange) else source,
+                        )
+                    )
+                    != visible
+                ):
+                    raise ValueError(
+                        "Rendered source logprobs changed during tokenization callback"
                     )
                 if request is None:
                     if require_supported_context:
@@ -5729,6 +5843,7 @@ def _tokenize_chat_view(
         _trace.consume_sources(
             consumed_sources,
             selected_request_fields=("tools", "chat_template", "chat_template_kwargs"),
+            rendered_evidence=True,
         )
         assert _trace.validate_sources is not None
         validate_consumed = _trace.validate_sources
@@ -5736,6 +5851,7 @@ def _tokenize_chat_view(
         validate_consumed = _sampled_source_validator(
             consumed_sources,
             selected_request_fields=("tools", "chat_template", "chat_template_kwargs"),
+            rendered_evidence=True,
         )
 
     def consumed_source_key(source: object) -> _SampledSourceKey:
@@ -7622,9 +7738,14 @@ def _tokenize_completions_token_history(
         flags[start:end] = [TokenFlag.EXACT | TokenFlag.SAMPLED | TokenFlag.OUTPUT] * (
             end - start
         )
+    ledger = _trace or _TraceBuilder(track_sources=False)
+    consumed: list[tuple[_SampledSourceKey, object]] = []
     for span in history.prompt_sources:
         if span.source is None:
             continue
+        if tokenizer is not None or ledger.track_sources:
+            evidence_source = _completion_evidence_source(span.source)
+            consumed.append((_sampled_source_key(evidence_source), evidence_source))
         if span.source.choice_index is not None:
             source_key = _sampled_source_key(span.source)
             source_keys[span.start : span.end] = [source_key] * (span.end - span.start)
@@ -7650,6 +7771,10 @@ def _tokenize_completions_token_history(
             continue
         if len(selected_logprobs) == span.end - span.start:
             logprobs[span.start : span.end] = selected_logprobs
+    if consumed:
+        ledger.consume_sources(
+            consumed, require_supported_context=tokenizer is not None
+        )
     _mark_sampled_stops(
         history.prompt,
         flags,
@@ -7657,6 +7782,8 @@ def _tokenize_completions_token_history(
         sources,
         tokenizer=tokenizer,
     )
+    if ledger.validate_sources is not None:
+        ledger.validate_sources(None, require_supported_context=tokenizer is not None)
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
@@ -7746,13 +7873,30 @@ def _tokenize_completions_string_history(
             raise ValueError("Completions sampled spans are out of bounds")
         sampled[start:end] = [True] * (end - start)
 
+    ledger = _trace or _TraceBuilder(track_sources=False)
+    pending: list[tuple[_SampledSourceKey, object]] = []
+
+    def checked(
+        function: Callable[..., Any], *args: Any, _callbacks: bool = True, **kwargs: Any
+    ) -> Any:
+        # Keys bind records at first use. Before a callout, register the records
+        # read since the last callback-free boundary; never reuse past a callout.
+        if _callbacks:
+            ledger.consume_sources(pending)
+            pending.clear()
+        return (
+            ledger.checked(function, *args, **kwargs)
+            if _callbacks
+            else function(*args, **kwargs)
+        )
+
     config: _TokenizerConfig | None = None
 
     def resolved_tokenizer() -> Tokenizer:
         nonlocal config, tokenizer
         if tokenizer is None:
-            config = config or _tokenizer_config(history.model, base_model)
-            tokenizer = _load_tokenizer(config)
+            config = config or checked(_tokenizer_config, history.model, base_model)
+            tokenizer = checked(_load_tokenizer, config)
         return tokenizer
 
     token_ids: list[int] = []
@@ -7767,6 +7911,8 @@ def _tokenize_completions_string_history(
         source_logprobs: list[float] = []
         is_sampled = any(sampled[span.start : span.end])
         if source is not None:
+            evidence_source = _completion_evidence_source(source)
+            pending.append((_sampled_source_key(evidence_source), evidence_source))
             prompt, completion, prompt_logprobs, completion_logprobs = (
                 _completion_source_evidence(source)
             )
@@ -7814,14 +7960,20 @@ def _tokenize_completions_string_history(
         ids = (
             exact
             if exact is not None
-            else _ids(resolved_tokenizer()(text, add_special_tokens=False))
+            else _ids(checked(resolved_tokenizer(), text, add_special_tokens=False))
         )
         token_ids.extend(ids)
         if exact is not None and len(source_logprobs) == len(ids):
             logprobs.extend(source_logprobs)
         else:
             visible = (
-                _completion_visible_logprobs(source, text, resolved_tokenizer(), ids)
+                checked(
+                    _completion_visible_logprobs,
+                    source,
+                    text,
+                    resolved_tokenizer(),
+                    ids,
+                )
                 if source is not None and source.choice_index is not None
                 else None
             )
@@ -7840,13 +7992,19 @@ def _tokenize_completions_string_history(
             sources[source_key] = source
         else:
             source_keys.extend([None] * len(ids))
-    _mark_sampled_stops(
+    checked(
+        _mark_sampled_stops,
         token_ids,
         flags,
         source_keys,
         sources,
         tokenizer=tokenizer,
+        _callbacks=tokenizer is not None,
     )
+    if pending and (ledger.track_sources or ledger.validate_sources is not None):
+        ledger.consume_sources(pending, require_supported_context=tokenizer is not None)
+    if ledger.validate_sources is not None:
+        ledger.validate_sources(None, require_supported_context=tokenizer is not None)
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
@@ -7859,9 +8017,7 @@ def _tokenize_completions_string_history(
     return tokenized
 
 
-def _completion_source_evidence(
-    source: CompletionsSource,
-) -> tuple[list[int] | None, list[int] | None, list[float], list[float]]:
+def _completion_evidence_source(source: CompletionsSource) -> CompletionsSource:
     from ._history import _completion_choice_groups
 
     prompt_groups = _completion_choice_groups(source.exchange)
@@ -7889,6 +8045,22 @@ def _completion_source_evidence(
         )
         if selected is None:
             raise ValueError("Completions choice source does not belong to its prompt")
+    return (
+        source
+        if source.choice_index is not None
+        else source.model_copy(update={"choice_index": selected.index})
+    )
+
+
+def _completion_source_evidence(
+    source: CompletionsSource,
+) -> tuple[list[int] | None, list[int] | None, list[float], list[float]]:
+    selected_source = _completion_evidence_source(source)
+    selected = next(
+        choice
+        for choice in source.exchange.response.choices
+        if choice.index == selected_source.choice_index
+    )
     return _completion_evidence(
         source.exchange.response.model_copy(update={"choices": [selected]}),
         echo=source.exchange.request.get("echo") is True,
@@ -8269,6 +8441,7 @@ def _validate_completed_sources(builders: Sequence[_TraceBuilder | None]) -> Non
                     builder.validate_context(True)
                 if builder.validate_sources is not None:
                     builder.validate_sources(None)
+                builder.validate_auxiliary()
 
 
 def _complete_resolved_sampled_stops(

@@ -203,12 +203,17 @@ source tokens, logprobs, model or stop evidence. ART checks each source around i
 STOP callback and checks all consumed evidence before returning, including
 logprobs used only by the rendered fallback. Multi-history
 tokenization also checks completed histories after later renderer callbacks.
+Evidence is bound when first read, including a later Responses generation read
+to prove a copied suffix, visible item logprobs, and text used for prefix repair.
+It is not a snapshot of every future response before that response is used.
 Ordered original requests and history context, including roles, tools, render
 settings and protocol selectors, are captured before callbacks and checked
 before reuse. Unexpected callback exceptions keep their original identity.
 These checks refuse stale results; they do not make callbacks or source objects
 immutable. Context snapshots reuse shared containers only within one observation;
 callback-free native assembly retains its bounded response-evidence reuse.
+Unused opaque request metadata remains valid on complete callback-free native
+paths; callbacks require context that ART can compare.
 
 A response copied into a later, shortened prompt is output provenance, but it is
 not a fresh sample under that new prompt. ART keeps its `OUTPUT`, `ASSISTANT`,
