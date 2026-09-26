@@ -7683,6 +7683,35 @@ class _NativeHistoryStreams(Exception):
             }
             for history in histories
         }
+        self.contexts = {
+            id(history): _native_stream_context(cast(ChatCompletionsHistory, history))
+            for history in histories
+        }
+
+
+def _native_stream_context(history: ChatCompletionsHistory) -> object:
+    """Keep request order, original source identities and scoped role inputs."""
+    return _render_context_key(
+        [
+            history.model,
+            history.messages,
+            history.tools,
+            history.chat_template,
+            history.chat_template_kwargs,
+            [
+                None
+                if source is None
+                else [
+                    id(type(source)),
+                    id(source.exchange),
+                    source.request_index,
+                    source.choice_index,
+                ]
+                for source in history.message_sources
+            ],
+            [dict(exchange.request) for exchange in _unique_exchanges(history)],
+        ]
+    )
 
 
 def _request_native_streams(history: History | LegacyHistory) -> None:
@@ -7782,16 +7811,19 @@ def _native_history_streams(
         ] + [last]
         for index, source, _, _ in run:
             sources[index] = source
-        streams.append(
-            history.model_copy(
-                update={
-                    "messages": deepcopy(messages),
-                    "message_sources": sources,
-                    "tools": deepcopy(history.tools),
-                    "chat_template_kwargs": deepcopy(history.chat_template_kwargs),
-                }
-            )
+        scoped = history.model_copy(
+            update={
+                "messages": deepcopy(messages),
+                "message_sources": sources,
+                "tools": deepcopy(history.tools),
+                "chat_template_kwargs": deepcopy(history.chat_template_kwargs),
+            }
         )
+        try:
+            _native_stream_context(scoped)
+        except (TypeError, RecursionError):
+            return [history]
+        streams.append(scoped)
     return streams
 
 
@@ -7800,12 +7832,16 @@ def _require_native_stream(
     value: TokenizedHistory,
     builder: _TraceBuilder,
     expected_keys: set[_SampledSourceKey] | None = None,
+    expected_context: object = None,
 ) -> None:
     """Certify all scoped sources again after any renderer/tokenizer callbacks."""
     assert isinstance(history, ChatCompletionsHistory)
     _validate_history_sources(history)
     state = _history_render_state(history)
     if state.context_changed or state.projection_matches is not True:
+        raise ValueError("Native stream request context changed")
+    context = _native_stream_context(history)
+    if expected_context is not None and context != expected_context:
         raise ValueError("Native stream request context changed")
     trace = builder.trace
     if trace is None:
@@ -7852,6 +7888,8 @@ def _require_native_stream(
     # A string stop reason may invoke an encoder while checking its suffix.
     if keys != {_sampled_source_key(source) for source in sources}:
         raise ValueError("Native stream source changed while proving STOP")
+    if context != _native_stream_context(history):
+        raise ValueError("Native stream context changed while proving STOP")
 
 
 def _materialize_trajectory(
@@ -7942,6 +7980,7 @@ def tokenize_trajectory(
         (history, False) for history in histories
     ]
     scoped_keys: dict[int, set[_SampledSourceKey]] = {}
+    scoped_contexts: dict[int, object] = {}
     index = 0
     while index < len(scopes):
         history, scoped = scopes[index]
@@ -7974,6 +8013,7 @@ def tokenize_trajectory(
             ):
                 raise
             scoped_keys.update(planned.keys)
+            scoped_contexts.update(planned.contexts)
             scopes[index : index + 1] = [(stream, True) for stream in planned.histories]
             continue
         tokenized.append(result)
@@ -7988,7 +8028,13 @@ def tokenize_trajectory(
     ):
         if scoped:
             assert builder is not None
-            _require_native_stream(history, value, builder, scoped_keys[id(history)])
+            _require_native_stream(
+                history,
+                value,
+                builder,
+                scoped_keys[id(history)],
+                scoped_contexts[id(history)],
+            )
     if not multi_history:
         return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
@@ -8016,6 +8062,7 @@ def _tokenize_trajectory_with_trace(
         (history, False) for history in histories
     ]
     scoped_keys: dict[int, set[_SampledSourceKey]] = {}
+    scoped_contexts: dict[int, object] = {}
     tokenized_histories: list[TokenizedHistory] = []
     traces: list[_HistoryTokenizationTrace] = []
     builders: list[_TraceBuilder] = []
@@ -8053,6 +8100,7 @@ def _tokenize_trajectory_with_trace(
             ):
                 raise
             scoped_keys.update(planned.keys)
+            scoped_contexts.update(planned.contexts)
             scopes[index : index + 1] = [(stream, True) for stream in planned.histories]
             continue
         if trace_builder.trace is None:
@@ -8067,7 +8115,13 @@ def _tokenize_trajectory_with_trace(
         scopes, tokenized_histories, builders, strict=True
     ):
         if scoped:
-            _require_native_stream(history, value, builder, scoped_keys[id(history)])
+            _require_native_stream(
+                history,
+                value,
+                builder,
+                scoped_keys[id(history)],
+                scoped_contexts[id(history)],
+            )
     return (
         TokenizedMultiHistoryTrajectory(
             trajectory=trajectory,

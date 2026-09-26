@@ -342,3 +342,45 @@ def test_stop_encoder_cannot_change_already_checked_source(
         module._require_native_stream(
             value.history, value, module._TraceBuilder(trace=trace, tokenizer=tokenizer)
         )
+
+
+@pytest.mark.parametrize(
+    "change", ["request", "request_order", "scoped_context", "source_identity"]
+)
+def test_stop_encoder_cannot_change_role_proof_context(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    trajectory, tokenizer = example()
+    second = trajectory.exchanges.chat_completions[1]
+    record(second).model_extra["stop_reason"] = "§"
+    result, traces = module._tokenize_trajectory_with_trace(
+        trajectory, tokenizer=tokenizer
+    )
+    value, trace = result.histories[-1], traces[-1]
+    history = value.history
+    assert isinstance(history, tr.ChatCompletionsHistory)
+    original = tokenizer.__class__.__call__
+
+    def mutate(self: Any, text: str, **kwargs: Any) -> Any:
+        if text == "§":
+            if change == "request":
+                second.request["chat_template_kwargs"] = {"changed": True}
+            elif change == "request_order":
+                cast(Any, second.request["messages"])[0] = dict(
+                    reversed(list(second.request["messages"][0].items()))
+                )
+            elif change == "scoped_context":
+                history.chat_template_kwargs = {"changed": True}
+            else:
+                source = history.message_sources[3]
+                assert source is not None
+                history.message_sources[3] = source.model_copy(
+                    update={"exchange": second.model_copy(deep=True)}
+                )
+        return original(self, text, **kwargs)
+
+    monkeypatch.setattr(tokenizer.__class__, "__call__", mutate)
+    with pytest.raises(ValueError, match="context changed while proving STOP"):
+        module._require_native_stream(
+            history, value, module._TraceBuilder(trace=trace, tokenizer=tokenizer)
+        )
