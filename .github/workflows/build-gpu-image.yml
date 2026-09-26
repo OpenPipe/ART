@@ -62,7 +62,8 @@ permissions:
 
 concurrency:
   group: build-gpu-image
-  cancel-in-progress: true
+  # Let a pushed image reach smoke and dispatch; GitHub keeps only the latest pending run.
+  cancel-in-progress: false
 
 jobs:
   build-gpu-image:
