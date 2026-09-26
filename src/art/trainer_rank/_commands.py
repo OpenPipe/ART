@@ -1192,6 +1192,9 @@ async def run_rank_callback_stream(
             if not (inspect.isgenerator(iterator) or inspect.isasyncgen(iterator)):
                 raise TypeError("Stream callback must return a generator")
             sent = None
+            exhausted = (
+                StopAsyncIteration if inspect.isasyncgen(iterator) else StopIteration
+            )
             while True:
                 try:
                     value = (
@@ -1199,11 +1202,7 @@ async def run_rank_callback_stream(
                         if inspect.isasyncgen(iterator)
                         else iterator.send(sent)
                     )
-                except (
-                    StopAsyncIteration
-                    if inspect.isasyncgen(iterator)
-                    else StopIteration
-                ):
+                except exhausted:
                     return
                 sent = yield RankCallbackResult(
                     0 if mode == "zero" else executor.dp_rank, value

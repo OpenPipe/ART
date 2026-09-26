@@ -1509,12 +1509,6 @@ def _load_adapter(
         return {key: handle.get_tensor(key) for key in keys if key in available}
 
 
-def _localized(
-    module: LoRA, tensor: torch.Tensor, parameter: torch.nn.Parameter
-) -> torch.Tensor:
-    return module._localized_weight(tensor, into=parameter).contiguous()
-
-
 def _slot_snapshot(trainer: TrainerRank) -> _SlotSnapshot:
     return tuple(
         (
@@ -1787,7 +1781,9 @@ def _optimizer_state(
                 for key, record in zip(keys, records, strict=True)
             }
             full = module._adapter_weight(tensors, suffix=suffix)
-            components[component].append(_localized(module, full, parameter))
+            components[component].append(
+                module._localized_weight(full, into=parameter).contiguous()
+            )
         key_steps = {source.manifest["steps"][key] for key in keys}
         if len(key_steps) != 1:
             raise RuntimeError(f"Optimizer steps differ for {keys}")
@@ -1840,27 +1836,6 @@ def _validate_base_model(
         raise trainer._slot_state_error(
             f"Checkpoint base model {configured!r} is incompatible with this runtime"
         )
-
-
-def _rollback_load(
-    trainer: TrainerRank,
-    snapshot: _SlotSnapshot,
-    temporary: str,
-    name: str,
-    previous: object,
-    group: dist.ProcessGroup | None,
-) -> None:
-    def rollback() -> None:
-        _restore_slots(snapshot)
-        trainer._checkpoint_slots.pop(temporary, None)
-        if previous is None:
-            trainer._checkpoint_slots.pop(name, None)
-        else:
-            from art.trainer_rank._impl import _CheckpointSlot
-
-            trainer._checkpoint_slots[name] = cast(_CheckpointSlot, previous)
-
-    _phase(rollback, "roll back checkpoint load", group)
 
 
 def load_checkpoint(
@@ -1986,7 +1961,16 @@ def load_checkpoint(
 
         _phase(commit, "commit checkpoint", group)
     except BaseException:
-        _rollback_load(trainer, snapshot, temporary, name, previous, group)
+
+        def rollback() -> None:
+            _restore_slots(snapshot)
+            trainer._checkpoint_slots.pop(temporary, None)
+            if previous is None:
+                trainer._checkpoint_slots.pop(name, None)
+            else:
+                trainer._checkpoint_slots[name] = previous
+
+        _phase(rollback, "roll back checkpoint load", group)
         raise
 
 
