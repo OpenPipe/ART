@@ -4962,6 +4962,8 @@ def _sampled_source_validator(
 
 
 def _stop_uses_callback(reason: int | str | None, tokenizer: Tokenizer | None) -> bool:
+    if type(tokenizer) is _RenderingTokenizer:
+        tokenizer = tokenizer.tokenizer
     if tokenizer is None or isinstance(reason, int) and not isinstance(reason, bool):
         return False
     if isinstance(reason, str) and reason:

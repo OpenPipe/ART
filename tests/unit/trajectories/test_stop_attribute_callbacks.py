@@ -10,7 +10,10 @@ import art.trajectories as tr
     "attribute", ["eos_token_id", "eot_token_id", "special_tokens_map"]
 )
 @pytest.mark.parametrize("mutate", [False, True])
-def test_stop_metadata_lookup_preserves_consumed_logprobs(attribute, mutate):
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_stop_metadata_lookup_preserves_consumed_logprobs(attribute, mutate, wrapped):
+    from art.trajectories import _tokenize as module
+
     exchange = _chat_exchange([1], [2, 3])
     choice = exchange.response.choices[0]
     assert choice.logprobs is not None and choice.logprobs.content is not None
@@ -24,6 +27,10 @@ def test_stop_metadata_lookup_preserves_consumed_logprobs(attribute, mutate):
         return {} if attribute == "special_tokens_map" else 3
 
     tokenizer = type("Tokenizer", (), {attribute: property(read)})()
+    if wrapped:
+        tokenizer = module._RenderingTokenizer(
+            cast(Any, tokenizer), module._RenderContextGuard(lambda: [])
+        )
     value = tr.Trajectory(exchanges=tr.TrajectoryExchanges(chat_completions=[exchange]))
     before = value.model_dump_json()
     if mutate:
@@ -43,7 +50,8 @@ def test_stop_metadata_lookup_preserves_consumed_logprobs(attribute, mutate):
     assert calls
 
 
-def test_plain_eos_metadata_preserves_native_callback_free_path(monkeypatch):
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_plain_eos_metadata_preserves_native_callback_free_path(monkeypatch, wrapped):
     from art.trajectories import _tokenize as module
 
     class Tokenizer:
@@ -56,7 +64,14 @@ def test_plain_eos_metadata_preserves_native_callback_free_path(monkeypatch):
     monkeypatch.setattr(module, "_load_tokenizer", unexpected)
     exchange = _chat_exchange([1], [2, 3])
     value = tr.Trajectory(exchanges=tr.TrajectoryExchanges(chat_completions=[exchange]))
-    actual = value.tokenize(tokenizer=cast(Any, Tokenizer()))
+    tokenizer = (
+        module._RenderingTokenizer(
+            cast(Any, Tokenizer()), module._RenderContextGuard(lambda: [])
+        )
+        if wrapped
+        else Tokenizer()
+    )
+    actual = value.tokenize(tokenizer=cast(Any, tokenizer))
     assert actual.tokens == [1, 2, 3]
     assert actual.logprobs[-2:] == [-0.2, -0.3]
     assert actual.flags[-1] & tr.TokenFlag.STOP
