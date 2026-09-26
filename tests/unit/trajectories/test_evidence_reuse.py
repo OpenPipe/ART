@@ -49,13 +49,97 @@ def test_exact_assembly_reuses_evidence_only_within_one_call(monkeypatch):
     before = value.model_dump_json()
     result = value.tokenize()
     assert result.tokens == [1, 2, 3, 4, 5, 6]
-    assert len(calls) == 4  # Two preflight fingerprints and two assembly fingerprints.
+    assert len(calls) == 2  # One callback-free decision/assembly phase per source.
     assert value.model_dump_json() == before
     lp = logprobs(first)
     lp[1].logprob = -7.5
     assert value.tokenize().logprobs[2] == -7.5
     assert result.logprobs[2] == -0.3
-    assert len(calls) == 8
+    assert len(calls) == 4
+
+
+def test_supplied_tokenizer_stop_probe_cannot_lend_stale_evidence(monkeypatch):
+    first = _chat_exchange([1], [2, 3])
+    extras(first)["stop_reason"] = "public-stop"
+    second = _chat_exchange([1, 2, 3, 4], [5, 9], offset=1)
+    value = trajectory(first, second)
+    history = value.histories()[0]
+    second_source = sources(history)[1]
+    original_key = module._sampled_source_key(second_source)
+
+    class Tokenizer:
+        eos_token_id = 9
+        all_special_ids = []
+        calls = 0
+
+        def apply_chat_template(self, *args, **kwargs):
+            raise AssertionError("complete records need no rendering")
+
+        def __call__(self, text, **kwargs):
+            assert text == "public-stop"
+            self.calls += 1
+            logprobs(second)[0].logprob = -8.5
+            return {"input_ids": [3]}
+
+    tokenizer = Tokenizer()
+    trace = module._TraceBuilder()
+    result = module.tokenize_history(
+        history,
+        model=history.model,
+        base_model=None,
+        tokenizer=cast(Any, tokenizer),
+        chat_template=None,
+        chat_template_kwargs=None,
+        _trace=trace,
+    )
+    assert tokenizer.calls >= 1 and trace.trace is not None
+    assert result.tokens == [1, 2, 3, 4, 5, 9]
+    assert result.logprobs[4] == -8.5
+    assert trace.trace.source_keys[4] == module._sampled_source_key(second_source)
+    assert trace.trace.source_keys[4] != original_key
+    assert result.flags[2] & tr.TokenFlag.STOP
+    assert result.flags[-1] & tr.TokenFlag.STOP
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_render_fallback_does_not_receive_decision_evidence(monkeypatch, override):
+    from test_tokenize import _character_template_history
+
+    history, tokenizer, _ = _character_template_history()
+    first_source = sources(history)[0]
+    exchange = first_source.exchange
+    old_key = module._sampled_source_key(first_source)
+    inner = trajectory(_chat_exchange([88], [99]))
+
+    def load(config):
+        # A nested tokenization and a source edit happen after the original
+        # length decision, at an existing renderer-loader callback boundary.
+        assert inner.tokenize().tokens == [88, 99]
+        logprobs(exchange)[0].logprob = -7.5
+        return tokenizer
+
+    monkeypatch.setattr(module, "_load_tokenizer", load)
+    monkeypatch.setattr(
+        module,
+        "_tokenizer_config",
+        lambda *args: module._TokenizerConfig("public/base"),
+    )
+    trace = module._TraceBuilder()
+    result = module.tokenize_history(
+        history,
+        model=history.model,
+        base_model="public/base",
+        tokenizer=None,
+        chat_template="explicit public template" if override else None,
+        chat_template_kwargs=None,
+        _trace=trace,
+    )
+    assert trace.trace is not None
+    new_key = module._sampled_source_key(first_source)
+    assert new_key != old_key
+    indices = [i for i, key in enumerate(trace.trace.source_keys) if key == new_key]
+    assert indices and result.logprobs[indices[0]] == -7.5
+    assert old_key not in trace.trace.source_keys
 
 
 @pytest.mark.parametrize(

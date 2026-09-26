@@ -3393,7 +3393,11 @@ def _last_source_exchange(sources: Sequence[object]) -> Exchange | None:
     return None
 
 
-def _history_has_length_stop(history: History) -> bool:
+def _history_has_length_stop(
+    history: History,
+    *,
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
+) -> bool:
     sources: Sequence[object]
     if isinstance(history, (ChatCompletionsHistory, AnthropicMessagesHistory)):
         sources = history.message_sources
@@ -3405,7 +3409,7 @@ def _history_has_length_stop(history: History) -> bool:
     for source in sources:
         if source is None or not _source_is_sampled(source):
             continue
-        source_key = _sampled_source_key(source)
+        source_key = _sampled_source_key(source, _fingerprints=_fingerprints)
         if source_key in seen:
             continue
         seen.add(source_key)
@@ -4533,11 +4537,14 @@ def _tokenize_exact_projected_chat_history(
     _trace: _TraceBuilder | None = None,
     _strict_sources: bool = False,
     _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
 ) -> TokenizedHistory | None:
     if not projection_validated and not _history_matches_projection(history):
         return None
     # Reuse evidence only in this callback-free phase, never across render/decode.
-    fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] = {}
+    fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] = (
+        {} if _fingerprints is None else _fingerprints
+    )
     sampled_sources: list[object] = []
     seen: set[tuple[object, ...]] = set()
     for message, source in zip(history.messages, history.message_sources, strict=True):
@@ -7388,7 +7395,17 @@ def _tokenize_history(
     can_render = tokenizer is None or callable(
         getattr(tokenizer, "apply_chat_template", None)
     )
-    has_length_stop = can_render and _history_has_length_stop(history)
+    # Without a tokenizer, the stop decision and first exact assembly have no
+    # user callback between them. Keep their evidence in one bounded phase;
+    # never carry it into a rendered or tokenizer-supplied path.
+    fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = (
+        {}
+        if tokenizer is None and isinstance(history, ChatCompletionsHistory)
+        else None
+    )
+    has_length_stop = can_render and _history_has_length_stop(
+        history, _fingerprints=fingerprints
+    )
     needs_synthetic_stop = _history_needs_synthetic_stop(history, tokenizer)
     needs_render = (
         render_state.needs_render
@@ -7422,6 +7439,7 @@ def _tokenize_history(
                     _trace=_trace,
                     _strict_sources=True,
                     _prior=_prior,
+                    _fingerprints=fingerprints,
                 )
             )
         ):
