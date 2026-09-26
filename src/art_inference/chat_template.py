@@ -104,7 +104,15 @@ def _without_inline_reasoning_parser(template: str) -> str:
         end = selected[-1][3]
         try:
             if operations(template[start:end]) == operation:
-                edits[start, end] = ""
+                # The enclosing tags also control unrelated surrounding
+                # whitespace. Disable the parser without deleting those tags.
+                _, body_start, body_end, first_end = selected[0]
+                edits[start, end] = (
+                    template[start:body_start]
+                    + " if false "
+                    + template[body_end:first_end]
+                    + template[selected[-1][0] : end]
+                )
         except TemplateSyntaxError:
             continue
     if not edits:

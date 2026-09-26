@@ -176,9 +176,13 @@ def test_explicit_template_override_retains_rendered_terminal_tail() -> None:
     )
 
 
-def test_request_owned_assistant_roles_survive_terminal_native_tool_output() -> None:
+@pytest.mark.parametrize("finish,sampled_eos", [("tool_calls", False), ("stop", True)])
+@pytest.mark.parametrize("standalone", [False, True])
+def test_request_owned_assistant_roles_survive_terminal_native_tool_output(
+    finish: str, sampled_eos: bool, standalone: bool
+) -> None:
     trajectory, tokenizer, records = projected_history(
-        finish="tool_calls", sampled_eos=False, earlier_length=False
+        finish=finish, sampled_eos=sampled_eos, earlier_length=False
     )
     exchange = trajectory.exchanges.chat_completions[0]
     exchange.request["messages"].insert(
@@ -191,7 +195,13 @@ def test_request_owned_assistant_roles_survive_terminal_native_tool_output() -> 
     payload["prompt_token_ids"] = prompt
     payload["choices"][0]["prompt_token_ids"] = prompt
     exchange.response = ChatCompletion.model_validate(payload)
-    result = trajectory.tokenize(tokenizer=tokenizer)
+    original = trajectory.model_dump(mode="python")
+    if standalone:
+        selected = trajectory.histories()[0]
+        assert isinstance(selected, tr.ChatCompletionsHistory)
+    else:
+        selected = trajectory
+    result = selected.tokenize(tokenizer=tokenizer)
     output = records[-1][1]
     assert result.tokens == prompt + output
     prefix_flags = result.flags[: len(prompt)]
@@ -201,6 +211,13 @@ def test_request_owned_assistant_roles_survive_terminal_native_tool_output() -> 
         flag & (tr.TokenFlag.OUTPUT | tr.TokenFlag.SAMPLED) for flag in prefix_flags
     )
     assert result.logprobs[len(prompt) :] == records[-1][2]
+    expected = [tr.TokenFlag.EXACT] * len(prompt)
+    start = len(tokenizer._encode("assistant:"))
+    end = len(tokenizer._encode("assistant:historical context§"))
+    expected[start:end] = [tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT] * (end - start)
+    expected[end - 1] |= tr.TokenFlag.STOP
+    assert prefix_flags == expected
+    assert trajectory.model_dump(mode="python") == original
 
 
 def test_unresolved_nonterminal_stop_still_loads_boundary_authority(

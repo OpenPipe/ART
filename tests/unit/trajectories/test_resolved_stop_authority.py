@@ -109,6 +109,60 @@ def test_all_exact_histories_do_not_load_or_retain_prior_call_authority(monkeypa
     assert all(not (h.flags[-1] & tr.TokenFlag.STOP) for h in result.histories)
 
 
+@pytest.mark.parametrize("supplied", [False, True])
+def test_later_history_callback_cannot_change_completed_source(monkeypatch, supplied):
+    first = branch(0, length=False, model="model/a")
+    second = branch(1, length=True, model="model/b")
+
+    class Tokenizer(_CharacterTemplateTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            assert first.response.choices[0].logprobs is not None
+            assert first.response.choices[0].logprobs.content is not None
+            first.response.choices[0].logprobs.content[0].logprob = -99
+            return super().apply_chat_template(messages, **kwargs)
+
+    tokenizer = Tokenizer()
+    bind(monkeypatch, {"model/b": tokenizer})
+    with pytest.raises(
+        ValueError, match="Sampled source changed during tokenization callback"
+    ):
+        trajectory(first, second).tokenize(
+            multi_history=True, tokenizer=tokenizer if supplied else None
+        )
+
+
+def test_stop_postpass_checks_original_evidence_before_consuming_it(monkeypatch):
+    first = branch(0, length=False)
+    second = branch(1, length=False)
+    last = branch(2, length=True)
+    first_extra = first.response.choices[0].model_extra
+    second_extra = second.response.choices[0].model_extra
+    assert first_extra is not None and second_extra is not None
+    second_extra["stop_reason"] = "restore"
+
+    class Tokenizer(_CharacterTemplateTokenizer):
+        restores = 0
+
+        def apply_chat_template(self, messages, **kwargs):
+            first_extra["stop_reason"] = 999
+            return super().apply_chat_template(messages, **kwargs)
+
+        def __call__(self, text, **kwargs):
+            if text == "restore":
+                self.restores += 1
+                first_extra.pop("stop_reason", None)
+                return {"input_ids": [9]}
+            return super().__call__(text, **kwargs)
+
+    tokenizer = Tokenizer()
+    bind(monkeypatch, {"test/model": tokenizer})
+    with pytest.raises(
+        ValueError, match="Sampled source changed during tokenization callback"
+    ):
+        trajectory(first, second, last).tokenize(multi_history=True)
+    assert tokenizer.restores == 0
+
+
 def test_resolved_authority_never_crosses_model_identity(monkeypatch):
     loads = bind(monkeypatch, {"model/a": _CharacterTemplateTokenizer()})
     result = trajectory(

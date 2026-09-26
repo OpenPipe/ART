@@ -9093,7 +9093,16 @@ def test_length_boundary_preserves_output_despite_probe_suffix_collision(
             _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
         return
 
-    tokenized, traces = _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
+    if corruption == "changed_sampled_token":
+        # The later request text disagrees with its recorded assistant token.
+        # A supplied renderer cannot prove that request's full role mask.
+        with pytest.raises(ValueError, match="Cannot preserve assistant boundaries"):
+            _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
+        tokenized, traces = _tokenize_trajectory_with_trace(trajectory, tokenizer=None)
+    else:
+        tokenized, traces = _tokenize_trajectory_with_trace(
+            trajectory, tokenizer=tokenizer
+        )
     assert len(tokenized.histories) == (
         2 if corruption == "changed_sampled_token" else 1
     )

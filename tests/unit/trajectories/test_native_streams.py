@@ -114,6 +114,100 @@ def test_old_single_history_refusal_is_retained() -> None:
         history.tokenize(tokenizer=tokenizer)
 
 
+def test_native_stream_preserves_interior_request_assistant_roles() -> None:
+    trajectory, tokenizer = example()
+    third = trajectory.exchanges.chat_completions[-1]
+    third.request["messages"][-1:-1] = [
+        {"role": "user", "content": "intermediate"},
+        {"role": "assistant", "content": "request-only"},
+    ]
+    prefix = "turn 0answer§turn 1answer§intermediate"
+    record(third).prompt_token_ids = tokenizer._encode(prefix + "request-only§turn 2")
+    before = trajectory.model_dump_json()
+    result = trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+    final = result.histories[-1]
+    assert final.tokens == [*record(third).prompt_token_ids, *record(third).token_ids]
+    assert result_terms(result) == native_terms(trajectory)
+    assert trajectory.model_dump_json() == before
+    context = slice(len(prefix), len(prefix + "request-only§"))
+    assert all(math.isnan(value) for value in final.logprobs[context])
+    assert final.flags[context] == [
+        *([tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT] * len("request-only")),
+        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.STOP,
+    ]
+
+
+def test_existing_native_shortcut_precedes_stream_refinement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trajectory, tokenizer = example()
+    record(trajectory.exchanges.chat_completions[0]).finish_reason = "stop"
+    render = tokenizer.apply_chat_template
+
+    def changed_renderer(messages: Any, **kwargs: Any) -> Any:
+        copied = deepcopy(messages)
+        for message in copied:
+            if message.get("role") == "assistant":
+                message["content"] = "different-renderer:" + (
+                    message.get("content") or ""
+                )
+        return render(copied, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "apply_chat_template", changed_renderer)
+    before = trajectory.model_dump_json()
+    with monkeypatch.context() as old_route:
+        old_route.setattr(module, "_native_history_streams", lambda history: [history])
+        existing = trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+    result = trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+    assert result.model_dump_json() == existing.model_dump_json()
+    assert result_terms(result) == native_terms(trajectory)
+    assert trajectory.model_dump_json() == before
+
+
+@pytest.mark.parametrize("middle_kind", ["tool", "reasoning"])
+def test_native_stream_keeps_complete_nonterminal_structured_output(
+    middle_kind: str,
+) -> None:
+    trajectory, tokenizer = example()
+    _, second, third = trajectory.exchanges.chat_completions
+    middle = _chat_exchange(
+        list(record(second).prompt_token_ids),
+        tokenizer._encode("different native middle body§"),
+        offset=1,
+    )
+    data = middle.response.model_dump(mode="python")
+    message = data["choices"][0]["message"]
+    if middle_kind == "tool":
+        message["content"] = None
+        message["tool_calls"] = [
+            {
+                "id": "middle-tool",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": '{"key": 1}'},
+            }
+        ]
+    else:
+        message["reasoning_content"] = "recorded structured reasoning"
+    middle.response = ChatCompletion.model_validate(data)
+    trajectory.exchanges.chat_completions[1] = middle
+    third.request["messages"][3] = record(middle).message.model_dump(
+        mode="python", exclude_none=True
+    )
+    record(third).prompt_token_ids = [
+        *record(middle).prompt_token_ids,
+        *record(middle).token_ids,
+        *tokenizer._encode("turn 2"),
+    ]
+    before = trajectory.model_dump_json()
+    result = trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+    assert result.histories[-1].tokens == [
+        *record(third).prompt_token_ids,
+        *record(third).token_ids,
+    ]
+    assert result_terms(result) == native_terms(trajectory)
+    assert trajectory.model_dump_json() == before
+
+
 def test_explicit_rendering_does_not_split(monkeypatch: pytest.MonkeyPatch) -> None:
     trajectory, tokenizer = example()
 
@@ -326,7 +420,9 @@ def test_callback_mutation_of_earlier_source_invalidates_scoped_output(
         return original(messages, **kwargs)
 
     monkeypatch.setattr(tokenizer, "apply_chat_template", mutate)
-    with pytest.raises(ValueError, match="inventory changed"):
+    with pytest.raises(
+        ValueError, match="Sampled source changed during tokenization callback"
+    ):
         trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
     assert count
 
@@ -398,15 +494,34 @@ def test_stop_encoder_cannot_change_role_proof_context(
 
 
 @pytest.mark.parametrize("private", [False, True])
-@pytest.mark.parametrize("change", ["request", "logprob", "stop_reason"])
+@pytest.mark.parametrize(
+    "change", ["request", "logprob", "stop_reason", "unscoped_logprob"]
+)
 def test_later_stop_encoder_cannot_change_an_already_certified_stream(
     monkeypatch: pytest.MonkeyPatch, private: bool, change: str
 ) -> None:
     trajectory, tokenizer = example()
-    first, second, _ = trajectory.exchanges.chat_completions
+    first, second, third = trajectory.exchanges.chat_completions
     record(first).finish_reason = "stop"
     record(first).model_extra["stop_reason"] = "§"
     record(second).model_extra["stop_reason"] = "§"
+    earlier = first
+    if change == "unscoped_logprob":
+        earlier = _chat_exchange(
+            tokenizer._encode("separate"), tokenizer._encode("answer§"), offset=-1
+        )
+        earlier.request["messages"] = [{"role": "user", "content": "separate"}]
+        trajectory.exchanges.chat_completions.insert(0, earlier)
+    # Request-owned roles make the old sampled-only boundary shortcut decline,
+    # so the later stream's validation callback is actually reached.
+    for exchange in (second, third):
+        exchange.request["messages"][2:2] = [
+            {"role": "user", "content": "bridge"},
+            {"role": "assistant", "content": "request-only"},
+        ]
+        record(exchange).prompt_token_ids[
+            len("turn 0answer§") : len("turn 0answer§")
+        ] = tokenizer._encode("bridgerequest-only§")
     original_guard = module._require_native_stream
     original_encode = tokenizer.__class__.__call__
     armed = False
@@ -431,15 +546,20 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
             changed = True
             if change == "request":
                 first.request["chat_template_kwargs"] = {"changed": True}
-            elif change == "logprob":
-                record(first).logprobs.content[0].logprob = -123.0
+            elif change in {"logprob", "unscoped_logprob"}:
+                record(earlier).logprobs.content[0].logprob = -123.0
             else:
                 record(first).model_extra["stop_reason"] = "!"
         return original_encode(self, text, **kwargs)
 
     monkeypatch.setattr(module, "_require_native_stream", guard)
     monkeypatch.setattr(tokenizer.__class__, "__call__", encode)
-    with pytest.raises(ValueError, match="during final STOP validation"):
+    message = (
+        "Sampled source changed during tokenization callback"
+        if change == "unscoped_logprob"
+        else "during final STOP validation"
+    )
+    with pytest.raises(ValueError, match=message):
         if private:
             module._tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
         else:

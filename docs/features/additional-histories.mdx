@@ -166,14 +166,18 @@ the final request in that run, all sampled responses' original conditioning and
 logprobs, and the original trajectory's reward. The existing first-occurrence
 mask still owns each sampled prefix edge once across streams. Earlier responses
 outside a run are that request's context; their assistant and STOP roles require
-the normal rendering proof and do not become new sampled output. This may load a
-tokenizer to prove request roles. Unproved request roles still refuse.
+the normal rendering proof. They retain native `EXACT` provenance but carry
+neither `SAMPLED` nor `OUTPUT`, so their generic output/SFT masks differ from an
+unsplit copied-response history. This may load a tokenizer to prove request
+roles. Unproved request roles still refuse.
 
 The internal exchange-training path uses the same refinement and one token weight
 per original trajectory. `History.tokenize()` and `multi_history=False` keep
 their single-linear representation. Explicit overrides, incomplete native
 records, and edited contexts do not authorize splitting. Extra streams may
 repeat context; there is no implied memory, speed, or numerical-training claim.
+Passing `chat_template` or `chat_template_kwargs` explicitly also disables
+refinement when the supplied value equals the recorded settings.
 
 Complete unchanged Chat histories end at the final recorded response token,
 including tool responses and responses stopped by a length limit. ART does not
@@ -202,10 +206,22 @@ the original request and template reproduce its complete native prompt, ART can
 recover historical assistant roles from that rendering. This uses the original
 tool serialization order and preserves role labels through exact length-stop
 assembly; it does not restore destructive parsing for new response content.
-Unproved historical role mappings still use the strict existing fallback.
+With a supplied renderer, request-owned assistant roles are proved throughout
+the native stream, including between sampled responses. A request whose text
+disagrees with its recorded assistant tokens can still use the offline native
+path, but cannot claim a complete rendered role mask. Unproved role mappings
+use the strict existing fallback and may be refused.
 
-A response copied into a later, shortened prompt is output provenance, but it is
-not a fresh sample under that new prompt. ART keeps its `OUTPUT`, `ASSISTANT`,
+Custom STOP encoders and terminator decoders must not change already-consumed
+source tokens, logprobs, model or stop evidence. ART checks each source around its
+STOP callback and checks all consumed evidence before returning. Multi-history
+tokenization also checks completed histories after later renderer callbacks.
+These checks refuse stale results; they do not make callbacks or source objects
+immutable. Callback-free native assembly retains its bounded evidence reuse.
+
+In an unsplit history, a response copied into a later, shortened prompt is output
+provenance, but it is not a fresh sample under that new prompt. ART keeps its
+`OUTPUT`, `ASSISTANT`,
 `EXACT`, and proven `STOP` flags while removing `SAMPLED` and the old conditional
 logprob. This requires the complete original sampled occurrence to remain in an
 earlier selected history; otherwise unchanged native replay is refused. The
