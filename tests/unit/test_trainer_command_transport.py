@@ -11,8 +11,8 @@ import weakref
 
 import pytest
 import torch
-import torch.multiprocessing as mp
-from trainer_rank_test_support import gloo_group
+import torch.distributed as dist
+from trainer_rank_test_support import gloo_group, spawn_and_join
 
 from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank
 from art.trainer_rank._commands import _Command, _encode_command, _Executor
@@ -133,6 +133,7 @@ def _transport_worker(physical: int, rendezvous: str, cuda: bool) -> None:
         ps = SimpleNamespace(
             get_tensor_model_parallel_rank=lambda: physical,
             get_context_parallel_rank=lambda: 0,
+            get_tensor_and_context_parallel_group=lambda **kwargs: dist.group.WORLD,
         )
         core, megatron = ModuleType("megatron.core"), ModuleType("megatron")
         setattr(core, "parallel_state", ps)
@@ -225,4 +226,9 @@ def test_commands_decode_on_cpu_and_native_handlers_place_locally(
 ) -> None:
     if cuda and torch.cuda.device_count() < 2:
         pytest.skip("requires two CUDA devices")
-    mp.spawn(_transport_worker, args=(str(tmp_path / "init"), cuda), nprocs=2)
+    spawn_and_join(
+        _transport_worker,
+        (str(tmp_path / "init"), cuda),
+        timeout=90,
+        failure="command transport did not complete",
+    )
