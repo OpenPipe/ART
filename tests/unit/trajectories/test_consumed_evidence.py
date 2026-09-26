@@ -177,3 +177,73 @@ def test_generic_evidence_reads_check_consumed_render_settings(field, mutate):
             if flag & tr.TokenFlag.SAMPLED
         ] == [20, 21]
         assert value.model_dump_json() == before
+
+
+@pytest.mark.parametrize("mutate", [False, True])
+def test_exchange_warning_hook_cannot_change_consumed_logprobs(monkeypatch, mutate):
+    import warnings
+
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
+    first = _message_exchange(
+        cast(
+            Any,
+            {
+                "model": "test/model",
+                "max_tokens": 5,
+                "messages": [{"role": "user", "content": "q"}],
+            },
+        ),
+        prompt_token_ids=[1],
+        token_ids=[2],
+        logprobs=[-0.2],
+    )
+    second = _message_exchange(
+        cast(
+            Any,
+            {
+                "model": "test/model",
+                "max_tokens": 5,
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": "answer"}],
+                    },
+                    {"role": "user", "content": "next"},
+                ],
+            },
+        ),
+        identifier="second",
+        offset=1,
+        prompt_token_ids=[1, 3, 4],
+        token_ids=[5],
+        logprobs=[-0.5],
+    )
+    value = tr.Trajectory(exchanges=tr.TrajectoryExchanges(messages=[first, second]))
+    history = value.anthropic_messages_history(
+        reconcile_text_equivalent_tokenizations=True
+    )
+    calls = []
+
+    def showwarning(*args, **kwargs):
+        calls.append(True)
+        if mutate:
+            assert second.response.model_extra is not None
+            second.response.model_extra["logprobs"][0] = -9
+
+    class Tokenizer:
+        def __call__(self, text, **kwargs):
+            assert text == "answer"
+            return [3]
+
+    monkeypatch.setattr(warnings, "showwarning", showwarning)
+    if mutate:
+        with pytest.raises(ValueError, match="[Ss]ampled source changed"):
+            history.tokenize(tokenizer=cast(Any, Tokenizer()))
+    else:
+        actual = history.tokenize(tokenizer=cast(Any, Tokenizer()))
+        assert actual.tokens == [1, 2, 4, 5]
+        assert actual.logprobs[1] == -0.2 and actual.logprobs[-1] == -0.5
+    assert calls

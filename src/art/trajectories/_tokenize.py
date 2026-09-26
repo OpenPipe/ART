@@ -2990,7 +2990,7 @@ def _tokenize_exchange_trajectory(
                 ]
             prompt = repaired
             prompt_is_exact = False
-            _warn_prefix_retokenization()
+            checked(_warn_prefix_retokenization)
             suffix = prompt[len(token_ids) :]
             token_ids.extend(suffix)
             logprobs.extend([math.nan] * len(suffix))
