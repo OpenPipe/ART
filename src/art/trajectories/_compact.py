@@ -717,7 +717,7 @@ def _decode(
 
 
 def _decode_value(value: object, strings: dict[str, str]) -> pydantic.JsonValue:
-    if value is None or isinstance(value, (bool, int, float)):
+    if value is None or isinstance(value, int) or isinstance(value, float):
         return value
     if isinstance(value, str):
         return strings.get(value, value)
