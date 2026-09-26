@@ -4671,162 +4671,9 @@ class _ChatViewTokenizer:
         self._prepare_span_search()
         self._prove_marked_bounds()
         self._prove_probed_bounds()
-        if (
-            self.projection_matches is True
-            and self.chat_template is None
-            and self.chat_template_kwargs is None
-        ):
-            sampled_message_indices: list[int] = []
-            seen_signatures: set[tuple[object, ...]] = set()
-            for message_index, (message, source) in enumerate(
-                zip(self.messages, self.history.message_sources, strict=True)
-            ):
-                signature = _source_signature(source)
-                if (
-                    message.get("role") == "assistant"
-                    and source is not None
-                    and signature is not None
-                    and signature not in seen_signatures
-                    and _source_is_sampled(source)
-                ):
-                    seen_signatures.add(signature)
-                    sampled_message_indices.append(message_index)
-            length_stop_boundaries: dict[
-                _SampledSourceKey, _RenderedLengthStopBoundary
-            ] = {}
-            rendered_length_stops = [
-                index
-                for index, selected in enumerate(self.length_stop_mask)
-                if selected
-            ]
-            length_stop_count = 0
-            length_stop_boundaries_complete = True
-            for position, message_index in enumerate(sampled_message_indices):
-                source = self.history.message_sources[message_index]
-                assert source is not None
-                source_key = _sampled_source_key(source)
-                stop_reason = _source_stop_evidence(source, source_key)[0]
-                output = _source_output_tokens(source, source_key)
-                synthetic_stop = (
-                    stop_reason == "stop"
-                    and bool(_terminator_ids(self.tokenizer))
-                    and output is not None
-                    and not _sampled_stop_suffix(
-                        output,
-                        source=source,
-                        source_key=source_key,
-                        tokenizer=self.tokenizer,
-                    )
-                )
-                if synthetic_stop and position + 1 < len(sampled_message_indices):
-                    length_stop_boundaries_complete = False
-                    break
-                if stop_reason != "length" and not synthetic_stop:
-                    continue
-                length_stop_count += stop_reason == "length"
-                bounds = (
-                    self.direct_bounds[message_index]
-                    if self.direct_bounds
-                    else self.marked_bounds.get(message_index)
-                    or self.probed_bounds.get(message_index)
-                )
-                if synthetic_stop and bounds is not None:
-                    # Tool part bounds can omit sampled closing markup. Prove the
-                    # complete sampled prefix before appending only its remainder.
-                    assert output is not None
-                    rendered_start = bounds[0]
-                    while rendered_start and self.assistant_mask[rendered_start - 1]:
-                        rendered_start -= 1
-                    bounds = _prove_exact_length_stopped_assistant_prefix(
-                        self._locations(output, rendered_start),
-                        self.assistant_mask,
-                        expected_start=rendered_start,
-                    )
-                if position + 1 < len(
-                    sampled_message_indices
-                ) and self._source_matches_context(source):
-                    prompt = self._source_prompt_tokens(source)
-                    output, _ = self._source_output_tokens(source)
-                    if (
-                        prompt is not None
-                        and output
-                        and length_stop_count <= len(rendered_length_stops)
-                    ):
-                        rendered_end = rendered_length_stops[length_stop_count - 1] + 1
-                        rendered_start = rendered_end - 1
-                        while (
-                            rendered_start and self.assistant_mask[rendered_start - 1]
-                        ):
-                            rendered_start -= 1
-                        exact_bounds = _prove_exact_length_stopped_assistant_prefix(
-                            [
-                                match
-                                for match in self._locations(output, rendered_start)
-                                if match[1] <= rendered_end
-                            ],
-                            self.assistant_mask,
-                            expected_start=rendered_start,
-                        )
-                        bounds = exact_bounds or bounds
-                next_prompt_end: int | None
-                if position + 1 < len(sampled_message_indices):
-                    next_message_index = sampled_message_indices[position + 1]
-                    next_bounds = (
-                        self.direct_bounds[next_message_index]
-                        if self.direct_bounds
-                        else self.marked_bounds.get(next_message_index)
-                        or self.probed_bounds.get(next_message_index)
-                    )
-                    # Part bounds can start after sampled tool-call markup; the
-                    # next generation boundary is the assistant span's start.
-                    next_prompt_end = (
-                        _next_assistant_span_start(self.assistant_mask, after=bounds[1])
-                        if bounds is not None
-                        else next_bounds[0]
-                        if next_bounds is not None
-                        else None
-                    )
-                else:
-                    next_prompt_end = len(self.rendered)
-                boundary = (
-                    _rendered_length_stop_boundary(
-                        self.rendered,
-                        self.assistant_mask,
-                        self.stop_mask,
-                        content_end=bounds[1],
-                        next_prompt_end=next_prompt_end,
-                    )
-                    if (
-                        bounds is not None
-                        and self._source_matches_context(source)
-                        and next_prompt_end is not None
-                    )
-                    else None
-                )
-                if boundary is None:
-                    if synthetic_stop or position + 1 < len(sampled_message_indices):
-                        length_stop_boundaries_complete = False
-                        break
-                    # A terminal length stop needs no renderer-owned tail: the
-                    # authoritative prompt and sampled output already describe the
-                    # complete trainable sequence. A later turn is required only
-                    # to prove a nonterminal synthetic boundary.
-                    continue
-                length_stop_boundaries[source_key] = boundary
-            if (
-                length_stop_count
-                and length_stop_boundaries_complete
-                and (
-                    exact := _tokenize_exact_projected_chat_history(
-                        self.history,
-                        tokenizer=self.tokenizer,
-                        length_stop_boundaries=length_stop_boundaries,
-                        projection_validated=True,
-                        _trace=self.trace,
-                    )
-                )
-            ):
-                return exact
+        exact = self._tokenize_exact_length_stops()
+        if exact is not None:
+            return exact
         sampled_message_count = sum(
             message.get("role") == "assistant"
             and source is not None
@@ -6408,6 +6255,165 @@ class _ChatViewTokenizer:
                     continue
                 if span := self._differing_span(probe):
                     self.probed_bounds[message_index] = span
+
+    def _tokenize_exact_length_stops(self) -> TokenizedHistory | None:
+        if (
+            self.projection_matches is True
+            and self.chat_template is None
+            and self.chat_template_kwargs is None
+        ):
+            sampled_message_indices: list[int] = []
+            seen_signatures: set[tuple[object, ...]] = set()
+            for message_index, (message, source) in enumerate(
+                zip(self.messages, self.history.message_sources, strict=True)
+            ):
+                signature = _source_signature(source)
+                if (
+                    message.get("role") == "assistant"
+                    and source is not None
+                    and signature is not None
+                    and signature not in seen_signatures
+                    and _source_is_sampled(source)
+                ):
+                    seen_signatures.add(signature)
+                    sampled_message_indices.append(message_index)
+            length_stop_boundaries: dict[
+                _SampledSourceKey, _RenderedLengthStopBoundary
+            ] = {}
+            rendered_length_stops = [
+                index
+                for index, selected in enumerate(self.length_stop_mask)
+                if selected
+            ]
+            length_stop_count = 0
+            length_stop_boundaries_complete = True
+            for position, message_index in enumerate(sampled_message_indices):
+                source = self.history.message_sources[message_index]
+                assert source is not None
+                source_key = _sampled_source_key(source)
+                stop_reason = _source_stop_evidence(source, source_key)[0]
+                output = _source_output_tokens(source, source_key)
+                synthetic_stop = (
+                    stop_reason == "stop"
+                    and bool(_terminator_ids(self.tokenizer))
+                    and output is not None
+                    and not _sampled_stop_suffix(
+                        output,
+                        source=source,
+                        source_key=source_key,
+                        tokenizer=self.tokenizer,
+                    )
+                )
+                if synthetic_stop and position + 1 < len(sampled_message_indices):
+                    length_stop_boundaries_complete = False
+                    break
+                if stop_reason != "length" and not synthetic_stop:
+                    continue
+                length_stop_count += stop_reason == "length"
+                bounds = (
+                    self.direct_bounds[message_index]
+                    if self.direct_bounds
+                    else self.marked_bounds.get(message_index)
+                    or self.probed_bounds.get(message_index)
+                )
+                if synthetic_stop and bounds is not None:
+                    # Tool part bounds can omit sampled closing markup. Prove the
+                    # complete sampled prefix before appending only its remainder.
+                    assert output is not None
+                    rendered_start = bounds[0]
+                    while rendered_start and self.assistant_mask[rendered_start - 1]:
+                        rendered_start -= 1
+                    bounds = _prove_exact_length_stopped_assistant_prefix(
+                        self._locations(output, rendered_start),
+                        self.assistant_mask,
+                        expected_start=rendered_start,
+                    )
+                if position + 1 < len(
+                    sampled_message_indices
+                ) and self._source_matches_context(source):
+                    prompt = self._source_prompt_tokens(source)
+                    output, _ = self._source_output_tokens(source)
+                    if (
+                        prompt is not None
+                        and output
+                        and length_stop_count <= len(rendered_length_stops)
+                    ):
+                        rendered_end = rendered_length_stops[length_stop_count - 1] + 1
+                        rendered_start = rendered_end - 1
+                        while (
+                            rendered_start and self.assistant_mask[rendered_start - 1]
+                        ):
+                            rendered_start -= 1
+                        exact_bounds = _prove_exact_length_stopped_assistant_prefix(
+                            [
+                                match
+                                for match in self._locations(output, rendered_start)
+                                if match[1] <= rendered_end
+                            ],
+                            self.assistant_mask,
+                            expected_start=rendered_start,
+                        )
+                        bounds = exact_bounds or bounds
+                next_prompt_end: int | None
+                if position + 1 < len(sampled_message_indices):
+                    next_message_index = sampled_message_indices[position + 1]
+                    next_bounds = (
+                        self.direct_bounds[next_message_index]
+                        if self.direct_bounds
+                        else self.marked_bounds.get(next_message_index)
+                        or self.probed_bounds.get(next_message_index)
+                    )
+                    # Part bounds can start after sampled tool-call markup; the
+                    # next generation boundary is the assistant span's start.
+                    next_prompt_end = (
+                        _next_assistant_span_start(self.assistant_mask, after=bounds[1])
+                        if bounds is not None
+                        else next_bounds[0]
+                        if next_bounds is not None
+                        else None
+                    )
+                else:
+                    next_prompt_end = len(self.rendered)
+                boundary = (
+                    _rendered_length_stop_boundary(
+                        self.rendered,
+                        self.assistant_mask,
+                        self.stop_mask,
+                        content_end=bounds[1],
+                        next_prompt_end=next_prompt_end,
+                    )
+                    if (
+                        bounds is not None
+                        and self._source_matches_context(source)
+                        and next_prompt_end is not None
+                    )
+                    else None
+                )
+                if boundary is None:
+                    if synthetic_stop or position + 1 < len(sampled_message_indices):
+                        length_stop_boundaries_complete = False
+                        break
+                    # A terminal length stop needs no renderer-owned tail: the
+                    # authoritative prompt and sampled output already describe the
+                    # complete trainable sequence. A later turn is required only
+                    # to prove a nonterminal synthetic boundary.
+                    continue
+                length_stop_boundaries[source_key] = boundary
+            if (
+                length_stop_count
+                and length_stop_boundaries_complete
+                and (
+                    exact := _tokenize_exact_projected_chat_history(
+                        self.history,
+                        tokenizer=self.tokenizer,
+                        length_stop_boundaries=length_stop_boundaries,
+                        projection_validated=True,
+                        _trace=self.trace,
+                    )
+                )
+            ):
+                return exact
+        return None
 
 
 def _tokenize_chat_view(
