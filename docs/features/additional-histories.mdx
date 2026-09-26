@@ -175,6 +175,13 @@ that the separator reproduces the next recorded prompt exactly. Edited contexts,
 explicit template overrides, incomplete projections, and unsupported templates
 continue through the generic rendering path and its source validation.
 
+Correcting literal-content rendering does not rewrite a recorded request. When
+the original request and template reproduce its complete native prompt, ART can
+recover historical assistant roles from that rendering. This uses the original
+tool serialization order and preserves role labels through exact length-stop
+assembly; it does not restore destructive parsing for new response content.
+Unproved historical role mappings still use the strict existing fallback.
+
 A response copied into a later, shortened prompt is output provenance, but it is
 not a fresh sample under that new prompt. ART keeps its `OUTPUT`, `ASSISTANT`,
 `EXACT`, and proven `STOP` flags while removing `SAMPLED` and the old conditional
