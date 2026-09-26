@@ -111,3 +111,9 @@ def test_gpu_image_workflow_qualifies_digest_before_fleet_prewarm() -> None:
     assert steps == sorted(steps)
     assert "IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}" in workflow
     assert '"art_image": f"{image_repo}@{image_digest}"' in workflow
+    assert "!cancelled() &&" in workflow
+    assert "steps.build.outcome == 'success' &&" in workflow
+    assert (
+        "steps.smoke.outcome == 'success' || steps.smoke.outcome == 'skipped'"
+        in workflow
+    )

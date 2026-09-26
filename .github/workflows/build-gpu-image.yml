@@ -218,6 +218,7 @@ jobs:
           bash scripts/build-gpu-image.sh "${args[@]}"
 
       - name: Smoke launch immutable image
+        id: smoke
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
         env:
           SMOKE_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
@@ -298,7 +299,13 @@ jobs:
             -d "${payload}"
 
       - name: Prewarm GPU image on nodes
-        if: ${{ github.event_name != 'workflow_dispatch' || inputs.prewarm_nodes }}
+        if: >-
+          ${{
+            !cancelled() &&
+            steps.build.outcome == 'success' &&
+            (steps.smoke.outcome == 'success' || steps.smoke.outcome == 'skipped') &&
+            (github.event_name != 'workflow_dispatch' || inputs.prewarm_nodes)
+          }}
         env:
           IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}
           IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
