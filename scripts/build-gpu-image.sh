@@ -7,6 +7,7 @@ Usage: build-gpu-image.sh [options]
 
 Options:
   --cluster-name NAME    Temporary BuildKit pod name to use
+  --image-digest DIGEST  Existing image digest for --prewarm-nodes-only
   --image-repo REPO      Image repository to publish
   --infra INFRA          Kubernetes-backed SkyPilot infra (default: k8s/cks-wb3)
   --no-cache             Disable registry-backed BuildKit cache
@@ -15,6 +16,7 @@ Options:
   --prewarm-infra INFRA  Kubernetes-backed infra to prewarm; repeatable
   --pull-image-repo REPO Image repository for cluster pulls/prewarm
   --prewarm-modal        Require prebuilding the pushed image in Modal
+  --prewarm-nodes-only   Skip build and Modal; prewarm an existing digest
   --prewarm-timeout DUR  Timeout for the prewarm DaemonSet rollout (default: 30m)
   --tag TAG              Image tag to publish (default: latest)
   --help                 Show this help
@@ -28,6 +30,7 @@ infra="${SKY_INFRA:-k8s/cks-wb3}"
 image_repo="${ART_IMAGE_REPO:-}"
 pull_image_repo="${ART_PULL_IMAGE_REPO:-}"
 image_tag="${IMAGE_TAG:-latest}"
+image_digest="${IMAGE_DIGEST:-}"
 docker_config_path="${DOCKER_CONFIG_PATH:-${HOME}/.docker/config.json}"
 buildkit_image="${BUILDKIT_IMAGE:-moby/buildkit:v0.29.0-rootless}"
 buildkit_namespace="${KUBECTL_NAMESPACE:-default}"
@@ -35,6 +38,7 @@ buildkit_wait_timeout="${BUILDKIT_WAIT_TIMEOUT:-300s}"
 no_cache="${NO_CACHE:-false}"
 prewarm_modal="${PREWARM_MODAL:-auto}"
 prewarm_nodes="${PREWARM_NODES:-true}"
+prewarm_nodes_only=false
 prewarm_infras=()
 if [[ -n "${PREWARM_INFRAS:-}" ]]; then
   while IFS= read -r prewarm_infra; do
@@ -71,6 +75,10 @@ while [[ $# -gt 0 ]]; do
       image_repo="$2"
       shift 2
       ;;
+    --image-digest)
+      image_digest="$2"
+      shift 2
+      ;;
     --infra)
       infra="$2"
       shift 2
@@ -99,6 +107,10 @@ while [[ $# -gt 0 ]]; do
       prewarm_modal=true
       shift
       ;;
+    --prewarm-nodes-only)
+      prewarm_nodes_only=true
+      shift
+      ;;
     --prewarm-timeout)
       prewarm_timeout="$2"
       shift 2
@@ -118,6 +130,15 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "${prewarm_nodes_only}" == "true" ]]; then
+  if [[ ! "${image_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+    echo "--prewarm-nodes-only requires --image-digest sha256:<64 lowercase hex>" >&2
+    exit 1
+  fi
+  prewarm_modal=false
+  prewarm_nodes=true
+fi
 
 case "${prewarm_modal}" in
   auto|true|false) ;;
@@ -290,12 +311,12 @@ else
   )"
 fi
 
-context_dir="$(mktemp -d "${TMPDIR:-/tmp}/art-gpu-build-context.XXXXXX")"
-buildkit_manifest_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-buildkit.XXXXXX")"
+context_dir=""
+buildkit_manifest_path=""
 registry_auth_json_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-auth.XXXXXX")"
-build_command_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-command.XXXXXX")"
-build_log_snapshot_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-log.XXXXXX")"
-build_log_offset_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-log-offset.XXXXXX")"
+build_command_path=""
+build_log_snapshot_path=""
+build_log_offset_path=""
 cleanup_prewarm_pods() {
   local context
   local selector
@@ -310,13 +331,24 @@ cleanup_prewarm_pods() {
 }
 cleanup() {
   cleanup_prewarm_pods
-  rm -rf "${context_dir}"
-  rm -f "${buildkit_manifest_path}" "${registry_auth_json_path}" \
-    "${build_command_path}" "${build_log_snapshot_path}" "${build_log_offset_path}"
-  "${build_kubectl_cmd[@]}" delete pod -n "${buildkit_namespace}" "${cluster_name}" \
-    --ignore-not-found --wait=true >/dev/null 2>&1 || true
+  rm -f "${registry_auth_json_path}"
+  if [[ -n "${context_dir}" ]]; then
+    rm -rf "${context_dir}"
+    rm -f "${buildkit_manifest_path}" "${build_command_path}" \
+      "${build_log_snapshot_path}" "${build_log_offset_path}"
+    "${build_kubectl_cmd[@]}" delete pod -n "${buildkit_namespace}" "${cluster_name}" \
+      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
+printf '%s' "${registry_auth_json_b64}" | base64 -d > "${registry_auth_json_path}"
+
+if [[ "${prewarm_nodes_only}" != "true" ]]; then
+context_dir="$(mktemp -d "${TMPDIR:-/tmp}/art-gpu-build-context.XXXXXX")"
+buildkit_manifest_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-buildkit.XXXXXX")"
+build_command_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-command.XXXXXX")"
+build_log_snapshot_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-log.XXXXXX")"
+build_log_offset_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-log-offset.XXXXXX")"
 printf '0' > "${build_log_offset_path}"
 
 mkdir -p "${context_dir}/docker" "${context_dir}/megatron_runtime" \
@@ -331,7 +363,6 @@ cp "${repo_root}/vllm_runtime/pyproject.toml" "${context_dir}/vllm_runtime/pypro
 cp "${repo_root}/vllm_runtime/uv.lock" "${context_dir}/vllm_runtime/uv.lock"
 cp "${repo_root}/.dockerignore" "${context_dir}/.dockerignore"
 cp "${repo_root}/docker/art-gpu.Dockerfile" "${context_dir}/docker/art-gpu.Dockerfile"
-printf '%s' "${registry_auth_json_b64}" | base64 -d > "${registry_auth_json_path}"
 
 echo "Launching temporary BuildKit pod ${cluster_name} on ${infra}"
 echo "Publishing ${image_repo}:${image_tag}"
@@ -466,6 +497,14 @@ if matches:
     print(matches[-1])
 PY
 )"
+if [[ ! "${image_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+  echo "Failed to resolve the pushed image digest" >&2
+  exit 1
+fi
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  printf 'image_digest=%s\n' "${image_digest}" >> "${GITHUB_OUTPUT}"
+fi
+fi
 prewarm_tag_image="${pull_image_repo}:${image_tag}"
 prewarm_image="${prewarm_tag_image}"
 prewarm_refresh_tag_image=""

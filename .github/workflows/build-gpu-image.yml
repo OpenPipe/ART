@@ -178,7 +178,8 @@ jobs:
             printf '\n'
           } >> "${GITHUB_ENV}"
 
-      - name: Build, push, and prewarm GPU image
+      - name: Build, push, and prewarm Modal image
+        id: build
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
@@ -188,14 +189,12 @@ jobs:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
           PREWARM_MODAL_INPUT: ${{ inputs.prewarm_modal }}
-          PREWARM_NODES: ${{ inputs.prewarm_nodes }}
           PREWARM_TIMEOUT: ${{ inputs.prewarm_timeout }}
         run: |
           IMAGE_TAG="${IMAGE_TAG:-latest}"
           NO_CACHE="${NO_CACHE:-false}"
           export PREWARM_MODAL="${PREWARM_MODAL:-auto}"
           PREWARM_MODAL_INPUT="${PREWARM_MODAL_INPUT:-true}"
-          PREWARM_NODES="${PREWARM_NODES:-true}"
           PREWARM_TIMEOUT="${PREWARM_TIMEOUT:-30m}"
 
           args=(
@@ -204,6 +203,7 @@ jobs:
             --image-repo "${IMAGE_REPO}"
             --pull-image-repo "${PULL_IMAGE_REPO}"
             --tag "${IMAGE_TAG}"
+            --no-prewarm-nodes
             --prewarm-timeout "${PREWARM_TIMEOUT}"
           )
 
@@ -215,38 +215,16 @@ jobs:
             args+=(--no-prewarm-modal)
           fi
 
-          if [ "${PREWARM_NODES}" != "true" ]; then
-            args+=(--no-prewarm-nodes)
-          fi
-
           bash scripts/build-gpu-image.sh "${args[@]}"
 
-      - name: Remove temporary image builder and prewarm pods
-        if: ${{ always() }}
-        run: |
-          prewarm_selector="art.openpipe/prewarm-name=art-gpu-image-prewarm,art.openpipe/prewarm-run=${PREWARM_RUN_UID}"
-          kubectl --context cks-wb3 delete pod -n default "${BUILD_CLUSTER_NAME}" \
-            --ignore-not-found --wait=false --request-timeout=30s || true
-          while IFS= read -r infra; do
-            case "${infra}" in
-              k8s/*) context="${infra#k8s/}" ;;
-              kubernetes/*) context="${infra#kubernetes/}" ;;
-              *) continue ;;
-            esac
-            kubectl --context "${context}" delete pod -n default \
-              -l "${prewarm_selector}" \
-              --ignore-not-found --wait=false --request-timeout=30s || true
-          done < <(printf '%s\n' "${PREWARM_INFRAS}" \
-            | awk 'BEGIN { RS = "[[:space:],]+" } NF { print }')
-
-      - name: Smoke launch prewarmed image
+      - name: Smoke launch immutable image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.smoke_launch }}
         env:
           SMOKE_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
-          IMAGE_TAG: ${{ inputs.tag }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}
           SMOKE_GPUS: ${{ inputs.smoke_gpus }}
         run: |
-          IMAGE_TAG="${IMAGE_TAG:-latest}"
+          [[ "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
           SMOKE_GPUS="${SMOKE_GPUS:-H200:1}"
           cluster="art-gpu-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           sky_venv="${RUNNER_TEMP}/skypilot-smoke"
@@ -285,7 +263,7 @@ jobs:
               -c "${cluster}" \
               --infra "${SKY_INFRA}" \
               --gpus "${SMOKE_GPUS}" \
-              --image-id "docker:${SMOKE_IMAGE_REPO}:${IMAGE_TAG}" \
+              --image-id "docker:${SMOKE_IMAGE_REPO}@${IMAGE_DIGEST}" \
               --config kubernetes.remote_identity.cks-wb3=skypilot-workload \
               --config kubernetes.pod_config.spec.schedulerName=binpack-scheduler \
               --config kubernetes.pod_config.spec.activeDeadlineSeconds=604800 \
@@ -300,6 +278,7 @@ jobs:
         env:
           CALADAN_REPOSITORY_DISPATCH_TOKEN: ${{ secrets.CALADAN_REPOSITORY_DISPATCH_TOKEN }}
           ART_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}
           IMAGE_TAG: ${{ inputs.tag || 'latest' }}
         run: |
           if [ -z "${CALADAN_REPOSITORY_DISPATCH_TOKEN}" ]; then
@@ -307,7 +286,8 @@ jobs:
             exit 1
           fi
 
-          payload="$(python3 -c 'import json, os; image_repo = os.environ["ART_IMAGE_REPO"]; image_tag = os.environ["IMAGE_TAG"]; print(json.dumps({"event_type": "art-gpu-image-built", "client_payload": {"art_sha": os.environ["GITHUB_SHA"], "art_ref": os.environ["GITHUB_REF_NAME"], "art_image": f"{image_repo}:{image_tag}", "art_image_repo": image_repo, "art_image_tag": image_tag, "prewarm_infras": os.environ["PREWARM_INFRAS"]}}))')"
+          [[ "${IMAGE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          payload="$(python3 -c 'import json, os; image_repo = os.environ["ART_IMAGE_REPO"]; image_tag = os.environ["IMAGE_TAG"]; image_digest = os.environ["IMAGE_DIGEST"]; print(json.dumps({"event_type": "art-gpu-image-built", "client_payload": {"art_sha": os.environ["GITHUB_SHA"], "art_ref": os.environ["GITHUB_REF_NAME"], "art_image": f"{image_repo}@{image_digest}", "art_image_repo": image_repo, "art_image_tag": image_tag, "art_image_digest": image_digest, "prewarm_infras": os.environ["PREWARM_INFRAS"]}}))')"
 
           curl -fsSL \
             -X POST \
@@ -316,3 +296,39 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY_OWNER}/caladan/dispatches" \
             -d "${payload}"
+
+      - name: Prewarm GPU image on nodes
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.prewarm_nodes }}
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}
+          IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+          IMAGE_TAG: ${{ inputs.tag || 'latest' }}
+          PREWARM_TIMEOUT: ${{ inputs.prewarm_timeout }}
+          PULL_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
+        run: |
+          bash scripts/build-gpu-image.sh \
+            --infra "${SKY_INFRA}" \
+            --image-digest "${IMAGE_DIGEST}" \
+            --image-repo "${IMAGE_REPO}" \
+            --prewarm-nodes-only \
+            --prewarm-timeout "${PREWARM_TIMEOUT:-30m}" \
+            --pull-image-repo "${PULL_IMAGE_REPO}" \
+            --tag "${IMAGE_TAG}"
+
+      - name: Remove temporary image builder and prewarm pods
+        if: ${{ always() }}
+        run: |
+          prewarm_selector="art.openpipe/prewarm-name=art-gpu-image-prewarm,art.openpipe/prewarm-run=${PREWARM_RUN_UID}"
+          kubectl --context cks-wb3 delete pod -n default "${BUILD_CLUSTER_NAME}" \
+            --ignore-not-found --wait=false --request-timeout=30s || true
+          while IFS= read -r infra; do
+            case "${infra}" in
+              k8s/*) context="${infra#k8s/}" ;;
+              kubernetes/*) context="${infra#kubernetes/}" ;;
+              *) continue ;;
+            esac
+            kubectl --context "${context}" delete pod -n default \
+              -l "${prewarm_selector}" \
+              --ignore-not-found --wait=false --request-timeout=30s || true
+          done < <(printf '%s\n' "${PREWARM_INFRAS}" \
+            | awk 'BEGIN { RS = "[[:space:],]+" } NF { print }')
