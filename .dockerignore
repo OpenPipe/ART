@@ -2,6 +2,10 @@ __pycache__/
 .art/
 # .env
 .venv/
+.git/
+.github/
+.claude/
+.ruff_cache/
 grpo_trainer_lora_model/
 logs/
 shared_cache.db
@@ -13,6 +17,8 @@ dist/
 replays/
 trajectories/
 .DS_Store
-# .local/
-# .claude/
 .vscode/
+*.pyc
+examples/*/data/
+examples/*/.venv/
+examples/*/wandb/
