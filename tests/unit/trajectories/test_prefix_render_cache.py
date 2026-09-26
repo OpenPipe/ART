@@ -183,9 +183,9 @@ def test_later_generation_split_is_recomputed_when_completed_suffix_is_equal(
 def test_completed_render_reuse_requires_same_messages_and_generation():
     calls = []
 
-    def render(messages, *, add_generation_prompt):
-        calls.append((deepcopy(messages), add_generation_prompt))
-        return json.dumps(messages) + str(add_generation_prompt)
+    def render(selected_messages, *, add_generation_prompt):
+        calls.append((deepcopy(selected_messages), add_generation_prompt))
+        return json.dumps(selected_messages) + str(add_generation_prompt)
 
     messages = [{"role": "assistant", "content": "original"}]
     cache = tokenization._PrefixChatRenderCache(render)
