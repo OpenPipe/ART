@@ -432,10 +432,7 @@ def test_unproved_historical_offset_declines(
     )
 
 
-@pytest.mark.parametrize("offsets", [False, True])
-def test_interior_historical_parser_cannot_change_sample_conditioning(
-    monkeypatch, offsets
-):
+def _interior_historical_case(offsets=True, selection="literal"):
     from openai.types.chat import ChatCompletion
     from test_literal_thinking_off import _TemplateTokenizer
     from test_tokenize import _chat_exchange
@@ -448,8 +445,28 @@ def test_interior_historical_parser_cannot_change_sample_conditioning(
         + "{{ content }}{% if message.role == 'assistant' %}§{% endif %}{% endfor %}"
     )
 
+    if selection != "literal":
+        template = template.replace(
+            "{{ content }}",
+            "{{ content }}{% for tool_call in message.tool_calls or [] %}{% for key, arg in tool_call.function.arguments.items() %}{{ key }}={{ arg }}{% endfor %}{% endfor %}",
+        )
+
     class Tokenizer(_TemplateTokenizer):
+        chat_template: Any
         eos_token_id = ord("§")
+
+        def get_chat_template(self, chat_template=None, tools=None):
+            if isinstance(self.chat_template, dict):
+                return self.chat_template.get(chat_template or "default", chat_template)
+            return chat_template or self.chat_template
+
+        def apply_chat_template(self, messages, **kwargs):
+            selected = self.get_chat_template(
+                kwargs.pop("chat_template", None), kwargs.get("tools")
+            )
+            return super().apply_chat_template(
+                messages, chat_template=selected, **kwargs
+            )
 
         def __call__(self, text, **kwargs):
             if kwargs.get("return_offsets_mapping") and not offsets:
@@ -457,33 +474,61 @@ def test_interior_historical_parser_cannot_change_sample_conditioning(
             return super().__call__(text, **kwargs)
 
     tokenizer = Tokenizer()
-    tokenizer.chat_template = template
+    tokenizer.chat_template = (
+        template if selection == "literal" else {"default": template, "named": template}
+    )
     messages = [{"role": "user", "content": "first query"}]
     exchanges = []
     records = []
     for index in range(2):
-        prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+        prompt = tokenizer.apply_chat_template(
+            module.normalize_tool_call_arguments_for_chat_template(messages, template),
+            add_generation_prompt=True,
+        )
         assert isinstance(prompt, list)
         output = list(map(ord, f"answer{index}§"))
         exchange = _chat_exchange(prompt, output, offset=index)
         exchange.request["messages"] = cast(
             list[ChatCompletionMessageParam], deepcopy(messages)
         )
-        exchange.request["chat_template"] = template
+        if selection is not None:
+            exchange.request["chat_template"] = (
+                template if selection == "literal" else selection
+            )
         payload = exchange.response.model_dump(mode="python")
         payload["choices"][0]["message"]["content"] = f"answer{index}"
         exchange.response = ChatCompletion.model_validate(payload)
         exchanges.append(exchange)
         records.append((prompt, output))
+        historical: dict[str, Any] = {"role": "assistant", "content": "x</think>y"}
+        if selection != "literal":
+            historical["tool_calls"] = [
+                {
+                    "id": "public-tool",
+                    "type": "function",
+                    "function": {
+                        "name": "public",
+                        "arguments": '{"public": "argument"}',
+                    },
+                }
+            ]
         messages.extend(
             [
                 {"role": "assistant", "content": f"answer{index}"},
                 {"role": "user", "content": "middle query"},
-                {"role": "assistant", "content": "x</think>y"},
+                historical,
                 {"role": "user", "content": "next query"},
             ]
         )
     value = tr.Trajectory(exchanges=tr.TrajectoryExchanges(chat_completions=exchanges))
+    return value, tokenizer, records
+
+
+@pytest.mark.parametrize("offsets", [False, True])
+def test_interior_historical_parser_cannot_change_sample_conditioning(
+    monkeypatch, offsets
+):
+    value, tokenizer, records = _interior_historical_case(offsets)
     original = value.model_dump()
     if not offsets:
         with pytest.raises(ValueError, match="Cannot preserve request roles"):
@@ -522,3 +567,66 @@ def test_interior_historical_parser_cannot_change_sample_conditioning(
         assert tr.first_occurrence_masks(
             actual.histories, where=flag
         ) == tr.first_occurrence_masks(expected.histories, where=flag)
+
+
+@pytest.mark.parametrize("route", ["history", "single", "multi"])
+def test_historical_role_callback_cannot_replace_consumed_earlier_logprob(
+    monkeypatch, route
+):
+    value, tokenizer, _ = _interior_historical_case()
+    first = value.exchanges.chat_completions[0]
+    apply = tokenizer.apply_chat_template
+    calls = []
+
+    def mutate(messages, **kwargs):
+        if kwargs.get("chat_template") == tokenizer.chat_template and len(messages) > 3:
+            calls.append(True)
+            logprobs = first.response.choices[0].logprobs
+            assert logprobs is not None and logprobs.content is not None
+            logprobs.content[0].logprob -= 0.5
+        return apply(messages, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "apply_chat_template", mutate)
+    with pytest.raises(ValueError, match="[Ss]ampled source changed"):
+        if route == "history":
+            value.chat_completions_history().tokenize(tokenizer=tokenizer)
+        else:
+            value.tokenize(tokenizer=tokenizer, multi_history=route == "multi")
+    assert calls
+
+
+@pytest.mark.parametrize("selection", [None, "named"])
+def test_named_original_request_proof_normalizes_tool_arguments(selection):
+    value, tokenizer, records = _interior_historical_case(selection=selection)
+    before = value.model_dump()
+    result = value.tokenize(tokenizer=tokenizer, multi_history=True)
+    assert result.histories[0].tokens == records[-1][0] + records[-1][1]
+    assert value.model_dump() == before
+    literal = value.model_copy(deep=True)
+    for exchange in literal.exchanges.chat_completions:
+        exchange.request["chat_template"] = tokenizer.chat_template["default"]
+    expected = literal.tokenize(tokenizer=tokenizer, multi_history=True)
+    assert result.histories[0].flags == expected.histories[0].flags
+    assert all(
+        a == b or math.isnan(a) and math.isnan(b)
+        for a, b in zip(
+            result.histories[0].logprobs, expected.histories[0].logprobs, strict=True
+        )
+    )
+    for flag in (
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.OUTPUT,
+        tr.TokenFlag.ASSISTANT,
+        tr.TokenFlag.STOP,
+    ):
+        assert tr.first_occurrence_masks(
+            result.histories, where=flag
+        ) == tr.first_occurrence_masks(expected.histories, where=flag)
+    for prompt, output in records:
+        history = result.histories[0]
+        assert history.tokens[: len(prompt)] == prompt
+        assert history.tokens[len(prompt) : len(prompt) + len(output)] == output
+        assert all(
+            flag & tr.TokenFlag.SAMPLED
+            for flag in history.flags[len(prompt) : len(prompt) + len(output)]
+        )

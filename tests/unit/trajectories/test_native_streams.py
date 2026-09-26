@@ -565,11 +565,15 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
 ) -> None:
     trajectory, tokenizer = example()
     first, second, third = trajectory.exchanges.chat_completions
-    record(first).finish_reason = "stop"
+    # Keep the nonterminal length stop: converting it to a STOP completion
+    # removes its copied occurrence from the later sampled-source inventory,
+    # letting the existing native success path return without refinement.
     record(first).model_extra["stop_reason"] = "§"
     record(second).model_extra["stop_reason"] = "§"
     earlier = first
-    if change.startswith("unscoped_"):
+    if change.startswith("unscoped_") or change == "stop_reason":
+        # A length-stopped source ignores stop_reason. Use an earlier actual
+        # STOP completion to test mutation of that consumed semantic input.
         earlier = _chat_exchange(
             tokenizer._encode("separatehistorical§again"),
             tokenizer._encode("answer§"),
@@ -653,14 +657,14 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
                 assert len(expanded) == 1
                 expanded[0].messages[0]["role"] = "assistant"
             else:
-                record(first).model_extra["stop_reason"] = "!"
+                record(earlier).model_extra["stop_reason"] = "!"
         return original_encode(self, text, **kwargs)
 
     monkeypatch.setattr(module, "_require_native_stream", guard)
     monkeypatch.setattr(module, "tokenize_history", history_call)
     monkeypatch.setattr(module, "_native_history_streams", plan_streams)
     monkeypatch.setattr(tokenizer.__class__, "__call__", encode)
-    if change == "unscoped_logprob":
+    if change in {"unscoped_logprob", "stop_reason"}:
         message = "Sampled source changed during tokenization callback"
     elif change.startswith("unscoped_") or change == "expanded_original_role":
         message = "Tokenization context changed during tokenization callback"
