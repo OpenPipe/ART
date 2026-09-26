@@ -527,7 +527,9 @@ _RANK_FIELDS = frozenset(
     "moe_forward_stages".split()
 )
 # Recorded by newer ranks; reports from before it replay with 0 (no dense stage).
-_OPTIONAL_RANK_FIELDS = frozenset({"dense_recompute_bytes_per_token"})
+_OPTIONAL_RANK_FIELDS = frozenset(
+    {"dense_recompute_bytes_per_token", "dense_no_grad_bytes_per_token"}
+)
 
 
 def _signature_values(values: dict[str, Any]) -> dict[str, Any]:
