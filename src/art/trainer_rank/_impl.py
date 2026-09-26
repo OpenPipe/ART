@@ -854,6 +854,9 @@ class _CheckpointSlot:
     custom: dict[str, _CustomObject] = dataclass_field(default_factory=dict)
     custom_payload: "PreparedCustomPayload | None" = None
     snapshot: bool = False
+    # Key for this committed content's routing observations; see
+    # ``TrainerRank._commit_route_epoch``.
+    route_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1553,6 +1556,13 @@ def _expert_lora_weight_storage(
 # Unmeasured EP sizes use the next measured one; above EP8 the allowance grows
 # with log2(EP) up to EP itself (every pair on one rank).
 _EP_ROUTED_ROW_ALLOWANCE = {2: 1.4, 4: 1.6, 8: 2.0}
+# Headroom above a checkpoint's observed routed share when that share exceeds
+# the allowance. For the EP2 policy above, call-to-call change was 0.013 and
+# batch resampling reached about 0.04 above the median.
+_ROUTED_SHARE_MARGIN = 0.10
+# Route epochs travel as float64 in the handoff exchange; stop observing well
+# before two could round to the same value.
+_ROUTE_EPOCH_LIMIT = 2**40
 
 
 def _ep_routed_row_allowance(ep: int) -> float:
@@ -2118,6 +2128,11 @@ class TrainerRank:
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
         self._snapshot_checkpoint_names: set[str] = set()
+        # Highest routed share observed per checkpoint route epoch, identical
+        # on every rank (``_release_cached_memory_for_backward``).
+        self._route_epochs = 0
+        self._routed_share_max: dict[int, float] = {}
+        self._last_routed_share: float | None = None
         self._prepared_lora_exports: dict[str, tuple[str, _PreparedLoraExport]] = {}
         self._checkpoint_prefetches: dict[str, Future[PreparedCheckpoint]] = {}
         self._checkpoint_prefetch_sources: dict[str, str] = {}
@@ -3090,11 +3105,24 @@ class TrainerRank:
         # outputs. Forward has already executed: never replan or retry here.
         with self._cache_recovery_episode(error=error) as (owner, started):
             exchange_error: BaseException | None = None
+            # EP is the same on every rank, so the payload shape is too. Every
+            # rank must reach the exchange, whatever its observation does.
+            routing = getattr(getattr(self, "_parallel_shape", None), "ep", 1) > 1
+            share, epoch = -1.0, -1
+            if routing and error is None:
+                try:
+                    share, epoch = self._local_routed_share(plan)
+                except Exception:
+                    share, epoch = -1.0, -1
+                except BaseException as exc:
+                    # Cancellation still exchanges, as a failed forward.
+                    error = exc
             try:
-                failed, gradients = self._recovery_reduce(
+                failed, gradients, *observed = self._recovery_reduce(
                     [
                         float(error is not None),
                         float(any(group.grad_enabled for group in plan.groups)),
+                        *((share, float(epoch), -float(epoch)) if routing else ()),
                     ],
                     op="MAX",
                     sync_across_dp=True,
@@ -3107,6 +3135,13 @@ class TrainerRank:
                 raise self._memory_error_with_reduction_note(error, exchange_error)
             if failed:
                 raise RuntimeError("Forward failed on another rank before handoff")
+            self._last_routed_share = None
+            if observed:
+                # Record only when every rank observed the same checkpoint
+                # epoch; any empty, unsupported or other-slot rank sends -1.
+                share, highest, lowest = observed
+                if highest >= 0 and highest == -lowest:
+                    self._record_routed_share(int(highest), share)
             if not gradients:
                 return
             self._try_cache_recovery(
@@ -3116,6 +3151,55 @@ class TrainerRank:
                 started=started,
                 handoff_grad=any(group.grad_enabled for group in plan.groups),
             )
+
+    def _local_routed_share(self, plan: _AnyForwardPlan) -> tuple[float, int]:
+        """This rank's worst-layer routed share and checkpoint epoch, or -1s.
+
+        HybridEP keeps each MoE layer's received rows per local expert after
+        combine, so at the handoff of a flat plan with one group they are this
+        forward's dispatch, with or without gradients. The share is the most
+        loaded layer's received pairs over top-k times the balanced rows that
+        pricing scales (``_plan_group_balanced_rows``), so a share above the
+        allowance means more rows arrived than were priced.
+        """
+        if (
+            not isinstance(plan, _FlatForwardPlan)
+            or len(plan.groups) != 1
+            or plan.groups[0].packed.tokens.numel() == 0
+            or plan.signature.topology[2] <= 1
+            or not getattr(self, "_ep_group_is_cp_group", False)
+            or not getattr(self, "_moe_memory_supported", False)
+        ):
+            return -1.0, -1
+        epoch = self._route_epoch(plan.groups[0].slot_ref)
+        (balanced,) = self._plan_group_balanced_rows(plan)
+        if epoch is None or epoch >= _ROUTE_EPOCH_LIMIT or balanced <= 0:
+            return -1.0, -1
+        from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
+
+        managers: list[Any] = []
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                dispatcher = getattr(module, "token_dispatcher", None)
+                manager = getattr(dispatcher, "_comm_manager", None)
+                if type(manager) is _HybridEPManager:
+                    managers.append(manager)
+        if not managers or len(managers) != self._moe_layers:
+            return -1.0, -1
+        received = torch.stack(
+            [manager.tokens_per_expert.detach().sum() for manager in managers]
+        )
+        topk = managers[0].config.moe_router_topk
+        return int(received.max().item()) / (topk * balanced), epoch
+
+    def _record_routed_share(self, epoch: int, share: float) -> None:
+        shares = self._routed_share_max
+        shares[epoch] = max(share, shares.get(epoch, share))
+        self._last_routed_share = share
+        observation = getattr(self, "_planner_observation", None)
+        if observation is not None:
+            replay = observation["replay"]
+            observation["replay"] = lambda: {**replay(), "routed_share": share}
 
     @overload
     def dp_rank_forward(
@@ -4082,6 +4166,70 @@ class TrainerRank:
         )
 
     def _plan_group_routed_rows(self, plan: _FlatForwardPlan) -> tuple[int, ...]:
+        """Balanced rows per group, raised to each slot's observed routing.
+
+        The cold allowance prices top-k x allowance pairs per balanced row. A
+        checkpoint whose worst observed share plus a margin exceeds that is
+        priced at the higher share instead; nothing is ever priced lower.
+        """
+        balanced = self._plan_group_balanced_rows(plan)
+        shares = [self._observed_routed_share(group.slot_ref) for group in plan.groups]
+        if all(share is None for share in shares):
+            return balanced
+        cold = _ep_routed_row_allowance(self._parallel_shape.ep)
+        return tuple(
+            rows
+            if share is None or share + _ROUTED_SHARE_MARGIN <= cold
+            else math.ceil(rows * (share + _ROUTED_SHARE_MARGIN) / cold)
+            for rows, share in zip(balanced, shares, strict=True)
+        )
+
+    def _route_epoch(self, ref: "LoRASlotRef | None") -> int | None:
+        if ref is None or ref.name is None:
+            return None
+        slot = getattr(self, "_checkpoint_slots", {}).get(ref.name)
+        return None if slot is None else slot.route_epoch
+
+    def _observed_routed_share(self, ref: "LoRASlotRef | None") -> float | None:
+        epoch = self._route_epoch(ref)
+        if epoch is None:
+            return None
+        return getattr(self, "_routed_share_max", {}).get(epoch)
+
+    def _commit_route_epoch(
+        self,
+        name: str,
+        previous: _CheckpointSlot | None = None,
+        *,
+        source: _CheckpointSlot | None = None,
+    ) -> None:
+        """Key a checkpoint's routing observations after every rank committed it.
+
+        Callers run this once the commit agreed across ranks, in the same order
+        everywhere, so each rank gives the same content the same new epoch.
+        Epochs are never reused. Loading over a name forgets the old content's
+        observations; optimizer steps keep the epoch, so its share only grows.
+        A snapshot starts from its ``source``'s share: same weights, same
+        routing.
+        """
+        epoch = self._route_epochs
+        self._checkpoint_slots[name].route_epoch = epoch
+        self._route_epochs += 1
+        inherited = (
+            None
+            if source is None or source.route_epoch is None
+            else self._routed_share_max.get(source.route_epoch)
+        )
+        if inherited is not None:
+            self._routed_share_max[epoch] = inherited
+        if previous is not None:
+            self._forget_route_epoch(previous)
+
+    def _forget_route_epoch(self, slot: _CheckpointSlot) -> None:
+        if slot.route_epoch is not None:
+            self._routed_share_max.pop(slot.route_epoch, None)
+
+    def _plan_group_balanced_rows(self, plan: _FlatForwardPlan) -> tuple[int, ...]:
         """Rows one rank's experts receive per group at balanced routing.
 
         HybridEP dispatches the whole EP group's rows. When that group is this
@@ -4762,6 +4910,7 @@ class TrainerRank:
 
     def _reset_planning_telemetry(self) -> None:
         self._planning_seconds_accum = 0.0
+        self._last_routed_share = None
         with self._layout_cache_lock:
             self._speculative_planning_seconds = 0.0
 
@@ -4775,6 +4924,9 @@ class TrainerRank:
             if isinstance(plan, _SplitForwardPlan)
             else (tuple(range(plan.request_count)),)
         )
+        # Consume the share so a later forward without a handoff reports none.
+        routed_share = getattr(self, "_last_routed_share", None)
+        self._last_routed_share = None
         self._last_forward_telemetry_snapshot = {
             "planning_ms": self._planning_seconds_accum * 1_000.0,
             "speculative_planning_ms": speculative_seconds * 1_000.0,
@@ -4785,6 +4937,7 @@ class TrainerRank:
             "subforward_request_indices": partition,
             "predicted_peak_bytes": check.estimated_required_bytes,
             "usable_limit_bytes": check.available_bytes,
+            "routed_share": routed_share,
         }
 
     def last_forward_telemetry(self) -> dict[str, Any]:
@@ -4799,7 +4952,9 @@ class TrainerRank:
         are the admitted plan's memory check (for a split: every retained
         graph plus the largest subforward's ephemeral share). A call refused
         with ``TrainerRankMemoryError`` is still reflected, with the binding
-        check that refused it.
+        check that refused it. ``routed_share`` is the micro-batch's worst
+        observed expert-parallel routed share over its balanced rows, when
+        every rank observed the same checkpoint, and otherwise None.
         """
 
         if self._last_forward_telemetry_snapshot is None:
@@ -6754,6 +6909,12 @@ class TrainerRank:
                                 self._plan_hybridep_growth_bytes(child)
                             ),
                         },
+                        # Each group's observed share behind its routed rows;
+                        # None prices the cold allowance.
+                        "routed_share_max": [
+                            self._observed_routed_share(group.slot_ref)
+                            for group in child.groups
+                        ],
                         "expected_required_bytes": cost.required,
                         "retained_bytes": cost.retained,
                         "cost_components": asdict(cost),

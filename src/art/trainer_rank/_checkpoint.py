@@ -1577,6 +1577,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
         destination,
         dict(source_slot.config),
         source_slot.revision,
+        source_slot.route_epoch,
         destination_slot is not None,
     )
     if any(value != identity for value in _gather(identity, group)):
@@ -1643,6 +1644,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
         _restore_slots(model_snapshot)
         trainer._checkpoint_slots.pop(destination, None)
         raise
+    trainer._commit_route_epoch(destination, source=source_slot)
     trainer._snapshot_checkpoint_names.add(destination)
     return True
 
@@ -1655,7 +1657,13 @@ def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
         trainer._default_slot_ref is not None
         and trainer._default_slot_ref.name == checkpoint
     ) or any(ref.name == checkpoint for ref in trainer._slot_stack)
-    state = (slot is not None, False if slot is None else slot.snapshot, active)
+    state = (
+        checkpoint,
+        slot is not None,
+        False if slot is None else slot.snapshot,
+        None if slot is None else slot.route_epoch,
+        active,
+    )
     if any(value != state for value in _gather(state, group)):
         raise trainer._slot_state_error(
             "Checkpoint snapshot state differs across ranks"
@@ -1688,6 +1696,7 @@ def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
         _restore_slots(model_snapshot)
         trainer._checkpoint_slots[checkpoint] = slot
         raise
+    trainer._forget_route_epoch(slot)
 
 
 def _commit_slot(trainer: TrainerRank, source: str, destination: str) -> None:
@@ -1846,9 +1855,24 @@ def load_checkpoint(
     forward_only: bool = False,
 ) -> None:
     group = _ensure_group(trainer)
-    if any(value != source.digest for value in _gather(source.digest, group)):
+    # Every rank must replace the same name, holding the same content, at the
+    # same point in its epoch sequence, so each gives the new content the same
+    # route epoch and forgets the same one.
+    current = trainer._checkpoint_slots.get(name)
+    target = (
+        source.digest,
+        name,
+        None if current is None else current.route_epoch,
+        getattr(trainer, "_route_epochs", 0),
+    )
+    targets = _gather(target, group)
+    if any(value[0] != source.digest for value in targets):
         raise trainer._slot_state_error(
             f"Checkpoint {name!r} content differs across ranks"
+        )
+    if any(value != target for value in targets):
+        raise trainer._slot_state_error(
+            f"Checkpoint {name!r} load target differs across ranks"
         )
     config = _phase(
         lambda: trainer._validate_checkpoint_adapter_config(
@@ -1959,6 +1983,7 @@ def load_checkpoint(
     except BaseException:
         _rollback_load(trainer, snapshot, temporary, name, previous, group)
         raise
+    trainer._commit_route_epoch(name, previous)
 
 
 def snapshot_prepared_checkpoint(
