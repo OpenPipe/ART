@@ -150,5 +150,8 @@ def test_empty_remote_stage_and_missing_local_stage():
     full = stage(2, local=False, q=rows, k=512)
     both = retained(plan(rows, small, full))
     without_small_tape = retained(plan(rows, full))
-    assert both - without_small_tape == Q * 256 + KV * 256 + FLEX * 256 + TAPE * rows
+    # The dropped tape's int64 index stays: the executor keeps it regardless.
+    assert both - without_small_tape == (
+        Q * 256 + KV * 256 + FLEX * 256 + 8 * 256 + TAPE * rows
+    )
     assert retained(plan(rows)) == 0

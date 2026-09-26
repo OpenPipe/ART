@@ -1562,8 +1562,8 @@ def minimum_retained_bytes_per_row(
     """The least ``retained_stage_record_bytes`` keeps per own row.
 
     Every rank with rows runs a local stage over all of them (each row attends
-    to itself); an aligned one keeps only the contiguous copies of multi-head
-    views, flex's output and its two LSEs.
+    to itself); an aligned one keeps at least the contiguous copies of
+    multi-head views, flex's output and its two LSEs.
     """
     copies = (q_heads > 1) * q_heads * head_dim + (kv_heads > 1) * kv_heads * (
         head_dim + value_head_dim
@@ -1642,8 +1642,10 @@ def retained_stage_record_bytes(
         total += (out_row + 2 * lse_row) * q_pad
         if q_pad != q_len:
             total += (out_row + lse_row) * q_len
-        # A partial-query tape also keeps its int64 row index.
-        tape = tape_row * own if q_full else (tape_row + 8) * q_len
+        tape = tape_row * (own if q_full else q_len)
+        if not q_full:
+            # Its int64 row index is kept even by the first producing stage.
+            total += 8 * q_len
         if stage.is_local_stage:
             local_produced = True
         else:
