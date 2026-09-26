@@ -152,7 +152,7 @@ def test_mixed_gradient_handoff_preserves_actual_check_profile_and_context(monke
     monkeypatch.setattr(
         rank,
         "_update_peak_memory_profile",
-        lambda plan, baseline: profiles.append((plan, baseline)),
+        lambda plan, baseline, **_: profiles.append((plan, baseline)),
     )
     state = allocator(monkeypatch)
     original_phase = _impl._telemetry_phase

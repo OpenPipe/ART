@@ -614,6 +614,16 @@ class _MemoryProfile:
     # Separate the retained compute rate from the peak, which also learns
     # caller-owned backward workspace. Requested outputs are charged explicitly.
     retained_compute_bytes_per_token: float | None = None
+    # A signature's first executed plan also pays one-time costs (compilation,
+    # first-use workspaces), which a small first wave spreads over few tokens.
+    # Admission uses the lower of the fit over every observation and the same
+    # fit over later flat waves' whole caller-phase peaks (forward plus the
+    # caller's loss and backward in the yield), which prices a wave smaller
+    # than the smallest of them as if it were that large.
+    warm_bytes_per_token: float | None = None
+    warm_packed_tokens: int | None = None
+    warm_logical_per_packed: float | None = None
+    caller_plans: int = 0
 
 
 @dataclass(frozen=True)
@@ -2031,6 +2041,9 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._cache_recovery_state = _CacheRecoveryState()
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
+        # Tracked peak-counter resets, and the latest (resets, peak) reading.
+        self._peak_resets = 0
+        self._peak_reading: tuple[int, int] | None = None
         self._split_memory_floors: dict[bytes, int] = {}
         self._split_memory_floor_status = "not_observed"
         self._last_global_micro_batch_size: int | None = None
@@ -2803,7 +2816,10 @@ class TrainerRank:
         rows and charges 6 KiB per logical token for the head plus the caller's
         loss saves and backward transients. A caller whose per-token head and
         loss memory peaks above that is unsupported: shared plans can exceed
-        their estimate.
+        their estimate. Backward is learned only when it runs inside the yield;
+        a backward deferred past it is not. A wave with another TrainerRank
+        forward inside its yield cannot lower later estimates below the
+        signature's first wave.
         """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
@@ -2882,6 +2898,7 @@ class TrainerRank:
             outputs: list[Any] = []
             flat_outputs = iter(tracked_outputs)
             error: BaseException | None = None
+            interval: tuple[int, int] | None = None
             try:
                 if isinstance(candidate.plan, _FlatForwardPlan):
                     tracked_outputs, memory_baseline = (
@@ -2891,6 +2908,8 @@ class TrainerRank:
                             context="forward_micro_batches",
                         )
                     )
+                    # This wave's peak interval, which its caller phase continues.
+                    interval = self.__dict__.get("_peak_reading")
                 else:
                     tracked_outputs, memory_baseline, forward_peak = (
                         self._execute_split_plan_with_memory_tracking(
@@ -2957,7 +2976,12 @@ class TrainerRank:
             # optimizer headroom. Peak only: the retained observation belongs
             # to the forward's return, already recorded for this same plan.
             if isinstance(candidate.plan, _FlatForwardPlan):
-                self._update_peak_memory_profile(candidate.plan, memory_baseline)
+                self._update_peak_memory_profile(
+                    candidate.plan,
+                    memory_baseline,
+                    caller_phase=True,
+                    interval=interval,
+                )
             elif memory_baseline is not None:
                 self._record_split_memory_floor(
                     candidate.plan, memory_baseline, forward_peak
@@ -6227,6 +6251,7 @@ class TrainerRank:
             torch.cuda.synchronize(self.device)
             baseline = int(torch.cuda.memory_allocated(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
+            self._peak_resets = self.__dict__.get("_peak_resets", 0) + 1
         else:
             baseline = None
         observation = getattr(self, "_planner_observation", None)
@@ -6277,6 +6302,9 @@ class TrainerRank:
         plan: _FlatForwardPlan,
         baseline: int | None,
         retained_after: int | None = None,
+        *,
+        caller_phase: bool = False,
+        interval: tuple[int, int] | None = None,
     ) -> None:
         if baseline is None:
             return
@@ -6284,12 +6312,21 @@ class TrainerRank:
         observation = getattr(self, "_planner_observation", None)
         if observation is not None:
             observation["peak"] = max(observation["peak"], peak)
+        resets = self.__dict__.get("_peak_resets", 0)
+        self._peak_reading = (resets, peak)
         self._update_memory_profile(
             plan,
             max(0, peak - baseline),
             retained_bytes=(
                 None if retained_after is None else max(0, retained_after - baseline)
             ),
+            # Only a whole wave: a nested forward resetting the counter during
+            # the yield, or an untracked reset (the counter fell below this
+            # wave's forward peak), leaves the peak since then short of it.
+            caller_phase=caller_phase
+            and interval is not None
+            and interval[0] == resets
+            and peak >= interval[1],
         )
 
     def _begin_planner_observation(
@@ -8051,27 +8088,52 @@ class TrainerRank:
         # usual trust growth. Normalize before multiplying: cancelling packed
         # tokens through two float operations can otherwise make a larger warm
         # layout cheaper.
-        profiled_tokens: int | float = packed_tokens
         packed_priced = profiled is not None and _packed_priced(
             signature, self._one_layer_recompute()
         )
-        if profiled is not None and logical_tokens is not None:
-            profiled_tokens = max(
+
+        def profiled_tokens(logical_per_packed: float) -> int | float:
+            if logical_tokens is None:
+                return packed_tokens
+            return max(
                 packed_tokens,
                 logical_tokens
-                / profiled.logical_per_packed
+                / logical_per_packed
                 / (_MEMORY_PROFILE_TRUST_GROWTH if packed_priced else 1),
             )
+
         # The trust window limits calibration growth, not the empirical floor.
         # Dropping that floor beyond the window can admit a larger request that
         # was refused just inside it, even below a previously observed peak.
         if profiled is None:
             compute = static_compute
         else:
+            profiled_bytes = profiled.bytes_per_token * profiled_tokens(
+                profiled.logical_per_packed
+            )
+            if (
+                profiled.warm_bytes_per_token is not None
+                and profiled.warm_packed_tokens is not None
+                and profiled.warm_logical_per_packed is not None
+            ):
+                # Later plans' own sharing: a rate learned under lighter
+                # sharing scales up for deeper-shared plans, as above. Pricing
+                # smaller waves as the smallest later plan keeps cost monotone
+                # in tokens, which the width search's bounds rely on; it is
+                # sound where a wave's memory is a fixed cost plus a per-token
+                # rate, as that plan's rate covers its share of the fixed cost.
+                profiled_bytes = min(
+                    profiled_bytes,
+                    profiled.warm_bytes_per_token
+                    * max(
+                        profiled.warm_packed_tokens,
+                        profiled_tokens(profiled.warm_logical_per_packed),
+                    ),
+                )
             compute = max(
                 static_compute,
                 int(
-                    profiled.bytes_per_token * profiled_tokens
+                    profiled_bytes
                     + (
                         _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
                         # Branch states grow with segments, not packed rows;
@@ -8244,12 +8306,33 @@ class TrainerRank:
         peak_delta_bytes: int,
         *,
         retained_bytes: int | None,
+        caller_phase: bool = False,
     ) -> None:
         if plan.packed_tokens <= 0:
             return
         compute_delta = max(0, peak_delta_bytes - plan.output_bytes)
         bytes_per_token = compute_delta / max(1, plan.packed_tokens)
         previous = self._memory_profiles.get(plan.signature)
+        logical_per_packed = plan.active_logical_tokens / max(1, plan.packed_tokens)
+        warm_rate = None if previous is None else previous.warm_bytes_per_token
+        warm_tokens = None if previous is None else previous.warm_packed_tokens
+        warm_sharing = None if previous is None else previous.warm_logical_per_packed
+        caller_plans = 0 if previous is None else previous.caller_plans
+        # Only a flat wave's whole caller phase covers the caller's backward;
+        # split children and dp_rank_forward observe forward only. A caller that
+        # defers backward past the yield is not covered. The profile's first
+        # such plan also pays one-time costs, so it is not warm.
+        if caller_phase:
+            if caller_plans:
+                warm_rate = max(bytes_per_token, warm_rate or 0.0)
+                warm_tokens = min(plan.packed_tokens, warm_tokens or plan.packed_tokens)
+                warm_sharing = max(logical_per_packed, warm_sharing or 1.0)
+            caller_plans += 1
+        elif caller_plans:
+            # After the seed, other readings cannot fit the warm profile, but a
+            # higher one still raises its rate (inert until a whole warm plan
+            # fits the rest), as it raises the fit over every observation.
+            warm_rate = max(warm_rate or 0.0, bytes_per_token)
         retained_fraction = None if previous is None else previous.retained_fraction
         retained_compute = (
             None if previous is None else previous.retained_compute_bytes_per_token
@@ -8278,11 +8361,15 @@ class TrainerRank:
                 0 if previous is None else previous.packed_tokens,
             ),
             logical_per_packed=max(
-                plan.active_logical_tokens / max(1, plan.packed_tokens),
+                logical_per_packed,
                 1.0 if previous is None else previous.logical_per_packed,
             ),
             retained_fraction=retained_fraction,
             retained_compute_bytes_per_token=retained_compute,
+            warm_bytes_per_token=warm_rate,
+            warm_packed_tokens=warm_tokens,
+            warm_logical_per_packed=warm_sharing,
+            caller_plans=caller_plans,
         )
 
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:
