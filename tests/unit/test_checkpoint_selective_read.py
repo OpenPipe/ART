@@ -18,7 +18,7 @@ import torch
 from art.trainer_rank import _checkpoint
 
 
-def _eager(prepared, relative, prefix, keys=None):
+def _eager(prepared, relative, prefix, keys=None, *, snapshot=None):
     payload = load_file(prepared.snapshot / relative)
     if keys is None:
         return {
@@ -44,6 +44,11 @@ class _Meta:
 
 @pytest.fixture
 def dependencies(monkeypatch):
+    _dependencies(monkeypatch)
+    monkeypatch.setattr(_checkpoint, "_ensure_finalize_group", lambda trainer: None)
+
+
+def _dependencies(monkeypatch):
     # Only the unchanged single-rank replicated merge and config writer are stand-ins.
     publish = ModuleType("art.megatron.weights.lora_publish")
 
@@ -65,7 +70,6 @@ def dependencies(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, publish.__name__, publish)
     monkeypatch.setitem(sys.modules, disk.__name__, disk)
-    monkeypatch.setattr(_checkpoint, "_ensure_finalize_group", lambda trainer: None)
 
 
 def _prepared(root, *, dtype=torch.bfloat16, rank=1, optimizer=True, damage=None):
@@ -325,3 +329,71 @@ def test_only_requested_component_bytes_materialized(
         results[name] = (len(reads), sum(size for _, size in reads))
     assert results["eager"] == (100, 5160)
     assert results["selective"] == (20, 1032)
+
+
+def test_finalizer_opens_and_indexes_each_snapshot_once(
+    dependencies, monkeypatch, tmp_path
+):
+    real = safetensors.safe_open
+    events = []
+
+    class Tracking:
+        def __init__(self, filename, **kwargs):
+            self.reader = real(filename, **kwargs)
+            self.path = Path(filename)
+
+        def __enter__(self):
+            self.reader.__enter__()
+            if self.path.parent.name == "snapshot":
+                events.append(("open", self.path.name))
+            return self
+
+        def __exit__(self, *args):
+            try:
+                return self.reader.__exit__(*args)
+            finally:
+                if self.path.parent.name == "snapshot":
+                    events.append(("close", self.path.name))
+
+        def offset_keys(self):
+            events.append(("index", self.path.name))
+            return self.reader.offset_keys()
+
+        def keys(self):
+            return self.reader.keys()
+
+        def get_tensor(self, key):
+            return self.reader.get_tensor(key)
+
+    monkeypatch.setattr(safetensors, "safe_open", Tracking)
+    prepared = _prepared(tmp_path)
+    _checkpoint.finish_checkpoint_save(_trainer(prepared), str(prepared.destination))
+    assert events == [
+        (action, f"block{block}.safetensors")
+        for block in range(2)
+        for action in ("open", "index", "close")
+    ]
+
+
+def test_block_reader_multiple_files_selected_keys_and_tensor_lifetime(tmp_path):
+    payload = {"lora/a": torch.tensor([-0.0, 3.0]), "step/a": torch.tensor(350.0)}
+    for name in ("one", "two"):
+        save_file(payload, tmp_path / name)
+    prepared = cast(_checkpoint._PreparedSave, SimpleNamespace(snapshot=tmp_path))
+    with _checkpoint._snapshot_block(None) as snapshot:
+        first = _checkpoint._read_snapshot(
+            prepared, "one", "lora", iter(["a", "a"]), snapshot=snapshot
+        )
+        second = _checkpoint._read_snapshot(prepared, "two", "step", snapshot=snapshot)
+        with pytest.raises(KeyError):
+            _checkpoint._read_snapshot(
+                prepared, "one", "lora", ["missing"], snapshot=snapshot
+            )
+    for name in ("one", "two"):
+        (tmp_path / name).unlink()
+    assert list(first) == ["a"]
+    assert (
+        first["a"].view(torch.int32).tolist()
+        == payload["lora/a"].view(torch.int32).tolist()
+    )
+    assert second["a"].item() == 350.0

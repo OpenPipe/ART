@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
@@ -21,6 +22,8 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
+    from safetensors import safe_open
+
     from art.megatron.lora import LoRA, LoraShardMeta, LoRASlotRef
     from art.trainer_rank._impl import (
         TrainerRank,
@@ -1021,24 +1024,63 @@ def prepare_checkpoint_save(
             trainer._checkpoint_save_condition.notify_all()
 
 
+@dataclass
+class _SnapshotBlock:
+    opened: ExitStack
+    payloads: dict[str, tuple[safe_open, list[str], set[str]]] = field(
+        default_factory=dict
+    )
+    shards: dict[str, list[_LocalShard]] | None = None
+
+
+@contextmanager
+def _snapshot_block(group: dist.ProcessGroup | None) -> Iterator[_SnapshotBlock]:
+    opened = ExitStack()
+    primary: BaseException | None = None
+    try:
+        yield _SnapshotBlock(opened)
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        error: BaseException | None = None
+        try:
+            opened.close()
+        except BaseException as exc:
+            error = exc
+        try:
+            raise_distributed(error, "close checkpoint snapshot block", group)
+        except BaseException as exc:
+            if primary is None:
+                raise
+            primary.add_note(f"Checkpoint snapshot close also failed: {exc!r}")
+
+
 def _read_snapshot(
     prepared: _PreparedSave,
     relative: str,
     prefix: str,
     keys: Iterable[str] | None = None,
+    *,
+    snapshot: _SnapshotBlock | None = None,
 ) -> dict[str, torch.Tensor]:
     safe_open = importlib.import_module("safetensors").safe_open
-    with safe_open(
-        prepared.snapshot / relative, framework="pt", device="cpu"
-    ) as payload:
-        names = payload.offset_keys()
+    with ExitStack() as opened:
+        if snapshot is None:
+            snapshot = _SnapshotBlock(opened)
+        if relative not in snapshot.payloads:
+            payload = snapshot.opened.enter_context(
+                safe_open(prepared.snapshot / relative, framework="pt", device="cpu")
+            )
+            names = payload.offset_keys()
+            snapshot.payloads[relative] = payload, names, set(names)
+        payload, names, available = snapshot.payloads[relative]
         if keys is None:
             keys = [
                 key.removeprefix(f"{prefix}/")
                 for key in names
                 if key.startswith(f"{prefix}/")
             ]
-        available = set(names)
         tensors = {}
         for key in keys:
             name = f"{prefix}/{key}"
@@ -1049,8 +1091,13 @@ def _read_snapshot(
 
 
 def _matching_shards(
-    prepared: _PreparedSave, metadata: Sequence[LoraShardMeta]
+    prepared: _PreparedSave,
+    metadata: Sequence[LoraShardMeta],
+    *,
+    snapshot: _SnapshotBlock | None = None,
 ) -> dict[str, list[_LocalShard]]:
+    if snapshot is not None and snapshot.shards is not None:
+        return snapshot.shards
     by_key: dict[str, list[LoraShardMeta]] = {}
     for item in metadata:
         by_key.setdefault(item.key, []).append(item)
@@ -1058,6 +1105,8 @@ def _matching_shards(
     for record in prepared.shards:
         if record.metadata in by_key.get(record.metadata.key, ()):
             matched.setdefault(record.metadata.key, []).append(record)
+    if snapshot is not None:
+        snapshot.shards = matched
     return matched
 
 
@@ -1066,6 +1115,8 @@ def _merge_component(
     metadata: Sequence[LoraShardMeta],
     component: str,
     group: dist.ProcessGroup | None,
+    *,
+    snapshot: _SnapshotBlock | None = None,
 ) -> dict[str, torch.Tensor]:
     from art.megatron.weights.lora_publish import merge_sharded_adapter_entries
 
@@ -1074,7 +1125,7 @@ def _merge_component(
     error: BaseException | None = None
     try:
         if owned:
-            shards = _matching_shards(prepared, owned)
+            shards = _matching_shards(prepared, owned, snapshot=snapshot)
             files = {record.file for records in shards.values() for record in records}
             for relative in files:
                 keys = [
@@ -1087,7 +1138,11 @@ def _merge_component(
                     )
                     == relative
                 ]
-                local.update(_read_snapshot(prepared, relative, component, keys))
+                local.update(
+                    _read_snapshot(
+                        prepared, relative, component, keys, snapshot=snapshot
+                    )
+                )
     except BaseException as exc:
         error = exc
     raise_distributed(error, f"read checkpoint {component} block", group)
@@ -1204,67 +1259,76 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
     lora_shards: list[Path] = []
     try:
         for index, block in enumerate(blocks):
-            block_metadata = [item for item in selected if item.block == block]
-            lora = _merge_component(prepared, block_metadata, "lora", group)
-            relative = f".adapter-{index:06d}.safetensors"
-            _rank_zero_phase(
-                lambda: importlib.import_module("safetensors.torch").save_file(
-                    lora, temporary / relative
-                ),
-                "write checkpoint adapter block",
-                group,
-            )
-            if _rank() == 0:
-                lora_shards.append(temporary / relative)
-            if prepared.optimizer is None:
-                continue
-            files: list[str] = []
-            for component in ("master", "exp_avg", "exp_avg_sq"):
-                tensors = _merge_component(prepared, block_metadata, component, group)
-                relative = f"optimizer/{component}-{index:06d}.safetensors"
-
-                def write_optimizer_block() -> None:
-                    (temporary / "optimizer").mkdir(exist_ok=True)
-                    importlib.import_module("safetensors.torch").save_file(
-                        tensors, temporary / relative
-                    )
-
+            with _snapshot_block(group) as snapshot:
+                block_metadata = [item for item in selected if item.block == block]
+                lora = _merge_component(
+                    prepared, block_metadata, "lora", group, snapshot=snapshot
+                )
+                relative = f".adapter-{index:06d}.safetensors"
                 _rank_zero_phase(
-                    write_optimizer_block, "write checkpoint optimizer block", group
+                    lambda: importlib.import_module("safetensors.torch").save_file(
+                        lora, temporary / relative
+                    ),
+                    "write checkpoint adapter block",
+                    group,
                 )
-                files.append(relative)
-            if _rank() == 0:
-                for key in (item.key for item in block_metadata):
-                    parameters[key] = list(files)
-            owned = [item for item in block_metadata if item.owner_rank == _rank()]
-            local_steps: dict[str, float] = {}
-            error: BaseException | None = None
-            try:
-                for relative in {
-                    record.file
-                    for records in _matching_shards(prepared, owned).values()
-                    for record in records
-                }:
-                    local_steps.update(
-                        (key, float(value.item()))
-                        for key, value in _read_snapshot(
-                            prepared, relative, "step"
-                        ).items()
+                if _rank() == 0:
+                    lora_shards.append(temporary / relative)
+                if prepared.optimizer is None:
+                    continue
+                files: list[str] = []
+                for component in ("master", "exp_avg", "exp_avg_sq"):
+                    tensors = _merge_component(
+                        prepared, block_metadata, component, group, snapshot=snapshot
                     )
-            except BaseException as exc:
-                error = exc
-            raise_distributed(error, "read checkpoint optimizer steps", group)
-            step_values: dict[str, set[float]] = {}
-            for values in _gather(local_steps, group):
-                for key, value in values.items():
-                    step_values.setdefault(key, set()).add(value)
-            if mismatched := {
-                key: values for key, values in step_values.items() if len(values) != 1
-            }:
-                raise trainer._slot_state_error(
-                    f"Optimizer shard steps differ: {mismatched}"
-                )
-            steps.update((key, values.pop()) for key, values in step_values.items())
+                    relative = f"optimizer/{component}-{index:06d}.safetensors"
+
+                    def write_optimizer_block() -> None:
+                        (temporary / "optimizer").mkdir(exist_ok=True)
+                        importlib.import_module("safetensors.torch").save_file(
+                            tensors, temporary / relative
+                        )
+
+                    _rank_zero_phase(
+                        write_optimizer_block, "write checkpoint optimizer block", group
+                    )
+                    files.append(relative)
+                if _rank() == 0:
+                    for key in (item.key for item in block_metadata):
+                        parameters[key] = list(files)
+                owned = [item for item in block_metadata if item.owner_rank == _rank()]
+                local_steps: dict[str, float] = {}
+                error: BaseException | None = None
+                try:
+                    for relative in {
+                        record.file
+                        for records in _matching_shards(
+                            prepared, owned, snapshot=snapshot
+                        ).values()
+                        for record in records
+                    }:
+                        local_steps.update(
+                            (key, float(value.item()))
+                            for key, value in _read_snapshot(
+                                prepared, relative, "step", snapshot=snapshot
+                            ).items()
+                        )
+                except BaseException as exc:
+                    error = exc
+                raise_distributed(error, "read checkpoint optimizer steps", group)
+                step_values: dict[str, set[float]] = {}
+                for values in _gather(local_steps, group):
+                    for key, value in values.items():
+                        step_values.setdefault(key, set()).add(value)
+                if mismatched := {
+                    key: values
+                    for key, values in step_values.items()
+                    if len(values) != 1
+                }:
+                    raise trainer._slot_state_error(
+                        f"Optimizer shard steps differ: {mismatched}"
+                    )
+                steps.update((key, values.pop()) for key, values in step_values.items())
 
         def commit() -> None:
             safe_open = importlib.import_module("safetensors").safe_open
