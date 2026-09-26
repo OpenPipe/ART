@@ -372,7 +372,10 @@ def _validate_manifest(
             parameters[key] = normalized
             files.update(normalized)
         if any(
-            not isinstance(value, int | float) or isinstance(value, bool)
+            not isinstance(value, int | float)
+            or isinstance(value, bool)
+            or value < 0
+            or (isinstance(value, float) and not value.is_integer())
             for value in steps.values()
         ):
             raise RuntimeError("Checkpoint optimizer steps are invalid")
