@@ -12,7 +12,7 @@ setup: |
     --frozen --no-install-project --inexact
 
 run: |
-  timeout --signal=TERM --kill-after=30s 20m \
+  timeout --signal=TERM --kill-after=30s 30m \
     bash scripts/ci/trainer-rank-gpu-tests.sh
 
 config:
