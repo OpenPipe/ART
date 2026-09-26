@@ -3442,6 +3442,7 @@ class TrainerRank:
             # execution belongs to the private model stream.
             materialized = self._capture_forward_options(inputs, options)
             requests = list(_flatten(materialized))
+        error: BaseException | None = None
         try:
             with torch.set_grad_enabled(enabled), self._rng.model():
                 self._reset_planning_telemetry()
@@ -3452,11 +3453,21 @@ class TrainerRank:
                     plan, check=check, context="forward"
                 )
                 outputs = _unflatten(materialized, iter(tracked_outputs))
+        except BaseException as exc:
+            error = exc
+            raise
         finally:
             # Failed peers must leave this frontier before the command layer's
             # error exchange, just as successful peers do. Caller RNG is restored
             # by model() before this collective, including on execution failure.
-            self._rng.synchronize(caller_group())
+            try:
+                self._rng.synchronize(caller_group())
+            except BaseException as sync_error:
+                if error is None:
+                    raise
+                self._memory_error_with_reduction_note(
+                    error, sync_error, operation="RNG synchronization"
+                )
         return outputs
 
     def _execute_admitted_plan(
@@ -8614,7 +8625,10 @@ class TrainerRank:
 
     @staticmethod
     def _memory_error_with_reduction_note(
-        error: BaseException, exchange_error: BaseException | None
+        error: BaseException,
+        exchange_error: BaseException | None,
+        *,
+        operation: str = "memory reduction",
     ) -> BaseException:
         # Raise outside the exchange handler to preserve the local error's chain.
         # A secondary poisoned-communicator failure is diagnostic, not the primary.
@@ -8622,7 +8636,7 @@ class TrainerRank:
             try:
                 BaseException.add_note(
                     error,
-                    "Secondary memory reduction failure:\n"
+                    f"Secondary {operation} failure:\n"
                     + "".join(traceback.format_exception(exchange_error)),
                 )
             except BaseException:

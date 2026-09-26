@@ -160,6 +160,57 @@ def test_forward_failure_restores_caller_and_advances_model(monkeypatch):
         assert torch.equal(torch.rand(7), torch.rand(7, generator=generator))
 
 
+@pytest.mark.parametrize(
+    "primary_type", (None, ValueError, asyncio.CancelledError, KeyboardInterrupt)
+)
+@pytest.mark.parametrize("sync_type", (None, OSError, asyncio.CancelledError))
+def test_forward_sync_preserves_primary_failure(monkeypatch, primary_type, sync_type):
+    trainer = _trainer()
+    caller = torch.get_rng_state()
+    primary = None if primary_type is None else primary_type("model failure")
+    secondary = None if sync_type is None else sync_type("sync failure")
+    cause, context = LookupError("existing cause"), RuntimeError("existing context")
+    expected = primary if primary is not None else secondary
+    if expected is not None:
+        expected.__cause__, expected.__context__ = cause, context
+        expected.__suppress_context__ = False
+        expected.add_note("existing note")
+    synchronized = []
+
+    def execute():
+        torch.rand(7)
+        if primary is not None:
+            raise primary
+        return []
+
+    def synchronize(group):
+        synchronized.append(group)
+        assert torch.equal(torch.get_rng_state(), caller)
+        if secondary is not None:
+            raise secondary
+
+    _stub_forward(monkeypatch, trainer, execute)
+    monkeypatch.setattr(trainer._rng, "synchronize", synchronize)
+    if expected is None:
+        assert trainer.forward([]) == []
+    else:
+        with pytest.raises(type(expected)) as caught:
+            trainer.forward([])
+        assert caught.value is expected
+        assert expected.__cause__ is cause and expected.__context__ is context
+        assert not expected.__suppress_context__
+        assert expected.__notes__[0] == "existing note"
+        assert len(expected.__notes__) == (
+            2 if primary is not None and secondary is not None else 1
+        )
+        if primary is not None and secondary is not None:
+            note = expected.__notes__[1]
+            assert "Secondary RNG synchronization failure:" in note
+            assert f"{type(secondary).__name__}: sync failure" in note
+    assert synchronized == [None]
+    assert torch.equal(torch.get_rng_state(), caller)
+
+
 def test_failed_forward_keeps_command_collectives_aligned(tmp_path):
     spawn_and_join(
         _failed_forward_worker,
