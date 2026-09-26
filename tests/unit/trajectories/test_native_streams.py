@@ -504,6 +504,7 @@ def test_stop_encoder_cannot_change_role_proof_context(
         "unscoped_request_role",
         "unscoped_request_tools",
         "unscoped_history_role",
+        "expanded_original_role",
     ],
 )
 def test_later_stop_encoder_cannot_change_an_already_certified_stream(
@@ -540,9 +541,19 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
     original_guard = module._require_native_stream
     original_encode = tokenizer.__class__.__call__
     original_history = module.tokenize_history
+    original_planner = module._native_history_streams
     completed = []
+    expanded = []
     armed = False
     changed = False
+
+    def plan_streams(history: Any) -> Any:
+        if any(
+            source is not None and source.exchange is second
+            for source in history.message_sources
+        ):
+            expanded.append(history)
+        return original_planner(history)
 
     def history_call(history: Any, *args: Any, **kwargs: Any) -> Any:
         value = original_history(history, *args, **kwargs)
@@ -585,18 +596,23 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
             elif change == "unscoped_history_role":
                 assert len(completed) == 1
                 completed[0].history.messages[1]["role"] = "user"
+            elif change == "expanded_original_role":
+                assert len(expanded) == 1
+                expanded[0].messages[0]["role"] = "assistant"
             else:
                 record(first).model_extra["stop_reason"] = "!"
         return original_encode(self, text, **kwargs)
 
     monkeypatch.setattr(module, "_require_native_stream", guard)
     monkeypatch.setattr(module, "tokenize_history", history_call)
+    monkeypatch.setattr(module, "_native_history_streams", plan_streams)
     monkeypatch.setattr(tokenizer.__class__, "__call__", encode)
-    message = (
-        "Sampled source changed during tokenization callback"
-        if change.startswith("unscoped_")
-        else "during final STOP validation"
-    )
+    if change == "unscoped_logprob":
+        message = "Sampled source changed during tokenization callback"
+    elif change.startswith("unscoped_") or change == "expanded_original_role":
+        message = "Tokenization context changed during tokenization callback"
+    else:
+        message = "during final STOP validation"
     with pytest.raises(ValueError, match=message):
         if private:
             module._tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
