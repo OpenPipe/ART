@@ -65,9 +65,14 @@ def _without_inline_reasoning_parser(template: str) -> str:
     def operations(text: str):
         return WithoutWhitespace().visit(env.parse(text)).body
 
-    operation = operations(
-        "".join("{% " + statement + " %}" for statement in _QWEN_INLINE_STATEMENTS)
-    )
+    parser = "".join("{% " + statement + " %}" for statement in _QWEN_INLINE_STATEMENTS)
+    operation = operations(parser)
+    structured_operation = operations(
+        "{% if message.reasoning_content is string %}"
+        "{% set reasoning_content = message.reasoning_content %}{% else %}"
+        + parser
+        + "{% endif %}"
+    )[0]
     normalized = re.sub(r"\r\n?", "\n", template)
     offsets = [
         i
@@ -210,50 +215,55 @@ def _without_inline_reasoning_parser(template: str) -> str:
             return equal if test.ops[0].op == "eq" else not equal
         return None
 
-    def visit(body: Sequence[nodes.Node], binding: nodes.Assign | None = None) -> None:
+    def visit(body: Sequence[nodes.Node], bindings: set[int]) -> set[int]:
+        bindings = bindings.copy()
         for node in body:
             if isinstance(node, nodes.If):
-                if id(node) in edited_parsers and node == operation[0]:
-                    if binding is not None:
-                        selected.add(id(binding))
-                    binding = None
-                    continue
-                if binding is not None and reads_content(node.test):
-                    shared.add(id(binding))
-                condition = assistant_condition(node.test)
-                if condition is not False:
-                    visit(node.body, binding)
-                if condition is not True:
-                    # elif_ is a list of If nodes whose else is stored on the
-                    # outer If. Stop following it once a role match is proved.
-                    for branch in node.elif_:
-                        visit([branch], binding)
-                        if assistant_condition(branch.test) is True:
-                            break
-                    else:
-                        visit(node.else_, binding)
-                if any(
-                    writes_content(n)
-                    for n in node.find_all((nodes.Assign, nodes.AssignBlock))
+                if (id(node) in edited_parsers and node == operation[0]) or (
+                    node == structured_operation
+                    and any(id(child) in edited_parsers for child in node.else_)
                 ):
-                    binding = None
+                    # The recognized structured/inline reasoning selector is
+                    # one normalization boundary too, preserving its existing
+                    # literal-content contract in either reasoning mode.
+                    if len(bindings) == 1:
+                        selected.update(bindings)
+                    else:
+                        shared.update(bindings)  # No unique consumed assignment.
+                    bindings.clear()
+                    continue
+                joined = set()
+                # If does not introduce a Jinja scope. Retain every binding
+                # reaching the join, including paths that skipped the parser.
+                for branch in (node, *node.elif_):
+                    if reads_content(branch.test):
+                        shared.update(bindings)
+                    condition = assistant_condition(branch.test)
+                    if condition is not False:
+                        joined.update(visit(branch.body, bindings))
+                    if condition is True:
+                        break
+                else:
+                    joined.update(visit(node.else_, bindings))
+                bindings = joined
             else:
-                if binding is not None and reads_content(node):
-                    shared.add(id(binding))
+                if reads_content(node):
+                    shared.update(bindings)
                 if isinstance(node, nodes.Assign):
                     if writes_content(node):
-                        binding = node
+                        bindings = {id(node)}
                 else:
                     # Macro/loop/with/block bodies have independent bindings.
                     for _, value in node.iter_fields():
                         if isinstance(value, list) and all(
                             isinstance(n, nodes.Node) for n in value
                         ):
-                            visit(value)
+                            visit(value, set())
                     if isinstance(node, nodes.AssignBlock) and writes_content(node):
-                        binding = None
+                        bindings.clear()
+        return bindings
 
-    visit(tree.body)
+    visit(tree.body, set())
     trims = [
         env.parse("{% set content = " + content + " %}").body[0]
         for content in (
