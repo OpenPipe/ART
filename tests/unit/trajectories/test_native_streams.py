@@ -6,7 +6,7 @@ import pickle
 import struct
 from typing import Any, cast
 
-from openai.types.chat import ChatCompletion
+from openai.types.chat import ChatCompletion, ChatCompletionMessageParam
 import pytest
 from test_tokenize import _CharacterTemplateTokenizer, _chat_exchange
 
@@ -168,7 +168,7 @@ def test_existing_late_native_role_proof_precedes_stream_refinement(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tokenizer = _CharacterTemplateTokenizer()
-    messages = [
+    messages: list[ChatCompletionMessageParam] = [
         {"role": "user", "content": "intro"},
         {"role": "assistant", "content": "history"},
         {"role": "user", "content": "turn0"},
@@ -645,7 +645,7 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
             elif change in {"logprob", "unscoped_logprob"}:
                 record(earlier).logprobs.content[0].logprob = -123.0
             elif change == "unscoped_request_role":
-                earlier.request["messages"][1]["role"] = "user"
+                cast(dict[str, Any], earlier.request["messages"][1])["role"] = "user"
             elif change == "unscoped_request_tools":
                 earlier.request["tools"] = [
                     {"type": "function", "function": {"name": "changed"}}
