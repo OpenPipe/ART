@@ -65,11 +65,15 @@ def _trainer(monkeypatch, *, dtype=torch.float32, rank=1, mode="full", missing=(
     if mode == "metadata_subset":
         metadata = metadata[::2]
     lora = ModuleType("art.megatron.lora")
-    lora.LoRA = _Exports  # type: ignore[attr-defined]
+    setattr(lora, "LoRA", _Exports)
     publish = ModuleType("art.megatron.weights.lora_publish")
-    publish.collect_local_lora_entries = lambda *args, **kwargs: (  # type: ignore[attr-defined]
-        {item.key: torch.zeros(3, rank) for item in metadata},
-        metadata,
+    setattr(
+        publish,
+        "collect_local_lora_entries",
+        lambda *args, **kwargs: (
+            {item.key: torch.zeros(3, rank) for item in metadata},
+            metadata,
+        ),
     )
     monkeypatch.setitem(sys.modules, lora.__name__, lora)
     monkeypatch.setitem(sys.modules, publish.__name__, publish)
