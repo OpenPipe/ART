@@ -867,6 +867,39 @@ def test_hybridep_recompute_prices_fresh_dense_output_without_buffer_growth(
     assert not torch.cuda.is_initialized()
 
 
+def test_hybridep_combine_extent_floors_the_layout_path(
+    hybrid_checkpoint_rank, monkeypatch
+):
+    rank = hybrid_checkpoint_rank
+    groups = ((2, True),)
+    calls = []
+
+    def layout_floor(layers, refs, routed, layouts):
+        calls.append(layouts)
+        return 7, 11
+
+    def generic_floor(*args):
+        raise AssertionError("per-rank layouts must take the layout path")
+
+    monkeypatch.setattr(rank, "_layout_checkpoint_floor", layout_floor)
+    monkeypatch.setattr(rank, "_generic_checkpoint_floor", generic_floor)
+    layouts = (object(),)
+    te = rank._te_workspace_growth_bytes()
+    # Two rows round up to four; the layout floor's small workspace loses.
+    assert rank._checkpoint_memory_floor(groups, layouts=layouts) == (
+        7,
+        4 * 2048 * 2 + te,
+    )
+    marker = torch.empty(0)
+    rank._pending_hybridep_graphs.append(weakref.ref(marker))
+    rank._hybridep_rows_high_water = 218751
+    assert rank._checkpoint_memory_floor(groups, layouts=layouts) == (
+        7,
+        218752 * 2048 * 2 + te,
+    )
+    assert calls == [layouts, layouts]
+
+
 @pytest.mark.parametrize("reference", ["absent", "expired", "smaller"])
 def test_hybridep_high_water_needs_a_live_larger_graph(
     hybrid_checkpoint_rank, reference
