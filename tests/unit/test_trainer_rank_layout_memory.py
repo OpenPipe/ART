@@ -80,7 +80,9 @@ def test_largest_rank_total_not_a_sum_of_rank_maxima():
     # full-query stages. Pricing it on its own rows is about neutral against
     # the busiest-rank floor, which over-counts boundaries and GDN instead.
     assert total(1) > total(0)
-    busiest = sum(r._checkpoint_memory_floor(((52480, True),), None, (48397,)))
+    busiest = sum(
+        r._checkpoint_memory_floor(((52480, True),), None, routed_rows=(48397,))
+    )
     assert abs(retained + workspace - busiest) < 0.01 * busiest
 
 
@@ -99,8 +101,8 @@ def test_no_grad_groups_keep_busiest_rank_pricing():
     layout = _GroupLayout((10, 8), (9, 9), (0, 0))
     groups = ((10, True), (12, False))
     assert r._checkpoint_memory_floor(
-        groups, None, (9, 12), (layout, layout)
-    ) == r._checkpoint_memory_floor(groups, None, (9, 12))
+        groups, None, routed_rows=(9, 12), layouts=(layout, layout)
+    ) == r._checkpoint_memory_floor(groups, None, routed_rows=(9, 12))
 
 
 def _plan(r, *, no_grad=False):

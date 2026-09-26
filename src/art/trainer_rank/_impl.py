@@ -614,6 +614,16 @@ class _MemoryProfile:
     # Separate the retained compute rate from the peak, which also learns
     # caller-owned backward workspace. Requested outputs are charged explicitly.
     retained_compute_bytes_per_token: float | None = None
+    # A signature's first executed plan also pays one-time costs (compilation,
+    # first-use workspaces), which a small first wave spreads over few tokens.
+    # Admission uses the lower of the fit over every observation and the same
+    # fit over later flat waves' whole caller-phase peaks (forward plus the
+    # caller's loss and backward in the yield), which prices a wave smaller
+    # than the smallest of them as if it were that large.
+    warm_bytes_per_token: float | None = None
+    warm_packed_tokens: int | None = None
+    warm_logical_per_packed: float | None = None
+    caller_plans: int = 0
 
 
 @dataclass(frozen=True)
@@ -2161,6 +2171,9 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._cache_recovery_state = _CacheRecoveryState()
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
+        # Tracked peak-counter resets, and the latest (resets, peak) reading.
+        self._peak_resets = 0
+        self._peak_reading: tuple[int, int] | None = None
         self._split_memory_floors: dict[bytes, int] = {}
         self._split_memory_floor_status = "not_observed"
         self._last_global_micro_batch_size: int | None = None
@@ -2933,7 +2946,10 @@ class TrainerRank:
         rows and charges 6 KiB per logical token for the head plus the caller's
         loss saves and backward transients. A caller whose per-token head and
         loss memory peaks above that is unsupported: shared plans can exceed
-        their estimate.
+        their estimate. Backward is learned only when it runs inside the yield;
+        a backward deferred past it is not. A wave with another TrainerRank
+        forward inside its yield cannot lower later estimates below the
+        signature's first wave.
         """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
@@ -3012,6 +3028,7 @@ class TrainerRank:
             outputs: list[Any] = []
             flat_outputs = iter(tracked_outputs)
             error: BaseException | None = None
+            interval: tuple[int, int] | None = None
             try:
                 if isinstance(candidate.plan, _FlatForwardPlan):
                     tracked_outputs, memory_baseline = (
@@ -3021,6 +3038,8 @@ class TrainerRank:
                             context="forward_micro_batches",
                         )
                     )
+                    # This wave's peak interval, which its caller phase continues.
+                    interval = self.__dict__.get("_peak_reading")
                 else:
                     tracked_outputs, memory_baseline, forward_peak = (
                         self._execute_split_plan_with_memory_tracking(
@@ -3087,7 +3106,12 @@ class TrainerRank:
             # optimizer headroom. Peak only: the retained observation belongs
             # to the forward's return, already recorded for this same plan.
             if isinstance(candidate.plan, _FlatForwardPlan):
-                self._update_peak_memory_profile(candidate.plan, memory_baseline)
+                self._update_peak_memory_profile(
+                    candidate.plan,
+                    memory_baseline,
+                    caller_phase=True,
+                    interval=interval,
+                )
             elif memory_baseline is not None:
                 self._record_split_memory_floor(
                     candidate.plan, memory_baseline, forward_peak
@@ -4341,10 +4365,69 @@ class TrainerRank:
             else routed * coefficient
         )
 
+    def _sequence_parallel_floor_covered(self, layers: int, tp: int, cp: int) -> bool:
+        """Whether the checkpoint floor covers a dense TP x SP recompute peak.
+
+        Traced once: dense Qwen3.8-27B (64 layers) at TP4 with sequence
+        parallelism and CP1. Over the gathered rows, the recomputed layer's peak
+        held its SP-gathered norm input (2H per row), the MLP FC1 stage (6F/TP),
+        the recomputed mixer (within its projection widths / TP), norm outputs
+        and other workspace (each under H), plus one input gradient per
+        sharded row. The floor repeats the sharded boundaries as the
+        input-gradient term, so that repeat must cover this workspace; GDN
+        segment states grow with segments instead and are priced separately.
+        Other TP sizes, CP, MoE, replicated QKV (KV groups below TP), missing
+        geometry and models too shallow or wide for the bound keep today's
+        pricing.
+        """
+        geometry = self._geometry
+        if tp != 4 or cp != 1 or self._moe_layers or geometry.moe_experts:
+            return False
+        hidden = self._hidden_size
+        ffn = geometry.ffn_hidden_size or 4 * hidden
+        attention_layers = self._num_layers > self._gdn_layers
+        if attention_layers and (
+            geometry.num_attention_heads <= 0
+            or geometry.kv_channels <= 0
+            # Replicated QKV keeps a global QKV output on every rank.
+            or not tp <= geometry.num_query_groups
+        ):
+            return False
+        gdn_widths = (
+            geometry.gdn_key_heads,
+            geometry.gdn_key_head_dim,
+            geometry.gdn_value_heads,
+            geometry.gdn_value_head_dim,
+            geometry.gdn_conv_kernel,  # Prices each segment's conv history.
+        )
+        if self._gdn_layers and min(gdn_widths) <= 0:
+            return False
+        attention = (
+            (7 if self._attention_output_gate else 5)
+            * geometry.num_attention_heads
+            * geometry.kv_channels
+            + 3 * geometry.num_query_groups * geometry.kv_channels
+            if attention_layers
+            else 0
+        )
+        gdn = (
+            4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+            + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+            if self._gdn_layers
+            else 0
+        )
+        # Per gathered row, times TP: the repeat is layers x H; the workspace is
+        # 2H + the FC1 stage (6F/TP, or the SwiGLU live set if wider) +
+        # mixer/TP + H of norms + H of other workspace, and the gradient H/TP.
+        stage = max(6, self._mlp_activation_factor) * ffn
+        workspace = 2 * hidden * tp + stage + max(attention, gdn) + 2 * hidden * tp
+        return layers * hidden >= workspace + hidden
+
     def _checkpoint_memory_floor(
         self,
         group_rows: tuple[tuple[int, bool], ...],
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+        gdn_segments: int = 0,
         routed_rows: tuple[int, ...] | None = None,
         layouts: tuple[_GroupLayout, ...] | None = None,
     ) -> tuple[int, int]:
@@ -4363,7 +4446,11 @@ class TrainerRank:
         decoder input, current layer input, its MLP residual and norm output.
         Count these four row tensors separately from returned outputs, allowing
         storage aliases. This is not a bound for custom preprocessing or all of
-        backward.
+        backward. With sequence parallelism a rank saves only its shard of each
+        boundary; that is priced only where ``_sequence_parallel_floor_covered``
+        holds, and there, for gradient waves, the recomputed GDN layer's
+        recurrent states for ``gdn_segments`` (gradient groups' segments) plus
+        padding, as traced (the recomputed mixer is not added at TP > 1).
         """
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
         if not group_rows or len(self.runtime.model) != 1:
@@ -4383,12 +4470,13 @@ class TrainerRank:
             return 0, 0
         config = decoder.config
         layers = len(decoder.layers)
+        _, tp, cp, pp = self._topology_key()
         expected = {
             "recompute_granularity": "full",
             "recompute_method": "uniform",
             "recompute_num_layers": 1,
             "distribute_saved_activations": False,
-            "sequence_parallel": False,
+            "sequence_parallel": tp > 1,
             "fp32_residual_connection": False,
             "cpu_offloading": False,
             "cuda_graph_impl": "none",
@@ -4402,7 +4490,8 @@ class TrainerRank:
             or config.params_dtype is not torch.bfloat16
             or self._param_dtype_size != 2
             or next(self.runtime.model[0].parameters()).dtype is not torch.bfloat16
-            or self._topology_key()[1::2] != (1, 1)
+            or pp != 1
+            or (tp > 1 and not self._sequence_parallel_floor_covered(layers, tp, cp))
             or any(
                 type(getattr(config, name, None)) is not type(value)
                 or getattr(config, name) != value
@@ -4420,8 +4509,75 @@ class TrainerRank:
             return 0, 0
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
         routed = (None,) * len(group_rows) if routed_rows is None else routed_rows
-        if layouts is not None and all(grad for _, grad in group_rows):
-            return self._layout_checkpoint_floor(decoder.layers, refs, routed, layouts)
+        if tp > 1:
+            retained, workspace = self._sequence_parallel_checkpoint_floor(
+                group_rows, refs, layers, tp, gdn_segments
+            )
+        elif layouts is not None and all(grad for _, grad in group_rows):
+            retained, workspace = self._layout_checkpoint_floor(
+                decoder.layers, refs, routed, layouts
+            )
+        else:
+            retained, workspace = self._generic_checkpoint_floor(
+                group_rows, refs, routed, layers
+            )
+        if (
+            gradient_rows
+            and self._topology_key() == (1, 1, 2, 1)
+            and self._parallel_shape == ParallelShape(tp=1, cp=2, ep=2, etp=1)
+            and self._moe_memory_supported
+        ):
+            # Recompute runs after _execute_flat_plan restores the communication
+            # high-water. Combine allocates a fresh BF16 [P, H] before cropping;
+            # this is separate from already-held native buffer capacity. Do not
+            # prune graph references or reset execution state while estimating.
+            rows = max(rows for rows, _ in group_rows)
+            if any(ref() is not None for ref in self._pending_hybridep_graphs):
+                rows = max(rows, self._hybridep_rows_high_water)
+            workspace = max(workspace, -(-rows // 4) * 4 * self._hidden_size * 2)
+        return retained, workspace
+
+    def _sequence_parallel_checkpoint_floor(
+        self,
+        group_rows: tuple[tuple[int, bool], ...],
+        refs: tuple["LoRASlotRef | None", ...],
+        layers: int,
+        tp: int,
+        gdn_segments: int,
+    ) -> tuple[int, int]:
+        """The traced TP x SP floor (``_sequence_parallel_floor_covered``)."""
+        gradient_rows = sum(rows for rows, grad in group_rows if grad)
+        # Physical rows are padded to a multiple of TP; each rank saves its shard.
+        retained = (
+            sum(-(-rows // tp) for rows, grad in group_rows if grad)
+            * layers
+            * self._hidden_size
+            * 2
+        )
+        if gradient_rows:
+            self._checkpoint_moe_bytes_per_token()
+        workspace = max(
+            self._moe_workspace_bytes(rows, checkpoint_grad=grad, slot_ref=ref)
+            + (0 if grad else 4 * rows * self._hidden_size * 2)
+            for (rows, grad), ref in zip(group_rows, refs, strict=True)
+        )
+        if self._gdn_layers and gradient_rows:
+            # Recurrent states grow with segments, not rows; backward recomputes
+            # one layer at a time. Padding to TP adds up to TP - 1 one-token
+            # roots per group. Kernel-internal chunk states are not bounded here.
+            roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
+            workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
+        return retained, workspace
+
+    def _generic_checkpoint_floor(
+        self,
+        group_rows: tuple[tuple[int, bool], ...],
+        refs: tuple["LoRASlotRef | None", ...],
+        routed: tuple[int | None, ...],
+        layers: int,
+    ) -> tuple[int, int]:
+        """Boundaries on the busiest rank's rows and one recomputed layer."""
+        gradient_rows = sum(rows for rows, grad in group_rows if grad)
         retained = gradient_rows * layers * self._hidden_size * 2
         moe = self._checkpoint_moe_bytes_per_token() if gradient_rows else 0
         # Beside the mixer, the recomputed layer keeps its post-mixer residual
@@ -4796,7 +4952,11 @@ class TrainerRank:
             include_checkpoint_input_gradient=False,
         )
         checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
-            group_rows, slot_refs, group_routed_rows, group_layouts
+            group_rows,
+            slot_refs,
+            gdn_segments,
+            routed_rows=group_routed_rows,
+            layouts=group_layouts,
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -5829,8 +5989,12 @@ class TrainerRank:
                 return estimates[width]
             indices, local_inputs = local_slice(width)
             local_requests = list(_flatten(local_inputs))
+            cheap_segments: list[int] = []
             values = self._estimate_flat_forward(
-                local_requests, checkpoint=checkpoint, sync_planning_errors=True
+                local_requests,
+                checkpoint=checkpoint,
+                sync_planning_errors=True,
+                gdn_segments=cheap_segments,
             )
             if not self._all_ranks_true(values is not None):
                 estimates[width] = None
@@ -5844,6 +6008,8 @@ class TrainerRank:
                 signature: _MemorySignature,
                 group_rows: tuple[tuple[int, bool], ...],
                 head_workspace_bytes: int,
+                *,
+                gdn_segments: int,
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature]:
                 with self._planning_status(True):
                     required = self._estimate_required_memory_bytes_from_values(
@@ -5851,12 +6017,9 @@ class TrainerRank:
                         output_bytes=output_bytes,
                         signature=signature,
                         logical_tokens=logical_tokens,
-                        # A radix tree has fewer than twice as many segments as
-                        # active requests; the exact plan uses its actual count.
-                        gdn_segments=2
-                        * sum(
-                            _request_mix_key(r) != "inactive" for r in local_requests
-                        ),
+                        # Gradient groups' segments: exact layouts' counts, else
+                        # a bound matching the estimate's (_estimate_flat_forward).
+                        gdn_segments=gdn_segments,
                         group_rows=group_rows,
                         head_workspace_bytes=head_workspace_bytes,
                     )
@@ -5870,14 +6033,20 @@ class TrainerRank:
             def priced_estimate(
                 *, exact: bool, memory_minimal: bool
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature] | None:
+                segments: list[int] = []
                 estimated = self._estimate_flat_forward(
                     local_requests,
                     checkpoint=checkpoint,
                     exact=exact,
                     memory_minimal=memory_minimal,
                     sync_planning_errors=True,
+                    gdn_segments=segments,
                 )
-                return None if estimated is None else priced(*estimated)
+                return (
+                    None
+                    if estimated is None
+                    else priced(*estimated, gdn_segments=sum(segments))
+                )
 
             def trusted(packed_tokens: int, signature: _MemorySignature) -> bool:
                 return self._all_ranks_have_memory_profile(
@@ -5890,7 +6059,7 @@ class TrainerRank:
             # reject on memory, or when it would reject on profile trust while
             # a profile exists — the selected layout may be far smaller than
             # the bound and squarely inside the profiled regime.
-            selected = priced(*values)
+            selected = priced(*values, gdn_segments=sum(cheap_segments))
             profiled = self._all_ranks_true(selected[3] in self._memory_profiles)
             needs_exact = not selected[0].fits or (
                 profiled and not trusted(selected[1], selected[3])
@@ -6563,6 +6732,7 @@ class TrainerRank:
         exact: bool = False,
         memory_minimal: bool = False,
         sync_planning_errors: bool = False,
+        gdn_segments: list[int] | None = None,
     ) -> tuple[int, int, _MemorySignature, tuple[tuple[int, bool], ...], int] | None:
         """Estimate packed tokens for width probing.
 
@@ -6575,6 +6745,9 @@ class TrainerRank:
         ``exact=True`` prices the planner's actual layouts (memoized by
         content) and is used only inside the band where those bounds disagree.
         Under CP it returns None: per-rank floors need materialized layouts.
+        ``gdn_segments`` receives each gradient group's segment count: exact
+        layouts' actual counts; in cheap mode, the same kind of bound as the
+        token count (twice the requests, as a radix tree has fewer, or one).
         """
 
         if sync_planning_errors:
@@ -6624,6 +6797,8 @@ class TrainerRank:
                     physical_rows = self._physical_tokens(layout.packed_tokens)
                     packed_tokens += physical_rows
                     group_rows.append((physical_rows, grad_enabled))
+                    if grad_enabled and gdn_segments is not None:
+                        gdn_segments.append(len(layout.segments))
                     projected = upper
                     positions = None
                     mixed_targets = (
@@ -6682,6 +6857,11 @@ class TrainerRank:
                 physical_rows = self._physical_tokens(group_packed_tokens)
                 packed_tokens += physical_rows
                 group_rows.append((physical_rows, grad_enabled))
+                if grad_enabled and gdn_segments is not None:
+                    # Bounds like the token counts: at most twice the requests
+                    # without sharing (acceptance), at least one with full
+                    # sharing (rejection); exact pricing counts the rest.
+                    gdn_segments.append(1 if memory_minimal else 2 * len(group_indices))
                 head_workspace_bytes = max(
                     head_workspace_bytes,
                     self._group_head_workspace_bytes(
@@ -6775,6 +6955,7 @@ class TrainerRank:
             torch.cuda.synchronize(self.device)
             baseline = int(torch.cuda.memory_allocated(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
+            self._peak_resets = self.__dict__.get("_peak_resets", 0) + 1
         else:
             baseline = None
         observation = getattr(self, "_planner_observation", None)
@@ -6825,6 +7006,9 @@ class TrainerRank:
         plan: _FlatForwardPlan,
         baseline: int | None,
         retained_after: int | None = None,
+        *,
+        caller_phase: bool = False,
+        interval: tuple[int, int] | None = None,
     ) -> None:
         if baseline is None:
             return
@@ -6832,12 +7016,21 @@ class TrainerRank:
         observation = getattr(self, "_planner_observation", None)
         if observation is not None:
             observation["peak"] = max(observation["peak"], peak)
+        resets = self.__dict__.get("_peak_resets", 0)
+        self._peak_reading = (resets, peak)
         self._update_memory_profile(
             plan,
             max(0, peak - baseline),
             retained_bytes=(
                 None if retained_after is None else max(0, retained_after - baseline)
             ),
+            # Only a whole wave: a nested forward resetting the counter during
+            # the yield, or an untracked reset (the counter fell below this
+            # wave's forward peak), leaves the peak since then short of it.
+            caller_phase=caller_phase
+            and interval is not None
+            and interval[0] == resets
+            and peak >= interval[1],
         )
 
     def _begin_planner_observation(
@@ -8577,7 +8770,11 @@ class TrainerRank:
             ),
         )
         retained, workspace = self._checkpoint_memory_floor(
-            group_rows, slot_refs, group_routed_rows, group_layouts
+            group_rows,
+            slot_refs,
+            gdn_segments,
+            routed_rows=group_routed_rows,
+            layouts=group_layouts,
         )
         static_compute = max(
             static_compute,
@@ -8600,27 +8797,52 @@ class TrainerRank:
         # usual trust growth. Normalize before multiplying: cancelling packed
         # tokens through two float operations can otherwise make a larger warm
         # layout cheaper.
-        profiled_tokens: int | float = packed_tokens
         packed_priced = profiled is not None and _packed_priced(
             signature, self._one_layer_recompute()
         )
-        if profiled is not None and logical_tokens is not None:
-            profiled_tokens = max(
+
+        def profiled_tokens(logical_per_packed: float) -> int | float:
+            if logical_tokens is None:
+                return packed_tokens
+            return max(
                 packed_tokens,
                 logical_tokens
-                / profiled.logical_per_packed
+                / logical_per_packed
                 / (_MEMORY_PROFILE_TRUST_GROWTH if packed_priced else 1),
             )
+
         # The trust window limits calibration growth, not the empirical floor.
         # Dropping that floor beyond the window can admit a larger request that
         # was refused just inside it, even below a previously observed peak.
         if profiled is None:
             compute = static_compute
         else:
+            profiled_bytes = profiled.bytes_per_token * profiled_tokens(
+                profiled.logical_per_packed
+            )
+            if (
+                profiled.warm_bytes_per_token is not None
+                and profiled.warm_packed_tokens is not None
+                and profiled.warm_logical_per_packed is not None
+            ):
+                # Later plans' own sharing: a rate learned under lighter
+                # sharing scales up for deeper-shared plans, as above. Pricing
+                # smaller waves as the smallest later plan keeps cost monotone
+                # in tokens, which the width search's bounds rely on; it is
+                # sound where a wave's memory is a fixed cost plus a per-token
+                # rate, as that plan's rate covers its share of the fixed cost.
+                profiled_bytes = min(
+                    profiled_bytes,
+                    profiled.warm_bytes_per_token
+                    * max(
+                        profiled.warm_packed_tokens,
+                        profiled_tokens(profiled.warm_logical_per_packed),
+                    ),
+                )
             compute = max(
                 static_compute,
                 int(
-                    profiled.bytes_per_token * profiled_tokens
+                    profiled_bytes
                     + (
                         _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
                         # Branch states grow with segments, not packed rows;
@@ -8882,12 +9104,33 @@ class TrainerRank:
         peak_delta_bytes: int,
         *,
         retained_bytes: int | None,
+        caller_phase: bool = False,
     ) -> None:
         if plan.packed_tokens <= 0:
             return
         compute_delta = max(0, peak_delta_bytes - plan.output_bytes)
         bytes_per_token = compute_delta / max(1, plan.packed_tokens)
         previous = self._memory_profiles.get(plan.signature)
+        logical_per_packed = plan.active_logical_tokens / max(1, plan.packed_tokens)
+        warm_rate = None if previous is None else previous.warm_bytes_per_token
+        warm_tokens = None if previous is None else previous.warm_packed_tokens
+        warm_sharing = None if previous is None else previous.warm_logical_per_packed
+        caller_plans = 0 if previous is None else previous.caller_plans
+        # Only a flat wave's whole caller phase covers the caller's backward;
+        # split children and dp_rank_forward observe forward only. A caller that
+        # defers backward past the yield is not covered. The profile's first
+        # such plan also pays one-time costs, so it is not warm.
+        if caller_phase:
+            if caller_plans:
+                warm_rate = max(bytes_per_token, warm_rate or 0.0)
+                warm_tokens = min(plan.packed_tokens, warm_tokens or plan.packed_tokens)
+                warm_sharing = max(logical_per_packed, warm_sharing or 1.0)
+            caller_plans += 1
+        elif caller_plans:
+            # After the seed, other readings cannot fit the warm profile, but a
+            # higher one still raises its rate (inert until a whole warm plan
+            # fits the rest), as it raises the fit over every observation.
+            warm_rate = max(warm_rate or 0.0, bytes_per_token)
         retained_fraction = None if previous is None else previous.retained_fraction
         retained_compute = (
             None if previous is None else previous.retained_compute_bytes_per_token
@@ -8916,11 +9159,15 @@ class TrainerRank:
                 0 if previous is None else previous.packed_tokens,
             ),
             logical_per_packed=max(
-                plan.active_logical_tokens / max(1, plan.packed_tokens),
+                logical_per_packed,
                 1.0 if previous is None else previous.logical_per_packed,
             ),
             retained_fraction=retained_fraction,
             retained_compute_bytes_per_token=retained_compute,
+            warm_bytes_per_token=warm_rate,
+            warm_packed_tokens=warm_tokens,
+            warm_logical_per_packed=warm_sharing,
+            caller_plans=caller_plans,
         )
 
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:

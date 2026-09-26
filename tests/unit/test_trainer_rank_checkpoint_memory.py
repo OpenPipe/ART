@@ -527,11 +527,11 @@ def test_routed_rows_move_only_the_routed_moe_part():
     r._moe_gradient_shared_bytes = 8192
     local, routed = 52480, 48397
     retained, workspace = r._checkpoint_memory_floor(((local, True),))
-    assert r._checkpoint_memory_floor(((local, True),), None, (local,)) == (
+    assert r._checkpoint_memory_floor(((local, True),), None, routed_rows=(local,)) == (
         retained,
         workspace,
     )
-    fewer = r._checkpoint_memory_floor(((local, True),), None, (routed,))
+    fewer = r._checkpoint_memory_floor(((local, True),), None, routed_rows=(routed,))
     assert fewer[0] == retained
     assert workspace - fewer[1] == (local - routed) * (188416 - 8192)
     # A rank can receive more routed rows than it holds: all are priced, and
