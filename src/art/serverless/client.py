@@ -285,7 +285,7 @@ class Client(AsyncAPIClient):
         self.api_key = api_key
         super().__init__(
             version=__version__,
-            base_url=base_url or "https://api.training.wandb.ai/v1",
+            base_url=base_url or "https://forge.coreweave.com/api/training/v1",
             _strict_response_validation=False,
             max_retries=3,
         )
