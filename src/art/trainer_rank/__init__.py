@@ -269,9 +269,9 @@ class TrainerRank(_impl.TrainerRank):
         Collective calls must still match across ranks.
 
         Admission learns each wave's memory peak, including the caller's loss
-        and backward. Only waves whose backward runs inside the yield, with no
-        other TrainerRank forward there, can lower later estimates below the
-        first wave's.
+        and backward when they run inside the yield; a backward deferred past the
+        yield is not learned. A wave with another TrainerRank forward inside its
+        yield cannot lower later estimates.
         """
         forward = cast(
             Callable[..., Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]],

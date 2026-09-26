@@ -2816,9 +2816,10 @@ class TrainerRank:
         rows and charges 6 KiB per logical token for the head plus the caller's
         loss saves and backward transients. A caller whose per-token head and
         loss memory peaks above that is unsupported: shared plans can exceed
-        their estimate. Only waves whose loss and backward run inside the yield,
-        with no other TrainerRank forward there, can lower later estimates below
-        the signature's first wave.
+        their estimate. Backward is learned only when it runs inside the yield;
+        a backward deferred past it is not. A wave with another TrainerRank
+        forward inside its yield cannot lower later estimates below the
+        signature's first wave.
         """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")

@@ -172,7 +172,7 @@ class TestRecovery(unittest.TestCase):
         self.addCleanup(observer_clock.stop)
         q = object.__new__(_impl.TrainerRank)
         q.device = types.SimpleNamespace(type="cuda")
-        q._update_peak_memory_profile = lambda *a: None
+        q._update_peak_memory_profile = lambda *a, **k: None
         q._execute_flat_plan = lambda p: [object() for _ in range(p.request_count)]
         q._telemetry_signature = lambda p: {}
         q._telemetry_plan_signature = lambda p: {}
