@@ -4019,10 +4019,69 @@ class TrainerRank:
             else rows * coefficient
         )
 
+    def _sequence_parallel_floor_covered(self, layers: int, tp: int, cp: int) -> bool:
+        """Whether the checkpoint floor covers a dense TP x SP recompute peak.
+
+        Traced once: dense Qwen3.8-27B (64 layers) at TP4 with sequence
+        parallelism and CP1. Over the gathered rows, the recomputed layer's peak
+        held its SP-gathered norm input (2H per row), the MLP FC1 stage (6F/TP),
+        the recomputed mixer (within its projection widths / TP), norm outputs
+        and other workspace (each under H), plus one input gradient per
+        sharded row. The floor repeats the sharded boundaries as the
+        input-gradient term, so that repeat must cover this workspace; GDN
+        segment states grow with segments instead and are priced separately.
+        Other TP sizes, CP, MoE, replicated QKV (KV groups below TP), missing
+        geometry and models too shallow or wide for the bound keep today's
+        pricing.
+        """
+        geometry = self._geometry
+        if tp != 4 or cp != 1 or self._moe_layers or geometry.moe_experts:
+            return False
+        hidden = self._hidden_size
+        ffn = geometry.ffn_hidden_size or 4 * hidden
+        attention_layers = self._num_layers > self._gdn_layers
+        if attention_layers and (
+            geometry.num_attention_heads <= 0
+            or geometry.kv_channels <= 0
+            # Replicated QKV keeps a global QKV output on every rank.
+            or not tp <= geometry.num_query_groups
+        ):
+            return False
+        gdn_widths = (
+            geometry.gdn_key_heads,
+            geometry.gdn_key_head_dim,
+            geometry.gdn_value_heads,
+            geometry.gdn_value_head_dim,
+            geometry.gdn_conv_kernel,  # Prices each segment's conv history.
+        )
+        if self._gdn_layers and min(gdn_widths) <= 0:
+            return False
+        attention = (
+            (7 if self._attention_output_gate else 5)
+            * geometry.num_attention_heads
+            * geometry.kv_channels
+            + 3 * geometry.num_query_groups * geometry.kv_channels
+            if attention_layers
+            else 0
+        )
+        gdn = (
+            4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+            + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+            if self._gdn_layers
+            else 0
+        )
+        # Per gathered row, times TP: the repeat is layers x H; the workspace is
+        # 2H + the FC1 stage (6F/TP, or the SwiGLU live set if wider) +
+        # mixer/TP + H of norms + H of other workspace, and the gradient H/TP.
+        stage = max(6, self._mlp_activation_factor) * ffn
+        workspace = 2 * hidden * tp + stage + max(attention, gdn) + 2 * hidden * tp
+        return layers * hidden >= workspace + hidden
+
     def _checkpoint_memory_floor(
         self,
         group_rows: tuple[tuple[int, bool], ...],
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+        gdn_segments: int = 0,
     ) -> tuple[int, int]:
         """Conservative saved-boundary charge and one disjoint MoE workspace.
 
@@ -4033,6 +4092,10 @@ class TrainerRank:
         residual and norm output across the MoE stage. Count these four row
         tensors separately from returned outputs, allowing storage aliases.
         This is not a bound for custom preprocessing, attention, or all backward.
+        With sequence parallelism a rank saves only its shard of each boundary;
+        that is priced only where ``_sequence_parallel_floor_covered`` holds,
+        and there, for gradient waves, the recomputed GDN layer's recurrent
+        states for ``gdn_segments`` (gradient groups' segments) plus padding.
         """
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
         if not group_rows or len(self.runtime.model) != 1:
@@ -4052,12 +4115,13 @@ class TrainerRank:
             return 0, 0
         config = decoder.config
         layers = len(decoder.layers)
+        _, tp, cp, pp = self._topology_key()
         expected = {
             "recompute_granularity": "full",
             "recompute_method": "uniform",
             "recompute_num_layers": 1,
             "distribute_saved_activations": False,
-            "sequence_parallel": False,
+            "sequence_parallel": tp > 1,
             "fp32_residual_connection": False,
             "cpu_offloading": False,
             "cuda_graph_impl": "none",
@@ -4071,7 +4135,8 @@ class TrainerRank:
             or config.params_dtype is not torch.bfloat16
             or self._param_dtype_size != 2
             or next(self.runtime.model[0].parameters()).dtype is not torch.bfloat16
-            or self._topology_key()[1::2] != (1, 1)
+            or pp != 1
+            or (tp > 1 and not self._sequence_parallel_floor_covered(layers, tp, cp))
             or any(
                 type(getattr(config, name, None)) is not type(value)
                 or getattr(config, name) != value
@@ -4087,7 +4152,13 @@ class TrainerRank:
             or getattr(decoder, "_forward_pre_hooks", None)
         ):
             return 0, 0
-        retained = gradient_rows * layers * self._hidden_size * 2
+        # Physical rows are padded to a multiple of TP; each rank saves its shard.
+        retained = (
+            sum(-(-rows // tp) for rows, grad in group_rows if grad)
+            * layers
+            * self._hidden_size
+            * 2
+        )
         if gradient_rows:
             self._checkpoint_moe_bytes_per_token()
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
@@ -4096,6 +4167,12 @@ class TrainerRank:
             + (0 if grad else 4 * rows * self._hidden_size * 2)
             for (rows, grad), ref in zip(group_rows, refs, strict=True)
         )
+        if tp > 1 and self._gdn_layers and gradient_rows:
+            # Recurrent states grow with segments, not rows; backward recomputes
+            # one layer at a time. Padding to TP adds up to TP - 1 one-token
+            # roots per group. Kernel-internal chunk states are not bounded here.
+            roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
+            workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
         return retained, workspace
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
@@ -4142,7 +4219,7 @@ class TrainerRank:
             include_checkpoint_input_gradient=False,
         )
         checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
-            group_rows, slot_refs
+            group_rows, slot_refs, gdn_segments
         )
         retained = self._retained_memory_bytes(
             signature,
@@ -5170,8 +5247,12 @@ class TrainerRank:
                 return estimates[width]
             indices, local_inputs = local_slice(width)
             local_requests = list(_flatten(local_inputs))
+            cheap_segments: list[int] = []
             values = self._estimate_flat_forward(
-                local_requests, checkpoint=checkpoint, sync_planning_errors=True
+                local_requests,
+                checkpoint=checkpoint,
+                sync_planning_errors=True,
+                gdn_segments=cheap_segments,
             )
             if not self._all_ranks_true(values is not None):
                 estimates[width] = None
@@ -5185,6 +5266,8 @@ class TrainerRank:
                 signature: _MemorySignature,
                 group_rows: tuple[tuple[int, bool], ...],
                 head_workspace_bytes: int,
+                *,
+                gdn_segments: int,
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature]:
                 with self._planning_status(True):
                     required = self._estimate_required_memory_bytes_from_values(
@@ -5192,12 +5275,9 @@ class TrainerRank:
                         output_bytes=output_bytes,
                         signature=signature,
                         logical_tokens=logical_tokens,
-                        # A radix tree has fewer than twice as many segments as
-                        # active requests; the exact plan uses its actual count.
-                        gdn_segments=2
-                        * sum(
-                            _request_mix_key(r) != "inactive" for r in local_requests
-                        ),
+                        # Gradient groups' segments: exact layouts' counts, else
+                        # a bound matching the estimate's (_estimate_flat_forward).
+                        gdn_segments=gdn_segments,
                         group_rows=group_rows,
                         head_workspace_bytes=head_workspace_bytes,
                     )
@@ -5211,14 +5291,20 @@ class TrainerRank:
             def priced_estimate(
                 *, exact: bool, memory_minimal: bool
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature] | None:
+                segments: list[int] = []
                 estimated = self._estimate_flat_forward(
                     local_requests,
                     checkpoint=checkpoint,
                     exact=exact,
                     memory_minimal=memory_minimal,
                     sync_planning_errors=True,
+                    gdn_segments=segments,
                 )
-                return None if estimated is None else priced(*estimated)
+                return (
+                    None
+                    if estimated is None
+                    else priced(*estimated, gdn_segments=sum(segments))
+                )
 
             def trusted(packed_tokens: int, signature: _MemorySignature) -> bool:
                 return self._all_ranks_have_memory_profile(
@@ -5231,7 +5317,7 @@ class TrainerRank:
             # reject on memory, or when it would reject on profile trust while
             # a profile exists — the selected layout may be far smaller than
             # the bound and squarely inside the profiled regime.
-            selected = priced(*values)
+            selected = priced(*values, gdn_segments=sum(cheap_segments))
             profiled = self._all_ranks_true(selected[3] in self._memory_profiles)
             needs_exact = not selected[0].fits or (
                 profiled and not trusted(selected[1], selected[3])
@@ -5904,6 +5990,7 @@ class TrainerRank:
         exact: bool = False,
         memory_minimal: bool = False,
         sync_planning_errors: bool = False,
+        gdn_segments: list[int] | None = None,
     ) -> tuple[int, int, _MemorySignature, tuple[tuple[int, bool], ...], int] | None:
         """Estimate packed tokens for width probing.
 
@@ -5916,6 +6003,9 @@ class TrainerRank:
         ``exact=True`` prices the planner's actual layouts (memoized by
         content) and is used only inside the band where those bounds disagree.
         Under CP it returns None: per-rank floors need materialized layouts.
+        ``gdn_segments`` receives each gradient group's segment count: exact
+        layouts' actual counts; in cheap mode, the same kind of bound as the
+        token count (twice the requests, as a radix tree has fewer, or one).
         """
 
         if sync_planning_errors:
@@ -5965,6 +6055,8 @@ class TrainerRank:
                     physical_rows = self._physical_tokens(layout.packed_tokens)
                     packed_tokens += physical_rows
                     group_rows.append((physical_rows, grad_enabled))
+                    if grad_enabled and gdn_segments is not None:
+                        gdn_segments.append(len(layout.segments))
                     projected = upper
                     positions = None
                     mixed_targets = (
@@ -6023,6 +6115,11 @@ class TrainerRank:
                 physical_rows = self._physical_tokens(group_packed_tokens)
                 packed_tokens += physical_rows
                 group_rows.append((physical_rows, grad_enabled))
+                if grad_enabled and gdn_segments is not None:
+                    # Bounds like the token counts: at most twice the requests
+                    # without sharing (acceptance), at least one with full
+                    # sharing (rejection); exact pricing counts the rest.
+                    gdn_segments.append(1 if memory_minimal else 2 * len(group_indices))
                 head_workspace_bytes = max(
                     head_workspace_bytes,
                     self._group_head_workspace_bytes(
@@ -7920,7 +8017,9 @@ class TrainerRank:
                 for ref in (slot_refs or (None,))
             ),
         )
-        retained, workspace = self._checkpoint_memory_floor(group_rows, slot_refs)
+        retained, workspace = self._checkpoint_memory_floor(
+            group_rows, slot_refs, gdn_segments
+        )
         static_compute = max(
             static_compute,
             max(retained, checkpoint_floor[0])
