@@ -159,7 +159,21 @@ for unchanged, complete exchange histories. Recorded logprobs belong to those
 exact conditioned tokens. Chat, Responses, Messages, and Completions keep their
 existing protocol-specific projection rules; no separate tokenization API or
 native-representation option is needed. `multi_history=True` preserves the
-histories selected by the trajectory, including their order and model selection.
+selected source order and model selection. If a complete unchanged Chat history
+cannot use the native fast path and its recorded requests are not one continuous
+token prefix, ART can refine it into adjacent native streams. Each stream retains
+the final request in that run, all sampled responses' original conditioning and
+logprobs, and the original trajectory's reward. The existing first-occurrence
+mask still owns each sampled prefix edge once across streams. Earlier responses
+outside a run are that request's context; their assistant and STOP roles require
+the normal rendering proof and do not become new sampled output. This may load a
+tokenizer to prove request roles. Unproved request roles still refuse.
+
+The internal exchange-training path uses the same refinement and one token weight
+per original trajectory. `History.tokenize()` and `multi_history=False` keep
+their single-linear representation. Explicit overrides, incomplete native
+records, and edited contexts do not authorize splitting. Extra streams may
+repeat context; there is no implied memory, speed, or numerical-training claim.
 
 Complete unchanged Chat histories end at the final recorded response token,
 including tool responses and responses stopped by a length limit. ART does not
