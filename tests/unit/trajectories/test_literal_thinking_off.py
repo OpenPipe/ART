@@ -589,7 +589,11 @@ def test_named_template_selection_failure_keeps_original_error():
     # Explicit unrelated templates are selected unchanged, not rewritten merely
     # because this tokenizer also has a known Qwen template in its dictionary.
     custom = "{% for message in messages %}{{ message.content }}{% endfor %}"
-    assert _tokenize._resolved_chat_template(tokenizer, custom, None) == (custom, {})
+    assert _tokenize._resolved_chat_template(tokenizer, custom, None) == (
+        custom,
+        custom,
+        {},
+    )
 
 
 @pytest.mark.parametrize("selection", [None, "named"])

@@ -7539,7 +7539,12 @@ def test_reasoning_stripped_tool_call_keeps_exact_evidence_for_strict_training(
     assert len(datums) == 4
 
 
-def test_responses_prompt_repair_opt_in_uses_native_text_and_source_position() -> None:
+def test_responses_prompt_repair_opt_in_uses_native_text_and_source_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
     exchange = _response_exchange("repeated-retokenization", 101)
     data = exchange.response.model_dump(mode="python")
     data["output"].append(
