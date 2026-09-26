@@ -1643,6 +1643,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
         _restore_slots(model_snapshot)
         trainer._checkpoint_slots.pop(destination, None)
         raise
+    trainer._commit_route_epoch(destination)
     trainer._snapshot_checkpoint_names.add(destination)
     return True
 
@@ -1688,6 +1689,7 @@ def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
         _restore_slots(model_snapshot)
         trainer._checkpoint_slots[checkpoint] = slot
         raise
+    trainer._forget_route_epoch(slot)
 
 
 def _commit_slot(trainer: TrainerRank, source: str, destination: str) -> None:
@@ -1959,6 +1961,7 @@ def load_checkpoint(
     except BaseException:
         _rollback_load(trainer, snapshot, temporary, name, previous, group)
         raise
+    trainer._commit_route_epoch(name, previous)
 
 
 def snapshot_prepared_checkpoint(
