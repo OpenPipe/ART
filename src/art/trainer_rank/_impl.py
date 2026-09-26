@@ -614,6 +614,13 @@ class _MemoryProfile:
     # Separate the retained compute rate from the peak, which also learns
     # caller-owned backward workspace. Requested outputs are charged explicitly.
     retained_compute_bytes_per_token: float | None = None
+    # A signature's first executed plan also pays one-time costs (compilation,
+    # first-use workspaces), which a small first wave spreads over few tokens.
+    # The same fit over later plans only prices waves at least as large as the
+    # smallest of them; smaller waves keep the fit over every plan.
+    warm_bytes_per_token: float | None = None
+    warm_packed_tokens: int | None = None
+    warm_logical_per_packed: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2031,6 +2038,10 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._cache_recovery_state = _CacheRecoveryState()
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
+        # Each signature's first executed plan, while it is alive (in process).
+        self._profile_seed_plans: dict[
+            _MemorySignature, weakref.ReferenceType[_FlatForwardPlan]
+        ] = {}
         self._split_memory_floors: dict[bytes, int] = {}
         self._split_memory_floor_status = "not_observed"
         self._last_global_micro_batch_size: int | None = None
@@ -8051,27 +8062,46 @@ class TrainerRank:
         # usual trust growth. Normalize before multiplying: cancelling packed
         # tokens through two float operations can otherwise make a larger warm
         # layout cheaper.
-        profiled_tokens: int | float = packed_tokens
         packed_priced = profiled is not None and _packed_priced(
             signature, self._one_layer_recompute()
         )
-        if profiled is not None and logical_tokens is not None:
-            profiled_tokens = max(
+
+        def profiled_tokens(logical_per_packed: float) -> int | float:
+            if logical_tokens is None:
+                return packed_tokens
+            return max(
                 packed_tokens,
                 logical_tokens
-                / profiled.logical_per_packed
+                / logical_per_packed
                 / (_MEMORY_PROFILE_TRUST_GROWTH if packed_priced else 1),
             )
+
         # The trust window limits calibration growth, not the empirical floor.
         # Dropping that floor beyond the window can admit a larger request that
         # was refused just inside it, even below a previously observed peak.
         if profiled is None:
             compute = static_compute
         else:
+            profiled_bytes = profiled.bytes_per_token * profiled_tokens(
+                profiled.logical_per_packed
+            )
+            if (
+                profiled.warm_bytes_per_token is not None
+                and profiled.warm_packed_tokens is not None
+                and profiled.warm_logical_per_packed is not None
+                and packed_tokens >= profiled.warm_packed_tokens
+            ):
+                # Later plans' own sharing: a rate learned under lighter
+                # sharing scales up for deeper-shared plans, as above.
+                profiled_bytes = min(
+                    profiled_bytes,
+                    profiled.warm_bytes_per_token
+                    * profiled_tokens(profiled.warm_logical_per_packed),
+                )
             compute = max(
                 static_compute,
                 int(
-                    profiled.bytes_per_token * profiled_tokens
+                    profiled_bytes
                     + (
                         _PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
                         # Branch states grow with segments, not packed rows;
@@ -8250,6 +8280,21 @@ class TrainerRank:
         compute_delta = max(0, peak_delta_bytes - plan.output_bytes)
         bytes_per_token = compute_delta / max(1, plan.packed_tokens)
         previous = self._memory_profiles.get(plan.signature)
+        logical_per_packed = plan.active_logical_tokens / max(1, plan.packed_tokens)
+        seeds = self.__dict__.setdefault("_profile_seed_plans", {})
+        if previous is None:
+            seeds[plan.signature] = weakref.ref(plan)
+        # The first plan's caller-phase update is still that plan. A weak
+        # reference, unlike ``id``, cannot match a later plan at a freed address.
+        seed = seeds.get(plan.signature)
+        warm = previous is not None and (seed is None or seed() is not plan)
+        warm_rate = None if previous is None else previous.warm_bytes_per_token
+        warm_tokens = None if previous is None else previous.warm_packed_tokens
+        warm_sharing = None if previous is None else previous.warm_logical_per_packed
+        if warm:
+            warm_rate = max(bytes_per_token, warm_rate or 0.0)
+            warm_tokens = min(plan.packed_tokens, warm_tokens or plan.packed_tokens)
+            warm_sharing = max(logical_per_packed, warm_sharing or 1.0)
         retained_fraction = None if previous is None else previous.retained_fraction
         retained_compute = (
             None if previous is None else previous.retained_compute_bytes_per_token
@@ -8278,11 +8323,14 @@ class TrainerRank:
                 0 if previous is None else previous.packed_tokens,
             ),
             logical_per_packed=max(
-                plan.active_logical_tokens / max(1, plan.packed_tokens),
+                logical_per_packed,
                 1.0 if previous is None else previous.logical_per_packed,
             ),
             retained_fraction=retained_fraction,
             retained_compute_bytes_per_token=retained_compute,
+            warm_bytes_per_token=warm_rate,
+            warm_packed_tokens=warm_tokens,
+            warm_logical_per_packed=warm_sharing,
         )
 
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:

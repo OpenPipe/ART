@@ -107,7 +107,13 @@ def test_inactive_length_preserves_warm_cost_and_profile(monkeypatch, output, no
         )
         assert lower == rank._plan_cost(plan)
     rank._update_memory_profile(second, 10_000, retained_bytes=1000)
-    assert rank._memory_profiles[first.signature] == profile
+    # The second plan is warm; inactive rows change neither its rate nor sharing.
+    assert rank._memory_profiles[first.signature] == replace(
+        profile,
+        warm_bytes_per_token=profile.bytes_per_token,
+        warm_packed_tokens=second.packed_tokens,
+        warm_logical_per_packed=profile.logical_per_packed,
+    )
 
 
 def test_public_pair_avoids_inactive_only_split_and_keeps_total_telemetry(monkeypatch):
@@ -376,11 +382,12 @@ def test_packed_sharing_clamp_is_monotone_and_learning_sharing_never_cheapens():
     rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * 8_000
     assert sweep[0] == sweep[3] == int((50_000 * 1000 + rows) * 1.1)
     assert sweep[4] == int((50_000 * 1001 + rows) * 1.1)
-    # Learning more sharing at a lower rate max-merges both; plans at
-    # or below the older ratio never get cheaper.
+    # Learning more sharing max-merges it; plans at or below the older ratio
+    # never get cheaper. (A later plan's lower rate may price larger plans;
+    # see test_trainer_rank_profile_warm.)
     before = [cost(packed, logical) for packed, logical in ((100, 100), (50, 100))]
     wider = replace(observed, packed_tokens=1, logical_tokens=8)
-    rank._update_memory_profile(wider, 1_000, retained_bytes=None)
+    rank._update_memory_profile(wider, wider.output_bytes + 50_000, retained_bytes=None)
     profile = rank._memory_profiles[single]
     assert profile.logical_per_packed > 1 and profile.bytes_per_token == 50_000
     after = [cost(packed, logical) for packed, logical in ((100, 100), (50, 100))]
