@@ -4666,36 +4666,7 @@ class _ChatViewTokenizer:
     def run(self) -> TokenizedHistory:
         self._render_messages()
         self._render_canonical_masks()
-        self.canonical_rendered = self.rendered
-        self.exact_prefix_length = 0
-        self.canonical_prefix_length = 0
-        if (
-            self.chat_template is None
-            and self.chat_template_kwargs is None
-            and self.projection_matches is True
-        ):
-            for message_index, (message, source) in enumerate(
-                zip(self.history.messages, self.history.message_sources, strict=True)
-            ):
-                if message.get("role") != "assistant" or source is None:
-                    continue
-                source_prompt = self._source_prompt_tokens(source)
-                if source_prompt and self._source_matches_context(source):
-                    rendered_prompt = self._probe_render(
-                        self.messages[:message_index], add_generation_prompt=True
-                    )
-                    if (
-                        rendered_prompt is not None
-                        and self.rendered[: len(rendered_prompt)] == rendered_prompt
-                    ):
-                        self.rendered = [
-                            *source_prompt,
-                            *self.rendered[len(rendered_prompt) :],
-                        ]
-                        self.exact_prefix_length = len(source_prompt)
-                        self.canonical_prefix_length = len(rendered_prompt)
-                        break
-
+        self._substitute_exact_prefix()
         canonical_length_stop_mask = _synthetic_length_stop_mask(
             self.messages,
             self.history.message_sources,
@@ -6336,6 +6307,37 @@ class _ChatViewTokenizer:
                 or dict(self.chat_template_kwargs) == (request_kwargs or {})
             )
         )
+
+    def _substitute_exact_prefix(self) -> None:
+        self.canonical_rendered = self.rendered
+        self.exact_prefix_length = 0
+        self.canonical_prefix_length = 0
+        if (
+            self.chat_template is None
+            and self.chat_template_kwargs is None
+            and self.projection_matches is True
+        ):
+            for message_index, (message, source) in enumerate(
+                zip(self.history.messages, self.history.message_sources, strict=True)
+            ):
+                if message.get("role") != "assistant" or source is None:
+                    continue
+                source_prompt = self._source_prompt_tokens(source)
+                if source_prompt and self._source_matches_context(source):
+                    rendered_prompt = self._probe_render(
+                        self.messages[:message_index], add_generation_prompt=True
+                    )
+                    if (
+                        rendered_prompt is not None
+                        and self.rendered[: len(rendered_prompt)] == rendered_prompt
+                    ):
+                        self.rendered = [
+                            *source_prompt,
+                            *self.rendered[len(rendered_prompt) :],
+                        ]
+                        self.exact_prefix_length = len(source_prompt)
+                        self.canonical_prefix_length = len(rendered_prompt)
+                        break
 
     def _locations(self, needle: Sequence[int], start: int) -> list[tuple[int, int]]:
         if not needle:
