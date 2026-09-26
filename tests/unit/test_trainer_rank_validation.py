@@ -1712,6 +1712,38 @@ def test_checkpoint_manifest_semantics_are_authenticated(
         prepare_checkpoint(str(root))
 
 
+@pytest.mark.parametrize("artifact_entries", (False, True))
+@pytest.mark.parametrize(
+    "step", (-1, -1.0, -0.5, 0.5, float("nan"), float("inf"), -float("inf"), True)
+)
+def test_checkpoint_rejects_invalid_optimizer_counter(
+    tmp_path: Path, step: float, artifact_entries: bool
+) -> None:
+    root = tmp_path / "checkpoint"
+    manifest = _canonical_checkpoint(root)
+    manifest["steps"][next(iter(manifest["steps"]))] = step
+    # A valid digest authenticates the bytes, not the counter's semantics.
+    manifest["digest"] = _manifest_digest(manifest)
+    (root / "checkpoint.json").write_text(json.dumps(manifest))
+    entries = [*manifest["files"], "checkpoint.json"] if artifact_entries else None
+
+    with pytest.raises(RuntimeError, match="optimizer steps are invalid"):
+        prepare_checkpoint(str(root), artifact_entries=entries)
+
+
+@pytest.mark.parametrize("step", (0, 0.0, -0.0, 50, 50.0, 2**53 + 1))
+def test_checkpoint_preserves_valid_optimizer_counter(
+    tmp_path: Path, step: float
+) -> None:
+    root = tmp_path / "checkpoint"
+    manifest = _canonical_checkpoint(root)
+    manifest["steps"][next(iter(manifest["steps"]))] = step
+    manifest["digest"] = _manifest_digest(manifest)
+    (root / "checkpoint.json").write_text(json.dumps(manifest))
+
+    assert prepare_checkpoint(str(root)).manifest == manifest
+
+
 @pytest.mark.parametrize("extra", (True, False))
 def test_checkpoint_optimizer_mapping_must_match_adapter(
     tmp_path: Path, extra: bool
