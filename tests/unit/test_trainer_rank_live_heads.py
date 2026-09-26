@@ -398,8 +398,6 @@ def test_distributed_persistent_buffers_use_dp_zero_authority(tmp_path):
 
 
 def _buffer_snapshot_failure_worker(process_rank, init_method):
-    import torch.distributed as dist
-
     from art.trainer_rank import _heads
 
     with gloo_group(process_rank, init_method, timeout=15):
@@ -1003,8 +1001,6 @@ def test_inplace_operation_snapshots_readonly_checkpoint_parameter():
 
 
 def _live_buffer_authority_worker(process_rank, init_method, asymmetric=False):
-    import torch.distributed as dist
-
     from art.trainer_rank._heads import synchronize_head_buffers
 
     with gloo_group(process_rank, init_method):

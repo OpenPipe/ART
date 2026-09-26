@@ -514,24 +514,18 @@ class _Executor:
             handle = f"{self.mode}:batches:{command.sequence}"
             self.state.iterators[handle] = self.rank.forward_batches(*args, **kwargs)
             return handle
-        if op in ("next", "batches_next"):
-            iterator = (
-                self.iterators[args[0]]
-                if op == "next"
-                else self.state.iterators[args[0]]
+        if op in ("next", "batches_next", "close", "batches_close"):
+            iterators = (
+                self.iterators if op in ("next", "close") else self.state.iterators
             )
-            batch = next(iterator, None)
-            if batch is None:
-                return (None, None)
-            return replace(batch, inputs=[], outputs=[]), self._packet(
-                batch.outputs, command.sequence
-            )
-        if op in ("close", "batches_close"):
-            iterator = (
-                self.iterators.pop(args[0], None)
-                if op == "close"
-                else self.state.iterators.pop(args[0], None)
-            )
+            if op in ("next", "batches_next"):
+                batch = next(iterators[args[0]], None)
+                if batch is None:
+                    return (None, None)
+                return replace(batch, inputs=[], outputs=[]), self._packet(
+                    batch.outputs, command.sequence
+                )
+            iterator = iterators.pop(args[0], None)
             if op == "batches_close":
                 self.state.batch_inputs.pop(args[0], None)
             if iterator is not None:

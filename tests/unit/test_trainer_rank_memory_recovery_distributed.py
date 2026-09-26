@@ -149,12 +149,10 @@ def _head_failure_worker(index: int, directory: str, failure: str) -> None:
             return convert(tensor, *args, **kwargs)
 
         setattr(trainer, "_commit_versioned_gradients", stage)
-        setattr(torch.Tensor, "to", copy)
-        try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(torch.Tensor, "to", copy)
             with pytest.raises((MemoryError, RuntimeError), match="head .* allocation"):
                 _Executor(trainer, "zero")._backward(packets, retain_graph=False)
-        finally:
-            setattr(torch.Tensor, "to", convert)
         torch.testing.assert_close(parameter.grad, torch.ones_like(parameter))
         assert trainer._version_state()._transaction is None
         dist.barrier()
