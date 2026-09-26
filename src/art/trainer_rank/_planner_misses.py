@@ -46,6 +46,7 @@ MAX_PLANNING_SPOOL_BYTES = 16 * 1024 * 1024
 _SOURCE_NAMES = (
     "_impl.py",
     "_memory.py",
+    "_micro_batch_planner.py",
     "_planner_cost.py",
     "_prefix_tree_planner.py",
     "_prefix_tree_performance_search.py",
