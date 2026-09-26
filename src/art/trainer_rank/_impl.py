@@ -3455,19 +3455,19 @@ class TrainerRank:
                 outputs = _unflatten(materialized, iter(tracked_outputs))
         except BaseException as exc:
             error = exc
-            raise
-        finally:
-            # Failed peers must leave this frontier before the command layer's
-            # error exchange, just as successful peers do. Caller RNG is restored
-            # by model() before this collective, including on execution failure.
-            try:
-                self._rng.synchronize(caller_group())
-            except BaseException as sync_error:
-                if error is None:
-                    raise
-                self._memory_error_with_reduction_note(
-                    error, sync_error, operation="RNG synchronization"
-                )
+        # Failed peers must leave this frontier before the command layer's
+        # error exchange, just as successful peers do. Caller RNG is restored
+        # by model() before this collective, including on execution failure.
+        try:
+            self._rng.synchronize(caller_group())
+        except BaseException as sync_error:
+            if error is None:
+                raise
+            self._memory_error_with_reduction_note(
+                error, sync_error, operation="RNG synchronization"
+            )
+        if error is not None:
+            raise error
         return outputs
 
     def _execute_admitted_plan(

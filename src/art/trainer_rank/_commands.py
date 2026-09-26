@@ -29,7 +29,7 @@ def _coordinate_call(call: Callable[[], T], *, group: dist.ProcessGroup | None) 
     result, error = None, None
     try:
         result = call()
-    except Exception as exc:
+    except BaseException as exc:
         error = exc
     failures = [None if error is None else f"{type(error).__name__}: {error}"]
     if dist.is_initialized():
@@ -324,7 +324,7 @@ class _Executor:
         return self._execute(command)
 
     async def serve(self) -> None:
-        cancelled = None
+        deferred: BaseException | None = None
         try:
             while True:
                 objects: list[Any] = [None]
@@ -348,19 +348,21 @@ class _Executor:
                     except asyncio.CancelledError as error:
                         # An abandoned receive could consume the next callback's
                         # command. Drain this session through its leader stop.
-                        cancelled = error
+                        deferred = error if deferred is None else deferred
                 command = self._decode(objects[0])
                 self.state.sequence = max(self.state.sequence, command.sequence)
                 if command.operation == "stop":
-                    if cancelled is not None:
-                        raise cancelled
+                    if deferred is not None:
+                        raise deferred
                     return
                 try:
                     self._execute(command)
-                except Exception:
+                except BaseException as error:
                     # The leader receives the same coordinated error and chooses
                     # whether to catch it, continue, or stop the callback.
-                    pass
+                    # Cancellation must not abandon the leader's stop command.
+                    if not isinstance(error, Exception):
+                        deferred = error if deferred is None else deferred
         finally:
             self.stopped = True
             self._close_iterators()
@@ -392,7 +394,7 @@ class _Executor:
         try:
             with torch.set_grad_enabled(command.grad_enabled):
                 result = self._dispatch(command)
-        except Exception as exc:
+        except BaseException as exc:
             error = exc
         errors = self._gather(
             None if error is None else f"{type(error).__name__}: {error}"

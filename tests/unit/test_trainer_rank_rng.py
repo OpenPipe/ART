@@ -20,7 +20,7 @@ from art.trainer_rank import (
     TrainerRank,
     run_rank_callback,
 )
-from art.trainer_rank._commands import join_rank_callback_release
+from art.trainer_rank._commands import _coordinate_call, join_rank_callback_release
 from art.trainer_rank._impl import _CheckpointSlot, _GatherContextParallelRows
 from art.trainer_rank._rng import RNGState, TrainerRNG, caller_group
 
@@ -207,6 +207,7 @@ def test_forward_sync_preserves_primary_failure(monkeypatch, primary_type, sync_
             note = expected.__notes__[1]
             assert "Secondary RNG synchronization failure:" in note
             assert f"{type(secondary).__name__}: sync failure" in note
+            assert "model failure" not in note
     assert synchronized == [None]
     assert torch.equal(torch.get_rng_state(), caller)
 
@@ -221,37 +222,76 @@ def test_failed_forward_keeps_command_collectives_aligned(tmp_path):
 
 
 def _failed_forward_worker(physical, rendezvous):
-    with gloo_group(physical, rendezvous, timeout=10):
-        trainer = _trainer()
-        with (
-            megatron_topology(physical, dp_size=1, tp_size=2),
-            pytest.MonkeyPatch.context() as patch,
+    with (
+        gloo_group(physical, rendezvous, timeout=10),
+        megatron_topology(physical, dp_size=1, tp_size=2),
+    ):
+        for primary_type, sync_failure, preflight in (
+            (ValueError, False, False),
+            (asyncio.CancelledError, True, False),
+            (KeyboardInterrupt, True, False),
+            (asyncio.CancelledError, False, False),
+            (KeyboardInterrupt, False, False),
+            (ValueError, True, False),
+            (asyncio.CancelledError, True, True),
+            (KeyboardInterrupt, False, True),
         ):
-            calls = 0
+            with pytest.MonkeyPatch.context() as patch:
+                _check_forward_failure(
+                    patch, physical, primary_type, sync_failure, preflight
+                )
 
-            def execute():
-                nonlocal calls
-                calls += 1
-                torch.rand(7)
-                if calls == 1 and physical == 1:
-                    raise ValueError("injected local model failure")
-                return []
 
-            _stub_forward(patch, trainer, execute)
+def _check_forward_failure(patch, physical, primary_type, sync_failure, preflight):
+    trainer = _trainer()
+    calls = 0
+    primary = primary_type("injected local model failure")
+    synchronize = trainer._rng.synchronize
 
-            def callback(view):
-                with pytest.raises(RuntimeError, match="injected local model failure"):
-                    view.forward([])
-                assert view.forward([]) == []
-                return "recovered"
+    def execute():
+        nonlocal calls
+        calls += 1
+        torch.rand(7)
 
-            async def run():
-                result = await run_rank_callback(trainer, callback)
-                await join_rank_callback_release(trainer)
-                assert result.value == ("recovered" if physical == 0 else None)
+        def compute():
+            if calls == 1 and physical == 1:
+                raise primary
+            return []
 
-            asyncio.run(run())
-            assert calls == 2
+        return _coordinate_call(compute, group=None) if preflight else compute()
+
+    def sync(group):
+        synchronize(group)
+        if calls == 1 and sync_failure:
+            raise OSError("injected synchronization failure")
+
+    _stub_forward(patch, trainer, execute)
+    patch.setattr(trainer._rng, "synchronize", sync)
+
+    def callback(view):
+        expected = OSError if sync_failure and not preflight else RuntimeError
+        with pytest.raises(expected, match="injected"):
+            view.forward([])
+        assert view.forward([]) == []
+        return "recovered"
+
+    async def run():
+        deferred = physical == 1 and not isinstance(primary, Exception)
+        try:
+            result = await run_rank_callback(trainer, callback)
+        except BaseException as error:
+            assert deferred and error is primary
+        else:
+            assert not deferred
+            assert result.value == ("recovered" if physical == 0 else None)
+        await join_rank_callback_release(trainer)
+        # A follower must drain the first stop, not consume the next session.
+        result = await run_rank_callback(trainer, lambda view: view.forward([]))
+        await join_rank_callback_release(trainer)
+        assert result.value == ([] if physical == 0 else None)
+
+    asyncio.run(run())
+    assert calls == 3
 
 
 @pytest.mark.parametrize("yield_empty", (False, True))
