@@ -2399,9 +2399,10 @@ def _checkpoint_load_failure_worker(
             parameter, torch.tensor([rank + 1.0]), atol=0, rtol=0
         )
         torch.testing.assert_close(gradient, torch.tensor([rank + 3.0]), atol=0, rtol=0)
-        completed = torch.tensor(1)
-        dist.all_reduce(completed)
-        assert completed.item() == world_size
+        for group in (trainer._checkpoint_process_group, None):
+            completed = torch.tensor(1)
+            dist.all_reduce(completed, group=group)
+            assert completed.item() == world_size
 
 
 @pytest.mark.parametrize(
