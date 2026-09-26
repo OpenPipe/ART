@@ -131,6 +131,57 @@ def test_later_history_callback_cannot_change_completed_source(monkeypatch, supp
         )
 
 
+@pytest.mark.parametrize("supplied", [False, True])
+@pytest.mark.parametrize(
+    "mutation",
+    ["request_role", "request_tools", "history_role", "history_kwargs", "kwargs_order"],
+)
+def test_later_history_callback_cannot_change_completed_context(
+    monkeypatch, supplied, mutation
+):
+    first = branch(0, length=False, model="model/a")
+    second = branch(1, length=True, model="model/b")
+
+    value = trajectory(first, second)
+    histories = value.histories()
+    original_histories = type(value).histories
+    monkeypatch.setattr(
+        type(value),
+        "histories",
+        lambda self, **kwargs: (
+            histories if self is value else original_histories(self, **kwargs)
+        ),
+    )
+    options = {"first": 1, "second": 2}
+
+    class Tokenizer(_CharacterTemplateTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            if mutation == "request_role":
+                first.request["messages"][0]["role"] = "assistant"
+            elif mutation == "request_tools":
+                first.request["tools"] = [
+                    {"type": "function", "function": {"name": "changed"}}
+                ]
+            elif mutation == "history_role":
+                histories[0].messages[0]["role"] = "assistant"
+            elif mutation == "history_kwargs":
+                histories[0].chat_template_kwargs = {"enable_thinking": True}
+            else:
+                options["first"] = options.pop("first")
+            return super().apply_chat_template(messages, **kwargs)
+
+    tokenizer = Tokenizer()
+    bind(monkeypatch, {"model/a": tokenizer, "model/b": tokenizer})
+    with pytest.raises(
+        ValueError, match="context changed during tokenization callback"
+    ):
+        value.tokenize(
+            multi_history=True,
+            tokenizer=tokenizer if supplied else None,
+            chat_template_kwargs=options if mutation == "kwargs_order" else None,
+        )
+
+
 def test_stop_postpass_checks_original_evidence_before_consuming_it(monkeypatch):
     first = branch(0, length=False)
     second = branch(1, length=False)
@@ -398,3 +449,138 @@ async def test_public_async_default_dispatch_uses_resolved_stop_authority(monkey
     assert loads == ["test/model"]
     assert len(results) == 1 and results[0].trajectory is value
     assert results[0].histories[-1].flags[-1] & tr.TokenFlag.STOP
+
+
+@pytest.mark.parametrize("mapping_type", ["ordered", "proxy"])
+@pytest.mark.parametrize("mutation", [None, "order", "value"])
+def test_standard_mapping_options_keep_context_proof(mapping_type, mutation):
+    from collections import OrderedDict
+    from types import MappingProxyType
+
+    options = OrderedDict(first=1, second=2)
+    selected = options if mapping_type == "ordered" else MappingProxyType(options)
+    exchange = branch(0, length=False)
+
+    class Tokenizer(_CharacterTemplateTokenizer):
+        changed = False
+
+        def apply_chat_template(self, messages, **kwargs):
+            if not self.changed and mutation is not None:
+                self.changed = True
+                if mutation == "order":
+                    options.move_to_end("first")
+                else:
+                    options["first"] = 99
+            return super().apply_chat_template(messages, **kwargs)
+
+    value = trajectory(exchange)
+    tokenizer = Tokenizer()
+    if mutation is None:
+        actual = value.tokenize(tokenizer=tokenizer, chat_template_kwargs=selected)
+        expected = value.tokenize(
+            tokenizer=_CharacterTemplateTokenizer(), chat_template_kwargs=dict(selected)
+        )
+        assert actual.tokens == expected.tokens and actual.flags == expected.flags
+        assert all(
+            a == b or math.isnan(a) and math.isnan(b)
+            for a, b in zip(actual.logprobs, expected.logprobs, strict=True)
+        )
+    else:
+        with pytest.raises(
+            ValueError, match="context changed during tokenization callback"
+        ):
+            value.tokenize(tokenizer=tokenizer, chat_template_kwargs=selected)
+        assert tokenizer.changed
+
+
+@pytest.mark.parametrize(
+    "protocol", ["messages", "responses", "completion_tokens", "completion_string"]
+)
+@pytest.mark.parametrize("mutate", [False, True])
+def test_protocol_history_context_survives_stop_callbacks(protocol, mutate):
+    from test_tokenize import (
+        _completion_exchange,
+        _message_exchange,
+        _response_exchange,
+    )
+
+    if protocol == "messages":
+        exchange = _message_exchange(
+            tr.MessagesRequest(
+                model="test/model", messages=[{"role": "user", "content": "question"}]
+            ),
+            prompt_token_ids=[1],
+            token_ids=[2],
+            logprobs=[-0.2],
+        )
+        exchanges = tr.TrajectoryExchanges(messages=[exchange])
+    elif protocol == "responses":
+        exchange = _response_exchange("public-response", 2, prompt_token_ids=[1])
+        exchanges = tr.TrajectoryExchanges(responses=[exchange])
+    else:
+        exchange = _completion_exchange(
+            prompt=[1] if protocol == "completion_tokens" else "question"
+        )
+        exchanges = tr.TrajectoryExchanges(completions=[exchange])
+    history = tr.Trajectory(exchanges=exchanges).histories()[0]
+    assert not isinstance(history, tr.LegacyHistory)
+    calls = []
+
+    class Tokenizer:
+        eos_token_id = 2
+
+        def __call__(self, text, **kwargs):
+            raise AssertionError("Complete native records need no encoding")
+
+        def convert_tokens_to_ids(self, token):
+            calls.append(token)
+            if mutate:
+                if protocol == "messages":
+                    assert isinstance(history, tr.AnthropicMessagesHistory)
+                    history.system = "changed system"
+                elif protocol == "responses":
+                    assert isinstance(history, tr.ResponsesHistory)
+                    history.previous_response_id = "changed-context"
+                else:
+                    assert isinstance(
+                        history,
+                        (tr.CompletionsTokenHistory, tr.CompletionsStringHistory),
+                    )
+                    history.sampled_spans = []
+            return None
+
+    if mutate:
+        with pytest.raises(
+            ValueError, match="context changed during tokenization callback"
+        ):
+            history.tokenize(tokenizer=cast(Any, Tokenizer()))
+    else:
+        actual = history.tokenize(tokenizer=cast(Any, Tokenizer()))
+        assert actual.tokens == [1, 2]
+        assert actual.flags[-1] & tr.TokenFlag.SAMPLED
+    assert calls
+
+
+def test_context_snapshot_shared_values_are_fresh_between_observations():
+    from copy import deepcopy
+
+    shared = {"role": "assistant", "content": ["original"]}
+    context = [[shared], {"messages": [shared]}]
+    before = module._tokenization_context(context)
+    assert before == module._tokenization_context(deepcopy(context))
+    validate = module._tokenization_context_validator(context)
+    shared["content"][0] = "changed"
+    assert module._tokenization_context(context) != before
+    with pytest.raises(ValueError, match="context changed"):
+        validate(True)
+    shared["content"][0] = "original"
+    validate(True)
+
+
+def test_context_snapshot_does_not_certify_cyclic_or_opaque_values():
+    cyclic = []
+    cyclic.append(cyclic)
+    with pytest.raises(RecursionError):
+        module._tokenization_context(cyclic)
+    with pytest.raises(TypeError, match="Unsupported mutable"):
+        module._tokenization_context([object()])

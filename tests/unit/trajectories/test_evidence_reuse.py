@@ -509,3 +509,93 @@ def test_edited_history_does_not_reuse_projection_proof(edit):
         history.messages[0]["content"] = "new question"
     with pytest.raises((ValueError, AssertionError)):
         history.tokenize(tokenizer=_CharacterTemplateTokenizer())
+
+
+@pytest.mark.parametrize("mutation", ["model", "logprob"])
+def test_boundary_decoder_cannot_change_later_source_model(monkeypatch, mutation):
+    from test_tokenize import _character_template_history
+
+    history, tokenizer, _ = _character_template_history()
+    sources = [
+        source
+        for source in history.message_sources
+        if source is not None and source.choice_index is not None
+    ]
+    middle = sources[1].exchange
+    final = sources[2].exchange
+    assert isinstance(middle, tr.ChatCompletionsExchange)
+    output = extras(middle)["token_ids"]
+    original_decode = tokenizer.decode
+    calls = []
+
+    def decode(ids, **kwargs):
+        if ids == output:
+            calls.append(True)
+            if mutation == "model":
+                final.request["model"] = "changed/model"
+            else:
+                assert isinstance(final, tr.ChatCompletionsExchange)
+                logprobs(final)[0].logprob = -99
+        return original_decode(ids, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "decode", decode)
+    with pytest.raises(
+        ValueError,
+        match="context changed|model no longer matches|Sampled source changed",
+    ):
+        history.tokenize(tokenizer=tokenizer)
+    assert calls
+
+
+def test_stop_callback_cannot_change_next_request_then_restore_it():
+    first = _chat_exchange([1], [2, 3])
+    second = _chat_exchange([1, 2, 3, 4], [5, 6], offset=1)
+    extras(first)["stop_reason"] = "first-stop"
+    extras(second)["stop_reason"] = "second-stop"
+    calls = []
+
+    class StopTokenizer:
+        def __call__(self, text, **kwargs):
+            calls.append(text)
+            if text == "first-stop":
+                second.request["tools"] = [
+                    {"type": "function", "function": {"name": "changed"}}
+                ]
+            else:
+                second.request.pop("tools", None)
+            return {"input_ids": [3 if text == "first-stop" else 6]}
+
+    with pytest.raises(
+        ValueError, match="context changed during tokenization callback"
+    ):
+        trajectory(first, second).tokenize(tokenizer=StopTokenizer())
+    assert calls == ["first-stop"]
+
+
+@pytest.mark.parametrize("kind", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_boundary_decoder_mutation_keeps_uncaught_exception_identity(monkeypatch, kind):
+    from test_tokenize import _character_template_history
+
+    history, tokenizer, _ = _character_template_history()
+    selected = [
+        source
+        for source in history.message_sources
+        if source is not None and source.choice_index is not None
+    ]
+    middle, final = selected[1].exchange, selected[2].exchange
+    assert isinstance(middle, tr.ChatCompletionsExchange)
+    assert isinstance(final, tr.ChatCompletionsExchange)
+    output = extras(middle)["token_ids"]
+    error = kind("public callback failure")
+    original_decode = tokenizer.decode
+
+    def decode(ids, **kwargs):
+        if ids == output:
+            logprobs(final)[0].logprob = -99
+            raise error
+        return original_decode(ids, **kwargs)
+
+    monkeypatch.setattr(tokenizer, "decode", decode)
+    with pytest.raises(kind) as caught:
+        history.tokenize(tokenizer=tokenizer)
+    assert caught.value is error

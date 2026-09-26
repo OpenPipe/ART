@@ -4305,7 +4305,9 @@ def _tokenization_context(value: object) -> object:
     request-owned context. Sampled response evidence has its own source-key
     validator; retaining entire response objects here would duplicate it.
     """
-    exchanges: dict[int, object] = {}
+    # Shared message dictionaries occur in many recorded request prefixes.
+    # Intern only within this one observation, never across callback checks.
+    observed: dict[int, tuple[object, object]] = {}
 
     def snapshot(item: object) -> object:
         kind = type(item)
@@ -4313,23 +4315,20 @@ def _tokenization_context(value: object) -> object:
             return kind, item
         if kind is float:
             return kind, repr(item)
+        previous = observed.get(id(item))
+        if previous is not None and previous[0] is item:
+            return previous[1]
         if kind in (list, tuple):
-            return kind, tuple(snapshot(child) for child in cast(Sequence, item))
-        if isinstance(item, Mapping):
-            return kind, tuple(
-                (snapshot(key), snapshot(child)) for key, child in item.items()
+            result = kind, tuple(snapshot(child) for child in cast(Sequence, item))
+        elif isinstance(item, Mapping):
+            result = (
+                kind,
+                tuple((snapshot(key), snapshot(child)) for key, child in item.items()),
             )
-        if isinstance(item, Exchange):
-            if id(item) not in exchanges:
-                exchanges[id(item)] = (
-                    kind,
-                    id(item),
-                    item.model,
-                    snapshot(item.request),
-                )
-            return exchanges[id(item)]
-        if isinstance(item, BaseModel):
-            return (
+        elif isinstance(item, Exchange):
+            result = kind, id(item), item.model, snapshot(item.request)
+        elif isinstance(item, BaseModel):
+            result = (
                 kind,
                 tuple(
                     (name, snapshot(getattr(item, name)))
@@ -4337,7 +4336,10 @@ def _tokenization_context(value: object) -> object:
                 ),
                 snapshot(item.model_extra),
             )
-        raise TypeError("Unsupported mutable tokenization context")
+        else:
+            raise TypeError("Unsupported mutable tokenization context")
+        observed[id(item)] = item, result
+        return result
 
     return snapshot(value)
 
