@@ -143,6 +143,9 @@ def test_profile_order_change_cannot_drop_completed_split_floor(monkeypatch):
 
 def _counter_split(monkeypatch):
     rank = _rank()
+    # Preserve this fixture's original recompute mode: one-layer packed pricing
+    # adds 6 KiB per token, dwarfing the synthetic 10,000-byte split budget.
+    rank._recompute_method = rank._recompute_num_layers = None
     # This executor injects allocator counters without creating cached graphs.
     monkeypatch.setattr(rank, "_graph_memory_policy_enabled", lambda: False)
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
