@@ -220,8 +220,8 @@ assistant body alone does not prove an altered role header. If that proof fails,
 ART refuses that rendered role certification; this check does not require
 reconstructing text on the complete offline native path.
 
-Custom STOP encoders and terminator decoders must not change already-consumed
-source tokens, logprobs, model or stop evidence. ART checks each source around its
+Custom STOP encoders, terminator decoders and metadata lookups must not change
+already-consumed source tokens, logprobs, model or stop evidence. ART checks each source around its
 STOP callback and checks all consumed evidence before returning, including
 logprobs used only by the rendered fallback. Multi-history
 tokenization also checks completed histories after later renderer callbacks.
@@ -231,10 +231,16 @@ repair. STOP admission also retains the source keys read before its encoder.
 It is not a snapshot of every future response before that response is used.
 Ordered original requests and history context, including roles, tools, render
 settings and protocol selectors, are captured before callbacks and checked
-before reuse. Rendering checks its current working projection and the actual
+before reuse. Chat role rendering checks its working projection and actual
 callback arguments before and immediately after callbacks, including optional
 probes; a later encoder cannot hide an earlier edit by restoring it. Unexpected
 callback exceptions keep their original identity.
+
+When recorded prompt IDs are unavailable, a supplied renderer defines the prompt
+tokens. ART cannot certify that arbitrary returned IDs implement a particular
+text transformation. A renderer changing a disposable, single-use message copy
+does not itself invalidate that authority; changes to borrowed sources or
+semantic inputs that ART reuses still require refusal.
 These checks refuse stale results; they do not make callbacks or source objects
 immutable. Context snapshots reuse shared containers only within one observation;
 callback-free native assembly retains its bounded response-evidence reuse.

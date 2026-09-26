@@ -2524,11 +2524,15 @@ def _resolved_chat_template(
 ) -> tuple[object, object, dict[str, Any]]:
     # Preserve preselection defaults: resolving a named template must not
     # silently change its generation mode. Explicit kwargs still override these.
-    configured = chat_template_with_preserved_thinking(template)
+    deferred = isinstance(template, dict)
+    configured = (
+        template if deferred else chat_template_with_preserved_thinking(template)
+    )
     defaults = default_chat_template_kwargs_for_template(configured)
     if isinstance(getattr(tokenizer, "chat_template", None), dict):
         select = getattr(tokenizer, "get_chat_template", None)
         if callable(select):
+            deferred = False
             selected = select(
                 chat_template=template if isinstance(template, str) else None,
                 tools=tools,
@@ -2548,6 +2552,8 @@ def _resolved_chat_template(
                     "The normalized chat template is also a template name; "
                     "cannot preserve the selected renderer without ambiguity"
                 )
+    if deferred:
+        configured = chat_template_with_preserved_thinking(configured)
     return configured, configured, defaults
 
 
@@ -4957,12 +4963,26 @@ def _sampled_source_validator(
 
 
 def _stop_uses_callback(reason: int | str | None, tokenizer: Tokenizer | None) -> bool:
-    return tokenizer is not None and (
-        isinstance(reason, str)
-        and bool(reason)
-        or not (isinstance(reason, int) and not isinstance(reason, bool))
-        and callable(getattr(tokenizer, "convert_tokens_to_ids", None))
-    )
+    if tokenizer is None or isinstance(reason, int) and not isinstance(reason, bool):
+        return False
+    if isinstance(reason, str) and reason:
+        return True
+    # Admission must not itself invoke a descriptor or custom lookup. Only
+    # absent metadata and plain scalar EOS IDs prove a callback-free lookup.
+    for name in (
+        "eos_token_id",
+        "eot_token_id",
+        "special_tokens_map",
+        "convert_tokens_to_ids",
+    ):
+        pure, value = _plain_tokenizer_attribute(tokenizer, name)
+        if (
+            not pure
+            or value is not None
+            and not (name in ("eos_token_id", "eot_token_id") and type(value) is int)
+        ):
+            return True
+    return False
 
 
 def _mark_sampled_stops(

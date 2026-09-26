@@ -99,3 +99,30 @@ def test_selected_body_normalizes_tool_arguments_without_reselecting(
         settings["enable_thinking"] is True and settings["preserve_thinking"] is False
         for settings in tokenizer.settings
     )
+
+
+@pytest.mark.parametrize("with_tools", [False, True])
+def test_named_selection_normalizes_only_the_selected_body(monkeypatch, with_tools):
+    tokenizer = _NamedTemplateTokenizer()
+    original = deepcopy(tokenizer.chat_template)
+    tools = (
+        [{"type": "function", "function": {"name": "lookup"}}] if with_tools else None
+    )
+    selected = tokenizer.chat_template["tool_use" if with_tools else "default"]
+    normalize = _tokenize.chat_template_with_preserved_thinking
+    expected = normalize(selected)
+    calls = []
+
+    def observe(template):
+        calls.append(template)
+        return normalize(template)
+
+    monkeypatch.setattr(_tokenize, "chat_template_with_preserved_thinking", observe)
+    selector, body, defaults = _tokenize._resolved_chat_template(
+        tokenizer, tokenizer.chat_template, tools
+    )
+    assert body == expected
+    assert selector == (expected if expected != selected else tokenizer.chat_template)
+    assert defaults == {}
+    assert tokenizer.chat_template == original
+    assert calls == [selected]
