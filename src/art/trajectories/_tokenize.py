@@ -4669,261 +4669,7 @@ class _ChatViewTokenizer:
         self._substitute_exact_prefix()
         self._translate_masks()
         self._prepare_span_search()
-        self.marked_bounds: dict[int, tuple[int, int]] = {}
-        self.marked_part_bounds: dict[int, list[tuple[int, int]]] = {}
-        if not self.direct_bounds:
-            marked_messages = deepcopy(self.messages)
-            marker_prefix = f"ART_TRAJECTORY_{id(marked_messages):x}_"
-            markers: dict[str, tuple[int, int, Literal["start", "end"]]] = {}
-            part_counts: dict[int, int] = {}
-            part_whitespace: dict[tuple[int, int], tuple[str, str]] = {}
-            for message_index, (message, source) in enumerate(
-                zip(marked_messages, self.history.message_sources, strict=True)
-            ):
-                if (
-                    message.get("role") != "assistant"
-                    or source is None
-                    or not _source_is_sampled(source)
-                ):
-                    continue
-                slot_groups = _chat_message_text_slot_groups(message)
-                if not slot_groups:
-                    continue
-                part_counts[message_index] = len(slot_groups)
-                for part_index, slots in enumerate(slot_groups):
-                    start = f"{marker_prefix}{message_index}_{part_index}_START"
-                    end = f"{marker_prefix}{message_index}_{part_index}_END"
-                    first, first_key = slots[0]
-                    last, last_key = slots[-1]
-                    first_text = str(first[first_key])
-                    last_text = str(last[last_key])
-                    leading = first_text[: len(first_text) - len(first_text.lstrip())]
-                    trailing = last_text[len(last_text.rstrip()) :]
-                    whitespace_only = (
-                        first is last
-                        and first_key == last_key
-                        and not first_text.strip()
-                    )
-                    if whitespace_only:
-                        trailing = ""
-                    if first is last and first_key == last_key:
-                        core = first_text[
-                            len(leading) : len(first_text) - len(trailing)
-                            if trailing
-                            else len(first_text)
-                        ]
-                        first[first_key] = leading + start + core + end + trailing
-                    else:
-                        first[first_key] = leading + start + first_text[len(leading) :]
-                        last[last_key] = (
-                            last_text[: len(last_text) - len(trailing)] + end + trailing
-                        )
-                    part_whitespace[(message_index, part_index)] = (
-                        ("", "") if whitespace_only else (leading, trailing)
-                    )
-                    markers[start] = (message_index, part_index, "start")
-                    markers[end] = (message_index, part_index, "end")
-            if markers:
-                try:
-                    marked_text = self.tokenizer.apply_chat_template(
-                        normalize_tool_call_arguments_for_chat_template(
-                            marked_messages, self.template
-                        ),
-                        tools=self.history.tools,
-                        tokenize=False,
-                        add_generation_prompt=not self.ends_with_assistant,
-                        **(
-                            {"chat_template": self.template}
-                            if self.template is not None
-                            else {}
-                        ),
-                        **self.kwargs,
-                    )
-                except Exception:
-                    marked_text = None
-                if isinstance(marked_text, str):
-                    marker_pattern = re.compile(
-                        rf"{re.escape(marker_prefix)}\d+_\d+_(?:START|END)"
-                    )
-                    matches = list(marker_pattern.finditer(marked_text))
-                    found_markers = [match.group(0) for match in matches]
-                else:
-                    matches = []
-                    found_markers = []
-                if (
-                    isinstance(marked_text, str)
-                    and len(found_markers) == len(markers)
-                    and set(found_markers) == set(markers)
-                ):
-                    unmarked_parts: list[str] = []
-                    char_bounds: dict[tuple[int, int], list[int]] = {}
-                    source_cursor = 0
-                    target_cursor = 0
-                    for match in matches:
-                        position = match.start()
-                        marker = match.group(0)
-                        message_index, part_index, boundary = markers[marker]
-                        chunk = marked_text[source_cursor:position]
-                        unmarked_parts.append(chunk)
-                        target_cursor += len(chunk)
-                        char_bounds.setdefault((message_index, part_index), [0, 0])[
-                            0 if boundary == "start" else 1
-                        ] = target_cursor
-                        source_cursor = match.end()
-                    unmarked_parts.append(marked_text[source_cursor:])
-                    unmarked_text = "".join(unmarked_parts)
-                    for key, bounds in char_bounds.items():
-                        leading, trailing = part_whitespace[key]
-                        if (
-                            leading
-                            and unmarked_text[
-                                max(0, bounds[0] - len(leading)) : bounds[0]
-                            ]
-                            == leading
-                        ):
-                            bounds[0] -= len(leading)
-                        if (
-                            trailing
-                            and unmarked_text[bounds[1] : bounds[1] + len(trailing)]
-                            == trailing
-                        ):
-                            bounds[1] += len(trailing)
-                    try:
-                        encoded = cast(_OffsetTokenizer, self.tokenizer)(
-                            unmarked_text,
-                            add_special_tokens=False,
-                            return_offsets_mapping=True,
-                        )
-                    except Exception:
-                        encoded = None
-                    encoded_data = _string_dict(encoded)
-                    raw_offsets = (
-                        encoded_data.get("offset_mapping")
-                        if encoded_data is not None
-                        else None
-                    )
-                    encoded_ids = _ids(encoded) if encoded is not None else []
-                    if (
-                        encoded is not None
-                        and (
-                            encoded_ids == self.canonical_rendered
-                            or (
-                                self.exact_prefix_length
-                                and len(encoded_ids) == len(self.canonical_rendered)
-                                and encoded_ids[self.canonical_prefix_length :]
-                                == self.canonical_rendered[
-                                    self.canonical_prefix_length :
-                                ]
-                            )
-                        )
-                        and isinstance(raw_offsets, list)
-                        and len(raw_offsets) == len(encoded_ids)
-                    ):
-                        offsets: list[tuple[int, int]] = []
-                        for value in raw_offsets:
-                            if (
-                                not isinstance(value, (list, tuple))
-                                or len(value) != 2
-                                or not all(isinstance(item, int) for item in value)
-                            ):
-                                break
-                            offsets.append((value[0], value[1]))
-                        if len(offsets) == len(encoded_ids):
-                            token_bounds: dict[tuple[int, int], tuple[int, int]] = {}
-                            token_cursor = 0
-                            for key, (char_start, char_end) in sorted(
-                                char_bounds.items(), key=lambda item: item[1]
-                            ):
-                                while (
-                                    token_cursor < len(offsets)
-                                    and offsets[token_cursor][1] <= char_start
-                                ):
-                                    token_cursor += 1
-                                token_end = token_cursor
-                                while (
-                                    token_end < len(offsets)
-                                    and offsets[token_end][0] < char_end
-                                ):
-                                    token_end += 1
-                                if char_start == char_end:
-                                    token_bounds[key] = (token_cursor, token_cursor)
-                                elif (
-                                    token_end > token_cursor
-                                    and offsets[token_cursor][0] >= char_start
-                                    and offsets[token_end - 1][1] <= char_end
-                                ):
-                                    token_bounds[key] = (token_cursor, token_end)
-                                token_cursor = token_end
-                            for message_index, part_count in part_counts.items():
-                                bounds = [
-                                    token_bounds[(message_index, part_index)]
-                                    for part_index in range(part_count)
-                                    if (message_index, part_index) in token_bounds
-                                ]
-                                if len(bounds) == part_count:
-                                    rendered_bounds = [
-                                        self._canonical_span_to_rendered(*bound)
-                                        for bound in bounds
-                                    ]
-                                    if any(bound is None for bound in rendered_bounds):
-                                        continue
-                                    translated = cast(
-                                        list[tuple[int, int]], rendered_bounds
-                                    )
-                                    self.marked_part_bounds[message_index] = translated
-                                    self.marked_bounds[message_index] = (
-                                        translated[0][0],
-                                        translated[-1][1],
-                                    )
-            for message_index, bounds in list(self.marked_part_bounds.items()):
-                whitespace_parts = [
-                    (part_index, text)
-                    for part_index, (_, text) in enumerate(
-                        _chat_message_parts(self.messages[message_index])
-                    )
-                    if text and not text.strip()
-                ]
-                for part_index, _ in whitespace_parts:
-                    empty_messages = deepcopy(self.messages)
-                    groups = _chat_message_text_slot_groups(
-                        empty_messages[message_index]
-                    )
-                    if part_index >= len(groups):
-                        self.marked_bounds.pop(message_index, None)
-                        self.marked_part_bounds.pop(message_index, None)
-                        break
-                    for container, key in groups[part_index]:
-                        container[key] = ""
-                    try:
-                        empty_render = self._render(
-                            empty_messages,
-                            add_generation_prompt=not self.ends_with_assistant,
-                        )
-                    except Exception:
-                        self.marked_bounds.pop(message_index, None)
-                        self.marked_part_bounds.pop(message_index, None)
-                        break
-                    empty_render = self._canonical_render_to_rendered(empty_render)
-                    if empty_render is None:
-                        self.marked_bounds.pop(message_index, None)
-                        self.marked_part_bounds.pop(message_index, None)
-                        break
-                    if empty_render == self.rendered:
-                        continue
-                    anchor = bounds[part_index][0]
-                    start = anchor - (len(self.rendered) - len(empty_render))
-                    span = (start, anchor)
-                    if (
-                        start < 0
-                        or self.rendered[: span[0]] + self.rendered[span[1] :]
-                        != empty_render
-                    ):
-                        self.marked_bounds.pop(message_index, None)
-                        self.marked_part_bounds.pop(message_index, None)
-                        break
-                    bounds[part_index] = span
-                    self.marked_bounds[message_index] = (bounds[0][0], bounds[-1][1])
-
+        self._prove_marked_bounds()
         self.probed_bounds: dict[int, tuple[int, int]] = {}
         if not self.direct_bounds:
             for message_index, (message, source) in enumerate(
@@ -6403,6 +6149,262 @@ class _ChatViewTokenizer:
         end = len(baseline) - suffix
         span = self._canonical_span_to_rendered(prefix, end)
         return span if span is not None and span[0] < span[1] else None
+
+    def _prove_marked_bounds(self) -> None:
+        self.marked_bounds: dict[int, tuple[int, int]] = {}
+        self.marked_part_bounds: dict[int, list[tuple[int, int]]] = {}
+        if not self.direct_bounds:
+            marked_messages = deepcopy(self.messages)
+            marker_prefix = f"ART_TRAJECTORY_{id(marked_messages):x}_"
+            markers: dict[str, tuple[int, int, Literal["start", "end"]]] = {}
+            part_counts: dict[int, int] = {}
+            part_whitespace: dict[tuple[int, int], tuple[str, str]] = {}
+            for message_index, (message, source) in enumerate(
+                zip(marked_messages, self.history.message_sources, strict=True)
+            ):
+                if (
+                    message.get("role") != "assistant"
+                    or source is None
+                    or not _source_is_sampled(source)
+                ):
+                    continue
+                slot_groups = _chat_message_text_slot_groups(message)
+                if not slot_groups:
+                    continue
+                part_counts[message_index] = len(slot_groups)
+                for part_index, slots in enumerate(slot_groups):
+                    start = f"{marker_prefix}{message_index}_{part_index}_START"
+                    end = f"{marker_prefix}{message_index}_{part_index}_END"
+                    first, first_key = slots[0]
+                    last, last_key = slots[-1]
+                    first_text = str(first[first_key])
+                    last_text = str(last[last_key])
+                    leading = first_text[: len(first_text) - len(first_text.lstrip())]
+                    trailing = last_text[len(last_text.rstrip()) :]
+                    whitespace_only = (
+                        first is last
+                        and first_key == last_key
+                        and not first_text.strip()
+                    )
+                    if whitespace_only:
+                        trailing = ""
+                    if first is last and first_key == last_key:
+                        core = first_text[
+                            len(leading) : len(first_text) - len(trailing)
+                            if trailing
+                            else len(first_text)
+                        ]
+                        first[first_key] = leading + start + core + end + trailing
+                    else:
+                        first[first_key] = leading + start + first_text[len(leading) :]
+                        last[last_key] = (
+                            last_text[: len(last_text) - len(trailing)] + end + trailing
+                        )
+                    part_whitespace[(message_index, part_index)] = (
+                        ("", "") if whitespace_only else (leading, trailing)
+                    )
+                    markers[start] = (message_index, part_index, "start")
+                    markers[end] = (message_index, part_index, "end")
+            if markers:
+                try:
+                    marked_text = self.tokenizer.apply_chat_template(
+                        normalize_tool_call_arguments_for_chat_template(
+                            marked_messages, self.template
+                        ),
+                        tools=self.history.tools,
+                        tokenize=False,
+                        add_generation_prompt=not self.ends_with_assistant,
+                        **(
+                            {"chat_template": self.template}
+                            if self.template is not None
+                            else {}
+                        ),
+                        **self.kwargs,
+                    )
+                except Exception:
+                    marked_text = None
+                if isinstance(marked_text, str):
+                    marker_pattern = re.compile(
+                        rf"{re.escape(marker_prefix)}\d+_\d+_(?:START|END)"
+                    )
+                    matches = list(marker_pattern.finditer(marked_text))
+                    found_markers = [match.group(0) for match in matches]
+                else:
+                    matches = []
+                    found_markers = []
+                if (
+                    isinstance(marked_text, str)
+                    and len(found_markers) == len(markers)
+                    and set(found_markers) == set(markers)
+                ):
+                    unmarked_parts: list[str] = []
+                    char_bounds: dict[tuple[int, int], list[int]] = {}
+                    source_cursor = 0
+                    target_cursor = 0
+                    for match in matches:
+                        position = match.start()
+                        marker = match.group(0)
+                        message_index, part_index, boundary = markers[marker]
+                        chunk = marked_text[source_cursor:position]
+                        unmarked_parts.append(chunk)
+                        target_cursor += len(chunk)
+                        char_bounds.setdefault((message_index, part_index), [0, 0])[
+                            0 if boundary == "start" else 1
+                        ] = target_cursor
+                        source_cursor = match.end()
+                    unmarked_parts.append(marked_text[source_cursor:])
+                    unmarked_text = "".join(unmarked_parts)
+                    for key, bounds in char_bounds.items():
+                        leading, trailing = part_whitespace[key]
+                        if (
+                            leading
+                            and unmarked_text[
+                                max(0, bounds[0] - len(leading)) : bounds[0]
+                            ]
+                            == leading
+                        ):
+                            bounds[0] -= len(leading)
+                        if (
+                            trailing
+                            and unmarked_text[bounds[1] : bounds[1] + len(trailing)]
+                            == trailing
+                        ):
+                            bounds[1] += len(trailing)
+                    try:
+                        encoded = cast(_OffsetTokenizer, self.tokenizer)(
+                            unmarked_text,
+                            add_special_tokens=False,
+                            return_offsets_mapping=True,
+                        )
+                    except Exception:
+                        encoded = None
+                    encoded_data = _string_dict(encoded)
+                    raw_offsets = (
+                        encoded_data.get("offset_mapping")
+                        if encoded_data is not None
+                        else None
+                    )
+                    encoded_ids = _ids(encoded) if encoded is not None else []
+                    if (
+                        encoded is not None
+                        and (
+                            encoded_ids == self.canonical_rendered
+                            or (
+                                self.exact_prefix_length
+                                and len(encoded_ids) == len(self.canonical_rendered)
+                                and encoded_ids[self.canonical_prefix_length :]
+                                == self.canonical_rendered[
+                                    self.canonical_prefix_length :
+                                ]
+                            )
+                        )
+                        and isinstance(raw_offsets, list)
+                        and len(raw_offsets) == len(encoded_ids)
+                    ):
+                        offsets: list[tuple[int, int]] = []
+                        for value in raw_offsets:
+                            if (
+                                not isinstance(value, (list, tuple))
+                                or len(value) != 2
+                                or not all(isinstance(item, int) for item in value)
+                            ):
+                                break
+                            offsets.append((value[0], value[1]))
+                        if len(offsets) == len(encoded_ids):
+                            token_bounds: dict[tuple[int, int], tuple[int, int]] = {}
+                            token_cursor = 0
+                            for key, (char_start, char_end) in sorted(
+                                char_bounds.items(), key=lambda item: item[1]
+                            ):
+                                while (
+                                    token_cursor < len(offsets)
+                                    and offsets[token_cursor][1] <= char_start
+                                ):
+                                    token_cursor += 1
+                                token_end = token_cursor
+                                while (
+                                    token_end < len(offsets)
+                                    and offsets[token_end][0] < char_end
+                                ):
+                                    token_end += 1
+                                if char_start == char_end:
+                                    token_bounds[key] = (token_cursor, token_cursor)
+                                elif (
+                                    token_end > token_cursor
+                                    and offsets[token_cursor][0] >= char_start
+                                    and offsets[token_end - 1][1] <= char_end
+                                ):
+                                    token_bounds[key] = (token_cursor, token_end)
+                                token_cursor = token_end
+                            for message_index, part_count in part_counts.items():
+                                bounds = [
+                                    token_bounds[(message_index, part_index)]
+                                    for part_index in range(part_count)
+                                    if (message_index, part_index) in token_bounds
+                                ]
+                                if len(bounds) == part_count:
+                                    rendered_bounds = [
+                                        self._canonical_span_to_rendered(*bound)
+                                        for bound in bounds
+                                    ]
+                                    if any(bound is None for bound in rendered_bounds):
+                                        continue
+                                    translated = cast(
+                                        list[tuple[int, int]], rendered_bounds
+                                    )
+                                    self.marked_part_bounds[message_index] = translated
+                                    self.marked_bounds[message_index] = (
+                                        translated[0][0],
+                                        translated[-1][1],
+                                    )
+            for message_index, bounds in list(self.marked_part_bounds.items()):
+                whitespace_parts = [
+                    (part_index, text)
+                    for part_index, (_, text) in enumerate(
+                        _chat_message_parts(self.messages[message_index])
+                    )
+                    if text and not text.strip()
+                ]
+                for part_index, _ in whitespace_parts:
+                    empty_messages = deepcopy(self.messages)
+                    groups = _chat_message_text_slot_groups(
+                        empty_messages[message_index]
+                    )
+                    if part_index >= len(groups):
+                        self.marked_bounds.pop(message_index, None)
+                        self.marked_part_bounds.pop(message_index, None)
+                        break
+                    for container, key in groups[part_index]:
+                        container[key] = ""
+                    try:
+                        empty_render = self._render(
+                            empty_messages,
+                            add_generation_prompt=not self.ends_with_assistant,
+                        )
+                    except Exception:
+                        self.marked_bounds.pop(message_index, None)
+                        self.marked_part_bounds.pop(message_index, None)
+                        break
+                    empty_render = self._canonical_render_to_rendered(empty_render)
+                    if empty_render is None:
+                        self.marked_bounds.pop(message_index, None)
+                        self.marked_part_bounds.pop(message_index, None)
+                        break
+                    if empty_render == self.rendered:
+                        continue
+                    anchor = bounds[part_index][0]
+                    start = anchor - (len(self.rendered) - len(empty_render))
+                    span = (start, anchor)
+                    if (
+                        start < 0
+                        or self.rendered[: span[0]] + self.rendered[span[1] :]
+                        != empty_render
+                    ):
+                        self.marked_bounds.pop(message_index, None)
+                        self.marked_part_bounds.pop(message_index, None)
+                        break
+                    bounds[part_index] = span
+                    self.marked_bounds[message_index] = (bounds[0][0], bounds[-1][1])
 
 
 def _tokenize_chat_view(
