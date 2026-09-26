@@ -256,7 +256,8 @@ def test_incomplete_or_edited_history_does_not_authorize_splitting(change: str) 
 
 
 @pytest.mark.parametrize(
-    "change", ["missing_source", "prompt", "lp", "stop", "extra_stop", "flags"]
+    "change",
+    ["missing_source", "prompt", "lp", "stop", "extra_stop", "flags", "extra_sample"],
 )
 def test_scoped_final_guard_rejects_corrupt_results(change: str) -> None:
     trajectory, tokenizer = example()
@@ -277,6 +278,11 @@ def test_scoped_final_guard_rejects_corrupt_results(change: str) -> None:
         value.flags[stop] &= ~tr.TokenFlag.STOP
     elif change == "extra_stop":
         value.flags[sampled[-1]] |= tr.TokenFlag.STOP
+    elif change == "extra_sample":
+        value.flags[0] |= tr.TokenFlag.SAMPLED
+        value.logprobs[0] = -0.5
+        trace.source_keys[0] = trace.source_keys[sampled[0]]
+        trace.validate(value)  # Coherent trace membership is not complete coverage.
     else:
         value.flags[sampled[0]] &= ~tr.TokenFlag.SAMPLED
     with pytest.raises((ValueError, AssertionError)):

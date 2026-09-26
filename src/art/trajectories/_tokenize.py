@@ -7862,6 +7862,7 @@ def _require_native_stream(
         and keys != expected_keys
     ):
         raise ValueError("Native stream sampled source inventory changed")
+    expected: list[_SampledSourceKey | None] = [None] * len(value.tokens)
     for source in sources:
         prompt, output, logprobs = _chat_source_record(source)
         if (
@@ -7875,6 +7876,10 @@ def _require_native_stream(
                 "Native stream does not preserve complete original conditioning"
             )
         key = _sampled_source_key(source)
+        for index in range(len(prompt), len(prompt) + len(output)):
+            if expected[index] is not None:
+                raise ValueError("Native stream sampled source spans overlap")
+            expected[index] = key
         suffix = _sampled_stop_suffix(
             output, source=source, source_key=key, tokenizer=builder.tokenizer
         )
@@ -7885,6 +7890,8 @@ def _require_native_stream(
         ]
         if observed != list(range(len(output) - suffix, len(output))):
             raise ValueError("Native stream sampled STOP differs from source authority")
+    if trace.source_keys != expected:
+        raise ValueError("Native stream has sampled tokens outside original sources")
     prompt, output, _ = _chat_source_record(sources[-1])
     if prompt is None or output is None or value.tokens != [*prompt, *output]:
         raise ValueError("Native stream must end at its final recorded output")
