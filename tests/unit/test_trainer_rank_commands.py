@@ -552,7 +552,10 @@ def test_released_client_graph_releases_physical_bridge():
 
 
 def test_forward_batches_captures_policy_before_iteration():
+    from art.trainer_rank._rng import TrainerRNG
+
     rank = object.__new__(TrainerRank)
+    rank._rng = TrainerRNG(torch.device("cpu"))
     rank._forward_options = ForwardOptions(max_gradient_staleness=1, allow_replay=False)
     rank._skipped_forward_waves = {}
     request = _input(3)

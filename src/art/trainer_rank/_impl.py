@@ -86,6 +86,7 @@ from art.trainer_rank._prefix_tree_planner import (
     prefix_tree_layout_candidates,
     select_prefix_tree_layout,
 )
+from art.trainer_rank._rng import TrainerRNG, caller_group
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 from art.trainer_rank._versions import (
     CheckpointVersion,
@@ -1928,6 +1929,7 @@ class TrainerRank:
         resolve_forward_options(options)
         self.runtime: TrainingRuntime = runtime
         self.device: torch.device = next(runtime.model[0].parameters()).device
+        self._rng = TrainerRNG(self.device)
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
         try:
             metadata_model = _language_model(runtime.model[0])
@@ -2366,6 +2368,7 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 "Custom checkpoint object registration differs across ranks"
             )
+        self._rng.synchronize(caller_group())
         slot = self._checkpoint_slots[checkpoint_name]
         existing = slot.custom.get(name)
         registered = None if existing is None else existing.kind
@@ -3075,6 +3078,16 @@ class TrainerRank:
         forwards and backwards on their TP/CP peers. `reduce` combines only
         distinct data-parallel batches.
 
+        Model PyTorch randomness advances separately from caller randomness,
+        seeded when the physical TrainerRank is constructed. Direct physical
+        callers continue their TP/CP leader's default CPU and trainer-device CUDA
+        streams before each yield/forward return and custom-object factory. This
+        keeps matching random masks and custom-head dropout consistent without
+        synchronizing DP workers. Python/NumPy RNGs, explicit generators, other
+        devices, concurrent RNG use and rank-dependent control flow are outside
+        this contract. Checkpoint saves do not persist RNG state; activation
+        checkpointing must preserve RNG for correct recomputation.
+
         Empty local microbatches are skipped unless `yield_empty=True`. Every
         rank must use the same setting. When a wave skips ranks, TrainerRank
         collective methods raise if called from its loop body; fully populated
@@ -3116,13 +3129,14 @@ class TrainerRank:
         try:
             while True:
                 self._guard_forward_collective("forward_batches")
-                with torch.set_grad_enabled(enabled):
+                with torch.set_grad_enabled(enabled), self._rng.model():
                     try:
                         batch = next(batches)
                     except StopIteration:
                         return
                 if not yield_empty and not batch.outputs:
                     continue
+                self._rng.synchronize(caller_group())
                 if (
                     not yield_empty
                     and batch.stats.global_count < self._dp_rank_and_size()[1]
@@ -3426,9 +3440,12 @@ class TrainerRank:
             backward.harvest()
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         with torch.set_grad_enabled(enabled):
-            self._reset_planning_telemetry()
+            # Caller iterators may draw their own inputs; only ART's internal
+            # execution belongs to the private model stream.
             materialized = self._capture_forward_options(inputs, options)
             requests = list(_flatten(materialized))
+        with torch.set_grad_enabled(enabled), self._rng.model():
+            self._reset_planning_telemetry()
             plan, check = self._plan_admissible_forward(
                 requests, checkpoint=checkpoint, context="forward"
             )
@@ -3437,7 +3454,9 @@ class TrainerRank:
             )
             if backward is not None:
                 backward.attach(tracked_outputs)
-            return _unflatten(materialized, iter(tracked_outputs))
+            outputs = _unflatten(materialized, iter(tracked_outputs))
+        self._rng.synchronize(caller_group())
+        return outputs
 
     def _execute_admitted_plan(
         self, plan: _AnyForwardPlan, *, check: _MemoryCheck, context: str

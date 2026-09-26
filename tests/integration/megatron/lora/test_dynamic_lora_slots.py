@@ -595,6 +595,8 @@ def _optimizer_state(trainer: TrainerRank, name: str) -> LocalOptimizerState:
 
 
 def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
+    from art.trainer_rank._rng import TrainerRNG
+
     trainer = TrainerRank.__new__(TrainerRank)
     trainer.runtime = SimpleNamespace(
         model=[lora],
@@ -602,6 +604,7 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
         model_support_handler=_IdentityModelSupportHandler(),
     )
     trainer.device = device
+    trainer._rng = TrainerRNG(device)
     trainer._slot_stack = []
     trainer._default_slot_ref = None
     trainer._skipped_forward_waves = {}

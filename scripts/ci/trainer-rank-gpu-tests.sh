@@ -11,6 +11,7 @@ test -x "${runtime_python}"
 
 "${runtime_python}" -m pytest --tb=short \
   tests/unit/test_trainer_rank_head_recompute.py \
+  tests/unit/test_trainer_rank_rng.py \
   tests/unit/test_trainer_rank_custom_tensors.py \
   tests/unit/test_trainer_rank_tensors.py \
   tests/unit/test_trainer_rank_graphs_cuda.py \

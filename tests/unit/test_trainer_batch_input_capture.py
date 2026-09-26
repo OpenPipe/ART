@@ -18,6 +18,7 @@ from art.trainer_rank import (
     Unset,
     run_rank_callback,
 )
+from art.trainer_rank._rng import TrainerRNG
 
 
 class _CapturingRank(_Rank):
@@ -33,6 +34,7 @@ def test_batches_snapshot_tokens_targets_and_structure_before_first_pull(
     rank: Any
     if surface == "native":
         rank = object.__new__(TrainerRank)
+        rank._rng = TrainerRNG(torch.device("cpu"))
         rank._skipped_forward_waves = {}
 
         def batches(inputs, **kwargs):

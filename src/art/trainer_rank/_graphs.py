@@ -6,7 +6,6 @@ from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field, fields, is_dataclass, replace
-import random
 from time import perf_counter
 from typing import Any, Literal
 from uuid import uuid4
@@ -18,6 +17,7 @@ from torch.multiprocessing.reductions import StorageWeakRef
 
 from art._tensor_residency import observe_resident_tensors
 
+from ._rng import RNGState as _RNGState
 from ._tensors import _map_tensor_arguments
 
 ForwardHandle = str
@@ -97,40 +97,6 @@ def _storage_sizes(tensors: Iterable[torch.Tensor]) -> tuple[int, int]:
         sum(size for (device, _), size in sizes.items() if device.type != "cpu"),
         sum(size for (device, _), size in sizes.items() if device.type == "cpu"),
     )
-
-
-@dataclass
-class _RNGState:
-    cpu: torch.Tensor
-    cuda: dict[int, torch.Tensor]
-    python: tuple[Any, ...]
-    tracker: Any = None
-
-    @classmethod
-    def capture(cls, devices: Sequence[int], tracker: Any) -> _RNGState:
-        return cls(
-            torch.get_rng_state(),
-            {device: torch.cuda.get_rng_state(device) for device in devices},
-            random.getstate(),
-            None if tracker is None else _snapshot(tracker.get_states()),
-        )
-
-    def restore(self, tracker: Any) -> None:
-        torch.set_rng_state(self.cpu)
-        for device, state in self.cuda.items():
-            torch.cuda.set_rng_state(state, device)
-        random.setstate(self.python)
-        if tracker is not None:
-            tracker.set_states(_snapshot(self.tracker))
-
-    @contextmanager
-    def replay(self, tracker: Any):
-        ambient = self.capture(tuple(self.cuda), tracker)
-        try:
-            self.restore(tracker)
-            yield
-        finally:
-            ambient.restore(tracker)
 
 
 @dataclass
