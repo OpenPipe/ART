@@ -19,6 +19,7 @@ _TEMPLATE = (
     Path(__file__).parents[2] / "fixtures/qwen35_preserved_thinking.jinja"
 ).read_text()
 _LITERAL = "HEAD\n</think>DISCARDED_PUBLIC_SEGMENT</think>\n\nTAIL"
+_RENDER_OVERRIDE = _TEMPLATE + "{# explicit rendering #}"
 
 
 class _TemplateTokenizer:
@@ -126,10 +127,10 @@ def _history(
 
 
 def _outcome(
-    history: tr.ChatCompletionsHistory, tokenizer: _TemplateTokenizer
+    history: tr.ChatCompletionsHistory, tokenizer: _TemplateTokenizer, **kwargs: Any
 ) -> object:
     try:
-        value = history.tokenize(tokenizer=tokenizer)
+        value = history.tokenize(tokenizer=tokenizer, **kwargs)
     except ValueError as error:
         return type(error), str(error)
     return value.tokens, value.flags, [None if x != x else x for x in value.logprobs]
@@ -138,23 +139,25 @@ def _outcome(
 @pytest.mark.parametrize(
     "content", [_LITERAL, "literal </think> text", "π<think>one<think>two</think>end"]
 )
+@pytest.mark.parametrize("rendered", [False, True])
 def test_native_thinking_off_retains_literal_content(
-    content: str, monkeypatch: pytest.MonkeyPatch
+    content: str, rendered: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     history, tokenizer = _history(content=content)
     original = history.model_dump(mode="python")
-    # The pre-fix history path misrenders literal content even when later native
-    # token splicing can recover the terminal output.
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            _tokenize, "chat_template_with_preserved_thinking", lambda value: value
-        )
-        _outcome(history, tokenizer)
-    assert content not in tokenizer.rendered[0]
-    tokenizer.calls.clear()
-    tokenizer.rendered.clear()
-    tokenized = history.tokenize(tokenizer=tokenizer)
-    assert content in tokenizer.rendered[0]
+    # Explicit rendering still needs literal-content normalization. Complete
+    # native output needs no rendering, even for a length-limited response.
+    override = _RENDER_OVERRIDE if rendered else None
+    if rendered:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                _tokenize, "chat_template_with_preserved_thinking", lambda value: value
+            )
+            _outcome(history, tokenizer, chat_template=override)
+        assert content not in tokenizer.rendered[0]
+        tokenizer.calls.clear()
+        tokenizer.rendered.clear()
+    tokenized = history.tokenize(tokenizer=tokenizer, chat_template=override)
     sampled = [
         i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED
     ]
@@ -163,8 +166,19 @@ def test_native_thinking_off_retains_literal_content(
     required = tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
     assert all(tokenized.flags[i] & required == required for i in sampled)
     assert not any(flag & tr.TokenFlag.STOP for flag in tokenized.flags)
-    assert tokenizer.calls[0][-1].get("reasoning_content", "") == ""
-    assert tokenizer.calls[0][-1]["content"] == content
+    if rendered:
+        assert content in tokenizer.rendered[0]
+        assert tokenizer.calls[0][-1].get("reasoning_content", "") == ""
+        assert tokenizer.calls[0][-1]["content"] == content
+    else:
+        assert not tokenizer.calls and not tokenizer.rendered
+        source = history.message_sources[-1]
+        assert source is not None and isinstance(
+            source.exchange, tr.ChatCompletionsExchange
+        )
+        recorded = source.exchange.response.choices[0].model_extra
+        assert recorded is not None
+        assert tokenized.tokens == recorded["prompt_token_ids"] + recorded["token_ids"]
     assert history.model_dump(mode="python") == original
 
 
@@ -221,8 +235,9 @@ def test_literal_content_is_not_inferred_from_source_thinking_mode(case: str) ->
     if case == "visible_only":
         cast(dict[str, Any], history.messages[-1]).pop("reasoning")
     original = history.model_dump(mode="python")
-    _outcome(history, tokenizer)
-    # Plain content stays literal independently of recorded/current thinking mode
+    _outcome(history, tokenizer, chat_template=_RENDER_OVERRIDE)
+    # Exercise rendering explicitly even when complete native output can bypass
+    # it. Plain content stays literal independently of recorded/current thinking mode
     # and whether the message has complete native token metadata. Structured
     # reasoning remains a separate field on the render copy.
     assert tokenizer.calls[0][-1]["content"] == _LITERAL
@@ -238,10 +253,13 @@ def test_literal_content_is_not_inferred_from_source_thinking_mode(case: str) ->
 
 
 @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
-def test_explicit_empty_reasoning_is_preserved(field: str) -> None:
+@pytest.mark.parametrize("rendered", [False, True])
+def test_explicit_empty_reasoning_is_preserved(field: str, rendered: bool) -> None:
     history, tokenizer = _history(reasoning="", reasoning_field=field)
     original = history.model_dump(mode="python")
-    tokenized = history.tokenize(tokenizer=tokenizer)
+    tokenized = history.tokenize(
+        tokenizer=tokenizer, chat_template=_RENDER_OVERRIDE if rendered else None
+    )
     assert (
         "".join(
             chr(token)
@@ -250,7 +268,10 @@ def test_explicit_empty_reasoning_is_preserved(field: str) -> None:
         )
         == _LITERAL
     )
-    assert tokenizer.calls[0][-1].get("reasoning_content", "") == ""
+    if rendered:
+        assert tokenizer.calls[0][-1].get("reasoning_content", "") == ""
+    else:
+        assert not tokenizer.calls and not tokenizer.rendered
     assert history.model_dump(mode="python") == original
 
 
@@ -409,17 +430,17 @@ def test_literal_next_turn_preserves_preceding_length_stop_boundary(
         )
         _outcome(history, tokenizer)
     boundary, old_exact = observed[0]
-    stored = list(boundary.tail + boundary.following)
-    assert old_exact is None
-    assert len(native_boundary) - len(stored) == 2
-    assert stored[:-1] == native_boundary[:-3]
-    assert tokenizer.decode(stored[-1:]) == "\n"
-    assert tokenizer.decode(native_boundary[-3:]) == "\n\n</think>\n\n"
+    # The final recorded body no longer needs a reconstructed terminal tail.
+    # Disabling literal normalization cannot invalidate the proved earlier gap.
+    assert old_exact is not None
+    assert list(boundary.tail + boundary.following) == native_boundary
     observed.clear()
 
     value = history.tokenize(tokenizer=tokenizer)
     fixed_boundary, fixed_exact = observed[0]
     assert fixed_exact is value
+    assert value.tokens == old_exact.tokens
+    assert value.flags == old_exact.flags
     assert list(fixed_boundary.tail + fixed_boundary.following) == native_boundary
     assert (
         value.tokens[: len(last["prompt_token_ids"]) + len(last["token_ids"])]
