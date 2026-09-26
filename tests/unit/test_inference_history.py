@@ -1,4 +1,6 @@
 import asyncio
+import copy
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -6,6 +8,7 @@ from pydantic import BaseModel, model_validator
 import pytest
 
 from art_inference import vllm
+from art_inference.append_only import chat_prefix_scope
 from art_inference.token_prefix import TokenPrefixStore
 
 
@@ -23,6 +26,7 @@ class Request(BaseModel):
     previous_response_id: str | None = None
     tools: list = []
     tool_choice: str = "auto"
+    parallel_tool_calls: bool | None = None
 
     @model_validator(mode="after")
     def validate_stream(self):
@@ -35,6 +39,7 @@ class Message(BaseModel):
     role: str = "assistant"
     reasoning_content: str
     content: str
+    tool_calls: list[dict] = []
 
 
 @pytest.fixture
@@ -61,6 +66,7 @@ def serving(monkeypatch):
     class Engine:
         def __init__(self):
             self.prompts = []
+            self.sampled = None
 
         async def generate(self, prompt, sampling_params=None):
             self.prompts.append(prompt["prompt_token_ids"])
@@ -69,6 +75,8 @@ def serving(monkeypatch):
                 if sampling_params
                 else [b"\nthought\n#action~"]
             )
+            if self.sampled is not None:
+                chunks = [self.sampled]
             for index, tokens in enumerate(chunks):
                 yield SimpleNamespace(
                     outputs=[
@@ -88,6 +96,7 @@ def serving(monkeypatch):
             self.chat_template = None
             self.chat_template_content_format = "string"
             self.parser = None
+            self.message = Message(reasoning_content="\nthought\n", content="action")
 
         async def preprocess_chat(self, request, messages, **kwargs):
             return await self.render_chat_request(request)
@@ -107,6 +116,10 @@ def serving(monkeypatch):
                         + message.get("reasoning_content", "").strip()
                         + "#"
                         + (message.get("content") or "")
+                        + "".join(
+                            call["function"]["name"]
+                            for call in message.get("tool_calls") or []
+                        )
                         + "~\n"
                     )
                 else:
@@ -117,7 +130,13 @@ def serving(monkeypatch):
 
         async def create_chat_completion(self, request, raw_request=None):
             _, inputs = await self.render_chat_request(request)
-            message = Message(reasoning_content="\nthought\n", content="action")
+            message = self.message
+            samples = {
+                "token_ids": list(self.engine.sampled or b"\nthought\n#action~"),
+                "logprobs": [-0.25]
+                * len(self.engine.sampled or b"\nthought\n#action~"),
+            }
+            usage = {"completion_tokens": len(samples["token_ids"])}
 
             async def stream():
                 params = SimpleNamespace(output_kind=SimpleNamespace(name="DELTA"))
@@ -126,7 +145,12 @@ def serving(monkeypatch):
                 yield (
                     "data: "
                     + json.dumps(
-                        {"choices": [{"index": 0, "delta": message.model_dump()}]}
+                        {
+                            "choices": [
+                                {"index": 0, "delta": message.model_dump(), **samples}
+                            ],
+                            "usage": usage,
+                        }
                     )
                     + "\n\n"
                 )
@@ -136,7 +160,10 @@ def serving(monkeypatch):
                 return stream()
             async for _ in self.engine.generate(inputs[0]):
                 pass
-            return SimpleNamespace(choices=[SimpleNamespace(index=0, message=message)])
+            return SimpleNamespace(
+                choices=[SimpleNamespace(index=0, message=message, **samples)],
+                usage=usage,
+            )
 
         async def create_completion(self, request, raw_request=None):
             return await self.create_chat_completion(request, raw_request)
@@ -286,6 +313,119 @@ def test_external_observations_use_the_host_store_without_local_publication(serv
     asyncio.run(run())
     assert observations
     assert not vllm._PREFIXES._scopes
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_serial_filtered_response_retains_all_samples_but_not_full_certificate(
+    serving, monkeypatch, stream
+):
+    server, modules = serving
+    sampled = b"\nthought\n#firstsecond~"
+    server.engine.sampled = sampled
+    server.message = Message(
+        reasoning_content="\nthought\n",
+        content="",
+        tool_calls=[
+            {
+                "index": 0,
+                "type": "function",
+                "function": {"name": "first", "arguments": "{}"},
+            }
+        ],
+    )
+    entries, raw_choices = [], []
+    observer = vllm.chat_response_prefixes
+
+    async def observe_choices(tokenizer, request, prompt, choices, render):
+        raw_choices.extend(copy.deepcopy(choices))
+        return await observer(tokenizer, request, prompt, choices, render)
+
+    async def observe(raw_request, values):
+        assert raw_request.headers == {"x-caladan-prefix-scope": "base"}
+        entries.extend(values)
+
+    monkeypatch.setattr(vllm, "chat_response_prefixes", observe_choices)
+    vllm.set_external_history_observer(observe, modules.__getitem__)
+
+    async def run():
+        request = Request(
+            messages=[{"role": "user", "content": "question"}],
+            parallel_tool_calls=False,
+            tools=[{"type": "function"}],
+            stream=stream,
+        )
+        result = await server.create_chat_completion(
+            request, SimpleNamespace(headers={"x-caladan-prefix-scope": "base"})
+        )
+        if stream:
+            chunks = [chunk async for chunk in result]
+            payload = json.loads(chunks[0][len("data: ") :])
+            choice = payload["choices"][0]
+            message = choice["delta"]
+            usage = payload["usage"]
+            assert chunks[-1] == "data: [DONE]\n\n"
+        else:
+            message = result.choices[0].message.model_dump()
+            choice = vars(result.choices[0])
+            usage = result.usage
+        assert message == server.message.model_dump()
+        assert choice["token_ids"] == list(sampled)
+        assert choice["logprobs"] == [-0.25] * len(sampled)
+        assert usage == {"completion_tokens": len(sampled)}
+
+    asyncio.run(run())
+    assert len(raw_choices) == 1
+    assert raw_choices[0][1:] == (list(sampled), True)
+    assert entries
+    assert all(b"first" not in bytes(raw) for _, raw, _ in entries)
+
+
+def test_native_scope_does_not_reuse_old_local_certificate(serving):
+    server, _ = serving
+    base = hashlib.sha256(
+        json.dumps(["model", None, {}, ""], sort_keys=True).encode()
+    ).hexdigest()
+    prompt = list(b"Uquestion;A")
+    vllm._PREFIXES.insert(base, prompt, list(b"unsafe"), "content")
+    asyncio.run(
+        server.create_chat_completion(
+            Request(messages=[{"role": "user", "content": "question"}])
+        )
+    )
+    assert server.engine.prompts == [prompt]
+    assert chat_prefix_scope(base) in vllm._PREFIXES._scopes
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("parallel", [False, True, None, "absent"])
+def test_responses_serial_policy_reaches_chat_observer(
+    serving, monkeypatch, stream, parallel
+):
+    server, _ = serving
+    observed = []
+    original = vllm.chat_response_prefixes
+
+    async def observe(tokenizer, request, prompt, choices, render):
+        observed.append(request.parallel_tool_calls)
+        return await original(tokenizer, request, prompt, choices, render)
+
+    monkeypatch.setattr(vllm, "chat_response_prefixes", observe)
+
+    async def run():
+        request = Request(
+            messages=[{"role": "user", "content": "question"}],
+            parallel_tool_calls=parallel if isinstance(parallel, bool) else None,
+            stream=stream,
+        )
+        if parallel == "absent":
+            del request.parallel_tool_calls
+        result = await server.create_responses(request)
+        if stream:
+            async for _ in result:
+                pass
+
+    asyncio.run(run())
+    assert observed == [parallel is not False]
 
 
 def test_previous_responses_keep_reasoning_and_tool_calls(serving):

@@ -19,11 +19,16 @@ class Request(BaseModel):
     previous_response_id: str | None = None
     stream: bool = False
     continue_final_message: bool = False
+    parallel_tool_calls: bool | None = None
 
 
 class Response(BaseModel):
     id: str = "previous"
     output: list = []
+
+
+class ChatRequest(Request):
+    parallel_tool_calls: bool = True
 
 
 @pytest.fixture
@@ -188,7 +193,7 @@ def serving():
         ),
         "sglang.srt.entrypoints.openai.encoding_dsv4": encoding,
         "sglang.srt.entrypoints.openai.protocol": SimpleNamespace(
-            ChatCompletionRequest=Request
+            ChatCompletionRequest=ChatRequest
         ),
         "sglang.srt.entrypoints.harmony_utils": SimpleNamespace(
             render_for_completion=lambda messages: messages
@@ -200,6 +205,38 @@ def serving():
     }
     sglang.patch_history(observe, modules.__getitem__)
     return Serving(), entries
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("parallel", [False, True, None, "absent"])
+def test_responses_serial_policy_reaches_chat_observer(
+    serving, monkeypatch, stream, parallel
+):
+    server, _ = serving
+    observed = []
+    original = sglang.chat_response_prefixes
+
+    async def observe(tokenizer, request, prompt, choices, render):
+        observed.append(request.parallel_tool_calls)
+        return await original(tokenizer, request, prompt, choices, render)
+
+    monkeypatch.setattr(sglang, "chat_response_prefixes", observe)
+
+    async def run():
+        request = Request(
+            input=[{"role": "user", "content": "question"}],
+            parallel_tool_calls=parallel if isinstance(parallel, bool) else None,
+            stream=stream,
+        )
+        if parallel == "absent":
+            del request.parallel_tool_calls
+        result = await server.create_responses(request)
+        if stream:
+            async for _ in result:
+                pass
+
+    asyncio.run(run())
+    assert observed == [parallel is not False]
 
 
 @pytest.mark.parametrize("stream", [False, True])

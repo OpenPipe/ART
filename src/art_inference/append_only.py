@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from functools import wraps
+import hashlib
 import json
 import sys
 from typing import Any
@@ -15,6 +16,25 @@ from typing import Any
 from .token_prefix import PrefixEdit, prefix_edits
 
 PrefixObservation = tuple[list[int], list[int], tuple[PrefixEdit, ...]]
+CHAT_PREFIX_POLICY = "serial-tool-lossless-v1"
+
+
+def chat_prefix_scope(base_scope: str) -> str:
+    """Fence certificates produced before serial-tool projection was checked.
+
+    Producers must derive this namespace themselves, not accept a caller's
+    policy label. Reads, including local and fallback reads, use only this scope.
+    """
+    return hashlib.sha256(
+        json.dumps([CHAT_PREFIX_POLICY, base_scope], separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def chat_prefix_eligible(
+    parallel_tool_calls: bool | None, tools: Any, message: Mapping[str, Any]
+) -> bool:
+    """Serial projection has no trusted witness for omitted sampled calls."""
+    return parallel_tool_calls is not False or not (tools or message.get("tool_calls"))
 
 
 def _rendering_edits(tokenizer, rendered, raw):
@@ -499,7 +519,14 @@ async def chat_response_prefixes(
                 raw_prompt,
                 output,
                 reasoning_prompt=reasoning_prompt,
-                complete=finished,
+                # Serial tool projection can hide sampled calls even when the
+                # parsed result contains only one (or no) call. Its terminal
+                # token does not prove full-turn equivalence; independently
+                # aligned reasoning remains eligible above.
+                complete=finished
+                and chat_prefix_eligible(
+                    payload.get("parallel_tool_calls"), payload.get("tools"), message
+                ),
             )
         )
     return entries

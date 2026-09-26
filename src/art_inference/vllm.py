@@ -16,6 +16,7 @@ from typing import Any
 
 from .append_only import (
     aligned_values,
+    chat_prefix_scope,
     chat_response_prefixes,
     merge_chat_delta,
     output_prefix_observations,
@@ -290,9 +291,11 @@ def patch_history(importer=importlib.import_module) -> None:
                 getattr(request, "chat_template_kwargs", None),
                 headers.get("authorization", ""),
             ]
-            scope = hashlib.sha256(
-                json.dumps(material, sort_keys=True).encode()
-            ).hexdigest()
+            scope = chat_prefix_scope(
+                hashlib.sha256(
+                    json.dumps(material, sort_keys=True).encode()
+                ).hexdigest()
+            )
             turn = _Turn(
                 scope,
                 tokenizer,
@@ -352,6 +355,9 @@ def patch_history(importer=importlib.import_module) -> None:
                 )
                 view = protocol.ChatCompletionRequest(
                     model=request.model,
+                    parallel_tool_calls=getattr(request, "parallel_tool_calls", None)
+                    is not False,
+                    tools=tools or [],
                     messages=conversation,
                     chat_template_kwargs=self._effective_chat_template_kwargs(request),
                 )
