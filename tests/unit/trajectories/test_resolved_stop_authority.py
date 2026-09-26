@@ -584,3 +584,50 @@ def test_context_snapshot_does_not_certify_cyclic_or_opaque_values():
         module._tokenization_context(cyclic)
     with pytest.raises(TypeError, match="Unsupported mutable"):
         module._tokenization_context([object()])
+
+
+@pytest.mark.parametrize("kind", ["enum", "enum_state", "string"])
+@pytest.mark.parametrize("mutate", [False, True])
+def test_scalar_subclass_context_keeps_value_and_mutable_state(kind, mutate):
+    from enum import Enum
+
+    class Content(str, Enum):
+        original = "public content"
+        changed = "changed content"
+
+    class Text(str):
+        state: list[str]
+
+    text = Text("public content")
+    text.state = ["original"]
+    selected = Content.original if kind in ("enum", "enum_state") else text
+    enum_state = ["original"]
+    if kind == "enum_state":
+        setattr(selected, "state", enum_state)
+    exchange = branch(0, length=False)
+    exchange.request["messages"][0]["content"] = selected
+    value = trajectory(exchange)
+    calls = []
+
+    class Tokenizer:
+        eos_token_id = 9
+
+        def convert_tokens_to_ids(self, token):
+            calls.append(token)
+            if mutate:
+                if kind == "enum":
+                    exchange.request["messages"][0]["content"] = Content.changed
+                elif kind == "enum_state":
+                    enum_state.append("changed")
+                else:
+                    text.state.append("changed")
+            return None
+
+    if mutate:
+        with pytest.raises(ValueError, match="context changed"):
+            value.tokenize(tokenizer=cast(Any, Tokenizer()))
+    else:
+        actual = value.tokenize(tokenizer=cast(Any, Tokenizer()))
+        assert actual.tokens
+        assert actual.flags[-1] & tr.TokenFlag.STOP
+    assert calls

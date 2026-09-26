@@ -189,7 +189,8 @@ recover historical assistant roles from that rendering. This uses the original
 tool serialization order and preserves role labels through exact length-stop
 assembly; it does not restore destructive parsing for new response content.
 With a supplied renderer, request-owned assistant roles are proved throughout
-the native stream, including between sampled responses. A request whose text
+the native stream, including between sampled responses. This requirement applies
+even when template normalization makes no change. A request whose text
 disagrees with its recorded assistant tokens can still use the offline native
 path, but cannot claim a complete rendered role mask. When literal-content
 normalization changes historical rendering, ART requires the original request
