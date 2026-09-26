@@ -84,7 +84,7 @@ def test_forward_only_observations_never_set_the_warm_fit():
     first, larger = _plans(r)
     _observe(r, first, FIRST)
     _update(r, larger, WARM, caller_phase=False)
-    assert r._memory_profiles[first.signature].warm_bytes_per_token is None
+    assert r._memory_profiles[first.signature].warm_packed_tokens is None
     assert _required(r, larger) == int(FIRST * larger.packed_tokens * 1.1)
     # A later caller phase is warm, and its peak includes the forward's.
     _update(r, larger, WARM, caller_phase=True)
@@ -265,8 +265,8 @@ def test_split_children_never_set_the_warm_fit(monkeypatch):
     next(batches)
     assert next(batches).stats.subforward_count > 1
     (signature,) = r._memory_profiles
-    # The seed's caller phase, then forward-only split children: not warm.
-    assert r._memory_profiles[signature].warm_bytes_per_token is None
+    # The seed's caller phase, then forward-only split children: no warm fit.
+    assert r._memory_profiles[signature].warm_packed_tokens is None
     assert [p for p in phases if p[1]] == [(1, True)]
     list(batches)
     # Only the later flat wave's caller phase fits the warm rate.
@@ -358,18 +358,18 @@ def test_only_a_whole_caller_phase_fits_the_warm_profile(monkeypatch):
         state["peak"] = larger.output_bytes + (WARM + 500_000) * n  # backward
         interrupt()
         _caller_phase(r, larger, interval)
-        return r._memory_profiles[signature].warm_bytes_per_token
+        return r._memory_profiles[signature]
 
     # A nested forward during the yield resets the counter: not whole, even
     # when its own peak is higher than this wave's forward.
     def nested():
-        forward(first, larger.output_bytes + (WARM + 100_000) * n)
+        forward(larger, larger.output_bytes + (WARM + 100_000) * n)
 
-    assert wave(nested) is None
+    assert wave(nested).warm_packed_tokens is None
     # An untracked reset: the counter falls below this wave's forward peak.
-    assert wave(lambda: state.update(peak=0)) is None
-    # An uninterrupted wave: forward, then the caller's loss and backward.
-    assert wave(lambda: None) == WARM + 500_000
+    assert wave(lambda: state.update(peak=0)).warm_packed_tokens is None
+    # Their readings raised the pending rate; an uninterrupted wave fits it.
+    assert wave(lambda: None).warm_bytes_per_token == WARM + 500_000
 
 
 def test_other_readings_raise_but_never_fit_the_warm_profile():
@@ -377,7 +377,7 @@ def test_other_readings_raise_but_never_fit_the_warm_profile():
     first, larger = _plans(r)
     _observe(r, first, FIRST)
     _update(r, larger, WARM, caller_phase=False)
-    assert r._memory_profiles[first.signature].warm_bytes_per_token is None
+    assert r._memory_profiles[first.signature].warm_packed_tokens is None
     _observe(r, larger, WARM)
     profile = r._memory_profiles[first.signature]
     assert profile.warm_bytes_per_token == WARM
@@ -456,4 +456,18 @@ def test_each_tracked_forward_starts_a_new_peak_interval(monkeypatch):
     assert baseline == 0 and interval[0] == seed[0] + 1
     r._run_flat_plan_with_memory_tracking(first, check=check, context="t")  # nested
     _caller_phase(r, larger, interval)
-    assert r._memory_profiles[larger.signature].warm_bytes_per_token is None
+    assert r._memory_profiles[larger.signature].warm_packed_tokens is None
+
+
+def test_a_higher_reading_before_the_first_warm_plan_is_kept():
+    """A seed, then a higher forward-only reading, then a lower whole warm
+    plan: the warm rate keeps the higher post-seed reading."""
+    r = rank()
+    first, larger = _plans(r)
+    _observe(r, first, FIRST)
+    _update(r, larger, WARM + 300_000, caller_phase=False)
+    assert _required(r, larger) == int(FIRST * larger.packed_tokens * 1.1)
+    _observe(r, larger, WARM)
+    profile = r._memory_profiles[first.signature]
+    assert profile.warm_bytes_per_token == WARM + 300_000
+    assert _required(r, larger) == int((WARM + 300_000) * larger.packed_tokens * 1.1)

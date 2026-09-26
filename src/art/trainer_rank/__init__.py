@@ -267,6 +267,11 @@ class TrainerRank(_impl.TrainerRank):
         iterator before making collective calls after an early exit. Guards apply
         on the iterator's thread; raw torch.distributed calls are not guarded.
         Collective calls must still match across ranks.
+
+        Admission learns each wave's memory peak, including the caller's loss
+        and backward. Only waves whose backward runs inside the yield, with no
+        other TrainerRank forward there, can lower later estimates below the
+        first wave's.
         """
         forward = cast(
             Callable[..., Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]],

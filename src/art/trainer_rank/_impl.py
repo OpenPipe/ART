@@ -2816,7 +2816,9 @@ class TrainerRank:
         rows and charges 6 KiB per logical token for the head plus the caller's
         loss saves and backward transients. A caller whose per-token head and
         loss memory peaks above that is unsupported: shared plans can exceed
-        their estimate.
+        their estimate. Only waves whose loss and backward run inside the yield,
+        with no other TrainerRank forward there, can lower later estimates below
+        the signature's first wave.
         """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
@@ -8325,10 +8327,11 @@ class TrainerRank:
                 warm_tokens = min(plan.packed_tokens, warm_tokens or plan.packed_tokens)
                 warm_sharing = max(logical_per_packed, warm_sharing or 1.0)
             caller_plans += 1
-        elif warm_rate is not None:
-            # Other readings cannot fit the warm profile, but a higher one still
-            # raises its rate, as it raises the fit over every observation.
-            warm_rate = max(warm_rate, bytes_per_token)
+        elif caller_plans:
+            # After the seed, other readings cannot fit the warm profile, but a
+            # higher one still raises its rate (inert until a whole warm plan
+            # fits the rest), as it raises the fit over every observation.
+            warm_rate = max(warm_rate or 0.0, bytes_per_token)
         retained_fraction = None if previous is None else previous.retained_fraction
         retained_compute = (
             None if previous is None else previous.retained_compute_bytes_per_token
