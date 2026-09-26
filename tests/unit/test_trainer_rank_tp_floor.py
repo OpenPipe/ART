@@ -20,6 +20,9 @@ H, F, LAYERS = 5120, 17408, 64
 TP4 = (1, 4, 1, 1)
 # The traced 062 wave: one request, 25,727 tokens padded to 25,728 rows.
 ROWS, OUTPUT = 25_728, 102_908
+# One segment's initial and final fp32 states over 12 local value heads, plus
+# conv history over 3 taps, in the recomputed GDN layer.
+SEGMENT = (4 * 12 * 128 * 128 + 2 * (2 * 4 * 128 + 12 * 128) * 3) * 2
 
 
 def tp_rank(layers=LAYERS, *, ffn=F, topology=TP4, sequence_parallel=True, **config):
@@ -75,6 +78,7 @@ def tp_rank(layers=LAYERS, *, ffn=F, topology=TP4, sequence_parallel=True, **con
         gdn_key_head_dim=128,
         gdn_value_heads=48,
         gdn_value_head_dim=128,
+        gdn_conv_kernel=4,
     )
     r._attention_output_gate = True
     r._gdn_layers = layers * 3 // 4
@@ -106,12 +110,13 @@ def test_the_traced_tp4_wave_prices_its_boundary_shards_and_their_repeat():
     retained, workspace = r._checkpoint_memory_floor(((ROWS, True),))
     # Each rank saves a quarter of every boundary: the traced 4.215 GB.
     assert retained == ROWS // 4 * LAYERS * H * 2 == 4_215_275_520
-    assert workspace == 0
+    # Without a segment count, only the TP-padding roots' states.
+    assert workspace == 3 * SEGMENT
     cost = _required(r)
     assert cost.checkpoint_input_gradient == retained
-    # One segment's recurrent states in the recomputed GDN layer.
+    # One segment plus up to three TP-padding roots, each with its states.
     state = cost.checkpoint_workspace
-    assert state == -(-r._gdn_segment_layer_bytes() // 1) < 2 * 2**20
+    assert state == 4 * SEGMENT
     assert cost.required == int((OUTPUT + 2 * retained + state) * 1.1)
     # Measured cold on all four ranks: 7.130 GB (7.060 GB in production), all
     # but the boundaries a transient recompute workspace; this raw floor
@@ -127,8 +132,9 @@ def test_rows_are_sharded_with_ceiling_and_only_gradient_groups_save_them():
     )
     mixed = r._checkpoint_memory_floor(((1024, True), (4096, False)))
     assert mixed[0] == 256 * LAYERS * H * 2
-    # No-grad groups keep today's four full rows; the static floor covers them.
-    assert mixed[1] == 4 * 4096 * H * 2
+    # No-grad groups keep today's four full rows (the static floor covers
+    # them); the gradient group adds its TP-padding roots' states.
+    assert mixed[1] == 4 * 4096 * H * 2 + 3 * SEGMENT
 
 
 @pytest.mark.parametrize(
@@ -206,11 +212,35 @@ def test_gdn_segment_states_are_priced_with_the_segments():
     r = tp_rank()
     rows = 8192
     cost = _required(r, group_rows=((rows, True),), gdn_segments=4096)
-    states = -(-4096 * r._gdn_segment_layer_bytes() // 1)
-    assert cost.checkpoint_workspace == states
-    # The recomputed layer's initial states alone: 4,096 x 12 local value
-    # heads x 128 x 128 x fp32.
-    assert states > 4096 * 12 * 128 * 128 * 4
-    assert cost.required >= int(
-        (OUTPUT + 2 * rows // 4 * LAYERS * H * 2 + states) * 1.1
+    assert cost.checkpoint_workspace == (4096 + 3) * SEGMENT
+    assert cost.required == int(
+        (OUTPUT + 2 * rows // 4 * LAYERS * H * 2 + (4096 + 3) * SEGMENT) * 1.1
     )
+
+
+def test_tp_padding_roots_carry_their_own_states():
+    """One one-token request: padding makes four roots, each with its states."""
+    r = tp_rank()
+    cost = _required(r, group_rows=((4, True),), gdn_segments=1)
+    # Four roots' initial states alone: 4 x 12 value heads x 128 x 128 x fp32.
+    assert cost.checkpoint_workspace == 4 * SEGMENT > 4 * 12 * 128 * 128 * 4
+    assert cost.required > 4 * SEGMENT
+
+
+def test_no_grad_waves_keep_their_pricing_whatever_the_segments():
+    r = tp_rank()
+    no_grad = r._checkpoint_memory_floor(((8192, False),), None, 8192)
+    assert no_grad == (0, 4 * 8192 * H * 2)
+
+
+def test_width_probes_count_only_gradient_segments():
+    from test_trainer_rank_checkpoint_memory import rank, requests
+
+    r = rank()
+    # One gradient request and one no-grad reference.
+    cheap: list[int] = []
+    assert r._estimate_flat_forward(requests(), gdn_segments=cheap) is not None
+    assert cheap == [2]  # A radix tree has fewer than twice its requests.
+    exact: list[int] = []
+    assert r._estimate_flat_forward(requests(), exact=True, gdn_segments=exact)
+    assert exact == [1]  # The selected layout's actual segments.
