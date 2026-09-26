@@ -1560,6 +1560,9 @@ _EP_ROUTED_ROW_ALLOWANCE = {2: 1.4, 4: 1.6, 8: 2.0}
 # the allowance. For the EP2 policy above, call-to-call change was 0.013 and
 # batch resampling reached about 0.04 above the median.
 _ROUTED_SHARE_MARGIN = 0.10
+# Route epochs travel as float64 in the handoff exchange; stop observing well
+# before two could round to the same value.
+_ROUTE_EPOCH_LIMIT = 2**40
 
 
 def _ep_routed_row_allowance(ep: int) -> float:
@@ -3111,6 +3114,9 @@ class TrainerRank:
                     share, epoch = self._local_routed_share(plan)
                 except Exception:
                     share, epoch = -1.0, -1
+                except BaseException as exc:
+                    # Cancellation still exchanges, as a failed forward.
+                    error = exc
             try:
                 failed, gradients, *observed = self._recovery_reduce(
                     [
@@ -3150,8 +3156,8 @@ class TrainerRank:
         """This rank's worst-layer routed share and checkpoint epoch, or -1s.
 
         HybridEP keeps each MoE layer's received rows per local expert after
-        combine, so at the handoff of a flat plan with one gradient group they
-        are this forward's dispatch. The share is the most loaded layer's
+        combine, so at the handoff of a flat plan with one group they are this
+        forward's dispatch, with or without gradients. The share is the most loaded layer's
         received pairs over top-k times the balanced rows that pricing scales
         (``_plan_group_balanced_rows``), so a share above the allowance means
         more rows arrived than were priced.
@@ -3159,7 +3165,6 @@ class TrainerRank:
         if (
             not isinstance(plan, _FlatForwardPlan)
             or len(plan.groups) != 1
-            or not plan.groups[0].grad_enabled
             or plan.groups[0].packed.tokens.numel() == 0
             or plan.signature.topology[2] <= 1
             or not getattr(self, "_ep_group_is_cp_group", False)
@@ -3168,7 +3173,7 @@ class TrainerRank:
             return -1.0, -1
         epoch = self._route_epoch(plan.groups[0].slot_ref)
         (balanced,) = self._plan_group_balanced_rows(plan)
-        if epoch is None or balanced <= 0:
+        if epoch is None or epoch >= _ROUTE_EPOCH_LIMIT or balanced <= 0:
             return -1.0, -1
         from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
 
@@ -4196,7 +4201,11 @@ class TrainerRank:
         return getattr(self, "_routed_share_max", {}).get(epoch)
 
     def _commit_route_epoch(
-        self, name: str, previous: _CheckpointSlot | None = None
+        self,
+        name: str,
+        previous: _CheckpointSlot | None = None,
+        *,
+        source: _CheckpointSlot | None = None,
     ) -> None:
         """Key a checkpoint's routing observations after every rank committed it.
 
@@ -4204,9 +4213,19 @@ class TrainerRank:
         everywhere, so each rank gives the same content the same new epoch.
         Epochs are never reused. Loading over a name forgets the old content's
         observations; optimizer steps keep the epoch, so its share only grows.
+        A snapshot starts from its ``source``'s share: same weights, same
+        routing.
         """
-        self._checkpoint_slots[name].route_epoch = self._route_epochs
+        epoch = self._route_epochs
+        self._checkpoint_slots[name].route_epoch = epoch
         self._route_epochs += 1
+        inherited = (
+            None
+            if source is None or source.route_epoch is None
+            else self._routed_share_max.get(source.route_epoch)
+        )
+        if inherited is not None:
+            self._routed_share_max[epoch] = inherited
         if previous is not None:
             self._forget_route_epoch(previous)
 
