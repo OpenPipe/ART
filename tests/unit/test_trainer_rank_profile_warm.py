@@ -241,7 +241,7 @@ def test_split_children_never_set_the_warm_fit(monkeypatch):
     forward_rate, backward_rate = 100, 300
     phases = []
 
-    def update(plan, baseline, retained_after=None, *, caller_phase=False):
+    def update(plan, baseline, retained_after=None, *, caller_phase=False, **_):
         # Stands in for the CUDA peak read: backward peaks above forward.
         phases.append((plan.request_count, caller_phase))
         rate = backward_rate if caller_phase else forward_rate
@@ -323,3 +323,137 @@ def test_a_width_accepted_on_the_no_sharing_bound_never_executes_above_it(
     # Accepted on the no-sharing bound, which priced more tokens than ran.
     assert batch.stats.packed_tokens == plan.packed_tokens
     assert batch.stats.estimated_required_bytes > own
+
+
+def _peak_reader(monkeypatch, r):
+    """Stand in for the CUDA peak counter, reset by each tracked forward."""
+    state = {"peak": 0}
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *_: state["peak"])
+
+    def forward(plan, peak):
+        r._peak_resets = r.__dict__.get("_peak_resets", 0) + 1
+        state["peak"] = peak
+        r._update_peak_memory_profile(plan, 0, 0)
+        return r._peak_reading
+
+    return state, forward
+
+
+def _caller_phase(r, plan, interval):
+    r._update_peak_memory_profile(plan, 0, caller_phase=True, interval=interval)
+
+
+def test_only_a_whole_caller_phase_fits_the_warm_profile(monkeypatch):
+    r = rank()
+    first, larger = _plans(r)
+    state, forward = _peak_reader(monkeypatch, r)
+    n = larger.packed_tokens
+    _caller_phase(
+        r, first, forward(first, first.output_bytes + FIRST * first.packed_tokens)
+    )
+    signature = first.signature
+
+    def wave(interrupt):
+        interval = forward(larger, larger.output_bytes + WARM * n)
+        state["peak"] = larger.output_bytes + (WARM + 500_000) * n  # backward
+        interrupt()
+        _caller_phase(r, larger, interval)
+        return r._memory_profiles[signature].warm_bytes_per_token
+
+    # A nested forward during the yield resets the counter: not whole, even
+    # when its own peak is higher than this wave's forward.
+    def nested():
+        forward(first, larger.output_bytes + (WARM + 100_000) * n)
+
+    assert wave(nested) is None
+    # An untracked reset: the counter falls below this wave's forward peak.
+    assert wave(lambda: state.update(peak=0)) is None
+    # An uninterrupted wave: forward, then the caller's loss and backward.
+    assert wave(lambda: None) == WARM + 500_000
+
+
+def test_other_readings_raise_but_never_fit_the_warm_profile():
+    r = rank()
+    first, larger = _plans(r)
+    _observe(r, first, FIRST)
+    _update(r, larger, WARM, caller_phase=False)
+    assert r._memory_profiles[first.signature].warm_bytes_per_token is None
+    _observe(r, larger, WARM)
+    profile = r._memory_profiles[first.signature]
+    assert profile.warm_bytes_per_token == WARM
+    # A higher forward-only or interrupted reading raises the warm rate, but
+    # neither extends the warm extent nor its sharing.
+    middle = r._plan_flat_forward(requests(4096, 64))
+    shared = replace(middle, logical_tokens=middle.packed_tokens * 8)
+    _update(r, shared, WARM + 300_000, caller_phase=False)
+    raised = r._memory_profiles[first.signature]
+    assert raised.warm_bytes_per_token == WARM + 300_000
+    assert raised.warm_packed_tokens == profile.warm_packed_tokens
+    assert raised.warm_logical_per_packed == profile.warm_logical_per_packed
+    _update(r, larger, WARM - 100_000, caller_phase=False)
+    assert r._memory_profiles[first.signature].warm_bytes_per_token == WARM + 300_000
+
+
+def test_a_nested_forward_during_the_yield_cannot_fit_the_warm_profile(monkeypatch):
+    """The real micro-batch loop: a caller that runs another tracked forward
+    after its backward leaves a peak counter reset since the wave's forward."""
+    from test_trainer_rank_split import _packed_budget, _request
+    from test_trainer_rank_split import _rank as split_rank
+
+    from art.trainer_rank import ForwardOutput
+
+    r = split_rank(monkeypatch)
+    monkeypatch.setattr(r, "_retained_memory_bytes", lambda *_args, **_kwargs: 0)
+    state, forward = _peak_reader(monkeypatch, r)
+
+    def run(plan, **_kwargs):
+        forward(plan, plan.output_bytes + 100 * plan.packed_tokens)
+        return [ForwardOutput(None, None, None, None)] * plan.request_count, 0
+
+    monkeypatch.setattr(r, "_run_flat_plan_with_memory_tracking", run)
+    _packed_budget(monkeypatch, r, 10)
+    items = [[_request(m)] for m in range(3)]
+    batches = r.forward_micro_batches(items)
+    for index, batch in enumerate(batches):
+        (signature,) = r._memory_profiles
+        state["peak"] += 200 * batch.stats.packed_tokens  # the caller's backward
+        if index == 1:
+            run(r._plan_flat_forward(items[0]))  # a nested tracked forward
+    profile = r._memory_profiles[signature]
+    assert profile.caller_plans == 2
+    # Only the uninterrupted third wave fit the warm rate, backward included.
+    assert profile.warm_bytes_per_token == 300
+
+
+def test_each_tracked_forward_starts_a_new_peak_interval(monkeypatch):
+    """The real tracked forward: its counter reset starts a new interval, so a
+    caller phase that continues an earlier one is not whole."""
+    r = rank()
+    first, larger = _plans(r)
+    state = {"peak": 0}
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *_: 0)
+    monkeypatch.setattr(
+        torch.cuda, "reset_peak_memory_stats", lambda *_: state.update(peak=0)
+    )
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *_: state["peak"])
+    monkeypatch.setattr(r, "device", torch.device("cuda", 0))
+
+    def execute(plan):
+        state["peak"] = plan.output_bytes + FIRST * plan.packed_tokens
+        return [None] * plan.request_count
+
+    monkeypatch.setattr(r, "_execute_flat_plan", execute)
+    check = _impl._MemoryCheck(0, 0, True)
+    _, baseline = r._run_flat_plan_with_memory_tracking(first, check=check, context="t")
+    seed = r._peak_reading
+    _caller_phase(r, first, seed)
+    _, baseline = r._run_flat_plan_with_memory_tracking(
+        larger, check=check, context="t"
+    )
+    interval = r._peak_reading
+    assert baseline == 0 and interval[0] == seed[0] + 1
+    r._run_flat_plan_with_memory_tracking(first, check=check, context="t")  # nested
+    _caller_phase(r, larger, interval)
+    assert r._memory_profiles[larger.signature].warm_bytes_per_token is None

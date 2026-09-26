@@ -617,8 +617,9 @@ class _MemoryProfile:
     # A signature's first executed plan also pays one-time costs (compilation,
     # first-use workspaces), which a small first wave spreads over few tokens.
     # Admission uses the lower of the fit over every observation and the same
-    # fit over later plans' caller-phase peaks (which include backward), which
-    # prices a wave smaller than the smallest of them as if it were that large.
+    # fit over later flat waves' whole caller-phase peaks (forward plus the
+    # caller's loss and backward in the yield), which prices a wave smaller
+    # than the smallest of them as if it were that large.
     warm_bytes_per_token: float | None = None
     warm_packed_tokens: int | None = None
     warm_logical_per_packed: float | None = None
@@ -2040,6 +2041,9 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._cache_recovery_state = _CacheRecoveryState()
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
+        # Tracked peak-counter resets, and the latest (resets, peak) reading.
+        self._peak_resets = 0
+        self._peak_reading: tuple[int, int] | None = None
         self._split_memory_floors: dict[bytes, int] = {}
         self._split_memory_floor_status = "not_observed"
         self._last_global_micro_batch_size: int | None = None
@@ -2891,6 +2895,7 @@ class TrainerRank:
             outputs: list[Any] = []
             flat_outputs = iter(tracked_outputs)
             error: BaseException | None = None
+            interval: tuple[int, int] | None = None
             try:
                 if isinstance(candidate.plan, _FlatForwardPlan):
                     tracked_outputs, memory_baseline = (
@@ -2900,6 +2905,8 @@ class TrainerRank:
                             context="forward_micro_batches",
                         )
                     )
+                    # This wave's peak interval, which its caller phase continues.
+                    interval = self.__dict__.get("_peak_reading")
                 else:
                     tracked_outputs, memory_baseline, forward_peak = (
                         self._execute_split_plan_with_memory_tracking(
@@ -2967,7 +2974,10 @@ class TrainerRank:
             # to the forward's return, already recorded for this same plan.
             if isinstance(candidate.plan, _FlatForwardPlan):
                 self._update_peak_memory_profile(
-                    candidate.plan, memory_baseline, caller_phase=True
+                    candidate.plan,
+                    memory_baseline,
+                    caller_phase=True,
+                    interval=interval,
                 )
             elif memory_baseline is not None:
                 self._record_split_memory_floor(
@@ -6238,6 +6248,7 @@ class TrainerRank:
             torch.cuda.synchronize(self.device)
             baseline = int(torch.cuda.memory_allocated(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
+            self._peak_resets = self.__dict__.get("_peak_resets", 0) + 1
         else:
             baseline = None
         observation = getattr(self, "_planner_observation", None)
@@ -6290,6 +6301,7 @@ class TrainerRank:
         retained_after: int | None = None,
         *,
         caller_phase: bool = False,
+        interval: tuple[int, int] | None = None,
     ) -> None:
         if baseline is None:
             return
@@ -6297,13 +6309,21 @@ class TrainerRank:
         observation = getattr(self, "_planner_observation", None)
         if observation is not None:
             observation["peak"] = max(observation["peak"], peak)
+        resets = self.__dict__.get("_peak_resets", 0)
+        self._peak_reading = (resets, peak)
         self._update_memory_profile(
             plan,
             max(0, peak - baseline),
             retained_bytes=(
                 None if retained_after is None else max(0, retained_after - baseline)
             ),
-            caller_phase=caller_phase,
+            # Only a whole wave: a nested forward resetting the counter during
+            # the yield, or an untracked reset (the counter fell below this
+            # wave's forward peak), leaves the peak since then short of it.
+            caller_phase=caller_phase
+            and interval is not None
+            and interval[0] == resets
+            and peak >= interval[1],
         )
 
     def _begin_planner_observation(
@@ -8295,15 +8315,20 @@ class TrainerRank:
         warm_tokens = None if previous is None else previous.warm_packed_tokens
         warm_sharing = None if previous is None else previous.warm_logical_per_packed
         caller_plans = 0 if previous is None else previous.caller_plans
-        # Only a flat wave's caller-phase peak includes its backward; split
-        # children and dp_rank_forward observe forward only. The profile's
-        # first such plan also pays one-time costs, so it is not warm.
+        # Only a flat wave's whole caller phase covers the caller's backward;
+        # split children and dp_rank_forward observe forward only. A caller that
+        # defers backward past the yield is not covered. The profile's first
+        # such plan also pays one-time costs, so it is not warm.
         if caller_phase:
             if caller_plans:
                 warm_rate = max(bytes_per_token, warm_rate or 0.0)
                 warm_tokens = min(plan.packed_tokens, warm_tokens or plan.packed_tokens)
                 warm_sharing = max(logical_per_packed, warm_sharing or 1.0)
             caller_plans += 1
+        elif warm_rate is not None:
+            # Other readings cannot fit the warm profile, but a higher one still
+            # raises its rate, as it raises the fit over every observation.
+            warm_rate = max(warm_rate, bytes_per_token)
         retained_fraction = None if previous is None else previous.retained_fraction
         retained_compute = (
             None if previous is None else previous.retained_compute_bytes_per_token
