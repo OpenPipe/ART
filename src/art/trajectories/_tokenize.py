@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 import codecs
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -988,35 +988,56 @@ def _require_causal_predecessor(trainable: Sequence[bool]) -> None:
         raise ValueError("A trainable trajectory cannot start with a sampled token")
 
 
+class _SampledSourceValidator(Protocol):
+    def __call__(
+        self,
+        selected: _SampledSourceKey | None,
+        *,
+        require_supported_context: bool = True,
+    ) -> None: ...
+
+
 @dataclass
 class _TraceBuilder:
     trace: _HistoryTokenizationTrace | None = None
     tokenizer: Tokenizer | None = None
     rendered_outputs: tuple[tuple[int, int, object], ...] = ()
-    validate_sources: Callable[[_SampledSourceKey | None], None] | None = None
+    validate_sources: _SampledSourceValidator | None = None
     validate_context: Callable[[bool], None] | None = None
     track_sources: bool = True
-    consumed_sources: dict[_SampledSourceKey, object] = field(default_factory=dict)
+    consumed_sources: dict[
+        tuple[_SampledSourceKey, int], tuple[_SampledSourceKey, object]
+    ] = field(default_factory=dict)
 
     def consume_sources(
         self,
-        sources: Mapping[_SampledSourceKey, object],
+        sources: Mapping[_SampledSourceKey, object]
+        | Sequence[tuple[_SampledSourceKey, object]],
         *,
         selected_request_fields: tuple[str, ...] | None = None,
+        require_supported_context: bool = True,
     ) -> None:
-        # Keep every consumed source, including rendered-only logprobs that do
-        # not appear in the sampled-token trace. Validate before extending it.
+        # Semantic keys survive protocol copies. Retain every consumed object,
+        # including aliases and rendered-only sources absent from the trace.
         if self.validate_sources is not None:
-            self.validate_sources(None)
+            self.validate_sources(
+                None, require_supported_context=require_supported_context
+            )
+        items: Iterable[tuple[_SampledSourceKey, object]] = (
+            cast(Mapping[_SampledSourceKey, object], sources).items()
+            if isinstance(sources, Mapping)
+            else sources
+        )
         added = {
-            key: source
-            for key, source in sources.items()
-            if key not in self.consumed_sources
+            (key, id(source)): (key, source)
+            for key, source in items
+            if (key, id(source)) not in self.consumed_sources
         }
         if added or self.validate_sources is None:
             self.consumed_sources.update(added)
             self.validate_sources = _sampled_source_validator(
-                self.consumed_sources, selected_request_fields=selected_request_fields
+                list(self.consumed_sources.values()),
+                selected_request_fields=selected_request_fields,
             )
 
     def set(
@@ -1029,9 +1050,11 @@ class _TraceBuilder:
         tokenizer: Tokenizer | None = None,
     ) -> None:
         if self.track_sources:
-            self.consume_sources(sources)
+            self.consume_sources(
+                sources, require_supported_context=tokenizer is not None
+            )
         elif self.validate_sources is not None:
-            self.validate_sources(None)
+            self.validate_sources(None, require_supported_context=tokenizer is not None)
         self.tokenizer = tokenizer
         trace = _HistoryTokenizationTrace(source_keys=source_keys, sources=sources)
         trace.validate(tokenized)
@@ -2777,17 +2800,24 @@ def _tokenize_exchange_trajectory(
     selected_model = exchanges[0].model
     if selected_model is None:
         raise AssertionError("_exchange_list returned an exchange without a model")
-    consumed_sources = {
-        _exchange_sampled_source_key(exchange): exchange for exchange in exchanges
-    }
+    consumed_sources = [
+        (_exchange_sampled_source_key(exchange), exchange) for exchange in exchanges
+    ]
     if _trace is not None:
-        _trace.consume_sources(consumed_sources)
+        _trace.consume_sources(
+            consumed_sources,
+            require_supported_context=tokenizer_instance is not None,
+        )
         assert _trace.validate_sources is not None
         validate_consumed = _trace.validate_sources
     else:
         validate_consumed = _sampled_source_validator(consumed_sources)
 
+    callback_used = False
+
     def checked(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        nonlocal callback_used
+        callback_used = True
         validate_consumed(None)
         result = function(*args, **kwargs)
         validate_consumed(None)
@@ -3043,7 +3073,9 @@ def _tokenize_exchange_trajectory(
         sources,
         tokenizer=tokenizer,
     )
-    validate_consumed(None)
+    validate_consumed(
+        None, require_supported_context=callback_used or tokenizer is not None
+    )
     tokenized = TokenizedHistory(
         history=history,
         model=selected_model,
@@ -4513,13 +4545,19 @@ def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
 
 
 def _sampled_source_validator(
-    sources: Mapping[_SampledSourceKey, object],
+    sources: Mapping[_SampledSourceKey, object]
+    | Sequence[tuple[_SampledSourceKey, object]],
     *,
     selected_request_fields: tuple[str, ...] | None = None,
-) -> Callable[[_SampledSourceKey | None], None]:
+) -> _SampledSourceValidator:
     expected = {}
     observed: dict[int, tuple[object, object]] = {}
-    for key, source in sources.items():
+    items: Iterable[tuple[_SampledSourceKey, object]] = (
+        cast(Mapping[_SampledSourceKey, object], sources).items()
+        if isinstance(sources, Mapping)
+        else sources
+    )
+    for key, source in items:
         exchange = _source_exchange(source)
         if exchange is None:
             raise ValueError("Sampled source has no exchange")
@@ -4527,49 +4565,70 @@ def _sampled_source_validator(
             request = _tokenization_context(exchange.request, _observed=observed)
         except TypeError:
             request = None
-        expected[key] = (
-            source,
-            exchange,
-            exchange.model,
-            _source_stop_evidence(source, key),
-            request,
-            _tokenization_context(
-                {name: exchange.request.get(name) for name in selected_request_fields}
+        expected.setdefault(key, []).append(
+            (
+                source,
+                exchange,
+                exchange.model,
+                _source_stop_evidence(source, key),
+                request,
+                _tokenization_context(
+                    {
+                        name: exchange.request.get(name)
+                        for name in selected_request_fields
+                    }
+                )
+                if selected_request_fields is not None
+                else None,
             )
-            if selected_request_fields is not None
-            else None,
         )
 
-    def validate(selected: _SampledSourceKey | None) -> None:
+    def validate(
+        selected: _SampledSourceKey | None,
+        *,
+        require_supported_context: bool = True,
+    ) -> None:
         # This observation is callback-free. Share aliased context containers
         # across its sources, never across separate validations/callbacks.
         observed: dict[int, tuple[object, object]] = {}
         for key in expected if selected is None else (selected,):
-            source, exchange, model, stop, request, selected_request = expected[key]
-            current = (
-                _exchange_sampled_source_key(source)
-                if isinstance(source, Exchange)
-                else _sampled_source_key(source)
-            )
-            if (
-                current != key
-                or _source_exchange(source) is not exchange
-                or exchange.model != model
-                or _source_stop_evidence(source, key) != stop
-            ):
-                raise ValueError("Sampled source changed during tokenization callback")
-            if request is None:
-                raise ValueError("Tokenization context cannot be checked for callbacks")
-            current_request = exchange.request
-            if selected is not None and selected_request_fields is not None:
-                current_request = {
-                    name: exchange.request.get(name) for name in selected_request_fields
-                }
-                request = selected_request
-            if _tokenization_context(current_request, _observed=observed) != request:
-                raise ValueError(
-                    "Tokenization context changed during tokenization callback"
+            for source, exchange, model, stop, request, selected_request in expected[
+                key
+            ]:
+                current = (
+                    _exchange_sampled_source_key(source)
+                    if isinstance(source, Exchange)
+                    else _sampled_source_key(source)
                 )
+                if (
+                    current != key
+                    or _source_exchange(source) is not exchange
+                    or exchange.model != model
+                    or _source_stop_evidence(source, key) != stop
+                ):
+                    raise ValueError(
+                        "Sampled source changed during tokenization callback"
+                    )
+                if request is None:
+                    if require_supported_context:
+                        raise ValueError(
+                            "Tokenization context cannot be checked for callbacks"
+                        )
+                    continue
+                current_request = exchange.request
+                if selected is not None and selected_request_fields is not None:
+                    current_request = {
+                        name: exchange.request.get(name)
+                        for name in selected_request_fields
+                    }
+                    request = selected_request
+                if (
+                    _tokenization_context(current_request, _observed=observed)
+                    != request
+                ):
+                    raise ValueError(
+                        "Tokenization context changed during tokenization callback"
+                    )
 
     return validate
 
@@ -5661,11 +5720,11 @@ def _tokenize_chat_view(
         for source in history.message_sources
         if source is not None and _source_is_sampled(source)
     }
-    consumed_sources = {
-        consumed_keys[id(source)]: source
+    consumed_sources = [
+        (consumed_keys[id(source)], source)
         for source in history.message_sources
         if id(source) in consumed_keys
-    }
+    ]
     if _trace is not None:
         _trace.consume_sources(
             consumed_sources,
