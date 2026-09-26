@@ -1243,10 +1243,13 @@ class _TraceBuilder:
             tokenizer.guard.check()
         if self.track_sources:
             self.consume_sources(
-                sources, require_supported_context=tokenizer is not None
+                sources,
+                require_supported_context=_tokenizer_requires_context(tokenizer),
             )
         elif self.validate_sources is not None:
-            self.validate_sources(None, require_supported_context=tokenizer is not None)
+            self.validate_sources(
+                None, require_supported_context=_tokenizer_requires_context(tokenizer)
+            )
         self.tokenizer = (
             tokenizer.tokenizer if type(tokenizer) is _RenderingTokenizer else tokenizer
         )
@@ -3005,12 +3008,24 @@ def _tokenize_exchange_trajectory(
     ]
     ledger = _trace or _TraceBuilder(track_sources=False)
     ledger.consume_sources(
-        consumed_sources, require_supported_context=tokenizer_instance is not None
+        consumed_sources,
+        require_supported_context=_tokenizer_requires_context(tokenizer_instance),
     )
     callback_used = False
 
     def checked(function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         nonlocal callback_used
+        if (
+            function is _template_ids
+            and (projection := kwargs.get("messages_override")) is not None
+        ):
+            # Responses keeps this projection for completion/continuation renders.
+            # Bind it before the first renderer can change a later ART input.
+            ledger.consume_auxiliary(
+                ("response_projection", id(projection)),
+                lambda projection=projection: projection,
+                projection,
+            )
         if not callback_used:
             ledger.consume_sources([], rendered_evidence=True)
         callback_used = True
@@ -3268,7 +3283,9 @@ def _tokenize_exchange_trajectory(
     )
     assert ledger.validate_sources is not None
     ledger.validate_sources(
-        None, require_supported_context=callback_used or tokenizer is not None
+        None,
+        require_supported_context=callback_used
+        or _tokenizer_requires_context(tokenizer),
     )
     tokenized = TokenizedHistory(
         history=history,
@@ -4378,7 +4395,7 @@ def _tokenize_exact_responses_history(
                 source=source,
                 source_key=source_key,
                 tokenizer=tokenizer,
-                _callbacks=tokenizer is not None,
+                _callbacks=_tokenizer_requires_context(tokenizer),
             )
             for offset in range(
                 max(len(token_ids) - len(output), len(token_ids) - stop_count),
@@ -4400,12 +4417,16 @@ def _tokenize_exact_responses_history(
         source_keys,
         sources,
         tokenizer=tokenizer,
-        _callbacks=tokenizer is not None,
+        _callbacks=_tokenizer_requires_context(tokenizer),
     )
     if pending and (ledger.track_sources or ledger.validate_sources is not None):
-        ledger.consume_sources(pending, require_supported_context=tokenizer is not None)
+        ledger.consume_sources(
+            pending, require_supported_context=_tokenizer_requires_context(tokenizer)
+        )
     if ledger.validate_sources is not None:
-        ledger.validate_sources(None, require_supported_context=tokenizer is not None)
+        ledger.validate_sources(
+            None, require_supported_context=_tokenizer_requires_context(tokenizer)
+        )
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
@@ -4983,6 +5004,21 @@ def _stop_uses_callback(reason: int | str | None, tokenizer: Tokenizer | None) -
             or value is not None
             and not (name in ("eos_token_id", "eot_token_id") and type(value) is int)
         ):
+            return True
+    return False
+
+
+def _tokenizer_requires_context(tokenizer: Tokenizer | None) -> bool:
+    """Plain STOP metadata alone does not introduce an external callback."""
+    if type(tokenizer) is _RenderingTokenizer:
+        tokenizer = tokenizer.tokenizer
+    if tokenizer is None:
+        return False
+    if callable(tokenizer) or _stop_uses_callback(None, tokenizer):
+        return True
+    for name in ("apply_chat_template", "get_chat_template", "decode"):
+        pure, value = _plain_tokenizer_attribute(tokenizer, name)
+        if not pure or value is not None:
             return True
     return False
 
@@ -7265,63 +7301,81 @@ def _tokenize_chat_view(
                 and chat_template is None
                 and chat_template_kwargs is None
             ):
-                # Later request-only assistants can have historical rendering
-                # different from today's normalized template too. Prove the
-                # entire final recorded request, not only the first prompt.
-                source = history.message_sources[sampled_message_indices[-1]]
-                assert source is not None
-                exchange = _source_exchange(source)
-                assert isinstance(
-                    exchange,
-                    (ChatCompletionsExchange, MessagesExchange, ResponsesExchange),
-                )
-                prompt = source_prompt_tokens(source)
-                signature = _source_signature(source)
-                validate_context = _tokenization_context_validator(history)
-                masks = None
-                if prompt and exact.tokens[: len(prompt)] == prompt:
-                    validate_consumed(None)
-                    request_messages, request_tools = _request_messages(exchange)
-                    try:
-                        masks = _recorded_prompt_role_masks(
-                            request_messages,
-                            [None] * len(request_messages),
-                            prompt,
-                            tokenizer=resolved_tokenizer,
-                            template=original_template,
-                            tools=request_tools,
-                            kwargs=kwargs,
+                # Use the first complete original request covering the final
+                # request-owned assistant; later native bodies may render differently.
+                rendering_guard.check()
+                last_request_assistant = max(
+                    (
+                        index
+                        for index, (message, source) in enumerate(
+                            zip(messages, history.message_sources, strict=True)
                         )
-                    except (TypeError, KeyError, NotImplementedError):
-                        pass
-                validate_context(True)
-                prompt_cache.clear()
-                output_cache.clear()
-                if _source_signature(source) != signature:
-                    raise ValueError(
-                        "Sampled source changed while proving recorded request roles"
+                        if message.get("role") == "assistant"
+                        and (source is None or not _source_is_sampled(source))
+                    ),
+                    default=-1,
+                )
+                for message_index in sampled_message_indices:
+                    if message_index <= last_request_assistant:
+                        continue
+                    source = history.message_sources[message_index]
+                    assert source is not None
+                    exchange = _source_exchange(source)
+                    assert isinstance(
+                        exchange,
+                        (ChatCompletionsExchange, MessagesExchange, ResponsesExchange),
                     )
-                if (
-                    masks is not None
-                    and all(
-                        flag & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
-                        or not (flag & TokenFlag.ASSISTANT)
-                        or assistant
-                        for flag, assistant in zip(exact.flags, masks[0])
-                    )
-                    and all(
-                        flag & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
-                        or not (flag & TokenFlag.STOP)
-                        or stop
-                        for flag, stop in zip(exact.flags, masks[1])
-                    )
-                ):
-                    for index, (assistant, stop) in enumerate(zip(*masks, strict=True)):
-                        if not exact.flags[index] & (
-                            TokenFlag.SAMPLED | TokenFlag.OUTPUT
+                    prompt = source_prompt_tokens(source)
+                    signature = _source_signature(source)
+                    validate_context = _tokenization_context_validator(history)
+                    masks = None
+                    if prompt and exact.tokens[: len(prompt)] == prompt:
+                        validate_consumed(None)
+                        request_messages, request_tools = _request_messages(exchange)
+                        try:
+                            masks = _recorded_prompt_role_masks(
+                                request_messages,
+                                [None] * len(request_messages),
+                                prompt,
+                                tokenizer=resolved_tokenizer,
+                                template=original_template,
+                                tools=request_tools,
+                                kwargs=kwargs,
+                            )
+                        except (TypeError, KeyError, NotImplementedError):
+                            pass
+                    validate_context(True)
+                    prompt_cache.clear()
+                    output_cache.clear()
+                    if _source_signature(source) != signature:
+                        raise ValueError(
+                            "Sampled source changed while proving recorded request roles"
+                        )
+                    if (
+                        masks is not None
+                        and all(
+                            flag & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
+                            or not (flag & TokenFlag.ASSISTANT)
+                            or assistant
+                            for flag, assistant in zip(exact.flags, masks[0])
+                        )
+                        and all(
+                            flag & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
+                            or not (flag & TokenFlag.STOP)
+                            or stop
+                            for flag, stop in zip(exact.flags, masks[1])
+                        )
+                    ):
+                        for index, (assistant, stop) in enumerate(
+                            zip(*masks, strict=True)
                         ):
-                            exact.flags[index] |= _rendered_flag(assistant, False, stop)
-                    return exact
+                            if not exact.flags[index] & (
+                                TokenFlag.SAMPLED | TokenFlag.OUTPUT
+                            ):
+                                exact.flags[index] |= _rendered_flag(
+                                    assistant, False, stop
+                                )
+                        return exact
                 raise ValueError(
                     "Cannot preserve request roles across exact native prompt replacement"
                 )
@@ -8100,7 +8154,7 @@ def _tokenize_completions_token_history(
             logprobs[span.start : span.end] = selected_logprobs
     if consumed:
         ledger.consume_sources(
-            consumed, require_supported_context=tokenizer is not None
+            consumed, require_supported_context=_tokenizer_requires_context(tokenizer)
         )
     _mark_sampled_stops(
         history.prompt,
@@ -8110,7 +8164,9 @@ def _tokenize_completions_token_history(
         tokenizer=tokenizer,
     )
     if ledger.validate_sources is not None:
-        ledger.validate_sources(None, require_supported_context=tokenizer is not None)
+        ledger.validate_sources(
+            None, require_supported_context=_tokenizer_requires_context(tokenizer)
+        )
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
@@ -8326,12 +8382,16 @@ def _tokenize_completions_string_history(
         source_keys,
         sources,
         tokenizer=tokenizer,
-        _callbacks=tokenizer is not None,
+        _callbacks=_tokenizer_requires_context(tokenizer),
     )
     if pending and (ledger.track_sources or ledger.validate_sources is not None):
-        ledger.consume_sources(pending, require_supported_context=tokenizer is not None)
+        ledger.consume_sources(
+            pending, require_supported_context=_tokenizer_requires_context(tokenizer)
+        )
     if ledger.validate_sources is not None:
-        ledger.validate_sources(None, require_supported_context=tokenizer is not None)
+        ledger.validate_sources(
+            None, require_supported_context=_tokenizer_requires_context(tokenizer)
+        )
     tokenized = TokenizedHistory(
         history=history,
         model=history.model,
@@ -9038,7 +9098,8 @@ def _materialize_trajectory(
 
 def _validate_completed_sources(builders: Sequence[_TraceBuilder | None]) -> None:
     if any(
-        builder is not None and builder.tokenizer is not None for builder in builders
+        builder is not None and _tokenizer_requires_context(builder.tokenizer)
+        for builder in builders
     ):
         # Later callbacks may edit an earlier completed history. Check its
         # original source keys and stop evidence without calling a tokenizer.
@@ -9073,9 +9134,10 @@ def _complete_resolved_sampled_stops(
             and (tokenizer := resolved.get(value.model)) is not None
         ):
             assert builder.validate_sources is not None
+            requires_context = _tokenizer_requires_context(tokenizer)
             if builder.validate_context is not None:
-                builder.validate_context(True)
-            builder.validate_sources(None)
+                builder.validate_context(requires_context)
+            builder.validate_sources(None, require_supported_context=requires_context)
             _mark_sampled_stops(
                 value.tokens,
                 value.flags,

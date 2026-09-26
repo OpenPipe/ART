@@ -206,8 +206,9 @@ the original request and template reproduce its complete native prompt, ART can
 recover historical assistant roles from that rendering. This uses the original
 tool serialization order and preserves role labels through exact length-stop
 assembly; it does not restore destructive parsing for new response content.
-The role proof covers the complete recorded request containing the last
-request-only assistant, including its trailing query. Later sampled native
+The role proof uses the first sufficient complete recorded request containing
+the last request-only assistant, including its trailing query; this applies to
+both normalized and original-template proofs. Later sampled native
 bodies remain authoritative even when their rendered projections differ.
 With a supplied renderer, request-owned assistant roles are proved throughout
 the native stream, including between sampled responses. This requirement applies
@@ -240,12 +241,15 @@ When recorded prompt IDs are unavailable, a supplied renderer defines the prompt
 tokens. ART cannot certify that arbitrary returned IDs implement a particular
 text transformation. A renderer changing a disposable, single-use message copy
 does not itself invalidate that authority; changes to borrowed sources or
-semantic inputs that ART reuses still require refusal.
+semantic inputs that ART reuses still require refusal. In particular, a
+Responses message projection reused for prompt and completion rendering must
+remain unchanged across those calls.
 These checks refuse stale results; they do not make callbacks or source objects
 immutable. Context snapshots reuse shared containers only within one observation;
 callback-free native assembly retains its bounded response-evidence reuse.
 Unused opaque request metadata remains valid on complete callback-free native
-paths; callbacks require context that ART can compare.
+paths, including a supplied tokenizer exposing only plain EOS metadata;
+callbacks require context that ART can compare.
 
 In an unsplit history, a response copied into a later, shortened prompt is output
 provenance, but it is not a fresh sample under that new prompt. ART keeps its
