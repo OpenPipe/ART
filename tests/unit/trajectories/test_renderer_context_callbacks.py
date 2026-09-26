@@ -390,7 +390,7 @@ def test_render_guard_does_not_certify_unsupported_callback_arguments():
 
 
 def test_trace_unwrap_does_not_probe_custom_tokenizer_class():
-    from art.trajectories._tokenize import _TraceBuilder, _sampled_source_key
+    from art.trajectories._tokenize import _sampled_source_key, _TraceBuilder
 
     class Tokenizer:
         @property
