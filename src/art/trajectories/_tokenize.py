@@ -553,6 +553,7 @@ def _translate_token_mask(
     mask: Sequence[bool],
     *,
     tokenizer: Tokenizer | None = None,
+    _opcodes: list[tuple[str, int, int, int, int]] | None = None,
 ) -> list[bool]:
     """Translate a token mask across a prefix replacement without guessing."""
 
@@ -563,9 +564,12 @@ def _translate_token_mask(
     translated = [False] * len(target)
     mapped = [False] * len(source)
     decode = getattr(tokenizer, "decode", None)
-    for tag, start, end, target_start, target_end in SequenceMatcher(
-        None, source, target, autojunk=False
-    ).get_opcodes():
+    opcodes = (
+        _opcodes or SequenceMatcher(None, source, target, autojunk=False).get_opcodes()
+    )
+    if _opcodes is not None and not _opcodes:
+        _opcodes.extend(opcodes)
+    for tag, start, end, target_start, target_end in opcodes:
         if tag == "equal":
             translated[target_start:target_end] = mask[start:end]
             mapped[start:end] = [True] * (end - start)
@@ -4973,22 +4977,32 @@ def _tokenize_chat_view(
         canonical_assistant_mask,
         direct_bounds or None,
     )
+    # These four masks translate the same pair of token sequences.
+    mask_opcodes: list[tuple[str, int, int, int, int]] = []
     assistant_mask = _translate_token_mask(
         canonical_rendered,
         rendered,
         canonical_assistant_mask,
         tokenizer=resolved_tokenizer,
+        _opcodes=mask_opcodes,
     )
     output_mask = _translate_token_mask(
         canonical_rendered,
         rendered,
         canonical_output_mask,
         tokenizer=resolved_tokenizer,
+        _opcodes=mask_opcodes,
     )
-    stop_mask = _translate_token_mask(canonical_rendered, rendered, canonical_stop_mask)
+    stop_mask = _translate_token_mask(
+        canonical_rendered, rendered, canonical_stop_mask, _opcodes=mask_opcodes
+    )
     length_stop_mask = _translate_token_mask(
-        canonical_rendered, rendered, canonical_length_stop_mask
+        canonical_rendered,
+        rendered,
+        canonical_length_stop_mask,
+        _opcodes=mask_opcodes,
     )
+    mask_opcodes.clear()
     positions_by_first_token: dict[int, list[int]] = {}
     for index, token_id in enumerate(rendered):
         positions_by_first_token.setdefault(token_id, []).append(index)

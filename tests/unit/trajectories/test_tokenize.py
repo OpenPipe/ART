@@ -766,6 +766,113 @@ def test_merged_whitespace_token_inherits_mask_of_its_characters(
     assert _translate_token_mask([1, 2], [3], mask, tokenizer=tokenizer) == [any(mask)]
 
 
+def test_chat_prefix_masks_share_one_alignment(monkeypatch: pytest.MonkeyPatch) -> None:
+    from difflib import SequenceMatcher
+
+    from art.trajectories._tokenize import _translate_token_mask
+
+    original = SequenceMatcher.get_opcodes
+    searches = 0
+
+    def get_opcodes(self):
+        nonlocal searches
+        frame = sys._getframe(1)
+        if frame.f_code is _translate_token_mask.__code__:
+            searches += 1
+        return original(self)
+
+    monkeypatch.setattr(SequenceMatcher, "get_opcodes", get_opcodes)
+    # Real history rendering changes the first prompt token and translates all
+    # four masks. Its exact outputs, logprobs and stop flags must still agree.
+    test_exact_output_boundaries_survive_prefix_order_drift_and_length_stop()
+    assert searches == 1
+
+
+def test_reused_mask_alignment_preserves_decoder_order() -> None:
+    from art.trajectories._tokenize import _translate_token_mask
+
+    source, target = [1, 2], [3]
+    masks = [[False, False], [True, False], [False, True], [True, True]]
+
+    def translate(shared: bool):
+        events: list[object] = []
+        opcodes: list[tuple[str, int, int, int, int]] = []
+
+        class Tokenizer:
+            @property
+            def decode(self):
+                events.append("lookup")
+
+                def decode(tokens, **kwargs):
+                    events.append((tokens.copy(), kwargs))
+                    return "\n\n"
+
+                return decode
+
+        outputs = [
+            _translate_token_mask(
+                source,
+                target,
+                mask,
+                tokenizer=cast(tr.Tokenizer, Tokenizer()),
+                _opcodes=opcodes if shared else None,
+            )
+            for mask in masks
+        ]
+        return outputs, events
+
+    cached = translate(True)
+    assert cached == translate(False)
+    assert cached[0] == [[False], [True], [True], [True]]
+    assert source == [1, 2] and target == [3]
+    assert masks == [[False, False], [True, False], [False, True], [True, True]]
+
+
+@pytest.mark.parametrize(
+    "error", [ValueError("decode"), KeyboardInterrupt(), SystemExit(7)]
+)
+def test_reused_mask_alignment_preserves_decoder_exception(
+    error: BaseException,
+) -> None:
+    from art.trajectories._tokenize import _translate_token_mask
+
+    opcodes: list[tuple[str, int, int, int, int]] = []
+
+    def decode(tokens, **kwargs):
+        raise error
+
+    tokenizer = cast(tr.Tokenizer, SimpleNamespace(decode=decode))
+    for mask in ([False, False], [True, False]):
+        if any(mask):
+            with pytest.raises(type(error)) as caught:
+                _translate_token_mask(
+                    [1, 2], [3], mask, tokenizer=tokenizer, _opcodes=opcodes
+                )
+            assert caught.value is error
+        else:
+            assert _translate_token_mask(
+                [1, 2], [3], mask, tokenizer=tokenizer, _opcodes=opcodes
+            ) == [False]
+
+
+def test_equal_mask_alignment_does_not_compute_opcodes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import difflib
+
+    from art.trajectories._tokenize import _translate_token_mask
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("equal tokens need no alignment")
+
+    monkeypatch.setattr(difflib, "SequenceMatcher", unexpected)
+    opcodes: list[tuple[str, int, int, int, int]] = []
+    mask = [True, False]
+    actual = _translate_token_mask([1, 2], [1, 2], mask, _opcodes=opcodes)
+    assert actual == mask and actual is not mask
+    assert opcodes == []
+
+
 def test_exact_length_boundary_with_multiple_parts_and_prefix_drift() -> None:
     first = _chat_exchange([1], [2, 9])
     second = _chat_exchange([1, 2, 9, 3], [4, 5], offset=1)
