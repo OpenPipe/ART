@@ -3639,12 +3639,12 @@ def test_forward_micro_batches_profiles_caller_peak_after_yield(
         "_run_flat_plan_with_memory_tracking",
         lambda *_args, **_kwargs: (_empty_outputs(plan), 123),
     )
-    profiles: list[tuple[int, int | None]] = []
+    profiles: list[tuple[int, int | None, bool]] = []
     monkeypatch.setattr(
         trainer,
         "_update_peak_memory_profile",
-        lambda candidate, baseline: profiles.append(
-            (candidate.packed_tokens, baseline)
+        lambda candidate, baseline, caller_phase=False: profiles.append(
+            (candidate.packed_tokens, baseline, caller_phase)
         ),
     )
 
@@ -3654,7 +3654,8 @@ def test_forward_micro_batches_profiles_caller_peak_after_yield(
     assert profiles == []
     with pytest.raises(StopIteration):
         next(batches)
-    assert profiles == [(plan.packed_tokens, 123)]
+    # The caller phase's peak includes backward: it may feed the warm fit.
+    assert profiles == [(plan.packed_tokens, 123, True)]
 
 
 @pytest.mark.parametrize("no_grad", [False, True])
@@ -3684,7 +3685,7 @@ def test_forward_micro_batches_releases_completed_wave_before_planning(
     monkeypatch.setattr(trainer, "_select_next_micro_batch", select_after_release)
     profiled: list[bool] = []
 
-    def profile(*_args):
+    def profile(*_args, **_kwargs):
         # Keep the completed wave through its caller peak observation.
         profiled.append(tensors[-1]() is not None)
 

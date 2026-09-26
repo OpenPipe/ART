@@ -616,11 +616,13 @@ class _MemoryProfile:
     retained_compute_bytes_per_token: float | None = None
     # A signature's first executed plan also pays one-time costs (compilation,
     # first-use workspaces), which a small first wave spreads over few tokens.
-    # The same fit over later plans only prices waves at least as large as the
-    # smallest of them; smaller waves keep the fit over every plan.
+    # Admission uses the lower of the fit over every observation and the same
+    # fit over later plans' caller-phase peaks (which include backward), which
+    # prices a wave smaller than the smallest of them as if it were that large.
     warm_bytes_per_token: float | None = None
     warm_packed_tokens: int | None = None
     warm_logical_per_packed: float | None = None
+    caller_plans: int = 0
 
 
 @dataclass(frozen=True)
@@ -2038,10 +2040,6 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._cache_recovery_state = _CacheRecoveryState()
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
-        # Each signature's first executed plan, while it is alive (in process).
-        self._profile_seed_plans: dict[
-            _MemorySignature, weakref.ReferenceType[_FlatForwardPlan]
-        ] = {}
         self._split_memory_floors: dict[bytes, int] = {}
         self._split_memory_floor_status = "not_observed"
         self._last_global_micro_batch_size: int | None = None
@@ -2968,7 +2966,9 @@ class TrainerRank:
             # optimizer headroom. Peak only: the retained observation belongs
             # to the forward's return, already recorded for this same plan.
             if isinstance(candidate.plan, _FlatForwardPlan):
-                self._update_peak_memory_profile(candidate.plan, memory_baseline)
+                self._update_peak_memory_profile(
+                    candidate.plan, memory_baseline, caller_phase=True
+                )
             elif memory_baseline is not None:
                 self._record_split_memory_floor(
                     candidate.plan, memory_baseline, forward_peak
@@ -6288,6 +6288,8 @@ class TrainerRank:
         plan: _FlatForwardPlan,
         baseline: int | None,
         retained_after: int | None = None,
+        *,
+        caller_phase: bool = False,
     ) -> None:
         if baseline is None:
             return
@@ -6301,6 +6303,7 @@ class TrainerRank:
             retained_bytes=(
                 None if retained_after is None else max(0, retained_after - baseline)
             ),
+            caller_phase=caller_phase,
         )
 
     def _begin_planner_observation(
@@ -8089,14 +8092,20 @@ class TrainerRank:
                 profiled.warm_bytes_per_token is not None
                 and profiled.warm_packed_tokens is not None
                 and profiled.warm_logical_per_packed is not None
-                and packed_tokens >= profiled.warm_packed_tokens
             ):
                 # Later plans' own sharing: a rate learned under lighter
-                # sharing scales up for deeper-shared plans, as above.
+                # sharing scales up for deeper-shared plans, as above. Pricing
+                # smaller waves as the smallest later plan keeps cost monotone
+                # in tokens, which the width search's bounds rely on; it is
+                # sound where a wave's memory is a fixed cost plus a per-token
+                # rate, as that plan's rate covers its share of the fixed cost.
                 profiled_bytes = min(
                     profiled_bytes,
                     profiled.warm_bytes_per_token
-                    * profiled_tokens(profiled.warm_logical_per_packed),
+                    * max(
+                        profiled.warm_packed_tokens,
+                        profiled_tokens(profiled.warm_logical_per_packed),
+                    ),
                 )
             compute = max(
                 static_compute,
@@ -8274,6 +8283,7 @@ class TrainerRank:
         peak_delta_bytes: int,
         *,
         retained_bytes: int | None,
+        caller_phase: bool = False,
     ) -> None:
         if plan.packed_tokens <= 0:
             return
@@ -8281,20 +8291,19 @@ class TrainerRank:
         bytes_per_token = compute_delta / max(1, plan.packed_tokens)
         previous = self._memory_profiles.get(plan.signature)
         logical_per_packed = plan.active_logical_tokens / max(1, plan.packed_tokens)
-        seeds = self.__dict__.setdefault("_profile_seed_plans", {})
-        if previous is None:
-            seeds[plan.signature] = weakref.ref(plan)
-        # The first plan's caller-phase update is still that plan. A weak
-        # reference, unlike ``id``, cannot match a later plan at a freed address.
-        seed = seeds.get(plan.signature)
-        warm = previous is not None and (seed is None or seed() is not plan)
         warm_rate = None if previous is None else previous.warm_bytes_per_token
         warm_tokens = None if previous is None else previous.warm_packed_tokens
         warm_sharing = None if previous is None else previous.warm_logical_per_packed
-        if warm:
-            warm_rate = max(bytes_per_token, warm_rate or 0.0)
-            warm_tokens = min(plan.packed_tokens, warm_tokens or plan.packed_tokens)
-            warm_sharing = max(logical_per_packed, warm_sharing or 1.0)
+        caller_plans = 0 if previous is None else previous.caller_plans
+        # Only a flat wave's caller-phase peak includes its backward; split
+        # children and dp_rank_forward observe forward only. The profile's
+        # first such plan also pays one-time costs, so it is not warm.
+        if caller_phase:
+            if caller_plans:
+                warm_rate = max(bytes_per_token, warm_rate or 0.0)
+                warm_tokens = min(plan.packed_tokens, warm_tokens or plan.packed_tokens)
+                warm_sharing = max(logical_per_packed, warm_sharing or 1.0)
+            caller_plans += 1
         retained_fraction = None if previous is None else previous.retained_fraction
         retained_compute = (
             None if previous is None else previous.retained_compute_bytes_per_token
@@ -8331,6 +8340,7 @@ class TrainerRank:
             warm_bytes_per_token=warm_rate,
             warm_packed_tokens=warm_tokens,
             warm_logical_per_packed=warm_sharing,
+            caller_plans=caller_plans,
         )
 
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:

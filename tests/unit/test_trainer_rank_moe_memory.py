@@ -103,9 +103,8 @@ def test_cp_memory_charges_local_and_gathered_outputs():
     compute = 16 * 2048 * 2 * 14
     assert estimate == int((compute + 2 * output_bytes) * 1.1)
     # A warm profile includes gather workspace already; do not add it twice.
-    # (A subclass: profiles hold a signature's first plan by weak reference.)
     rank._update_memory_profile(
-        type("Plan", (SimpleNamespace,), {})(
+        SimpleNamespace(
             signature=signature,
             packed_tokens=16,
             output_bytes=output_bytes,
