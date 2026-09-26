@@ -49,7 +49,7 @@ def test_shared_head_lower_and_plan_keep_all_keywords(monkeypatch):
         0,
         2 * (188416 + 4 * 2048 * 2),
     )
-    assert rank._plan_head_workspace_bytes(plan) == 2 * 248320 * 2
+    assert rank._plan_head_workspace_bytes(plan) == 7 * 2 * 248320 * 2
     calls = record_prices(monkeypatch, rank)
     lower = rank._split_chunk_lower_cost(
         requests, tuple(item.input_tokens for item in requests), checkpoint=Unset
@@ -69,7 +69,7 @@ def test_shared_head_lower_and_plan_keep_all_keywords(monkeypatch):
         assert_plan_values(rank, plan, values)
     # All shape/floor inputs remain available together, even though the dense
     # head dominates this two-row source floor and sharing changes logical rows.
-    assert cost.required == int((plan.output_bytes + 2 * 248320 * 2) * 1.1)
+    assert cost.required == int((plan.output_bytes + 7 * 2 * 248320 * 2) * 1.1)
 
 
 def test_cp_gdn_segments_groups_and_retained_tokens_reach_exact_search(monkeypatch):

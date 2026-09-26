@@ -234,6 +234,7 @@ jobs:
             tests/unit/test_trainer_rank_slot_memory.py \
             tests/unit/test_trainer_rank_moe_memory.py \
             tests/unit/test_trainer_rank_head_memory.py \
+            tests/unit/test_trainer_rank_eager_head_memory.py::test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound \
             tests/unit/test_trainer_rank_mixed_head_memory.py \
             tests/unit/test_trainer_rank_ignored_mixed_head.py \
             tests/unit/test_trainer_rank_pending_memory.py \
@@ -259,6 +260,7 @@ jobs:
           uv run --no-sync pytest --nbval --current-env --tb=short tests/unit \
             --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
             --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
+            --deselect=tests/unit/test_trainer_rank_eager_head_memory.py::test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound \
             --ignore=tests/unit/test_megatron_reference_logprobs.py \
             --ignore=tests/unit/test_moe_routing_replay.py \
             --ignore=tests/unit/test_moe_routing_real_path.py \
