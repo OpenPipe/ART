@@ -1863,7 +1863,7 @@ def load_checkpoint(
         source.digest,
         name,
         None if current is None else current.route_epoch,
-        trainer._route_epochs,
+        getattr(trainer, "_route_epochs", 0),
     )
     targets = _gather(target, group)
     if any(value[0] != source.digest for value in targets):
