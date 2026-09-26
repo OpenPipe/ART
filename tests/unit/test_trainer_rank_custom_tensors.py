@@ -1074,12 +1074,14 @@ def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_
 
     relative = "optimizer/custom.safetensors"
     payload = load_file(saved / relative)
-    payload["step/value_head.proj.bias"].fill_(step)
-    save_file(payload, saved / relative)
-    manifest = json.loads((saved / "checkpoint.json").read_text())
-    manifest["files"][relative] = _file_digest(saved / relative)
-    manifest["digest"] = _manifest_digest(manifest)
-    (saved / "checkpoint.json").write_text(json.dumps(manifest))
+    assert payload["step/value_head.proj.bias"].item() == 1.0
+    if not valid:
+        payload["step/value_head.proj.bias"].fill_(step)
+        save_file(payload, saved / relative)
+        manifest = json.loads((saved / "checkpoint.json").read_text())
+        manifest["files"][relative] = _file_digest(saved / relative)
+        manifest["digest"] = _manifest_digest(manifest)
+        (saved / "checkpoint.json").write_text(json.dumps(manifest))
 
     restored, restored_api = _empty_real_lora_trainer()
 

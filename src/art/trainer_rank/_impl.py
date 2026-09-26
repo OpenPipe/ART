@@ -10714,12 +10714,7 @@ def _validate_custom_optimizer_state(
         for name, tensor in tensors.items()
         if tuple(tensor.shape) != expected_shape or tensor.dtype != torch.float32
     ]
-    if (
-        invalid
-        or not math.isfinite(state.step)
-        or state.step < 0
-        or state.step != int(state.step)
-    ):
+    if invalid or state.step < 0 or not state.step.is_integer():
         raise TrainerRankSlotStateError(
             f"Custom optimizer state for {checkpoint!r}/{key!r} is invalid; "
             f"expected FP32 tensors with shape {expected_shape} and a nonnegative "
