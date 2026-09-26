@@ -76,13 +76,50 @@ def test_override_selects_best_rung_not_last(monkeypatch):
     assert [plan.packed_tokens for plan in executed] == [20, 20]
 
 
-def test_ep_unsupported_split_is_never_overridden(monkeypatch):
+@pytest.mark.parametrize("allow", [False, True])
+def test_ep_override_keeps_unsplit_plan(monkeypatch, allow):
+    rank = _oversized(monkeypatch)
+    rank._allow_oversized_batches = allow
+    monkeypatch.setattr(rank, "_expert_parallel_active", lambda: True)
+    monkeypatch.setattr(
+        rank, "_admit_split_rung", lambda *a, **k: pytest.fail("EP split attempted")
+    )
+    executed = _recording_executor(monkeypatch, rank)
+    requests = [_request(i) for i in range(2)]
+    if allow:
+        rank.dp_rank_forward(requests)
+        assert len(executed) == 1
+        assert executed[0].request_count == 2
+        assert executed[0].packed_tokens == 20
+    else:
+        with pytest.raises(tr.TrainerRankMemoryError, match="expert parallelism"):
+            rank.dp_rank_forward(requests)
+        assert not executed
+
+
+@pytest.mark.parametrize("best_is_minimal", [False, True])
+def test_ep_override_selects_lowest_priced_unsplit_plan(monkeypatch, best_is_minimal):
     rank = _oversized(monkeypatch)
     monkeypatch.setattr(rank, "_expert_parallel_active", lambda: True)
+    original = rank._plan_flat_forward
+    plans = {}
+
+    def plan(*args, memory_minimal=False, **kwargs):
+        value = original(*args, memory_minimal=memory_minimal, **kwargs)
+        plans[id(value)] = memory_minimal
+        return value
+
+    def check(value, **kwargs):
+        required = 10 if plans[id(value)] == best_is_minimal else 20
+        return tr._MemoryCheck(required, 5, False)
+
+    monkeypatch.setattr(rank, "_plan_flat_forward", plan)
+    monkeypatch.setattr(rank, "_memory_check", check)
     executed = _recording_executor(monkeypatch, rank)
-    with pytest.raises(tr.TrainerRankMemoryError, match="expert parallelism"):
-        rank.dp_rank_forward([_request(i) for i in range(2)])
-    assert not executed
+    rank.dp_rank_forward([_request(i) for i in range(2)])
+    assert len(executed) == 1
+    assert plans[id(executed[0])] == best_is_minimal
+    assert rank.last_forward_telemetry()["predicted_peak_bytes"] == 10
 
 
 def test_disagreeing_peer_refuses_override(monkeypatch):
@@ -100,15 +137,17 @@ def test_disagreeing_peer_refuses_override(monkeypatch):
     assert seen == [([1.0, 0.0, 0.0], "MIN", False)]
 
 
-def test_microbatch_override_keeps_minimum_wave_inputs(monkeypatch):
+@pytest.mark.parametrize("ep", [False, True])
+def test_microbatch_override_keeps_minimum_wave_inputs(monkeypatch, ep):
     rank = _oversized(monkeypatch)
+    monkeypatch.setattr(rank, "_expert_parallel_active", lambda: ep)
     wave = [_request(i) for i in range(4)]
     candidate = rank._select_next_micro_batch([wave, [_request(99)]], 0)
     assert candidate.inputs == [wave]
     assert candidate.indices == (0,)
     assert candidate.stats_global_count == 1
-    assert candidate.plan.subforward_count == 4
-    assert candidate.check.estimated_required_bytes == 10
+    assert candidate.plan.subforward_count == (1 if ep else 4)
+    assert candidate.check.estimated_required_bytes == (40 if ep else 10)
 
 
 def test_nonmemory_validation_is_not_overridden(monkeypatch):

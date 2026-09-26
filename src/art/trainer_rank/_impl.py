@@ -3222,12 +3222,16 @@ class TrainerRank:
                 f"{refusal_prefix}; a single request cannot be split",
             )
         if self._expert_parallel_active():
+            # EP cannot split internally, but the unsplit plans are supported.
+            # Retain the best one for the explicit oversized opt-in only.
             return _ForwardRefusal(
-                plan,
-                check,
+                *(
+                    best
+                    if getattr(self, "_allow_oversized_batches", False)
+                    else (plan, check)
+                ),
                 f"{refusal_prefix}; unable to find a feasible split: internal "
                 "splitting is disabled under expert parallelism in this release",
-                overridable=False,
             )
         # A rejected lower bound normally avoids materializing the rung. If
         # ranks disagree on the opt-in, keep that original behavior everywhere
@@ -7120,8 +7124,8 @@ class TrainerRank:
             assert refused is not None
             if admit_refusal is not None:
                 # Only the exhausted memory-refusal path changes. Every peer
-                # must have a supported candidate; never override an EP or
-                # failed planning/runtime capability guard.
+                # must have a supported candidate; never override a failed
+                # planning/runtime capability guard.
                 allowed = (
                     getattr(self, "_allow_oversized_batches", False)
                     and refused.overridable
