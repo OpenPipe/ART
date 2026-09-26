@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 from test_trainer_rank_custom_tensors import _trainer, _use_local_gradients
 import torch
+import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
-from trainer_rank_test_support import gloo_group, spawn_and_join
+from trainer_rank_test_support import gloo_group, megatron_topology, spawn_and_join
 
 from art.trainer_rank import AdamParams, ModuleHandle, run_rank_callback
+from art.trainer_rank._commands import join_rank_callback_release
 from art.trainer_rank._heads import (
     HeadRegistration,
     LiveHead,
@@ -52,6 +55,102 @@ def _native_head(kind="module", name="head", factory=TiedHead):
     trainer, rank = _trainer("student")
     native = getattr(rank, kind)(name, factory, checkpoint="student")
     return trainer, native
+
+
+def _factory_failure_worker(physical, rendezvous, mode, dp_size):
+    with gloo_group(physical, rendezvous, timeout=10):
+        trainer, _ = _trainer("student")
+        # Import native support before the topology facade.
+        trainer._slot_ref("student")
+        for attribute in (
+            "_checkpoint_process_group",
+            "_checkpoint_finalize_process_group",
+        ):
+            setattr(
+                trainer,
+                attribute,
+                dist.new_group(backend="gloo", timeout=timedelta(seconds=5)),
+            )
+        slot = trainer._checkpoint_slots["student"]
+        with megatron_topology(physical, dp_size=dp_size, tp_size=2 // dp_size):
+
+            async def run():
+                leader = physical == 0 or (mode == "rank" and dp_size == 2)
+                for error_type in (ValueError, asyncio.CancelledError):
+                    primary = error_type("injected head factory failure")
+                    cause, context = KeyError("cause"), LookupError("context")
+                    primary.__cause__, primary.__context__ = cause, context
+                    calls = []
+
+                    def factory():
+                        calls.append(True)
+                        if physical == 0:
+                            raise primary
+                        return TiedHead()
+
+                    def failed(view):
+                        view.module("failed", factory, checkpoint="student")
+
+                    before = dict(slot.custom), slot.params, slot.optimizer
+                    if leader:
+                        expected = error_type if physical == 0 else RuntimeError
+                        with pytest.raises(
+                            expected, match="injected head factory failure"
+                        ) as caught:
+                            await run_rank_callback(trainer, failed, mode=mode)
+                        if physical == 0:
+                            assert caught.value is primary
+                            assert (
+                                primary.__cause__ is cause
+                                and primary.__context__ is context
+                            )
+                    else:
+                        await run_rank_callback(trainer, failed, mode=mode)
+                    await join_rank_callback_release(trainer)
+                    assert len(calls) == int(leader)
+                    assert (slot.custom, slot.params, slot.optimizer) == before
+                    completed = torch.tensor(1)
+                    dist.all_reduce(completed, group=trainer._checkpoint_group())
+                    assert completed.item() == 2
+
+                calls = []
+
+                def factory():
+                    calls.append(True)
+                    return TiedHead()
+
+                def register(view):
+                    head = view.module("head", factory, checkpoint="student")
+                    assert view.module("head", factory, checkpoint="student") is head
+                    assert head(torch.tensor(3.0)).item() == 15
+
+                await run_rank_callback(trainer, register, mode=mode)
+                assert len(calls) == int(leader)
+                assert "failed" not in slot.custom and "head" in slot.custom
+
+                def local_lookup(view):
+                    if physical == 0:
+                        head = view.module("head", factory, checkpoint="student")
+                        assert head(torch.tensor(3.0)).item() == 15
+
+                # DP1 enters callback cleanup while DP0 reopens the existing
+                # head. Lookup must remain local instead of entering WORLD.
+                await run_rank_callback(trainer, local_lookup, mode=mode)
+                assert len(calls) == int(leader)
+
+            asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode,dp_size", [("rank", 2), ("rank", 1), ("zero", 2)])
+def test_head_factory_failure_keeps_registration_and_callback_groups_usable(
+    tmp_path, mode, dp_size
+):
+    spawn_and_join(
+        _factory_failure_worker,
+        (f"file://{tmp_path / 'factory-failure'}", mode, dp_size),
+        timeout=90,
+        failure="Head factory failure stranded a registration or callback peer",
+    )
 
 
 def _live_head(

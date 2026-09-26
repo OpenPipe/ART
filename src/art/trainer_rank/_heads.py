@@ -538,7 +538,8 @@ class HeadRegistration:
     checkpoint: Any
     name: str
     kind: HeadKind
-    value: torch.nn.Module | torch.Tensor
+    value: torch.nn.Module | torch.Tensor | None
+    factory_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -643,7 +644,18 @@ def execute_head_operation(
             trainer, checkpoint, name
         ) if name in trainer._checkpoint_slots[checkpoint].custom else None
     if kind == "head_register":
+        from . import _checkpoint
+
         registration: HeadRegistration = payload
+        # Every DP/TP/CP participant must settle leader-side construction before
+        # any rank enters checkpoint resolution or mutates its registered heads.
+        _checkpoint.raise_distributed(
+            None
+            if registration.factory_error is None
+            else RuntimeError(registration.factory_error),
+            f"construct custom object {registration.name!r}",
+            trainer._checkpoint_group(),
+        )
         checkpoint = trainer._resolve_custom_checkpoint(registration.checkpoint)
         existing = trainer._checkpoint_slots[checkpoint].custom.get(registration.name)
         if existing is not None:
@@ -1309,12 +1321,32 @@ def logical_register_head(
         if not current.invalid:
             return current.value
     if state is None:
-        value = factory()
-        state = view._invoke(
-            "head", "head_register", HeadRegistration(checkpoint, name, kind, value)
-        ).state
+        value, error, factory_error = None, None, None
+        try:
+            value = factory()
+        except BaseException as exc:
+            error = exc
+            factory_error = type(exc).__name__
+            try:
+                factory_error += f": {exc}"
+            except BaseException:
+                pass
+        try:
+            state = view._invoke(
+                "head",
+                "head_register",
+                HeadRegistration(checkpoint, name, kind, value, factory_error),
+            ).state
+        except BaseException:
+            if error is None:
+                raise
+        # Preserve the factory's original type, identity and chain at its owner;
+        # physical command peers receive an ordinary coordinated failure.
+        if error is not None:
+            raise error
     else:
         value = deepcopy(view._rank._checkpoint_slots[checkpoint].custom[name].value)
+    assert value is not None
     value = (
         move_module(value, view.device)
         if isinstance(value, torch.nn.Module)
