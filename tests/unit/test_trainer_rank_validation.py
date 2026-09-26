@@ -2356,41 +2356,23 @@ def _checkpoint_load_failure_worker(
 
             monkeypatch.setattr(torch.Tensor, "__deepcopy__", copy_tensor)
 
-        monkeypatch.setattr(
-            checkpoint_module,
-            "_load_adapter",
-            (
-                lambda *_args: (
-                    (_ for _ in ()).throw(RuntimeError("injected snapshot read"))
-                    if phase == "read" and rank == 1
-                    else {}
-                )
-            ),
-        )
-        monkeypatch.setattr(
-            checkpoint_module,
-            "_optimizer_state",
-            (
-                lambda *_args: (
-                    (_ for _ in ()).throw(RuntimeError("injected optimizer read"))
-                    if phase == "optimizer" and rank == 1
-                    else LocalOptimizerState(
-                        (), (), (), (), cast(OptimizerConfig, optimizer)
-                    )
-                )
-            ),
-        )
-        monkeypatch.setattr(
-            checkpoint_module,
-            "_commit_slot",
-            (
-                lambda *_args: (
-                    (_ for _ in ()).throw(RuntimeError("injected rank-zero commit"))
-                    if phase == "commit" and rank == 0
-                    else None
-                )
-            ),
-        )
+        def load_adapter(*_args: object) -> dict[str, torch.Tensor]:
+            if phase == "read" and rank == 1:
+                raise RuntimeError("injected snapshot read")
+            return {}
+
+        def optimizer_state(*_args: object) -> LocalOptimizerState:
+            if phase == "optimizer" and rank == 1:
+                raise RuntimeError("injected optimizer read")
+            return LocalOptimizerState((), (), (), (), cast(OptimizerConfig, optimizer))
+
+        def commit_slot(*_args: object) -> None:
+            if phase == "commit" and rank == 0:
+                raise RuntimeError("injected rank-zero commit")
+
+        monkeypatch.setattr(checkpoint_module, "_load_adapter", load_adapter)
+        monkeypatch.setattr(checkpoint_module, "_optimizer_state", optimizer_state)
+        monkeypatch.setattr(checkpoint_module, "_commit_slot", commit_slot)
 
         with pytest.raises(
             RuntimeError, match="injected|Another rank failed"
