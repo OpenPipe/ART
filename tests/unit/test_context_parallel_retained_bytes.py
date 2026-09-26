@@ -14,16 +14,31 @@ from art.megatron.context_parallel.types import (  # noqa: E402
     TokenRange,
 )
 
+
 # Qwen3.6-35B-A3B attention: 16 query heads, 2 KV heads of 256, BF16, and the
 # H200 flash block for a 256-wide head (128 query, 64 key rows).
-GEOMETRY = dict(
-    q_heads=16,
-    kv_heads=2,
-    head_dim=256,
-    value_head_dim=256,
-    element_size=2,
-    block_size=(128, 64),
-)
+def retained(runtime_plan, *, q_heads=16, kv_heads=2):
+    return retained_stage_record_bytes(
+        runtime_plan,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=256,
+        value_head_dim=256,
+        element_size=2,
+        block_size=(128, 64),
+    )
+
+
+def minimum(*, q_heads=16, kv_heads=2):
+    return minimum_retained_bytes_per_row(
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        head_dim=256,
+        value_head_dim=256,
+        element_size=2,
+    )
+
+
 # Flex's output keeps its own LSE beside the normalized copy it returns;
 # logical-length copies keep one.
 Q, KV, FLEX, OUT, TAPE = 8192, 2048, 8192 + 2 * 64, 8192 + 64, 16 * 257 * 4
@@ -61,12 +76,9 @@ def test_aligned_single_stage_copies_views_without_output_copies():
     # Real-data rank 0: one aligned local stage. Contiguous copies of the
     # permuted Q/K/V views, flex output and LSE; no padding, copies or tape.
     rows = 52480
-    retained = retained_stage_record_bytes(
-        plan(rows, stage(0, local=True, q=rows, k=rows)), **GEOMETRY
-    )
-    assert retained == Q * rows + KV * rows + FLEX * rows  # 0.971 GB traced
-    geometry = {k: v for k, v in GEOMETRY.items() if k != "block_size"}
-    assert retained == rows * minimum_retained_bytes_per_row(**geometry)
+    kept = retained(plan(rows, stage(0, local=True, q=rows, k=rows)))
+    assert kept == Q * rows + KV * rows + FLEX * rows  # 0.971 GB traced
+    assert kept == rows * minimum()
 
 
 def test_unaligned_single_stage_pads_and_copies_the_logical_output():
@@ -74,31 +86,28 @@ def test_unaligned_single_stage_pads_and_copies_the_logical_output():
     # up to its 128-row block, so both pad.
     rows = 52481
     stage_len = 411 * 128
-    retained = retained_stage_record_bytes(
+    kept = retained(
         plan(
             rows, stage(0, local=True, q=rows, k=rows, q_len=stage_len, k_len=stage_len)
-        ),
-        **GEOMETRY,
+        )
     )
-    assert retained == Q * stage_len + KV * stage_len + FLEX * stage_len + OUT * rows
+    assert kept == Q * stage_len + KV * stage_len + FLEX * stage_len + OUT * rows
 
 
 def test_tiny_stage_pads_to_two_blocks():
-    retained = retained_stage_record_bytes(
-        plan(5, stage(0, local=True, q=5, k=5)), **GEOMETRY
-    )
-    assert retained == Q * 256 + KV * 128 + FLEX * 256 + OUT * 5
+    kept = retained(plan(5, stage(0, local=True, q=5, k=5)))
+    assert kept == Q * 256 + KV * 128 + FLEX * 256 + OUT * 5
 
 
-def test_single_head_views_are_already_contiguous():
+def test_single_head_views_may_still_be_copied():
+    # One head does not make a view of a fused QKV split contiguous, so the
+    # mirror still charges the copies; only the lower bound leaves them out.
     rows = 1024
-    geometry = dict(GEOMETRY, q_heads=1, kv_heads=1)
-    retained = retained_stage_record_bytes(
-        plan(rows, stage(0, local=True, q=rows, k=rows)), **geometry
+    kept = retained(
+        plan(rows, stage(0, local=True, q=rows, k=rows)), q_heads=1, kv_heads=1
     )
-    assert retained == (256 * 2 + 2 * 4) * rows
-    del geometry["block_size"]
-    assert minimum_retained_bytes_per_row(**geometry) == 256 * 2 + 2 * 4
+    assert kept == (512 + 1024 + 512 + 2 * 4) * rows
+    assert minimum(q_heads=1, kv_heads=1) == 512 + 2 * 4
 
 
 def test_full_query_remote_stage_keeps_fetch_buffers_and_a_merge_tape():
@@ -107,14 +116,14 @@ def test_full_query_remote_stage_keeps_fetch_buffers_and_a_merge_tape():
     own, remote_k = 44314, 16504
     local = stage(0, local=True, q=own, k=own, q_len=44352, k_len=44352)
     remote = stage(1, local=False, q=own, k=remote_k, q_len=44352, k_len=16512)
-    retained = retained_stage_record_bytes(plan(own, local, remote), **GEOMETRY)
+    kept = retained(plan(own, local, remote))
     q_pad = 347 * 128  # 44,416, as flex's traced output size shows
     local_bytes = Q * q_pad + KV * 44352 + FLEX * q_pad + OUT * own
     remote_bytes = (
         Q * q_pad + KV * remote_k + KV * 16512 + FLEX * q_pad + OUT * own + TAPE * own
     )
-    assert retained == local_bytes + remote_bytes
-    assert 3.05e9 < retained < 3.10e9  # 3.07 GB traced
+    assert kept == local_bytes + remote_bytes
+    assert 3.05e9 < kept < 3.10e9  # 3.07 GB traced
 
 
 def test_partial_query_remote_stage_keeps_its_gather_and_a_partial_tape():
@@ -122,25 +131,24 @@ def test_partial_query_remote_stage_keeps_its_gather_and_a_partial_tape():
     own = 105153
     local = stage(0, local=True, q=own, k=own, q_len=105216, k_len=105216)
     remote = stage(1, local=False, q=768, k=20608, own=own)
-    retained = retained_stage_record_bytes(plan(own, local, remote), **GEOMETRY)
+    kept = retained(plan(own, local, remote))
     local_bytes = Q * 105216 + KV * 105216 + FLEX * 105216 + OUT * own
-    # Aligned: the query gather and fetch buffers feed flex without copies.
-    remote_bytes = Q * 768 + KV * 20608 + FLEX * 768 + TAPE * 768
-    assert retained == local_bytes + remote_bytes
+    # Aligned: the query gather and fetch buffers feed flex without copies; the
+    # partial tape also keeps its int64 row index.
+    remote_bytes = Q * 768 + KV * 20608 + FLEX * 768 + (TAPE + 8) * 768
+    assert kept == local_bytes + remote_bytes
 
 
 def test_empty_remote_stage_and_missing_local_stage():
     rows = 1024
     empty = stage(1, local=False, q=0, k=0)
-    alone = retained_stage_record_bytes(
-        plan(rows, stage(0, local=True, q=rows, k=rows), empty), **GEOMETRY
-    )
+    alone = retained(plan(rows, stage(0, local=True, q=rows, k=rows), empty))
     assert alone == Q * rows + KV * rows + FLEX * rows
     # Without a local stage, the first ready remote stage records no tape; the
     # mirror drops the smallest so it never under-counts the order.
     small = stage(1, local=False, q=256, k=256, own=rows)
     full = stage(2, local=False, q=rows, k=512)
-    both = retained_stage_record_bytes(plan(rows, small, full), **GEOMETRY)
-    without_small_tape = retained_stage_record_bytes(plan(rows, full), **GEOMETRY)
+    both = retained(plan(rows, small, full))
+    without_small_tape = retained(plan(rows, full))
     assert both - without_small_tape == Q * 256 + KV * 256 + FLEX * 256 + TAPE * rows
-    assert retained_stage_record_bytes(plan(rows), **GEOMETRY) == 0
+    assert retained(plan(rows)) == 0

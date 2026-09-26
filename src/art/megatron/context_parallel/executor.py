@@ -1623,7 +1623,10 @@ def retained_stage_record_bytes(
             total += q_row * q_len
         if q_pad != q_len:
             total += q_row * q_pad
-        elif q_full and q_heads > 1:
+        elif q_full:
+            # A view of the projection output: flex copies it unless it is
+            # already contiguous, which one head alone does not guarantee
+            # (a fused QKV split keeps the projection's token stride).
             total += q_row * q_len
         # Keys and values: local ranges as for queries; remote ones land in
         # contiguous head-major fetch buffers kept as the stage's inputs.
@@ -1634,12 +1637,13 @@ def retained_stage_record_bytes(
             total += (k_row + v_row) * k_len
         if k_pad != k_len:
             total += (k_row + v_row) * k_pad
-        elif k_full and kv_heads > 1:
+        elif k_full:
             total += (k_row + v_row) * k_len
         total += (out_row + 2 * lse_row) * q_pad
         if q_pad != q_len:
             total += (out_row + lse_row) * q_len
-        tape = tape_row * (own if q_full else q_len)
+        # A partial-query tape also keeps its int64 row index.
+        tape = tape_row * own if q_full else (tape_row + 8) * q_len
         if stage.is_local_stage:
             local_produced = True
         else:

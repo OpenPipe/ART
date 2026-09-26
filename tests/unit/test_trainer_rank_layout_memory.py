@@ -61,6 +61,7 @@ def test_largest_rank_total_not_a_sum_of_rank_maxima():
 
     def total(rank_index):
         attention = layout.attention_rows[rank_index]
+        assert layout.gdn_rows is not None
         gdn = layout.gdn_rows[rank_index]
         ledger = H * (20 * attention + 20 * gdn)
         stages = (

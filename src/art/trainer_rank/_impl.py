@@ -4454,6 +4454,16 @@ class TrainerRank:
             gradient_groups=all(group.grad_enabled for group in plan.groups),
         ):
             return None
+        started = time.perf_counter()
+        try:
+            return self._compute_group_layouts(plan)
+        finally:
+            # Planning work: every rank's CP plan, cached by planning key.
+            self._planning_seconds_accum += time.perf_counter() - started
+
+    def _compute_group_layouts(
+        self, plan: _FlatForwardPlan
+    ) -> tuple[_GroupLayout, ...]:
         geometry = self._geometry
         from art.megatron.context_parallel.executor import retained_stage_record_bytes
         from art.megatron.context_parallel.runtime import context_parallel_rank_layouts
