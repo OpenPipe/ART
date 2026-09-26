@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Coroutine
+from contextlib import nullcontext
 import gc
 from types import SimpleNamespace
 from typing import Any, cast
@@ -104,6 +105,7 @@ async def test_operation_captures_tensor_arguments_at_submission():
         _rank=SimpleNamespace(),
         forward=lambda inputs: inputs * 3,
         export_forward=lambda output: output,
+        _release_on_error=lambda handles: nullcontext(),
     )
     assert torch.equal(await execute_operation(rank, operation), torch.tensor([6.0]))
 
@@ -208,6 +210,7 @@ async def test_batch_pulls_and_close_are_identified_without_advancing_twice():
         open_forward_batches=lambda **kwargs: events.append("open") or "iterator",
         next_forward_batch=lambda **kwargs: events.append("next") or "batch",
         export_forward=lambda batch: SimpleNamespace(handle="packet", batch=batch),
+        _release_on_error=lambda handles: nullcontext(),
         close_forward_batches=lambda handle: events.append(("close", handle)),
         release_forward=lambda handles: events.append(("release", tuple(handles))),
     )

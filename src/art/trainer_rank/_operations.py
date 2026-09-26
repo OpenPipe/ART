@@ -185,17 +185,13 @@ async def execute_operation(rank_zero: Any, operation: TrainerOperation) -> Any:
             # receives the original policy, and native callback views are intact.
             transport = copy(rank_zero)
             transport._transport_handles = []
-            try:
-                tree = (
-                    transport.forward(**payload)
-                    if operation.kind == "forward"
-                    else transport.next_forward_batch(**payload)
-                )
+            tree = (
+                transport.forward(**payload)
+                if operation.kind == "forward"
+                else transport.next_forward_batch(**payload)
+            )
+            with transport._release_on_error(transport._transport_handles):
                 result = None if tree is None else transport.export_forward(tree)
-            except BaseException:
-                if transport._transport_handles:
-                    transport._invoke("release", tuple(transport._transport_handles))
-                raise
         elif operation.kind == "backward":
             result = rank_zero.backward_packets(**payload)
         elif operation.kind == "optim_step":

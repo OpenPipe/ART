@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import gc
+import sys
 from typing import Any, cast
 import weakref
 
@@ -163,9 +164,12 @@ async def test_transport_preserves_worker_admission_and_native_view(policy):
     assert not rank._rank_command_state.graphs
 
 
-@pytest.mark.parametrize("failure_kind", ["budget", "allocation"])
+@pytest.mark.parametrize(
+    "failure_kind", ["budget", "allocation", "release", "cancel", "attach"]
+)
+@pytest.mark.parametrize("batches", [False, True])
 async def test_export_failure_releases_only_failed_operation_and_counts_live_exports(
-    monkeypatch, failure_kind
+    monkeypatch, failure_kind, batches
 ):
     rank: Any = _TransportRank()
     view = _view(_Executor(rank, "zero"))
@@ -189,6 +193,32 @@ async def test_export_failure_releases_only_failed_operation_and_counts_live_exp
     good = await _operation(view, "forward", {"inputs": request}, "good")
     assert sum(t.numel() * t.element_size() for t in state.exports[good.handle]) == 4
     original_graphs = set(state.graphs)
+    handle = (
+        await _operation(view, "batches_open", {"inputs": [request, _input(7)]}, "open")
+        if batches
+        else None
+    )
+    operation = TrainerOperation.capture(
+        ("failure", 1),
+        "batches_next" if batches else "forward",
+        {"handle": handle} if batches else {"inputs": request},
+    )
+    error = (asyncio.CancelledError if failure_kind == "cancel" else MemoryError)(
+        "injected transport delivery failure"
+    )
+    release_fails = failure_kind in ("release", "cancel", "attach")
+    invoke = view._executor.invoke
+    release_calls, flushes = [], []
+
+    def release(operation, *args, **kwargs):
+        if operation == "release":
+            release_calls.append(args[0])
+            if release_fails and len(release_calls) <= 2:
+                raise RuntimeError("injected release failure")
+        return invoke(operation, *args, **kwargs)
+
+    monkeypatch.setattr(view._executor, "invoke", release)
+    monkeypatch.setattr(view, "_flush_heads", lambda: flushes.append(sys.exc_info()[1]))
     # The worker snapshot fits. A budget drop at export must fail before
     # its clone and clean only the newly created physical graphs.
     calls = 0
@@ -198,28 +228,73 @@ async def test_export_failure_releases_only_failed_operation_and_counts_live_exp
         calls += 1
         return available() if calls == 1 else 0
 
+    detach, managed = _tensors.detach_tree, _tensors.managed_tensor
     if failure_kind == "budget":
         rank._available_cpu_memory_bytes = constrained
+    elif failure_kind == "attach":
+
+        def reject_attach(tensor):
+            raise error
+
+        monkeypatch.setattr(_tensors, "managed_tensor", reject_attach)
     else:
-        detach = _tensors.detach_tree
 
         def reject_clone(handle, *args, **kwargs):
             if handle.startswith("client:"):
-                raise MemoryError("export snapshot allocation failed")
+                raise error
             return detach(handle, *args, **kwargs)
 
         monkeypatch.setattr(_tensors, "detach_tree", reject_clone)
-    with pytest.raises(MemoryError, match="export snapshot") as failure:
-        await _operation(view, "forward", {"inputs": request}, "failure")
+    with pytest.raises(
+        type(error), match="export snapshot|transport delivery"
+    ) as failure:
+        await execute_operation(view, operation)
     assert failure.value.__traceback__ is not None
+    if failure_kind != "budget":
+        assert failure.value is error
+    assert len(release_calls) == 1 and flushes and not any(flushes)
+    assert (set(state.graphs) != original_graphs) is release_fails
+    assert state.released == set(state.graphs) - original_graphs
+    with pytest.raises(type(error), match=str(failure.value)) as replay:
+        await execute_operation(view, operation)
+    assert replay.value is not failure.value and len(release_calls) == 1
     assert set(state.exports) == {good.handle}
-    assert set(state.graphs) == original_graphs
     assert 4 in observed
     rank._available_cpu_memory_bytes = available
+    monkeypatch.setattr(_tensors, "detach_tree", detach)
+    monkeypatch.setattr(_tensors, "managed_tensor", managed)
+    if release_fails:
+        before = len(flushes)
+        with pytest.raises(RuntimeError, match="injected release failure"):
+            view.optim_step()
+        assert len(release_calls) == 2 and len(flushes) == before and rank.steps == 0
+        assert state.released == set(state.graphs) - original_graphs
+    assert view.optim_step() == {"steps": 1}
+    assert not state.released and set(state.graphs) == original_graphs
     await _operation(view, "release", {"handles": [good.handle]}, "release")
     assert not state.exports
     assert not state.graphs
     assert available() == total
+    if batches and failure_kind == "attach":
+        assert not state.iterators and not state.batch_inputs
+        handle = await _operation(
+            view, "batches_open", {"inputs": [_input(7)]}, "reopen"
+        )
+    packet = await _operation(
+        view,
+        "batches_next" if batches else "forward",
+        {"handle": handle} if batches else {"inputs": _input(7)},
+        "recovered",
+    )
+    client = CotangentCollector()
+    output = client.attach(packet)
+    value = (output.outputs[0] if batches else output).hidden_states
+    await _operation(view, "backward", {"packets": client.backward(value.sum())})
+    assert rank.weight.grad.item() == 28
+    if batches:
+        await _operation(view, "batches_close", {"handle": handle}, "close")
+    assert not state.graphs and not state.exports
+    assert not state.iterators and not state.batch_inputs
 
 
 def test_transport_release_drops_cpu_payload_without_collecting_cycles():
