@@ -172,12 +172,23 @@ def test_mixed_gradient_handoff_preserves_actual_check_profile_and_context(monke
         ]
     ]
     with torch.no_grad():
-        iterator = rank.forward_micro_batches(inputs, no_grad=True)
+        iterator = rank.forward_batches(inputs, no_grad=True)
         batch = next(iterator)
         assert not torch.is_grad_enabled()
         assert [g.grad_enabled for g in executed[0].groups] == [False, True]
         assert state["releases"] == 1 and state["current"] == torch.device("cuda:7")
-        assert batch.inputs == inputs and batch.indices == (0,)
+        assert len(batch.inputs) == 1 and batch.indices == (0,)
+        for actual, expected in zip(batch.inputs[0], inputs[0], strict=True):
+            torch.testing.assert_close(actual.input_tokens, expected.input_tokens)
+            torch.testing.assert_close(actual.target_tokens, expected.target_tokens)
+            assert (
+                replace(
+                    actual,
+                    input_tokens=expected.input_tokens,
+                    target_tokens=expected.target_tokens,
+                )
+                == expected
+            )
         assert (
             batch.stats.estimated_required_bytes == checks[0].estimated_required_bytes
         )
@@ -222,7 +233,7 @@ def test_handoff_failure_preserves_error_and_restores_device_and_grad_context(
     else:
         state["failure"] = original
     with torch.no_grad():
-        iterator = rank.forward_micro_batches([_target_request(1)], no_grad=False)
+        iterator = rank.forward_batches([_target_request(1)], no_grad=False)
         with pytest.raises(RuntimeError) as caught:
             next(iterator)
         assert caught.value is original
@@ -312,6 +323,6 @@ def test_direct_forward_has_no_new_handoff_policy(monkeypatch):
         "_release_cached_memory_for_backward",
         lambda plan: pytest.fail("direct forward is outside the iterator handoff"),
     )
-    output = rank.dp_rank_forward([_target_request(1)])[0]
+    output = rank.forward([_target_request(1)])[0]
     output.target_logprobs.sum().backward()
     assert len(executed) == 1

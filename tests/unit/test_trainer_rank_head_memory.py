@@ -128,7 +128,7 @@ def test_real_head_split_fits_before_cache_recovery(monkeypatch):
         r, "_try_cache_recovery", lambda *a, **kw: pytest.fail("Split already fits")
     )
     executed = _recording_executor(monkeypatch, r)
-    batches = list(r.forward_micro_batches([requests]))
+    batches = list(r.forward_batches([requests]))
     assert len(batches) == 1 and batches[0].stats.subforward_count == 2
     assert batches[0].stats.global_count == 1 and len(executed) == 2
     assert [

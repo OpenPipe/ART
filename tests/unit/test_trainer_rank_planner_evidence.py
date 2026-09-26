@@ -41,7 +41,7 @@ def scalar(request):
 
 
 def test_first_and_selected_are_not_latest_or_evicted():
-    decision = evidence.Decision("dp_rank_forward", sync_across_dp=False)
+    decision = evidence.Decision("forward", sync_across_dp=False)
     first = sample(decision, 100)
     selected = sample(decision, 80)
     for i in range(100):
@@ -58,8 +58,8 @@ def test_first_and_selected_are_not_latest_or_evicted():
 
 def test_nested_rank_context_isolated_and_restored():
     a, b = object(), object()
-    outer = evidence.Decision("dp_rank_forward", sync_across_dp=False, owner=a)
-    inner = evidence.Decision("dp_rank_forward", sync_across_dp=False, owner=b)
+    outer = evidence.Decision("forward", sync_across_dp=False, owner=a)
+    inner = evidence.Decision("forward", sync_across_dp=False, owner=b)
     with evidence.scope(outer):
         assert evidence.current(a) is outer and evidence.current(b) is None
         with evidence.scope(inner):
@@ -93,7 +93,7 @@ def test_memory_sampling_count_and_policy_unchanged(scalar, backend):
     ordinary_calls, ordinary_events = calls[:], cuda.events[:]
     calls.clear()
     cuda.events.clear()
-    decision = evidence.Decision("dp_rank_forward", sync_across_dp=False, owner=rank)
+    decision = evidence.Decision("forward", sync_across_dp=False, owner=rank)
     with evidence.scope(decision):
         observed = rank._memory_check_required(80)
     assert observed == ordinary
@@ -121,9 +121,7 @@ def test_local_and_reduced_samples_remain_distinct(scalar, monkeypatch):
 
     dist.all_reduce = reduce
     monkeypatch.setattr(tr, "dist", dist)
-    decision = evidence.Decision(
-        "forward_micro_batches", sync_across_dp=True, owner=rank
-    )
+    decision = evidence.Decision("forward_batches", sync_across_dp=True, owner=rank)
     with evidence.scope(decision):
         check = rank._memory_check_required(80, sync_across_dp=True)
     assert calls == [("MAX", None), ("MIN", None)]
@@ -141,7 +139,7 @@ def test_final_refusal_emits_without_forward_or_memory_window(monkeypatch, tmp_p
     rank._planner_reporter = reports.Reporter(1e9, spool_dir=tmp_path / "reports")
     rank._planner_device_identity = {}
     with pytest.raises(tr.TrainerRankMemoryError):
-        rank.dp_rank_forward([_request(i) for i in range(4)])
+        rank.forward([_request(i) for i in range(4)])
     raw = next(rank._planner_reporter.spool_dir.glob("*.json")).read_bytes()
     record = reports.validate_report(raw)
     assert record["event"] == "admission_refused"
@@ -192,7 +190,7 @@ def test_unmatched_refusal_never_claims_denial_replay(
         if microbatch:
             rank._select_next_micro_batch([requests], 0)
         else:
-            rank.dp_rank_forward(requests)
+            rank.forward(requests)
     record = reports.validate_report(
         next(rank._planner_reporter.spool_dir.glob("*.json")).read_bytes()
     )
@@ -231,7 +229,7 @@ def test_cancellation_and_reporting_failure_never_replace_original(
             search,
             lambda x: x,
             lambda x, c: x,
-            context="dp_rank_forward",
+            context="forward",
             sync_across_dp=False,
         )
     assert not rank._planner_reporter.spool_dir.exists()
@@ -267,7 +265,7 @@ def test_actual_cache_release_trace_and_nonfinite_budget(scalar, tmp_path):
         if item["kind"] == "recovery" and item["status"] == "completed"
     )
     assert completed["values"]["observed_available_delta_bytes"] == 160
-    decision = evidence.Decision("dp_rank_forward", sync_across_dp=False)
+    decision = evidence.Decision("forward", sync_across_dp=False)
     decision.outcome = "planning_error"
     decision.record("recovery", "budget_observed", local_high_seconds=math.inf)
     value = decision.snapshot()
@@ -286,9 +284,7 @@ def test_budget_trace_uses_completed_backward_and_observer_operands(scalar):
     backward.cost_ns = 500_000_000
     ticks = iter((10.0, 11.0, 13.0))
     rank._recovery_clock = lambda: next(ticks)
-    decision = evidence.Decision(
-        "forward_micro_batches", sync_across_dp=True, owner=rank
-    )
+    decision = evidence.Decision("forward_batches", sync_across_dp=True, owner=rank)
     with evidence.scope(decision):
         _, error, _ = run(rank, [fail(names), recovery.success(names)])
     assert error is None and cuda.events.count("release") == 1
@@ -307,9 +303,7 @@ def test_handoff_sentinel_is_not_reported_as_available_memory(scalar):
     cuda.free = 1
     cuda.memory_reserved = lambda device: cuda.allocated + 100
     cuda.device = lambda device: nullcontext()
-    decision = evidence.Decision(
-        "forward_micro_batches", sync_across_dp=True, owner=rank
-    )
+    decision = evidence.Decision("forward_batches", sync_across_dp=True, owner=rank)
     with evidence.scope(decision):
         rank._release_cached_memory_for_backward(
             SimpleNamespace(groups=[SimpleNamespace(grad_enabled=True)])
@@ -530,7 +524,7 @@ def test_compaction_bounds_field_names_and_total_encoding_work(
 
 
 def test_summary_trimming_preserves_first_selected(monkeypatch):
-    decision = evidence.Decision("dp_rank_forward", sync_across_dp=False)
+    decision = evidence.Decision("forward", sync_across_dp=False)
     decision.first = decision.selected = sample(decision)
     decision.outcome = "refused"
     for i in range(60):
@@ -562,7 +556,7 @@ def test_legacy_report_reader_remains_supported(tmp_path):
 def test_planning_oom_does_not_borrow_previous_forward(monkeypatch, tmp_path):
     rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
     )
     original = tr.torch.cuda.OutOfMemoryError("new planning allocation")
     _, caught, _ = run(rank, [original])
@@ -595,9 +589,7 @@ def test_refresh_preserves_local_estimate_and_separate_reduced_operand(
 
     dist.all_reduce = reduce
     monkeypatch.setattr(tr, "dist", dist)
-    decision = evidence.Decision(
-        "forward_micro_batches", sync_across_dp=True, owner=rank
-    )
+    decision = evidence.Decision("forward_batches", sync_across_dp=True, owner=rank)
     with evidence.scope(decision):
         first = rank._memory_check_required(80, sync_across_dp=True)
         selected = rank._refresh_memory_check(first, sync_across_dp=True)
@@ -620,7 +612,7 @@ def test_refresh_preserves_local_estimate_and_separate_reduced_operand(
 
 
 def test_refresh_without_original_sample_leaves_local_requirement_unknown():
-    decision = evidence.Decision("dp_rank_forward", sync_across_dp=False)
+    decision = evidence.Decision("forward", sync_across_dp=False)
     with decision.refresh_of(None):
         value = sample(decision, 150)
     assert value.local_required_bytes is value.required_from_ordinal is None

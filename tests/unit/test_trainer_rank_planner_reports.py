@@ -351,11 +351,14 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
     unrecorded["replay"]["memory_replay"]["rank"]["one_layer_recompute"] = None
     with pytest.raises(ValueError, match="recompute mode is not recorded"):
         reports.replay(unrecorded)
-    drifted = reports.validate_report(path.read_bytes())
-    drifted["replay"]["source_files"]["_impl.py"]["sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="source differs"):
-        reports.replay(drifted)
-    assert reports.replay(drifted, allow_source_drift=True)["source_matches"] is False
+    for name in ("_impl.py", "_memory_policy.py", "_options.py"):
+        drifted = reports.validate_report(path.read_bytes())
+        drifted["replay"]["source_files"][name]["sha256"] = "0" * 64
+        with pytest.raises(ValueError, match="source differs"):
+            reports.replay(drifted)
+        assert (
+            reports.replay(drifted, allow_source_drift=True)["source_matches"] is False
+        )
     assert "_gdn_memory.py" in reports._source_files()
     # Frozen stages are independent inputs, not a recorded total substituted
     # for the estimator. Changing a fixed stage changes actual recomputation.
@@ -482,7 +485,8 @@ def test_actual_emitted_split_retains_evidence_but_refuses_missing_runtime_facts
 
 
 @pytest.mark.parametrize("slots", [[], [[True, [[3, 8], []]], [False, []]]])
-def test_signature_json_roundtrip_is_immutable(slots):
+@pytest.mark.parametrize("placements", [[], [["gpu", "model"], ["replay", "cpu"]]])
+def test_signature_json_roundtrip_is_immutable(slots, placements):
     from art.trainer_rank._impl import _MemorySignature
 
     values: dict[str, Any] = dict(
@@ -493,6 +497,7 @@ def test_signature_json_roundtrip_is_immutable(slots):
         grad_enabled=True,
         grad_modes=[True],
         slot_shapes=slots,
+        memory_placement=placements,
     )
     old = dict(values)
     for name in ("topology", "planner_coefficients", "request_mix", "grad_modes"):
@@ -504,6 +509,7 @@ def test_signature_json_roundtrip_is_immutable(slots):
     assert key.slot_shapes == tuple(
         (enabled, tuple(map(tuple, shapes))) for enabled, shapes in slots
     )
+    assert key.memory_placement == tuple(map(tuple, placements))
 
 
 @pytest.mark.parametrize(

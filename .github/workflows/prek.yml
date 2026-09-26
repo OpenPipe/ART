@@ -224,10 +224,13 @@ jobs:
             tests/unit/test_prefix_tree_grad_parity.py \
             tests/unit/test_prefix_tree_packing.py \
             tests/unit/test_trainer_rank_handoff_budget.py \
+            tests/unit/test_trainer_rank_graph_backward_work.py \
             tests/unit/test_qwen35_adapter_config.py \
             tests/unit/test_trainer_rank_physical_reserve.py \
             tests/unit/test_trainer_rank_validation.py \
             tests/unit/test_trainer_rank_weird_shapes.py \
+            tests/unit/test_trainer_rank_slot_graph_lifetime.py \
+            tests/unit/test_trainer_rank_commands.py::test_gloo_dp2_tp2_participation_and_gradients \
             tests/unit/test_trainer_rank_admission_inputs.py \
             tests/unit/test_trainer_rank_checkpoint_memory.py \
             tests/unit/test_trainer_rank_tp_floor.py \
@@ -260,6 +263,7 @@ jobs:
           uv run --no-sync pytest --nbval --current-env --tb=short tests/unit \
             --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
             --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
+            --deselect=tests/unit/test_trainer_rank_commands.py::test_gloo_dp2_tp2_participation_and_gradients \
             --ignore=tests/unit/test_megatron_reference_logprobs.py \
             --ignore=tests/unit/test_moe_routing_replay.py \
             --ignore=tests/unit/test_moe_routing_real_path.py \
@@ -269,10 +273,12 @@ jobs:
             --ignore=tests/unit/test_prefix_tree_grad_parity.py \
             --ignore=tests/unit/test_prefix_tree_packing.py \
             --ignore=tests/unit/test_trainer_rank_handoff_budget.py \
+            --ignore=tests/unit/test_trainer_rank_graph_backward_work.py \
             --ignore=tests/unit/test_qwen35_adapter_config.py \
             --ignore=tests/unit/test_trainer_rank_physical_reserve.py \
             --ignore=tests/unit/test_trainer_rank_validation.py \
             --ignore=tests/unit/test_trainer_rank_weird_shapes.py \
+            --ignore=tests/unit/test_trainer_rank_slot_graph_lifetime.py \
             --ignore=tests/unit/test_trainer_rank_admission_inputs.py \
             --ignore=tests/unit/test_trainer_rank_checkpoint_memory.py \
             --ignore=tests/unit/test_trainer_rank_tp_floor.py \

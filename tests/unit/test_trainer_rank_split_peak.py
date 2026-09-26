@@ -4,40 +4,21 @@ from collections import namedtuple
 from contextlib import nullcontext
 from dataclasses import replace
 from itertools import permutations
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
+from test_trainer_rank_active_memory import _rank as _active_rank
 import torch
 
 from art.trainer_rank import _impl as tr
 
 
-class _Model(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16))
-        self.config = SimpleNamespace(hidden_size=8, num_layers=4, padded_vocab_size=32)
-        self.decoder = object()
-
-    def _preprocess(self, *args, **kwargs):
-        return None
-
-
 def _rank():
-    return tr.TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[_Model()],
-                optimizer=None,
-                provider=SimpleNamespace(
-                    hidden_size=8, num_layers=4, recompute_granularity="full"
-                ),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
-    )
+    rank = _active_rank()
+    # Preserve this module's original recompute mode: packed pricing would
+    # overwhelm the synthetic budgets and bypass the split-floor oracles.
+    rank._recompute_method = rank._recompute_num_layers = None
+    return rank
 
 
 def _requests(count=2, length=100):
@@ -157,6 +138,10 @@ def test_profile_order_change_cannot_drop_completed_split_floor(monkeypatch):
     assert rank._plan_cost(b).ephemeral > rank._plan_cost(a).ephemeral
     before = dict(rank._memory_profiles)
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 10_000)
+    assert (
+        rank._split_required_memory([rank._plan_cost(p) for p in plan.subforwards])
+        < 10_000
+    )
     accepted, check = rank._admit_split_rung(
         ((0,), (1,)),
         requests,
@@ -170,6 +155,8 @@ def test_profile_order_change_cannot_drop_completed_split_floor(monkeypatch):
 
 def _counter_split(monkeypatch):
     rank = _rank()
+    # This executor injects allocator counters without creating cached graphs.
+    monkeypatch.setattr(rank, "_graph_memory_policy_enabled", lambda: False)
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     _native_slot_fields(monkeypatch, rank)
     requests = _requests()
@@ -218,7 +205,7 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
     rank, requests, counters = _counter_split(monkeypatch)
     releases = []
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: releases.append(True))
-    iterator = rank.forward_micro_batches([requests], yield_empty=True)
+    iterator = rank.forward_batches([requests], yield_empty=True)
     batch = next(iterator)
     assert batch.stats.subforward_count == counters["executed"] == 2
     assert counters["resets"] == [100, 600]
@@ -229,7 +216,7 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
     del batch
     counters["allocated"] = 100
     with pytest.raises(tr.TrainerRankMemoryError):
-        next(rank.forward_micro_batches([requests], yield_empty=True))
+        next(rank.forward_batches([requests], yield_empty=True))
     assert counters["executed"] == 2
 
     assert releases == []
@@ -238,7 +225,7 @@ def test_completed_iterator_preserves_caller_peak_for_next_admission(monkeypatch
 @pytest.mark.parametrize("termination", ["throw", "close"])
 def test_incomplete_caller_does_not_learn_split_peak(monkeypatch, termination):
     rank, requests, counters = _counter_split(monkeypatch)
-    iterator = rank.forward_micro_batches([requests], yield_empty=True)
+    iterator = rank.forward_batches([requests], yield_empty=True)
     batch = next(iterator)
     assert batch.stats.subforward_count == counters["executed"] == 2
     children = dict(rank._memory_profiles)
@@ -260,7 +247,7 @@ def test_partial_forward_does_not_learn_split_peak(monkeypatch):
     rank, requests, counters = _counter_split(monkeypatch)
     original = torch.cuda.OutOfMemoryError("second split child allocation")
     counters.update(fail_at=2, error=original)
-    iterator = rank.forward_micro_batches([requests], yield_empty=True)
+    iterator = rank.forward_batches([requests], yield_empty=True)
     with pytest.raises(tr.TrainerRankPartialExecutionError) as caught:
         next(iterator)
     assert "1 of 2 completed" in str(caught.value)

@@ -1,4 +1,4 @@
-# TP support gate: DP2 x TP2 public forward_micro_batches cell (4x H200, Kubernetes).
+# TP support gate: DP2 x TP2 public forward_batches cell (4x H200, Kubernetes).
 #
 # The global wave planner's world-scope collectives composed with TP execution
 # collectives (pair scope): at least two waves under the test-only memory cap,

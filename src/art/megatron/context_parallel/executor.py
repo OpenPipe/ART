@@ -3,12 +3,14 @@ from __future__ import annotations
 from typing import Any, cast
 
 import torch
+from torch._C._autograd import _get_current_graph_task_keep_graph
 from torch._dynamo import config as dynamo_config
 import torch.distributed as dist
 from torch.nn.attention.flex_attention import BlockMask
 import triton
 import triton.language as tl
 
+from art._tensor_residency import record_resident_tensors
 from art.megatron.flex_attn.compiled import (
     SparseBlockSize,
     flash_sparse_block_size_for_head_dim,
@@ -672,6 +674,16 @@ class FlexAttentionKernel:
             head_dim_v=int(v.shape[-1]),
             device=q.device,
         )
+        if (
+            backend == "FLASH"
+            and q.device.type == "cuda"
+            and int(q.shape[-1]) <= 64
+            and torch.cuda.get_device_capability(q.device)[0] == 9
+        ):
+            # SM90 sparse FLASH dQ is incorrect at these head widths. Both
+            # backends use 128x128 mask blocks here; select Triton's distinct
+            # compiled kernel and LSE convention together.
+            backend = "TRITON"
         if compile_key is None:
             _q_len, _k_len, compile_key = select_sparse_execution_family(
                 is_local_stage=bool(is_local_stage),
@@ -2063,6 +2075,7 @@ def _run_context_parallel_backward(
     replay_records: list[dict[str, Any]] | None = None,
     replay_accum_out: torch.Tensor | None = None,
     replay_accum_lse: torch.Tensor | None = None,
+    retain_graph: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     kernel = FlexAttentionKernel(
         compile_enabled=compile_enabled,
@@ -2240,6 +2253,7 @@ def _run_context_parallel_backward(
             inputs=inputs,
             grad_outputs=tuple(stage_output_grads),
             allow_unused=True,
+            retain_graph=retain_graph,
         )
         grad_map: dict[str, torch.Tensor | None] = {
             name: grad for name, grad in zip(input_names, input_grads, strict=True)
@@ -2376,6 +2390,14 @@ class ArtContextParallelFn(torch.autograd.Function):
             tensors_to_save.extend((replay_accum_out, replay_accum_lse))
         ctx.save_for_backward(*tensors_to_save)
         ctx.replay_records = replay_records
+        record_resident_tensors(
+            tuple(
+                value
+                for record in replay_records
+                for value in record.values()
+                if isinstance(value, torch.Tensor)
+            )
+        )
         return output.detach()
 
     @staticmethod
@@ -2390,6 +2412,14 @@ class ArtContextParallelFn(torch.autograd.Function):
             softmax_offset = None
             replay_accum_out = None
             replay_accum_lse = None
+        retain_graph = _get_current_graph_task_keep_graph()
+        replay_records = cast(list[dict[str, Any]], ctx.replay_records)
+        # Stage backward consumes its dictionaries and merge tape. A retained
+        # outer graph needs both that metadata and the inner attention graphs
+        # again; copying dictionaries preserves them without copying tensors.
+        if retain_graph:
+            replay_records = [record.copy() for record in replay_records]
+        succeeded = False
         try:
             dq, dk, dv, grad_softmax_offset = _run_context_parallel_backward(
                 grad_output=grad_output,
@@ -2403,12 +2433,15 @@ class ArtContextParallelFn(torch.autograd.Function):
                 sliding_window=ctx.sliding_window,
                 triton_num_stages_2_head_dims=ctx.triton_num_stages_2_head_dims,
                 softmax_offset=softmax_offset,
-                replay_records=cast(list[dict[str, Any]], ctx.replay_records),
+                replay_records=replay_records,
                 replay_accum_out=replay_accum_out,
                 replay_accum_lse=replay_accum_lse,
+                retain_graph=retain_graph,
             )
+            succeeded = True
         finally:
-            ctx.replay_records = None
+            if not retain_graph or not succeeded:
+                ctx.replay_records = None
         return dq, dk, dv, grad_softmax_offset, None, None, None, None, None, None
 
 

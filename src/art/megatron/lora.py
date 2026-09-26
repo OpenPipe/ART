@@ -1,4 +1,6 @@
-from collections.abc import Iterator, Sequence
+from __future__ import annotations
+
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass, replace
@@ -69,15 +71,41 @@ class LoRASlotRef:
 _CURRENT_LORA_SLOT: contextvars.ContextVar[LoRASlotRef | None] = contextvars.ContextVar(
     "art_megatron_current_lora_slot", default=None
 )
+_CURRENT_LORA_VERSION: contextvars.ContextVar[LoRAVersion | None] = (
+    contextvars.ContextVar("art_megatron_current_lora_version", default=None)
+)
+
+
+@dataclass(frozen=True)
+class LoRAVersion:
+    ref: LoRASlotRef
+    version: Any
+    slots: Mapping[int, LoRASlot]
+    validate: Callable[[], None]
+    weight_version: Any = None
+
+    @property
+    def nbytes(self) -> int:
+        return sum(
+            param.numel() * param.element_size()
+            for slot in self.slots.values()
+            for param in (slot.A_T, slot.B_T)
+        )
 
 
 @contextmanager
-def use_lora_slot(ref: LoRASlotRef | None) -> Iterator[None]:
+def use_lora_slot(
+    ref: LoRASlotRef | None, *, version: LoRAVersion | None = None
+) -> Iterator[None]:
+    if version is not None and version.ref != ref:
+        raise ValueError("LoRA version belongs to a different slot")
     token = _CURRENT_LORA_SLOT.set(ref)
+    version_token = _CURRENT_LORA_VERSION.set(version)
     try:
         yield
     finally:
         _CURRENT_LORA_SLOT.reset(token)
+        _CURRENT_LORA_VERSION.reset(version_token)
 
 
 _logger = logging.getLogger(__name__)
@@ -130,15 +158,13 @@ def _collect_compile_garbage() -> None:
 
 def _with_captured_lora_slot(function: _F) -> _F:
     context = _CURRENT_LORA_SLOT.get()
+    version = _CURRENT_LORA_VERSION.get()
 
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         _collect_compile_garbage()
-        token = _CURRENT_LORA_SLOT.set(context)
-        try:
+        with use_lora_slot(context, version=version):
             result = function(*args, **kwargs)
-        finally:
-            _CURRENT_LORA_SLOT.reset(token)
         # A compile inside this call has unwound; collect before its backward.
         # Failed calls leave the mark for the next call, keeping their error.
         _collect_compile_garbage()
@@ -157,7 +183,7 @@ def _patch_function_once(module: Any, name: str, wrapper: Callable[[_F], _F]) ->
 
 
 def install_lora_checkpoint_context_hooks() -> None:
-    """Preserve the selected dynamic LoRA slot across activation recompute."""
+    """Preserve the selected slot and immutable tensors across recompute."""
 
     def wrap_checkpoint(original: _F, function_index: int) -> _F:
         @functools.wraps(original)
@@ -967,7 +993,8 @@ class LoRA(torch.nn.Module):
             return self.A_T, self.B_T, self.scale
         if ref.name is None:
             return None
-        slot = self._slot(ref)
+        version = _CURRENT_LORA_VERSION.get()
+        slot = self._slot(ref) if version is None else version.slots.get(id(self))
         if slot is None:
             return None
         return slot.A_T, slot.B_T, slot.scale

@@ -43,7 +43,7 @@ def test_admission_consumes_the_only_first_release(rig):
     rank._release_cached_memory_for_backward(plan(True))
     assert cuda.events.count("release") == 1
     assert rank._recovery_state().cost > before
-    rank._record_recovery_work("forward_micro_batches", 100.0)
+    rank._record_recovery_work("forward_batches", 100.0)
     rank._release_cached_memory_for_backward(plan(True))
     assert cuda.events.count("release") == 2
 
@@ -85,7 +85,7 @@ def test_diagnostic_admission_exit_charges_one_episode(
             lambda: next(searches),
             lambda value: value,
             lambda value, check: (value[0], check),
-            context="forward_micro_batches",
+            context="forward_batches",
             sync_across_dp=True,
             admit_refusal=lambda refused: (refused.plan, refused.check),
         )
@@ -142,7 +142,7 @@ def test_diagnostic_refresh_exit_charges_once_without_release(rig, override):
             lambda: next(searches),
             lambda value: value,
             lambda value, check: (value[0], check),
-            context="forward_micro_batches",
+            context="forward_batches",
             sync_across_dp=True,
             admit_refusal=lambda refused: (refused.plan, refused.check),
         )
@@ -301,7 +301,7 @@ def test_new_handoff_failure_retires_only_owned_output_aliases(monkeypatch):
     primary = RuntimeError("post-release sample")
     state["failure"] = primary
     with torch.no_grad():
-        iterator = rank.forward_micro_batches([_target_request(1)], no_grad=False)
+        iterator = rank.forward_batches([_target_request(1)], no_grad=False)
         with pytest.raises(RuntimeError) as caught:
             next(iterator)
         assert caught.value is primary and not torch.is_grad_enabled()

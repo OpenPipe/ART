@@ -128,7 +128,7 @@ def test_public_pair_avoids_inactive_only_split_and_keeps_total_telemetry(monkey
         ], None
 
     monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
-    batches = list(rank.forward_micro_batches([_requests(inactive_length=8001)]))
+    batches = list(rank.forward_batches([_requests(inactive_length=8001)]))
     assert len(batches) == 1
     batch = batches[0]
     assert batch.indices == (0,)
@@ -264,7 +264,7 @@ def test_direct_forward_does_not_drop_observed_peak_outside_trust(monkeypatch, n
         with pytest.raises(
             TrainerRankMemoryError, match="single request cannot be split"
         ):
-            rank.dp_rank_forward([request(length)])
+            rank.forward([request(length)])
         assert rank.last_forward_telemetry()["predicted_peak_bytes"] >= 10_000
 
 

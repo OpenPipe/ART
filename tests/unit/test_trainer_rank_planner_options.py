@@ -26,7 +26,7 @@ def test_default_refusal_does_not_execute(monkeypatch):
     rank._allow_oversized_batches = False
     executed = _recording_executor(monkeypatch, rank)
     with pytest.raises(tr.TrainerRankMemoryError):
-        rank.dp_rank_forward([_request(i) for i in range(4)])
+        rank.forward([_request(i) for i in range(4)])
     assert executed == []
 
 
@@ -37,7 +37,7 @@ def test_override_exhausts_recovery_then_runs_lowest_exact_split(monkeypatch):
         rank, "_try_cache_recovery", lambda *a, **k: events.append("recovery") or False
     )
     executed = _recording_executor(monkeypatch, rank)
-    rank.dp_rank_forward([_request(i) for i in range(4)])
+    rank.forward([_request(i) for i in range(4)])
     assert events == ["recovery"]
     assert len(executed) == 4
     assert all(plan.packed_tokens == 10 for plan in executed)
@@ -47,7 +47,7 @@ def test_override_exhausts_recovery_then_runs_lowest_exact_split(monkeypatch):
 def test_fitting_split_is_unchanged_when_override_enabled(monkeypatch):
     rank = _oversized(monkeypatch, limit=20)
     executed = _recording_executor(monkeypatch, rank)
-    rank.dp_rank_forward([_request(i) for i in range(4)])
+    rank.forward([_request(i) for i in range(4)])
     assert [plan.packed_tokens for plan in executed] == [20, 20]
 
 
@@ -60,7 +60,7 @@ def test_cache_recovery_fit_wins_over_unsafe_minimum(monkeypatch):
 
     monkeypatch.setattr(rank, "_try_cache_recovery", recover)
     executed = _recording_executor(monkeypatch, rank)
-    rank.dp_rank_forward([_request(i) for i in range(4)])
+    rank.forward([_request(i) for i in range(4)])
     assert [plan.packed_tokens for plan in executed] == [20, 20]
 
 
@@ -72,7 +72,7 @@ def test_override_selects_best_rung_not_last(monkeypatch):
         lambda *, packed_tokens, **k: {40: 400, 20: 20, 10: 30}[packed_tokens],
     )
     executed = _recording_executor(monkeypatch, rank)
-    rank.dp_rank_forward([_request(i) for i in range(4)])
+    rank.forward([_request(i) for i in range(4)])
     assert [plan.packed_tokens for plan in executed] == [20, 20]
 
 
@@ -81,7 +81,7 @@ def test_ep_unsupported_split_is_never_overridden(monkeypatch):
     monkeypatch.setattr(rank, "_expert_parallel_active", lambda: True)
     executed = _recording_executor(monkeypatch, rank)
     with pytest.raises(tr.TrainerRankMemoryError, match="expert parallelism"):
-        rank.dp_rank_forward([_request(i) for i in range(2)])
+        rank.forward([_request(i) for i in range(2)])
     assert not executed
 
 
@@ -96,7 +96,7 @@ def test_disagreeing_peer_refuses_override(monkeypatch):
 
     monkeypatch.setattr(rank, "_recovery_reduce", reduce)
     with pytest.raises(tr.TrainerRankMemoryError):
-        rank.dp_rank_forward([_request(0)])
+        rank.forward([_request(0)])
     assert seen == [([1.0, 0.0, 0.0], "MIN", False)]
 
 
@@ -114,9 +114,7 @@ def test_microbatch_override_keeps_minimum_wave_inputs(monkeypatch):
 def test_nonmemory_validation_is_not_overridden(monkeypatch):
     rank = _oversized(monkeypatch)
     with pytest.raises(ValueError, match="exceeds vocabulary"):
-        rank.dp_rank_forward(
-            [tr.ForwardInput(input_tokens=torch.tensor([1]), top_k=1000)]
-        )
+        rank.forward([tr.ForwardInput(input_tokens=torch.tensor([1]), top_k=1000)])
 
 
 def _reporting_rank(monkeypatch, tmp_path):
@@ -164,10 +162,43 @@ def _records(root: Path):
     return [json.loads(path.read_text()) for path in root.rglob("*.json")]
 
 
+def test_graph_placement_report_preserves_selected_local_admission(
+    monkeypatch, tmp_path
+):
+    from art.trainer_rank import ForwardOptions, _planner_evidence
+
+    rank, _, _ = _reporting_rank(monkeypatch, tmp_path)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda *args: 10_000)
+    monkeypatch.setattr(rank, "_available_cpu_memory_bytes", lambda: 1_000_000)
+    request = tr.replace(
+        _request(0),
+        options=ForwardOptions(backward_state="replay", output_device="cpu"),
+    )
+    decision = _planner_evidence.Decision("forward", sync_across_dp=False, owner=rank)
+    with _planner_evidence.scope(decision):
+        plan, check = rank._admit_graph_memory(rank._plan_flat_forward([request]))
+    assert check.fits and check.sample is not None
+    local = check.sample.local_required_bytes
+    assert local is not None
+    rank._begin_planner_observation(
+        plan,
+        tr.replace(
+            check, estimated_required_bytes=check.estimated_required_bytes + 123
+        ),
+    )
+    observation = rank._planner_observation
+    assert observation is not None and observation["comparable"]
+    snapshot = observation["replay"]()
+    assert observation["predicted"] == round(local / tr._MEMORY_SAFETY_FACTOR)
+    assert snapshot["local_admission_peak_bytes"] == local
+    assert snapshot["reduced_admission_peak_bytes"] == local + 123
+    assert snapshot["requests"][0]["options"]["backward_state"] == "replay"
+
+
 def test_report_uses_local_prediction_before_profile_update(monkeypatch, tmp_path):
     rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(9999, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(9999, 10000, True), context="forward"
     )
     counters["peak"] = 500  # caller backward exceeds the earlier forward peak
     rank._complete_planner_observation()
@@ -190,7 +221,7 @@ def test_caught_backward_oom_is_reported_once_without_completed_peak(
 ):
     rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
     )
     error = torch.cuda.OutOfMemoryError("caller backward allocation")
     rank.report_planner_oom(error)
@@ -217,7 +248,7 @@ def test_forward_oom_report_preserves_original_cause(monkeypatch, tmp_path):
     monkeypatch.setattr(rank, "_execute_flat_plan", fail)
     with pytest.raises(tr.TrainerRankMemoryError) as raised:
         rank._run_flat_plan_with_memory_tracking(
-            plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+            plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
         )
     assert raised.value.__cause__ is error
     [record] = _records(tmp_path)
@@ -230,7 +261,7 @@ def test_snapshot_failure_still_persists_minimal_oom(monkeypatch, tmp_path):
     rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
     monkeypatch.setattr(rank, "_plan_cost", lambda plan: 1 / 0)
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
     )
     rank.report_planner_oom(torch.cuda.OutOfMemoryError("backward"))
     [record] = _records(tmp_path)
@@ -241,7 +272,7 @@ def test_snapshot_failure_still_persists_minimal_oom(monkeypatch, tmp_path):
 def test_nonoom_does_not_mint_oom_report(monkeypatch, tmp_path):
     rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
     )
     rank.report_planner_oom(RuntimeError("unrelated failure"))
     rank.discard_planner_observation()
@@ -261,7 +292,7 @@ def test_delayed_report_keeps_original_request_options(monkeypatch, tmp_path, oo
     }
     output_bytes = plan.output_bytes
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
     )
     # Caller/backward work can reuse the mutable ForwardInput before emission.
     request.top_k = 9
@@ -287,7 +318,7 @@ def test_delayed_report_keeps_original_request_options(monkeypatch, tmp_path, oo
 def test_changed_tokens_mark_replay_incomplete(monkeypatch, tmp_path):
     rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
     )
     plan.groups[0].items[0].input_ids[0] = 123
     rank._complete_planner_observation()
@@ -305,7 +336,7 @@ def test_disabled_reports_do_not_sample_extra_counters(monkeypatch, tmp_path):
         lambda plan: pytest.fail("disabled observation built snapshot"),
     )
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
     )
     rank.finish_planner_observation()
     assert not _records(tmp_path)
@@ -330,7 +361,7 @@ def test_mixed_rank_flags_do_not_add_divergent_split_pricing(monkeypatch):
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     with pytest.raises(tr.TrainerRankMemoryError):
-        rank.dp_rank_forward([_request(i) for i in range(4)])
+        rank.forward([_request(i) for i in range(4)])
     assert planned == [4, 4]  # disabled peer keeps lower-bound pruning everywhere
     assert all(entry[1]["sync_across_dp"] is False for entry in seen)
 
@@ -343,13 +374,13 @@ def test_fitting_path_adds_no_option_agreement_collective(monkeypatch):
         lambda *a, **k: pytest.fail("new normal-path collective"),
     )
     _recording_executor(monkeypatch, rank)
-    rank.dp_rank_forward([_request(0)])
+    rank.forward([_request(0)])
 
 
 def test_iterator_close_preserves_pending_backward_oom_context(monkeypatch, tmp_path):
     rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda sample=None: 10000)
-    iterator = rank.forward_micro_batches([_request(0)])
+    iterator = rank.forward_batches([_request(0)])
     next(iterator)
     iterator.close()
     assert rank._planner_observation is not None
@@ -374,7 +405,7 @@ def test_split_report_keeps_first_child_peak_across_resets(monkeypatch, tmp_path
 
     monkeypatch.setattr(rank, "_execute_flat_plan", execute)
     rank._execute_split_plan_with_memory_tracking(
-        split, check=tr._MemoryCheck(440, 10000, True), context="dp_rank_forward"
+        split, check=tr._MemoryCheck(440, 10000, True), context="forward"
     )
     counters["peak"] = 350
     rank._complete_planner_observation()
@@ -406,7 +437,7 @@ def test_volatile_budget_uses_smaller_materialized_candidate(monkeypatch):
         lambda: selected,
         lambda value: (value.plan, value.check),
         lambda value, check: tr.replace(value, check=check),
-        context="forward_micro_batches",
+        context="forward_batches",
         sync_across_dp=True,
         admit_refusal=lambda refusal: pytest.fail("lost original candidate mapping"),
     )
@@ -421,14 +452,10 @@ def test_interleaved_execution_scopes_preserve_both_oom_inputs(monkeypatch, tmp_
     one, two = {}, {}
     check = tr._MemoryCheck(220, 10000, True)
     with rank.planner_observation_scope(one):
-        rank._run_flat_plan_with_memory_tracking(
-            first, check=check, context="dp_rank_forward"
-        )
+        rank._run_flat_plan_with_memory_tracking(first, check=check, context="forward")
     with rank.planner_observation_scope(two):
         rank.discard_planner_observation()  # new actor execution cannot erase one
-        rank._run_flat_plan_with_memory_tracking(
-            second, check=check, context="dp_rank_forward"
-        )
+        rank._run_flat_plan_with_memory_tracking(second, check=check, context="forward")
     with rank.planner_observation_scope(one):
         rank.report_planner_oom(torch.cuda.OutOfMemoryError("first backward"))
     with rank.planner_observation_scope(two):
@@ -457,7 +484,7 @@ def test_overlapping_scope_does_not_claim_completed_comparison(monkeypatch, tmp_
     for context in (one, two):
         with rank.planner_observation_scope(context):
             rank._run_flat_plan_with_memory_tracking(
-                plan, check=check, context="dp_rank_forward"
+                plan, check=check, context="forward"
             )
     for context in (one, two):
         with rank.planner_observation_scope(context):
@@ -473,7 +500,7 @@ def test_sequential_scopes_keep_independent_completed_peaks(monkeypatch, tmp_pat
         counters.update(allocated=100, peak=100)
         with rank.planner_observation_scope({}):
             rank._run_flat_plan_with_memory_tracking(
-                plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+                plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
             )
             rank._complete_planner_observation()
     assert len(_records(tmp_path)) == 2
@@ -507,7 +534,7 @@ def test_dp_refusal_prices_share_world_scope_before_best_choice(
         lambda: next(searches),
         lambda value: (value.plan, value.check),
         lambda value, check: tr.replace(value, check=check),
-        context="forward_micro_batches",
+        context="forward_batches",
         sync_across_dp=True,
         admit_refusal=lambda refused: tr.replace(
             candidate, plan=refused.plan, check=refused.check, stats_global_count=1
@@ -530,7 +557,7 @@ def test_dp_disagreeing_fallback_widths_refuse_before_execution(monkeypatch):
             lambda: refusal,
             lambda value: (value.plan, value.check),
             lambda value, check: value,
-            context="forward_micro_batches",
+            context="forward_batches",
             sync_across_dp=True,
             admit_refusal=lambda r: tr._CandidateMicroBatch(
                 items, (0,), r.plan, r.check, 1, 0, True
@@ -547,7 +574,7 @@ def test_dp_forward_reports_at_forward_boundary_not_later_optimizer(
         "_plan_admissible_forward",
         lambda *a, **k: (plan, tr._MemoryCheck(220, 10000, True)),
     )
-    rank.dp_rank_forward([_request(0)])
+    rank.forward([_request(0)])
     [record] = _records(tmp_path)
     assert record["observed_peak_bytes"] == 250
     assert record["phase"] == "forward"
@@ -564,7 +591,7 @@ def test_closed_forward_keeps_backward_oom_without_false_partial_peak(
 ):
     rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
     rank._execute_admitted_plan(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
     )
     counters["peak"] = 10000
     rank.report_planner_oom(torch.cuda.OutOfMemoryError("later backward"))
@@ -585,7 +612,7 @@ def test_execution_finish_does_not_complete_abandoned_microbatch_window(
 ):
     rank, plan, counters = _reporting_rank(monkeypatch, tmp_path)
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="forward_micro_batches"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward_batches"
     )
     counters["peak"] = 10000
     rank.finish_planner_observation()
@@ -600,7 +627,7 @@ def test_abandoned_execution_does_not_poison_future_measurements(monkeypatch, tm
         rank._run_flat_plan_with_memory_tracking(
             plan,
             check=tr._MemoryCheck(220, 10000, True),
-            context="forward_micro_batches",
+            context="forward_batches",
         )
     assert rank._planner_active_observations
     del abandoned
@@ -609,7 +636,7 @@ def test_abandoned_execution_does_not_poison_future_measurements(monkeypatch, tm
     counters.update(allocated=100, peak=100)
     with rank.planner_observation_scope({}):
         rank._execute_admitted_plan(
-            plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+            plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
         )
     [record] = _records(tmp_path)
     assert record["observed_peak_bytes"] == 250
@@ -628,7 +655,7 @@ def test_diagnostic_registry_failure_does_not_replace_forward_oom(
     monkeypatch.setattr(rank, "_execute_flat_plan", execute)
     with pytest.raises(tr.TrainerRankMemoryError) as raised:
         rank._run_flat_plan_with_memory_tracking(
-            plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+            plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
         )
     assert raised.value.__cause__ is error
     rank.finish_planner_observation()  # diagnostic cleanup must also be auxiliary
@@ -637,7 +664,7 @@ def test_diagnostic_registry_failure_does_not_replace_forward_oom(
 def test_complete_diagnostic_failure_and_cancellation_semantics(monkeypatch, tmp_path):
     rank, plan, _ = _reporting_rank(monkeypatch, tmp_path)
     rank._run_flat_plan_with_memory_tracking(
-        plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+        plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
     )
     del rank._planner_overlap_generation
     rank._complete_planner_observation()  # ordinary diagnostic AttributeError is contained
@@ -659,13 +686,13 @@ def test_closed_dp_context_invalidates_other_executions_open_caller_window(
     one, two = {}, {}
     with rank.planner_observation_scope(one):
         rank._execute_admitted_plan(
-            plan, check=tr._MemoryCheck(220, 10000, True), context="dp_rank_forward"
+            plan, check=tr._MemoryCheck(220, 10000, True), context="forward"
         )
     [forward_report] = _records(tmp_path)
     assert forward_report["observed_peak_bytes"] == 250
     assert one["observation"]["window_open"] is False
 
-    iterator = rank.forward_micro_batches([_request(1)])
+    iterator = rank.forward_batches([_request(1)])
     with rank.planner_observation_scope(two):
         next(iterator)
     # A resumes caller backward while B's yielded microbatch interval is open.

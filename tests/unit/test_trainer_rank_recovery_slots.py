@@ -45,7 +45,7 @@ def test_dp_recovery_ensures_before_all_searches(search_count, empty):
     rank._snapshot_planning_telemetry = lambda *args: None
     rank._try_cache_recovery = lambda *args, **kwargs: True
     result = rank._plan_admissible_forward(
-        requests, checkpoint=checkpoint, context="dp_rank_forward"
+        requests, checkpoint=checkpoint, context="forward"
     )
     assert result == fit and not results
     assert events == ["ensure"] + ["search"] * search_count
@@ -71,7 +71,7 @@ def test_checkpoint_error_precedes_search_and_preserves_identity(error_type):
     rank._recover_admission = forbidden
     rank._find_admissible_forward = forbidden
     with pytest.raises(error_type) as captured:
-        rank._plan_admissible_forward([], checkpoint=None, context="dp_rank_forward")
+        rank._plan_admissible_forward([], checkpoint=None, context="forward")
     assert captured.value is error
     assert error.__cause__ is cause and error.__context__ is context
     assert error.__suppress_context__ and events == ["ensure"]
@@ -80,6 +80,7 @@ def test_checkpoint_error_precedes_search_and_preserves_identity(error_type):
 @pytest.mark.parametrize("ensure_slots", (None, False, True))
 def test_direct_search_keeps_default_setup(ensure_slots):
     rank = TrainerRank.__new__(TrainerRank)
+    rank.device = _impl.torch.device("cpu")
     events = []
     plan, check = object(), _impl._MemoryCheck(80, 200, True)
     rank._ensure_checkpoint_slots_for = lambda *a, **kw: events.append("ensure")

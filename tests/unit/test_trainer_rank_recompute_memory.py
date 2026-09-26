@@ -75,7 +75,7 @@ def test_reported_cold_request_is_refused_before_execution(
     assert not rank._memory_check(_plan(rank)).fits
     assert rank._memory_check(_plan(rank, tokens=1024)).fits
     with pytest.raises(TrainerRankMemoryError):
-        rank.dp_rank_forward(
+        rank.forward(
             [ForwardInput(input_tokens=torch.arange(32710), hidden_states=True)]
         )
 

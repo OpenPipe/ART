@@ -50,6 +50,8 @@ _SOURCE_NAMES = (
     "_prefix_tree_performance_search.py",
     "_planner_misses.py",
     "_gdn_memory.py",
+    "_memory_policy.py",
+    "_options.py",
     "_planner_evidence.py",
     "_planner_retention.py",
 )
@@ -532,6 +534,9 @@ def _signature_values(values: dict[str, Any]) -> dict[str, Any]:
     values = dict(values)
     for name in ("topology", "planner_coefficients", "request_mix", "grad_modes"):
         values[name] = tuple(values[name])
+    values["memory_placement"] = tuple(
+        tuple(placement) for placement in values.get("memory_placement", ())
+    )
     slots = []
     raw_slots = values.get("slot_shapes", ())
     if not isinstance(raw_slots, (list, tuple)):
