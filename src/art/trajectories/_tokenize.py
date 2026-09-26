@@ -4584,131 +4584,1632 @@ def _preserve_literal_thinking_off_content(
             message["reasoning_content"] = ""
 
 
-def _tokenize_chat_view(
-    history: ChatCompletionsHistory,
-    *,
-    base_model: str | None,
-    tokenizer: Tokenizer | None,
-    chat_template: str | None,
-    chat_template_kwargs: Mapping[str, object] | None,
-    _projection_matches: bool | None = None,
-    _trace: _TraceBuilder | None = None,
-) -> TokenizedHistory:
-    _validate_history_sources(history)
-    config = (
-        _TokenizerConfig(base_model or history.model or "")
-        if tokenizer is not None
-        or (base_model is not None and chat_template is not None)
-        else _tokenizer_config(history.model or "", base_model)
-    )
-    if tokenizer is None:
-        if not history.model and base_model is None:
-            raise ValueError("History tokenization requires a model or base_model")
-        tokenizer = _load_tokenizer(config)
-    assert tokenizer is not None
-    resolved_tokenizer = tokenizer
-    messages = [dict(message) for message in history.messages]
-    explicit_kwargs = {
-        **(config.chat_template_kwargs or {}),
-        **(history.chat_template_kwargs or {}),
-        **(chat_template_kwargs or {}),
-    }
-    last_exchange = _last_source_exchange(history.message_sources)
-    if isinstance(last_exchange, MessagesExchange) and isinstance(
-        thinking := last_exchange.request.get("thinking"), dict
-    ):
-        explicit_kwargs.setdefault("enable_thinking", thinking.get("type") == "enabled")
-        if budget := thinking.get("budget_tokens"):
-            explicit_kwargs.setdefault("thinking_budget", budget)
-    template = chat_template or history.chat_template or config.chat_template
-    if template is None:
-        tokenizer_template = getattr(resolved_tokenizer, "chat_template", None)
-        if isinstance(tokenizer_template, str):
-            template = tokenizer_template
-    template = chat_template_with_preserved_thinking(template)
-    kwargs = {
-        **default_chat_template_kwargs_for_template(template),
-        **explicit_kwargs,
-    }
-    _preserve_literal_thinking_off_content(history, messages, template, kwargs)
-    ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
-    segmented = False
+class _ChatViewTokenizer:
+    """Tokenize one chat-completions history view, stage by stage.
 
-    def raw_render(
-        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    ``run`` executes the stages in their original order: render the messages,
+    derive canonical assistant/stop masks, splice in the authoritative sampled
+    prompt prefix, translate masks onto the final render, prove sampled message
+    bounds (marker render, then probes), try the exact projected length-stop
+    path, collect exact-token replacements per message and assemble the
+    ``TokenizedHistory``. Shared pipeline state lives on the instance; each
+    stage method reads what earlier stages produced.
+    """
+
+    def __init__(
+        self,
+        history: ChatCompletionsHistory,
+        *,
+        base_model: str | None,
+        tokenizer: Tokenizer | None,
+        chat_template: str | None,
+        chat_template_kwargs: Mapping[str, object] | None,
+        _projection_matches: bool | None = None,
+        _trace: _TraceBuilder | None = None,
+    ) -> None:
+        _validate_history_sources(history)
+        config = (
+            _TokenizerConfig(base_model or history.model or "")
+            if tokenizer is not None
+            or (base_model is not None and chat_template is not None)
+            else _tokenizer_config(history.model or "", base_model)
+        )
+        if tokenizer is None:
+            if not history.model and base_model is None:
+                raise ValueError("History tokenization requires a model or base_model")
+            tokenizer = _load_tokenizer(config)
+        assert tokenizer is not None
+        self.tokenizer = tokenizer
+        messages = [dict(message) for message in history.messages]
+        explicit_kwargs = {
+            **(config.chat_template_kwargs or {}),
+            **(history.chat_template_kwargs or {}),
+            **(chat_template_kwargs or {}),
+        }
+        last_exchange = _last_source_exchange(history.message_sources)
+        if isinstance(last_exchange, MessagesExchange) and isinstance(
+            thinking := last_exchange.request.get("thinking"), dict
+        ):
+            explicit_kwargs.setdefault(
+                "enable_thinking", thinking.get("type") == "enabled"
+            )
+            if budget := thinking.get("budget_tokens"):
+                explicit_kwargs.setdefault("thinking_budget", budget)
+        template = chat_template or history.chat_template or config.chat_template
+        if template is None:
+            tokenizer_template = getattr(self.tokenizer, "chat_template", None)
+            if isinstance(tokenizer_template, str):
+                template = tokenizer_template
+        template = chat_template_with_preserved_thinking(template)
+        kwargs = {
+            **default_chat_template_kwargs_for_template(template),
+            **explicit_kwargs,
+        }
+        _preserve_literal_thinking_off_content(history, messages, template, kwargs)
+        ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
+        segmented = False
+        self.history = history
+        self.chat_template = chat_template
+        self.chat_template_kwargs = chat_template_kwargs
+        self.projection_matches = _projection_matches
+        self.trace = _trace
+        self.messages = messages
+        self.template = template
+        self.kwargs = kwargs
+        self.ends_with_assistant = ends_with_assistant
+        self.segmented = segmented
+        self.prefix_render_cache = _PrefixChatRenderCache(self._render_normalized_text)
+        self.part_ids_cache: dict[str, list[int]] = {}
+        self.prompt_cache: dict[int, list[int] | None] = {}
+        self.output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
+
+    def run(self) -> TokenizedHistory:
+        self.rendered = self._raw_render(
+            self.messages, add_generation_prompt=not self.ends_with_assistant
+        )
+        if any(
+            message.get("role") == "assistant"
+            and isinstance(message.get("reasoning"), str)
+            and message["reasoning"]
+            and not message.get("reasoning_content")
+            for message in self.messages
+        ):
+            without_reasoning = deepcopy(self.messages)
+            for message in without_reasoning:
+                message.pop("reasoning", None)
+            if (
+                self._probe_render(
+                    without_reasoning,
+                    add_generation_prompt=not self.ends_with_assistant,
+                )
+                == self.rendered
+            ):
+                aliased_messages = deepcopy(self.messages)
+                for message in aliased_messages:
+                    reasoning = message.pop("reasoning", None)
+                    if isinstance(reasoning, str) and reasoning:
+                        message.setdefault("reasoning_content", reasoning)
+                aliased_render = self._probe_render(
+                    aliased_messages,
+                    add_generation_prompt=not self.ends_with_assistant,
+                )
+                if aliased_render is not None:
+                    self.messages = aliased_messages
+                    self.rendered = aliased_render
+        if any(
+            message.get("role") == "assistant"
+            and isinstance(message.get("refusal"), str)
+            and message["refusal"]
+            for message in self.messages
+        ):
+            without_refusals = deepcopy(self.messages)
+            for message in without_refusals:
+                message.pop("refusal", None)
+            if (
+                self._probe_render(
+                    without_refusals,
+                    add_generation_prompt=not self.ends_with_assistant,
+                )
+                == self.rendered
+            ):
+                merged_messages = deepcopy(self.messages)
+                for message in merged_messages:
+                    refusal = message.pop("refusal", None)
+                    if not isinstance(refusal, str) or not refusal:
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        message["content"] = content + refusal
+                    elif isinstance(content, list):
+                        message["content"] = [
+                            *content,
+                            {"type": "text", "text": refusal},
+                        ]
+                    elif content is None:
+                        message["content"] = refusal
+                    else:
+                        raise ValueError(
+                            "Cannot render an assistant refusal with this content shape"
+                        )
+                merged_render = self._probe_render(
+                    merged_messages,
+                    add_generation_prompt=not self.ends_with_assistant,
+                )
+                if merged_render is not None:
+                    self.messages = merged_messages
+                    self.rendered = merged_render
+        direct_render: list[int] = []
+        self.direct_bounds: list[tuple[int, int]] = []
+        for message in self.messages:
+            start = len(direct_render)
+            for _, text in _chat_message_parts(message):
+                direct_render.extend(self._part_ids(text))
+            self.direct_bounds.append((start, len(direct_render)))
+        if direct_render == self.rendered:
+            self.canonical_assistant_mask = [False] * len(self.rendered)
+            for message, (start, end) in zip(
+                self.messages, self.direct_bounds, strict=True
+            ):
+                if message.get("role") == "assistant":
+                    self.canonical_assistant_mask[start:end] = [True] * (end - start)
+        else:
+            self.direct_bounds = []
+            self.segmented = True
+            self.rendered, self.canonical_assistant_mask = self._segmented_render(
+                self.messages, add_generation_prompt=not self.ends_with_assistant
+            )
+        _materialize_missing_role_stop(
+            self.rendered, self.canonical_assistant_mask, self.messages, self.tokenizer
+        )
+        self.canonical_assistant_mask, self.canonical_stop_mask = _assistant_stop_masks(
+            self.rendered, self.canonical_assistant_mask, self.tokenizer
+        )
+        self.canonical_rendered = self.rendered
+        self.exact_prefix_length = 0
+        self.canonical_prefix_length = 0
+        if (
+            self.chat_template is None
+            and self.chat_template_kwargs is None
+            and self.projection_matches is True
+        ):
+            for message_index, (message, source) in enumerate(
+                zip(self.history.messages, self.history.message_sources, strict=True)
+            ):
+                if message.get("role") != "assistant" or source is None:
+                    continue
+                source_prompt = self._source_prompt_tokens(source)
+                if source_prompt and self._source_matches_context(source):
+                    rendered_prompt = self._probe_render(
+                        self.messages[:message_index], add_generation_prompt=True
+                    )
+                    if (
+                        rendered_prompt is not None
+                        and self.rendered[: len(rendered_prompt)] == rendered_prompt
+                    ):
+                        self.rendered = [
+                            *source_prompt,
+                            *self.rendered[len(rendered_prompt) :],
+                        ]
+                        self.exact_prefix_length = len(source_prompt)
+                        self.canonical_prefix_length = len(rendered_prompt)
+                        break
+
+        canonical_length_stop_mask = _synthetic_length_stop_mask(
+            self.messages,
+            self.history.message_sources,
+            self.canonical_assistant_mask,
+            self.canonical_stop_mask,
+        )
+        canonical_output_mask = _response_output_mask(
+            self.messages,
+            self.history.message_sources,
+            self.canonical_assistant_mask,
+            self.direct_bounds or None,
+        )
+        self.assistant_mask = _translate_token_mask(
+            self.canonical_rendered,
+            self.rendered,
+            self.canonical_assistant_mask,
+            tokenizer=self.tokenizer,
+        )
+        self.output_mask = _translate_token_mask(
+            self.canonical_rendered,
+            self.rendered,
+            canonical_output_mask,
+            tokenizer=self.tokenizer,
+        )
+        self.stop_mask = _translate_token_mask(
+            self.canonical_rendered, self.rendered, self.canonical_stop_mask
+        )
+        self.length_stop_mask = _translate_token_mask(
+            self.canonical_rendered, self.rendered, canonical_length_stop_mask
+        )
+        self.positions_by_first_token: dict[int, list[int]] = {}
+        for index, token_id in enumerate(self.rendered):
+            self.positions_by_first_token.setdefault(token_id, []).append(index)
+        self.locations_by_needle: dict[tuple[int, ...], list[tuple[int, int]]] = {}
+        self.replacements: list[
+            tuple[
+                int,
+                int,
+                list[int],
+                list[float],
+                bool,
+                _SampledSourceKey,
+                object,
+                int | None,
+            ]
+        ] = []
+        self.search_cursor = 0
+        self.sampled_texts = {
+            text
+            for message, source in zip(
+                self.messages, self.history.message_sources, strict=True
+            )
+            if message.get("role") == "assistant"
+            and source is not None
+            and _source_is_sampled(source)
+            for _, text in _chat_message_parts(message)
+        }
+        if self.rendered != self.canonical_rendered:
+            self.direct_bounds = []
+        self.marked_bounds: dict[int, tuple[int, int]] = {}
+        self.marked_part_bounds: dict[int, list[tuple[int, int]]] = {}
+        if not self.direct_bounds:
+            marked_messages = deepcopy(self.messages)
+            marker_prefix = f"ART_TRAJECTORY_{id(marked_messages):x}_"
+            markers: dict[str, tuple[int, int, Literal["start", "end"]]] = {}
+            part_counts: dict[int, int] = {}
+            part_whitespace: dict[tuple[int, int], tuple[str, str]] = {}
+            for message_index, (message, source) in enumerate(
+                zip(marked_messages, self.history.message_sources, strict=True)
+            ):
+                if (
+                    message.get("role") != "assistant"
+                    or source is None
+                    or not _source_is_sampled(source)
+                ):
+                    continue
+                slot_groups = _chat_message_text_slot_groups(message)
+                if not slot_groups:
+                    continue
+                part_counts[message_index] = len(slot_groups)
+                for part_index, slots in enumerate(slot_groups):
+                    start = f"{marker_prefix}{message_index}_{part_index}_START"
+                    end = f"{marker_prefix}{message_index}_{part_index}_END"
+                    first, first_key = slots[0]
+                    last, last_key = slots[-1]
+                    first_text = str(first[first_key])
+                    last_text = str(last[last_key])
+                    leading = first_text[: len(first_text) - len(first_text.lstrip())]
+                    trailing = last_text[len(last_text.rstrip()) :]
+                    whitespace_only = (
+                        first is last
+                        and first_key == last_key
+                        and not first_text.strip()
+                    )
+                    if whitespace_only:
+                        trailing = ""
+                    if first is last and first_key == last_key:
+                        core = first_text[
+                            len(leading) : len(first_text) - len(trailing)
+                            if trailing
+                            else len(first_text)
+                        ]
+                        first[first_key] = leading + start + core + end + trailing
+                    else:
+                        first[first_key] = leading + start + first_text[len(leading) :]
+                        last[last_key] = (
+                            last_text[: len(last_text) - len(trailing)] + end + trailing
+                        )
+                    part_whitespace[(message_index, part_index)] = (
+                        ("", "") if whitespace_only else (leading, trailing)
+                    )
+                    markers[start] = (message_index, part_index, "start")
+                    markers[end] = (message_index, part_index, "end")
+            if markers:
+                try:
+                    marked_text = self.tokenizer.apply_chat_template(
+                        normalize_tool_call_arguments_for_chat_template(
+                            marked_messages, self.template
+                        ),
+                        tools=self.history.tools,
+                        tokenize=False,
+                        add_generation_prompt=not self.ends_with_assistant,
+                        **(
+                            {"chat_template": self.template}
+                            if self.template is not None
+                            else {}
+                        ),
+                        **self.kwargs,
+                    )
+                except Exception:
+                    marked_text = None
+                if isinstance(marked_text, str):
+                    marker_pattern = re.compile(
+                        rf"{re.escape(marker_prefix)}\d+_\d+_(?:START|END)"
+                    )
+                    matches = list(marker_pattern.finditer(marked_text))
+                    found_markers = [match.group(0) for match in matches]
+                else:
+                    matches = []
+                    found_markers = []
+                if (
+                    isinstance(marked_text, str)
+                    and len(found_markers) == len(markers)
+                    and set(found_markers) == set(markers)
+                ):
+                    unmarked_parts: list[str] = []
+                    char_bounds: dict[tuple[int, int], list[int]] = {}
+                    source_cursor = 0
+                    target_cursor = 0
+                    for match in matches:
+                        position = match.start()
+                        marker = match.group(0)
+                        message_index, part_index, boundary = markers[marker]
+                        chunk = marked_text[source_cursor:position]
+                        unmarked_parts.append(chunk)
+                        target_cursor += len(chunk)
+                        char_bounds.setdefault((message_index, part_index), [0, 0])[
+                            0 if boundary == "start" else 1
+                        ] = target_cursor
+                        source_cursor = match.end()
+                    unmarked_parts.append(marked_text[source_cursor:])
+                    unmarked_text = "".join(unmarked_parts)
+                    for key, bounds in char_bounds.items():
+                        leading, trailing = part_whitespace[key]
+                        if (
+                            leading
+                            and unmarked_text[
+                                max(0, bounds[0] - len(leading)) : bounds[0]
+                            ]
+                            == leading
+                        ):
+                            bounds[0] -= len(leading)
+                        if (
+                            trailing
+                            and unmarked_text[bounds[1] : bounds[1] + len(trailing)]
+                            == trailing
+                        ):
+                            bounds[1] += len(trailing)
+                    try:
+                        encoded = cast(_OffsetTokenizer, self.tokenizer)(
+                            unmarked_text,
+                            add_special_tokens=False,
+                            return_offsets_mapping=True,
+                        )
+                    except Exception:
+                        encoded = None
+                    encoded_data = _string_dict(encoded)
+                    raw_offsets = (
+                        encoded_data.get("offset_mapping")
+                        if encoded_data is not None
+                        else None
+                    )
+                    encoded_ids = _ids(encoded) if encoded is not None else []
+                    if (
+                        encoded is not None
+                        and (
+                            encoded_ids == self.canonical_rendered
+                            or (
+                                self.exact_prefix_length
+                                and len(encoded_ids) == len(self.canonical_rendered)
+                                and encoded_ids[self.canonical_prefix_length :]
+                                == self.canonical_rendered[
+                                    self.canonical_prefix_length :
+                                ]
+                            )
+                        )
+                        and isinstance(raw_offsets, list)
+                        and len(raw_offsets) == len(encoded_ids)
+                    ):
+                        offsets: list[tuple[int, int]] = []
+                        for value in raw_offsets:
+                            if (
+                                not isinstance(value, (list, tuple))
+                                or len(value) != 2
+                                or not all(isinstance(item, int) for item in value)
+                            ):
+                                break
+                            offsets.append((value[0], value[1]))
+                        if len(offsets) == len(encoded_ids):
+                            token_bounds: dict[tuple[int, int], tuple[int, int]] = {}
+                            token_cursor = 0
+                            for key, (char_start, char_end) in sorted(
+                                char_bounds.items(), key=lambda item: item[1]
+                            ):
+                                while (
+                                    token_cursor < len(offsets)
+                                    and offsets[token_cursor][1] <= char_start
+                                ):
+                                    token_cursor += 1
+                                token_end = token_cursor
+                                while (
+                                    token_end < len(offsets)
+                                    and offsets[token_end][0] < char_end
+                                ):
+                                    token_end += 1
+                                if char_start == char_end:
+                                    token_bounds[key] = (token_cursor, token_cursor)
+                                elif (
+                                    token_end > token_cursor
+                                    and offsets[token_cursor][0] >= char_start
+                                    and offsets[token_end - 1][1] <= char_end
+                                ):
+                                    token_bounds[key] = (token_cursor, token_end)
+                                token_cursor = token_end
+                            for message_index, part_count in part_counts.items():
+                                bounds = [
+                                    token_bounds[(message_index, part_index)]
+                                    for part_index in range(part_count)
+                                    if (message_index, part_index) in token_bounds
+                                ]
+                                if len(bounds) == part_count:
+                                    rendered_bounds = [
+                                        self._canonical_span_to_rendered(*bound)
+                                        for bound in bounds
+                                    ]
+                                    if any(bound is None for bound in rendered_bounds):
+                                        continue
+                                    translated = cast(
+                                        list[tuple[int, int]], rendered_bounds
+                                    )
+                                    self.marked_part_bounds[message_index] = translated
+                                    self.marked_bounds[message_index] = (
+                                        translated[0][0],
+                                        translated[-1][1],
+                                    )
+            for message_index, bounds in list(self.marked_part_bounds.items()):
+                whitespace_parts = [
+                    (part_index, text)
+                    for part_index, (_, text) in enumerate(
+                        _chat_message_parts(self.messages[message_index])
+                    )
+                    if text and not text.strip()
+                ]
+                for part_index, _ in whitespace_parts:
+                    empty_messages = deepcopy(self.messages)
+                    groups = _chat_message_text_slot_groups(
+                        empty_messages[message_index]
+                    )
+                    if part_index >= len(groups):
+                        self.marked_bounds.pop(message_index, None)
+                        self.marked_part_bounds.pop(message_index, None)
+                        break
+                    for container, key in groups[part_index]:
+                        container[key] = ""
+                    try:
+                        empty_render = self._render(
+                            empty_messages,
+                            add_generation_prompt=not self.ends_with_assistant,
+                        )
+                    except Exception:
+                        self.marked_bounds.pop(message_index, None)
+                        self.marked_part_bounds.pop(message_index, None)
+                        break
+                    empty_render = self._canonical_render_to_rendered(empty_render)
+                    if empty_render is None:
+                        self.marked_bounds.pop(message_index, None)
+                        self.marked_part_bounds.pop(message_index, None)
+                        break
+                    if empty_render == self.rendered:
+                        continue
+                    anchor = bounds[part_index][0]
+                    start = anchor - (len(self.rendered) - len(empty_render))
+                    span = (start, anchor)
+                    if (
+                        start < 0
+                        or self.rendered[: span[0]] + self.rendered[span[1] :]
+                        != empty_render
+                    ):
+                        self.marked_bounds.pop(message_index, None)
+                        self.marked_part_bounds.pop(message_index, None)
+                        break
+                    bounds[part_index] = span
+                    self.marked_bounds[message_index] = (bounds[0][0], bounds[-1][1])
+
+        self.probed_bounds: dict[int, tuple[int, int]] = {}
+        if not self.direct_bounds:
+            for message_index, (message, source) in enumerate(
+                zip(self.messages, self.history.message_sources, strict=True)
+            ):
+                if (
+                    message_index in self.marked_bounds
+                    or message.get("role") != "assistant"
+                    or source is None
+                    or not _source_is_sampled(source)
+                ):
+                    continue
+                parts = _chat_message_parts(message)
+                if not parts:
+                    exact_output, _ = self._source_output_tokens(source)
+                    if exact_output:
+                        try:
+                            prefix = self._render(
+                                self.messages[:message_index],
+                                add_generation_prompt=True,
+                            )
+                            completed = self._render(
+                                self.messages[: message_index + 1],
+                                add_generation_prompt=False,
+                            )
+                        except Exception:
+                            continue
+                        rendered_prefix = self._canonical_render_to_rendered(prefix)
+                        rendered_completed = self._canonical_render_to_rendered(
+                            completed
+                        )
+                        if (
+                            completed[: len(prefix)] == prefix
+                            and rendered_prefix is not None
+                            and rendered_completed is not None
+                            and self.rendered[: len(rendered_completed)]
+                            == rendered_completed
+                        ):
+                            self.probed_bounds[message_index] = (
+                                len(rendered_prefix),
+                                len(rendered_prefix),
+                            )
+                    continue
+                if any(part == "tool_call" for part, _ in parts):
+                    probe_messages = deepcopy(self.messages)
+                    for part_index, slots in enumerate(
+                        _chat_message_text_slot_groups(probe_messages[message_index])
+                    ):
+                        for slot_index, (container, key) in enumerate(slots):
+                            original = str(container[key])
+                            leading = original[: len(original) - len(original.lstrip())]
+                            trailing = original[len(original.rstrip()) :]
+                            marker = (
+                                f"art_trajectory_probe_{id(probe_messages):x}_"
+                                f"{part_index}_{slot_index}"
+                            )
+                            replacement = (
+                                json.dumps({marker: True})
+                                if key == "arguments"
+                                else marker
+                            )
+                            container[key] = leading + replacement + trailing
+                    probe = self._probe_render(
+                        probe_messages,
+                        add_generation_prompt=not self.ends_with_assistant,
+                    )
+                    if probe is not None and (span := self._differing_span(probe)):
+                        self.probed_bounds[message_index] = span
+                        continue
+                if len(parts) == 1:
+                    try:
+                        prefix = self._render(
+                            self.messages[:message_index], add_generation_prompt=True
+                        )
+                    except Exception:
+                        prefix = []
+                    local = self._part_ids(parts[0][1])
+                    rendered_prefix = self._canonical_render_to_rendered(prefix)
+                    if rendered_prefix is not None and self.rendered == [
+                        *rendered_prefix,
+                        *local,
+                    ]:
+                        self.probed_bounds[message_index] = (
+                            len(rendered_prefix),
+                            len(self.rendered),
+                        )
+                        continue
+                    try:
+                        completed = self._render(
+                            self.messages[: message_index + 1],
+                            add_generation_prompt=False,
+                        )
+                    except Exception:
+                        completed = []
+                    rendered_completed = self._canonical_render_to_rendered(completed)
+                    if (
+                        completed == [*prefix, *local]
+                        and rendered_prefix is not None
+                        and rendered_completed is not None
+                        and self.rendered[: len(rendered_completed)]
+                        == rendered_completed
+                    ):
+                        self.probed_bounds[message_index] = (
+                            len(rendered_prefix),
+                            len(rendered_completed),
+                        )
+                        continue
+                probe_messages = deepcopy(self.messages)
+                slot_groups = _chat_message_text_slot_groups(
+                    probe_messages[message_index]
+                )
+                if not slot_groups:
+                    continue
+                for part_index, slots in enumerate(slot_groups):
+                    for slot_index, (container, key) in enumerate(slots):
+                        original = str(container[key])
+                        leading = original[: len(original) - len(original.lstrip())]
+                        trailing = original[len(original.rstrip()) :]
+                        container[key] = (
+                            leading + f"ART_TRAJECTORY_{id(probe_messages):x}_"
+                            f"PROBE_{part_index}_{slot_index}" + trailing
+                        )
+                try:
+                    probe = self._render(
+                        probe_messages,
+                        add_generation_prompt=not self.ends_with_assistant,
+                    )
+                except Exception:
+                    continue
+                if span := self._differing_span(probe):
+                    self.probed_bounds[message_index] = span
+        if (
+            self.projection_matches is True
+            and self.chat_template is None
+            and self.chat_template_kwargs is None
+        ):
+            sampled_message_indices: list[int] = []
+            seen_signatures: set[tuple[object, ...]] = set()
+            for message_index, (message, source) in enumerate(
+                zip(self.messages, self.history.message_sources, strict=True)
+            ):
+                signature = _source_signature(source)
+                if (
+                    message.get("role") == "assistant"
+                    and source is not None
+                    and signature is not None
+                    and signature not in seen_signatures
+                    and _source_is_sampled(source)
+                ):
+                    seen_signatures.add(signature)
+                    sampled_message_indices.append(message_index)
+            length_stop_boundaries: dict[
+                _SampledSourceKey, _RenderedLengthStopBoundary
+            ] = {}
+            rendered_length_stops = [
+                index
+                for index, selected in enumerate(self.length_stop_mask)
+                if selected
+            ]
+            length_stop_count = 0
+            length_stop_boundaries_complete = True
+            for position, message_index in enumerate(sampled_message_indices):
+                source = self.history.message_sources[message_index]
+                assert source is not None
+                source_key = _sampled_source_key(source)
+                stop_reason = _source_stop_evidence(source, source_key)[0]
+                output = _source_output_tokens(source, source_key)
+                synthetic_stop = (
+                    stop_reason == "stop"
+                    and bool(_terminator_ids(self.tokenizer))
+                    and output is not None
+                    and not _sampled_stop_suffix(
+                        output,
+                        source=source,
+                        source_key=source_key,
+                        tokenizer=self.tokenizer,
+                    )
+                )
+                if synthetic_stop and position + 1 < len(sampled_message_indices):
+                    length_stop_boundaries_complete = False
+                    break
+                if stop_reason != "length" and not synthetic_stop:
+                    continue
+                length_stop_count += stop_reason == "length"
+                bounds = (
+                    self.direct_bounds[message_index]
+                    if self.direct_bounds
+                    else self.marked_bounds.get(message_index)
+                    or self.probed_bounds.get(message_index)
+                )
+                if synthetic_stop and bounds is not None:
+                    # Tool part bounds can omit sampled closing markup. Prove the
+                    # complete sampled prefix before appending only its remainder.
+                    assert output is not None
+                    rendered_start = bounds[0]
+                    while rendered_start and self.assistant_mask[rendered_start - 1]:
+                        rendered_start -= 1
+                    bounds = _prove_exact_length_stopped_assistant_prefix(
+                        self._locations(output, rendered_start),
+                        self.assistant_mask,
+                        expected_start=rendered_start,
+                    )
+                if position + 1 < len(
+                    sampled_message_indices
+                ) and self._source_matches_context(source):
+                    prompt = self._source_prompt_tokens(source)
+                    output, _ = self._source_output_tokens(source)
+                    if (
+                        prompt is not None
+                        and output
+                        and length_stop_count <= len(rendered_length_stops)
+                    ):
+                        rendered_end = rendered_length_stops[length_stop_count - 1] + 1
+                        rendered_start = rendered_end - 1
+                        while (
+                            rendered_start and self.assistant_mask[rendered_start - 1]
+                        ):
+                            rendered_start -= 1
+                        exact_bounds = _prove_exact_length_stopped_assistant_prefix(
+                            [
+                                match
+                                for match in self._locations(output, rendered_start)
+                                if match[1] <= rendered_end
+                            ],
+                            self.assistant_mask,
+                            expected_start=rendered_start,
+                        )
+                        bounds = exact_bounds or bounds
+                next_prompt_end: int | None
+                if position + 1 < len(sampled_message_indices):
+                    next_message_index = sampled_message_indices[position + 1]
+                    next_bounds = (
+                        self.direct_bounds[next_message_index]
+                        if self.direct_bounds
+                        else self.marked_bounds.get(next_message_index)
+                        or self.probed_bounds.get(next_message_index)
+                    )
+                    # Part bounds can start after sampled tool-call markup; the
+                    # next generation boundary is the assistant span's start.
+                    next_prompt_end = (
+                        _next_assistant_span_start(self.assistant_mask, after=bounds[1])
+                        if bounds is not None
+                        else next_bounds[0]
+                        if next_bounds is not None
+                        else None
+                    )
+                else:
+                    next_prompt_end = len(self.rendered)
+                boundary = (
+                    _rendered_length_stop_boundary(
+                        self.rendered,
+                        self.assistant_mask,
+                        self.stop_mask,
+                        content_end=bounds[1],
+                        next_prompt_end=next_prompt_end,
+                    )
+                    if (
+                        bounds is not None
+                        and self._source_matches_context(source)
+                        and next_prompt_end is not None
+                    )
+                    else None
+                )
+                if boundary is None:
+                    if synthetic_stop or position + 1 < len(sampled_message_indices):
+                        length_stop_boundaries_complete = False
+                        break
+                    # A terminal length stop needs no renderer-owned tail: the
+                    # authoritative prompt and sampled output already describe the
+                    # complete trainable sequence. A later turn is required only
+                    # to prove a nonterminal synthetic boundary.
+                    continue
+                length_stop_boundaries[source_key] = boundary
+            if (
+                length_stop_count
+                and length_stop_boundaries_complete
+                and (
+                    exact := _tokenize_exact_projected_chat_history(
+                        self.history,
+                        tokenizer=self.tokenizer,
+                        length_stop_boundaries=length_stop_boundaries,
+                        projection_validated=True,
+                        _trace=self.trace,
+                    )
+                )
+            ):
+                return exact
+        sampled_message_count = sum(
+            message.get("role") == "assistant"
+            and source is not None
+            and _source_is_sampled(source)
+            for message, source in zip(
+                self.messages, self.history.message_sources, strict=True
+            )
+        )
+        for message_index, (message, source) in enumerate(
+            zip(self.messages, self.history.message_sources, strict=True)
+        ):
+            parts = _chat_message_parts(message)
+            sampled = (
+                message.get("role") == "assistant"
+                and source is not None
+                and _source_is_sampled(source)
+            )
+            full_exact, full_logprobs = (
+                self._source_output_tokens(source) if sampled else (None, [])
+            )
+            if sampled and not parts and not full_exact:
+                continue
+            complete_sampled_message = (
+                sampled
+                and source is not None
+                and _source_covers_complete_sampled_message(
+                    self.history.messages[message_index], source
+                )
+            )
+            authoritative_prompt = (
+                self._source_prompt_tokens(source)
+                if sampled and source is not None
+                else None
+            )
+            initial_proven_bounds = self.marked_bounds.get(
+                message_index
+            ) or self.probed_bounds.get(message_index)
+            exact_output_matches: list[tuple[int, int]] | None = None
+            exact_output_span: tuple[int, int] | None = None
+            corrected_message_end: int | None = None
+            if (
+                complete_sampled_message
+                and source is not None
+                and full_exact
+                and self.projection_matches is True
+                and self.chat_template is None
+                and self.chat_template_kwargs is None
+                and self._source_matches_context(source)
+                and _source_stop_evidence(source, _sampled_source_key(source))[0]
+                != "length"
+            ):
+                exact_output_matches = self._locations(full_exact, self.search_cursor)
+                if authoritative_prompt is not None:
+                    exact_output_span = _prove_exact_sampled_assistant_span(
+                        exact_output_matches,
+                        self.assistant_mask,
+                        after=self.search_cursor,
+                        expected_start=len(authoritative_prompt),
+                    )
+            if (
+                complete_sampled_message
+                and full_exact is not None
+                and exact_output_span is None
+                and message_index in self.marked_bounds
+                and isinstance(
+                    getattr(source, "exchange", None), ChatCompletionsExchange
+                )
+                and self.marked_bounds[message_index][1]
+                - self.marked_bounds[message_index][0]
+                != len(full_exact)
+            ):
+                try:
+                    prefix = self._render(
+                        self.messages[:message_index], add_generation_prompt=True
+                    )
+                    completed = self._render(
+                        self.messages[: message_index + 1], add_generation_prompt=False
+                    )
+                except Exception:
+                    self.marked_bounds.pop(message_index, None)
+                    self.marked_part_bounds.pop(message_index, None)
+                    prefix = completed = None
+
+                rendered_prefix = (
+                    self._canonical_render_to_rendered(prefix)
+                    if prefix is not None
+                    else None
+                )
+                rendered_completed = (
+                    self._canonical_render_to_rendered(completed)
+                    if completed is not None
+                    else None
+                )
+                corrected_bounds = (
+                    self._canonical_span_to_rendered(len(prefix), len(completed))
+                    if prefix is not None and completed is not None
+                    else None
+                )
+                if (
+                    prefix is not None
+                    and completed is not None
+                    and rendered_prefix is not None
+                    and rendered_completed is not None
+                    and corrected_bounds is not None
+                    and self.rendered[: len(rendered_prefix)] == rendered_prefix
+                    and self.rendered[: len(rendered_completed)] == rendered_completed
+                ):
+                    self.marked_bounds[message_index] = corrected_bounds
+                    corrected_message_end = corrected_bounds[1]
+                    if any(
+                        not corrected_bounds[0] <= start <= end <= corrected_bounds[1]
+                        for start, end in self.marked_part_bounds.get(message_index, ())
+                    ):
+                        self.marked_part_bounds.pop(message_index, None)
+                else:
+                    self.marked_bounds.pop(message_index, None)
+                    self.marked_part_bounds.pop(message_index, None)
+            proven_bounds = (
+                self.marked_bounds.get(message_index)
+                or self.probed_bounds.get(message_index)
+                or initial_proven_bounds
+            )
+            if (
+                exact_output_span is None
+                and exact_output_matches is not None
+                and proven_bounds is not None
+            ):
+                exact_output_span = _prove_exact_sampled_assistant_span(
+                    exact_output_matches,
+                    self.assistant_mask,
+                    after=self.search_cursor,
+                    expected_start=proven_bounds[0],
+                )
+            source_boundary = False
+            generation_start: int | None = None
+            sampled_bounds: tuple[int, int] | None = None
+            content_bounds_proven = False
+            if sampled:
+                if exact_output_span is not None:
+                    sampled_bounds = exact_output_span
+                    content_bounds_proven = True
+                elif self.direct_bounds:
+                    sampled_bounds = self.direct_bounds[message_index]
+                    content_bounds_proven = True
+                elif message_index in self.marked_bounds:
+                    sampled_bounds = self.marked_bounds[message_index]
+                    content_bounds_proven = True
+                elif message_index in self.probed_bounds:
+                    sampled_bounds = self.probed_bounds[message_index]
+                    content_bounds_proven = True
+                else:
+                    assert source is not None
+                    source_prompt = self._source_prompt_tokens(source)
+                    source_context_matches = self._source_matches_context(source)
+                    if (
+                        source_context_matches
+                        and source_prompt
+                        and self.rendered[: len(source_prompt)] == source_prompt
+                    ):
+                        self.search_cursor = max(self.search_cursor, len(source_prompt))
+                        source_boundary = True
+                        generation_start = len(source_prompt)
+                        sampled_bounds = (generation_start, len(self.rendered))
+                    elif sampled_message_count == 1:
+                        prompt_render = self._probe_render(
+                            self.messages[:message_index], add_generation_prompt=True
+                        )
+                        rendered_prompt = (
+                            self._canonical_render_to_rendered(prompt_render)
+                            if prompt_render is not None
+                            else None
+                        )
+                        if (
+                            rendered_prompt is None
+                            or self.rendered[: len(rendered_prompt)] != rendered_prompt
+                        ):
+                            raise ValueError(
+                                "Could not locate a sampled history message in the "
+                                "rendered history"
+                            )
+                        generation_start = len(rendered_prompt)
+                        sampled_bounds = (generation_start, len(self.rendered))
+                    else:
+                        raise ValueError(
+                            "Could not prove a sampled history message boundary with this "
+                            "tokenizer"
+                        )
+            if content_bounds_proven:
+                assert sampled_bounds is not None
+                # Proven message bounds outrank approximate matches in earlier context.
+                self.search_cursor = sampled_bounds[0]
+            full_matches = (
+                self._locations(full_exact, self.search_cursor)
+                if sampled and full_exact
+                else []
+            )
+            first_part_matches = (
+                self._locations(self._part_ids(parts[0][1]), self.search_cursor)
+                if parts
+                else []
+            )
+            if sampled_bounds is not None:
+                lower, upper = sampled_bounds
+                full_matches = [
+                    match
+                    for match in full_matches
+                    if match[0] >= lower and match[1] <= upper
+                ]
+                first_part_matches = [
+                    match
+                    for match in first_part_matches
+                    if match[0] >= lower and match[1] <= upper
+                ]
+            if (
+                full_exact is not None
+                and full_matches
+                and (
+                    (source_boundary and full_matches[0][0] == self.search_cursor)
+                    or exact_output_span is not None
+                    or (
+                        complete_sampled_message
+                        and len(full_matches) == 1
+                        and first_part_matches
+                        and full_matches[0][0] == first_part_matches[0][0]
+                    )
+                )
+            ):
+                span = full_matches[0]
+                start, end = span
+                self.replacements.append(
+                    (
+                        start,
+                        end,
+                        full_exact,
+                        full_logprobs
+                        if len(full_logprobs) == len(full_exact)
+                        else [math.nan] * len(full_exact),
+                        True,
+                        _sampled_source_key(source),
+                        source,
+                        None,
+                    )
+                )
+                self.search_cursor = end
+                continue
+
+            source_exchange = getattr(source, "exchange", None)
+            multi_generation_response = (
+                isinstance(source_exchange, ResponsesExchange)
+                and len(_response_generations(source_exchange.response)) > 1
+            )
+            if sampled and not content_bounds_proven:
+                raise ValueError(
+                    "Could not uniquely locate or prove the sampled content boundary "
+                    f"for history message {message_index} with this tokenizer"
+                )
+            if (
+                sampled
+                and full_exact is None
+                and message_index in self.probed_bounds
+                and parts
+                and any(part == "tool_call" for part, _ in parts)
+            ):
+                assert source is not None and sampled_bounds is not None
+                start, end = sampled_bounds
+                self.replacements.append(
+                    (
+                        start,
+                        end,
+                        self.rendered[start:end],
+                        [math.nan] * (end - start),
+                        False,
+                        _sampled_source_key(source),
+                        source,
+                        None,
+                    )
+                )
+                self.search_cursor = end
+                continue
+            if (
+                complete_sampled_message
+                and full_exact is not None
+                and (
+                    multi_generation_response
+                    or len(parts) != 1
+                    or len(full_exact) != len(self._part_ids(parts[0][1]))
+                )
+            ):
+                if not parts and sampled_bounds is not None:
+                    start = end = sampled_bounds[0]
+                elif sampled_bounds is None:
+                    raise ValueError(
+                        "Could not locate a complete sampled message in the rendered history"
+                    )
+                elif sampled_bounds[0] == sampled_bounds[1]:
+                    if not content_bounds_proven:
+                        raise ValueError(
+                            "Could not locate a complete sampled message in the rendered "
+                            "history"
+                        )
+                    start = end = sampled_bounds[0]
+                else:
+                    start, end = sampled_bounds
+                if parts and len(parts) == 1 and parts[0][0] == "content":
+                    visible_matches = [
+                        match
+                        for match in self._locations(self._part_ids(parts[0][1]), start)
+                        if match[1] <= end
+                    ]
+                    if len(visible_matches) != 1 or (
+                        not content_bounds_proven
+                        and generation_start is not None
+                        and visible_matches[0][0] != generation_start
+                    ):
+                        raise ValueError(
+                            "Could not prove the sampled content boundary in the "
+                            "rendered history"
+                        )
+                    start, end = visible_matches[0]
+                elif generation_start is not None and (
+                    multi_generation_response
+                    or len(parts) != 1
+                    or parts[0][0] != "content"
+                ):
+                    start = generation_start
+                if _sampled_stop_suffix(
+                    full_exact,
+                    source=source,
+                    source_key=_sampled_source_key(source),
+                    tokenizer=self.tokenizer,
+                ):
+                    # Adjacent assistants can share a role mask. Prove this message's
+                    # end before replacing its rendered closing markup and stop.
+                    completed = self._probe_render(
+                        self.messages[: message_index + 1], add_generation_prompt=False
+                    )
+                    rendered_completed = (
+                        self._canonical_render_to_rendered(completed)
+                        if completed is not None
+                        else None
+                    )
+                    if (
+                        rendered_completed is not None
+                        and self.rendered[: len(rendered_completed)]
+                        == rendered_completed
+                    ):
+                        tail_mask, tail_stops = _assistant_stop_masks(
+                            rendered_completed,
+                            self.assistant_mask[: len(rendered_completed)],
+                            self.tokenizer,
+                        )
+                        tail_end = end
+                        while tail_end < len(tail_mask) and tail_mask[tail_end]:
+                            tail_end += 1
+                        if tail_end > end and tail_stops[tail_end - 1]:
+                            end = tail_end
+                self.replacements.append(
+                    (
+                        start,
+                        end,
+                        full_exact,
+                        full_logprobs
+                        if len(full_logprobs) == len(full_exact)
+                        else [math.nan] * len(full_exact),
+                        True,
+                        _sampled_source_key(source),
+                        source,
+                        None,
+                    )
+                )
+                if (
+                    message_index < len(self.messages) - 1
+                    and isinstance(source_exchange, ChatCompletionsExchange)
+                    and self.rendered[start:end] != full_exact
+                ):
+                    _warn_prefix_retokenization()
+                self.search_cursor = end
+                continue
+
+            replacement_start = len(self.replacements)
+            for part_index, (part, text) in enumerate(parts):
+                if not sampled and text not in self.sampled_texts:
+                    continue
+                local = self._part_ids(text)
+                if not local:
+                    continue
+                proven_part_bounds = self.marked_part_bounds.get(message_index)
+                span = (
+                    proven_part_bounds[part_index]
+                    if proven_part_bounds is not None
+                    else next(iter(self._locations(local, self.search_cursor)), None)
+                )
+                if span is None:
+                    if not sampled:
+                        continue
+                    raise ValueError(
+                        "Could not locate a history message in the rendered history"
+                    )
+                if sampled_bounds is not None:
+                    lower, upper = sampled_bounds
+                    if proven_part_bounds is None:
+                        bounded_matches = [
+                            match
+                            for match in self._locations(
+                                local, max(lower, self.search_cursor)
+                            )
+                            if match[1] <= upper
+                        ]
+                        if len(bounded_matches) != 1:
+                            raise ValueError(
+                                "Could not uniquely locate a sampled history message in "
+                                "the rendered history"
+                            )
+                        span = bounded_matches[0]
+                start, end = span
+                self.search_cursor = end
+                if not sampled:
+                    continue
+                assert source is not None
+                exact, logprobs = _chat_source_tokens(
+                    source,
+                    text,
+                    part=part,
+                    full_tokens=(full_exact, full_logprobs),
+                )
+                if (
+                    exact is None
+                    and corrected_message_end is not None
+                    and proven_part_bounds is not None
+                ):
+                    raise ValueError(
+                        "Could not preserve exact sampled tokens for a corrected history part"
+                    )
+                if (
+                    exact is not None
+                    and corrected_message_end is not None
+                    and proven_part_bounds is not None
+                    and sampled_bounds is not None
+                    and start != sampled_bounds[0]
+                ):
+                    raise ValueError("Could not prove the complete sampled part start")
+                if (
+                    exact is not None
+                    and self.rendered[start : start + len(exact)] == exact
+                ):
+                    end = start + len(exact)
+                    if (
+                        corrected_message_end is not None
+                        and end > corrected_message_end
+                    ):
+                        raise ValueError(
+                            "Exact sampled tokens extend beyond their proven message bounds"
+                        )
+                    self.search_cursor = end
+                elif (
+                    exact is not None
+                    and corrected_message_end is not None
+                    and _sampled_stop_suffix(
+                        exact,
+                        source=source,
+                        source_key=_sampled_source_key(source),
+                        tokenizer=self.tokenizer,
+                    )
+                ):
+                    # Use the proven message end to replace its rendered stop,
+                    # just as the whole-message path does for sampled stops.
+                    tail_mask, tail_stops = _assistant_stop_masks(
+                        self.rendered[:corrected_message_end],
+                        self.assistant_mask[:corrected_message_end],
+                        self.tokenizer,
+                    )
+                    tail_end = end
+                    while tail_end < len(tail_mask) and tail_mask[tail_end]:
+                        tail_end += 1
+                    if tail_end > end and tail_stops[tail_end - 1]:
+                        end = tail_end
+                        self.search_cursor = end
+                if (
+                    exact is not None
+                    and corrected_message_end is not None
+                    and _source_stop_evidence(source, _sampled_source_key(source))[0]
+                    != "length"
+                ):
+                    # Source evidence assigns STOP; retain synthetic length boundaries.
+                    self.stop_mask[start:end] = [False] * (end - start)
+                replacement = exact if exact is not None else self.rendered[start:end]
+                if exact is None and not logprobs:
+                    exchange = getattr(source, "exchange", None)
+                    if isinstance(
+                        exchange,
+                        (ChatCompletionsExchange, ResponsesExchange, MessagesExchange),
+                    ):
+                        evidence = _visible_token_evidence(
+                            self.tokenizer,
+                            exchange,
+                            source=source,
+                            sampled_text=text,
+                        )
+                        if evidence is not None:
+                            replacement, logprobs = evidence
+                        else:
+                            logprobs = (
+                                _align_visible_logprobs(
+                                    self.tokenizer,
+                                    replacement,
+                                    exchange,
+                                    source=source,
+                                    sampled_text=text,
+                                )
+                                or []
+                            )
+                self.replacements.append(
+                    (
+                        start,
+                        end,
+                        replacement,
+                        logprobs
+                        if len(logprobs) == len(replacement)
+                        else [math.nan] * len(replacement),
+                        exact is not None,
+                        _sampled_source_key(source),
+                        source,
+                        span[1]
+                        if corrected_message_end is not None
+                        and proven_part_bounds is not None
+                        else None,
+                    )
+                )
+            message_replacements = self.replacements[replacement_start:]
+            if (
+                sampled
+                and message_replacements
+                and all(part == "tool_call" for part, _ in parts)
+                and not (
+                    all(replacement[4] for replacement in message_replacements)
+                    and all(
+                        left[1] == right[0]
+                        for left, right in zip(
+                            message_replacements,
+                            message_replacements[1:],
+                            strict=False,
+                        )
+                    )
+                )
+            ):
+                start = message_replacements[0][0]
+                end = message_replacements[-1][1]
+                del self.replacements[replacement_start:]
+                self.replacements.append(
+                    (
+                        start,
+                        end,
+                        self.rendered[start:end],
+                        [math.nan] * (end - start),
+                        False,
+                        message_replacements[0][5],
+                        message_replacements[0][6],
+                        None,
+                    )
+                )
+            if sampled and not parts and full_exact is not None:
+                raise ValueError(
+                    "Could not locate exact sampled output in the rendered history"
+                )
+        token_ids: list[int] = []
+        logprobs: list[float] = []
+        flags: list[TokenFlag] = []
+        source_keys: list[_SampledSourceKey | None] = []
+        sources: dict[_SampledSourceKey, object] = {}
+        cursor = 0
+        for (
+            start,
+            end,
+            replacement,
+            replacement_logprobs,
+            exact,
+            source_key,
+            source,
+            part_end,
+        ) in sorted(self.replacements, key=lambda item: (item[0], item[1])):
+            synthetic_stop_token: int | None = None
+            if exact and _source_stop_evidence(source, source_key)[0] == "length":
+                synthetic_stop = next(
+                    (index for index in range(start, end) if self.stop_mask[index]),
+                    None,
+                )
+                if synthetic_stop is not None:
+                    if part_end is not None and synthetic_stop + 1 < part_end:
+                        if end < part_end:
+                            raise ValueError(
+                                "Exact sampled tokens do not cover the proven history part"
+                            )
+                        # Keep the boundary without replaying replaced visible content.
+                        synthetic_stop_token = self.rendered[synthetic_stop]
+                        end = part_end
+                    else:
+                        end = synthetic_stop
+            if start < cursor:
+                raise ValueError("Rendered assistant source spans overlap")
+            token_ids.extend(self.rendered[cursor:start])
+            logprobs.extend([math.nan] * (start - cursor))
+            flags.extend(
+                _rendered_flag(
+                    assistant and not length_stop,
+                    output and not length_stop,
+                    stop,
+                )
+                for assistant, output, stop, length_stop in zip(
+                    self.assistant_mask[cursor:start],
+                    self.output_mask[cursor:start],
+                    self.stop_mask[cursor:start],
+                    self.length_stop_mask[cursor:start],
+                    strict=True,
+                )
+            )
+            source_keys.extend([None] * (start - cursor))
+            try:
+                replacement_stop_mask = _translate_token_mask(
+                    self.rendered[start:end], replacement, self.stop_mask[start:end]
+                )
+            except ValueError:
+                replacement_stop_mask = [False] * len(replacement)
+            if synthetic_stop_token is not None:
+                replacement_stop_mask = [False] * len(replacement)
+            replacement_length_stop_mask = (
+                [False] * len(replacement)
+                if synthetic_stop_token is not None
+                else _translate_token_mask(
+                    self.rendered[start:end],
+                    replacement,
+                    self.length_stop_mask[start:end],
+                )
+            )
+            if exact:
+                token_ids.extend(replacement)
+                logprobs.extend(replacement_logprobs)
+                replacement_flags = [
+                    TokenFlag.EXACT
+                    | TokenFlag.SAMPLED
+                    | TokenFlag.ASSISTANT
+                    | TokenFlag.OUTPUT
+                    | (TokenFlag.STOP if stop else TokenFlag(0))
+                    for stop in replacement_stop_mask
+                ]
+                if part_end is not None:
+                    _mark_sampled_stops(
+                        replacement,
+                        replacement_flags,
+                        [source_key] * len(replacement),
+                        {source_key: source},
+                        tokenizer=self.tokenizer,
+                    )
+                flags.extend(replacement_flags)
+                source_keys.extend([source_key] * len(replacement))
+                sources[source_key] = source
+            else:
+                token_ids.extend(replacement)
+                logprobs.extend(
+                    replacement_logprobs
+                    if len(replacement_logprobs) == len(replacement)
+                    else [math.nan] * len(replacement)
+                )
+                flags.extend(
+                    _rendered_flag(
+                        not length_stop,
+                        not length_stop,
+                        stop,
+                    )
+                    for stop, length_stop in zip(
+                        replacement_stop_mask,
+                        replacement_length_stop_mask,
+                        strict=True,
+                    )
+                )
+                source_keys.extend([None] * len(replacement))
+            if synthetic_stop_token is not None:
+                token_ids.append(synthetic_stop_token)
+                logprobs.append(math.nan)
+                flags.append(TokenFlag.STOP)
+                source_keys.append(None)
+            cursor = end
+        token_ids.extend(self.rendered[cursor:])
+        logprobs.extend([math.nan] * (len(self.rendered) - cursor))
+        flags.extend(
+            _rendered_flag(
+                assistant and not length_stop,
+                output and not length_stop,
+                stop,
+            )
+            for assistant, output, stop, length_stop in zip(
+                self.assistant_mask[cursor:],
+                self.output_mask[cursor:],
+                self.stop_mask[cursor:],
+                self.length_stop_mask[cursor:],
+                strict=True,
+            )
+        )
+        source_keys.extend([None] * (len(self.rendered) - cursor))
+        exact_coverage_length = 0
+        for source in self.history.message_sources:
+            if (
+                source is None
+                or not _source_is_sampled(source)
+                or not self._source_matches_context(source)
+            ):
+                continue
+            source_prompt = self._source_prompt_tokens(source)
+            if (
+                source_prompt is not None
+                and token_ids[: len(source_prompt)] == source_prompt
+            ):
+                exact_coverage_length = max(exact_coverage_length, len(source_prompt))
+        for index in range(exact_coverage_length):
+            flags[index] |= TokenFlag.EXACT
+        if self.history.model is None:
+            raise ValueError("History tokenization requires a model")
+        _mark_sampled_stops(
+            token_ids,
+            flags,
+            source_keys,
+            sources,
+            tokenizer=self.tokenizer,
+        )
+        tokenized = TokenizedHistory(
+            history=self.history,
+            model=self.history.model,
+            tokens=token_ids,
+            logprobs=logprobs,
+            flags=flags,
+        )
+        if self.trace is not None:
+            self.trace.set(tokenized, source_keys, sources)
+        return tokenized
+
+    def _raw_render(
+        self, selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> list[int]:
         render_messages = normalize_tool_call_arguments_for_chat_template(
-            selected_messages, template
+            selected_messages, self.template
         )
         return _ids(
-            resolved_tokenizer.apply_chat_template(
+            self.tokenizer.apply_chat_template(
                 render_messages,
-                tools=history.tools,
+                tools=self.history.tools,
                 tokenize=True,
                 add_generation_prompt=add_generation_prompt,
-                **({"chat_template": template} if template is not None else {}),
-                **kwargs,
+                **(
+                    {"chat_template": self.template}
+                    if self.template is not None
+                    else {}
+                ),
+                **self.kwargs,
             )
         )
 
-    def render_normalized_text(
-        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    def _render_normalized_text(
+        self, selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> str:
-        value = resolved_tokenizer.apply_chat_template(
+        value = self.tokenizer.apply_chat_template(
             selected_messages,
-            tools=history.tools,
+            tools=self.history.tools,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
-            **({"chat_template": template} if template is not None else {}),
-            **kwargs,
+            **({"chat_template": self.template} if self.template is not None else {}),
+            **self.kwargs,
         )
         if not isinstance(value, str):
             raise TypeError("Chat template did not render text")
         return value
 
-    def render_text(
-        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    def _render_text(
+        self, selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> str:
-        return render_normalized_text(
+        return self._render_normalized_text(
             normalize_tool_call_arguments_for_chat_template(
-                selected_messages, template
+                selected_messages, self.template
             ),
             add_generation_prompt=add_generation_prompt,
         )
 
-    prefix_render_cache = _PrefixChatRenderCache(render_normalized_text)
-
-    def segmented_render(
-        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    def _segmented_render(
+        self, selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> tuple[list[int], list[bool]]:
         try:
             if cacheable_chat_template(
-                resolved_tokenizer, template, history.tools, kwargs, selected_messages
+                self.tokenizer,
+                self.template,
+                self.history.tools,
+                self.kwargs,
+                selected_messages,
             ):
                 # Normalization is message-local. Only the admitted nonmutating
                 # renderer may share its normalized messages between prefixes.
                 selected_messages = normalize_tool_call_arguments_for_chat_template(
-                    selected_messages, template
+                    selected_messages, self.template
                 )
-                text = render_normalized_text(
+                text = self._render_normalized_text(
                     selected_messages, add_generation_prompt=add_generation_prompt
                 )
-                span_render = prefix_render_cache.for_messages(
+                span_render = self.prefix_render_cache.for_messages(
                     selected_messages,
                     text,
                     settings=_render_context_key(
                         [
-                            history.tools,
-                            kwargs,
-                            getattr(resolved_tokenizer, "special_tokens_map"),
+                            self.history.tools,
+                            self.kwargs,
+                            getattr(self.tokenizer, "special_tokens_map"),
                         ]
                     ),
                 )
             else:
-                text = render_text(
+                text = self._render_text(
                     selected_messages, add_generation_prompt=add_generation_prompt
                 )
-                span_render = render_text
+                span_render = self._render_text
             spans = _assistant_char_spans(
                 selected_messages,
                 text,
@@ -4716,13 +6217,13 @@ def _tokenize_chat_view(
                 add_generation_prompt=add_generation_prompt,
             )
         except (TypeError, KeyError):
-            token_ids = raw_render(
+            token_ids = self._raw_render(
                 selected_messages, add_generation_prompt=add_generation_prompt
             )
             return token_ids, _assistant_token_mask_from_ids(
                 selected_messages,
                 token_ids,
-                raw_render,
+                self._raw_render,
                 add_generation_prompt=add_generation_prompt,
             )
         try:
@@ -4735,7 +6236,7 @@ def _tokenize_chat_view(
                     (text[start:end], True),
                 ):
                     ids = (
-                        _ids(resolved_tokenizer(part, add_special_tokens=False))
+                        _ids(self.tokenizer(part, add_special_tokens=False))
                         if part
                         else []
                     )
@@ -4744,170 +6245,66 @@ def _tokenize_chat_view(
                 cursor = end
             suffix = text[cursor:]
             suffix_ids = (
-                _ids(resolved_tokenizer(suffix, add_special_tokens=False))
-                if suffix
-                else []
+                _ids(self.tokenizer(suffix, add_special_tokens=False)) if suffix else []
             )
             token_ids.extend(suffix_ids)
             mask.extend([False] * len(suffix_ids))
             return token_ids, mask
         except (TypeError, KeyError, ValueError):
-            token_ids = raw_render(
+            token_ids = self._raw_render(
                 selected_messages, add_generation_prompt=add_generation_prompt
             )
             return token_ids, _assistant_token_mask_from_ids(
                 selected_messages,
                 token_ids,
-                raw_render,
+                self._raw_render,
                 add_generation_prompt=add_generation_prompt,
             )
 
-    def render(
-        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    def _render(
+        self, selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> list[int]:
-        if segmented:
-            return segmented_render(
+        if self.segmented:
+            return self._segmented_render(
                 selected_messages, add_generation_prompt=add_generation_prompt
             )[0]
-        return raw_render(
+        return self._raw_render(
             selected_messages, add_generation_prompt=add_generation_prompt
         )
 
-    def probe_render(
-        selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
+    def _probe_render(
+        self, selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> list[int] | None:
         try:
-            return render(
+            return self._render(
                 selected_messages, add_generation_prompt=add_generation_prompt
             )
         except Exception:
             return None
 
-    rendered = raw_render(messages, add_generation_prompt=not ends_with_assistant)
-    if any(
-        message.get("role") == "assistant"
-        and isinstance(message.get("reasoning"), str)
-        and message["reasoning"]
-        and not message.get("reasoning_content")
-        for message in messages
-    ):
-        without_reasoning = deepcopy(messages)
-        for message in without_reasoning:
-            message.pop("reasoning", None)
-        if (
-            probe_render(
-                without_reasoning,
-                add_generation_prompt=not ends_with_assistant,
+    def _part_ids(self, text: str) -> list[int]:
+        if text not in self.part_ids_cache:
+            self.part_ids_cache[text] = _ids(
+                self.tokenizer(text, add_special_tokens=False)
             )
-            == rendered
-        ):
-            aliased_messages = deepcopy(messages)
-            for message in aliased_messages:
-                reasoning = message.pop("reasoning", None)
-                if isinstance(reasoning, str) and reasoning:
-                    message.setdefault("reasoning_content", reasoning)
-            aliased_render = probe_render(
-                aliased_messages,
-                add_generation_prompt=not ends_with_assistant,
-            )
-            if aliased_render is not None:
-                messages = aliased_messages
-                rendered = aliased_render
-    if any(
-        message.get("role") == "assistant"
-        and isinstance(message.get("refusal"), str)
-        and message["refusal"]
-        for message in messages
-    ):
-        without_refusals = deepcopy(messages)
-        for message in without_refusals:
-            message.pop("refusal", None)
-        if (
-            probe_render(
-                without_refusals,
-                add_generation_prompt=not ends_with_assistant,
-            )
-            == rendered
-        ):
-            merged_messages = deepcopy(messages)
-            for message in merged_messages:
-                refusal = message.pop("refusal", None)
-                if not isinstance(refusal, str) or not refusal:
-                    continue
-                content = message.get("content")
-                if isinstance(content, str):
-                    message["content"] = content + refusal
-                elif isinstance(content, list):
-                    message["content"] = [
-                        *content,
-                        {"type": "text", "text": refusal},
-                    ]
-                elif content is None:
-                    message["content"] = refusal
-                else:
-                    raise ValueError(
-                        "Cannot render an assistant refusal with this content shape"
-                    )
-            merged_render = probe_render(
-                merged_messages,
-                add_generation_prompt=not ends_with_assistant,
-            )
-            if merged_render is not None:
-                messages = merged_messages
-                rendered = merged_render
+        return self.part_ids_cache[text]
 
-    part_ids_cache: dict[str, list[int]] = {}
-
-    def part_ids(text: str) -> list[int]:
-        if text not in part_ids_cache:
-            part_ids_cache[text] = _ids(
-                resolved_tokenizer(text, add_special_tokens=False)
-            )
-        return part_ids_cache[text]
-
-    direct_render: list[int] = []
-    direct_bounds: list[tuple[int, int]] = []
-    for message in messages:
-        start = len(direct_render)
-        for _, text in _chat_message_parts(message):
-            direct_render.extend(part_ids(text))
-        direct_bounds.append((start, len(direct_render)))
-    if direct_render == rendered:
-        canonical_assistant_mask = [False] * len(rendered)
-        for message, (start, end) in zip(messages, direct_bounds, strict=True):
-            if message.get("role") == "assistant":
-                canonical_assistant_mask[start:end] = [True] * (end - start)
-    else:
-        direct_bounds = []
-        segmented = True
-        rendered, canonical_assistant_mask = segmented_render(
-            messages, add_generation_prompt=not ends_with_assistant
-        )
-    _materialize_missing_role_stop(
-        rendered, canonical_assistant_mask, messages, resolved_tokenizer
-    )
-    canonical_assistant_mask, canonical_stop_mask = _assistant_stop_masks(
-        rendered, canonical_assistant_mask, resolved_tokenizer
-    )
-
-    prompt_cache: dict[int, list[int] | None] = {}
-    output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
-
-    def source_prompt_tokens(source: object) -> list[int] | None:
+    def _source_prompt_tokens(self, source: object) -> list[int] | None:
         key = id(source)
-        if key not in prompt_cache:
-            prompt_cache[key] = _chat_source_prompt_tokens(source)
-        return prompt_cache[key]
+        if key not in self.prompt_cache:
+            self.prompt_cache[key] = _chat_source_prompt_tokens(source)
+        return self.prompt_cache[key]
 
-    def source_output_tokens(
+    def _source_output_tokens(
+        self,
         source: object,
     ) -> tuple[list[int] | None, list[float]]:
         key = id(source)
-        if key not in output_cache:
-            output_cache[key] = _chat_source_full_tokens(source)
-        return output_cache[key]
+        if key not in self.output_cache:
+            self.output_cache[key] = _chat_source_full_tokens(source)
+        return self.output_cache[key]
 
-    def source_matches_context(source: object) -> bool:
+    def _source_matches_context(self, source: object) -> bool:
         exchange = getattr(source, "exchange", None)
         if not isinstance(
             exchange, (ChatCompletionsExchange, MessagesExchange, ResponsesExchange)
@@ -4923,138 +6320,58 @@ def _tokenize_chat_view(
         request_template = exchange.request.get("chat_template")
         request_kwargs = exchange.request.get("chat_template_kwargs")
         return (
-            history.tools
+            self.history.tools
             == _openai_tools(exchange.request.get("tools"), dialect=dialect)
-            and history.chat_template == request_template
-            and history.chat_template_kwargs == request_kwargs
-            and (chat_template is None or chat_template == request_template)
+            and self.history.chat_template == request_template
+            and self.history.chat_template_kwargs == request_kwargs
+            and (self.chat_template is None or self.chat_template == request_template)
             and (
-                chat_template_kwargs is None
-                or dict(chat_template_kwargs) == (request_kwargs or {})
+                self.chat_template_kwargs is None
+                or dict(self.chat_template_kwargs) == (request_kwargs or {})
             )
         )
 
-    canonical_rendered = rendered
-    exact_prefix_length = 0
-    canonical_prefix_length = 0
-    if (
-        chat_template is None
-        and chat_template_kwargs is None
-        and _projection_matches is True
-    ):
-        for message_index, (message, source) in enumerate(
-            zip(history.messages, history.message_sources, strict=True)
-        ):
-            if message.get("role") != "assistant" or source is None:
-                continue
-            source_prompt = source_prompt_tokens(source)
-            if source_prompt and source_matches_context(source):
-                rendered_prompt = probe_render(
-                    messages[:message_index], add_generation_prompt=True
-                )
-                if (
-                    rendered_prompt is not None
-                    and rendered[: len(rendered_prompt)] == rendered_prompt
-                ):
-                    rendered = [*source_prompt, *rendered[len(rendered_prompt) :]]
-                    exact_prefix_length = len(source_prompt)
-                    canonical_prefix_length = len(rendered_prompt)
-                    break
-
-    canonical_length_stop_mask = _synthetic_length_stop_mask(
-        messages,
-        history.message_sources,
-        canonical_assistant_mask,
-        canonical_stop_mask,
-    )
-    canonical_output_mask = _response_output_mask(
-        messages,
-        history.message_sources,
-        canonical_assistant_mask,
-        direct_bounds or None,
-    )
-    assistant_mask = _translate_token_mask(
-        canonical_rendered,
-        rendered,
-        canonical_assistant_mask,
-        tokenizer=resolved_tokenizer,
-    )
-    output_mask = _translate_token_mask(
-        canonical_rendered,
-        rendered,
-        canonical_output_mask,
-        tokenizer=resolved_tokenizer,
-    )
-    stop_mask = _translate_token_mask(canonical_rendered, rendered, canonical_stop_mask)
-    length_stop_mask = _translate_token_mask(
-        canonical_rendered, rendered, canonical_length_stop_mask
-    )
-    positions_by_first_token: dict[int, list[int]] = {}
-    for index, token_id in enumerate(rendered):
-        positions_by_first_token.setdefault(token_id, []).append(index)
-    locations_by_needle: dict[tuple[int, ...], list[tuple[int, int]]] = {}
-
-    def locations(needle: Sequence[int], start: int) -> list[tuple[int, int]]:
+    def _locations(self, needle: Sequence[int], start: int) -> list[tuple[int, int]]:
         if not needle:
             return []
         key = tuple(needle)
-        if key not in locations_by_needle:
-            locations_by_needle[key] = [
+        if key not in self.locations_by_needle:
+            self.locations_by_needle[key] = [
                 (index, index + len(key))
-                for index in positions_by_first_token.get(key[0], [])
-                if rendered[index : index + len(key)] == list(key)
+                for index in self.positions_by_first_token.get(key[0], [])
+                if self.rendered[index : index + len(key)] == list(key)
             ]
-        spans = locations_by_needle[key]
+        spans = self.locations_by_needle[key]
         return spans[bisect_left(spans, (start, -1)) :]
 
-    replacements: list[
-        tuple[
-            int,
-            int,
-            list[int],
-            list[float],
-            bool,
-            _SampledSourceKey,
-            object,
-            int | None,
-        ]
-    ] = []
-    search_cursor = 0
-    sampled_texts = {
-        text
-        for message, source in zip(messages, history.message_sources, strict=True)
-        if message.get("role") == "assistant"
-        and source is not None
-        and _source_is_sampled(source)
-        for _, text in _chat_message_parts(message)
-    }
-    if rendered != canonical_rendered:
-        direct_bounds = []
-
-    def canonical_render_to_rendered(probe: Sequence[int]) -> list[int] | None:
-        if not exact_prefix_length:
+    def _canonical_render_to_rendered(self, probe: Sequence[int]) -> list[int] | None:
+        if not self.exact_prefix_length:
             return list(probe)
         if (
-            len(probe) < canonical_prefix_length
-            or list(probe[:canonical_prefix_length])
-            != canonical_rendered[:canonical_prefix_length]
+            len(probe) < self.canonical_prefix_length
+            or list(probe[: self.canonical_prefix_length])
+            != self.canonical_rendered[: self.canonical_prefix_length]
         ):
             return None
         return [
-            *rendered[:exact_prefix_length],
-            *probe[canonical_prefix_length:],
+            *self.rendered[: self.exact_prefix_length],
+            *probe[self.canonical_prefix_length :],
         ]
 
-    def canonical_span_to_rendered(start: int, end: int) -> tuple[int, int] | None:
-        if not exact_prefix_length:
+    def _canonical_span_to_rendered(
+        self, start: int, end: int
+    ) -> tuple[int, int] | None:
+        if not self.exact_prefix_length:
             return start, end
-        if start < canonical_prefix_length:
+        if start < self.canonical_prefix_length:
             return None
-        delta = exact_prefix_length - canonical_prefix_length
+        delta = self.exact_prefix_length - self.canonical_prefix_length
         return start + delta, end + delta
 
-    def differing_span(probe: Sequence[int]) -> tuple[int, int] | None:
-        baseline = canonical_rendered if exact_prefix_length else rendered
+    def _differing_span(self, probe: Sequence[int]) -> tuple[int, int] | None:
+        baseline = (
+            self.canonical_rendered if self.exact_prefix_length else self.rendered
+        )
         prefix = 0
         while (
             prefix < len(baseline)
@@ -5070,1233 +6387,29 @@ def _tokenize_chat_view(
         ):
             suffix += 1
         end = len(baseline) - suffix
-        span = canonical_span_to_rendered(prefix, end)
+        span = self._canonical_span_to_rendered(prefix, end)
         return span if span is not None and span[0] < span[1] else None
 
-    marked_bounds: dict[int, tuple[int, int]] = {}
-    marked_part_bounds: dict[int, list[tuple[int, int]]] = {}
-    if not direct_bounds:
-        marked_messages = deepcopy(messages)
-        marker_prefix = f"ART_TRAJECTORY_{id(marked_messages):x}_"
-        markers: dict[str, tuple[int, int, Literal["start", "end"]]] = {}
-        part_counts: dict[int, int] = {}
-        part_whitespace: dict[tuple[int, int], tuple[str, str]] = {}
-        for message_index, (message, source) in enumerate(
-            zip(marked_messages, history.message_sources, strict=True)
-        ):
-            if (
-                message.get("role") != "assistant"
-                or source is None
-                or not _source_is_sampled(source)
-            ):
-                continue
-            slot_groups = _chat_message_text_slot_groups(message)
-            if not slot_groups:
-                continue
-            part_counts[message_index] = len(slot_groups)
-            for part_index, slots in enumerate(slot_groups):
-                start = f"{marker_prefix}{message_index}_{part_index}_START"
-                end = f"{marker_prefix}{message_index}_{part_index}_END"
-                first, first_key = slots[0]
-                last, last_key = slots[-1]
-                first_text = str(first[first_key])
-                last_text = str(last[last_key])
-                leading = first_text[: len(first_text) - len(first_text.lstrip())]
-                trailing = last_text[len(last_text.rstrip()) :]
-                whitespace_only = (
-                    first is last and first_key == last_key and not first_text.strip()
-                )
-                if whitespace_only:
-                    trailing = ""
-                if first is last and first_key == last_key:
-                    core = first_text[
-                        len(leading) : len(first_text) - len(trailing)
-                        if trailing
-                        else len(first_text)
-                    ]
-                    first[first_key] = leading + start + core + end + trailing
-                else:
-                    first[first_key] = leading + start + first_text[len(leading) :]
-                    last[last_key] = (
-                        last_text[: len(last_text) - len(trailing)] + end + trailing
-                    )
-                part_whitespace[(message_index, part_index)] = (
-                    ("", "") if whitespace_only else (leading, trailing)
-                )
-                markers[start] = (message_index, part_index, "start")
-                markers[end] = (message_index, part_index, "end")
-        if markers:
-            try:
-                marked_text = resolved_tokenizer.apply_chat_template(
-                    normalize_tool_call_arguments_for_chat_template(
-                        marked_messages, template
-                    ),
-                    tools=history.tools,
-                    tokenize=False,
-                    add_generation_prompt=not ends_with_assistant,
-                    **({"chat_template": template} if template is not None else {}),
-                    **kwargs,
-                )
-            except Exception:
-                marked_text = None
-            if isinstance(marked_text, str):
-                marker_pattern = re.compile(
-                    rf"{re.escape(marker_prefix)}\d+_\d+_(?:START|END)"
-                )
-                matches = list(marker_pattern.finditer(marked_text))
-                found_markers = [match.group(0) for match in matches]
-            else:
-                matches = []
-                found_markers = []
-            if (
-                isinstance(marked_text, str)
-                and len(found_markers) == len(markers)
-                and set(found_markers) == set(markers)
-            ):
-                unmarked_parts: list[str] = []
-                char_bounds: dict[tuple[int, int], list[int]] = {}
-                source_cursor = 0
-                target_cursor = 0
-                for match in matches:
-                    position = match.start()
-                    marker = match.group(0)
-                    message_index, part_index, boundary = markers[marker]
-                    chunk = marked_text[source_cursor:position]
-                    unmarked_parts.append(chunk)
-                    target_cursor += len(chunk)
-                    char_bounds.setdefault((message_index, part_index), [0, 0])[
-                        0 if boundary == "start" else 1
-                    ] = target_cursor
-                    source_cursor = match.end()
-                unmarked_parts.append(marked_text[source_cursor:])
-                unmarked_text = "".join(unmarked_parts)
-                for key, bounds in char_bounds.items():
-                    leading, trailing = part_whitespace[key]
-                    if (
-                        leading
-                        and unmarked_text[max(0, bounds[0] - len(leading)) : bounds[0]]
-                        == leading
-                    ):
-                        bounds[0] -= len(leading)
-                    if (
-                        trailing
-                        and unmarked_text[bounds[1] : bounds[1] + len(trailing)]
-                        == trailing
-                    ):
-                        bounds[1] += len(trailing)
-                try:
-                    encoded = cast(_OffsetTokenizer, resolved_tokenizer)(
-                        unmarked_text,
-                        add_special_tokens=False,
-                        return_offsets_mapping=True,
-                    )
-                except Exception:
-                    encoded = None
-                encoded_data = _string_dict(encoded)
-                raw_offsets = (
-                    encoded_data.get("offset_mapping")
-                    if encoded_data is not None
-                    else None
-                )
-                encoded_ids = _ids(encoded) if encoded is not None else []
-                if (
-                    encoded is not None
-                    and (
-                        encoded_ids == canonical_rendered
-                        or (
-                            exact_prefix_length
-                            and len(encoded_ids) == len(canonical_rendered)
-                            and encoded_ids[canonical_prefix_length:]
-                            == canonical_rendered[canonical_prefix_length:]
-                        )
-                    )
-                    and isinstance(raw_offsets, list)
-                    and len(raw_offsets) == len(encoded_ids)
-                ):
-                    offsets: list[tuple[int, int]] = []
-                    for value in raw_offsets:
-                        if (
-                            not isinstance(value, (list, tuple))
-                            or len(value) != 2
-                            or not all(isinstance(item, int) for item in value)
-                        ):
-                            break
-                        offsets.append((value[0], value[1]))
-                    if len(offsets) == len(encoded_ids):
-                        token_bounds: dict[tuple[int, int], tuple[int, int]] = {}
-                        token_cursor = 0
-                        for key, (char_start, char_end) in sorted(
-                            char_bounds.items(), key=lambda item: item[1]
-                        ):
-                            while (
-                                token_cursor < len(offsets)
-                                and offsets[token_cursor][1] <= char_start
-                            ):
-                                token_cursor += 1
-                            token_end = token_cursor
-                            while (
-                                token_end < len(offsets)
-                                and offsets[token_end][0] < char_end
-                            ):
-                                token_end += 1
-                            if char_start == char_end:
-                                token_bounds[key] = (token_cursor, token_cursor)
-                            elif (
-                                token_end > token_cursor
-                                and offsets[token_cursor][0] >= char_start
-                                and offsets[token_end - 1][1] <= char_end
-                            ):
-                                token_bounds[key] = (token_cursor, token_end)
-                            token_cursor = token_end
-                        for message_index, part_count in part_counts.items():
-                            bounds = [
-                                token_bounds[(message_index, part_index)]
-                                for part_index in range(part_count)
-                                if (message_index, part_index) in token_bounds
-                            ]
-                            if len(bounds) == part_count:
-                                rendered_bounds = [
-                                    canonical_span_to_rendered(*bound)
-                                    for bound in bounds
-                                ]
-                                if any(bound is None for bound in rendered_bounds):
-                                    continue
-                                translated = cast(
-                                    list[tuple[int, int]], rendered_bounds
-                                )
-                                marked_part_bounds[message_index] = translated
-                                marked_bounds[message_index] = (
-                                    translated[0][0],
-                                    translated[-1][1],
-                                )
-        for message_index, bounds in list(marked_part_bounds.items()):
-            whitespace_parts = [
-                (part_index, text)
-                for part_index, (_, text) in enumerate(
-                    _chat_message_parts(messages[message_index])
-                )
-                if text and not text.strip()
-            ]
-            for part_index, _ in whitespace_parts:
-                empty_messages = deepcopy(messages)
-                groups = _chat_message_text_slot_groups(empty_messages[message_index])
-                if part_index >= len(groups):
-                    marked_bounds.pop(message_index, None)
-                    marked_part_bounds.pop(message_index, None)
-                    break
-                for container, key in groups[part_index]:
-                    container[key] = ""
-                try:
-                    empty_render = render(
-                        empty_messages,
-                        add_generation_prompt=not ends_with_assistant,
-                    )
-                except Exception:
-                    marked_bounds.pop(message_index, None)
-                    marked_part_bounds.pop(message_index, None)
-                    break
-                empty_render = canonical_render_to_rendered(empty_render)
-                if empty_render is None:
-                    marked_bounds.pop(message_index, None)
-                    marked_part_bounds.pop(message_index, None)
-                    break
-                if empty_render == rendered:
-                    continue
-                anchor = bounds[part_index][0]
-                start = anchor - (len(rendered) - len(empty_render))
-                span = (start, anchor)
-                if (
-                    start < 0
-                    or rendered[: span[0]] + rendered[span[1] :] != empty_render
-                ):
-                    marked_bounds.pop(message_index, None)
-                    marked_part_bounds.pop(message_index, None)
-                    break
-                bounds[part_index] = span
-                marked_bounds[message_index] = (bounds[0][0], bounds[-1][1])
 
-    probed_bounds: dict[int, tuple[int, int]] = {}
-    if not direct_bounds:
-        for message_index, (message, source) in enumerate(
-            zip(messages, history.message_sources, strict=True)
-        ):
-            if (
-                message_index in marked_bounds
-                or message.get("role") != "assistant"
-                or source is None
-                or not _source_is_sampled(source)
-            ):
-                continue
-            parts = _chat_message_parts(message)
-            if not parts:
-                exact_output, _ = source_output_tokens(source)
-                if exact_output:
-                    try:
-                        prefix = render(
-                            messages[:message_index],
-                            add_generation_prompt=True,
-                        )
-                        completed = render(
-                            messages[: message_index + 1],
-                            add_generation_prompt=False,
-                        )
-                    except Exception:
-                        continue
-                    rendered_prefix = canonical_render_to_rendered(prefix)
-                    rendered_completed = canonical_render_to_rendered(completed)
-                    if (
-                        completed[: len(prefix)] == prefix
-                        and rendered_prefix is not None
-                        and rendered_completed is not None
-                        and rendered[: len(rendered_completed)] == rendered_completed
-                    ):
-                        probed_bounds[message_index] = (
-                            len(rendered_prefix),
-                            len(rendered_prefix),
-                        )
-                continue
-            if any(part == "tool_call" for part, _ in parts):
-                probe_messages = deepcopy(messages)
-                for part_index, slots in enumerate(
-                    _chat_message_text_slot_groups(probe_messages[message_index])
-                ):
-                    for slot_index, (container, key) in enumerate(slots):
-                        original = str(container[key])
-                        leading = original[: len(original) - len(original.lstrip())]
-                        trailing = original[len(original.rstrip()) :]
-                        marker = (
-                            f"art_trajectory_probe_{id(probe_messages):x}_"
-                            f"{part_index}_{slot_index}"
-                        )
-                        replacement = (
-                            json.dumps({marker: True}) if key == "arguments" else marker
-                        )
-                        container[key] = leading + replacement + trailing
-                probe = probe_render(
-                    probe_messages,
-                    add_generation_prompt=not ends_with_assistant,
-                )
-                if probe is not None and (span := differing_span(probe)):
-                    probed_bounds[message_index] = span
-                    continue
-            if len(parts) == 1:
-                try:
-                    prefix = render(
-                        messages[:message_index], add_generation_prompt=True
-                    )
-                except Exception:
-                    prefix = []
-                local = part_ids(parts[0][1])
-                rendered_prefix = canonical_render_to_rendered(prefix)
-                if rendered_prefix is not None and rendered == [
-                    *rendered_prefix,
-                    *local,
-                ]:
-                    probed_bounds[message_index] = (
-                        len(rendered_prefix),
-                        len(rendered),
-                    )
-                    continue
-                try:
-                    completed = render(
-                        messages[: message_index + 1],
-                        add_generation_prompt=False,
-                    )
-                except Exception:
-                    completed = []
-                rendered_completed = canonical_render_to_rendered(completed)
-                if (
-                    completed == [*prefix, *local]
-                    and rendered_prefix is not None
-                    and rendered_completed is not None
-                    and rendered[: len(rendered_completed)] == rendered_completed
-                ):
-                    probed_bounds[message_index] = (
-                        len(rendered_prefix),
-                        len(rendered_completed),
-                    )
-                    continue
-            probe_messages = deepcopy(messages)
-            slot_groups = _chat_message_text_slot_groups(probe_messages[message_index])
-            if not slot_groups:
-                continue
-            for part_index, slots in enumerate(slot_groups):
-                for slot_index, (container, key) in enumerate(slots):
-                    original = str(container[key])
-                    leading = original[: len(original) - len(original.lstrip())]
-                    trailing = original[len(original.rstrip()) :]
-                    container[key] = (
-                        leading + f"ART_TRAJECTORY_{id(probe_messages):x}_"
-                        f"PROBE_{part_index}_{slot_index}" + trailing
-                    )
-            try:
-                probe = render(
-                    probe_messages,
-                    add_generation_prompt=not ends_with_assistant,
-                )
-            except Exception:
-                continue
-            if span := differing_span(probe):
-                probed_bounds[message_index] = span
-
-    if (
-        _projection_matches is True
-        and chat_template is None
-        and chat_template_kwargs is None
-    ):
-        sampled_message_indices: list[int] = []
-        seen_signatures: set[tuple[object, ...]] = set()
-        for message_index, (message, source) in enumerate(
-            zip(messages, history.message_sources, strict=True)
-        ):
-            signature = _source_signature(source)
-            if (
-                message.get("role") == "assistant"
-                and source is not None
-                and signature is not None
-                and signature not in seen_signatures
-                and _source_is_sampled(source)
-            ):
-                seen_signatures.add(signature)
-                sampled_message_indices.append(message_index)
-        length_stop_boundaries: dict[
-            _SampledSourceKey, _RenderedLengthStopBoundary
-        ] = {}
-        rendered_length_stops = [
-            index for index, selected in enumerate(length_stop_mask) if selected
-        ]
-        length_stop_count = 0
-        length_stop_boundaries_complete = True
-        for position, message_index in enumerate(sampled_message_indices):
-            source = history.message_sources[message_index]
-            assert source is not None
-            source_key = _sampled_source_key(source)
-            stop_reason = _source_stop_evidence(source, source_key)[0]
-            output = _source_output_tokens(source, source_key)
-            synthetic_stop = (
-                stop_reason == "stop"
-                and bool(_terminator_ids(resolved_tokenizer))
-                and output is not None
-                and not _sampled_stop_suffix(
-                    output,
-                    source=source,
-                    source_key=source_key,
-                    tokenizer=resolved_tokenizer,
-                )
-            )
-            if synthetic_stop and position + 1 < len(sampled_message_indices):
-                length_stop_boundaries_complete = False
-                break
-            if stop_reason != "length" and not synthetic_stop:
-                continue
-            length_stop_count += stop_reason == "length"
-            bounds = (
-                direct_bounds[message_index]
-                if direct_bounds
-                else marked_bounds.get(message_index)
-                or probed_bounds.get(message_index)
-            )
-            if synthetic_stop and bounds is not None:
-                # Tool part bounds can omit sampled closing markup. Prove the
-                # complete sampled prefix before appending only its remainder.
-                assert output is not None
-                rendered_start = bounds[0]
-                while rendered_start and assistant_mask[rendered_start - 1]:
-                    rendered_start -= 1
-                bounds = _prove_exact_length_stopped_assistant_prefix(
-                    locations(output, rendered_start),
-                    assistant_mask,
-                    expected_start=rendered_start,
-                )
-            if position + 1 < len(sampled_message_indices) and source_matches_context(
-                source
-            ):
-                prompt = source_prompt_tokens(source)
-                output, _ = source_output_tokens(source)
-                if (
-                    prompt is not None
-                    and output
-                    and length_stop_count <= len(rendered_length_stops)
-                ):
-                    rendered_end = rendered_length_stops[length_stop_count - 1] + 1
-                    rendered_start = rendered_end - 1
-                    while rendered_start and assistant_mask[rendered_start - 1]:
-                        rendered_start -= 1
-                    exact_bounds = _prove_exact_length_stopped_assistant_prefix(
-                        [
-                            match
-                            for match in locations(output, rendered_start)
-                            if match[1] <= rendered_end
-                        ],
-                        assistant_mask,
-                        expected_start=rendered_start,
-                    )
-                    bounds = exact_bounds or bounds
-            next_prompt_end: int | None
-            if position + 1 < len(sampled_message_indices):
-                next_message_index = sampled_message_indices[position + 1]
-                next_bounds = (
-                    direct_bounds[next_message_index]
-                    if direct_bounds
-                    else marked_bounds.get(next_message_index)
-                    or probed_bounds.get(next_message_index)
-                )
-                # Part bounds can start after sampled tool-call markup; the
-                # next generation boundary is the assistant span's start.
-                next_prompt_end = (
-                    _next_assistant_span_start(assistant_mask, after=bounds[1])
-                    if bounds is not None
-                    else next_bounds[0]
-                    if next_bounds is not None
-                    else None
-                )
-            else:
-                next_prompt_end = len(rendered)
-            boundary = (
-                _rendered_length_stop_boundary(
-                    rendered,
-                    assistant_mask,
-                    stop_mask,
-                    content_end=bounds[1],
-                    next_prompt_end=next_prompt_end,
-                )
-                if (
-                    bounds is not None
-                    and source_matches_context(source)
-                    and next_prompt_end is not None
-                )
-                else None
-            )
-            if boundary is None:
-                if synthetic_stop or position + 1 < len(sampled_message_indices):
-                    length_stop_boundaries_complete = False
-                    break
-                # A terminal length stop needs no renderer-owned tail: the
-                # authoritative prompt and sampled output already describe the
-                # complete trainable sequence. A later turn is required only
-                # to prove a nonterminal synthetic boundary.
-                continue
-            length_stop_boundaries[source_key] = boundary
-        if (
-            length_stop_count
-            and length_stop_boundaries_complete
-            and (
-                exact := _tokenize_exact_projected_chat_history(
-                    history,
-                    tokenizer=resolved_tokenizer,
-                    length_stop_boundaries=length_stop_boundaries,
-                    projection_validated=True,
-                    _trace=_trace,
-                )
-            )
-        ):
-            return exact
-
-    sampled_message_count = sum(
-        message.get("role") == "assistant"
-        and source is not None
-        and _source_is_sampled(source)
-        for message, source in zip(messages, history.message_sources, strict=True)
-    )
-    for message_index, (message, source) in enumerate(
-        zip(messages, history.message_sources, strict=True)
-    ):
-        parts = _chat_message_parts(message)
-        sampled = (
-            message.get("role") == "assistant"
-            and source is not None
-            and _source_is_sampled(source)
-        )
-        full_exact, full_logprobs = (
-            source_output_tokens(source) if sampled else (None, [])
-        )
-        if sampled and not parts and not full_exact:
-            continue
-        complete_sampled_message = (
-            sampled
-            and source is not None
-            and _source_covers_complete_sampled_message(
-                history.messages[message_index], source
-            )
-        )
-        authoritative_prompt = (
-            source_prompt_tokens(source) if sampled and source is not None else None
-        )
-        initial_proven_bounds = marked_bounds.get(message_index) or probed_bounds.get(
-            message_index
-        )
-        exact_output_matches: list[tuple[int, int]] | None = None
-        exact_output_span: tuple[int, int] | None = None
-        corrected_message_end: int | None = None
-        if (
-            complete_sampled_message
-            and source is not None
-            and full_exact
-            and _projection_matches is True
-            and chat_template is None
-            and chat_template_kwargs is None
-            and source_matches_context(source)
-            and _source_stop_evidence(source, _sampled_source_key(source))[0]
-            != "length"
-        ):
-            exact_output_matches = locations(full_exact, search_cursor)
-            if authoritative_prompt is not None:
-                exact_output_span = _prove_exact_sampled_assistant_span(
-                    exact_output_matches,
-                    assistant_mask,
-                    after=search_cursor,
-                    expected_start=len(authoritative_prompt),
-                )
-        if (
-            complete_sampled_message
-            and full_exact is not None
-            and exact_output_span is None
-            and message_index in marked_bounds
-            and isinstance(getattr(source, "exchange", None), ChatCompletionsExchange)
-            and marked_bounds[message_index][1] - marked_bounds[message_index][0]
-            != len(full_exact)
-        ):
-            try:
-                prefix = render(messages[:message_index], add_generation_prompt=True)
-                completed = render(
-                    messages[: message_index + 1], add_generation_prompt=False
-                )
-            except Exception:
-                marked_bounds.pop(message_index, None)
-                marked_part_bounds.pop(message_index, None)
-                prefix = completed = None
-
-            rendered_prefix = (
-                canonical_render_to_rendered(prefix) if prefix is not None else None
-            )
-            rendered_completed = (
-                canonical_render_to_rendered(completed)
-                if completed is not None
-                else None
-            )
-            corrected_bounds = (
-                canonical_span_to_rendered(len(prefix), len(completed))
-                if prefix is not None and completed is not None
-                else None
-            )
-            if (
-                prefix is not None
-                and completed is not None
-                and rendered_prefix is not None
-                and rendered_completed is not None
-                and corrected_bounds is not None
-                and rendered[: len(rendered_prefix)] == rendered_prefix
-                and rendered[: len(rendered_completed)] == rendered_completed
-            ):
-                marked_bounds[message_index] = corrected_bounds
-                corrected_message_end = corrected_bounds[1]
-                if any(
-                    not corrected_bounds[0] <= start <= end <= corrected_bounds[1]
-                    for start, end in marked_part_bounds.get(message_index, ())
-                ):
-                    marked_part_bounds.pop(message_index, None)
-            else:
-                marked_bounds.pop(message_index, None)
-                marked_part_bounds.pop(message_index, None)
-        proven_bounds = (
-            marked_bounds.get(message_index)
-            or probed_bounds.get(message_index)
-            or initial_proven_bounds
-        )
-        if (
-            exact_output_span is None
-            and exact_output_matches is not None
-            and proven_bounds is not None
-        ):
-            exact_output_span = _prove_exact_sampled_assistant_span(
-                exact_output_matches,
-                assistant_mask,
-                after=search_cursor,
-                expected_start=proven_bounds[0],
-            )
-        source_boundary = False
-        generation_start: int | None = None
-        sampled_bounds: tuple[int, int] | None = None
-        content_bounds_proven = False
-        if sampled:
-            if exact_output_span is not None:
-                sampled_bounds = exact_output_span
-                content_bounds_proven = True
-            elif direct_bounds:
-                sampled_bounds = direct_bounds[message_index]
-                content_bounds_proven = True
-            elif message_index in marked_bounds:
-                sampled_bounds = marked_bounds[message_index]
-                content_bounds_proven = True
-            elif message_index in probed_bounds:
-                sampled_bounds = probed_bounds[message_index]
-                content_bounds_proven = True
-            else:
-                assert source is not None
-                source_prompt = source_prompt_tokens(source)
-                source_context_matches = source_matches_context(source)
-                if (
-                    source_context_matches
-                    and source_prompt
-                    and rendered[: len(source_prompt)] == source_prompt
-                ):
-                    search_cursor = max(search_cursor, len(source_prompt))
-                    source_boundary = True
-                    generation_start = len(source_prompt)
-                    sampled_bounds = (generation_start, len(rendered))
-                elif sampled_message_count == 1:
-                    prompt_render = probe_render(
-                        messages[:message_index], add_generation_prompt=True
-                    )
-                    rendered_prompt = (
-                        canonical_render_to_rendered(prompt_render)
-                        if prompt_render is not None
-                        else None
-                    )
-                    if (
-                        rendered_prompt is None
-                        or rendered[: len(rendered_prompt)] != rendered_prompt
-                    ):
-                        raise ValueError(
-                            "Could not locate a sampled history message in the "
-                            "rendered history"
-                        )
-                    generation_start = len(rendered_prompt)
-                    sampled_bounds = (generation_start, len(rendered))
-                else:
-                    raise ValueError(
-                        "Could not prove a sampled history message boundary with this "
-                        "tokenizer"
-                    )
-        if content_bounds_proven:
-            assert sampled_bounds is not None
-            # Proven message bounds outrank approximate matches in earlier context.
-            search_cursor = sampled_bounds[0]
-        full_matches = (
-            locations(full_exact, search_cursor) if sampled and full_exact else []
-        )
-        first_part_matches = (
-            locations(part_ids(parts[0][1]), search_cursor) if parts else []
-        )
-        if sampled_bounds is not None:
-            lower, upper = sampled_bounds
-            full_matches = [
-                match
-                for match in full_matches
-                if match[0] >= lower and match[1] <= upper
-            ]
-            first_part_matches = [
-                match
-                for match in first_part_matches
-                if match[0] >= lower and match[1] <= upper
-            ]
-        if (
-            full_exact is not None
-            and full_matches
-            and (
-                (source_boundary and full_matches[0][0] == search_cursor)
-                or exact_output_span is not None
-                or (
-                    complete_sampled_message
-                    and len(full_matches) == 1
-                    and first_part_matches
-                    and full_matches[0][0] == first_part_matches[0][0]
-                )
-            )
-        ):
-            span = full_matches[0]
-            start, end = span
-            replacements.append(
-                (
-                    start,
-                    end,
-                    full_exact,
-                    full_logprobs
-                    if len(full_logprobs) == len(full_exact)
-                    else [math.nan] * len(full_exact),
-                    True,
-                    _sampled_source_key(source),
-                    source,
-                    None,
-                )
-            )
-            search_cursor = end
-            continue
-
-        source_exchange = getattr(source, "exchange", None)
-        multi_generation_response = (
-            isinstance(source_exchange, ResponsesExchange)
-            and len(_response_generations(source_exchange.response)) > 1
-        )
-        if sampled and not content_bounds_proven:
-            raise ValueError(
-                "Could not uniquely locate or prove the sampled content boundary "
-                f"for history message {message_index} with this tokenizer"
-            )
-        if (
-            sampled
-            and full_exact is None
-            and message_index in probed_bounds
-            and parts
-            and any(part == "tool_call" for part, _ in parts)
-        ):
-            assert source is not None and sampled_bounds is not None
-            start, end = sampled_bounds
-            replacements.append(
-                (
-                    start,
-                    end,
-                    rendered[start:end],
-                    [math.nan] * (end - start),
-                    False,
-                    _sampled_source_key(source),
-                    source,
-                    None,
-                )
-            )
-            search_cursor = end
-            continue
-        if (
-            complete_sampled_message
-            and full_exact is not None
-            and (
-                multi_generation_response
-                or len(parts) != 1
-                or len(full_exact) != len(part_ids(parts[0][1]))
-            )
-        ):
-            if not parts and sampled_bounds is not None:
-                start = end = sampled_bounds[0]
-            elif sampled_bounds is None:
-                raise ValueError(
-                    "Could not locate a complete sampled message in the rendered history"
-                )
-            elif sampled_bounds[0] == sampled_bounds[1]:
-                if not content_bounds_proven:
-                    raise ValueError(
-                        "Could not locate a complete sampled message in the rendered "
-                        "history"
-                    )
-                start = end = sampled_bounds[0]
-            else:
-                start, end = sampled_bounds
-            if parts and len(parts) == 1 and parts[0][0] == "content":
-                visible_matches = [
-                    match
-                    for match in locations(part_ids(parts[0][1]), start)
-                    if match[1] <= end
-                ]
-                if len(visible_matches) != 1 or (
-                    not content_bounds_proven
-                    and generation_start is not None
-                    and visible_matches[0][0] != generation_start
-                ):
-                    raise ValueError(
-                        "Could not prove the sampled content boundary in the "
-                        "rendered history"
-                    )
-                start, end = visible_matches[0]
-            elif generation_start is not None and (
-                multi_generation_response or len(parts) != 1 or parts[0][0] != "content"
-            ):
-                start = generation_start
-            if _sampled_stop_suffix(
-                full_exact,
-                source=source,
-                source_key=_sampled_source_key(source),
-                tokenizer=resolved_tokenizer,
-            ):
-                # Adjacent assistants can share a role mask. Prove this message's
-                # end before replacing its rendered closing markup and stop.
-                completed = probe_render(
-                    messages[: message_index + 1], add_generation_prompt=False
-                )
-                rendered_completed = (
-                    canonical_render_to_rendered(completed)
-                    if completed is not None
-                    else None
-                )
-                if (
-                    rendered_completed is not None
-                    and rendered[: len(rendered_completed)] == rendered_completed
-                ):
-                    tail_mask, tail_stops = _assistant_stop_masks(
-                        rendered_completed,
-                        assistant_mask[: len(rendered_completed)],
-                        resolved_tokenizer,
-                    )
-                    tail_end = end
-                    while tail_end < len(tail_mask) and tail_mask[tail_end]:
-                        tail_end += 1
-                    if tail_end > end and tail_stops[tail_end - 1]:
-                        end = tail_end
-            replacements.append(
-                (
-                    start,
-                    end,
-                    full_exact,
-                    full_logprobs
-                    if len(full_logprobs) == len(full_exact)
-                    else [math.nan] * len(full_exact),
-                    True,
-                    _sampled_source_key(source),
-                    source,
-                    None,
-                )
-            )
-            if (
-                message_index < len(messages) - 1
-                and isinstance(source_exchange, ChatCompletionsExchange)
-                and rendered[start:end] != full_exact
-            ):
-                _warn_prefix_retokenization()
-            search_cursor = end
-            continue
-
-        replacement_start = len(replacements)
-        for part_index, (part, text) in enumerate(parts):
-            if not sampled and text not in sampled_texts:
-                continue
-            local = part_ids(text)
-            if not local:
-                continue
-            proven_part_bounds = marked_part_bounds.get(message_index)
-            span = (
-                proven_part_bounds[part_index]
-                if proven_part_bounds is not None
-                else next(iter(locations(local, search_cursor)), None)
-            )
-            if span is None:
-                if not sampled:
-                    continue
-                raise ValueError(
-                    "Could not locate a history message in the rendered history"
-                )
-            if sampled_bounds is not None:
-                lower, upper = sampled_bounds
-                if proven_part_bounds is None:
-                    bounded_matches = [
-                        match
-                        for match in locations(local, max(lower, search_cursor))
-                        if match[1] <= upper
-                    ]
-                    if len(bounded_matches) != 1:
-                        raise ValueError(
-                            "Could not uniquely locate a sampled history message in "
-                            "the rendered history"
-                        )
-                    span = bounded_matches[0]
-            start, end = span
-            search_cursor = end
-            if not sampled:
-                continue
-            assert source is not None
-            exact, logprobs = _chat_source_tokens(
-                source,
-                text,
-                part=part,
-                full_tokens=(full_exact, full_logprobs),
-            )
-            if (
-                exact is None
-                and corrected_message_end is not None
-                and proven_part_bounds is not None
-            ):
-                raise ValueError(
-                    "Could not preserve exact sampled tokens for a corrected history part"
-                )
-            if (
-                exact is not None
-                and corrected_message_end is not None
-                and proven_part_bounds is not None
-                and sampled_bounds is not None
-                and start != sampled_bounds[0]
-            ):
-                raise ValueError("Could not prove the complete sampled part start")
-            if exact is not None and rendered[start : start + len(exact)] == exact:
-                end = start + len(exact)
-                if corrected_message_end is not None and end > corrected_message_end:
-                    raise ValueError(
-                        "Exact sampled tokens extend beyond their proven message bounds"
-                    )
-                search_cursor = end
-            elif (
-                exact is not None
-                and corrected_message_end is not None
-                and _sampled_stop_suffix(
-                    exact,
-                    source=source,
-                    source_key=_sampled_source_key(source),
-                    tokenizer=resolved_tokenizer,
-                )
-            ):
-                # Use the proven message end to replace its rendered stop,
-                # just as the whole-message path does for sampled stops.
-                tail_mask, tail_stops = _assistant_stop_masks(
-                    rendered[:corrected_message_end],
-                    assistant_mask[:corrected_message_end],
-                    resolved_tokenizer,
-                )
-                tail_end = end
-                while tail_end < len(tail_mask) and tail_mask[tail_end]:
-                    tail_end += 1
-                if tail_end > end and tail_stops[tail_end - 1]:
-                    end = tail_end
-                    search_cursor = end
-            if (
-                exact is not None
-                and corrected_message_end is not None
-                and _source_stop_evidence(source, _sampled_source_key(source))[0]
-                != "length"
-            ):
-                # Source evidence assigns STOP; retain synthetic length boundaries.
-                stop_mask[start:end] = [False] * (end - start)
-            replacement = exact if exact is not None else rendered[start:end]
-            if exact is None and not logprobs:
-                exchange = getattr(source, "exchange", None)
-                if isinstance(
-                    exchange,
-                    (ChatCompletionsExchange, ResponsesExchange, MessagesExchange),
-                ):
-                    evidence = _visible_token_evidence(
-                        tokenizer,
-                        exchange,
-                        source=source,
-                        sampled_text=text,
-                    )
-                    if evidence is not None:
-                        replacement, logprobs = evidence
-                    else:
-                        logprobs = (
-                            _align_visible_logprobs(
-                                tokenizer,
-                                replacement,
-                                exchange,
-                                source=source,
-                                sampled_text=text,
-                            )
-                            or []
-                        )
-            replacements.append(
-                (
-                    start,
-                    end,
-                    replacement,
-                    logprobs
-                    if len(logprobs) == len(replacement)
-                    else [math.nan] * len(replacement),
-                    exact is not None,
-                    _sampled_source_key(source),
-                    source,
-                    span[1]
-                    if corrected_message_end is not None
-                    and proven_part_bounds is not None
-                    else None,
-                )
-            )
-        message_replacements = replacements[replacement_start:]
-        if (
-            sampled
-            and message_replacements
-            and all(part == "tool_call" for part, _ in parts)
-            and not (
-                all(replacement[4] for replacement in message_replacements)
-                and all(
-                    left[1] == right[0]
-                    for left, right in zip(
-                        message_replacements,
-                        message_replacements[1:],
-                        strict=False,
-                    )
-                )
-            )
-        ):
-            start = message_replacements[0][0]
-            end = message_replacements[-1][1]
-            del replacements[replacement_start:]
-            replacements.append(
-                (
-                    start,
-                    end,
-                    rendered[start:end],
-                    [math.nan] * (end - start),
-                    False,
-                    message_replacements[0][5],
-                    message_replacements[0][6],
-                    None,
-                )
-            )
-        if sampled and not parts and full_exact is not None:
-            raise ValueError(
-                "Could not locate exact sampled output in the rendered history"
-            )
-
-    token_ids: list[int] = []
-    logprobs: list[float] = []
-    flags: list[TokenFlag] = []
-    source_keys: list[_SampledSourceKey | None] = []
-    sources: dict[_SampledSourceKey, object] = {}
-    cursor = 0
-    for (
-        start,
-        end,
-        replacement,
-        replacement_logprobs,
-        exact,
-        source_key,
-        source,
-        part_end,
-    ) in sorted(replacements, key=lambda item: (item[0], item[1])):
-        synthetic_stop_token: int | None = None
-        if exact and _source_stop_evidence(source, source_key)[0] == "length":
-            synthetic_stop = next(
-                (index for index in range(start, end) if stop_mask[index]), None
-            )
-            if synthetic_stop is not None:
-                if part_end is not None and synthetic_stop + 1 < part_end:
-                    if end < part_end:
-                        raise ValueError(
-                            "Exact sampled tokens do not cover the proven history part"
-                        )
-                    # Keep the boundary without replaying replaced visible content.
-                    synthetic_stop_token = rendered[synthetic_stop]
-                    end = part_end
-                else:
-                    end = synthetic_stop
-        if start < cursor:
-            raise ValueError("Rendered assistant source spans overlap")
-        token_ids.extend(rendered[cursor:start])
-        logprobs.extend([math.nan] * (start - cursor))
-        flags.extend(
-            _rendered_flag(
-                assistant and not length_stop,
-                output and not length_stop,
-                stop,
-            )
-            for assistant, output, stop, length_stop in zip(
-                assistant_mask[cursor:start],
-                output_mask[cursor:start],
-                stop_mask[cursor:start],
-                length_stop_mask[cursor:start],
-                strict=True,
-            )
-        )
-        source_keys.extend([None] * (start - cursor))
-        try:
-            replacement_stop_mask = _translate_token_mask(
-                rendered[start:end], replacement, stop_mask[start:end]
-            )
-        except ValueError:
-            replacement_stop_mask = [False] * len(replacement)
-        if synthetic_stop_token is not None:
-            replacement_stop_mask = [False] * len(replacement)
-        replacement_length_stop_mask = (
-            [False] * len(replacement)
-            if synthetic_stop_token is not None
-            else _translate_token_mask(
-                rendered[start:end], replacement, length_stop_mask[start:end]
-            )
-        )
-        if exact:
-            token_ids.extend(replacement)
-            logprobs.extend(replacement_logprobs)
-            replacement_flags = [
-                TokenFlag.EXACT
-                | TokenFlag.SAMPLED
-                | TokenFlag.ASSISTANT
-                | TokenFlag.OUTPUT
-                | (TokenFlag.STOP if stop else TokenFlag(0))
-                for stop in replacement_stop_mask
-            ]
-            if part_end is not None:
-                _mark_sampled_stops(
-                    replacement,
-                    replacement_flags,
-                    [source_key] * len(replacement),
-                    {source_key: source},
-                    tokenizer=resolved_tokenizer,
-                )
-            flags.extend(replacement_flags)
-            source_keys.extend([source_key] * len(replacement))
-            sources[source_key] = source
-        else:
-            token_ids.extend(replacement)
-            logprobs.extend(
-                replacement_logprobs
-                if len(replacement_logprobs) == len(replacement)
-                else [math.nan] * len(replacement)
-            )
-            flags.extend(
-                _rendered_flag(
-                    not length_stop,
-                    not length_stop,
-                    stop,
-                )
-                for stop, length_stop in zip(
-                    replacement_stop_mask,
-                    replacement_length_stop_mask,
-                    strict=True,
-                )
-            )
-            source_keys.extend([None] * len(replacement))
-        if synthetic_stop_token is not None:
-            token_ids.append(synthetic_stop_token)
-            logprobs.append(math.nan)
-            flags.append(TokenFlag.STOP)
-            source_keys.append(None)
-        cursor = end
-    token_ids.extend(rendered[cursor:])
-    logprobs.extend([math.nan] * (len(rendered) - cursor))
-    flags.extend(
-        _rendered_flag(
-            assistant and not length_stop,
-            output and not length_stop,
-            stop,
-        )
-        for assistant, output, stop, length_stop in zip(
-            assistant_mask[cursor:],
-            output_mask[cursor:],
-            stop_mask[cursor:],
-            length_stop_mask[cursor:],
-            strict=True,
-        )
-    )
-    source_keys.extend([None] * (len(rendered) - cursor))
-    exact_coverage_length = 0
-    for source in history.message_sources:
-        if (
-            source is None
-            or not _source_is_sampled(source)
-            or not source_matches_context(source)
-        ):
-            continue
-        source_prompt = source_prompt_tokens(source)
-        if (
-            source_prompt is not None
-            and token_ids[: len(source_prompt)] == source_prompt
-        ):
-            exact_coverage_length = max(exact_coverage_length, len(source_prompt))
-    for index in range(exact_coverage_length):
-        flags[index] |= TokenFlag.EXACT
-    if history.model is None:
-        raise ValueError("History tokenization requires a model")
-    _mark_sampled_stops(
-        token_ids,
-        flags,
-        source_keys,
-        sources,
-        tokenizer=resolved_tokenizer,
-    )
-    tokenized = TokenizedHistory(
-        history=history,
-        model=history.model,
-        tokens=token_ids,
-        logprobs=logprobs,
-        flags=flags,
-    )
-    if _trace is not None:
-        _trace.set(tokenized, source_keys, sources)
-    return tokenized
+def _tokenize_chat_view(
+    history: ChatCompletionsHistory,
+    *,
+    base_model: str | None,
+    tokenizer: Tokenizer | None,
+    chat_template: str | None,
+    chat_template_kwargs: Mapping[str, object] | None,
+    _projection_matches: bool | None = None,
+    _trace: _TraceBuilder | None = None,
+) -> TokenizedHistory:
+    return _ChatViewTokenizer(
+        history,
+        base_model=base_model,
+        tokenizer=tokenizer,
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+        _projection_matches=_projection_matches,
+        _trace=_trace,
+    ).run()
 
 
 def _tokenize_completions_token_history(
