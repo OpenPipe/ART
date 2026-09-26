@@ -93,7 +93,7 @@ def test_recovery_keeps_profile_demand_above_cold_head_floor(monkeypatch):
     )
 
 
-def test_real_head_split_fits_before_cache_recovery(monkeypatch):
+def test_real_head_fitting_split_after_cache_recovery_denial(monkeypatch):
     from test_trainer_rank_split import _recording_executor
 
     from art.trainer_rank import TrainerRank, _impl
@@ -124,11 +124,18 @@ def test_real_head_split_fits_before_cache_recovery(monkeypatch):
     monkeypatch.setattr(
         r, "_available_memory_bytes", lambda: TrainerRank._available_memory_bytes(probe)
     )
-    monkeypatch.setattr(
-        r, "_try_cache_recovery", lambda *a, **kw: pytest.fail("Split already fits")
-    )
+    denied_check = r._memory_check(whole)
+    assert not denied_check.fits
+    recovery_attempts = []
+
+    def deny_recovery(check, *, require_unused_cache=False, **kwargs):
+        recovery_attempts.append((check, require_unused_cache))
+        return False
+
+    monkeypatch.setattr(r, "_try_cache_recovery", deny_recovery)
     executed = _recording_executor(monkeypatch, r)
     batches = list(r.forward_micro_batches([requests]))
+    assert recovery_attempts == [(denied_check, True)]
     assert len(batches) == 1 and batches[0].stats.subforward_count == 2
     assert batches[0].stats.global_count == 1 and len(executed) == 2
     assert [

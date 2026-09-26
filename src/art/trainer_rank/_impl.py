@@ -626,6 +626,7 @@ class _CandidateMicroBatch(Generic[ForwardInputsT]):
     rejected_candidates: int
     cold_start: bool
     fallback: _CandidateMicroBatch[ForwardInputsT] | None = None
+    recovery_target: tuple["_FlatForwardPlan", _MemoryCheck] | None = None
 
 
 class _SlotGraphSentinel(torch.autograd.Function):
@@ -3175,6 +3176,7 @@ class TrainerRank:
         checkpoint: AdapterSelection,
         refusal_prefix: str,
         ensure_slots: bool = True,
+        unsplit_targets: list[tuple[_FlatForwardPlan, _MemoryCheck]] | None = None,
     ) -> tuple[_AnyForwardPlan, _MemoryCheck] | _ForwardRefusal:
         """Find an admissible plan: unsplit first, then the bounded split ladder.
 
@@ -3199,6 +3201,8 @@ class TrainerRank:
         )
         check = self._memory_check(plan)
         if check.fits:
+            if unsplit_targets is not None:
+                unsplit_targets[:] = [(plan, check)]
             return plan, check
         best = (plan, check)
         # Best effort before splitting: the memory-minimal (full sharing)
@@ -3208,9 +3212,15 @@ class TrainerRank:
         )
         check = self._memory_check(plan)
         if check.fits:
+            if unsplit_targets is not None:
+                unsplit_targets[:] = [(plan, check)]
             return plan, check
         if check.estimated_required_bytes < best[1].estimated_required_bytes:
             best = (plan, check)
+        if unsplit_targets is not None:
+            # Preserve the exact already-priced unsplit operand before the
+            # ladder can replace best with a smaller internal split.
+            unsplit_targets[:] = [best]
         request_count = len(requests)
         if request_count == 1:
             return _ForwardRefusal(
@@ -5493,11 +5503,13 @@ class TrainerRank:
                     "smallest DP microbatch is predicted to exceed available memory"
                 )
                 admission_error: BaseException | None = None
+                unsplit_targets: list[tuple[_FlatForwardPlan, _MemoryCheck]] = []
                 try:
                     found = self._find_admissible_forward(
                         list(_flatten(local_inputs)),
                         checkpoint=checkpoint,
                         refusal_prefix=refusal_prefix,
+                        unsplit_targets=unsplit_targets,
                     )
                 except BaseException as exc:
                     admission_error, found = exc, None
@@ -5507,6 +5519,11 @@ class TrainerRank:
                         if admission_error is not None
                         else 1
                         if isinstance(found, _ForwardRefusal)
+                        else 3
+                        if isinstance(
+                            cast("tuple[_AnyForwardPlan, _MemoryCheck]", found)[0],
+                            _FlatForwardPlan,
+                        )
                         else 2
                     )
                 except BaseException:
@@ -5528,6 +5545,10 @@ class TrainerRank:
                         "to find a feasible split for its share",
                     )
                 split_plan, split_check = found
+                # The existing MIN outcome carries the split bit too. Flat and
+                # empty local shares retain their exact target when any peer
+                # splits; pure search never releases cache itself.
+                recovery_target = unsplit_targets[0] if outcome == 2 else None
                 return _CandidateMicroBatch(
                     inputs=local_inputs,
                     indices=indices,
@@ -5536,6 +5557,7 @@ class TrainerRank:
                     stats_global_count=min_width,
                     rejected_candidates=len(rejected_widths),
                     cold_start=True,
+                    recovery_target=recovery_target,
                 )
             if first.cold_start:
                 return first
@@ -7069,7 +7091,7 @@ class TrainerRank:
         return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
     def _admission_outcome(self, local: int) -> int:
-        """Existing world fallback MIN: error=0, refusal=1, fit=2."""
+        """World fallback MIN: error=0, refusal=1, split fit=2, flat fit=3."""
         if not (dist.is_available() and dist.is_initialized()):
             return local
         value = torch.tensor(
@@ -7246,6 +7268,8 @@ class TrainerRank:
                     decision = _planner_evidence.current(self)
                     if decision is not None:
                         decision.outcome = "admitted_oversized"
+                    if isinstance(selected, _CandidateMicroBatch):
+                        selected = replace(selected, recovery_target=None)
                     return selected
             decision = _planner_evidence.current(self)
             if decision is not None:
@@ -7278,6 +7302,8 @@ class TrainerRank:
             if sync_across_dp:
                 check = self._refresh_memory_check(check, sync_across_dp=True)
             if check.fits:
+                if isinstance(value, _CandidateMicroBatch):
+                    value = replace(value, recovery_target=None)
                 return update(value, check)
             refused = _ForwardRefusal(
                 plan,
@@ -7308,6 +7334,44 @@ class TrainerRank:
         value = search()
         result = finish(value)
         if result is not None:
+            target = (
+                value.recovery_target
+                if isinstance(value, _CandidateMicroBatch)
+                else None
+            )
+            if target is not None:
+                with self._cache_recovery_episode() as (owner, started):
+                    _planner_evidence.record(
+                        self,
+                        "recovery",
+                        "before_internal_split",
+                        target_required_bytes=target[1].estimated_required_bytes,
+                        target_sample_ordinal=(
+                            None
+                            if target[1].sample is None
+                            else target[1].sample.ordinal
+                        ),
+                        target_packed_tokens=target[0].packed_tokens,
+                    )
+                    if self._try_cache_recovery(
+                        target[1],
+                        sync_across_dp=sync_across_dp,
+                        owner=owner,
+                        started=started,
+                        require_unused_cache=True,
+                    ):
+                        result = finish(search())
+                    else:
+                        # Optional recovery may decline; preserve the fitting
+                        # split, refreshing its original operand, not its price.
+                        result = finish(result)
+                        if result is None:
+                            result = finish(search())
+                    if result is not None:
+                        return result
+                    assert refused is not None
+                    self._snapshot_planning_telemetry(refused.plan, refused.check)
+                    return reject()  # Never a second release in this admission.
             return result
         assert refused is not None
         original = refused.error(context)
@@ -7527,6 +7591,7 @@ class TrainerRank:
         owner: object,
         started: float | None,
         handoff_grad: bool = False,
+        require_unused_cache: bool = False,
     ) -> bool:
         state = self._recovery_state()
         backward = self._backward_work()
@@ -7616,11 +7681,11 @@ class TrainerRank:
             ):
                 free, total = torch.cuda.mem_get_info(self.device)
                 needed = int(free) < required + int(total * _MEMORY_RESERVE_FRACTION)
-                if check is None:
+                if check is None or require_unused_cache:
                     needed &= int(torch.cuda.memory_reserved(self.device)) > int(
                         torch.cuda.memory_allocated(self.device)
                     )
-                elif os.environ.get(_TEST_HOOKS_ENV) == "1":
+                if check is not None and os.environ.get(_TEST_HOOKS_ENV) == "1":
                     limit = os.environ.get(_TEST_MEMORY_LIMIT_ENV)
                     if limit:
                         cap_blocks = required > max(
