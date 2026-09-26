@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
 import hashlib
+import json
 import logging
 import math
 import os
@@ -69,6 +70,7 @@ from art.trainer_rank._prefix_tree_planner import (
     CanonicalPrefixTree,
     PrefixTreeLayout,
     build_canonical_prefix_tree,
+    canonical_token_rows_fingerprint,
     prefix_tree_layout_candidates,
     select_prefix_tree_layout,
 )
@@ -954,6 +956,7 @@ class _ForwardGroupPlan:
     items: tuple[_ForwardItem, ...]
     packed: PrefixTreePack
     layout: PrefixTreeLayout | None = None
+    input_row_fingerprints: tuple[tuple[int, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -4272,6 +4275,7 @@ class TrainerRank:
             else (tuple(range(plan.request_count)),)
         )
         self._last_forward_telemetry_snapshot = {
+            **self._packing_fingerprints(plan),
             "planning_ms": self._planning_seconds_accum * 1_000.0,
             "speculative_planning_ms": speculative_seconds * 1_000.0,
             "selected_max_depth": plan.selected_max_depth,
@@ -4296,6 +4300,16 @@ class TrainerRank:
         graph plus the largest subforward's ephemeral share). A call refused
         with ``TrainerRankMemoryError`` is still reflected, with the binding
         check that refused it.
+
+        ``packing_plan_sha256`` commits to ordered local prefix-pack geometry
+        and TP padding, before CP dispatch. ``subforward_packing_plan_sha256``
+        lists the child commitments in execution order, with
+        ``subforward_request_indices`` supplying the outer mapping. These are
+        not unique event IDs: identical child geometries share a digest.
+        ``input_tokens_sha256`` recomposes existing row hashes in original flat
+        request order, independent of packing; it is unavailable if any request
+        was inactive. These are planning-time commitments, not model/target
+        label/caller loss-mask fingerprints or evidence of completed execution.
         """
 
         if self._last_forward_telemetry_snapshot is None:
@@ -5861,6 +5875,13 @@ class TrainerRank:
                         request_indices=tuple(group_indices),
                         items=items,
                         packed=packed,
+                        input_row_fingerprints=tuple(
+                            zip(
+                                tree.sequence_lengths,
+                                tree.row_fingerprints,
+                                strict=True,
+                            )
+                        ),
                         layout=layout
                         if getattr(
                             getattr(self, "_planner_reporter", None),
@@ -6631,6 +6652,7 @@ class TrainerRank:
     def _telemetry_signature(cls, plan: _AnyForwardPlan) -> dict[str, object]:
         return {
             **cls._telemetry_plan_signature(plan),
+            **cls._packing_fingerprints(plan),
             "request_count": plan.request_count,
             "packed_tokens": plan.packed_tokens,
             "logical_tokens": plan.logical_tokens,
@@ -6640,6 +6662,84 @@ class TrainerRank:
             "group_segment_counts": tuple(
                 len(group.packed.segments) for group in plan.groups
             ),
+        }
+
+    @staticmethod
+    def _packing_fingerprints(plan: _AnyForwardPlan) -> dict[str, object]:
+        """Host metadata only: never copy/read tensor values or query CUDA.
+
+        Geometry excludes content, checkpoint names and later CP kernel plans.
+        Input hashes reuse canonical little-endian int64 row commitments; no
+        additional token hashing is done, including for rejected candidates.
+        Keep this high-cardinality evidence outside compile-plan deduplication.
+        """
+
+        def digest(value: object) -> str:
+            return hashlib.sha256(
+                json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest()
+
+        split = isinstance(plan, _SplitForwardPlan)
+        children = plan.subforwards if split else (plan,)
+        mappings = (
+            plan.request_indices if split else (tuple(range(plan.request_count)),)
+        )
+        rows: list[tuple[int, str] | None] = [None] * plan.request_count
+        fingerprints = []
+        for child, mapping in zip(children, mappings, strict=True):
+            groups = []
+            tp = child.signature.topology[1]
+            for group in child.groups:
+                length = int(group.packed.tokens.numel())
+                groups.append(
+                    (
+                        group.request_indices,
+                        group.grad_enabled,
+                        length,
+                        ((length + tp - 1) // tp) * tp,
+                        tuple(
+                            (
+                                segment.sequence_indices,
+                                segment.start,
+                                segment.end,
+                                segment.packed_start,
+                                segment.group_id,
+                                segment.parent_id,
+                            )
+                            for segment in group.packed.segments
+                        ),
+                    )
+                )
+                for index, row in zip(
+                    group.request_indices, group.input_row_fingerprints, strict=False
+                ):
+                    rows[mapping[index]] = row
+            fingerprints.append(
+                digest(
+                    (
+                        "art.prefix-pack/v1",
+                        child.signature.topology,
+                        child.request_count,
+                        groups,
+                    )
+                )
+            )
+        complete_rows = tuple(row for row in rows if row is not None)
+        return {
+            "packing_fingerprint_schema": "art.prefix-pack/v1",
+            "packing_plan_sha256": digest(
+                (
+                    "art.prefix-pack-split/v1",
+                    plan.request_count,
+                    tuple(zip(mappings, fingerprints, strict=True)),
+                )
+            )
+            if split
+            else fingerprints[0],
+            "subforward_packing_plan_sha256": tuple(fingerprints),
+            "input_tokens_sha256": canonical_token_rows_fingerprint(complete_rows)
+            if len(complete_rows) == plan.request_count
+            else None,
         }
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
