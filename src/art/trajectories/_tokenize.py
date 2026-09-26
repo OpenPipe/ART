@@ -4664,80 +4664,7 @@ class _ChatViewTokenizer:
         self.output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
 
     def run(self) -> TokenizedHistory:
-        self.rendered = self._raw_render(
-            self.messages, add_generation_prompt=not self.ends_with_assistant
-        )
-        if any(
-            message.get("role") == "assistant"
-            and isinstance(message.get("reasoning"), str)
-            and message["reasoning"]
-            and not message.get("reasoning_content")
-            for message in self.messages
-        ):
-            without_reasoning = deepcopy(self.messages)
-            for message in without_reasoning:
-                message.pop("reasoning", None)
-            if (
-                self._probe_render(
-                    without_reasoning,
-                    add_generation_prompt=not self.ends_with_assistant,
-                )
-                == self.rendered
-            ):
-                aliased_messages = deepcopy(self.messages)
-                for message in aliased_messages:
-                    reasoning = message.pop("reasoning", None)
-                    if isinstance(reasoning, str) and reasoning:
-                        message.setdefault("reasoning_content", reasoning)
-                aliased_render = self._probe_render(
-                    aliased_messages,
-                    add_generation_prompt=not self.ends_with_assistant,
-                )
-                if aliased_render is not None:
-                    self.messages = aliased_messages
-                    self.rendered = aliased_render
-        if any(
-            message.get("role") == "assistant"
-            and isinstance(message.get("refusal"), str)
-            and message["refusal"]
-            for message in self.messages
-        ):
-            without_refusals = deepcopy(self.messages)
-            for message in without_refusals:
-                message.pop("refusal", None)
-            if (
-                self._probe_render(
-                    without_refusals,
-                    add_generation_prompt=not self.ends_with_assistant,
-                )
-                == self.rendered
-            ):
-                merged_messages = deepcopy(self.messages)
-                for message in merged_messages:
-                    refusal = message.pop("refusal", None)
-                    if not isinstance(refusal, str) or not refusal:
-                        continue
-                    content = message.get("content")
-                    if isinstance(content, str):
-                        message["content"] = content + refusal
-                    elif isinstance(content, list):
-                        message["content"] = [
-                            *content,
-                            {"type": "text", "text": refusal},
-                        ]
-                    elif content is None:
-                        message["content"] = refusal
-                    else:
-                        raise ValueError(
-                            "Cannot render an assistant refusal with this content shape"
-                        )
-                merged_render = self._probe_render(
-                    merged_messages,
-                    add_generation_prompt=not self.ends_with_assistant,
-                )
-                if merged_render is not None:
-                    self.messages = merged_messages
-                    self.rendered = merged_render
+        self._render_messages()
         direct_render: list[int] = []
         self.direct_bounds: list[tuple[int, int]] = []
         for message in self.messages:
@@ -6281,6 +6208,82 @@ class _ChatViewTokenizer:
             )
         except Exception:
             return None
+
+    def _render_messages(self) -> None:
+        self.rendered = self._raw_render(
+            self.messages, add_generation_prompt=not self.ends_with_assistant
+        )
+        if any(
+            message.get("role") == "assistant"
+            and isinstance(message.get("reasoning"), str)
+            and message["reasoning"]
+            and not message.get("reasoning_content")
+            for message in self.messages
+        ):
+            without_reasoning = deepcopy(self.messages)
+            for message in without_reasoning:
+                message.pop("reasoning", None)
+            if (
+                self._probe_render(
+                    without_reasoning,
+                    add_generation_prompt=not self.ends_with_assistant,
+                )
+                == self.rendered
+            ):
+                aliased_messages = deepcopy(self.messages)
+                for message in aliased_messages:
+                    reasoning = message.pop("reasoning", None)
+                    if isinstance(reasoning, str) and reasoning:
+                        message.setdefault("reasoning_content", reasoning)
+                aliased_render = self._probe_render(
+                    aliased_messages,
+                    add_generation_prompt=not self.ends_with_assistant,
+                )
+                if aliased_render is not None:
+                    self.messages = aliased_messages
+                    self.rendered = aliased_render
+        if any(
+            message.get("role") == "assistant"
+            and isinstance(message.get("refusal"), str)
+            and message["refusal"]
+            for message in self.messages
+        ):
+            without_refusals = deepcopy(self.messages)
+            for message in without_refusals:
+                message.pop("refusal", None)
+            if (
+                self._probe_render(
+                    without_refusals,
+                    add_generation_prompt=not self.ends_with_assistant,
+                )
+                == self.rendered
+            ):
+                merged_messages = deepcopy(self.messages)
+                for message in merged_messages:
+                    refusal = message.pop("refusal", None)
+                    if not isinstance(refusal, str) or not refusal:
+                        continue
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        message["content"] = content + refusal
+                    elif isinstance(content, list):
+                        message["content"] = [
+                            *content,
+                            {"type": "text", "text": refusal},
+                        ]
+                    elif content is None:
+                        message["content"] = refusal
+                    else:
+                        raise ValueError(
+                            "Cannot render an assistant refusal with this content shape"
+                        )
+                merged_render = self._probe_render(
+                    merged_messages,
+                    add_generation_prompt=not self.ends_with_assistant,
+                )
+                if merged_render is not None:
+                    self.messages = merged_messages
+                    self.rendered = merged_render
 
     def _part_ids(self, text: str) -> list[int]:
         if text not in self.part_ids_cache:
