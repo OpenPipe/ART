@@ -14,8 +14,9 @@ from test_trainer_rank_moe_memory import _rank as _moe_rank
 from test_trainer_rank_moe_memory import layer  # noqa: F401
 import torch
 
-from art.trainer_rank import _impl
+from art.trainer_rank import ForwardInput, _impl
 from art.trainer_rank._impl import (
+    Unset,
     _dense_mlp_recompute_bytes_per_token,
     _GroupLayout,
     _MemorySignature,
@@ -193,6 +194,12 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "unwrapped_fc1",
         "unfused_norm",
         "rank",
+        "mixer_adapter_rank",
+        "mixer_child_hook",
+        "mixer_child_forward",
+        "norm_delegate",
+        "slot_selector",
+        "active_selector",
         "chunks",
     ],
 )
@@ -203,6 +210,7 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     from art.megatron import lora as lora_module
+    from art.megatron.gdn.operator import _empty_safe_norm_forward
 
     layers = [_dense_layer(gdn=index != 1) for index in range(3)]
     for wrapped in layers:
@@ -227,6 +235,19 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
             return super().forward(*args, **kwargs)
 
     custom = MethodType(lambda self, *a, **k: None, layer)
+
+    def mixer_child(edit):
+        # A child the mixer runs, such as its core attention or a norm.
+        def apply():
+            child = torch.nn.LayerNorm(4)
+            edit(child)
+            layer.self_attention.core_attention = child
+
+        return apply
+
+    def foreign_norm_delegate(norm):
+        norm._art_empty_safe_norm_physical_forward = MethodType(lambda self, x: x, norm)
+        norm.forward = MethodType(_empty_safe_norm_forward, norm)
 
     edits = {
         "fc1_hook": hook(mlp.linear_fc1),
@@ -284,6 +305,23 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         ),
         "rank": lambda: setattr(
             mlp.linear_fc1, "up_lora", _adapter(lora_module, HIDDEN, FFN, 512)
+        ),
+        "mixer_adapter_rank": lambda: setattr(
+            layer.self_attention, "qkv_lora", _adapter(lora_module, HIDDEN, HIDDEN, 512)
+        ),
+        "mixer_child_hook": mixer_child(
+            lambda child: child.register_forward_hook(lambda *args: None)
+        ),
+        "mixer_child_forward": mixer_child(
+            lambda child: setattr(child, "forward", MethodType(lambda s, x: x, child))
+        ),
+        "norm_delegate": mixer_child(foreign_norm_delegate),
+        # Execution selects tensors through the instance; the gate must too.
+        "slot_selector": lambda: setattr(
+            mlp.linear_fc1.gate_lora, "_slot", lambda ref: None
+        ),
+        "active_selector": lambda: setattr(
+            mlp.linear_fc1.gate_lora, "active_lora_tensors", lambda: None
         ),
         "chunks": lambda: None,
     }
@@ -500,3 +538,117 @@ def test_the_traced_qwen_attention_mixer_is_accepted():
         STAGE,
         NO_GRAD,
     )
+
+
+def test_every_adapter_the_layer_runs_is_priced_beside_arts_norm_wrapper():
+    from art.megatron import lora as lora_module
+    from art.megatron.gdn.operator import _empty_safe_norm_forward
+
+    layers = [_dense_layer(gdn=index != 2) for index in range(3)]
+    for layer in layers:
+        _wrap_like_art(layer)
+    # A mixer adapter keeps its rank-wide products beside the MLP's.
+    layers[1].self_attention.qkv_lora = _adapter(lora_module, HIDDEN, HIDDEN, 32)
+    # ART's empty-safe norm wrapper still calls the norm's own forward.
+    norm = torch.nn.LayerNorm(HIDDEN)
+    norm._art_empty_safe_norm_physical_forward = norm.forward
+    norm.forward = MethodType(_empty_safe_norm_forward, norm)
+    layers[0].self_attention.q_layernorm = norm
+    ranks = 2 * (3 * RANK + 32)
+    assert _dense_mlp_recompute_bytes_per_token([_dense_model(layers)]) == (
+        (13 * FFN + ranks) * 2,
+        (6 * FFN + 6 * HIDDEN + ranks) * 2,
+    )
+
+
+def test_named_slots_are_read_through_the_lookup_execution_uses():
+    from art.megatron import lora as lora_module
+
+    layers = [_dense_layer(gdn=index == 0) for index in range(2)]
+    for layer in layers:
+        _wrap_like_art(layer)
+    model = _dense_model(layers)
+    policy = rank()._slot_ref("policy")
+    adapters = [
+        m for layer in layers for m in layer.modules() if type(m) is lora_module.LoRA
+    ]
+
+    def load(adapter, width):
+        slot = _module(lora_module.LoRASlot)
+        slot.A_T = torch.nn.Parameter(
+            torch.empty(adapter.A_T.shape[0], width, dtype=torch.bfloat16)
+        )
+        slot.B_T = torch.nn.Parameter(
+            torch.empty(width, adapter.B_T.shape[1], dtype=torch.bfloat16)
+        )
+        adapter._slot_keys = {policy: "slot_0"}
+        adapter._slot_modules = torch.nn.ModuleDict({"slot_0": slot})
+
+    for adapter in adapters:
+        load(adapter, 16)
+    widths = (13 * FFN + 2 * 3 * 16) * 2, (6 * FFN + 6 * HIDDEN + 2 * 3 * 16) * 2
+    assert _dense_mlp_recompute_bytes_per_token([model], policy) == widths
+    # A slot without an adapter on one module runs the base output there.
+    for layer in layers:
+        layer.mlp.linear_fc1.up_lora._slot_keys = {}
+    assert _dense_mlp_recompute_bytes_per_token([model], policy) == (
+        (13 * FFN + 2 * 2 * 16) * 2,
+        (6 * FFN + 6 * HIDDEN + 2 * 2 * 16) * 2,
+    )
+    load(adapters[0], 300)  # Loaded wider than the priced rank.
+    assert _dense_mlp_recompute_bytes_per_token([model], policy) == (0, 0)
+
+
+@pytest.mark.parametrize("case", ["selective", "eval"])
+def test_dense_widths_need_the_checkpoint_floors_decoder(case):
+    """The no-grad discount must not outlive the floor that adds TE growth."""
+    r = _at_cp2(_dense_rank())
+    assert r._dense_mlp_widths() == (STAGE, NO_GRAD)
+    decoder = _impl._language_model(r.runtime.model[0]).decoder
+    if case == "selective":
+        decoder.config.recompute_granularity = "selective"
+    else:
+        decoder.train(False)
+    assert r._checkpoint_memory_floor(((12_000, False), (8_000, False))) == (0, 0)
+    assert r._dense_mlp_widths() == (0, 0)
+    discounted = _no_grad_required(r, (12_000, 8_000))
+    r._dense_recompute_bytes_per_token = r._dense_no_grad_bytes_per_token = 0
+    assert _no_grad_required(r, (12_000, 8_000)) == discounted
+
+
+def test_the_split_lower_bound_never_exceeds_the_exact_no_grad_price(monkeypatch):
+    r = _at_cp2(_dense_rank())
+    signature = _MemorySignature(CP2, (1, None), 2, (), False, (False, False))
+
+    def required(rows, lower_bound):
+        return r._subforward_cost(
+            packed_tokens=20_480,
+            output_bytes=0,
+            signature=signature,
+            logical_tokens=20_480,
+            group_rows=tuple((n, False) for n in rows),
+            lower_bound=lower_bound,
+        ).required
+
+    # Even shares bound the busiest rank's rows from below, but the largest
+    # group's share of today's floor falls as the other group's rows grow.
+    assert required((8192, 2048), False) > required((8192, 4096), False)
+    assert required((8192, 2048), True) <= required((8192, 4096), False)
+    # The split planner prices its optimistic rows in that mode.
+    modes = []
+    exact = r._subforward_cost
+    monkeypatch.setattr(
+        r,
+        "_subforward_cost",
+        lambda **kwargs: modes.append(kwargs.get("lower_bound")) or exact(**kwargs),
+    )
+    chunk = [
+        ForwardInput(
+            input_tokens=torch.arange(64), target_tokens=torch.arange(64), no_grad=True
+        )
+        for _ in range(2)
+    ]
+    r._split_chunk_lower_cost(
+        chunk, tuple(q.input_tokens for q in chunk), checkpoint=Unset
+    )
+    assert modes == [True]

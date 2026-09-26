@@ -1652,9 +1652,10 @@ def _dense_mlp_recompute_bytes_per_token(
     - A no-grad layer holds its three 2F FC1 tensors, residual, norm and CP
       gather rows: 263 KB per row measured, priced as 6F + 6H.
 
-    Both add the LoRA rank intermediates. Every decoder layer, and ``slot_ref``'s
-    adapters, must match the traced execution (ART's own GDN layer and mixer
-    wrappers included); otherwise (0, 0) keeps today's allowances.
+    Both add the rank intermediates of every adapter in the layer. Every
+    decoder layer, all it runs and ``slot_ref``'s adapters must match the
+    traced execution (ART's own GDN layer, mixer and norm wrappers included);
+    otherwise (0, 0) keeps today's allowances.
     """
     if len(model) != 1:
         return 0, 0
@@ -1677,6 +1678,7 @@ def _dense_mlp_recompute_bytes_per_token(
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
         from art.megatron.gdn.operator import (
+            _empty_safe_norm_forward,
             _gdn_island_layer_forward,
             _prefix_tree_forward,
         )
@@ -1793,8 +1795,30 @@ def _dense_mlp_recompute_bytes_per_token(
             or getattr(config, "glu_linear_offset", 0.0) != 0.0
         ):
             return 0, 0
-        for adapter in adapters:
-            tensors = _slot_lora_tensors(adapter, slot_ref)
+        # Everything else the layer runs, the mixer's children included, must
+        # be the traced execution too: no hooks, and no forward but ART's
+        # empty-safe norm wrapper. Every adapter must be an exact LoRA whose
+        # selector is the one execution uses, within the priced rank.
+        layer_rank = 0
+        for child in layer.modules():
+            if child is layer or child is mixer:
+                continue
+            if not (
+                plain(child)
+                or plain(
+                    child,
+                    _empty_safe_norm_forward,
+                    "_art_empty_safe_norm_physical_forward",
+                )
+            ):
+                return 0, 0
+            if not isinstance(child, LoRA):
+                continue
+            if type(child) is not LoRA or any(
+                name in vars(child) for name in ("_slot", "active_lora_tensors")
+            ):
+                return 0, 0
+            tensors = _slot_lora_tensors(child, slot_ref)
             if tensors is None:
                 if slot_ref is None or slot_ref.name is None:
                     return 0, 0
@@ -1809,10 +1833,12 @@ def _dense_mlp_recompute_bytes_per_token(
                 or not 0 < a.shape[1] <= _DENSE_LORA_RANK_LIMIT
             ):
                 return 0, 0
-            rank = max(rank, int(a.shape[1]))
+            layer_rank += int(a.shape[1])
+        rank = max(rank, layer_rank)
         width, hidden = max(width, ffn), max(hidden, size)
-    # Each of three adapters keeps its rank-wide input product and gradient.
-    adapters = 6 * rank
+    # Each of a layer's adapters, the mixer's too, keeps its rank-wide input
+    # product and gradient.
+    adapters = 2 * rank
     return (7 * width + 6 * width + adapters) * 2, (
         6 * width + 6 * hidden + adapters
     ) * 2
@@ -3936,6 +3962,7 @@ class TrainerRank:
             # The average CP load is an optimistic bound, not an admission cost.
             retained_tokens=(packed_tokens + signature.topology[2] - 1)
             // signature.topology[2],
+            lower_bound=True,
         )
         profile = self._memory_profiles.get(signature)
         if (
@@ -4393,46 +4420,28 @@ class TrainerRank:
             else routed * coefficient
         )
 
-    def _checkpoint_memory_floor(
-        self,
-        group_rows: tuple[tuple[int, bool], ...],
-        slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
-        routed_rows: tuple[int, ...] | None = None,
-        layouts: tuple[_GroupLayout, ...] | None = None,
-    ) -> tuple[int, int]:
-        """Conservative saved-boundary charge and one recomputed layer's workspace.
+    def _checkpoint_floor_decoder(self) -> Any | None:
+        """The decoder whose saved boundaries the checkpoint floor prices, or None.
 
-        ``routed_rows`` are each group's balanced dispatched rows per rank
-        (``_plan_group_routed_rows``); by default, its local rows. With
-        ``layouts`` (``_plan_group_layouts``), price every rank on its own CP
-        layouts instead of the busiest rank's rows (``_layout_checkpoint_floor``).
-        Count actual local full/uniform/1 boundaries, including aliases, rather
-        than claiming measured distinct storage. Only this call's new groups
-        enter the term; already-live graphs remain in the availability baseline.
-        The workspace is one MoE stage plus what else is live beside it.
-        Gradient groups recompute the layer, so its attention or GDN mixer
-        keeps its saved activations across the MoE stage. No-grad groups keep
-        decoder input, current layer input, its MLP residual and norm output.
-        Count these four row tensors separately from returned outputs, allowing
-        storage aliases. This is not a bound for custom preprocessing or all of
-        backward.
+        Every local layer recomputed full/uniform/1 in BF16 at TP1/PP1, with
+        no custom checkpointed forward. The dense widths require it too, so a
+        discount never outlives the floor that carries its TE growth.
         """
-        gradient_rows = sum(rows for rows, grad in group_rows if grad)
-        if not group_rows or len(self.runtime.model) != 1:
-            return 0, 0
+        if len(self.runtime.model) != 1:
+            return None
         try:
             decoder = _language_model(self.runtime.model[0]).decoder
         except (AttributeError, RuntimeError):
-            return 0, 0
+            return None
         try:
             from megatron.core.transformer.transformer_block import TransformerBlock
         except ModuleNotFoundError as error:
             if error.name != "megatron":
                 raise
-            return 0, 0
+            return None
 
         if type(decoder) is not TransformerBlock:
-            return 0, 0
+            return None
         config = decoder.config
         layers = len(decoder.layers)
         expected = {
@@ -4469,7 +4478,38 @@ class TrainerRank:
             or getattr(decoder, "_forward_hooks", None)
             or getattr(decoder, "_forward_pre_hooks", None)
         ):
+            return None
+        return decoder
+
+    def _checkpoint_memory_floor(
+        self,
+        group_rows: tuple[tuple[int, bool], ...],
+        slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+        routed_rows: tuple[int, ...] | None = None,
+        layouts: tuple[_GroupLayout, ...] | None = None,
+    ) -> tuple[int, int]:
+        """Conservative saved-boundary charge and one recomputed layer's workspace.
+
+        ``routed_rows`` are each group's balanced dispatched rows per rank
+        (``_plan_group_routed_rows``); by default, its local rows. With
+        ``layouts`` (``_plan_group_layouts``), price every rank on its own CP
+        layouts instead of the busiest rank's rows (``_layout_checkpoint_floor``).
+        Count actual local full/uniform/1 boundaries, including aliases, rather
+        than claiming measured distinct storage. Only this call's new groups
+        enter the term; already-live graphs remain in the availability baseline.
+        The workspace is one MoE stage plus what else is live beside it.
+        Gradient groups recompute the layer, so its attention or GDN mixer
+        keeps its saved activations across the MoE stage. No-grad groups keep
+        decoder input, current layer input, its MLP residual and norm output.
+        Count these four row tensors separately from returned outputs, allowing
+        storage aliases. This is not a bound for custom preprocessing or all of
+        backward.
+        """
+        gradient_rows = sum(rows for rows, grad in group_rows if grad)
+        decoder = self._checkpoint_floor_decoder() if group_rows else None
+        if decoder is None:
             return 0, 0
+        layers = len(decoder.layers)
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
         routed = (None,) * len(group_rows) if routed_rows is None else routed_rows
         if layouts is not None and all(grad for _, grad in group_rows):
@@ -4826,7 +4866,8 @@ class TrainerRank:
         slack is smaller, and above CP2 a rank's remote attention stages may
         keep more than the CP2 allowance; the per-boundary gradient allowance
         still covers both. Named slots are rechecked: their adapters must stay
-        within the priced rank.
+        within the priced rank. Only where the checkpoint floor prices the
+        decoder, which also carries the TE workspace growth.
         """
         stage = getattr(self, "_dense_recompute_bytes_per_token", 0)
         no_grad = getattr(self, "_dense_no_grad_bytes_per_token", 0)
@@ -4836,6 +4877,7 @@ class TrainerRank:
             or stage <= 0
             or no_grad <= 0
             or self._topology_key()[2] != 2
+            or self._checkpoint_floor_decoder() is None
         ):
             return 0, 0
         for ref in slot_refs or ():
@@ -4882,7 +4924,9 @@ class TrainerRank:
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
+        lower_bound: bool = False,
     ) -> _SubforwardCost:
+        """``lower_bound`` prices optimistic rows from below (split pruning)."""
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
@@ -4897,6 +4941,7 @@ class TrainerRank:
             checkpoint_floor=checkpoint_floor,
             retained_tokens=retained_tokens,
             include_checkpoint_input_gradient=False,
+            lower_bound=lower_bound,
         )
         checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
             group_rows, slot_refs, group_routed_rows, group_layouts
@@ -8582,6 +8627,7 @@ class TrainerRank:
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         include_checkpoint_input_gradient: bool = True,
+        lower_bound: bool = False,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -8605,10 +8651,16 @@ class TrainerRank:
             # (charged below): price the largest group's own physical rows at
             # the traced width. The per-packed-token floor is kept only as that
             # group's share, which it matched for one group on Qwen3.8-27B.
+            # That share falls as another group's rows grow, so a lower bound
+            # on optimistic rows keeps only the largest group's own rows.
             rows = [rows for rows, _ in group_rows]
-            static_compute = max(
-                max(rows) * no_grad,
-                -(-static_compute * max(rows) // max(1, sum(rows))),
+            static_compute = (
+                max(rows) * no_grad
+                if lower_bound
+                else max(
+                    max(rows) * no_grad,
+                    -(-static_compute * max(rows) // max(1, sum(rows))),
+                )
             )
         if signature.grad_enabled and self._recompute_granularity != "full":
             geometry = self._geometry
