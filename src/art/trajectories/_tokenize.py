@@ -809,10 +809,10 @@ def _merge_recorded_request_roles(
     stop_mask: Sequence[bool],
     length_stop_mask: Sequence[bool],
     *,
-    prompt: Sequence[int] | None,
+    prompts: Iterable[Sequence[int] | None],
 ) -> bool:
-    # Sampled responses own their native flags. Request-only assistant roles
-    # must retain a complete prefix proof, including roles between responses.
+    # Prove the complete recorded request owning the last request-only role.
+    # Later sampled native bodies need not match their rendered projection.
     roles = [
         (index, _rendered_flag(assistant, False, stop))
         for index, (assistant, output, stop, length_stop) in enumerate(
@@ -820,9 +820,21 @@ def _merge_recorded_request_roles(
         )
         if not output and not length_stop and (assistant or stop)
     ]
-    if roles and prompt is None:
-        return False
-    end = max(roles[-1][0] + 1, len(prompt or ())) if roles else 0
+    end = 0
+    if roles:
+        prompt = next(
+            (
+                prompt
+                for prompt in prompts
+                if prompt is not None
+                and len(prompt) > roles[-1][0]
+                and exact.tokens[: len(prompt)] == list(prompt)
+            ),
+            None,
+        )
+        if prompt is None:
+            return False
+        end = len(prompt)
     if exact.tokens[:end] != list(rendered[:end]) or any(
         exact.flags[index] & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
         for index, _ in roles
@@ -7218,8 +7230,9 @@ def _tokenize_chat_view(
                 output_mask,
                 stop_mask,
                 length_stop_mask,
-                prompt=source_prompt_tokens(
-                    history.message_sources[sampled_message_indices[-1]]
+                prompts=(
+                    source_prompt_tokens(history.message_sources[index])
+                    for index in sampled_message_indices
                 ),
             ):
                 return exact

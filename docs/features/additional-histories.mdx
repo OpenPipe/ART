@@ -188,6 +188,9 @@ the original request and template reproduce its complete native prompt, ART can
 recover historical assistant roles from that rendering. This uses the original
 tool serialization order and preserves role labels through exact length-stop
 assembly; it does not restore destructive parsing for new response content.
+The role proof covers the complete recorded request containing the last
+request-only assistant, including its trailing query. Later sampled native
+bodies remain authoritative even when their rendered projections differ.
 With a supplied renderer, request-owned assistant roles are proved throughout
 the native stream, including between sampled responses. This requirement applies
 even when template normalization makes no change. A request whose text
