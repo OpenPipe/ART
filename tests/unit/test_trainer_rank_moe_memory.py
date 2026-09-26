@@ -844,7 +844,8 @@ def test_hybridep_recompute_prices_fresh_dense_output_without_buffer_growth(
     )
     assert rank._plan_hybridep_growth_bytes(plan) == 0
     retained, workspace = rank._checkpoint_memory_floor(groups)
-    assert workspace == 218752 * 2048 * 2 == 896008192
+    # The combine output, with the TE workspaces live beside it.
+    assert workspace == 218752 * 2048 * 2 + rank._te_workspace_growth_bytes()
     cost = rank._subforward_cost(**values)
     assert cost.required == int((8 + 2 * retained + workspace) * 1.1)
     assert cost.checkpoint_workspace == workspace  # Maximum, not stage + output.

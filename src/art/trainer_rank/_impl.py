@@ -4386,7 +4386,12 @@ class TrainerRank:
             rows = max(rows for rows, _ in group_rows)
             if any(ref() is not None for ref in self._pending_hybridep_graphs):
                 rows = max(rows, self._hybridep_rows_high_water)
-            workspace = max(workspace, -(-rows // 4) * 4 * self._hidden_size * 2)
+            # The combine output and the TE workspaces are live together.
+            workspace = max(
+                workspace,
+                -(-rows // 4) * 4 * self._hidden_size * 2
+                + self._te_workspace_growth_bytes(),
+            )
         return retained, workspace
 
     def _sequence_parallel_checkpoint_floor(
@@ -4737,19 +4742,24 @@ class TrainerRank:
         Backward recomputes the last layer first, so its peak meets every saved
         boundary but only the one incoming gradient. Where the MoE stage covers
         every layer's recompute, FC1 included (Qwen3.6-35B-A3B traces at CP1,
-        CP2/EP1 and EP2/CP2), charge that gradient. Elsewhere keep one gradient
-        per boundary: that allowance also covers dense MLP and other recompute
-        work the floor does not price.
+        CP2/EP1 and EP2/CP2), charge that gradient. Elsewhere, including above
+        CP2 (more remote attention stages than the mixer's CP2 allowance), keep
+        one gradient per boundary: that allowance also covers dense MLP and
+        other recompute work the floor does not price.
         """
         retained, _ = self._checkpoint_memory_floor(group_rows)
         if not retained:
             return 0
         gradient_rows = sum(rows for rows, grad in group_rows if grad)
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
-        if self._checkpoint_moe_bytes_per_token() and all(
-            self._moe_recompute_covered_for(ref)
-            for (_, grad), ref in zip(group_rows, refs, strict=True)
-            if grad
+        if (
+            self._topology_key()[2] <= 2
+            and self._checkpoint_moe_bytes_per_token()
+            and all(
+                self._moe_recompute_covered_for(ref)
+                for (_, grad), ref in zip(group_rows, refs, strict=True)
+                if grad
+            )
         ):
             return gradient_rows * self._hidden_size * 2
         return retained
