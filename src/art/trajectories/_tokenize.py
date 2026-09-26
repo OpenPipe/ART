@@ -9,10 +9,15 @@ from datetime import datetime
 from enum import Enum
 from functools import lru_cache
 from hashlib import sha256
+from inspect import getattr_static
+from io import BytesIO
 import json
 import math
+from operator import attrgetter, is_
+from pickle import Pickler, PicklingError
 import re
 import threading
+from types import FunctionType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 import warnings
 
@@ -804,9 +809,11 @@ def _merge_recorded_request_roles(
     output_mask: Sequence[bool],
     stop_mask: Sequence[bool],
     length_stop_mask: Sequence[bool],
+    *,
+    prompts: Iterable[Sequence[int] | None],
 ) -> bool:
-    # Sampled responses own their native flags. Request-only assistant roles
-    # must retain a complete prefix proof, including roles between responses.
+    # Prove the complete recorded request owning the last request-only role.
+    # Later sampled native bodies need not match their rendered projection.
     roles = [
         (index, _rendered_flag(assistant, False, stop))
         for index, (assistant, output, stop, length_stop) in enumerate(
@@ -814,7 +821,21 @@ def _merge_recorded_request_roles(
         )
         if not output and not length_stop and (assistant or stop)
     ]
-    end = roles[-1][0] + 1 if roles else 0
+    end = 0
+    if roles:
+        prompt = next(
+            (
+                prompt
+                for prompt in prompts
+                if prompt is not None
+                and len(prompt) > roles[-1][0]
+                and exact.tokens[: len(prompt)] == list(prompt)
+            ),
+            None,
+        )
+        if prompt is None:
+            return False
+        end = len(prompt)
     if exact.tokens[:end] != list(rendered[:end]) or any(
         exact.flags[index] & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
         for index, _ in roles
@@ -998,6 +1019,133 @@ class _SampledSourceValidator(Protocol):
     ) -> None: ...
 
 
+class _PlainRenderPickler(Pickler):
+    def reducer_override(self, value: object) -> Any:
+        # Exact builtins use the C traversal. Never call custom reducers.
+        raise TypeError("A typed rendering snapshot is required")
+
+
+class _RenderContextGuard:
+    """Keep one working projection stable across external callbacks."""
+
+    @staticmethod
+    def plain(value: object, *, memo: bool) -> bytes:
+        stream = BytesIO()
+        pickler = _PlainRenderPickler(stream, protocol=4)
+        pickler.fast = not memo
+        pickler.dump(value)
+        return stream.getvalue()
+
+    @classmethod
+    def snapshot(cls, value: object) -> tuple:
+        # Both encodings are local observations, never deserialized. The fresh
+        # C memo compresses repeated containers; the value-only encoding permits
+        # equal-valued copies with a different alias layout.
+        try:
+            return "plain", cls.plain(value, memo=True), cls.plain(value, memo=False)
+        except (TypeError, ValueError, RecursionError, PicklingError):
+            return "typed", _tokenization_context(value)
+
+    def __init__(self, read: Callable[[], object]) -> None:
+        self.read = read
+        self.expected = self.snapshot(read())
+        self.failed: BaseException | None = None
+
+    def check_value(self, value: object, expected: tuple) -> None:
+        if self.failed is not None:
+            raise self.failed
+        try:
+            unchanged = (
+                self.plain(value, memo=True) == expected[1]
+                or self.plain(value, memo=False) == expected[2]
+                if expected[0] == "plain"
+                else _tokenization_context(value) == expected[1]
+            )
+        except (TypeError, ValueError, RecursionError, PicklingError):
+            unchanged = False
+        if not unchanged:
+            self.failed = ValueError(
+                "Rendering context changed during tokenization callback"
+            )
+            raise self.failed
+
+    def check(self) -> None:
+        if self.failed is not None:
+            raise self.failed
+        try:
+            value = self.read()
+        except BaseException as error:
+            self.failed = error
+            raise
+        self.check_value(value, self.expected)
+
+    def reset(self) -> None:
+        # Only ART's intentional projection replacement may establish a new
+        # baseline, after checking the old projection and the rendered probe.
+        if self.failed is not None:
+            raise self.failed
+        self.expected = self.snapshot(self.read())
+
+    def call(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        self.check()
+        arguments = [list(args), kwargs]
+        expected = self.snapshot(arguments)
+        try:
+            result = function(*args, **kwargs)
+        except BaseException as error:
+            try:
+                self.check()
+                self.check_value(arguments, expected)
+            except BaseException:
+                # Optional renderer probes can catch the original exception.
+                # Keep its identity and prevent a later fallback blessing edits.
+                self.failed = error
+            raise
+        self.check()
+        self.check_value(arguments, expected)
+        return result
+
+
+def _plain_tokenizer_attribute(tokenizer: object, name: str) -> tuple[bool, object]:
+    kind = type(tokenizer)
+    if type(kind) is not type:
+        return False, None
+    static = getattr_static(tokenizer, name, None)
+    pure = (
+        getattr_static(kind, "__getattribute__") is object.__getattribute__
+        and not any("__getattr__" in vars(parent) for parent in kind.__mro__)
+        and (
+            type(static) is FunctionType
+            or (
+                type(type(static)) is type
+                and getattr_static(type(static), "__get__", None) is None
+            )
+        )
+    )
+    return pure, static
+
+
+class _RenderingTokenizer:
+    def __init__(self, tokenizer: Tokenizer, guard: _RenderContextGuard) -> None:
+        self.tokenizer, self.guard = tokenizer, guard
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self.guard.call(self.tokenizer, *args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        pure_lookup, _ = _plain_tokenizer_attribute(self.tokenizer, name)
+        value = (
+            getattr(self.tokenizer, name)
+            if pure_lookup
+            else self.guard.call(lambda: getattr(self.tokenizer, name))
+        )
+        return (
+            (lambda *args, **kwargs: self.guard.call(value, *args, **kwargs))
+            if callable(value)
+            else value
+        )
+
+
 @dataclass
 class _TraceBuilder:
     trace: _HistoryTokenizationTrace | None = None
@@ -1091,13 +1239,17 @@ class _TraceBuilder:
         *,
         tokenizer: Tokenizer | None = None,
     ) -> None:
+        if type(tokenizer) is _RenderingTokenizer:
+            tokenizer.guard.check()
         if self.track_sources:
             self.consume_sources(
                 sources, require_supported_context=tokenizer is not None
             )
         elif self.validate_sources is not None:
             self.validate_sources(None, require_supported_context=tokenizer is not None)
-        self.tokenizer = tokenizer
+        self.tokenizer = (
+            tokenizer.tokenizer if type(tokenizer) is _RenderingTokenizer else tokenizer
+        )
         trace = _HistoryTokenizationTrace(source_keys=source_keys, sources=sources)
         trace.validate(tokenized)
         self.trace = trace
@@ -3644,12 +3796,20 @@ def _native_nonterminal_stops_known(
 
 
 def _history_needs_synthetic_stop(
-    history: History, tokenizer: Tokenizer | None
+    history: History,
+    tokenizer: Tokenizer | None,
+    *,
+    _trace: _TraceBuilder | None = None,
 ) -> bool:
-    if (
-        tokenizer is None
-        or not callable(getattr(tokenizer, "apply_chat_template", None))
-        or not _terminator_ids(tokenizer)
+    if tokenizer is None or not callable(
+        getattr(tokenizer, "apply_chat_template", None)
+    ):
+        return False
+    ledger = _trace or _TraceBuilder(track_sources=False)
+    if not (
+        ledger.checked(_terminator_ids, tokenizer)
+        if _stop_uses_callback(None, tokenizer)
+        else _terminator_ids(tokenizer)
     ):
         return False
     sources: Sequence[object]
@@ -3660,6 +3820,13 @@ def _history_needs_synthetic_stop(
     else:
         return False
     seen: set[_SampledSourceKey] = set()
+    pending: list[tuple[_SampledSourceKey, object]] = []
+
+    def flush() -> None:
+        if pending:
+            ledger.consume_sources(pending)
+            pending.clear()
+
     for source in sources:
         if source is None or not _source_is_sampled(source):
             continue
@@ -3667,16 +3834,32 @@ def _history_needs_synthetic_stop(
         if source_key in seen:
             continue
         seen.add(source_key)
+        pending.append((source_key, source))
         if _source_stop_evidence(source, source_key)[0] != "stop":
             continue
         output = _source_output_tokens(source, source_key)
-        if output is not None and not _sampled_stop_suffix(
+        if output is None:
+            continue
+        callback = _stop_uses_callback(
+            _source_stop_evidence(source, source_key)[1], tokenizer
+        )
+        if callback:
+            flush()
+        count = (
+            ledger.checked
+            if callback
+            else lambda function, *args, **kwargs: function(*args, **kwargs)
+        )(
+            _sampled_stop_suffix,
             output,
             source=source,
             source_key=source_key,
             tokenizer=tokenizer,
-        ):
+        )
+        if not count:
+            flush()
             return True
+    flush()
     return False
 
 
@@ -4557,10 +4740,13 @@ def _tokenization_context(
 
     def snapshot(item: object) -> object:
         kind = type(item)
-        if kind in (str, int, bool, bytes, type(None), datetime):
-            return kind, item
-        if kind is float:
-            return kind, repr(item)
+        previous = observed.get(id(item))
+        if previous is not None and previous[0] is item:
+            return previous[1]
+        if kind in (str, int, bool, bytes, type(None), datetime, float):
+            result = kind, repr(item) if kind is float else item
+            observed[id(item)] = item, result
+            return result
         if isinstance(item, Enum):
             if getattr(item, "__objclass__", kind) is not kind:
                 raise TypeError("Unsupported enum tokenization context")
@@ -4581,9 +4767,6 @@ def _tokenization_context(
             else:
                 scalar = bytes.__bytes__(item)
             return kind, scalar, snapshot(getattr(item, "__dict__", None))
-        previous = observed.get(id(item))
-        if previous is not None and previous[0] is item:
-            return previous[1]
         if kind in (list, tuple):
             result = kind, tuple(snapshot(child) for child in cast(Sequence, item))
         elif isinstance(item, Mapping):
@@ -4631,6 +4814,20 @@ def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
     return validate
 
 
+def _rendered_response_evidence(source: object) -> object:
+    exchange = _source_exchange(source)
+    if not isinstance(exchange, ResponsesExchange):
+        return None
+    selected = _responses_source_outputs(source)
+    # Item-local IDs, bytes, text and logprobs can all participate in rendered
+    # evidence even when the native generation has its own aggregate record.
+    return (
+        [exchange.response.output[index] for index in selected[1]]
+        if selected is not None
+        else exchange.response.output
+    )
+
+
 def _sampled_source_validator(
     sources: Mapping[_SampledSourceKey, object]
     | Sequence[tuple[_SampledSourceKey, object]],
@@ -4653,6 +4850,14 @@ def _sampled_source_validator(
             request = _tokenization_context(exchange.request, _observed=observed)
         except TypeError:
             request = None
+        try:
+            plain_request = (
+                _RenderContextGuard.plain(exchange.request, memo=False)
+                if request is not None
+                else None
+            )
+        except (TypeError, ValueError, RecursionError, PicklingError):
+            plain_request = None
         expected.setdefault(key, []).append(
             (
                 source,
@@ -4660,6 +4865,7 @@ def _sampled_source_validator(
                 exchange.model,
                 _source_stop_evidence(source, key),
                 request,
+                plain_request,
                 _tokenization_context(
                     {
                         name: exchange.request.get(name)
@@ -4668,12 +4874,7 @@ def _sampled_source_validator(
                 )
                 if selected_request_fields is not None
                 else None,
-                _tokenization_context(
-                    _visible_logprobs(
-                        exchange,
-                        source=None if isinstance(source, Exchange) else source,
-                    )
-                )
+                _tokenization_context(_rendered_response_evidence(source))
                 if rendered_evidence and isinstance(exchange, ResponsesExchange)
                 else None,
             )
@@ -4694,6 +4895,7 @@ def _sampled_source_validator(
                 model,
                 stop,
                 request,
+                plain_request,
                 selected_request,
                 visible,
             ) in expected[key]:
@@ -4713,16 +4915,11 @@ def _sampled_source_validator(
                     )
                 if (
                     visible is not None
-                    and _tokenization_context(
-                        _visible_logprobs(
-                            exchange,
-                            source=None if isinstance(source, Exchange) else source,
-                        )
-                    )
+                    and _tokenization_context(_rendered_response_evidence(source))
                     != visible
                 ):
                     raise ValueError(
-                        "Rendered source logprobs changed during tokenization callback"
+                        "Rendered source evidence changed during tokenization callback"
                     )
                 if request is None:
                     if require_supported_context:
@@ -4731,6 +4928,17 @@ def _sampled_source_validator(
                         )
                     continue
                 current_request = exchange.request
+                if selected is None and plain_request is not None:
+                    try:
+                        # Equality only: the original typed snapshot established
+                        # admission. Any changed/rich shape uses that same proof.
+                        if (
+                            _RenderContextGuard.plain(current_request, memo=False)
+                            == plain_request
+                        ):
+                            continue
+                    except (TypeError, ValueError, RecursionError, PicklingError):
+                        pass
                 if selected is not None and selected_request_fields is not None:
                     current_request = {
                         name: exchange.request.get(name)
@@ -5735,16 +5943,44 @@ def _tokenize_chat_view(
         # Keep every consumed source bound even for a standalone/single history.
         _trace.track_sources = True
     _validate_history_sources(history)
+    ledger = _trace or _TraceBuilder(track_sources=False)
+    _trace = ledger
+    if ledger.validate_context is None:
+        ledger.validate_context = _tokenization_context_validator(
+            [history, chat_template, chat_template_kwargs]
+        )
+    # Current projected sources have already been inspected for admission.
+    consumed_keys = {
+        id(source): _sampled_source_key(source)
+        for source in history.message_sources
+        if source is not None and _source_is_sampled(source)
+    }
+    consumed_sources = [
+        (consumed_keys[id(source)], source)
+        for source in history.message_sources
+        if id(source) in consumed_keys
+    ]
+    ledger.consume_sources(
+        consumed_sources,
+        selected_request_fields=("tools", "chat_template", "chat_template_kwargs"),
+        require_supported_context=False,
+        # Only Responses has additional item-local rendered evidence to admit
+        # after native-boundary fallback. Other protocols are already complete.
+        rendered_evidence=not any(
+            isinstance(_source_exchange(source), ResponsesExchange)
+            for _, source in consumed_sources
+        ),
+    )
     config = (
         _TokenizerConfig(base_model or history.model or "")
         if tokenizer is not None
         or (base_model is not None and chat_template is not None)
-        else _tokenizer_config(history.model or "", base_model)
+        else ledger.checked(_tokenizer_config, history.model or "", base_model)
     )
     if tokenizer is None:
         if not history.model and base_model is None:
             raise ValueError("History tokenization requires a model or base_model")
-        tokenizer = _load_tokenizer(config)
+        tokenizer = ledger.checked(_load_tokenizer, config)
     assert tokenizer is not None
     resolved_tokenizer = tokenizer
     messages = [dict(message) for message in history.messages]
@@ -5762,19 +5998,80 @@ def _tokenize_chat_view(
             explicit_kwargs.setdefault("thinking_budget", budget)
     template = chat_template or history.chat_template or config.chat_template
     if template is None:
-        tokenizer_template = getattr(resolved_tokenizer, "chat_template", None)
+        pure_template, tokenizer_template = _plain_tokenizer_attribute(
+            resolved_tokenizer, "chat_template"
+        )
+        if not pure_template:
+            tokenizer_template = ledger.checked(
+                getattr, resolved_tokenizer, "chat_template", None
+            )
         if isinstance(tokenizer_template, str):
             template = tokenizer_template
     original_template = template
-    template, normalization_template, defaults = _resolved_chat_template(
-        resolved_tokenizer, template, history.tools
+    pure_template, tokenizer_template = _plain_tokenizer_attribute(
+        resolved_tokenizer, "chat_template"
     )
+    if (
+        pure_template
+        and type(tokenizer_template) in (str, type(None))
+        and type(template) in (str, type(None))
+    ):
+        # Plain unnamed template normalization has no tokenizer callback.
+        template, normalization_template, defaults = _resolved_chat_template(
+            resolved_tokenizer, template, history.tools
+        )
+    else:
+        template, normalization_template, defaults = ledger.checked(
+            _resolved_chat_template, resolved_tokenizer, template, history.tools
+        )
     kwargs = {
         **defaults,
         **explicit_kwargs,
     }
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"
     segmented = False
+
+    bound_sources = tuple(history.message_sources)
+    present_sources = tuple(source for source in bound_sources if source is not None)
+    exchange_of = attrgetter("exchange")
+    bound_exchanges = tuple(map(exchange_of, present_sources))
+    selectors = attrgetter(
+        "request_index", "choice_index", "output_indices", "generation_index"
+    )
+
+    def rendering_context() -> object:
+        # Current message projections and source selectors are linear in the
+        # view. Original growing requests are checked at their consumption sites.
+        if (
+            len(history.message_sources) != len(bound_sources)
+            or not all(map(is_, history.message_sources, bound_sources))
+            or not all(map(is_, map(exchange_of, present_sources), bound_exchanges))
+        ):
+            raise ValueError("Rendering context changed during tokenization callback")
+        return [
+            messages,
+            history.messages,
+            history.model,
+            history.tools,
+            history.chat_template,
+            history.chat_template_kwargs,
+            template,
+            kwargs,
+            tuple(map(selectors, present_sources)),
+        ]
+
+    rendering_guard = _RenderContextGuard(rendering_context)
+    original_context_validator = ledger.validate_context
+
+    def validate_rendering_context(active: bool) -> None:
+        assert original_context_validator is not None
+        original_context_validator(active)
+        rendering_guard.check()
+
+    ledger.validate_context = validate_rendering_context
+    resolved_tokenizer = cast(
+        Tokenizer, _RenderingTokenizer(resolved_tokenizer, rendering_guard)
+    )
 
     def raw_render(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
@@ -5829,32 +6126,14 @@ def _tokenize_chat_view(
         ):
             return recorded
 
-    # Generic rendering consumes the complete projected response set. Retain
-    # that evidence before callbacks, rather than blessing fresh keys afterward.
-    consumed_keys = {
-        id(source): _sampled_source_key(source)
-        for source in history.message_sources
-        if source is not None and _source_is_sampled(source)
-    }
-    consumed_sources = [
-        (consumed_keys[id(source)], source)
-        for source in history.message_sources
-        if id(source) in consumed_keys
-    ]
-    if _trace is not None:
-        _trace.consume_sources(
+    if not ledger.rendered_evidence:
+        ledger.consume_sources(
             consumed_sources,
             selected_request_fields=("tools", "chat_template", "chat_template_kwargs"),
             rendered_evidence=True,
         )
-        assert _trace.validate_sources is not None
-        validate_consumed = _trace.validate_sources
-    else:
-        validate_consumed = _sampled_source_validator(
-            consumed_sources,
-            selected_request_fields=("tools", "chat_template", "chat_template_kwargs"),
-            rendered_evidence=True,
-        )
+    assert ledger.validate_sources is not None
+    validate_consumed = ledger.validate_sources
 
     def consumed_source_key(source: object) -> _SampledSourceKey:
         key = consumed_keys[id(source)]
@@ -5875,8 +6154,10 @@ def _tokenize_chat_view(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
     ) -> tuple[list[int], list[bool]]:
         try:
-            if cacheable_chat_template(
-                resolved_tokenizer, template, history.tools, kwargs, selected_messages
+            if rendering_guard.call(
+                lambda: cacheable_chat_template(
+                    tokenizer, template, history.tools, kwargs, selected_messages
+                )
             ):
                 # Normalization is message-local. Only the admitted nonmutating
                 # renderer may share its normalized messages between prefixes.
@@ -6004,7 +6285,9 @@ def _tokenize_chat_view(
                 add_generation_prompt=not ends_with_assistant,
             )
             if aliased_render is not None:
+                rendering_guard.check()
                 messages = aliased_messages
+                rendering_guard.reset()
                 rendered = aliased_render
     if any(
         message.get("role") == "assistant"
@@ -6046,7 +6329,9 @@ def _tokenize_chat_view(
                 add_generation_prompt=not ends_with_assistant,
             )
             if merged_render is not None:
+                rendering_guard.check()
                 messages = merged_messages
+                rendering_guard.reset()
                 rendered = merged_render
 
     part_ids_cache: dict[str, list[int]] = {}
@@ -6086,13 +6371,16 @@ def _tokenize_chat_view(
     prompt_cache: dict[int, list[int] | None] = {}
     output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
 
-    def source_prompt_tokens(source: object) -> list[int] | None:
-        if id(source) in consumed_keys:
-            consumed_source_key(source)
+    def cached_source_prompt(source: object) -> list[int] | None:
         key = id(source)
         if key not in prompt_cache:
             prompt_cache[key] = _chat_source_prompt_tokens(source)
         return prompt_cache[key]
+
+    def source_prompt_tokens(source: object) -> list[int] | None:
+        if id(source) in consumed_keys:
+            consumed_source_key(source)
+        return cached_source_prompt(source)
 
     def source_output_tokens(
         source: object,
@@ -6104,7 +6392,7 @@ def _tokenize_chat_view(
             output_cache[key] = _chat_source_full_tokens(source)
         return output_cache[key]
 
-    def source_matches_context(source: object) -> bool:
+    def current_source_context(source: object) -> bool:
         exchange = getattr(source, "exchange", None)
         if not isinstance(
             exchange, (ChatCompletionsExchange, MessagesExchange, ResponsesExchange)
@@ -6130,6 +6418,16 @@ def _tokenize_chat_view(
                 or dict(chat_template_kwargs) == (request_kwargs or {})
             )
         )
+
+    def source_matches_context(source: object) -> bool:
+        consumed_source_key(source)
+        return current_source_context(source)
+
+    def matching_source_prompt(source: object) -> list[int] | None:
+        # One selected-source check covers this adjacent setting/cache read;
+        # there is no renderer or tokenizer callback between the two values.
+        consumed_source_key(source)
+        return cached_source_prompt(source) if current_source_context(source) else None
 
     canonical_rendered = rendered
     exact_prefix_length = 0
@@ -6187,6 +6485,7 @@ def _tokenize_chat_view(
                                     ResponsesExchange,
                                 ),
                             )
+                            validate_consumed(None)
                             request_messages, request_tools = _request_messages(
                                 exchange
                             )
@@ -6933,6 +7232,10 @@ def _tokenize_chat_view(
                 output_mask,
                 stop_mask,
                 length_stop_mask,
+                prompts=(
+                    source_prompt_tokens(history.message_sources[index])
+                    for index in sampled_message_indices
+                ),
             ):
                 return exact
             if (
@@ -6955,6 +7258,7 @@ def _tokenize_chat_view(
                 validate_context = _tokenization_context_validator(history)
                 masks = None
                 if prompt and exact.tokens[: len(prompt)] == prompt:
+                    validate_consumed(None)
                     request_messages, request_tools = _request_messages(exchange)
                     try:
                         masks = _recorded_prompt_role_masks(
@@ -7355,7 +7659,7 @@ def _tokenize_chat_view(
                 and isinstance(source_exchange, ChatCompletionsExchange)
                 and rendered[start:end] != full_exact
             ):
-                _warn_prefix_retokenization()
+                rendering_guard.call(_warn_prefix_retokenization)
             search_cursor = end
             continue
 
@@ -7460,7 +7764,7 @@ def _tokenize_chat_view(
                     (ChatCompletionsExchange, ResponsesExchange, MessagesExchange),
                 ):
                     evidence = _visible_token_evidence(
-                        tokenizer,
+                        resolved_tokenizer,
                         exchange,
                         source=source,
                         sampled_text=text,
@@ -7470,7 +7774,7 @@ def _tokenize_chat_view(
                     else:
                         logprobs = (
                             _align_visible_logprobs(
-                                tokenizer,
+                                resolved_tokenizer,
                                 replacement,
                                 exchange,
                                 source=source,
@@ -7670,13 +7974,9 @@ def _tokenize_chat_view(
     source_keys.extend([None] * (len(rendered) - cursor))
     exact_coverage_length = 0
     for source in history.message_sources:
-        if (
-            source is None
-            or not _source_is_sampled(source)
-            or not source_matches_context(source)
-        ):
+        if source is None or not _source_is_sampled(source):
             continue
-        source_prompt = source_prompt_tokens(source)
+        source_prompt = matching_source_prompt(source)
         if (
             source_prompt is not None
             and token_ids[: len(source_prompt)] == source_prompt
@@ -8152,7 +8452,9 @@ def _tokenize_history(
     can_render = tokenizer is None or callable(
         getattr(tokenizer, "apply_chat_template", None)
     )
-    needs_synthetic_stop = _history_needs_synthetic_stop(history, tokenizer)
+    needs_synthetic_stop = _history_needs_synthetic_stop(
+        history, tokenizer, _trace=_trace
+    )
     if tokenizer is not None and can_render:
         # STOP discovery can call a supplied tokenizer before native assembly.
         # Its result cannot lend an old model/view proof to changed sources.

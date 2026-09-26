@@ -206,6 +206,9 @@ the original request and template reproduce its complete native prompt, ART can
 recover historical assistant roles from that rendering. This uses the original
 tool serialization order and preserves role labels through exact length-stop
 assembly; it does not restore destructive parsing for new response content.
+The role proof covers the complete recorded request containing the last
+request-only assistant, including its trailing query. Later sampled native
+bodies remain authoritative even when their rendered projections differ.
 With a supplied renderer, request-owned assistant roles are proved throughout
 the native stream, including between sampled responses. This requirement applies
 even when template normalization makes no change. A request whose text
@@ -214,7 +217,8 @@ path, but cannot claim a complete rendered role mask. Recovering those roles
 requires the original request to reproduce the complete recorded prompt, with
 only independently proved whitespace retokenization permitted. Matching an
 assistant body alone does not prove an altered role header. If that proof fails,
-ART refuses to attach recorded logprobs to a changed prompt.
+ART refuses that rendered role certification; this check does not require
+reconstructing text on the complete offline native path.
 
 Custom STOP encoders and terminator decoders must not change already-consumed
 source tokens, logprobs, model or stop evidence. ART checks each source around its
@@ -222,11 +226,15 @@ STOP callback and checks all consumed evidence before returning, including
 logprobs used only by the rendered fallback. Multi-history
 tokenization also checks completed histories after later renderer callbacks.
 Evidence is bound when first read, including a later Responses generation read
-to prove a copied suffix, visible item logprobs, and text used for prefix repair.
+to prove a copied suffix, rendered item IDs and logprobs, and text used for prefix
+repair. STOP admission also retains the source keys read before its encoder.
 It is not a snapshot of every future response before that response is used.
 Ordered original requests and history context, including roles, tools, render
 settings and protocol selectors, are captured before callbacks and checked
-before reuse. Unexpected callback exceptions keep their original identity.
+before reuse. Rendering checks its current working projection and the actual
+callback arguments before and immediately after callbacks, including optional
+probes; a later encoder cannot hide an earlier edit by restoring it. Unexpected
+callback exceptions keep their original identity.
 These checks refuse stale results; they do not make callbacks or source objects
 immutable. Context snapshots reuse shared containers only within one observation;
 callback-free native assembly retains its bounded response-evidence reuse.

@@ -1,4 +1,4 @@
-"""Public, explicit-rendering Responses evidence callback regression."""
+"""Public explicit-rendered Responses item-ID consumption regression."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import art.trajectories as tr
 
 @pytest.mark.parametrize("route", ["history", "trajectory"])
 @pytest.mark.parametrize("mutate", [False, True])
-def test_multi_output_generation_keeps_consumed_visible_logprobs(route, mutate):
+def test_multi_output_generation_keeps_consumed_item_token_id(route, mutate):
     projected = _multi_output_responses_chat_history()
     source = next(
         source
@@ -38,13 +38,16 @@ def test_multi_output_generation_keeps_consumed_visible_logprobs(route, mutate):
                 "top_logprobs": [],
             }
         ]
+    data["output"][0]["content"][0]["logprobs"][0]["token_id"] = 20
     exchange.response = Response.model_validate(data)
     value = tr.Trajectory(exchanges=tr.TrajectoryExchanges(responses=[exchange]))
-    output = exchange.response.output[0]
-    assert isinstance(output, ResponseOutputMessage)
-    content = output.content[0]
+    item = exchange.response.output[0]
+    assert isinstance(item, ResponseOutputMessage)
+    content = item.content[0]
     assert isinstance(content, ResponseOutputText) and content.logprobs
     first_lp = content.logprobs[0]
+    assert first_lp.model_extra is not None
+    extras = first_lp.model_extra
     calls = []
 
     class Tokenizer:
@@ -52,8 +55,9 @@ def test_multi_output_generation_keeps_consumed_visible_logprobs(route, mutate):
             token = {"turn 0": 1, "first": 20, "second": 30}[text]
             if kwargs.get("return_offsets_mapping"):
                 calls.append(text)
-                if mutate and text == "first":
-                    first_lp.logprob = -9.0
+                if mutate and text == "second":
+                    assert first_lp.model_extra is not None
+                    extras["token_id"] = 99
                 return {"input_ids": [token], "offset_mapping": [(0, len(text))]}
             return [token]
 
@@ -75,11 +79,21 @@ def test_multi_output_generation_keeps_consumed_visible_logprobs(route, mutate):
             actual = tokenize()
             # If the guard misses the edit, prove this is the consumed old
             # value being returned, not a benign pre-consumption refresh.
-            assert first_lp.logprob == -9.0
+            assert extras["token_id"] == 99
+            assert first_lp.logprob == -0.1
             assert actual.tokens == [1, 20, 30]
+            assert math.isnan(actual.logprobs[0])
             assert actual.logprobs[1:] == [-0.1, -0.2]
-            assert not any(flag & tr.TokenFlag.SAMPLED for flag in actual.flags)
-        assert first_lp.logprob == -9.0
+            assert actual.flags == [
+                tr.TokenFlag(0),
+                tr.TokenFlag.ASSISTANT
+                | tr.TokenFlag.OUTPUT
+                | tr.TokenFlag.EXACT
+                | tr.TokenFlag.SAMPLED,
+                tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT,
+            ]
+        assert extras["token_id"] == 99
+        assert first_lp.logprob == -0.1
     else:
         actual = tokenize()
         assert actual.tokens == [1, 20, 30]
@@ -87,8 +101,12 @@ def test_multi_output_generation_keeps_consumed_visible_logprobs(route, mutate):
         assert actual.logprobs[1:] == [-0.1, -0.2]
         assert actual.flags == [
             tr.TokenFlag(0),
-            tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT,
+            tr.TokenFlag.ASSISTANT
+            | tr.TokenFlag.OUTPUT
+            | tr.TokenFlag.EXACT
+            | tr.TokenFlag.SAMPLED,
             tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT,
         ]
         assert first_lp.logprob == -0.1
-    assert "first" in calls
+        assert extras["token_id"] == 20
+    assert "second" in calls

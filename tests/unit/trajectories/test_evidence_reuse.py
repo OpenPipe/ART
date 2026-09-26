@@ -102,7 +102,7 @@ def test_supplied_tokenizer_stop_probe_cannot_lend_stale_evidence(monkeypatch):
 
 
 @pytest.mark.parametrize("override", [False, True])
-def test_render_fallback_does_not_receive_decision_evidence(monkeypatch, override):
+def test_render_fallback_binds_evidence_before_loader_callback(monkeypatch, override):
     from test_tokenize import _character_template_history
 
     monkeypatch.setattr(module, "_WARNED_PREFIX_RETOKENIZATION", False)
@@ -125,16 +125,25 @@ def test_render_fallback_does_not_receive_decision_evidence(monkeypatch, overrid
         "_tokenizer_config",
         lambda *args: module._TokenizerConfig("public/base"),
     )
+
+    def invoke(trace):
+        return module.tokenize_history(
+            history,
+            model=history.model,
+            base_model="public/base",
+            tokenizer=None,
+            chat_template="explicit public template" if override else None,
+            chat_template_kwargs=None,
+            _trace=trace,
+        )
+
+    # The loader cannot replace evidence already inspected for this call.
+    with pytest.raises(ValueError, match="Sampled source changed"):
+        invoke(module._TraceBuilder())
+    # A subsequent invocation binds the edited value freshly; no decision memo
+    # or failed-call validator leaks into that independent tokenization.
     trace = module._TraceBuilder()
-    result = module.tokenize_history(
-        history,
-        model=history.model,
-        base_model="public/base",
-        tokenizer=None,
-        chat_template="explicit public template" if override else None,
-        chat_template_kwargs=None,
-        _trace=trace,
-    )
+    result = invoke(trace)
     assert trace.trace is not None
     new_key = module._sampled_source_key(first_source)
     assert new_key != old_key
@@ -471,7 +480,9 @@ def test_stop_decision_callback_cannot_change_history_model():
             exchange.request["model"] = "changed/model"
             return {"input_ids": [3]}
 
-    with pytest.raises(ValueError, match="model no longer matches"):
+    with pytest.raises(
+        ValueError, match="model no longer matches|Sampled source changed"
+    ):
         history.tokenize(tokenizer=Tokenizer())
 
 

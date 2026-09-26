@@ -677,3 +677,42 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
             trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
         assert changed
     assert changed
+
+
+@pytest.mark.parametrize("public", [False, True])
+@pytest.mark.parametrize("mutation", [False, True])
+def test_stream_refinement_keeps_stop_preflight_evidence(
+    public: bool, mutation: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trajectory, tokenizer = example()
+    choice = record(trajectory.exchanges.chat_completions[1])
+    choice.model_extra["stop_reason"] = "§"
+    original = choice.logprobs.content[0].logprob
+    encode = tokenizer.__class__.__call__
+    calls = 0
+
+    def callback(self: Any, text: str, **kwargs: Any) -> Any:
+        nonlocal calls
+        if text == "§":
+            calls += 1
+            if mutation and calls == 1:
+                choice.logprobs.content[0].logprob = -99.0
+        return encode(self, text, **kwargs)
+
+    monkeypatch.setattr(tokenizer.__class__, "__call__", callback)
+
+    def invoke() -> Any:
+        if public:
+            return trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+        return module._tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)[
+            0
+        ]
+
+    if mutation:
+        with pytest.raises(ValueError, match="[Ss]ampled source changed"):
+            invoke()
+        assert calls > 0 and choice.logprobs.content[0].logprob == -99.0
+    else:
+        result = invoke()
+        assert len(result.histories) == 3 and calls > 0
+        assert choice.logprobs.content[0].logprob == original
