@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import Enum
 from functools import lru_cache
 from hashlib import sha256
 import json
@@ -969,6 +970,8 @@ class _TraceBuilder:
         *,
         tokenizer: Tokenizer | None = None,
     ) -> None:
+        if self.validate_sources is not None:
+            self.validate_sources(None)
         self.tokenizer = tokenizer
         trace = _HistoryTokenizationTrace(source_keys=source_keys, sources=sources)
         trace.validate(tokenized)
@@ -3464,6 +3467,28 @@ def _history_has_length_stop(
     return False
 
 
+def _native_nonterminal_stops_known(
+    history: ChatCompletionsHistory,
+    *,
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
+) -> bool:
+    sources: dict[_SampledSourceKey, object] = {}
+    for message, source in zip(history.messages, history.message_sources, strict=True):
+        if message.get("role") != "assistant":
+            continue
+        if source is None or not _source_is_sampled(source):
+            return False
+        sources[_sampled_source_key(source, _fingerprints=_fingerprints)] = source
+    for key, source in list(sources.items())[:-1]:
+        kind, reason = _source_stop_evidence(source, key)
+        if kind != "stop" or not isinstance(reason, int) or isinstance(reason, bool):
+            return False
+        output = _source_output_tokens(source, key)
+        if not output or output[-1] != reason:
+            return False
+    return bool(sources)
+
+
 def _history_needs_synthetic_stop(
     history: History, tokenizer: Tokenizer | None
 ) -> bool:
@@ -4327,6 +4352,26 @@ def _tokenization_context(value: object) -> object:
             return kind, item
         if kind is float:
             return kind, repr(item)
+        if isinstance(item, Enum):
+            if getattr(item, "__objclass__", kind) is not kind:
+                raise TypeError("Unsupported enum tokenization context")
+            return kind, snapshot(
+                {
+                    key: child
+                    for key, child in vars(item).items()
+                    if key != "__objclass__"
+                }
+            )
+        if isinstance(item, (str, int, float, bytes)):
+            if isinstance(item, str):
+                scalar = str.__str__(item)
+            elif isinstance(item, int):
+                scalar = int.__int__(item)
+            elif isinstance(item, float):
+                scalar = repr(float.__float__(item))
+            else:
+                scalar = bytes.__bytes__(item)
+            return kind, scalar, snapshot(getattr(item, "__dict__", None))
         previous = observed.get(id(item))
         if previous is not None and previous[0] is item:
             return previous[1]
@@ -4367,7 +4412,9 @@ def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
     def validate(require_supported: bool) -> None:
         if expected is None and not require_supported:
             return
-        if expected is None or _tokenization_context(value) != expected:
+        if expected is None:
+            raise ValueError("Tokenization context cannot be checked for callbacks")
+        if _tokenization_context(value) != expected:
             raise ValueError(
                 "Tokenization context changed during tokenization callback"
             )
@@ -5492,6 +5539,37 @@ def _tokenize_chat_view(
         ):
             return recorded
 
+    # Generic rendering consumes the complete projected response set. Retain
+    # that evidence before callbacks, rather than blessing fresh keys afterward.
+    consumed_keys = {
+        id(source): _sampled_source_key(source)
+        for source in history.message_sources
+        if source is not None and _source_is_sampled(source)
+    }
+    consumed_sources = {
+        consumed_keys[id(source)]: source
+        for source in history.message_sources
+        if id(source) in consumed_keys
+    }
+    validate_consumed = _sampled_source_validator(consumed_sources)
+    if _trace is not None:
+        if _trace.validate_sources is not None:
+            _trace.validate_sources(None)
+        _trace.validate_sources = validate_consumed
+
+    def consumed_source_key(source: object) -> _SampledSourceKey:
+        key = consumed_keys[id(source)]
+        validate_consumed(key)
+        return key
+
+    def sampled_stop_suffix(tokens: Sequence[int], source: object) -> int:
+        key = consumed_source_key(source)
+        count = _sampled_stop_suffix(
+            tokens, source=source, source_key=key, tokenizer=resolved_tokenizer
+        )
+        validate_consumed(key)
+        return count
+
     prefix_render_cache = _PrefixChatRenderCache(render_normalized_text)
 
     def segmented_render(
@@ -5710,6 +5788,8 @@ def _tokenize_chat_view(
     output_cache: dict[int, tuple[list[int] | None, list[float]]] = {}
 
     def source_prompt_tokens(source: object) -> list[int] | None:
+        if id(source) in consumed_keys:
+            consumed_source_key(source)
         key = id(source)
         if key not in prompt_cache:
             prompt_cache[key] = _chat_source_prompt_tokens(source)
@@ -5718,6 +5798,8 @@ def _tokenize_chat_view(
     def source_output_tokens(
         source: object,
     ) -> tuple[list[int] | None, list[float]]:
+        if id(source) in consumed_keys:
+            consumed_source_key(source)
         key = id(source)
         if key not in output_cache:
             output_cache[key] = _chat_source_full_tokens(source)
@@ -5844,6 +5926,7 @@ def _tokenize_chat_view(
                             )
                     break
 
+    validate_consumed(None)
     canonical_length_stop_mask = _synthetic_length_stop_mask(
         messages,
         history.message_sources,
@@ -6379,7 +6462,7 @@ def _tokenize_chat_view(
         for position, message_index in enumerate(sampled_message_indices):
             source = history.message_sources[message_index]
             assert source is not None
-            source_key = _sampled_source_key(source)
+            source_key = consumed_source_key(source)
             stop_reason = _source_stop_evidence(source, source_key)[0]
             if _recorded_boundaries and position + 1 == len(sampled_message_indices):
                 length_stop_count += stop_reason == "length"
@@ -6389,12 +6472,7 @@ def _tokenize_chat_view(
                 stop_reason == "stop"
                 and bool(_terminator_ids(resolved_tokenizer))
                 and output is not None
-                and not _sampled_stop_suffix(
-                    output,
-                    source=source,
-                    source_key=source_key,
-                    tokenizer=resolved_tokenizer,
-                )
+                and not sampled_stop_suffix(output, source)
             )
             if synthetic_stop and position + 1 < len(sampled_message_indices):
                 length_stop_boundaries_complete = False
@@ -6623,7 +6701,7 @@ def _tokenize_chat_view(
             and chat_template is None
             and chat_template_kwargs is None
             and source_matches_context(source)
-            and _source_stop_evidence(source, _sampled_source_key(source))[0]
+            and _source_stop_evidence(source, consumed_source_key(source))[0]
             != "length"
         ):
             exact_output_matches = locations(full_exact, search_cursor)
@@ -6802,7 +6880,7 @@ def _tokenize_chat_view(
                     if len(full_logprobs) == len(full_exact)
                     else [math.nan] * len(full_exact),
                     True,
-                    _sampled_source_key(source),
+                    consumed_source_key(source),
                     source,
                     None,
                 )
@@ -6836,7 +6914,7 @@ def _tokenize_chat_view(
                     rendered[start:end],
                     [math.nan] * (end - start),
                     False,
-                    _sampled_source_key(source),
+                    consumed_source_key(source),
                     source,
                     None,
                 )
@@ -6887,12 +6965,7 @@ def _tokenize_chat_view(
                 multi_generation_response or len(parts) != 1 or parts[0][0] != "content"
             ):
                 start = generation_start
-            if _sampled_stop_suffix(
-                full_exact,
-                source=source,
-                source_key=_sampled_source_key(source),
-                tokenizer=resolved_tokenizer,
-            ):
+            if sampled_stop_suffix(full_exact, source):
                 # Adjacent assistants can share a role mask. Prove this message's
                 # end before replacing its rendered closing markup and stop.
                 completed = probe_render(
@@ -6926,7 +6999,7 @@ def _tokenize_chat_view(
                     if len(full_logprobs) == len(full_exact)
                     else [math.nan] * len(full_exact),
                     True,
-                    _sampled_source_key(source),
+                    consumed_source_key(source),
                     source,
                     None,
                 )
@@ -7010,12 +7083,7 @@ def _tokenize_chat_view(
             elif (
                 exact is not None
                 and corrected_message_end is not None
-                and _sampled_stop_suffix(
-                    exact,
-                    source=source,
-                    source_key=_sampled_source_key(source),
-                    tokenizer=resolved_tokenizer,
-                )
+                and sampled_stop_suffix(exact, source)
             ):
                 # Use the proven message end to replace its rendered stop,
                 # just as the whole-message path does for sampled stops.
@@ -7033,7 +7101,7 @@ def _tokenize_chat_view(
             if (
                 exact is not None
                 and corrected_message_end is not None
-                and _source_stop_evidence(source, _sampled_source_key(source))[0]
+                and _source_stop_evidence(source, consumed_source_key(source))[0]
                 != "length"
             ):
                 # Source evidence assigns STOP; retain synthetic length boundaries.
@@ -7073,7 +7141,7 @@ def _tokenize_chat_view(
                     if len(logprobs) == len(replacement)
                     else [math.nan] * len(replacement),
                     exact is not None,
-                    _sampled_source_key(source),
+                    consumed_source_key(source),
                     source,
                     span[1]
                     if corrected_message_end is not None
@@ -7272,6 +7340,7 @@ def _tokenize_chat_view(
         flags[index] |= TokenFlag.EXACT
     if history.model is None:
         raise ValueError("History tokenization requires a model")
+    validate_consumed(None)
     _mark_sampled_stops(
         token_ids,
         flags,
@@ -7741,18 +7810,7 @@ def _tokenize_history(
             (
                 not has_length_stop
                 or not _copied_context
-                and sum(
-                    message.get("role") == "assistant" for message in history.messages
-                )
-                == 1
-                and all(
-                    message.get("role") != "assistant"
-                    or source is not None
-                    and _source_is_sampled(source)
-                    for message, source in zip(
-                        history.messages, history.message_sources, strict=True
-                    )
-                )
+                and _native_nonterminal_stops_known(history, _fingerprints=fingerprints)
             )
             and not needs_request_roles
             and not needs_synthetic_stop

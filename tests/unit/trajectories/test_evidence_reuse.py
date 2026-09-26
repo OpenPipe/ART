@@ -599,3 +599,98 @@ def test_boundary_decoder_mutation_keeps_uncaught_exception_identity(monkeypatch
     with pytest.raises(kind) as caught:
         history.tokenize(tokenizer=tokenizer)
     assert caught.value is error
+
+
+@pytest.mark.parametrize("mutate", [False, True])
+def test_explicit_render_binds_logprobs_before_stop_encoder(mutate):
+    from test_tokenize import _CharacterTemplateTokenizer
+
+    calls = []
+    exchange = None
+
+    class Tokenizer(_CharacterTemplateTokenizer):
+        eos_token_id = None
+        all_special_tokens = []
+
+        def convert_tokens_to_ids(self, token):
+            return None
+
+        def __call__(self, text, **kwargs):
+            if text == "END":
+                calls.append(text)
+                if mutate and len(calls) == 1:
+                    assert exchange is not None
+                    logprobs(exchange)[0].logprob = -9.0
+                return {"input_ids": [99]}
+            return super().__call__(text, **kwargs)
+
+    tokenizer = Tokenizer()
+    messages = [{"role": "user", "content": "turn 0"}]
+    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+    assert isinstance(prompt, list)
+    exchange = _chat_exchange(prompt, [20])
+    choice = exchange.response.choices[0]
+    choice.message.content = "ab"
+    logprobs(exchange)[0].logprob = -0.5
+    extras(exchange)["stop_reason"] = "END"
+    history = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(chat_completions=[exchange])
+    ).chat_completions_history()
+    if mutate:
+        with pytest.raises(ValueError, match="[Ss]ampled source changed"):
+            history.tokenize(tokenizer=tokenizer, chat_template="explicit override")
+    else:
+        result = history.tokenize(
+            tokenizer=tokenizer, chat_template="explicit override"
+        )
+        assert result.tokens[len(prompt)] == 20 and result.logprobs[len(prompt)] == -0.5
+        assert result.flags[len(prompt)] & tr.TokenFlag.SAMPLED
+    assert calls
+
+
+@pytest.mark.parametrize("mutate", [False, True])
+def test_explicit_render_checks_next_source_before_stop_consumption(mutate):
+    from test_tokenize import _CharacterTemplateTokenizer
+
+    calls = []
+    second = None
+
+    class Tokenizer(_CharacterTemplateTokenizer):
+        eos_token_id = None
+        all_special_tokens = []
+
+        def convert_tokens_to_ids(self, token):
+            return None
+
+        def __call__(self, text, **kwargs):
+            if text in ("FIRST", "SECOND", "CHANGED"):
+                calls.append(text)
+                assert second is not None
+                if text == "FIRST" and mutate:
+                    extras(second)["stop_reason"] = "CHANGED"
+                elif text == "CHANGED":
+                    # A final-only equality check could miss this restoration.
+                    extras(second)["stop_reason"] = "SECOND"
+                return {"input_ids": [99]}
+            return super().__call__(text, **kwargs)
+
+    tokenizer = Tokenizer()
+    prompt = tokenizer._encode("turn 0")
+    first = _chat_exchange(prompt, [20])
+    second = _chat_exchange([*prompt, 20, *tokenizer._encode("turn 1")], [21], offset=1)
+    extras(first)["stop_reason"] = "FIRST"
+    extras(second)["stop_reason"] = "SECOND"
+    value = trajectory(first, second)
+    before = value.model_dump_json()
+    if mutate:
+        with pytest.raises(ValueError, match="[Ss]ampled source changed"):
+            value.tokenize(tokenizer=tokenizer, chat_template="explicit override")
+        assert "FIRST" in calls and "CHANGED" not in calls
+    else:
+        result = value.tokenize(tokenizer=tokenizer, chat_template="explicit override")
+        assert [
+            token
+            for token, flag in zip(result.tokens, result.flags)
+            if flag & tr.TokenFlag.SAMPLED
+        ] == [20, 21]
+        assert value.model_dump_json() == before

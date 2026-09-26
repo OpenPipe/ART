@@ -251,3 +251,26 @@ def test_unresolved_nonterminal_stop_still_loads_boundary_authority(
         | tr.TokenFlag.STOP
     )
     assert math.isnan(result.logprobs[boundary])
+
+
+def test_known_numeric_nonterminal_stop_keeps_terminal_length_offline(monkeypatch):
+    first = _chat_exchange([1], [2, 3])
+    assert first.response.choices[0].model_extra is not None
+    first.response.choices[0].model_extra["stop_reason"] = 3
+    last = _chat_exchange([1, 2, 3, 4], [5], offset=1)
+    last.response.choices[0].finish_reason = "length"
+    value = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(chat_completions=[first, last])
+    )
+
+    def no_load(*args, **kwargs):
+        raise AssertionError("Complete numeric-stop chain needs no tokenizer")
+
+    monkeypatch.setattr(module, "_tokenizer_config", no_load)
+    monkeypatch.setattr(module, "_load_tokenizer", no_load)
+    result = value.tokenize()
+    assert result.tokens == [1, 2, 3, 4, 5]
+    assert result.flags[2] & tr.TokenFlag.STOP
+    assert not result.flags[-1] & tr.TokenFlag.STOP
+    assert result.logprobs[1:3] == [-0.2, -0.3]
+    assert result.logprobs[-1] == -0.5
