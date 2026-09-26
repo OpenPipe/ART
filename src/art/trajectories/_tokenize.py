@@ -626,9 +626,21 @@ def _recorded_prompt_role_masks(
                 "Renderer changed context while proving recorded request roles"
             )
 
+    normalization_template = template
+    if isinstance(getattr(tokenizer, "chat_template", None), dict) and callable(
+        select := getattr(tokenizer, "get_chat_template", None)
+    ):
+        normalization_template = select(
+            chat_template=template if isinstance(template, str) else None,
+            tools=tools,
+        )
+        check_context()
+
     def render(selected: list[dict[str, Any]], *, add_generation_prompt: bool) -> str:
         value = tokenizer.apply_chat_template(
-            normalize_tool_call_arguments_for_chat_template(selected, template),
+            normalize_tool_call_arguments_for_chat_template(
+                selected, normalization_template
+            ),
             tools=tools,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
@@ -5379,6 +5391,10 @@ def _tokenize_chat_view(
     _trace: _TraceBuilder | None = None,
     _prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = (),
 ) -> TokenizedHistory:
+    if _trace is not None:
+        # Rendering may continue after exact assembly to prove historical roles.
+        # Keep every consumed source bound even for a standalone/single history.
+        _trace.track_sources = True
     _validate_history_sources(history)
     config = (
         _TokenizerConfig(base_model or history.model or "")
@@ -7909,8 +7925,7 @@ def tokenize_history(
         _projection_validated=_projection_validated,
         _copied_context=bool(copied),
     )
-    if trace_builder.tokenizer is not None:
-        trace_builder.validate_context(True)
+    _validate_completed_sources([trace_builder])
     if copied:
         if trace_builder is None or trace_builder.trace is None:
             raise ValueError(
