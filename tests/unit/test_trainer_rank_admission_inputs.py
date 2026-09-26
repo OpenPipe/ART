@@ -33,6 +33,7 @@ def assert_plan_values(rank, plan, values):
     assert values["gdn_segments"] == plan.grad_segment_count
     assert values["group_rows"] == rank._plan_group_rows(plan)
     assert values["group_routed_rows"] == rank._plan_group_routed_rows(plan)
+    assert values["group_layouts"] == rank._plan_group_layouts(plan)
     assert values["head_workspace_bytes"] == rank._plan_head_workspace_bytes(plan)
     assert values["checkpoint_floor"] == _gdn_memory.plan_floor(rank, plan)
     assert values["retained_tokens"] == rank._plan_retained_tokens(plan)

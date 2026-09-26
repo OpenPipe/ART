@@ -239,6 +239,8 @@ jobs:
             tests/unit/test_trainer_rank_pending_memory.py \
             tests/unit/test_trainer_rank_shared_memory.py \
             tests/unit/test_trainer_rank_converted_memory.py \
+            tests/unit/test_trainer_rank_layout_memory.py \
+            tests/unit/test_context_parallel_retained_bytes.py \
             tests/unit/test_trainer_rank_split.py \
             tests/unit/test_megatron_compile_garbage.py \
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
@@ -283,4 +285,6 @@ jobs:
             --ignore=tests/unit/test_trainer_rank_pending_memory.py \
             --ignore=tests/unit/test_trainer_rank_shared_memory.py \
             --ignore=tests/unit/test_megatron_compile_garbage.py \
-            --ignore=tests/unit/test_trainer_rank_converted_memory.py
+            --ignore=tests/unit/test_trainer_rank_converted_memory.py \
+            --ignore=tests/unit/test_trainer_rank_layout_memory.py \
+            --ignore=tests/unit/test_context_parallel_retained_bytes.py

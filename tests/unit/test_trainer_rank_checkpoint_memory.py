@@ -534,10 +534,11 @@ def test_routed_rows_move_only_the_routed_moe_part():
     fewer = r._checkpoint_memory_floor(((local, True),), None, (routed,))
     assert fewer[0] == retained
     assert workspace - fewer[1] == (local - routed) * (188416 - 8192)
-    # Never more routed rows than local ones.
-    assert r._moe_workspace_bytes(
-        10, routed_rows=20, checkpoint_grad=True
-    ) == r._moe_workspace_bytes(10, checkpoint_grad=True)
+    # A rank can receive more routed rows than it holds: all are priced, and
+    # the shared part stays on the routed count.
+    assert r._moe_workspace_bytes(10, routed_rows=20, checkpoint_grad=True) == (
+        20 * 188416
+    )
     r._moe_gradient_shared_bytes = 188417
     with pytest.raises(ValueError, match="shared-expert"):
         r._moe_workspace_bytes(10, checkpoint_grad=True)
