@@ -67,6 +67,7 @@ from art.trainer_rank._impl import (
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
     from art.megatron.train import TrainingRuntime
+    from art.trainer_rank._impl import _AdapterConfig
 
 
 class _Model:
@@ -1459,6 +1460,15 @@ def test_prepared_snapshot_loads_forward_only_without_replacing_slots(
         snapshot_prepared_checkpoint(trainer, source, "loaded")
 
 
+def _adapter_config(model: str = "test/model") -> _AdapterConfig:
+    return {
+        "base_model_name_or_path": model,
+        "r": 1,
+        "lora_alpha": 1,
+        "target_modules": [],
+    }
+
+
 def test_checkpoint_export_requires_retained_adapter_config() -> None:
     trainer = TrainerRank(_runtime())
     with pytest.raises(TrainerRankSlotStateError, match="unloaded checkpoint"):
@@ -1490,12 +1500,7 @@ def test_prepared_lora_export_lifecycle_without_megatron(
     )
     trainer = TrainerRank(_runtime())
     trainer._checkpoint_slots["student"] = _CheckpointSlot(
-        config={
-            "base_model_name_or_path": "test",
-            "r": 1,
-            "lora_alpha": 1,
-            "target_modules": [],
-        },
+        config=_adapter_config("test"),
         revision=7,
     )
 
@@ -1533,12 +1538,7 @@ def test_checkpoint_save_rejects_accumulated_gradients() -> None:
     trainer._checkpoint_slots.setdefault("student", _CheckpointSlot()).params = (
         parameter,
     )
-    trainer._checkpoint_slots["student"].config = {
-        "base_model_name_or_path": "test",
-        "r": 1,
-        "lora_alpha": 1,
-        "target_modules": [],
-    }
+    trainer._checkpoint_slots["student"].config = _adapter_config("test")
 
     with pytest.raises(TrainerRankSlotStateError, match="accumulated gradients"):
         _validate_save_state(trainer, "student")
@@ -2177,12 +2177,7 @@ def test_checkpoint_cleanup_gather_preserves_finish_error(
 def test_checkpoint_prepare_preserves_foreign_reservation(tmp_path: Path) -> None:
     trainer = _save_state_trainer()
     trainer._checkpoint_slots["student"] = _CheckpointSlot(
-        config={
-            "base_model_name_or_path": "test",
-            "r": 1,
-            "lora_alpha": 1,
-            "target_modules": [],
-        }
+        config=_adapter_config("test")
     )
     output = tmp_path / "save"
     reservation = tmp_path / ".save.reserved"
@@ -2203,12 +2198,7 @@ def test_checkpoint_prepare_reports_snapshot_cleanup_failure(
 
     trainer = _save_state_trainer()
     trainer._checkpoint_slots["student"] = _CheckpointSlot(
-        config={
-            "base_model_name_or_path": "test",
-            "r": 1,
-            "lora_alpha": 1,
-            "target_modules": [],
-        }
+        config=_adapter_config("test")
     )
     original = _checkpoint.shutil.rmtree
 
@@ -2262,12 +2252,7 @@ def _checkpoint_load_failure_worker(
         if phase == "export":
             if rank == 1:
                 trainer._checkpoint_slots["student"] = _CheckpointSlot(
-                    config={
-                        "base_model_name_or_path": "test/model",
-                        "r": 1,
-                        "lora_alpha": 1,
-                        "target_modules": [],
-                    }
+                    config=_adapter_config()
                 )
             with pytest.raises((ValueError, RuntimeError), match="Unknown|Another"):
                 lora_export_module.export_lora(trainer, "/unused", "student")
@@ -2308,12 +2293,7 @@ def _checkpoint_load_failure_worker(
         )
         source = PreparedCheckpoint(
             Path("/unused"),
-            {
-                "base_model_name_or_path": "test/model",
-                "r": 1,
-                "lora_alpha": 1,
-                "target_modules": [],
-            },
+            cast(dict[str, object], _adapter_config()),
             (),
             manifest,
             "digest",
