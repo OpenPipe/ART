@@ -28,7 +28,8 @@ directory; these cases pin the paths the audit found repeatedly re-fixed:
   exchange_inexact_length_stop            length stop without token ids (inexact
                                           assistant attribution)
 
-``qwen3/*`` (real ``Qwen/Qwen3-0.6B`` tokenizer; skipped when not cached offline)
+``qwen3/*`` (real ``Qwen/Qwen3-0.6B`` tokenizer pinned to ``_QWEN3_REVISION``;
+skipped when transformers is missing or that snapshot is not cached offline)
   chat_multi_turn_tool_calls_reasoning, chat_thinking_enabled,
   chat_thinking_off_literal_think_markers, chat_multi_part_assistant_content
                                           the same render-path histories through
@@ -69,6 +70,13 @@ from art.trajectories import TrajectoryExchanges
 
 GOLDEN_CASES = Path(__file__).with_name("tokenize_golden_cases.json")
 _QWEN3 = "Qwen/Qwen3-0.6B"
+# Snapshot the qwen3/* goldens were generated from; loaded offline only.
+_QWEN3_REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
+
+# A case builder returns the tokenized history plus the tokenizer and base_model
+# it used, so the recorded input digest captures tokenizer identity.
+Built = tuple[tr.TokenizedHistory, object, str | None]
+Builder = Callable[[pytest.FixtureRequest], Built]
 
 _MESSAGES: list[dict[str, Any]] = [
     {"role": "system", "content": "You are terse."},
@@ -138,26 +146,25 @@ def _chat_history(
     )
 
 
-def _fake(
-    messages: list[dict[str, Any]], **kwargs: Any
-) -> Callable[[Any], tr.TokenizedHistory]:
-    def build(_: Any) -> tr.TokenizedHistory:
-        return _chat_history(
+def _fake(messages: list[dict[str, Any]], **kwargs: Any) -> Builder:
+    def build(_: pytest.FixtureRequest) -> Built:
+        tokenizer = _QwenLikeCharacterTokenizer()
+        tokenized = _chat_history(
             messages, model="test/qwen", chat_template=_QWEN_LIKE_TEMPLATE, **kwargs
-        ).tokenize(tokenizer=_QwenLikeCharacterTokenizer())
+        ).tokenize(tokenizer=tokenizer)
+        return tokenized, tokenizer, None
 
     return build
 
 
-def _qwen3(
-    messages: list[dict[str, Any]], **kwargs: Any
-) -> Callable[[Any], tr.TokenizedHistory]:
-    def build(tokenizer: Any) -> tr.TokenizedHistory:
-        if tokenizer is None:
-            pytest.skip(f"{_QWEN3} tokenizer is not cached offline")
-        return _chat_history(messages, model=_QWEN3, **kwargs).tokenize(
+def _qwen3(messages: list[dict[str, Any]], **kwargs: Any) -> Builder:
+    def build(request: pytest.FixtureRequest) -> Built:
+        # Fetched lazily so the fake/* cases never import transformers.
+        tokenizer = request.getfixturevalue("qwen3_tokenizer")
+        tokenized = _chat_history(messages, model=_QWEN3, **kwargs).tokenize(
             base_model=_QWEN3, tokenizer=tokenizer
         )
+        return tokenized, tokenizer, f"{_QWEN3}@{_QWEN3_REVISION}"
 
     return build
 
@@ -167,11 +174,13 @@ def _with_finish_reason(exchange: Any, finish_reason: str) -> Any:
     return exchange
 
 
-def _exchanges(*exchanges: Any) -> Callable[[Any], tr.TokenizedHistory]:
-    def build(_: Any) -> tr.TokenizedHistory:
-        return art.Trajectory(
+def _exchanges(*exchanges: Any) -> Builder:
+    def build(_: pytest.FixtureRequest) -> Built:
+        tokenizer = _StopTokenizer()
+        tokenized = art.Trajectory(
             exchanges=TrajectoryExchanges(chat_completions=list(exchanges))
-        ).tokenize(tokenizer=_StopTokenizer())
+        ).tokenize(tokenizer=tokenizer)
+        return tokenized, tokenizer, None
 
     return build
 
@@ -197,7 +206,7 @@ def _inexact_length_exchange() -> Any:
     return exchange
 
 
-CASES: dict[str, Callable[[Any], tr.TokenizedHistory]] = {
+CASES: dict[str, Builder] = {
     "fake/chat_multi_turn_tool_calls_reasoning": _fake(_MESSAGES, tools=_TOOLS),
     "fake/chat_thinking_enabled": _fake(
         _MESSAGES, tools=_TOOLS, chat_template_kwargs={"enable_thinking": True}
@@ -233,23 +242,30 @@ CASES: dict[str, Callable[[Any], tr.TokenizedHistory]] = {
 
 @pytest.fixture(scope="module")
 def qwen3_tokenizer() -> Any:
+    """The pinned Qwen3 tokenizer from the local HF cache, or skip."""
+
     pytest.importorskip("transformers")
     from art.tokenizer import get_tokenizer
 
     try:
-        return get_tokenizer(_QWEN3, local_files_only=True)
-    except Exception:  # noqa: BLE001 - any loader failure means "not cached"
-        return None
+        return get_tokenizer(_QWEN3, revision=_QWEN3_REVISION, local_files_only=True)
+    except Exception as error:  # noqa: BLE001 - any loader failure means "not cached"
+        pytest.skip(
+            f"{_QWEN3}@{_QWEN3_REVISION[:8]} is not cached offline: "
+            f"{type(error).__name__}"
+        )
 
 
-def _record(case_id: str, tokenized: tr.TokenizedHistory) -> dict[str, Any]:
+def _record(
+    tokenized: tr.TokenizedHistory, tokenizer: object, base_model: str | None
+) -> dict[str, Any]:
     digest = output_digest(
         tokenized,
         input_hash=input_digest(
             tokenized.history,
             model=tokenized.model,
-            base_model=None,
-            tokenizer=None,
+            base_model=base_model,
+            tokenizer=tokenizer,
             chat_template=None,
             chat_template_kwargs=None,
         ),
@@ -284,9 +300,9 @@ def _first_value_difference(expected: dict[str, Any], actual: dict[str, Any]) ->
 
 
 @pytest.mark.parametrize("case_id", sorted(CASES))
-def test_tokenize_golden(case_id: str, qwen3_tokenizer: Any) -> None:
-    tokenized = CASES[case_id](qwen3_tokenizer)
-    record = _record(case_id, tokenized)
+def test_tokenize_golden(case_id: str, request: pytest.FixtureRequest) -> None:
+    tokenized, tokenizer, base_model = CASES[case_id](request)
+    record = _record(tokenized, tokenizer, base_model)
     if mode() == "update":
         _write_case(case_id, record)
         return
