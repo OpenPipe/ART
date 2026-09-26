@@ -4173,6 +4173,20 @@ class TrainerRank:
             # roots per group. Kernel-internal chunk states are not bounded here.
             roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
             workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
+        if (
+            gradient_rows
+            and self._topology_key() == (1, 1, 2, 1)
+            and self._parallel_shape == ParallelShape(tp=1, cp=2, ep=2, etp=1)
+            and self._moe_memory_supported
+        ):
+            # Recompute runs after _execute_flat_plan restores the communication
+            # high-water. Combine allocates a fresh BF16 [P, H] before cropping;
+            # this is separate from already-held native buffer capacity. Do not
+            # prune graph references or reset execution state while estimating.
+            rows = max(rows for rows, _ in group_rows)
+            if any(ref() is not None for ref in self._pending_hybridep_graphs):
+                rows = max(rows, self._hybridep_rows_high_water)
+            workspace = max(workspace, -(-rows // 4) * 4 * self._hidden_size * 2)
         return retained, workspace
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
