@@ -65,14 +65,15 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         return value
     if type(value) in (bool, float, int):
         return value
-    if isinstance(value, list) and all(
-        item is None or type(item) in (bool, float, int) for item in value
-    ):
-        return value
-
     value_id = id(value)
     if value_id in memo:
         return memo[value_id]
+
+    if isinstance(value, list) and all(
+        item is None or type(item) in (bool, float, int) for item in value
+    ):
+        memo[value_id] = value
+        return value
 
     if isinstance(value, BaseModel):
         memo[value_id] = value
