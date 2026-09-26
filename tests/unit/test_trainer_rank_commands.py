@@ -229,22 +229,50 @@ def test_rank_facade_is_trainer_rank_and_dispatches_inherited_methods():
     assert asyncio.run(run_rank_callback(rank, callback)).value == {"steps": 1}
 
 
-def test_stream_forwards_sends_and_closes():
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "ending", ["close", "return", StopIteration, StopAsyncIteration]
+)
+def test_stream_forwards_sends_and_closes(asynchronous, ending):
     rank: Any = _Rank()
     closed = []
+    error = ending("user generator failure") if isinstance(ending, type) else None
 
     def callback(view):
         try:
             sent = yield view.forward(_input(3)).hidden_states.item()
             yield sent * 2
+            if error is not None:
+                raise error
+        finally:
+            closed.append(True)
+
+    async def async_callback(view):
+        try:
+            sent = yield view.forward(_input(3)).hidden_states.item()
+            yield sent * 2
+            if error is not None:
+                raise error
         finally:
             closed.append(True)
 
     async def run():
-        stream = run_rank_callback_stream(rank, callback, mode="zero")
+        stream = run_rank_callback_stream(
+            rank, async_callback if asynchronous else callback, mode="zero"
+        )
         assert (await anext(stream)).value == 6
         assert (await stream.asend(9)).value == 18
+        if ending == "return":
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+        elif error is not None:
+            with pytest.raises(RuntimeError, match="generator raised") as failure:
+                await anext(stream)
+            assert failure.value.__cause__ is error
         await stream.aclose()
+        assert (
+            await run_rank_callback(rank, lambda view: view.optim_step())
+        ).value == {"steps": 1}
 
     asyncio.run(run())
     assert closed == [True]

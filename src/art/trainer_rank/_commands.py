@@ -1199,7 +1199,11 @@ async def run_rank_callback_stream(
                         if inspect.isasyncgen(iterator)
                         else iterator.send(sent)
                     )
-                except (StopIteration, StopAsyncIteration):
+                except (
+                    StopAsyncIteration
+                    if inspect.isasyncgen(iterator)
+                    else StopIteration
+                ):
                     return
                 sent = yield RankCallbackResult(
                     0 if mode == "zero" else executor.dp_rank, value

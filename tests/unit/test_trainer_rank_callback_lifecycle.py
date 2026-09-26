@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from trainer_rank_test_support import gloo_group, megatron_topology
 
-from art.trainer_rank import run_rank_callback
+from art.trainer_rank import run_rank_callback, run_rank_callback_stream
 
 
 class _CheckpointRank(_Rank):
@@ -154,6 +154,32 @@ def _lifecycle_worker(physical, rendezvous):
             assert rank._slot_stack == (["outer", "changed"] if physical else ["outer"])
             rank._slot_stack.clear()
             rank.zero_grad = zero_grad
+            asyncio.run(run_rank_callback(rank, following, mode=mode))
+            dist.barrier()
+
+            wrong_stop = StopAsyncIteration("user generator failure")
+            closed = []
+
+            def generate(view):
+                try:
+                    view.zero_grad()
+                    yield 17
+                    raise wrong_stop
+                finally:
+                    closed.append(True)
+
+            async def consume():
+                async for result in run_rank_callback_stream(rank, generate, mode=mode):
+                    assert result.value == (17 if physical == 0 else None)
+
+            if physical == 0:
+                with pytest.raises(RuntimeError, match="generator raised") as failure:
+                    asyncio.run(consume())
+                assert failure.value.__cause__ is wrong_stop
+            else:
+                asyncio.run(consume())
+            assert closed == ([True] if physical == 0 else [])
+            dist.barrier()
             asyncio.run(run_rank_callback(rank, following, mode=mode))
             dist.barrier()
 
