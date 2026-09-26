@@ -3253,8 +3253,6 @@ class TrainerRank:
                 # Do not retain our completed graph through a new handoff traceback.
                 del tracked_outputs, flat_outputs, outputs
                 raise
-            if backward is not None:
-                backward.attach(tracked_outputs)
             stop = start + candidate.stats_global_count
             if stop < len(items):
                 self._last_global_micro_batch_size = max(
@@ -3452,8 +3450,6 @@ class TrainerRank:
             tracked_outputs = self._execute_admitted_plan(
                 plan, check=check, context="forward"
             )
-            if backward is not None:
-                backward.attach(tracked_outputs)
             outputs = _unflatten(materialized, iter(tracked_outputs))
         self._rng.synchronize(caller_group())
         return outputs
@@ -7309,6 +7305,11 @@ class TrainerRank:
                 if spec is not None and captured_spec != spec:
                     raise RuntimeError("Forward replay changed its output tree")
                 spec = captured_spec
+                # Observe physical backward, including replay, before the cache
+                # replaces these outputs with detached caller cotangent proxies.
+                backward = self._backward_work()
+                if backward is not None:
+                    backward.attach(outputs)
                 return tensors
             finally:
                 if hybrid is not None:

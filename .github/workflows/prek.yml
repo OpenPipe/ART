@@ -224,6 +224,7 @@ jobs:
             tests/unit/test_prefix_tree_grad_parity.py \
             tests/unit/test_prefix_tree_packing.py \
             tests/unit/test_trainer_rank_handoff_budget.py \
+            tests/unit/test_trainer_rank_graph_backward_work.py \
             tests/unit/test_qwen35_adapter_config.py \
             tests/unit/test_trainer_rank_physical_reserve.py \
             tests/unit/test_trainer_rank_validation.py \
@@ -272,6 +273,7 @@ jobs:
             --ignore=tests/unit/test_prefix_tree_grad_parity.py \
             --ignore=tests/unit/test_prefix_tree_packing.py \
             --ignore=tests/unit/test_trainer_rank_handoff_budget.py \
+            --ignore=tests/unit/test_trainer_rank_graph_backward_work.py \
             --ignore=tests/unit/test_qwen35_adapter_config.py \
             --ignore=tests/unit/test_trainer_rank_physical_reserve.py \
             --ignore=tests/unit/test_trainer_rank_validation.py \
