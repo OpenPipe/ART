@@ -260,13 +260,17 @@ class CheckpointVersions:
 
     def commit(self, gradients: Sequence[VersionedGradient]) -> None:
         batch = _GradientBatch()
+        prepared = None
         try:
             self.validate_gradients(gradients)
             for entry in gradients:
                 batch.add(*entry)
-            self._commit_batch(batch)
+            prepared = self._prepare_batch(batch)
+            self._publish(prepared)
         finally:
             batch.clear()
+            if prepared is not None:
+                prepared.clear()
 
     def _prepare_batch(self, batch: _GradientBatch) -> _PreparedGradients:
         from ._parameter_hooks import apply_parameter_hooks
@@ -312,16 +316,6 @@ class CheckpointVersions:
                 self._origins, prepared.origins = prepared.origins, {}
             finally:
                 parameter = gradient = previous = None
-
-    def _commit_batch(self, batch: _GradientBatch) -> None:
-        prepared = None
-        try:
-            prepared = self._prepare_batch(batch)
-            self._publish(prepared)
-        finally:
-            batch.clear()
-            if prepared is not None:
-                prepared.clear()
 
     def validate_accumulated(self, names: Sequence[str]) -> None:
         for name in names:
