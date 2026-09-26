@@ -12,6 +12,7 @@ import pytest
 
 import art.trajectories as tr
 from art.trajectories import _tokenize
+from art_inference.chat_template import chat_template_with_preserved_thinking
 
 # Public Qwen3.5 template after ART's existing thinking-preservation rewrite.
 _TEMPLATE = (
@@ -442,3 +443,159 @@ def test_literal_next_turn_preserves_preceding_length_stop_boundary(
             for flag in value.flags[start:stop]
         )
     assert history.model_dump(mode="python") == original
+
+
+class _NamedTemplateTokenizer(_TemplateTokenizer):
+    chat_template: Any
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.chat_template = {
+            "default": _TEMPLATE,
+            "tool_use": _TEMPLATE + "TOOL_TEMPLATE",
+            "named": _TEMPLATE + "NAMED_TEMPLATE",
+        }
+        self.selected: list[str] = []
+        self.settings: list[dict[str, Any]] = []
+
+    def get_chat_template(self, chat_template=None, tools=None):
+        # Transformers' named/default/tool selection contract, before rendering.
+        templates = self.chat_template
+        if chat_template is not None:
+            return templates.get(chat_template, chat_template)
+        if tools is not None and "tool_use" in templates:
+            return templates["tool_use"]
+        if "default" in templates:
+            return templates["default"]
+        raise ValueError("No default template")
+
+    def apply_chat_template(self, messages, **kwargs):
+        template = self.get_chat_template(
+            kwargs.pop("chat_template", None), kwargs.get("tools")
+        )
+        self.selected.append(template)
+        self.settings.append(deepcopy(kwargs))
+        return super().apply_chat_template(messages, chat_template=template, **kwargs)
+
+
+@pytest.mark.parametrize("selection", ["default", "tools", "named", "literal_override"])
+@pytest.mark.parametrize("route", ["history", "exchange"])
+def test_unconfigured_named_template_preserves_unrecorded_literal_content(
+    selection, route
+):
+    tokenizer = _NamedTemplateTokenizer()
+    templates_before = deepcopy(tokenizer.chat_template)
+    history, _ = _history()
+    source = history.message_sources[-1]
+    assert source is not None
+    exchange = source.exchange.model_copy(deep=True)
+    assert isinstance(exchange, tr.ChatCompletionsExchange)
+    exchange.request.pop("chat_template", None)
+    override = (
+        "named"
+        if selection == "named"
+        else _TEMPLATE + "OVERRIDE_TEMPLATE"
+        if selection == "literal_override"
+        else None
+    )
+    tools: list[Any] | None = (
+        [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}},
+            }
+        ]
+        if selection == "tools"
+        else None
+    )
+    if route == "history":
+        # No native tokens: preservation must come from rendering itself.
+        history = tr.ChatCompletionsHistory(
+            model="public/qwen35",
+            messages=deepcopy(history.messages),
+            message_sources=[None] * len(history.messages),
+            tools=tools,
+        )
+        before = history.model_dump()
+        result = history.tokenize(
+            tokenizer=tokenizer,
+            chat_template=override,
+            chat_template_kwargs={"enable_thinking": True, "preserve_thinking": False},
+        )
+        assert _LITERAL in tokenizer.decode(result.tokens)
+        assert not any(flag & tr.TokenFlag.SAMPLED for flag in result.flags)
+        assert history.model_dump() == before
+    else:
+        if tools is not None:
+            exchange.request["tools"] = tools
+        before = exchange.model_dump()
+        result = _tokenize._template_ids(
+            tokenizer,
+            exchange,
+            completed=True,
+            config=_tokenize._TokenizerConfig(base_model="public/qwen35"),
+            chat_template=override,
+            chat_template_kwargs={"enable_thinking": True, "preserve_thinking": False},
+        )
+        assert _LITERAL in tokenizer.decode(result)
+        assert exchange.model_dump() == before
+    assert tokenizer.chat_template == templates_before
+    assert tokenizer.selected
+    expected = (
+        templates_before["named"]
+        if selection == "named"
+        else override
+        if selection == "literal_override"
+        else templates_before["tool_use"]
+        if selection == "tools"
+        else templates_before["default"]
+    )
+    assert all(
+        selected == chat_template_with_preserved_thinking(expected)
+        for selected in tokenizer.selected
+    )
+    assert all(
+        settings["enable_thinking"] is True and settings["preserve_thinking"] is False
+        for settings in tokenizer.settings
+    )
+
+
+def test_named_template_selection_failure_keeps_original_error():
+    tokenizer = _NamedTemplateTokenizer()
+    del tokenizer.chat_template["default"]
+    with pytest.raises(ValueError, match="No default template"):
+        _tokenize._resolved_chat_template(tokenizer, None, None)
+    # Explicit unrelated templates are selected unchanged, not rewritten merely
+    # because this tokenizer also has a known Qwen template in its dictionary.
+    custom = "{% for message in messages %}{{ message.content }}{% endfor %}"
+    assert _tokenize._resolved_chat_template(tokenizer, custom, None) == (custom, {})
+
+
+@pytest.mark.parametrize("selection", [None, "named"])
+def test_named_selection_preserves_implicit_generation_mode(selection):
+    tokenizer = _NamedTemplateTokenizer()
+    history, _ = _history()
+    source = history.message_sources[-1]
+    assert source is not None
+    exchange = source.exchange.model_copy(deep=True)
+    assert isinstance(exchange, tr.ChatCompletionsExchange)
+    exchange.request.pop("chat_template", None)
+    exchange.request.pop("chat_template_kwargs", None)
+    expected = tokenizer.apply_chat_template(
+        exchange.request["messages"],
+        chat_template=selection,
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+    tokenizer.settings.clear()
+    actual = _tokenize._template_ids(
+        tokenizer,
+        exchange,
+        completed=False,
+        config=_tokenize._TokenizerConfig(base_model="public/qwen35"),
+        chat_template=selection,
+        chat_template_kwargs=None,
+    )
+    assert actual == expected
+    assert "enable_thinking" not in tokenizer.settings[-1]
+    assert "preserve_thinking" not in tokenizer.settings[-1]

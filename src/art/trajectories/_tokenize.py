@@ -2070,6 +2070,25 @@ def _response_message(
     raise TypeError("Completions responses do not use chat templates")
 
 
+def _resolved_chat_template(
+    tokenizer: Tokenizer, template: object, tools: object
+) -> tuple[object, dict[str, Any]]:
+    # Preserve preselection defaults: resolving a named template must not
+    # silently change its generation mode. Explicit kwargs still override these.
+    configured = chat_template_with_preserved_thinking(template)
+    defaults = default_chat_template_kwargs_for_template(configured)
+    if isinstance(getattr(tokenizer, "chat_template", None), dict):
+        select = getattr(tokenizer, "get_chat_template", None)
+        if callable(select):
+            configured = chat_template_with_preserved_thinking(
+                select(
+                    chat_template=template if isinstance(template, str) else None,
+                    tools=tools,
+                )
+            )
+    return configured, defaults
+
+
 def _template_ids(
     tokenizer: Tokenizer,
     exchange: Exchange,
@@ -2117,9 +2136,9 @@ def _template_ids(
         or config.chat_template
         or getattr(tokenizer, "chat_template", None)
     )
-    template = chat_template_with_preserved_thinking(template)
+    template, defaults = _resolved_chat_template(tokenizer, template, tools)
     kwargs = {
-        **default_chat_template_kwargs_for_template(template),
+        **defaults,
         **explicit_kwargs,
     }
     result = tokenizer.apply_chat_template(
@@ -5015,9 +5034,11 @@ def _tokenize_chat_view(
         tokenizer_template = getattr(resolved_tokenizer, "chat_template", None)
         if isinstance(tokenizer_template, str):
             template = tokenizer_template
-    template = chat_template_with_preserved_thinking(template)
+    template, defaults = _resolved_chat_template(
+        resolved_tokenizer, template, history.tools
+    )
     kwargs = {
-        **default_chat_template_kwargs_for_template(template),
+        **defaults,
         **explicit_kwargs,
     }
     ends_with_assistant = bool(messages) and messages[-1].get("role") == "assistant"

@@ -305,3 +305,71 @@ def test_newline_parser_spelling_in_nonexecutable_token_unchanged(newline, wrapp
     else:
         template = '{{ "' + operation + '" }}'
     assert _without_inline_reasoning_parser(template) == template
+
+
+@pytest.mark.parametrize("spelling", ["double_quotes", "spacing", "parentheses"])
+def test_equivalent_inline_operations_preserve_literal_and_structured_fields(spelling):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    operation = match.group()
+    if spelling == "double_quotes":
+        operation = operation.replace("'", '"')
+    elif spelling == "spacing":
+        operation = operation.replace("content.split", "content . split").replace(
+            "[0]", "[ 0 ]"
+        )
+    else:
+        operation = operation.replace(
+            "if '</think>' in content", "if ('</think>' in content)"
+        )
+    template = _TEMPLATE[: match.start()] + operation + _TEMPLATE[match.end() :]
+    assert template != _TEMPLATE
+    fixed = chat_template_with_preserved_thinking(template)
+    for content in _LITERALS:
+        for reasoning in (None, "", "explicit structured reasoning\n"):
+            messages = [_USER, {"role": "assistant", "content": content}]
+            if reasoning is not None:
+                messages[-1]["reasoning_content"] = reasoning
+            for preserve in (False, True):
+                kwargs = dict(enable_thinking=False, preserve_thinking=preserve)
+                assert _render(fixed, messages, **kwargs) == _render(
+                    _FIXED, messages, **kwargs
+                )
+    assert chat_template_with_preserved_thinking(fixed) == fixed
+
+
+@pytest.mark.parametrize("wrapper", ["raw", "comment", "quoted"])
+def test_equivalent_operation_as_literal_data_is_not_edited(wrapper):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    operation = match.group().replace("'", '"')
+    if wrapper == "raw":
+        literal = "{% raw %}" + operation + "{% endraw %}"
+    elif wrapper == "comment":
+        literal = "{#" + operation + "#}"
+    else:
+        literal = "{{ '" + operation + "' }}"
+    assert _without_inline_reasoning_parser(literal) == literal
+    assert isinstance(_FIXED, str)
+    assert _without_inline_reasoning_parser(_TEMPLATE + literal) == _FIXED + literal
+
+
+@pytest.mark.parametrize("change", ["different_split", "side_effect", "different_gate"])
+def test_distinct_custom_content_operations_are_not_inferred(change):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    operation = match.group()
+    if change == "different_split":
+        operation = operation.replace(
+            "content.split('</think>')[-1]", "content.split('</think>')[0]"
+        )
+    elif change == "side_effect":
+        operation = operation.replace(
+            "{%- endif %}", "{%- set other = content %}{%- endif %}"
+        )
+    else:
+        operation = operation.replace(
+            "if '</think>' in content", "if custom and '</think>' in content"
+        )
+    assert operation != match.group()
+    assert _without_inline_reasoning_parser(operation) == operation

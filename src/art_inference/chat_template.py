@@ -28,62 +28,93 @@ _MINIMAX_PRESERVE_PRIOR_THINKING = (
 # These operations infer reasoning from arbitrary assistant content and can
 # discard everything before the last <think> or between repeated </think> tags.
 # Match the operations, not a model revision or the text of a particular answer.
+_QWEN_INLINE_STATEMENTS = (
+    "if '</think>' in content",
+    "set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n')",
+    "set content = content.split('</think>')[-1].lstrip('\\n')",
+    "endif",
+)
 _QWEN_INLINE_REASONING = re.compile(
     r"\s*".join(
         r"\{%[-+]?\s*" + re.escape(statement) + r"\s*[-+]?%\}"
-        for statement in (
-            "if '</think>' in content",
-            "set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n')",
-            "set content = content.split('</think>')[-1].lstrip('\\n')",
-            "endif",
-        )
+        for statement in _QWEN_INLINE_STATEMENTS
     )
 )
 
 
 def _without_inline_reasoning_parser(template: str) -> str:
-    matches = list(_QWEN_INLINE_REASONING.finditer(template))
-    if not matches:
+    if "reasoning_content" not in template or "split" not in template:
         return template
     from jinja2 import Environment, TemplateSyntaxError
 
-    # Only executable block tokens may be edited. The same spelling inside a
-    # quoted expression, raw block or comment is literal template data.
-    # Jinja lexes normalized newlines; map its positions to the original source.
+    # Compare parsed operations, not quote/spacing choices or a template hash.
+    # Only executable block tokens may be edited; quoted/raw/comment data stays.
+    env = Environment()
+    operation = env.parse(
+        "".join("{% " + statement + " %}" for statement in _QWEN_INLINE_STATEMENTS)
+    ).body
     normalized = re.sub(r"\r\n?", "\n", template)
     offsets = [
         i
         for i, char in enumerate(template)
         if not (char == "\n" and i and template[i - 1] == "\r")
-    ]
-    starts: set[int] = set()
+    ] + [len(template)]
+    blocks: list[tuple[int, int, int, int]] = []
     cursor = 0
+    opening = None
     try:
-        for _, kind, value in Environment().lex(template):
+        for _, kind, value in env.lex(template):
             start = normalized.find(value, cursor)
             if start < 0 or normalized[cursor:start].strip():
                 return template  # Lexer normalization could not be source-joined.
             if kind == "block_begin":
-                starts.add(offsets[start])
+                opening = offsets[start], offsets[start + len(value)]
+            elif kind == "block_end" and opening is not None:
+                # The lexer can include whitespace following a right-trim tag.
+                end = start + value.index("%}") + 2
+                blocks.append((*opening, offsets[start], offsets[end]))
+                opening = None
             cursor = start + len(value)
     except TemplateSyntaxError:
         return template  # Leave invalid templates to their existing renderer.
-    edits = {
-        (match.start(), match.end()): "" for match in matches if match.start() in starts
-    }
+    edits: dict[tuple[int, int], str] = {}
+    for index, (start, _, _, _) in enumerate(blocks):
+        selected = blocks[index : index + 4]
+        if len(selected) != 4 or "split" not in template[start : selected[-1][3]]:
+            continue
+        if any(
+            template[left[3] : right[0]].strip()
+            for left, right in zip(selected, selected[1:])
+        ):
+            continue
+        end = selected[-1][3]
+        try:
+            if env.parse(template[start:end]).body == operation:
+                edits[start, end] = ""
+        except TemplateSyntaxError:
+            continue
     if not edits:
         return template
     # Dropping structured reasoning must not trim the visible assistant body.
-    for content in (
-        "render_content(message.content, true)|trim",
-        "(render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
-    ):
-        statement = "{%- set content = " + content + " %}"
-        for match in re.finditer(re.escape(statement), template):
-            if match.start() in starts:
-                edits[match.span()] = (
-                    "{%- set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim) %}"
+    trims = [
+        env.parse("{% set content = " + content + " %}").body
+        for content in (
+            "render_content(message.content, true)|trim",
+            "(render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
+        )
+    ]
+    for start, body_start, body_end, end in blocks:
+        if "render_content" not in template[body_start:body_end]:
+            continue
+        try:
+            if env.parse(template[start:end]).body in trims:
+                edits[start, end] = (
+                    template[start:body_start]
+                    + " set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim) "
+                    + template[body_end:end]
                 )
+        except TemplateSyntaxError:
+            continue
     for (start, end), replacement in sorted(edits.items(), reverse=True):
         template = template[:start] + replacement + template[end:]
     return template

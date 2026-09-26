@@ -43,6 +43,12 @@ format into `reasoning_content` and `content` before rendering. A leading tag
 pair alone cannot establish that format. Structured reasoning and the template's
 generation-prompt defaults retain their existing behavior.
 
+For named template dictionaries, ART uses the tokenizer’s default, tool, or
+explicitly selected template before applying the same correction. The correction
+recognizes the known inline-content parsing operations, including equivalent
+quoting and spacing; it does not reinterpret arbitrary custom template logic.
+This also preserves literal content when no recorded token IDs are available.
+
 By splitting each turn into a separate history, you can preserve these tokens for training:
 
 ```python
