@@ -4665,32 +4665,7 @@ class _ChatViewTokenizer:
 
     def run(self) -> TokenizedHistory:
         self._render_messages()
-        direct_render: list[int] = []
-        self.direct_bounds: list[tuple[int, int]] = []
-        for message in self.messages:
-            start = len(direct_render)
-            for _, text in _chat_message_parts(message):
-                direct_render.extend(self._part_ids(text))
-            self.direct_bounds.append((start, len(direct_render)))
-        if direct_render == self.rendered:
-            self.canonical_assistant_mask = [False] * len(self.rendered)
-            for message, (start, end) in zip(
-                self.messages, self.direct_bounds, strict=True
-            ):
-                if message.get("role") == "assistant":
-                    self.canonical_assistant_mask[start:end] = [True] * (end - start)
-        else:
-            self.direct_bounds = []
-            self.segmented = True
-            self.rendered, self.canonical_assistant_mask = self._segmented_render(
-                self.messages, add_generation_prompt=not self.ends_with_assistant
-            )
-        _materialize_missing_role_stop(
-            self.rendered, self.canonical_assistant_mask, self.messages, self.tokenizer
-        )
-        self.canonical_assistant_mask, self.canonical_stop_mask = _assistant_stop_masks(
-            self.rendered, self.canonical_assistant_mask, self.tokenizer
-        )
+        self._render_canonical_masks()
         self.canonical_rendered = self.rendered
         self.exact_prefix_length = 0
         self.canonical_prefix_length = 0
@@ -6291,6 +6266,34 @@ class _ChatViewTokenizer:
                 self.tokenizer(text, add_special_tokens=False)
             )
         return self.part_ids_cache[text]
+
+    def _render_canonical_masks(self) -> None:
+        direct_render: list[int] = []
+        self.direct_bounds: list[tuple[int, int]] = []
+        for message in self.messages:
+            start = len(direct_render)
+            for _, text in _chat_message_parts(message):
+                direct_render.extend(self._part_ids(text))
+            self.direct_bounds.append((start, len(direct_render)))
+        if direct_render == self.rendered:
+            self.canonical_assistant_mask = [False] * len(self.rendered)
+            for message, (start, end) in zip(
+                self.messages, self.direct_bounds, strict=True
+            ):
+                if message.get("role") == "assistant":
+                    self.canonical_assistant_mask[start:end] = [True] * (end - start)
+        else:
+            self.direct_bounds = []
+            self.segmented = True
+            self.rendered, self.canonical_assistant_mask = self._segmented_render(
+                self.messages, add_generation_prompt=not self.ends_with_assistant
+            )
+        _materialize_missing_role_stop(
+            self.rendered, self.canonical_assistant_mask, self.messages, self.tokenizer
+        )
+        self.canonical_assistant_mask, self.canonical_stop_mask = _assistant_stop_masks(
+            self.rendered, self.canonical_assistant_mask, self.tokenizer
+        )
 
     def _source_prompt_tokens(self, source: object) -> list[int] | None:
         key = id(source)
