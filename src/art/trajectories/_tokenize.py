@@ -4675,175 +4675,7 @@ class _ChatViewTokenizer:
         if exact is not None:
             return exact
         self._collect_replacements()
-        token_ids: list[int] = []
-        logprobs: list[float] = []
-        flags: list[TokenFlag] = []
-        source_keys: list[_SampledSourceKey | None] = []
-        sources: dict[_SampledSourceKey, object] = {}
-        cursor = 0
-        for (
-            start,
-            end,
-            replacement,
-            replacement_logprobs,
-            exact,
-            source_key,
-            source,
-            part_end,
-        ) in sorted(self.replacements, key=lambda item: (item[0], item[1])):
-            synthetic_stop_token: int | None = None
-            if exact and _source_stop_evidence(source, source_key)[0] == "length":
-                synthetic_stop = next(
-                    (index for index in range(start, end) if self.stop_mask[index]),
-                    None,
-                )
-                if synthetic_stop is not None:
-                    if part_end is not None and synthetic_stop + 1 < part_end:
-                        if end < part_end:
-                            raise ValueError(
-                                "Exact sampled tokens do not cover the proven history part"
-                            )
-                        # Keep the boundary without replaying replaced visible content.
-                        synthetic_stop_token = self.rendered[synthetic_stop]
-                        end = part_end
-                    else:
-                        end = synthetic_stop
-            if start < cursor:
-                raise ValueError("Rendered assistant source spans overlap")
-            token_ids.extend(self.rendered[cursor:start])
-            logprobs.extend([math.nan] * (start - cursor))
-            flags.extend(
-                _rendered_flag(
-                    assistant and not length_stop,
-                    output and not length_stop,
-                    stop,
-                )
-                for assistant, output, stop, length_stop in zip(
-                    self.assistant_mask[cursor:start],
-                    self.output_mask[cursor:start],
-                    self.stop_mask[cursor:start],
-                    self.length_stop_mask[cursor:start],
-                    strict=True,
-                )
-            )
-            source_keys.extend([None] * (start - cursor))
-            try:
-                replacement_stop_mask = _translate_token_mask(
-                    self.rendered[start:end], replacement, self.stop_mask[start:end]
-                )
-            except ValueError:
-                replacement_stop_mask = [False] * len(replacement)
-            if synthetic_stop_token is not None:
-                replacement_stop_mask = [False] * len(replacement)
-            replacement_length_stop_mask = (
-                [False] * len(replacement)
-                if synthetic_stop_token is not None
-                else _translate_token_mask(
-                    self.rendered[start:end],
-                    replacement,
-                    self.length_stop_mask[start:end],
-                )
-            )
-            if exact:
-                token_ids.extend(replacement)
-                logprobs.extend(replacement_logprobs)
-                replacement_flags = [
-                    TokenFlag.EXACT
-                    | TokenFlag.SAMPLED
-                    | TokenFlag.ASSISTANT
-                    | TokenFlag.OUTPUT
-                    | (TokenFlag.STOP if stop else TokenFlag(0))
-                    for stop in replacement_stop_mask
-                ]
-                if part_end is not None:
-                    _mark_sampled_stops(
-                        replacement,
-                        replacement_flags,
-                        [source_key] * len(replacement),
-                        {source_key: source},
-                        tokenizer=self.tokenizer,
-                    )
-                flags.extend(replacement_flags)
-                source_keys.extend([source_key] * len(replacement))
-                sources[source_key] = source
-            else:
-                token_ids.extend(replacement)
-                logprobs.extend(
-                    replacement_logprobs
-                    if len(replacement_logprobs) == len(replacement)
-                    else [math.nan] * len(replacement)
-                )
-                flags.extend(
-                    _rendered_flag(
-                        not length_stop,
-                        not length_stop,
-                        stop,
-                    )
-                    for stop, length_stop in zip(
-                        replacement_stop_mask,
-                        replacement_length_stop_mask,
-                        strict=True,
-                    )
-                )
-                source_keys.extend([None] * len(replacement))
-            if synthetic_stop_token is not None:
-                token_ids.append(synthetic_stop_token)
-                logprobs.append(math.nan)
-                flags.append(TokenFlag.STOP)
-                source_keys.append(None)
-            cursor = end
-        token_ids.extend(self.rendered[cursor:])
-        logprobs.extend([math.nan] * (len(self.rendered) - cursor))
-        flags.extend(
-            _rendered_flag(
-                assistant and not length_stop,
-                output and not length_stop,
-                stop,
-            )
-            for assistant, output, stop, length_stop in zip(
-                self.assistant_mask[cursor:],
-                self.output_mask[cursor:],
-                self.stop_mask[cursor:],
-                self.length_stop_mask[cursor:],
-                strict=True,
-            )
-        )
-        source_keys.extend([None] * (len(self.rendered) - cursor))
-        exact_coverage_length = 0
-        for source in self.history.message_sources:
-            if (
-                source is None
-                or not _source_is_sampled(source)
-                or not self._source_matches_context(source)
-            ):
-                continue
-            source_prompt = self._source_prompt_tokens(source)
-            if (
-                source_prompt is not None
-                and token_ids[: len(source_prompt)] == source_prompt
-            ):
-                exact_coverage_length = max(exact_coverage_length, len(source_prompt))
-        for index in range(exact_coverage_length):
-            flags[index] |= TokenFlag.EXACT
-        if self.history.model is None:
-            raise ValueError("History tokenization requires a model")
-        _mark_sampled_stops(
-            token_ids,
-            flags,
-            source_keys,
-            sources,
-            tokenizer=self.tokenizer,
-        )
-        tokenized = TokenizedHistory(
-            history=self.history,
-            model=self.history.model,
-            tokens=token_ids,
-            logprobs=logprobs,
-            flags=flags,
-        )
-        if self.trace is not None:
-            self.trace.set(tokenized, source_keys, sources)
-        return tokenized
+        return self._assemble()
 
     def _raw_render(
         self, selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
@@ -6417,6 +6249,177 @@ class _ChatViewTokenizer:
                 raise ValueError(
                     "Could not locate exact sampled output in the rendered history"
                 )
+
+    def _assemble(self) -> TokenizedHistory:
+        token_ids: list[int] = []
+        logprobs: list[float] = []
+        flags: list[TokenFlag] = []
+        source_keys: list[_SampledSourceKey | None] = []
+        sources: dict[_SampledSourceKey, object] = {}
+        cursor = 0
+        for (
+            start,
+            end,
+            replacement,
+            replacement_logprobs,
+            exact,
+            source_key,
+            source,
+            part_end,
+        ) in sorted(self.replacements, key=lambda item: (item[0], item[1])):
+            synthetic_stop_token: int | None = None
+            if exact and _source_stop_evidence(source, source_key)[0] == "length":
+                synthetic_stop = next(
+                    (index for index in range(start, end) if self.stop_mask[index]),
+                    None,
+                )
+                if synthetic_stop is not None:
+                    if part_end is not None and synthetic_stop + 1 < part_end:
+                        if end < part_end:
+                            raise ValueError(
+                                "Exact sampled tokens do not cover the proven history part"
+                            )
+                        # Keep the boundary without replaying replaced visible content.
+                        synthetic_stop_token = self.rendered[synthetic_stop]
+                        end = part_end
+                    else:
+                        end = synthetic_stop
+            if start < cursor:
+                raise ValueError("Rendered assistant source spans overlap")
+            token_ids.extend(self.rendered[cursor:start])
+            logprobs.extend([math.nan] * (start - cursor))
+            flags.extend(
+                _rendered_flag(
+                    assistant and not length_stop,
+                    output and not length_stop,
+                    stop,
+                )
+                for assistant, output, stop, length_stop in zip(
+                    self.assistant_mask[cursor:start],
+                    self.output_mask[cursor:start],
+                    self.stop_mask[cursor:start],
+                    self.length_stop_mask[cursor:start],
+                    strict=True,
+                )
+            )
+            source_keys.extend([None] * (start - cursor))
+            try:
+                replacement_stop_mask = _translate_token_mask(
+                    self.rendered[start:end], replacement, self.stop_mask[start:end]
+                )
+            except ValueError:
+                replacement_stop_mask = [False] * len(replacement)
+            if synthetic_stop_token is not None:
+                replacement_stop_mask = [False] * len(replacement)
+            replacement_length_stop_mask = (
+                [False] * len(replacement)
+                if synthetic_stop_token is not None
+                else _translate_token_mask(
+                    self.rendered[start:end],
+                    replacement,
+                    self.length_stop_mask[start:end],
+                )
+            )
+            if exact:
+                token_ids.extend(replacement)
+                logprobs.extend(replacement_logprobs)
+                replacement_flags = [
+                    TokenFlag.EXACT
+                    | TokenFlag.SAMPLED
+                    | TokenFlag.ASSISTANT
+                    | TokenFlag.OUTPUT
+                    | (TokenFlag.STOP if stop else TokenFlag(0))
+                    for stop in replacement_stop_mask
+                ]
+                if part_end is not None:
+                    _mark_sampled_stops(
+                        replacement,
+                        replacement_flags,
+                        [source_key] * len(replacement),
+                        {source_key: source},
+                        tokenizer=self.tokenizer,
+                    )
+                flags.extend(replacement_flags)
+                source_keys.extend([source_key] * len(replacement))
+                sources[source_key] = source
+            else:
+                token_ids.extend(replacement)
+                logprobs.extend(
+                    replacement_logprobs
+                    if len(replacement_logprobs) == len(replacement)
+                    else [math.nan] * len(replacement)
+                )
+                flags.extend(
+                    _rendered_flag(
+                        not length_stop,
+                        not length_stop,
+                        stop,
+                    )
+                    for stop, length_stop in zip(
+                        replacement_stop_mask,
+                        replacement_length_stop_mask,
+                        strict=True,
+                    )
+                )
+                source_keys.extend([None] * len(replacement))
+            if synthetic_stop_token is not None:
+                token_ids.append(synthetic_stop_token)
+                logprobs.append(math.nan)
+                flags.append(TokenFlag.STOP)
+                source_keys.append(None)
+            cursor = end
+        token_ids.extend(self.rendered[cursor:])
+        logprobs.extend([math.nan] * (len(self.rendered) - cursor))
+        flags.extend(
+            _rendered_flag(
+                assistant and not length_stop,
+                output and not length_stop,
+                stop,
+            )
+            for assistant, output, stop, length_stop in zip(
+                self.assistant_mask[cursor:],
+                self.output_mask[cursor:],
+                self.stop_mask[cursor:],
+                self.length_stop_mask[cursor:],
+                strict=True,
+            )
+        )
+        source_keys.extend([None] * (len(self.rendered) - cursor))
+        exact_coverage_length = 0
+        for source in self.history.message_sources:
+            if (
+                source is None
+                or not _source_is_sampled(source)
+                or not self._source_matches_context(source)
+            ):
+                continue
+            source_prompt = self._source_prompt_tokens(source)
+            if (
+                source_prompt is not None
+                and token_ids[: len(source_prompt)] == source_prompt
+            ):
+                exact_coverage_length = max(exact_coverage_length, len(source_prompt))
+        for index in range(exact_coverage_length):
+            flags[index] |= TokenFlag.EXACT
+        if self.history.model is None:
+            raise ValueError("History tokenization requires a model")
+        _mark_sampled_stops(
+            token_ids,
+            flags,
+            source_keys,
+            sources,
+            tokenizer=self.tokenizer,
+        )
+        tokenized = TokenizedHistory(
+            history=self.history,
+            model=self.history.model,
+            tokens=token_ids,
+            logprobs=logprobs,
+            flags=flags,
+        )
+        if self.trace is not None:
+            self.trace.set(tokenized, source_keys, sources)
+        return tokenized
 
 
 def _tokenize_chat_view(
