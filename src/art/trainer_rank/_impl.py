@@ -3177,17 +3177,13 @@ class TrainerRank:
             return -1.0, -1
         from megatron.core.transformer.moe.token_dispatcher import _HybridEPManager
 
-        managers = [
-            manager
-            for chunk in self.runtime.model
-            for module in chunk.modules()
-            if type(
-                manager := getattr(
-                    getattr(module, "token_dispatcher", None), "_comm_manager", None
-                )
-            )
-            is _HybridEPManager
-        ]
+        managers: list[Any] = []
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                dispatcher = getattr(module, "token_dispatcher", None)
+                manager = getattr(dispatcher, "_comm_manager", None)
+                if type(manager) is _HybridEPManager:
+                    managers.append(manager)
         if not managers or len(managers) != self._moe_layers:
             return -1.0, -1
         received = torch.stack(
