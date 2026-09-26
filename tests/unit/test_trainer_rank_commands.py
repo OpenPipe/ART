@@ -10,6 +10,7 @@ import sys
 import threading
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 import weakref
 
 import pytest
@@ -361,8 +362,7 @@ def _distributed_worker(physical, rendezvous, output):
                 decoded_outputs.append(value[1].packet.tensors)
             return value
 
-        setattr(_commands.cloudpickle, "loads", track_loads)
-        try:
+        with patch.object(_commands.cloudpickle, "loads", track_loads):
             large = run(
                 lambda view: view.forward(
                     [
@@ -380,8 +380,6 @@ def _distributed_worker(physical, rendezvous, output):
                     no_grad=True,
                 )
             )
-        finally:
-            setattr(_commands.cloudpickle, "loads", loads)
         assert bool(decoded_outputs) is (physical == 0)
         if physical == 0:
             assert (
@@ -420,11 +418,8 @@ def _distributed_worker(physical, rendezvous, output):
             with pytest.raises(ValueError, match="result decode failure"):
                 view.forward([_input(11)])
 
-        setattr(_commands.cloudpickle, "loads", fail_result_decode)
-        try:
+        with patch.object(_commands.cloudpickle, "loads", fail_result_decode):
             run(decode_refusal)
-        finally:
-            setattr(_commands.cloudpickle, "loads", loads)
         assert set(rank._rank_command_state.graphs) <= retained_before_failure
         assert not rank._rank_command_state.iterators
         run(lambda view: view.backward(_loss_tree(view.forward([_input(11)]))))
@@ -441,11 +436,10 @@ def _distributed_worker(physical, rendezvous, output):
             return dumps(value)
 
         rank._available_cpu_memory_bytes = lambda: 1024 if physical == 0 else 1 << 60
-        setattr(_commands.cloudpickle, "dumps", track_dumps)
         try:
-            run(host_refusal)
+            with patch.object(_commands.cloudpickle, "dumps", track_dumps):
+                run(host_refusal)
         finally:
-            setattr(_commands.cloudpickle, "dumps", dumps)
             del rank._available_cpu_memory_bytes
         assert not serialized
 
@@ -453,8 +447,6 @@ def _distributed_worker(physical, rendezvous, output):
         retained_before_failure = set(rank._rank_command_state.graphs)
 
         def failing_forward(tree, **kwargs):
-            from dataclasses import replace
-
             result = forward(tree, **kwargs)
             if isinstance(result, ForwardOutput):
                 result = replace(
@@ -467,11 +459,8 @@ def _distributed_worker(physical, rendezvous, output):
             with pytest.raises(RuntimeError, match="physical backward failure"):
                 view.backward(_loss_tree(view.forward([_input(7)])))
 
-        rank.forward = failing_forward
-        try:
+        with patch.object(rank, "forward", failing_forward):
             run(backward_refusal)
-        finally:
-            rank.forward = forward
         assert set(rank._rank_command_state.graphs) <= retained_before_failure
         run(lambda view: view.zero_grad())
         del sys.modules["megatron"], sys.modules["megatron.core"]
