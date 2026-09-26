@@ -630,3 +630,170 @@ def test_split_charges_the_largest_hybridep_growth_beside_any_child_peak():
     )
     assert required >= int((2 + 15_000 + 10_000) * 1.1)
     assert required >= int((15_000 + 1) * 1.1) + int(10_000 * 1.1)
+
+
+@pytest.fixture
+def hybrid_checkpoint_rank(layer, monkeypatch):
+    from megatron.core.transformer.transformer_block import TransformerBlock
+    from test_trainer_rank_converted_memory import weights
+    from test_trainer_rank_pending_memory import module
+
+    with torch.device("meta"):
+        moe = _hybridep(weights(layer, 8), 2)
+        moe.token_dispatcher.num_local_experts = 128
+        for fc, inputs, outputs in (
+            (moe.experts.linear_fc1, 2048, 1024),
+            (moe.experts.linear_fc2, 512, 2048),
+        ):
+            fc.lora.A_T = torch.nn.Parameter(
+                torch.empty(128, inputs, 8, dtype=torch.bfloat16)
+            )
+            fc.lora.B_T = torch.nn.Parameter(
+                torch.empty(128, 8, outputs, dtype=torch.bfloat16)
+            )
+        decoder = module(TransformerBlock)
+        decoder.config = SimpleNamespace(
+            hidden_size=2048,
+            num_layers=40,
+            padded_vocab_size=32,
+            params_dtype=torch.bfloat16,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            distribute_saved_activations=False,
+            sequence_parallel=False,
+            fp32_residual_connection=False,
+            cpu_offloading=False,
+            cuda_graph_impl="none",
+            fp8=None,
+            fp4=None,
+        )
+        decoder.num_layers_per_pipeline_rank = 40
+        decoder.layers = torch.nn.ModuleList(
+            [moe] + [torch.nn.Linear(1, 1).bfloat16() for _ in range(39)]
+        )
+        model: Any = torch.nn.Module()
+        model.config, model.decoder = decoder.config, decoder
+        model._preprocess = lambda: None
+        # Only distributed topology is mocked. Real constructor metadata selects
+        # the HybridEP coefficient, without loading a model or initializing CUDA.
+        monkeypatch.setattr(TrainerRank, "_topology_key", lambda self: (1, 1, 2, 1))
+        rank = TrainerRank(
+            cast(
+                Any,
+                SimpleNamespace(
+                    model=[model],
+                    optimizer=None,
+                    provider=SimpleNamespace(
+                        hidden_size=2048,
+                        num_layers=40,
+                        expert_model_parallel_size=2,
+                        expert_tensor_parallel_size=1,
+                        num_moe_experts=256,
+                    ),
+                    model_support_handler=SimpleNamespace(
+                        build_gdn_execution_spec=False
+                    ),
+                ),
+            )
+        )
+    assert rank._moe_output_bytes_per_token == 282624
+    assert rank._moe_memory_supported
+    return rank
+
+
+def test_hybridep_recompute_prices_fresh_dense_output_without_buffer_growth(
+    hybrid_checkpoint_rank, monkeypatch
+):
+    from megatron.core.transformer.moe import fused_a2a
+
+    rank = hybrid_checkpoint_rank
+    groups = ((2, True),)
+    signature = replace(_signature(), topology=(1, 1, 2, 1))
+    values = dict(
+        packed_tokens=2,
+        logical_tokens=2,
+        output_bytes=8,
+        signature=signature,
+        group_rows=groups,
+    )
+    baseline = rank._subforward_cost(**values)
+    marker = torch.empty(0)
+    refs = rank._pending_hybridep_graphs
+    refs.append(weakref.ref(marker))
+    rank._hybridep_rows_high_water = 218751  # Physical extent rounds to218752.
+    monkeypatch.setattr(rank, "_topology", lambda: SimpleNamespace(tp=1, cp=2))
+    monkeypatch.setattr(rank, "_plan_group_rows", lambda plan: groups)
+    held = SimpleNamespace(
+        configurer=SimpleNamespace(
+            buffer_config=SimpleNamespace(max_num_of_tokens_per_rank=400512)
+        )
+    )
+    monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", held)
+    plan = SimpleNamespace(
+        groups=(
+            SimpleNamespace(
+                packed=SimpleNamespace(tokens=torch.empty((1, 2), device="meta"))
+            ),
+        )
+    )
+    assert rank._plan_hybridep_growth_bytes(plan) == 0
+    retained, workspace = rank._checkpoint_memory_floor(groups)
+    assert workspace == 218752 * 2048 * 2 == 896008192
+    cost = rank._subforward_cost(**values)
+    assert cost.required == int((8 + 2 * retained + workspace) * 1.1)
+    assert cost.checkpoint_workspace == workspace  # Maximum, not stage + output.
+    rank._available_memory_bytes = lambda: 600000000
+    assert rank._memory_check_required(baseline.required).fits
+    assert not rank._memory_check_required(cost.required).fits
+    rank._memory_profiles[signature] = _MemoryProfile(
+        bytes_per_token=1, packed_tokens=2
+    )
+    assert rank._subforward_cost(**values).required == cost.required
+    rank._memory_profiles[signature] = _MemoryProfile(
+        bytes_per_token=10**9, packed_tokens=2
+    )
+    assert rank._subforward_cost(**values).required == int(
+        (8 + 2 * 10**9 + 2 * _PACKED_PRICED_LOGICAL_ROW_BYTES) * 1.1
+    )
+    assert rank._pending_hybridep_graphs is refs and refs == [weakref.ref(marker)]
+    assert rank._hybridep_rows_high_water == 218751
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("reference", ["absent", "expired", "smaller"])
+def test_hybridep_high_water_needs_a_live_larger_graph(
+    hybrid_checkpoint_rank, reference
+):
+    rank = hybrid_checkpoint_rank
+    groups = ((17, True), (19, True))
+    baseline = rank._checkpoint_memory_floor(groups)
+    marker = torch.empty(0)
+    refs = rank._pending_hybridep_graphs
+    if reference != "absent":
+        refs.append(weakref.ref(marker))
+    rank._hybridep_rows_high_water = 1 if reference == "smaller" else 10**6
+    if reference == "expired":
+        del marker
+    before = tuple(refs)
+    assert rank._checkpoint_memory_floor(groups) == baseline
+    assert tuple(refs) == before and rank._pending_hybridep_graphs is refs
+
+
+@pytest.mark.parametrize(
+    "mode", ["empty", "no_grad", "cp1", "ep1", "unsupported", "selective"]
+)
+def test_hybridep_recompute_extent_guard(hybrid_checkpoint_rank, mode):
+    rank = hybrid_checkpoint_rank
+    groups = () if mode == "empty" else ((2, mode != "no_grad"),)
+    if mode in ("cp1", "ep1"):
+        rank._parallel_shape = replace(rank._parallel_shape, **{mode[:2]: 1})
+    elif mode == "unsupported":
+        rank._moe_memory_supported = False
+    elif mode == "selective":
+        rank.runtime.model[0].decoder.config.recompute_granularity = "selective"
+    baseline = rank._checkpoint_memory_floor(groups)
+    marker = torch.empty(0)
+    rank._pending_hybridep_graphs.append(weakref.ref(marker))
+    rank._hybridep_rows_high_water = 10**6
+    assert rank._checkpoint_memory_floor(groups) == baseline
