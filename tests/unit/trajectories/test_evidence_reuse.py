@@ -306,6 +306,175 @@ def test_copied_context_stop_callback_clears_evidence_and_records():
     assert not value.flags[1] & tr.TokenFlag.SAMPLED
 
 
+@pytest.mark.parametrize(
+    "mutation_call,field",
+    [(call, "logprob") for call in range(1, 7)]
+    + [(2, field) for field in ("prompt", "output", "finish", "stop_reason", "model")],
+)
+def test_public_copied_stop_callback_cannot_return_stale_final_logprobs(
+    mutation_call, field
+):
+    first = _chat_exchange([1], [2, 3])
+    extras(first)["stop_reason"] = "public-stop"
+    second = _chat_exchange([1, 3, 4], [5, 6], offset=1)
+    value = trajectory(first, second)
+
+    class StopTokenizer:
+        eos_token_id = 6
+        all_special_ids = []
+        calls = 0
+
+        def __call__(self, text, **kwargs):
+            assert text == "public-stop"
+            self.calls += 1
+            if self.calls == mutation_call:
+                if field == "logprob":
+                    logprobs(second)[0].logprob = -8.5
+                elif field in {"prompt", "output"}:
+                    extras(second)[
+                        "prompt_token_ids" if field == "prompt" else "token_ids"
+                    ][0] = 99
+                elif field == "finish":
+                    second.response.choices[0].finish_reason = "length"
+                elif field == "stop_reason":
+                    extras(second)["stop_reason"] = 99
+                else:
+                    second.request["model"] = "changed/model"
+            return {"input_ids": [3]}
+
+    tokenizer = StopTokenizer()
+    if mutation_call == 2:
+        with pytest.raises(
+            ValueError, match="Sampled source changed during tokenization callback"
+        ):
+            value.tokenize(tokenizer=tokenizer, multi_history=True)
+        assert tokenizer.calls == 2
+        return
+    result = value.tokenize(tokenizer=tokenizer, multi_history=True)
+    assert len(result.histories) == 2
+    assert result.histories[-1].tokens == [1, 3, 4, 5, 6]
+    assert result.histories[-1].logprobs[3] == logprobs(second)[0].logprob
+
+
+def test_final_stop_marker_callback_cannot_change_consumed_source():
+    exchange = _chat_exchange([1], [2, 3])
+    extras(exchange)["stop_reason"] = "public-stop"
+
+    class StopTokenizer:
+        def __call__(self, text, **kwargs):
+            assert text == "public-stop"
+            extras(exchange)["stop_reason"] = 99
+            return {"input_ids": [3]}
+
+    with pytest.raises(
+        ValueError, match="Sampled source changed during tokenization callback"
+    ):
+        trajectory(exchange).tokenize(tokenizer=StopTokenizer())
+
+
+def test_stop_callback_is_checked_before_next_source_can_restore_evidence():
+    first = _chat_exchange([1], [2, 3])
+    second = _chat_exchange([1, 2, 3, 4], [5, 6], offset=1)
+    extras(first)["stop_reason"] = "first-stop"
+    extras(second)["stop_reason"] = "second-stop"
+    calls = []
+
+    class StopTokenizer:
+        def __call__(self, text, **kwargs):
+            calls.append(text)
+            if text == "first-stop":
+                extras(second)["stop_reason"] = "changed-stop"
+                return {"input_ids": [3]}
+            extras(second)["stop_reason"] = "second-stop"
+            return {"input_ids": [99]}
+
+    with pytest.raises(
+        ValueError, match="Sampled source changed during tokenization callback"
+    ):
+        trajectory(first, second).tokenize(tokenizer=StopTokenizer())
+    assert calls == ["first-stop"]
+
+
+def test_later_stop_callback_cannot_change_an_already_marked_source():
+    first = _chat_exchange([1], [2, 3])
+    second = _chat_exchange([1, 2, 3, 4], [5, 6], offset=1)
+    extras(first)["stop_reason"] = "first-stop"
+    extras(second)["stop_reason"] = "second-stop"
+
+    class StopTokenizer:
+        def __call__(self, text, **kwargs):
+            if text == "second-stop":
+                logprobs(first)[0].logprob = -9
+            return {"input_ids": [3 if text == "first-stop" else 6]}
+
+    with pytest.raises(
+        ValueError, match="Sampled source changed during tokenization callback"
+    ):
+        trajectory(first, second).tokenize(tokenizer=StopTokenizer())
+
+
+@pytest.mark.parametrize("callback", ["convert", "decode"])
+def test_terminator_lookup_cannot_change_consumed_logprobs(callback):
+    exchange = _chat_exchange([1], [2, 3])
+
+    class Tokenizer:
+        eos_token_id = 3
+        unk_token_id = None
+        all_special_tokens = []
+
+        def convert_tokens_to_ids(self, token):
+            if callback == "convert":
+                logprobs(exchange)[0].logprob = -9
+            return 99
+
+        def decode(self, ids, **kwargs):
+            if callback == "decode":
+                logprobs(exchange)[0].logprob = -9
+            return "not a special token"
+
+    with pytest.raises(
+        ValueError, match="Sampled source changed during tokenization callback"
+    ):
+        trajectory(exchange).tokenize(tokenizer=Tokenizer())
+
+
+@pytest.mark.parametrize("reason", [None, 3, ""])
+def test_plain_stop_authority_needs_no_callback_revalidation(monkeypatch, reason):
+    exchange = _chat_exchange([1], [2, 3])
+    extras(exchange)["stop_reason"] = reason
+
+    class Tokenizer:
+        eos_token_id = 3
+
+    def unexpected(*args):
+        raise AssertionError("plain attributes and numeric STOP need no callback fence")
+
+    monkeypatch.setattr(module, "_sampled_source_validator", unexpected)
+    result = trajectory(exchange).tokenize(tokenizer=Tokenizer())
+    assert result.tokens == [1, 2, 3]
+    assert result.logprobs[1:] == [-0.2, -0.3]
+    assert result.flags[-1] & tr.TokenFlag.STOP
+
+
+def test_stop_decision_callback_cannot_change_history_model():
+    exchange = _chat_exchange([1], [2, 3])
+    extras(exchange)["stop_reason"] = "public-stop"
+    history = trajectory(exchange).histories()[0]
+
+    class Tokenizer:
+        eos_token_id = 3
+
+        def apply_chat_template(self, *args, **kwargs):
+            raise AssertionError("model change must be refused before rendering")
+
+        def __call__(self, text, **kwargs):
+            exchange.request["model"] = "changed/model"
+            return {"input_ids": [3]}
+
+    with pytest.raises(ValueError, match="model no longer matches"):
+        history.tokenize(tokenizer=Tokenizer())
+
+
 def test_decoder_exception_identity_and_next_call_fresh():
     first = _chat_exchange([1], [2, 3])
     extras(first)["stop_reason"] = "public-stop"

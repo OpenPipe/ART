@@ -188,7 +188,18 @@ the original request and template reproduce its complete native prompt, ART can
 recover historical assistant roles from that rendering. This uses the original
 tool serialization order and preserves role labels through exact length-stop
 assembly; it does not restore destructive parsing for new response content.
-Unproved historical role mappings still use the strict existing fallback.
+With a supplied renderer, request-owned assistant roles are proved throughout
+the native stream, including between sampled responses. A request whose text
+disagrees with its recorded assistant tokens can still use the offline native
+path, but cannot claim a complete rendered role mask. Unproved role mappings
+use the strict existing fallback and may be refused.
+
+Custom STOP encoders and terminator decoders must not change already-consumed
+source tokens, logprobs, model or stop evidence. ART checks each source around its
+STOP callback and checks all consumed evidence before returning. Multi-history
+tokenization also checks completed histories after later renderer callbacks.
+These checks refuse stale results; they do not make callbacks or source objects
+immutable. Callback-free native assembly retains its bounded evidence reuse.
 
 A response copied into a later, shortened prompt is output provenance, but it is
 not a fresh sample under that new prompt. ART keeps its `OUTPUT`, `ASSISTANT`,

@@ -34,6 +34,35 @@ _LITERALS = (
 )
 
 
+@pytest.mark.parametrize("trim_blocks,lstrip_blocks", [(False, False), (True, True)])
+@pytest.mark.parametrize(
+    "left,right", [("", ""), ("-", ""), ("", "-"), ("-", "-"), ("+", "+")]
+)
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_disabling_inline_parser_preserves_outer_whitespace(
+    trim_blocks, lstrip_blocks, left, right, newline
+):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    operation = match.group()
+    operation = "{%" + left + operation[3:]
+    operation = operation[:-2].rstrip("-+") + right + "%}"
+    template = ("HEADER \n\t" + operation + "\n \tTAIL{{ content }}").replace(
+        "\n", newline
+    )
+    env = ImmutableSandboxedEnvironment(
+        trim_blocks=trim_blocks, lstrip_blocks=lstrip_blocks
+    )
+    fixed = _without_inline_reasoning_parser(template)
+    ordinary = env.from_string(template).render(content="plain answer")
+    assert env.from_string(fixed).render(content="plain answer") == ordinary
+    literal = "prefix<think>literal</think>suffix"
+    assert env.from_string(fixed).render(content=literal) == ordinary.replace(
+        "plain answer", literal
+    )
+    assert _without_inline_reasoning_parser(fixed) == fixed
+
+
 def _render(template, messages, **kwargs):
     def refuse(message):
         raise ValueError(message)

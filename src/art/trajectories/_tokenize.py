@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 import codecs
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -746,6 +746,34 @@ def _rendered_flag(assistant: bool, output: bool, stop: bool) -> TokenFlag:
     return flag | TokenFlag.STOP if stop else flag
 
 
+def _merge_recorded_request_roles(
+    exact: TokenizedHistory,
+    rendered: Sequence[int],
+    assistant_mask: Sequence[bool],
+    output_mask: Sequence[bool],
+    stop_mask: Sequence[bool],
+    length_stop_mask: Sequence[bool],
+) -> bool:
+    # Sampled responses own their native flags. Request-only assistant roles
+    # must retain a complete prefix proof, including roles between responses.
+    roles = [
+        (index, _rendered_flag(assistant, False, stop))
+        for index, (assistant, output, stop, length_stop) in enumerate(
+            zip(assistant_mask, output_mask, stop_mask, length_stop_mask, strict=True)
+        )
+        if not output and not length_stop and (assistant or stop)
+    ]
+    end = roles[-1][0] + 1 if roles else 0
+    if exact.tokens[:end] != list(rendered[:end]) or any(
+        exact.flags[index] & (TokenFlag.SAMPLED | TokenFlag.OUTPUT)
+        for index, _ in roles
+    ):
+        return False
+    for index, flags in roles:
+        exact.flags[index] |= flags
+    return True
+
+
 def _synthetic_length_stop_mask(
     messages: Sequence[Mapping[str, object]],
     sources: Sequence[object | None],
@@ -915,6 +943,7 @@ class _TraceBuilder:
     trace: _HistoryTokenizationTrace | None = None
     tokenizer: Tokenizer | None = None
     rendered_outputs: tuple[tuple[int, int, object], ...] = ()
+    validate_sources: Callable[[_SampledSourceKey | None], None] | None = None
 
     def set(
         self,
@@ -930,6 +959,7 @@ class _TraceBuilder:
         trace.validate(tokenized)
         self.trace = trace
         self.rendered_outputs = rendered_outputs
+        self.validate_sources = _sampled_source_validator(sources)
 
 
 def _fingerprint(value: object) -> str:
@@ -4264,6 +4294,49 @@ def _source_has_no_materialized_output(
     return False
 
 
+def _sampled_source_validator(
+    sources: Mapping[_SampledSourceKey, object],
+) -> Callable[[_SampledSourceKey | None], None]:
+    expected = {}
+    for key, source in sources.items():
+        exchange = _source_exchange(source)
+        if exchange is None:
+            raise ValueError("Sampled source has no exchange")
+        expected[key] = (
+            source,
+            exchange,
+            exchange.model,
+            _source_stop_evidence(source, key),
+        )
+
+    def validate(selected: _SampledSourceKey | None) -> None:
+        for key in expected if selected is None else (selected,):
+            source, exchange, model, stop = expected[key]
+            current = (
+                _exchange_sampled_source_key(source)
+                if isinstance(source, Exchange)
+                else _sampled_source_key(source)
+            )
+            if (
+                current != key
+                or _source_exchange(source) is not exchange
+                or exchange.model != model
+                or _source_stop_evidence(source, key) != stop
+            ):
+                raise ValueError("Sampled source changed during tokenization callback")
+
+    return validate
+
+
+def _stop_uses_callback(reason: int | str | None, tokenizer: Tokenizer | None) -> bool:
+    return tokenizer is not None and (
+        isinstance(reason, str)
+        and bool(reason)
+        or not (isinstance(reason, int) and not isinstance(reason, bool))
+        and callable(getattr(tokenizer, "convert_tokens_to_ids", None))
+    )
+
+
 def _mark_sampled_stops(
     token_ids: Sequence[int],
     flags: list[TokenFlag],
@@ -4272,13 +4345,17 @@ def _mark_sampled_stops(
     *,
     tokenizer: Tokenizer | None,
 ) -> None:
+    validate_sources = None
     positions: dict[_SampledSourceKey, list[int]] = {}
     for index, source_key in enumerate(source_keys):
         if source_key is not None:
             positions.setdefault(source_key, []).append(index)
     for source_key, indices in positions.items():
+        if validate_sources is not None:
+            validate_sources(source_key)
         source = sources[source_key]
-        if _source_stop_evidence(source, source_key)[0] != "stop":
+        kind, reason = _source_stop_evidence(source, source_key)
+        if kind != "stop":
             continue
         selected = [token_ids[index] for index in indices]
         complete = _source_output_tokens(source, source_key)
@@ -4286,14 +4363,24 @@ def _mark_sampled_stops(
             continue
         if selected != complete[-len(selected) :]:
             continue
+        callback_used = _stop_uses_callback(reason, tokenizer)
+        if callback_used and validate_sources is None:
+            validate_sources = _sampled_source_validator(sources)
         count = _sampled_stop_suffix(
             selected,
             source=source,
             source_key=source_key,
             tokenizer=tokenizer,
         )
+        if callback_used:
+            assert validate_sources is not None
+            validate_sources(source_key)
         for index in indices[-count:] if count else ():
             flags[index] |= TokenFlag.STOP
+    if validate_sources is not None:
+        # Later callbacks may edit an already-marked source. Check all consumed
+        # evidence once before return, without rehashing every source per stop.
+        validate_sources(None)
 
 
 @dataclass(frozen=True)
@@ -4700,9 +4787,17 @@ def _tokenize_exact_projected_chat_history(
             logprobs[start:end] = [math.nan] * len(retained_ids)
             records.clear()  # A custom STOP decoder may change source objects.
             fingerprints.clear()
+            reason = _source_stop_evidence(source, source_key)[1]
+            validate_sources = (
+                _sampled_source_validator({**sources, source_key: source})
+                if _stop_uses_callback(reason, tokenizer)
+                else None
+            )
             stop_count = _sampled_stop_suffix(
                 output, source=source, source_key=source_key, tokenizer=tokenizer
             )
+            if validate_sources is not None:
+                validate_sources(None)
             for offset in range(max(start, end - stop_count), end):
                 flags[offset] |= TokenFlag.STOP
             boundary = (length_stop_boundaries or {}).get(source_key)
@@ -4747,7 +4842,12 @@ def _tokenize_exact_projected_chat_history(
                 ):
                     records.clear()  # Never reuse records across user callbacks.
                     fingerprints.clear()
-                    if decode(native_boundary[:extra]).isspace():
+                    validate_sources = _sampled_source_validator(
+                        {**sources, source_key: source}
+                    )
+                    whitespace = decode(native_boundary[:extra]).isspace()
+                    validate_sources(None)
+                    if whitespace:
                         # Services may insert whitespace before a truncated turn's
                         # proven stop tail. Keep those served, nonsampled tokens.
                         boundary = _RenderedLengthStopBoundary(
@@ -6266,24 +6366,15 @@ def _tokenize_chat_view(
                     _trace=_trace,
                 )
             )
+            and _merge_recorded_request_roles(
+                exact,
+                rendered,
+                assistant_mask,
+                output_mask,
+                stop_mask,
+                length_stop_mask,
+            )
         ):
-            # The exact builder owns sampled spans, but the rendered request
-            # already proved role labels before the first sampled response.
-            # Retain those labels instead of discarding them on this return.
-            if (
-                exact_prefix_length
-                and exact.tokens[:exact_prefix_length] == rendered[:exact_prefix_length]
-                and not any(
-                    flag & TokenFlag.SAMPLED
-                    for flag in exact.flags[:exact_prefix_length]
-                )
-            ):
-                for index in range(exact_prefix_length):
-                    exact.flags[index] |= _rendered_flag(
-                        assistant_mask[index] and not length_stop_mask[index],
-                        output_mask[index] and not length_stop_mask[index],
-                        stop_mask[index],
-                    )
             return exact
 
     sampled_message_count = sum(
@@ -7384,6 +7475,14 @@ def _tokenize_history(
             _trace=_trace,
         )
     _validate_history_sources(history)
+    can_render = tokenizer is None or callable(
+        getattr(tokenizer, "apply_chat_template", None)
+    )
+    needs_synthetic_stop = _history_needs_synthetic_stop(history, tokenizer)
+    if tokenizer is not None and can_render:
+        # STOP discovery can call a supplied tokenizer before native assembly.
+        # Its result cannot lend an old model/view proof to changed sources.
+        _validate_history_sources(history)
     override_requires_render = (
         chat_template is not None
         and chat_template != getattr(history, "chat_template", None)
@@ -7397,9 +7496,6 @@ def _tokenize_history(
         if _projection_validated
         else _history_render_state(history)
     )
-    can_render = tokenizer is None or callable(
-        getattr(tokenizer, "apply_chat_template", None)
-    )
     # Without a tokenizer, the stop decision and first exact assembly have no
     # user callback between them. Keep their evidence in one bounded phase;
     # never carry it into a rendered or tokenizer-supplied path.
@@ -7411,7 +7507,6 @@ def _tokenize_history(
     has_length_stop = can_render and _history_has_length_stop(
         history, _fingerprints=fingerprints
     )
-    needs_synthetic_stop = _history_needs_synthetic_stop(history, tokenizer)
     needs_render = (
         render_state.needs_render
         or override_requires_render
@@ -7428,6 +7523,17 @@ def _tokenize_history(
         ):
             return exact
     if isinstance(history, ChatCompletionsHistory):
+        needs_request_roles = (
+            tokenizer is not None
+            and can_render
+            and any(
+                message.get("role") == "assistant"
+                and (source is None or not _source_is_sampled(source))
+                for message, source in zip(
+                    history.messages, history.message_sources, strict=True
+                )
+            )
+        )
         if (
             (
                 not has_length_stop
@@ -7445,6 +7551,7 @@ def _tokenize_history(
                     )
                 )
             )
+            and not needs_request_roles
             and not needs_synthetic_stop
             and not override_requires_render
             and not render_state.context_changed
@@ -7475,7 +7582,7 @@ def _tokenize_history(
             ),
             _prior=_prior,
             _recorded_boundaries=(
-                (has_length_stop or needs_synthetic_stop)
+                (has_length_stop or needs_synthetic_stop or needs_request_roles)
                 and not override_requires_render
                 and not render_state.context_changed
                 and (_projection_validated or render_state.projection_matches is True)
@@ -7657,6 +7764,17 @@ def _materialize_trajectory(
     )
 
 
+def _validate_completed_sources(builders: Sequence[_TraceBuilder | None]) -> None:
+    if any(
+        builder is not None and builder.tokenizer is not None for builder in builders
+    ):
+        # Later callbacks may edit an earlier completed history. Check its
+        # original source keys and stop evidence without calling a tokenizer.
+        for builder in builders:
+            if builder is not None and builder.validate_sources is not None:
+                builder.validate_sources(None)
+
+
 def _complete_resolved_sampled_stops(
     tokenized: Sequence[TokenizedHistory], builders: Sequence[_TraceBuilder | None]
 ) -> None:
@@ -7678,6 +7796,8 @@ def _complete_resolved_sampled_stops(
             and builder.trace is not None
             and (tokenizer := resolved.get(value.model)) is not None
         ):
+            assert builder.validate_sources is not None
+            builder.validate_sources(None)
             _mark_sampled_stops(
                 value.tokens,
                 value.flags,
@@ -7685,6 +7805,7 @@ def _complete_resolved_sampled_stops(
                 builder.trace.sources,
                 tokenizer=tokenizer,
             )
+    _validate_completed_sources(builders)
 
 
 def tokenize_trajectory(
@@ -7721,9 +7842,8 @@ def tokenize_trajectory(
     prior: list[tuple[TokenizedHistory, _HistoryTokenizationTrace]] = []
     tokenized = []
     stop_builders: list[_TraceBuilder | None] = []
-    collect_stops = tokenizer is None and len(histories) > 1
     for history, copied in zip(histories, context_sources, strict=True):
-        trace = _TraceBuilder() if track_context or collect_stops else None
+        trace = _TraceBuilder() if len(histories) > 1 else None
         result = tokenize_history(
             history,
             model=model if isinstance(history, LegacyHistory) else history.model,
@@ -7740,8 +7860,7 @@ def tokenize_trajectory(
         stop_builders.append(trace)
         if track_context and trace is not None and trace.trace is not None:
             prior.append((result, trace.trace))
-    if collect_stops:
-        _complete_resolved_sampled_stops(tokenized, stop_builders)
+    _complete_resolved_sampled_stops(tokenized, stop_builders)
     if not multi_history:
         return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
@@ -7790,8 +7909,7 @@ def _tokenize_trajectory_with_trace(
         tokenized_histories.append(tokenized)
         traces.append(trace_builder.trace)
         builders.append(trace_builder)
-    if tokenizer is None:
-        _complete_resolved_sampled_stops(tokenized_histories, builders)
+    _complete_resolved_sampled_stops(tokenized_histories, builders)
     return (
         TokenizedMultiHistoryTrajectory(
             trajectory=trajectory,
