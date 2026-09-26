@@ -3157,10 +3157,10 @@ class TrainerRank:
 
         HybridEP keeps each MoE layer's received rows per local expert after
         combine, so at the handoff of a flat plan with one group they are this
-        forward's dispatch, with or without gradients. The share is the most loaded layer's
-        received pairs over top-k times the balanced rows that pricing scales
-        (``_plan_group_balanced_rows``), so a share above the allowance means
-        more rows arrived than were priced.
+        forward's dispatch, with or without gradients. The share is the most
+        loaded layer's received pairs over top-k times the balanced rows that
+        pricing scales (``_plan_group_balanced_rows``), so a share above the
+        allowance means more rows arrived than were priced.
         """
         if (
             not isinstance(plan, _FlatForwardPlan)

@@ -341,8 +341,8 @@ def test_route_epochs_follow_agreed_commits(tmp_path: Path):
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
-@pytest.mark.parametrize("peer", ["name", "epoch"])
-def test_loads_and_discards_must_agree_on_their_target(tmp_path: Path, peer):
+@pytest.mark.parametrize("peer", ["name", "epoch", "counter"])
+def test_loads_and_snapshots_must_agree_on_their_target(tmp_path: Path, peer):
     from art.trainer_rank import TrainerRankSlotStateError, _checkpoint
     from tests.unit.test_trainer_rank_custom_tensors import _real_lora_trainer
 
@@ -355,16 +355,21 @@ def test_loads_and_discards_must_agree_on_their_target(tmp_path: Path, peer):
     trainer._record_routed_share(1, 1.6)
     gather = _checkpoint._gather
 
+    # Gathered tuples: a load's (digest, name, epoch, counter), a snapshot's
+    # (source, destination, config, revision, source epoch, exists) and a
+    # discard's (name, loaded, snapshot, epoch, active).
+    fields = {
+        "name": {4: 1, 6: 1, 5: 0},
+        "epoch": {4: 2, 6: 4, 5: 3},
+        "counter": {4: 3},
+    }[peer]
+
     def disagree(value, group=None):
-        # One simulated peer targets another name, or holds another epoch.
+        # One simulated peer targets another name or holds another epoch.
         values = gather(value, group)
-        if isinstance(value, tuple) and len(value) in (3, 5):
+        if isinstance(value, tuple) and len(value) in fields:
             other = list(value)
-            if peer == "name":
-                other[1 if len(value) == 3 else 0] = "other"
-            else:
-                index = 2 if len(value) == 3 else 3
-                other[index] = 7
+            other[fields[len(value)]] = "other" if peer == "name" else 7
             values = (*values, tuple(other))
         return values
 
@@ -374,8 +379,12 @@ def test_loads_and_discards_must_agree_on_their_target(tmp_path: Path, peer):
             _checkpoint.load_checkpoint(
                 trainer, _checkpoint.prepare_checkpoint(str(saved)), "policy"
             )
-        with pytest.raises(TrainerRankSlotStateError, match="state differs"):
-            trainer._discard_snapshot_checkpoint("policy:step0")
+        if peer != "counter":
+            with pytest.raises(TrainerRankSlotStateError, match="state differs"):
+                trainer.snapshot_checkpoint("policy", "policy:step1")
+            with pytest.raises(TrainerRankSlotStateError, match="state differs"):
+                trainer._discard_snapshot_checkpoint("policy:step0")
+    assert "policy:step1" not in trainer._checkpoint_slots
     assert trainer._checkpoint_slots["policy"].route_epoch == 0
     assert trainer._checkpoint_slots["policy:step0"].route_epoch == 1
     assert trainer._route_epochs == 2

@@ -1855,12 +1855,18 @@ def load_checkpoint(
     forward_only: bool = False,
 ) -> None:
     group = _ensure_group(trainer)
-    # Every rank must replace the same name, holding the same content, so each
-    # gives the new content the same route epoch and forgets the same one.
+    # Every rank must replace the same name, holding the same content, at the
+    # same point in its epoch sequence, so each gives the new content the same
+    # route epoch and forgets the same one.
     current = trainer._checkpoint_slots.get(name)
-    target = (source.digest, name, None if current is None else current.route_epoch)
+    target = (
+        source.digest,
+        name,
+        None if current is None else current.route_epoch,
+        trainer._route_epochs,
+    )
     targets = _gather(target, group)
-    if any(digest != source.digest for digest, _, _ in targets):
+    if any(value[0] != source.digest for value in targets):
         raise trainer._slot_state_error(
             f"Checkpoint {name!r} content differs across ranks"
         )
