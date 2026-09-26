@@ -495,7 +495,16 @@ def test_stop_encoder_cannot_change_role_proof_context(
 
 @pytest.mark.parametrize("private", [False, True])
 @pytest.mark.parametrize(
-    "change", ["request", "logprob", "stop_reason", "unscoped_logprob"]
+    "change",
+    [
+        "request",
+        "logprob",
+        "stop_reason",
+        "unscoped_logprob",
+        "unscoped_request_role",
+        "unscoped_request_tools",
+        "unscoped_history_role",
+    ],
 )
 def test_later_stop_encoder_cannot_change_an_already_certified_stream(
     monkeypatch: pytest.MonkeyPatch, private: bool, change: str
@@ -506,11 +515,17 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
     record(first).model_extra["stop_reason"] = "§"
     record(second).model_extra["stop_reason"] = "§"
     earlier = first
-    if change == "unscoped_logprob":
+    if change.startswith("unscoped_"):
         earlier = _chat_exchange(
-            tokenizer._encode("separate"), tokenizer._encode("answer§"), offset=-1
+            tokenizer._encode("separatehistorical§again"),
+            tokenizer._encode("answer§"),
+            offset=-1,
         )
-        earlier.request["messages"] = [{"role": "user", "content": "separate"}]
+        earlier.request["messages"] = [
+            {"role": "user", "content": "separate"},
+            {"role": "assistant", "content": "historical"},
+            {"role": "user", "content": "again"},
+        ]
         trajectory.exchanges.chat_completions.insert(0, earlier)
     # Request-owned roles make the old sampled-only boundary shortcut decline,
     # so the later stream's validation callback is actually reached.
@@ -524,8 +539,21 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
         ] = tokenizer._encode("bridgerequest-only§")
     original_guard = module._require_native_stream
     original_encode = tokenizer.__class__.__call__
+    original_history = module.tokenize_history
+    completed = []
     armed = False
     changed = False
+
+    def history_call(history: Any, *args: Any, **kwargs: Any) -> Any:
+        value = original_history(history, *args, **kwargs)
+        if change.startswith("unscoped_") and any(
+            source is not None and source.exchange is earlier
+            for source in history.message_sources
+        ):
+            assert value.flags[len("separate")] & tr.TokenFlag.ASSISTANT
+            assert not value.flags[len("separate")] & tr.TokenFlag.SAMPLED
+            completed.append(value)
+        return value
 
     def guard(history: Any, *args: Any, **kwargs: Any) -> None:
         nonlocal armed
@@ -548,15 +576,25 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
                 first.request["chat_template_kwargs"] = {"changed": True}
             elif change in {"logprob", "unscoped_logprob"}:
                 record(earlier).logprobs.content[0].logprob = -123.0
+            elif change == "unscoped_request_role":
+                earlier.request["messages"][1]["role"] = "user"
+            elif change == "unscoped_request_tools":
+                earlier.request["tools"] = [
+                    {"type": "function", "function": {"name": "changed"}}
+                ]
+            elif change == "unscoped_history_role":
+                assert len(completed) == 1
+                completed[0].history.messages[1]["role"] = "user"
             else:
                 record(first).model_extra["stop_reason"] = "!"
         return original_encode(self, text, **kwargs)
 
     monkeypatch.setattr(module, "_require_native_stream", guard)
+    monkeypatch.setattr(module, "tokenize_history", history_call)
     monkeypatch.setattr(tokenizer.__class__, "__call__", encode)
     message = (
         "Sampled source changed during tokenization callback"
-        if change == "unscoped_logprob"
+        if change.startswith("unscoped_")
         else "during final STOP validation"
     )
     with pytest.raises(ValueError, match=message):
@@ -564,4 +602,5 @@ def test_later_stop_encoder_cannot_change_an_already_certified_stream(
             module._tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
         else:
             trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+        assert changed
     assert changed
