@@ -14,6 +14,11 @@ import art.trajectories as tr
 from art.trajectories import _tokenize as module
 
 
+@pytest.fixture(autouse=True)
+def isolate_prefix_warning(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(module, "_WARNED_PREFIX_RETOKENIZATION", False)
+
+
 def record(exchange: tr.ChatCompletionsExchange) -> Any:
     return cast(Any, exchange.response.choices[0])
 
