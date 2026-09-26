@@ -25,7 +25,7 @@ class Request(BaseModel):
     continue_final_message: bool = False
     chat_template_kwargs: dict = {}
     previous_response_id: str | None = None
-    tools: list = []
+    tools: list | None = []
     tool_choice: str = "auto"
     parallel_tool_calls: bool | None = None
 
@@ -427,6 +427,67 @@ def test_responses_serial_policy_reaches_chat_observer(
 
     asyncio.run(run())
     assert observed == [parallel is not False]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "tools", [None, [], [{"type": "function", "function": {"name": "echo"}}]]
+)
+def test_responses_optional_tools_use_valid_native_chat_view(
+    serving, monkeypatch, stream, tools
+):
+    server, modules = serving
+    observed = []
+    original = vllm.chat_response_prefixes
+
+    class NativeChatRequest(Request):
+        tools: list | None = None
+        tool_choice: str = "none"
+
+        @model_validator(mode="before")
+        @classmethod
+        def reject_empty_tools(cls, data):
+            # vLLM's ChatCompletionRequest rejects [], while Responses accepts
+            # omitted tools and its conversion helper returns None.
+            if data.get("tools") == []:
+                raise ValueError("`tools` must not be an empty array")
+            return data
+
+    modules[
+        "vllm.entrypoints.openai.chat_completion.protocol"
+    ].ChatCompletionRequest = NativeChatRequest
+    modules["vllm.entrypoints.openai.responses.utils"].construct_tool_dicts = (
+        lambda values, choice: values or None
+    )
+
+    async def observe(tokenizer, request, prompt, choices, render):
+        observed.append((request.tools, request.parallel_tool_calls, choices))
+        return await original(tokenizer, request, prompt, choices, render)
+
+    monkeypatch.setattr(vllm, "chat_response_prefixes", observe)
+
+    async def run():
+        options = {} if tools is None else {"tools": tools}
+        response = await server.create_responses(
+            Request(
+                messages=[{"role": "user", "content": "question"}],
+                parallel_tool_calls=False,
+                stream=stream,
+                **options,
+            )
+        )
+        if stream:
+            events = [event async for event in response]
+            assert len(events) == 1
+            assert events[0].type == "response.completed"
+            response = events[0].response
+        assert response.output[0]["content"] == "action"
+
+    asyncio.run(run())
+    assert len(server.engine.prompts) == 1
+    assert len(observed) == 1
+    assert observed[0][:2] == (tools or None, False)
+    assert observed[0][2][0][1:] == (list(b"\nthought\n#action~"), True)
 
 
 def test_previous_responses_keep_reasoning_and_tool_calls(serving):
