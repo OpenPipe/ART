@@ -129,7 +129,10 @@ def test_prefix_cache_bypasses_non_json_context(value):
     assert cache.for_messages([{"content": value}], "unchanged") is render
 
 
-def test_later_generation_split_is_recomputed_when_completed_suffix_is_equal():
+@pytest.mark.parametrize("seed_completed", [False, True])
+def test_later_generation_split_is_recomputed_when_completed_suffix_is_equal(
+    seed_completed,
+):
     messages = [
         {"role": "user", "content": "x"},
         {"role": "assistant", "content": "A"},
@@ -150,7 +153,11 @@ def test_later_generation_split_is_recomputed_when_completed_suffix_is_equal():
     tokenization._assistant_char_spans(
         messages,
         original,
-        cache.for_messages(messages, original),
+        cache.for_messages(
+            messages,
+            original,
+            add_generation_prompt=False if seed_completed else None,
+        ),
         add_generation_prompt=False,
     )
     probe = deepcopy(messages)
@@ -158,7 +165,12 @@ def test_later_generation_split_is_recomputed_when_completed_suffix_is_equal():
     text = render(probe, add_generation_prompt=False)
     assert text == original.replace(">A!", ">B!")
     actual = tokenization._assistant_char_spans(
-        probe, text, cache.for_messages(probe, text), add_generation_prompt=False
+        probe,
+        text,
+        cache.for_messages(
+            probe, text, add_generation_prompt=False if seed_completed else None
+        ),
+        add_generation_prompt=False,
     )
     expected = tokenization._assistant_char_spans(
         probe, text, render, add_generation_prompt=False
@@ -166,6 +178,29 @@ def test_later_generation_split_is_recomputed_when_completed_suffix_is_equal():
     assert actual == expected
     start, end = actual[-1]
     assert text[start:end] == "ELLO!"
+
+
+def test_completed_render_reuse_requires_same_messages_and_generation():
+    calls = []
+
+    def render(messages, *, add_generation_prompt):
+        calls.append((deepcopy(messages), add_generation_prompt))
+        return json.dumps(messages) + str(add_generation_prompt)
+
+    messages = [{"role": "assistant", "content": "original"}]
+    cache = tokenization._PrefixChatRenderCache(render)
+    cache.for_messages(messages, render(messages, add_generation_prompt=False))
+    probe = [{"role": "assistant", "content": "changed"}]
+    text = render(probe, add_generation_prompt=False)
+    cached = cache.for_messages(probe, text, add_generation_prompt=False)
+    before = len(calls)
+    assert cached(probe[:], add_generation_prompt=False) == text
+    assert len(calls) == before
+    assert cached(probe, add_generation_prompt=True) != text
+    assert len(calls) == before + 1
+    assert cached(deepcopy(probe), add_generation_prompt=False) == text
+    assert len(calls) == before + 2
+    assert cached([], add_generation_prompt=False) == "[]False"
 
 
 _TEMPLATE = """{% for message in messages %}<{{ message.role }}>{{ message.content or '' }}
@@ -395,4 +430,4 @@ def test_probe_scaling_reuses_only_unchanged_prefixes(monkeypatch, turns, tools)
     if tools:
         assert cached_calls <= calls - turns * (turns - 1)
     else:
-        assert cached_calls == calls  # Plain text already avoids tool probes.
+        assert cached_calls == calls - 1  # The completed full render is reused.
