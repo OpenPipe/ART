@@ -73,9 +73,12 @@ def test_gpu_image_node_prewarm_reuses_an_existing_digest(tmp_path: Path) -> Non
         capture_output=True,
     )
 
+    assert "Prewarming Kubernetes context test" in result.stdout
     assert "Skipping GPU node prewarm" in result.stdout
     assert "Launching temporary BuildKit" not in result.stdout
-    assert " apply " not in kubectl_log.read_text()
+    kubectl_calls = kubectl_log.read_text()
+    assert "get nodes" in kubectl_calls
+    assert " apply " not in kubectl_calls
 
 
 def test_gpu_image_node_prewarm_requires_an_immutable_digest() -> None:
@@ -109,6 +112,7 @@ def test_gpu_image_workflow_qualifies_digest_before_fleet_prewarm() -> None:
         )
     ]
     assert steps == sorted(steps)
+    assert workflow.count("GH_TOKEN: ${{ github.token }}") == 2
     assert "IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}" in workflow
     assert '"art_image": f"{image_repo}@{image_digest}"' in workflow
     assert "!cancelled() &&" in workflow

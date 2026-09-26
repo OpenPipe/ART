@@ -307,6 +307,7 @@ jobs:
             (github.event_name != 'workflow_dispatch' || inputs.prewarm_nodes)
           }}
         env:
+          GH_TOKEN: ${{ github.token }}
           IMAGE_DIGEST: ${{ steps.build.outputs.image_digest }}
           IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag || 'latest' }}
