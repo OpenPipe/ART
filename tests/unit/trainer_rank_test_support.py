@@ -64,15 +64,35 @@ def megatron_topology(physical, *, dp_size, tp_size):
 def spawn_and_join(worker, args, *, timeout, failure, nprocs=2):
     """Bound a collective test while preserving spawned-worker tracebacks."""
     processes = mp.spawn(worker, args=args, nprocs=nprocs, join=False)
+    error = None
     try:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if processes.join(timeout=1):
                 return
         pytest.fail(failure)
+    except BaseException as exc:
+        error = exc
+        raise
     finally:
-        for process in processes.processes:
-            if process.is_alive():
-                process.terminate()
-        for process in processes.processes:
-            process.join(timeout=5)
+        try:
+            for process in processes.processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in processes.processes:
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=5)
+            survivors = [p.pid for p in processes.processes if p.is_alive()]
+            if survivors:
+                pytest.fail(f"Spawned workers survived SIGKILL: {survivors}")
+        except BaseException as cleanup_error:
+            if error is None:
+                raise
+            try:
+                BaseException.add_note(
+                    error, f"Worker cleanup failed: {cleanup_error!r}"
+                )
+            except BaseException:
+                pass
