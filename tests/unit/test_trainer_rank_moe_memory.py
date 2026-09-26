@@ -589,7 +589,9 @@ def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
     # Growth enters the forward and checkpoint peaks, not forward retention.
     rank._update_memory_profile(plan, 10**9, retained_bytes=10**8)
     monkeypatch.setattr(
-        rank, "_checkpoint_memory_floor", lambda rows, refs=None: (10**7, 10**6)
+        rank,
+        "_checkpoint_memory_floor",
+        lambda rows, refs=None, segments=0: (10**7, 10**6),
     )
     grown = rank._plan_cost(plan)
     monkeypatch.setattr(rank, "_plan_hybridep_growth_bytes", lambda plan: 0)
