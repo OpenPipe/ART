@@ -50,6 +50,8 @@ _SOURCE_NAMES = (
     "_prefix_tree_performance_search.py",
     "_planner_misses.py",
     "_gdn_memory.py",
+    "_memory_policy.py",
+    "_options.py",
     "_planner_evidence.py",
     "_planner_retention.py",
 )

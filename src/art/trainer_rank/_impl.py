@@ -3442,16 +3442,21 @@ class TrainerRank:
             # execution belongs to the private model stream.
             materialized = self._capture_forward_options(inputs, options)
             requests = list(_flatten(materialized))
-        with torch.set_grad_enabled(enabled), self._rng.model():
-            self._reset_planning_telemetry()
-            plan, check = self._plan_admissible_forward(
-                requests, checkpoint=checkpoint, context="forward"
-            )
-            tracked_outputs = self._execute_admitted_plan(
-                plan, check=check, context="forward"
-            )
-            outputs = _unflatten(materialized, iter(tracked_outputs))
-        self._rng.synchronize(caller_group())
+        try:
+            with torch.set_grad_enabled(enabled), self._rng.model():
+                self._reset_planning_telemetry()
+                plan, check = self._plan_admissible_forward(
+                    requests, checkpoint=checkpoint, context="forward"
+                )
+                tracked_outputs = self._execute_admitted_plan(
+                    plan, check=check, context="forward"
+                )
+                outputs = _unflatten(materialized, iter(tracked_outputs))
+        finally:
+            # Failed peers must leave this frontier before the command layer's
+            # error exchange, just as successful peers do. Caller RNG is restored
+            # by model() before this collective, including on execution failure.
+            self._rng.synchronize(caller_group())
         return outputs
 
     def _execute_admitted_plan(

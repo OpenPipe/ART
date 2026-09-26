@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
@@ -10,8 +11,16 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.checkpoint import checkpoint
+from trainer_rank_test_support import gloo_group, megatron_topology, spawn_and_join
 
-from art.trainer_rank import AdamParams, ForwardInput, ForwardOutput, TrainerRank
+from art.trainer_rank import (
+    AdamParams,
+    ForwardInput,
+    ForwardOutput,
+    TrainerRank,
+    run_rank_callback,
+)
+from art.trainer_rank._commands import join_rank_callback_release
 from art.trainer_rank._impl import _CheckpointSlot, _GatherContextParallelRows
 from art.trainer_rank._rng import RNGState, TrainerRNG, caller_group
 
@@ -149,6 +158,49 @@ def test_forward_failure_restores_caller_and_advances_model(monkeypatch):
     generator = torch.Generator().set_state(internal_states[0])
     with trainer._rng.model():
         assert torch.equal(torch.rand(7), torch.rand(7, generator=generator))
+
+
+def test_failed_forward_keeps_command_collectives_aligned(tmp_path):
+    spawn_and_join(
+        _failed_forward_worker,
+        (f"file://{tmp_path / 'failed-forward'}",),
+        timeout=90,
+        failure="Forward failure stranded a peer before command error exchange",
+    )
+
+
+def _failed_forward_worker(physical, rendezvous):
+    with gloo_group(physical, rendezvous, timeout=10):
+        trainer = _trainer()
+        with (
+            megatron_topology(physical, dp_size=1, tp_size=2),
+            pytest.MonkeyPatch.context() as patch,
+        ):
+            calls = 0
+
+            def execute():
+                nonlocal calls
+                calls += 1
+                torch.rand(7)
+                if calls == 1 and physical == 1:
+                    raise ValueError("injected local model failure")
+                return []
+
+            _stub_forward(patch, trainer, execute)
+
+            def callback(view):
+                with pytest.raises(RuntimeError, match="injected local model failure"):
+                    view.forward([])
+                assert view.forward([]) == []
+                return "recovered"
+
+            async def run():
+                result = await run_rank_callback(trainer, callback)
+                await join_rank_callback_release(trainer)
+                assert result.value == ("recovered" if physical == 0 else None)
+
+            asyncio.run(run())
+            assert calls == 2
 
 
 @pytest.mark.parametrize("yield_empty", (False, True))
