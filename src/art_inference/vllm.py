@@ -358,7 +358,7 @@ def patch_history(importer=importlib.import_module) -> None:
                     model=request.model,
                     parallel_tool_calls=getattr(request, "parallel_tool_calls", None)
                     is not False,
-                    tools=tools or [],
+                    tools=tools or None,
                     messages=[
                         openai_tool_arguments(message) for message in conversation
                     ],
