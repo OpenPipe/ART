@@ -7706,6 +7706,9 @@ def _native_stream_context(history: ChatCompletionsHistory) -> object:
                     id(source.exchange),
                     source.request_index,
                     source.choice_index,
+                    list(_source_stop_evidence(source, _sampled_source_key(source)))
+                    if _source_is_sampled(source)
+                    else None,
                 ]
                 for source in history.message_sources
             ],
@@ -7892,6 +7895,25 @@ def _require_native_stream(
         raise ValueError("Native stream context changed while proving STOP")
 
 
+def _require_native_streams_unchanged(
+    scopes: Sequence[tuple[History | LegacyHistory, bool]],
+    keys: Mapping[int, set[_SampledSourceKey]],
+    contexts: Mapping[int, object],
+) -> None:
+    # A later scope's STOP encoder can change an earlier, already checked source.
+    # This final barrier invokes no tokenizer/renderer callbacks.
+    for history, scoped in scopes:
+        if not scoped:
+            continue
+        assert isinstance(history, ChatCompletionsHistory)
+        if keys[id(history)] != {
+            _sampled_source_key(source)
+            for source in history.message_sources
+            if source is not None and _source_is_sampled(source)
+        } or contexts[id(history)] != _native_stream_context(history):
+            raise ValueError("Native stream changed during final STOP validation")
+
+
 def _materialize_trajectory(
     tokenized: TokenizedHistory, trajectory: Trajectory
 ) -> TokenizedTrajectory:
@@ -8035,6 +8057,7 @@ def tokenize_trajectory(
                 scoped_keys[id(history)],
                 scoped_contexts[id(history)],
             )
+    _require_native_streams_unchanged(scopes, scoped_keys, scoped_contexts)
     if not multi_history:
         return _materialize_trajectory(tokenized[0], trajectory)
     return TokenizedMultiHistoryTrajectory(
@@ -8122,6 +8145,7 @@ def _tokenize_trajectory_with_trace(
                 scoped_keys[id(history)],
                 scoped_contexts[id(history)],
             )
+    _require_native_streams_unchanged(scopes, scoped_keys, scoped_contexts)
     return (
         TokenizedMultiHistoryTrajectory(
             trajectory=trajectory,

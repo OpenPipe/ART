@@ -384,3 +384,53 @@ def test_stop_encoder_cannot_change_role_proof_context(
         module._require_native_stream(
             history, value, module._TraceBuilder(trace=trace, tokenizer=tokenizer)
         )
+
+
+@pytest.mark.parametrize("private", [False, True])
+@pytest.mark.parametrize("change", ["request", "logprob", "stop_reason"])
+def test_later_stop_encoder_cannot_change_an_already_certified_stream(
+    monkeypatch: pytest.MonkeyPatch, private: bool, change: str
+) -> None:
+    trajectory, tokenizer = example()
+    first, second, _ = trajectory.exchanges.chat_completions
+    record(first).finish_reason = "stop"
+    record(first).model_extra["stop_reason"] = "§"
+    record(second).model_extra["stop_reason"] = "§"
+    original_guard = module._require_native_stream
+    original_encode = tokenizer.__class__.__call__
+    armed = False
+    changed = False
+
+    def guard(history: Any, *args: Any, **kwargs: Any) -> None:
+        nonlocal armed
+        # Final scope validation supplies planning snapshots; earlier assembly
+        # checks do not. Arm only the later stream's actual STOP encoder.
+        armed = len(args) >= 4 and any(
+            source is not None and source.exchange is second
+            for source in history.message_sources
+        )
+        try:
+            original_guard(history, *args, **kwargs)
+        finally:
+            armed = False
+
+    def encode(self: Any, text: str, **kwargs: Any) -> Any:
+        nonlocal changed
+        if armed and text == "§":
+            changed = True
+            if change == "request":
+                first.request["chat_template_kwargs"] = {"changed": True}
+            elif change == "logprob":
+                record(first).logprobs.content[0].logprob = -123.0
+            else:
+                record(first).model_extra["stop_reason"] = "!"
+        return original_encode(self, text, **kwargs)
+
+    monkeypatch.setattr(module, "_require_native_stream", guard)
+    monkeypatch.setattr(tokenizer.__class__, "__call__", encode)
+    with pytest.raises(ValueError, match="during final STOP validation"):
+        if private:
+            module._tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
+        else:
+            trajectory.tokenize(multi_history=True, tokenizer=tokenizer)
+    assert changed
