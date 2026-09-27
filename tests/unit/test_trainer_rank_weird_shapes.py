@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
 import torch
 from trainer_rank_test_support import _FakeGPT
+from trainer_rank_test_support import _packed_budget as _set_packed_token_budget
 
 from art.megatron.prefix_tree_packing import (
     estimate_prefix_tree_packed_tokens,
@@ -44,6 +45,17 @@ def _runtime() -> "TrainingRuntime":
     )  # type: ignore
 
 
+def _empty_executor(monkeypatch: pytest.MonkeyPatch, rank: TrainerRank) -> None:
+    monkeypatch.setattr(
+        rank,
+        "_run_flat_plan_with_memory_tracking",
+        lambda plan, **_kwargs: (
+            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
+            None,
+        ),
+    )
+
+
 def _tokens(*values: int) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.long)
 
@@ -73,24 +85,6 @@ def _target_request(
         hidden_states=hidden_states,
         checkpoint=checkpoint,
     )
-
-
-def _set_packed_token_budget(
-    monkeypatch: pytest.MonkeyPatch,
-    rank: TrainerRank,
-    available: int | Callable[[], int],
-) -> None:
-    monkeypatch.setattr(
-        rank,
-        "_estimate_required_memory_bytes_from_values",
-        lambda *, packed_tokens, **_kwargs: packed_tokens,
-    )
-
-    def check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
-        limit = available if isinstance(available, int) else available()
-        return _MemoryCheck(required, limit, required <= limit)
-
-    monkeypatch.setattr(rank, "_memory_check_required", check)
 
 
 def _ternary_tree_sequences() -> tuple[torch.Tensor, ...]:
@@ -237,14 +231,7 @@ def test_forward_batches_preserves_nested_vineppo_groups(
             plan.packed_tokens, 10_000, True
         ),
     )
-    monkeypatch.setattr(
-        rank,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: (
-            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
-            None,
-        ),
-    )
+    _empty_executor(monkeypatch, rank)
     groups = _vineppo_like_inputs()
 
     micro_batches = list(rank.forward_batches(groups))
@@ -268,14 +255,7 @@ def test_forward_batches_prewarms_next_wave_during_yield(
     limit = rank._estimate_flat_forward(inputs[:4])
     assert limit is not None
     _set_packed_token_budget(monkeypatch, rank, lambda: limit[0])
-    monkeypatch.setattr(
-        rank,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: (
-            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
-            None,
-        ),
-    )
+    _empty_executor(monkeypatch, rank)
 
     generator = rank.forward_batches(inputs)
     first = next(generator)
@@ -322,14 +302,7 @@ def _prewarmed_rank(
     limit = rank._estimate_flat_forward(budget_rows)
     assert limit is not None
     _set_packed_token_budget(monkeypatch, rank, lambda: limit[0])
-    monkeypatch.setattr(
-        rank,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: (
-            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
-            None,
-        ),
-    )
+    _empty_executor(monkeypatch, rank)
     return rank
 
 
@@ -405,14 +378,7 @@ def test_width_search_lets_prefix_sharing_widen_the_wave(
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True)
-    monkeypatch.setattr(
-        rank,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: (
-            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
-            None,
-        ),
-    )
+    _empty_executor(monkeypatch, rank)
     plan = rank._plan_flat_forward(inputs)
     assert plan.packed_tokens < 4_002, "planner must share the common prefix"
     # Budget fits the shared plan (2,002 packed) but not the no-sharing bound
@@ -459,17 +425,7 @@ def test_width_search_survives_non_monotone_cost_optimal_layouts(
         monkeypatch.setattr(
             rank, "_all_ranks_have_memory_profile", lambda **_kwargs: True
         )
-        monkeypatch.setattr(
-            rank,
-            "_run_flat_plan_with_memory_tracking",
-            lambda plan, **_kwargs: (
-                [
-                    ForwardOutput(None, None, None, None)
-                    for _ in range(plan.request_count)
-                ],
-                None,
-            ),
-        )
+        _empty_executor(monkeypatch, rank)
         two = rank._plan_flat_forward(inputs[:2]).packed_tokens
         three = rank._plan_flat_forward(inputs).packed_tokens
         return rank, inputs, two, three
@@ -637,14 +593,7 @@ def test_profiled_steady_state_keeps_the_wide_shared_wave(
     inputs = [_target_request(_tokens(*prompt, tail)) for tail in range(16)]
     rank = TrainerRank(_attention_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
-    monkeypatch.setattr(
-        rank,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: (
-            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
-            None,
-        ),
-    )
+    _empty_executor(monkeypatch, rank)
     plan = rank._plan_flat_forward(inputs)
     assert plan.packed_tokens == 1_016, plan.packed_tokens
     # Steady state: a prior call profiled exactly this shape.
@@ -678,14 +627,7 @@ def test_forward_preserves_caller_owned_nested_input_tensors(
     rank = TrainerRank(_runtime())
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_all_ranks_have_memory_profile", lambda **_: True)
-    monkeypatch.setattr(
-        rank,
-        "_run_flat_plan_with_memory_tracking",
-        lambda plan, **_kwargs: (
-            [ForwardOutput(None, None, None, None) for _ in range(plan.request_count)],
-            None,
-        ),
-    )
+    _empty_executor(monkeypatch, rank)
     groups = _vineppo_like_inputs()
     tensors = [
         (request, request.input_tokens, request.target_tokens)

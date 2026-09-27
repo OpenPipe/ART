@@ -1,5 +1,6 @@
 """Shared runtime construction and process groups for trainer-rank contract tests."""
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import timedelta
 import sys
@@ -14,17 +15,14 @@ import torch.multiprocessing as mp
 
 if TYPE_CHECKING:
     from art.megatron.train import TrainingRuntime
+    from art.trainer_rank import TrainerRank
 
 
 class _FakeGPT(torch.nn.Module):
-    def __init__(self, *, hidden_size: int = 8, vocab_size: int = 32) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.float16))
-        self.config = SimpleNamespace(
-            hidden_size=hidden_size,
-            num_layers=4,
-            padded_vocab_size=vocab_size,
-        )
+        self.config = SimpleNamespace(hidden_size=8, num_layers=4, padded_vocab_size=32)
         self.decoder = object()
 
     def _preprocess(self, *args: object, **kwargs: object) -> None:
@@ -61,6 +59,28 @@ def checkpoint_runtime(
         rank=0,
         world_size=1,
     )  # type: ignore
+
+
+def _packed_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: "TrainerRank",
+    available: int | Callable[[], int],
+) -> None:
+    """Express memory purely in packed tokens, bypassing the live model."""
+
+    from art.trainer_rank._impl import _MemoryCheck
+
+    monkeypatch.setattr(
+        rank,
+        "_estimate_required_memory_bytes_from_values",
+        lambda *, packed_tokens, **_kwargs: packed_tokens,
+    )
+
+    def check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
+        limit = available if isinstance(available, int) else available()
+        return _MemoryCheck(required, limit, required <= limit)
+
+    monkeypatch.setattr(rank, "_memory_check_required", check)
 
 
 @contextmanager

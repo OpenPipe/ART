@@ -31,7 +31,6 @@ and expected to FAIL on the pre-split tree. Contract, as agreed:
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import math
@@ -41,7 +40,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
-from trainer_rank_test_support import _FakeGPT
+from trainer_rank_test_support import _FakeGPT, _packed_budget
 
 from art.trainer_rank import (
     ForwardInput,
@@ -56,7 +55,6 @@ from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
     Unset,
     _FlatForwardPlan,
-    _MemoryCheck,
     _MemoryProfile,
     _SplitForwardPlan,
 )
@@ -91,26 +89,6 @@ def _request(marker: int, length: int = 10) -> ForwardInput:
         [10_000 + marker, *range(1, length - 1), marker], dtype=torch.long
     )
     return ForwardInput(input_tokens=tokens, target_tokens=tokens)
-
-
-def _packed_budget(
-    monkeypatch: pytest.MonkeyPatch,
-    rank: TrainerRank,
-    available: int | Callable[[], int],
-) -> None:
-    """Express memory purely in packed tokens, bypassing the live model."""
-
-    monkeypatch.setattr(
-        rank,
-        "_estimate_required_memory_bytes_from_values",
-        lambda *, packed_tokens, **_kwargs: packed_tokens,
-    )
-
-    def check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
-        limit = available if isinstance(available, int) else available()
-        return _MemoryCheck(required, limit, required <= limit)
-
-    monkeypatch.setattr(rank, "_memory_check_required", check)
 
 
 def _recording_executor(
