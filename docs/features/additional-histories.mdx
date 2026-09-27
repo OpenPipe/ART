@@ -188,10 +188,13 @@ the original request and template reproduce its complete native prompt, ART can
 recover historical assistant roles from that rendering. This uses the original
 tool serialization order and preserves role labels through exact length-stop
 assembly; it does not restore destructive parsing for new response content.
-The role proof uses the first sufficient complete recorded request containing
-the last request-only assistant, including its trailing query; this applies to
-both normalized and original-template proofs. Later sampled native
-bodies remain authoritative even when their rendered projections differ.
+The role proof uses a complete recorded request covering the request-only role
+spans being attributed, including its trailing query. The normalized path uses
+the first sufficient request; the original-template fallback also locates the
+last request-only assistant message. Later sampled native bodies remain
+authoritative even when their rendered projections differ. An empty assistant
+with no rendered token extent supplies no role or STOP authority for unmatched
+native tokens; ART leaves those tokens' roles unknown rather than inventing them.
 With a supplied renderer, request-owned assistant roles are proved throughout
 the native stream, including between sampled responses. This requirement applies
 even when template normalization makes no change. A request whose text
@@ -224,9 +227,11 @@ callback exceptions keep their original identity.
 When recorded prompt IDs are unavailable, a supplied renderer defines the prompt
 tokens. ART cannot certify that arbitrary returned IDs implement a particular
 text transformation. A renderer changing a disposable, single-use message copy
-does not itself invalidate that authority; changes to borrowed sources or
-semantic inputs that ART reuses still require refusal. In particular, a
-Responses message projection reused for prompt and completion rendering must
+does not itself invalidate that authority. ART refuses inconsistent borrowed
+provenance and changed semantic inputs that it reuses. An edit to an original
+object that is restored before any later consumption, leaves final provenance
+unchanged, and changes no tokenization decision is not itself a stale result.
+A Responses message projection reused for prompt and completion rendering must
 remain unchanged across those calls.
 These checks refuse stale results; they do not make callbacks or source objects
 immutable. Context snapshots reuse shared containers only within one observation;
