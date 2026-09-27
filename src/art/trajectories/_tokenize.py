@@ -1274,6 +1274,38 @@ def _fingerprint(value: object) -> str:
     return sha256(serialized.encode()).hexdigest()
 
 
+class _RevalidatedFingerprints(dict[tuple[int, str, int], tuple[Exchange, str]]):
+    """Reuse JSON encoding only after freshly comparing detached evidence."""
+
+    def __init__(self) -> None:
+        self.observations: dict[tuple[int, str, int], tuple[Exchange, bytes, str]] = {}
+        self.snapshot_bytes = 0
+
+    def fingerprint(
+        self, exchange: Exchange, protocol: str, index: int, evidence: object
+    ) -> str:
+        if type(protocol) is not str or type(index) is not int:
+            return _fingerprint(evidence)
+        try:
+            # Exact builtins only: no user reducers, alias-dependent memo or
+            # borrowed containers. Float bits and primitive types stay distinct.
+            snapshot = _RenderContextGuard.plain(evidence, memo=False)
+        except (TypeError, ValueError, RecursionError, PicklingError):
+            return _fingerprint(evidence)
+        key = id(exchange), protocol, index
+        previous = self.observations.get(key)
+        if previous is not None and previous[0] is exchange and previous[1] == snapshot:
+            return previous[2]
+        result = _fingerprint(evidence)
+        retained_bytes = self.snapshot_bytes - (len(previous[1]) if previous else 0)
+        if (
+            previous is not None or len(self.observations) < 256
+        ) and retained_bytes + len(snapshot) <= 8 << 20:
+            self.observations[key] = exchange, snapshot, result
+            self.snapshot_bytes = retained_bytes + len(snapshot)
+        return result
+
+
 def _chat_logprob_fingerprint_evidence(choice: Choice) -> dict[str, object] | None:
     if choice.logprobs is None:
         return None
@@ -1304,7 +1336,7 @@ def _sampled_evidence_fingerprint(
     index: int,
     _cache: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
 ) -> str:
-    if _cache is not None:
+    if _cache is not None and type(_cache) is not _RevalidatedFingerprints:
         key = (id(exchange), protocol, index)
         cached = _cache.get(key)
         if cached is not None and cached[0] is exchange:
@@ -1400,7 +1432,11 @@ def _sampled_evidence_fingerprint(
             "logprobs": response_extra.get("logprobs"),
             "stop_reason": exchange.response.stop_reason,
         }
-    return _fingerprint(evidence)
+    return (
+        _cache.fingerprint(exchange, protocol, index, evidence)
+        if type(_cache) is _RevalidatedFingerprints
+        else _fingerprint(evidence)
+    )
 
 
 def _source_key(
@@ -1475,12 +1511,17 @@ def _sampled_source_key(
     raise ValueError("Sampled token source has an unsupported exchange")
 
 
-def _exchange_sampled_source_key(exchange: Exchange) -> _SampledSourceKey:
+def _exchange_sampled_source_key(
+    exchange: Exchange,
+    *,
+    _fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = None,
+) -> _SampledSourceKey:
     if isinstance(exchange, ChatCompletionsExchange):
         return _source_key(
             exchange,
             protocol="chat_completions",
             index=exchange.response.choices[0].index,
+            _fingerprints=_fingerprints,
         )
     if isinstance(exchange, CompletionsExchange):
         return _source_key(
@@ -1488,11 +1529,16 @@ def _exchange_sampled_source_key(exchange: Exchange) -> _SampledSourceKey:
             protocol="completions",
             index=exchange.response.choices[0].index,
             prompt_index=0,
+            _fingerprints=_fingerprints,
         )
     if isinstance(exchange, ResponsesExchange):
-        return _source_key(exchange, protocol="responses", index=0)
+        return _source_key(
+            exchange, protocol="responses", index=0, _fingerprints=_fingerprints
+        )
     if isinstance(exchange, MessagesExchange):
-        return _source_key(exchange, protocol="messages", index=0)
+        return _source_key(
+            exchange, protocol="messages", index=0, _fingerprints=_fingerprints
+        )
     raise TypeError(f"Unsupported sampled exchange: {type(exchange).__name__}")
 
 
@@ -4947,6 +4993,8 @@ def _sampled_source_validator(
             )
         )
 
+    fingerprints = _RevalidatedFingerprints()
+
     def validate(
         selected: _SampledSourceKey | None,
         *,
@@ -4967,9 +5015,9 @@ def _sampled_source_validator(
                 visible,
             ) in expected[key]:
                 current = (
-                    _exchange_sampled_source_key(source)
+                    _exchange_sampled_source_key(source, _fingerprints=fingerprints)
                     if isinstance(source, Exchange)
-                    else _sampled_source_key(source)
+                    else _sampled_source_key(source, _fingerprints=fingerprints)
                 )
                 if (
                     current != key
