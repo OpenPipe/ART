@@ -25,6 +25,7 @@ from anthropic.types import Message, MessageParam, TextBlock
 from openai.types import Completion
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
+from openai.types.chat.chat_completion_token_logprob import ChatCompletionTokenLogprob
 from openai.types.responses import Response
 from pydantic import BaseModel
 
@@ -609,7 +610,8 @@ def _recorded_prompt_tokens(
     tools: object,
     kwargs: Mapping[str, object],
 ) -> list[int]:
-    messages, tools, kwargs = deepcopy((messages, tools, dict(kwargs)))
+    messages, tools = deepcopy((messages, tools))
+    kwargs = dict(kwargs)
     context = _render_context_key([messages, tools, kwargs])
 
     def check() -> None:
@@ -660,7 +662,8 @@ def _recorded_prompt_role_masks(
         return None
     if not any(message.get("role") == "assistant" for message in messages):
         return None
-    messages, tools, kwargs = deepcopy((messages, tools, dict(kwargs)))
+    messages, tools = deepcopy((messages, tools))
+    kwargs = dict(kwargs)
     original_context = _render_context_key([messages, tools, dict(kwargs)])
 
     def check_context() -> None:
@@ -1278,7 +1281,7 @@ def _chat_logprob_fingerprint_evidence(choice: Choice) -> dict[str, object] | No
     def values(items: Sequence[object] | None) -> list[dict[str, object]]:
         result: list[dict[str, object]] = []
         for item in items or []:
-            data = _dump(item)
+            data = _token_logprob_data(item)
             result.append(
                 {
                     key: data[key]
@@ -1527,6 +1530,15 @@ def _dump(value: object) -> dict[str, Any]:
     return _string_dict(value) or {}
 
 
+def _token_logprob_data(value: object) -> dict[str, Any]:
+    if isinstance(value, ChatCompletionTokenLogprob):
+        # Recorded fields, including provider token_id extras, are evidence.
+        # Serializing a typed row must not execute a model_dump override while
+        # numeric assembly and its fingerprint consume that same evidence.
+        return {**value.__dict__, **(value.model_extra or {})}
+    return _dump(value)
+
+
 def _field(value: object, name: str, default: object = None) -> object:
     return (
         value.get(name, default)
@@ -1596,7 +1608,7 @@ def _pairs(
     logprobs: list[float] = []
     complete = True
     for value in values:
-        data = _dump(value)
+        data = _token_logprob_data(value)
         token_id = _pair_token_id(data, required=require_token_ids, field=field)
         if token_id is None:
             complete = False
@@ -2658,12 +2670,14 @@ def _visible_logprobs(
         entries = _chat_logprob_entries(choice)
         decoder = codecs.getincrementaldecoder("utf-8")()
         for index, entry in enumerate(entries):
-            data = _dump(entry)
+            data = _token_logprob_data(entry)
             raw_bytes = data.get("bytes")
             if isinstance(raw_bytes, list):
                 try:
                     next_data = (
-                        _dump(entries[index + 1]) if index + 1 < len(entries) else {}
+                        _token_logprob_data(entries[index + 1])
+                        if index + 1 < len(entries)
+                        else {}
                     )
                     text = decoder.decode(
                         bytes(raw_bytes),
@@ -3027,6 +3041,12 @@ def _tokenize_exchange_trajectory(
                 ("response_projection", id(projection)),
                 lambda projection=projection: projection,
                 projection,
+            )
+            # Selection and rendering are separate callbacks. The retained
+            # projection must remain stable before either consumes it.
+            args = (
+                _RenderingTokenizer(args[0], _RenderContextGuard(lambda: projection)),
+                *args[1:],
             )
         if not callback_used:
             ledger.consume_sources([], rendered_evidence=True)
@@ -6535,6 +6555,9 @@ def _tokenize_chat_view(
                     exact_prefix_length = len(source_prompt)
                     canonical_prefix_length = len(rendered_prompt)
                     needs_request_roles = any(
+                        canonical_assistant_mask[:canonical_prefix_length]
+                        + canonical_stop_mask[:canonical_prefix_length]
+                    ) and any(
                         prior_message.get("role") == "assistant"
                         and (
                             prior_source is None or not _source_is_sampled(prior_source)
