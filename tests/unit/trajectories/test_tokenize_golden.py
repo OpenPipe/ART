@@ -240,6 +240,23 @@ CASES: dict[str, Builder] = {
 }
 
 
+def _cache_miss_errors() -> tuple[type[BaseException], ...]:
+    # transformers wraps an offline miss (local_files_only=True, uncached repo or
+    # revision) in a plain OSError; huggingface_hub raises these subclasses when
+    # called directly. ImportError covers a missing optional dependency.
+    errors: list[type[BaseException]] = [ImportError, OSError]
+    try:
+        from huggingface_hub.errors import EntryNotFoundError, LocalEntryNotFoundError
+    except ImportError:
+        pass
+    else:
+        errors.extend((EntryNotFoundError, LocalEntryNotFoundError))
+    return tuple(errors)
+
+
+_CACHE_MISS_ERRORS = _cache_miss_errors()
+
+
 @pytest.fixture(scope="module")
 def qwen3_tokenizer() -> Any:
     """The pinned Qwen3 tokenizer from the local HF cache, or skip."""
@@ -249,7 +266,9 @@ def qwen3_tokenizer() -> Any:
 
     try:
         return get_tokenizer(_QWEN3, revision=_QWEN3_REVISION, local_files_only=True)
-    except Exception as error:  # noqa: BLE001 - any loader failure means "not cached"
+    except _CACHE_MISS_ERRORS as error:
+        # Only an absent optional dependency or an offline cache miss is a
+        # skip; a loader regression (TypeError, AssertionError, ...) propagates.
         pytest.skip(
             f"{_QWEN3}@{_QWEN3_REVISION[:8]} is not cached offline: "
             f"{type(error).__name__}"
