@@ -2012,11 +2012,16 @@ def test_concurrent_checkpoint_finish_runs_once(
     assert calls == 1
 
 
-@pytest.mark.parametrize("action", ("finish", "abort"))
+@pytest.mark.parametrize(
+    "action,retry", (("finish", "finish"), ("finish", "abort"), ("abort", "abort"))
+)
+@pytest.mark.parametrize("failed_path", ("snapshot", "reservation"))
 def test_checkpoint_cleanup_failure_can_be_retried(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     action: str,
+    retry: str,
+    failed_path: str,
 ) -> None:
     from art.trainer_rank import _checkpoint
 
@@ -2028,28 +2033,77 @@ def test_checkpoint_cleanup_failure_can_be_retried(
     def finalize(_trainer: TrainerRank, _prepared: _PreparedSave) -> None:
         nonlocal finalizations
         finalizations += 1
+        prepared.destination.mkdir()
+        (prepared.destination / "committed").write_bytes(b"saved state")
 
     original = _checkpoint.shutil.rmtree
     failed = False
+    failure = OSError("injected cleanup failure")
 
     def fail_once(path: Path, ignore_errors: bool = False, **_: object) -> None:
         nonlocal failed
-        if Path(path) == prepared.snapshot and not failed:
+        if Path(path) == getattr(prepared, failed_path) and not failed:
             failed = True
-            raise OSError("injected cleanup failure")
+            raise failure
         original(path, ignore_errors=ignore_errors)
 
     monkeypatch.setattr(_checkpoint, "_finish", finalize)
     monkeypatch.setattr(_checkpoint.shutil, "rmtree", fail_once)
     operation = finish_checkpoint_save if action == "finish" else abort_checkpoint_save
-    with pytest.raises(BaseExceptionGroup, match="cleanup failed"):
+    with pytest.raises(BaseExceptionGroup, match="cleanup failed") as raised:
         operation(trainer, "save")
-    operation(trainer, "save")
+    assert raised.value.exceptions == (failure,)
+    assert trainer._checkpoint_save_outcomes["save"] == action
+    assert trainer._checkpoint_save_next == 1
+    recovery = finish_checkpoint_save if retry == "finish" else abort_checkpoint_save
+    recovery(trainer, "save")
+    abort_checkpoint_save(trainer, "save")
 
     assert finalizations == (1 if action == "finish" else 0)
+    assert trainer._finalized_checkpoint_saves["save"].outcome == action
+    assert trainer._checkpoint_save_next == 1
     assert "save" not in trainer._prepared_checkpoint_saves
+    assert "save" not in trainer._checkpoint_save_outcomes
     assert not prepared.snapshot.exists()
     assert not prepared.reservation.exists()
+    if action == "finish":
+        assert (prepared.destination / "committed").read_bytes() == b"saved state"
+    else:
+        assert not prepared.destination.exists()
+
+
+@pytest.mark.parametrize("finalized", (False, True))
+@pytest.mark.parametrize(
+    "outcome,action", (("abort", "finish"), ("invalid", "finish"), ("invalid", "abort"))
+)
+def test_checkpoint_terminal_outcome_rejects_invalid_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    finalized: bool,
+    outcome: str,
+    action: str,
+) -> None:
+    from art.trainer_rank import _checkpoint
+
+    trainer = _save_state_trainer()
+    prepared = _prepared_save(tmp_path, 0)
+    if finalized:
+        trainer._finalized_checkpoint_saves["save"] = _FinalizedSave(
+            0, cast(Any, outcome)
+        )
+    else:
+        trainer._prepared_checkpoint_saves["save"] = prepared
+        trainer._checkpoint_save_outcomes["save"] = cast(Any, outcome)
+    monkeypatch.setattr(_checkpoint, "_finish", lambda *_: pytest.fail("reran finish"))
+    monkeypatch.setattr(
+        _checkpoint, "_cleanup_paths", lambda *_: pytest.fail("cleanup")
+    )
+    operation = finish_checkpoint_save if action == "finish" else abort_checkpoint_save
+    with pytest.raises(RuntimeError, match=f"already {outcome}ed"):
+        operation(trainer, "save")
+    assert trainer._checkpoint_save_next == 0
+    assert prepared.snapshot.exists() and prepared.reservation.exists()
+    assert not prepared.destination.exists()
 
 
 def test_checkpoint_cleanup_gather_failure_releases_finalizer(
@@ -2081,8 +2135,9 @@ def test_checkpoint_cleanup_gather_failure_releases_finalizer(
     assert "save" not in trainer._prepared_checkpoint_saves
 
 
+@pytest.mark.parametrize("action", ("finish", "abort"))
 def test_checkpoint_asymmetric_cleanup_gather_can_converge(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str
 ) -> None:
     from art.trainer_rank import _checkpoint
 
@@ -2094,6 +2149,7 @@ def test_checkpoint_asymmetric_cleanup_gather_can_converge(
     completed._finalized_checkpoint_saves["save"] = _FinalizedSave(0, "finish")
     retained._prepared_checkpoint_saves["save"] = retained_save
     retained._checkpoint_save_outcomes["save"] = "finish"
+    completed._checkpoint_save_next = retained._checkpoint_save_next = 1
 
     def mixed(
         value: object, _group: dist.ProcessGroup | None = None
@@ -2103,11 +2159,17 @@ def test_checkpoint_asymmetric_cleanup_gather_can_converge(
         return (value, value)
 
     monkeypatch.setattr(_checkpoint, "_gather", mixed)
-    finish_checkpoint_save(completed, "save")
-    finish_checkpoint_save(retained, "save")
-    assert "save" in completed._finalized_checkpoint_saves
-    assert "save" in retained._finalized_checkpoint_saves
+    monkeypatch.setattr(_checkpoint, "_finish", lambda *_: pytest.fail("reran finish"))
+    operation = finish_checkpoint_save if action == "finish" else abort_checkpoint_save
+    operation(completed, "save")
+    operation(retained, "save")
+    assert completed._finalized_checkpoint_saves["save"].outcome == "finish"
+    assert retained._finalized_checkpoint_saves["save"].outcome == "finish"
+    assert completed._checkpoint_save_next == retained._checkpoint_save_next == 1
     assert "save" not in retained._prepared_checkpoint_saves
+    assert (
+        not retained_save.snapshot.exists() and not retained_save.reservation.exists()
+    )
 
 
 def test_checkpoint_cleanup_gather_preserves_finish_error(

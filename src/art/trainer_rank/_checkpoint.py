@@ -1347,11 +1347,12 @@ def _finalize_checkpoint_save(
                 return
             raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
         finalized_ranks = _gather(finalized is not None, group)
+        # Abort may finish cleanup without rolling back a committed save.
+        if outcome not in (None, action, "finish"):
+            raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
         if all(finalized_ranks):
             if outcome == "finish" or action == "abort":
                 return
-            raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
-        if outcome is not None and outcome != action:
             raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
         prepared = local if finalized is None else None
         assert prepared is not None or finalized is not None
