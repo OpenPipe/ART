@@ -299,7 +299,7 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
                     "checkpoint_peak_increment": 0,
                     "hybridep_growth": 0,
                     "checkpoint_adapter_gradient": 0,
-                    "checkpoint_adapter_gradient_slots": 0,
+                    "checkpoint_adapter_gradient_slots": "",
                 },
             }
         ],

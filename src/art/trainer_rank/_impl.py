@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
 import hashlib
+import json
 import logging
 import math
 import os
@@ -1068,10 +1069,10 @@ class _SubforwardCost:
     # Adapter gradients the recompute backward holds beyond the boundaries it
     # has released (``_checkpoint_adapter_gradient_bytes``), before the safety
     # factor. Split children training the same slots share them, so a split
-    # charges the largest once; ``..._slots`` identifies those slots within
-    # this process (a hash, 0 when none), keeping the cost JSON-serializable.
+    # charges the largest once; ``..._slots`` names those slots (sorted JSON
+    # of kind/name pairs, "" when none), keeping the cost JSON-serializable.
     checkpoint_adapter_gradient: int = 0
-    checkpoint_adapter_gradient_slots: int = 0
+    checkpoint_adapter_gradient_slots: str = ""
 
     @property
     def ephemeral(self) -> int:
@@ -4273,21 +4274,38 @@ class TrainerRank:
         layer_of: dict[int, int] = {}
         params: dict[int, torch.nn.Parameter] = {}
 
-        def slot_params(module: torch.nn.Module) -> Iterator[torch.nn.Parameter]:
-            for child in module.modules():
+        def slot_params(
+            modules: Iterable[torch.nn.Module],
+        ) -> Iterator[torch.nn.Parameter]:
+            for module in modules:
                 # A LoRA without slot tables holds no slot parameters.
-                if isinstance(child, LoRA) and "_slot_keys" in vars(child):
+                if isinstance(module, LoRA) and "_slot_keys" in vars(module):
                     for ref in refs:
-                        yield from child.lora_slot_params(ref)
+                        yield from module.lora_slot_params(ref)
 
         for index, layer in enumerate(layers):
-            for param in slot_params(layer):
+            for param in slot_params(layer.modules()):
                 params[id(param)] = param
                 layer_of[id(param)] = max(layer_of.get(id(param), -1), index)
-        for param in slot_params(chunk):
-            if id(param) not in params:
-                params[id(param)] = param
-                layer_of[id(param)] = len(layers)
+        # Outside the decoder (a head runs its backward first) is live
+        # throughout, even for a parameter a decoder layer also uses.
+        inside = {id(module) for module in layers.modules()}
+        outside = (module for module in chunk.modules() if id(module) not in inside)
+        for param in slot_params(outside):
+            params[id(param)] = param
+            layer_of[id(param)] = len(layers)
+        # A checkpoint's other trainable parameters (custom objects) have no
+        # decoder position; count them as live throughout.
+        for ref in refs:
+            slot = (
+                None
+                if ref.name is None
+                else getattr(self, "_checkpoint_slots", {}).get(ref.name)
+            )
+            for param in () if slot is None else slot.params:
+                if id(param) not in params:
+                    params[id(param)] = param
+                    layer_of[id(param)] = len(layers)
         sizes = [0] * (len(layers) + 1)
         for param_id, param in params.items():
             if (
@@ -4308,8 +4326,9 @@ class TrainerRank:
         gradient allocated so far: those of layers i..L-1 (a layer allocates its
         own during its backward) and any outside the decoder. The floor already
         prices all L boundaries at once, so the extra peak is
-        max(0, max over i of gradients(i..) - boundaries(i+1..)). It is taken
-        over the real per-layer sizes, not a uniform-layer line. A short
+        max(0, max over i of gradients(i..) - boundaries(i+1..)), taken at every
+        layer over the real per-layer gradient sizes and the caller's per-layer
+        boundaries, not along a uniform-layer line. A short
         first wave peaks at layer 0 (Qwen3.6-35B-A3B CP2: 830-900 MB of expert
         LoRA gradients live at its peak), a long one at the last layer.
         ``boundaries`` gives each decoder layer's saved-boundary bytes;
@@ -4435,9 +4454,11 @@ class TrainerRank:
             checkpoint_peak_increment=required - forward_required,
             hybridep_growth=hybridep_growth_bytes,
             checkpoint_adapter_gradient=adapter_gradient,
-            checkpoint_adapter_gradient_slots=hash(gradient_slots)
+            checkpoint_adapter_gradient_slots=json.dumps(
+                sorted([ref.kind, ref.name] for ref in gradient_slots)
+            )
             if adapter_gradient
-            else 0,
+            else "",
         )
 
     def _retained_memory_bytes(

@@ -142,6 +142,25 @@ def test_pending_gradients_count_local_unallocated_slot_parameters():
     assert r._pending_adapter_gradient_bytes([]) == ()
 
 
+def test_a_parameter_the_head_also_uses_is_live_throughout():
+    tied = parameter(7)
+    layers = [lora(policy=[tied, parameter(3)]), lora(policy=[parameter(5)])]
+    r = adapter_rank(layers, lora(policy=[tied]))
+    # The head's backward runs before the decoder's and allocates it first.
+    assert r._pending_adapter_gradient_bytes([POLICY]) == (3 * 2, 5 * 2, 7 * 2)
+
+
+def test_other_checkpoint_parameters_are_live_throughout():
+    from art.trainer_rank._impl import _CheckpointSlot
+
+    adapter = parameter(3)
+    custom = parameter(11)
+    r = adapter_rank([lora(policy=[adapter])], torch.nn.Module())
+    r._checkpoint_slots["policy"] = _CheckpointSlot(params=(adapter, custom))
+    # A custom object's parameter has no decoder position; LoRA ones keep theirs.
+    assert r._pending_adapter_gradient_bytes([POLICY]) == (3 * 2, 11 * 2)
+
+
 def test_a_step_with_allocated_gradients_prices_no_extra():
     params = [parameter(100) for _ in range(4)]
     r = adapter_rank([lora(policy=[p]) for p in params], torch.nn.Module())
@@ -184,7 +203,7 @@ def test_cost_and_estimate_charge_the_extra_while_gradients_are_pending(monkeypa
     assert extra > 0
     cost = priced(r, values, (POLICY, None))
     assert cost.checkpoint_adapter_gradient == extra
-    assert cost.checkpoint_adapter_gradient_slots == hash(frozenset({POLICY}))
+    assert cost.checkpoint_adapter_gradient_slots == '[["checkpoint", "policy"]]'
     assert cost.required == int(
         (out + retained + workspace + COLD + retained + extra) * 1.1
     )
@@ -212,7 +231,7 @@ def test_cost_and_estimate_charge_the_extra_while_gradients_are_pending(monkeypa
     )
 
 
-def child(extra: int, slots: int, workspace: int = 10) -> _SubforwardCost:
+def child(extra: int, slots: str, workspace: int = 10) -> _SubforwardCost:
     return _SubforwardCost(
         required=int((1 + workspace + 1 + extra) * 1.1),
         retained=0,
@@ -225,12 +244,12 @@ def child(extra: int, slots: int, workspace: int = 10) -> _SubforwardCost:
 
 
 def test_split_charges_shared_gradients_once_and_distinct_slots_each():
-    shared = [child(500, 7), child(300, 7)]
+    shared = [child(500, "a"), child(300, "a")]
     assert TrainerRank._split_required_memory(shared) == int((2 + 2 + 10 + 500) * 1.1)
-    distinct = [child(500, 7), child(300, 9)]
+    distinct = [child(500, "a"), child(300, "b")]
     assert TrainerRank._split_required_memory(distinct) == int((2 + 2 + 10 + 800) * 1.1)
     # A child with no pending gradients does not change the shared charge.
-    assert TrainerRank._split_required_memory([child(500, 7), child(0, 0)]) == int(
+    assert TrainerRank._split_required_memory([child(500, "a"), child(0, "")]) == int(
         (2 + 2 + 10 + 500) * 1.1
     )
 
