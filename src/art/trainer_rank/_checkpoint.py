@@ -987,7 +987,6 @@ def prepare_checkpoint_save(
             trainer._prepared_checkpoint_saves[output_dir] = prepared
             trainer._finalized_checkpoint_saves.pop(output_dir, None)
             trainer._checkpoint_preparing_saves.discard(output_dir)
-            trainer._checkpoint_save_condition.notify_all()
 
 
 def _read_snapshot(
@@ -1299,7 +1298,6 @@ def _advance_save_queue(trainer: TrainerRank, sequence: int) -> None:
         while trainer._checkpoint_save_next in trainer._checkpoint_save_skipped:
             trainer._checkpoint_save_skipped.remove(trainer._checkpoint_save_next)
             trainer._checkpoint_save_next += 1
-        trainer._checkpoint_save_condition.notify_all()
 
 
 def _cleanup_paths(paths: Iterable[Path]) -> BaseException | None:
@@ -1312,38 +1310,6 @@ def _cleanup_paths(paths: Iterable[Path]) -> BaseException | None:
         except BaseException as exc:
             errors.append(exc)
     return BaseExceptionGroup("checkpoint cleanup failed", errors) if errors else None
-
-
-def _claim_finalization(
-    trainer: TrainerRank,
-    output_dir: str,
-    action: Literal["finish", "abort"],
-) -> _PreparedSave | None:
-    with trainer._checkpoint_save_condition:
-        while True:
-            prepared = trainer._prepared_checkpoint_saves.get(output_dir)
-            if prepared is None:
-                if output_dir in trainer._finalized_checkpoint_saves:
-                    return None
-                if action == "abort":
-                    return None
-                raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
-            outcome = trainer._checkpoint_save_outcomes.get(output_dir)
-            if outcome is not None and outcome != action:
-                raise RuntimeError(
-                    f"Checkpoint save was already {outcome}ed: {output_dir}"
-                )
-            if output_dir in trainer._checkpoint_finalizing_saves:
-                trainer._checkpoint_save_condition.wait()
-                continue
-            if outcome is None and prepared.sequence != trainer._checkpoint_save_next:
-                raise RuntimeError(
-                    "Checkpoint saves must be finalized in preparation order: "
-                    f"expected sequence {trainer._checkpoint_save_next}, got "
-                    f"{prepared.sequence}"
-                )
-            trainer._checkpoint_finalizing_saves[output_dir] = action
-            return prepared
 
 
 def _finalize_checkpoint_save(
@@ -1387,12 +1353,19 @@ def _finalize_checkpoint_save(
             raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
         if outcome is not None and outcome != action:
             raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
-        prepared = (
-            _claim_finalization(trainer, output_dir, action)
-            if finalized is None
-            else None
-        )
+        prepared = local if finalized is None else None
         assert prepared is not None or finalized is not None
+        if prepared is not None:
+            with trainer._checkpoint_save_condition:
+                if (
+                    outcome is None
+                    and prepared.sequence != trainer._checkpoint_save_next
+                ):
+                    raise RuntimeError(
+                        "Checkpoint saves must be finalized in preparation order: "
+                        f"expected sequence {trainer._checkpoint_save_next}, got "
+                        f"{prepared.sequence}"
+                    )
         error: BaseException | None = None
         cleanup_failed = True
         try:
@@ -1464,7 +1437,6 @@ def _finalize_checkpoint_save(
                 )
         finally:
             with trainer._checkpoint_save_condition:
-                trainer._checkpoint_finalizing_saves.pop(output_dir, None)
                 if not cleanup_failed:
                     trainer._prepared_checkpoint_saves.pop(output_dir, None)
                     trainer._checkpoint_save_outcomes.pop(output_dir, None)
@@ -1472,7 +1444,6 @@ def _finalize_checkpoint_save(
                     trainer._finalized_checkpoint_saves[output_dir] = _FinalizedSave(
                         sequence, outcome
                     )
-                trainer._checkpoint_save_condition.notify_all()
 
 
 def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:

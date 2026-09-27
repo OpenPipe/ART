@@ -2095,7 +2095,6 @@ class TrainerRank:
         self._checkpoint_save_next = 0
         self._checkpoint_save_skipped: set[int] = set()
         self._checkpoint_preparing_saves: set[str] = set()
-        self._checkpoint_finalizing_saves: dict[str, Literal["finish", "abort"]] = {}
         self._checkpoint_save_outcomes: dict[str, Literal["finish", "abort"]] = {}
         self._prepared_checkpoint_saves: dict[str, _PreparedSave] = {}
         self._finalized_checkpoint_saves: dict[str, _FinalizedSave] = {}

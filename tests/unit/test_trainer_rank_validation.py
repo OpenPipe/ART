@@ -2076,7 +2076,7 @@ def test_checkpoint_cleanup_gather_failure_releases_finalizer(
     monkeypatch.setattr(_checkpoint, "_gather", fail_once)
     with pytest.raises(RuntimeError, match="cleanup gather"):
         finish_checkpoint_save(trainer, "save")
-    assert "save" not in trainer._checkpoint_finalizing_saves
+    assert not trainer._checkpoint_finalize_lock.locked()
     finish_checkpoint_save(trainer, "save")
     assert "save" not in trainer._prepared_checkpoint_saves
 
