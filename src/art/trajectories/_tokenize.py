@@ -5610,8 +5610,7 @@ def _tokenize_recorded_chat_boundaries(
     This does not repartition histories or infer flags for request-owned assistant
     messages. Unsupported render/decode capabilities retain the ordinary path.
     """
-    decode = getattr(tokenizer, "decode", None)
-    if not callable(decode) or not messages or messages[-1].get("role") != "assistant":
+    if not messages or messages[-1].get("role") != "assistant":
         return None
     entries: list[tuple[int, object, list[int], list[int], list[float]]] = []
     sources: dict[_SampledSourceKey, object] = {}
@@ -5702,6 +5701,9 @@ def _tokenize_recorded_chat_boundaries(
         ):
             continue
         try:
+            decode = checked(lambda: getattr(tokenizer, "decode", None))
+            if not callable(decode):
+                return decline()
             body = checked(
                 lambda: decode(
                     output,
