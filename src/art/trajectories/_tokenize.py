@@ -17,7 +17,7 @@ from operator import attrgetter, is_
 from pickle import Pickler, PicklingError
 import re
 import threading
-from types import FunctionType
+from types import FunctionType, MemberDescriptorType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 import warnings
 
@@ -4780,12 +4780,13 @@ def _tokenization_context(
         if isinstance(item, Enum):
             if getattr(item, "__objclass__", kind) is not kind:
                 raise TypeError("Unsupported enum tokenization context")
-            return kind, snapshot(
+            return kind, instance_state(
+                item,
                 {
                     key: child
                     for key, child in vars(item).items()
                     if key != "__objclass__"
-                }
+                },
             )
         if isinstance(item, (str, int, float, bytes)):
             if isinstance(item, str):
@@ -4796,7 +4797,7 @@ def _tokenization_context(
                 scalar = repr(float.__float__(item))
             else:
                 scalar = bytes.__bytes__(item)
-            return kind, scalar, snapshot(getattr(item, "__dict__", None))
+            return kind, scalar, instance_state(item, getattr(item, "__dict__", None))
         if kind in (list, tuple):
             result = kind, tuple(snapshot(child) for child in cast(Sequence, item))
         elif isinstance(item, Mapping):
@@ -4819,6 +4820,23 @@ def _tokenization_context(
             raise TypeError("Unsupported mutable tokenization context")
         observed[id(item)] = item, result
         return result
+
+    def instance_state(item: object, dictionary: object) -> object:
+        # Scalar subclasses and Enum members may keep mutable state in slots.
+        # Read actual slot storage, including inherited/shadowed slots, without
+        # invoking an instance's attribute lookup or replacement properties.
+        slots = []
+        kind = type(item)
+        for owner in type.__getattribute__(kind, "__mro__"):
+            for name, descriptor in type.__getattribute__(owner, "__dict__").items():
+                if type(descriptor) is MemberDescriptorType:
+                    try:
+                        child = descriptor.__get__(item, kind)
+                    except AttributeError:
+                        slots.append((owner, name, False))
+                    else:
+                        slots.append((owner, name, True, snapshot(child)))
+        return snapshot(dictionary), tuple(slots)
 
     return snapshot(value)
 
@@ -5611,8 +5629,7 @@ def _tokenize_recorded_chat_boundaries(
     This does not repartition histories or infer flags for request-owned assistant
     messages. Unsupported render/decode capabilities retain the ordinary path.
     """
-    decode = getattr(tokenizer, "decode", None)
-    if not callable(decode) or not messages or messages[-1].get("role") != "assistant":
+    if not messages or messages[-1].get("role") != "assistant":
         return None
     entries: list[tuple[int, object, list[int], list[int], list[float]]] = []
     sources: dict[_SampledSourceKey, object] = {}
@@ -5703,6 +5720,9 @@ def _tokenize_recorded_chat_boundaries(
         ):
             continue
         try:
+            decode = checked(lambda: getattr(tokenizer, "decode", None))
+            if not callable(decode):
+                return decline()
             body = checked(
                 lambda: decode(
                     output,
