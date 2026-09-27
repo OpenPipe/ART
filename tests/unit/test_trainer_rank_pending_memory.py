@@ -12,6 +12,7 @@ import torch
 from art.megatron.prefix_tree_packing import prefix_tree_pack
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank import _gdn_memory as g
+from art.trainer_rank._impl import _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD
 from art.trainer_rank._impl import Unset, _MemoryProfile
 
 
@@ -133,7 +134,7 @@ def test_actual_constructor_cache_and_full_plan(pending_rank):
     assert (
         rank._memory_check(plan).estimated_required_bytes
         == rank._plan_cost(plan).required
-        == 32229502659
+        == 32303322409
     )
     selected = rank._select_next_micro_batch(requests, 0)
     assert (
@@ -196,7 +197,7 @@ def test_exact_pending_demand_survives_recovery(monkeypatch, pending_rank, fits_
     plan = pending_rank._plan_flat_forward(requests)
     assert pending_rank._estimate_flat_forward(requests) is None
     assert g.plan_floor(pending_rank, plan) == (8296857600, 12705630112)
-    assert pending_rank._memory_check(plan).estimated_required_bytes == 32229502659
+    assert pending_rank._memory_check(plan).estimated_required_bytes == 32303322409
     _check_component_demand_recovery(
         monkeypatch, pending_rank, requests, fits_after=fits_after
     )
@@ -214,8 +215,8 @@ def test_original_installed_norm_preserves_pending_floor(layer):
     assert g.model_shapes(rank) is not None
     plan = rank._plan_flat_forward(full_requests())
     assert g.plan_floor(rank, plan) == (8296857600, 12705630112)
-    assert rank._memory_check(plan).estimated_required_bytes == 32229502659
-    assert rank._plan_cost(plan).required == 32229502659
+    assert rank._memory_check(plan).estimated_required_bytes == 32303322409
+    assert rank._plan_cost(plan).required == 32303322409
     assert rank._estimate_flat_forward(full_requests()) is None
     for requests in ([], full_requests(no_grad=True)):
         assert g.plan_floor(rank, rank._plan_flat_forward(requests)) == (0, 0)
@@ -384,7 +385,7 @@ def test_constructor_declined_moe_keeps_generic_admission(layer, unsupported):
     required = rank._plan_cost(plan).required
     # Generic checkpoint-input accounting still applies without a MoE component.
     gradient = 50640 * 40 * 2048 * 2
-    assert required == int((plan.output_bytes + 2 * gradient) * 1.1)
+    assert required == int((plan.output_bytes + 2 * gradient + COLD) * 1.1)
     rank._available_memory_bytes = lambda: required - 1
     assert not rank._memory_check(plan).fits
     rank._available_memory_bytes = lambda: required
