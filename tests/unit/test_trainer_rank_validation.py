@@ -19,6 +19,7 @@ import weakref
 import pytest
 import torch
 import torch.distributed as dist
+from trainer_rank_test_support import checkpoint_runtime as _runtime
 from trainer_rank_test_support import gloo_group, spawn_and_join
 
 from art.megatron.prefix_tree_packing import prefix_tree_pack
@@ -66,7 +67,6 @@ from art.trainer_rank._impl import (
 
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
-    from art.megatron.train import TrainingRuntime
     from art.trainer_rank._impl import _AdapterConfig
 
 
@@ -129,38 +129,6 @@ class _NativeOptimizer:
 @dataclass(frozen=True)
 class _SlotRef:
     name: str | None
-
-
-def _runtime(
-    model: torch.nn.Module | None = None,
-    *,
-    optimizer: object | None = None,
-) -> "TrainingRuntime":
-    # Deliberately lightweight structural fake; importing/constructing the real
-    # Megatron runtime would make these CPU-only unit tests require Megatron.
-    return SimpleNamespace(
-        model=[model or torch.nn.Linear(1, 1)],
-        optimizer=optimizer,
-        provider=SimpleNamespace(
-            hidden_size=4,
-            num_layers=1,
-            kv_channels=2,
-            art_flex_sliding_windows=(16,),
-        ),
-        model_support_handler=SimpleNamespace(
-            build_gdn_execution_spec=True,
-            canonicalize_loaded_lora_state=lambda state, _model: state,
-            from_vllm_lora_tensors=lambda state, **_kwargs: state,
-            to_vllm_lora_tensors=lambda state, **kwargs: (
-                state,
-                kwargs["adapter_config"],
-            ),
-            zero_internal_padding_grads=lambda _model: None,
-            zero_internal_padding_params=lambda _model: None,
-        ),
-        rank=0,
-        world_size=1,
-    )  # type: ignore
 
 
 def _slot_ref(name: str | None) -> "LoRASlotRef":

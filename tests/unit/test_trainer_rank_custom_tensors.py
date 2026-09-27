@@ -16,6 +16,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from trainer_rank_test_support import checkpoint_runtime as _runtime
 from trainer_rank_test_support import gloo_group
 
 from art.trainer_rank import (
@@ -94,32 +95,6 @@ class _BufferLayoutHead(torch.nn.Module):
     def __init__(self, *, persistent: bool) -> None:
         super().__init__()
         self.register_buffer("running", torch.ones(1), persistent=persistent)
-
-
-def _runtime(model: torch.nn.Module | None = None) -> Any:
-    return SimpleNamespace(
-        model=[model or torch.nn.Linear(1, 1)],
-        optimizer=None,
-        provider=SimpleNamespace(
-            hidden_size=4,
-            num_layers=1,
-            kv_channels=2,
-            art_flex_sliding_windows=(16,),
-        ),
-        model_support_handler=SimpleNamespace(
-            build_gdn_execution_spec=True,
-            canonicalize_loaded_lora_state=lambda state, _model: state,
-            from_vllm_lora_tensors=lambda state, **_kwargs: state,
-            to_vllm_lora_tensors=lambda state, **kwargs: (
-                state,
-                kwargs["adapter_config"],
-            ),
-            zero_internal_padding_grads=lambda _model: None,
-            zero_internal_padding_params=lambda _model: None,
-        ),
-        rank=0,
-        world_size=1,
-    )
 
 
 def _config() -> dict[str, object]:

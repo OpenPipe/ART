@@ -1,14 +1,51 @@
-"""Real process groups and lightweight topology for trainer-rank contract tests."""
+"""Shared runtime construction and process groups for trainer-rank contract tests."""
 
 from contextlib import contextmanager
 from datetime import timedelta
 import sys
 import time
 from types import ModuleType, SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+if TYPE_CHECKING:
+    from art.megatron.train import TrainingRuntime
+
+
+def checkpoint_runtime(
+    model: torch.nn.Module | None = None,
+    *,
+    optimizer: object | None = None,
+) -> "TrainingRuntime":
+    # Deliberately lightweight structural fake; importing/constructing the real
+    # Megatron runtime would make these CPU-only unit tests require Megatron.
+    return SimpleNamespace(
+        model=[model or torch.nn.Linear(1, 1)],
+        optimizer=optimizer,
+        provider=SimpleNamespace(
+            hidden_size=4,
+            num_layers=1,
+            kv_channels=2,
+            art_flex_sliding_windows=(16,),
+        ),
+        model_support_handler=SimpleNamespace(
+            build_gdn_execution_spec=True,
+            canonicalize_loaded_lora_state=lambda state, _model: state,
+            from_vllm_lora_tensors=lambda state, **_kwargs: state,
+            to_vllm_lora_tensors=lambda state, **kwargs: (
+                state,
+                kwargs["adapter_config"],
+            ),
+            zero_internal_padding_grads=lambda _model: None,
+            zero_internal_padding_params=lambda _model: None,
+        ),
+        rank=0,
+        world_size=1,
+    )  # type: ignore
 
 
 @contextmanager
