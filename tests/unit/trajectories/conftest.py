@@ -23,8 +23,11 @@ without touching ``src/``. Not traced: direct calls to ``_tokenize_history`` or
 ``_tokenize_chat_view`` in tests, and work done inside ``_parallel``'s spawned
 worker processes (the patch lives only in the pytest process). Calls that raise
 are not recorded. Digests are computed after the test body finishes so timing
-tests are not perturbed. Tests marked ``@pytest.mark.no_tokenize_golden`` are
-never traced. Tests absent from the golden are listed at session end, not failed.
+tests are not perturbed; a call the harness cannot digest fails the test in
+either mode and leaves its golden entry untouched. Tests marked
+``@pytest.mark.no_tokenize_golden`` are never traced. In check mode a passing
+test with a golden entry but no calls fails like any call-count mismatch; tests
+absent from the golden are listed at session end, not failed.
 """
 
 from __future__ import annotations
@@ -35,7 +38,6 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 from typing import Any
-import warnings
 
 from _tokenize_golden import (
     MODE_ENV,
@@ -162,25 +164,34 @@ def _tokenize_golden_trace(request: pytest.FixtureRequest) -> Iterator[None]:
         yield
 
     nodeid = request.node.nodeid
-    if not raw_calls or nodeid not in _PASSED:
+    if nodeid not in _PASSED:
         return
     calls: list[Digest] = []
-    for raw in raw_calls:
+    for index, raw in enumerate(raw_calls):
         try:
             calls.append(_digest(raw))
-        except Exception as error:  # noqa: BLE001 - observation must not alter tests
-            warnings.warn(
-                f"tokenize golden trace could not digest a call in {nodeid}: "
-                f"{type(error).__name__}: {error}",
-                stacklevel=2,
+        except Exception as error:  # noqa: BLE001 - reported below as a harness bug
+            # An undigestable output is a harness bug. Never store a truncated
+            # entry: un-mark the node so the retention rule leaves its existing
+            # golden entry untouched, then fail loudly.
+            _PASSED.discard(nodeid)
+            pytest.fail(
+                f"{nodeid}: tokenize golden could not digest tokenize_history call "
+                f"#{index}: {type(error).__name__}: {error}. Its golden entry was "
+                "left unchanged.",
+                pytrace=False,
             )
     if _MODE == "update":
-        _RECORDED[nodeid] = calls
+        if calls:
+            _RECORDED[nodeid] = calls
         return
     expected = _golden().get(nodeid)
     if expected is None:
-        _UNKNOWN.append(nodeid)
+        if calls:
+            _UNKNOWN.append(nodeid)
         return
+    # Zero calls against an existing entry is a count mismatch too: a refactor
+    # that stops tokenizing must not pass silently.
     if len(expected) != len(calls):
         pytest.fail(
             f"{nodeid}: tokenize_history was called {len(calls)} times; the golden "
