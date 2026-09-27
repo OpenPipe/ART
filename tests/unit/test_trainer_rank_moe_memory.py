@@ -897,7 +897,16 @@ def test_hybridep_combine_extent_floors_the_layout_path(
         7,
         218752 * 2048 * 2 + te,
     )
-    assert calls == [layouts, layouts]
+    # A larger stage already carries its TE growth; the combine floor adds none.
+    stage = 218752 * 2048 * 2 + te + 1
+
+    def larger_layout_floor(layers, refs, routed, layouts):
+        calls.append(layouts)
+        return 7, stage
+
+    monkeypatch.setattr(rank, "_layout_checkpoint_floor", larger_layout_floor)
+    assert rank._checkpoint_memory_floor(groups, layouts=layouts) == (7, stage)
+    assert calls == [layouts, layouts, layouts]
 
 
 @pytest.mark.parametrize("reference", ["absent", "expired", "smaller"])
