@@ -118,7 +118,6 @@ def correct_logprob_cotangent(
 @dataclass(frozen=True)
 class _OutputCorrection:
     index: int
-    kind: str
     original_logprobs: torch.Tensor
     token_index: int | None = None
     original_tokens: torch.Tensor | None = None
@@ -309,7 +308,6 @@ def capture_forward_corrections(
             index = indices[id(tensor)]
             entry = _OutputCorrection(
                 index=index,
-                kind=kind,
                 original_logprobs=tensor.detach().to("cpu", copy=True),
                 token_index=indices[id(output.top_k.tokens)]
                 if kind == "top_k"
@@ -321,10 +319,7 @@ def capture_forward_corrections(
                 if kind == "top_k" and output.logits is not None
                 else None,
             )
-            if index in entries and (
-                entries[index].kind != kind
-                or entries[index].token_index != entry.token_index
-            ):
+            if index in entries and entries[index].token_index != entry.token_index:
                 raise ValueError(
                     "an aliased output tensor has ambiguous correction semantics"
                 )
