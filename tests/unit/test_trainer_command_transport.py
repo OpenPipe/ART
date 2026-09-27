@@ -130,7 +130,8 @@ def _transport_worker(physical: int, rendezvous: str, cuda: bool) -> None:
         gloo_group(physical, f"file://{rendezvous}"),
         megatron_topology(physical, dp_size=1, tp_size=2),
     ):
-        runtime = _runtime(torch.nn.Linear(1, 1).to(device))
+        model = torch.nn.Linear(1, 1).to(device)
+        runtime = _runtime(model)
         runtime.rank, runtime.world_size = physical, 2
         rank: Any = TrainerRank(runtime)
         rank._dp_rank_and_size = lambda: (0, 1)
@@ -179,7 +180,7 @@ def _transport_worker(physical: int, rendezvous: str, cuda: bool) -> None:
         def forward(inputs: ForwardInput) -> ForwardOutput:
             assert inputs.input_tokens.device.type == "cpu"
             values = inputs.input_tokens.to(device=device, dtype=torch.float32)
-            return ForwardOutput(None, None, None, values * runtime.model[0].weight)
+            return ForwardOutput(None, None, None, values * model.weight)
 
         rank.forward = forward
         inputs = ForwardInput(input_tokens=torch.tensor([1, 2, 3], device=device))
