@@ -4245,6 +4245,20 @@ class TrainerRank:
             workspace = max(workspace, -(-rows // 4) * 4 * self._hidden_size * 2)
         return retained, workspace
 
+    @staticmethod
+    def _gradient_slots(
+        group_rows: Sequence[tuple[int, bool]],
+        slot_refs: Sequence["LoRASlotRef | None"] | None,
+    ) -> frozenset["LoRASlotRef"]:
+        """Gradient groups' adapter slots; the base model (no name) has none."""
+        return frozenset(
+            ref
+            for (_, grad), ref in zip(
+                group_rows, slot_refs or (None,) * len(group_rows), strict=True
+            )
+            if grad and ref is not None and ref.name is not None
+        )
+
     def _pending_adapter_gradient_bytes(
         self, refs: Iterable["LoRASlotRef"]
     ) -> tuple[int, ...]:
@@ -4288,9 +4302,18 @@ class TrainerRank:
                 params[id(param)] = param
                 layer_of[id(param)] = max(layer_of.get(id(param), -1), index)
         # Outside the decoder (a head runs its backward first) is live
-        # throughout, even for a parameter a decoder layer also uses.
-        inside = {id(module) for module in layers.modules()}
-        outside = (module for module in chunk.modules() if id(module) not in inside)
+        # throughout, even for a parameter or module a decoder layer also uses:
+        # walk every path except through the layers themselves.
+        outside: list[torch.nn.Module] = []
+        visited: set[int] = set()
+        pending_modules: list[torch.nn.Module] = [chunk]
+        while pending_modules:
+            module = pending_modules.pop()
+            if module is layers or id(module) in visited:
+                continue
+            visited.add(id(module))
+            outside.append(module)
+            pending_modules.extend(module.children())
         for param in slot_params(outside):
             params[id(param)] = param
             layer_of[id(param)] = len(layers)
@@ -4407,13 +4430,7 @@ class TrainerRank:
         # backing stores, nor a bound for compiler saves or other backward work.
         # Keep it out of forward retention, including the cold fallback above.
         gradient = checkpoint_retained
-        gradient_slots = frozenset(
-            ref
-            for (_, grad), ref in zip(
-                group_rows, slot_refs or (None,) * len(group_rows), strict=True
-            )
-            if grad and ref is not None
-        )
+        gradient_slots = self._gradient_slots(group_rows, slot_refs)
         adapter_gradient = (
             self._checkpoint_adapter_gradient_bytes(
                 gradient_slots, (gradient // self._num_layers,) * self._num_layers
@@ -4455,7 +4472,17 @@ class TrainerRank:
             hybridep_growth=hybridep_growth_bytes,
             checkpoint_adapter_gradient=adapter_gradient,
             checkpoint_adapter_gradient_slots=json.dumps(
-                sorted([ref.kind, ref.name] for ref in gradient_slots)
+                [
+                    [ref.kind, ref.name]
+                    for ref in sorted(
+                        gradient_slots,
+                        key=lambda ref: (
+                            ref.kind,
+                            ref.name is not None,
+                            ref.name or "",
+                        ),
+                    )
+                ]
             )
             if adapter_gradient
             else "",
@@ -6220,7 +6247,9 @@ class TrainerRank:
                 # exact plan instead of admitting with the constructor rank.
                 return None
             gradient_slots = [
-                ref for (ref, grad), _ in groups if grad and ref is not None
+                ref
+                for (ref, grad), _ in groups
+                if grad and ref is not None and ref.name is not None
             ]
             if (
                 gradient_slots
@@ -8245,15 +8274,7 @@ class TrainerRank:
         if include_checkpoint_input_gradient and retained:
             # The backward's other end and cold transients, as _subforward_cost.
             backward = retained + self._checkpoint_adapter_gradient_bytes(
-                (
-                    ref
-                    for (_, grad), ref in zip(
-                        group_rows,
-                        slot_refs or (None,) * len(group_rows),
-                        strict=True,
-                    )
-                    if grad and ref is not None
-                ),
+                self._gradient_slots(group_rows, slot_refs),
                 (retained // self._num_layers,) * self._num_layers,
             )
             if profiled is None and any(grad for _, grad in group_rows):
