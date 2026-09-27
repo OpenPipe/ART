@@ -16,6 +16,21 @@ if TYPE_CHECKING:
     from art.megatron.train import TrainingRuntime
 
 
+class _FakeGPT(torch.nn.Module):
+    def __init__(self, *, hidden_size: int = 8, vocab_size: int = 32) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.float16))
+        self.config = SimpleNamespace(
+            hidden_size=hidden_size,
+            num_layers=4,
+            padded_vocab_size=vocab_size,
+        )
+        self.decoder = object()
+
+    def _preprocess(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
 def checkpoint_runtime(
     model: torch.nn.Module | None = None,
     *,

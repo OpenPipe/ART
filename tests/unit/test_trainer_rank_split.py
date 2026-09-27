@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 import torch
+from trainer_rank_test_support import _FakeGPT
 
 from art.trainer_rank import (
     ForwardInput,
@@ -64,21 +65,6 @@ from art.trainer_rank._prefix_tree_planner import plan_prefix_tree_layout
 if TYPE_CHECKING:
     from art.megatron.lora import LoRASlotRef
     from art.megatron.train import TrainingRuntime
-
-
-class _FakeGPT(torch.nn.Module):
-    def __init__(self, *, hidden_size: int = 8, vocab_size: int = 32) -> None:
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.float16))
-        self.config = SimpleNamespace(
-            hidden_size=hidden_size,
-            num_layers=4,
-            padded_vocab_size=vocab_size,
-        )
-        self.decoder = object()
-
-    def _preprocess(self, *args: object, **kwargs: object) -> None:
-        return None
 
 
 def _runtime() -> "TrainingRuntime":

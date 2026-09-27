@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 import torch
+from trainer_rank_test_support import _FakeGPT
 
 from art.megatron.prefix_tree_packing import (
     estimate_prefix_tree_packed_tokens,
@@ -30,21 +31,6 @@ from art.trainer_rank._prefix_tree_planner import build_canonical_prefix_tree
 
 if TYPE_CHECKING:
     from art.megatron.train import TrainingRuntime
-
-
-class _FakeGPT(torch.nn.Module):
-    def __init__(self, *, hidden_size: int = 8, vocab_size: int = 32) -> None:
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.float16))
-        self.config = SimpleNamespace(
-            hidden_size=hidden_size,
-            num_layers=4,
-            padded_vocab_size=vocab_size,
-        )
-        self.decoder = object()
-
-    def _preprocess(self, *args: object, **kwargs: object) -> None:
-        return None
 
 
 def _runtime() -> "TrainingRuntime":
