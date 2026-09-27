@@ -10644,8 +10644,8 @@ def _track_custom_object(
                 getattr(child, f"_{kind}s")[key] = replacements[identity]
     from ._heads import native_module_handle
 
-    trainer = tracker.validate()
-    return replace(custom, handle=native_module_handle(trainer, custom, tracker))
+    tracker.validate()
+    return replace(custom, handle=native_module_handle(custom, tracker))
 
 
 def _custom_layout(

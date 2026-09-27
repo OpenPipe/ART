@@ -7,7 +7,6 @@ from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, SupportsIndex, cast
-import weakref
 
 import torch
 
@@ -464,13 +463,7 @@ class ModuleHandle(torch.nn.Module):
 
 
 class _NativeModuleState:
-    def __init__(
-        self,
-        trainer: TrainerRank,
-        tracker: _CustomTensorTracker,
-        module: torch.nn.Module,
-    ):
-        self.trainer = weakref.ref(trainer)
+    def __init__(self, tracker: _CustomTensorTracker, module: torch.nn.Module):
         self.tracker = tracker
         self.module = module
 
@@ -527,9 +520,9 @@ def _stage_local_buffers(
 
 
 def native_module_handle(
-    trainer: TrainerRank, custom: _CustomObject, tracker: _CustomTensorTracker
+    custom: _CustomObject, tracker: _CustomTensorTracker
 ) -> ModuleHandle:
-    state = _NativeModuleState(trainer, tracker, cast(torch.nn.Module, custom.value))
+    state = _NativeModuleState(tracker, cast(torch.nn.Module, custom.value))
     return ModuleHandle(state.module, state.capture, state.publish)
 
 
