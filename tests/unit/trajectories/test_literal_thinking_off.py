@@ -234,7 +234,15 @@ def test_literal_content_is_not_inferred_from_source_thinking_mode(case: str) ->
     if case == "visible_only":
         cast(dict[str, Any], history.messages[-1]).pop("reasoning")
     original = history.model_dump(mode="python")
-    tokenized = history.tokenize(tokenizer=tokenizer, chat_template=_RENDER_OVERRIDE)
+    tokenized = _tokenize._tokenize_chat_view(
+        history,
+        base_model=None,
+        tokenizer=tokenizer,
+        chat_template=None,
+        chat_template_kwargs=None,
+        _projection_matches=_tokenize._history_render_state(history).projection_matches,
+        _recorded_boundaries=False,
+    )
     # Independent public transcript and source-field oracles, not a second run
     # with an already-inert workaround disabled.
     expected = (
@@ -257,6 +265,21 @@ def test_literal_content_is_not_inferred_from_source_thinking_mode(case: str) ->
     expected_sampled = "" if case in {"no_source", "request_source"} else _LITERAL
     assert tokenizer.decode([tokenized.tokens[i] for i in sampled]) == expected_sampled
     assert [tokenized.logprobs[i] for i in sampled] == [-0.5] * len(expected_sampled)
+    assert history.model_dump(mode="python") == original
+    tokenizer.calls.clear()
+    tokenizer.rendered.clear()
+    assert _outcome(history, tokenizer, chat_template=_RENDER_OVERRIDE) == (
+        (
+            ValueError,
+            "Could not locate a sampled history message in the rendered history",
+        )
+        if structured
+        else (
+            tokenized.tokens,
+            tokenized.flags,
+            [None if x != x else x for x in tokenized.logprobs],
+        )
+    )
     # Exercise rendering explicitly even when complete native output can bypass
     # it. Plain content stays literal independently of recorded/current thinking mode
     # and whether the message has complete native token metadata. Structured
