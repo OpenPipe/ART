@@ -8,9 +8,11 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import lru_cache
 from hashlib import sha256
+from inspect import getattr_static
 import json
 import math
 import re
+import sys
 import threading
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 import warnings
@@ -7890,6 +7892,21 @@ def _restore_recorded_request_roles(
             )
         except (TypeError, RecursionError):
             return  # The exact native prefix is usable without role annotations.
+        if template is None and templates is not None:
+            base = getattr(
+                sys.modules.get("transformers.tokenization_utils_base"),
+                "PreTrainedTokenizerBase",
+                None,
+            )
+            stock_selector = getattr(base, "get_chat_template", None)
+            if (
+                stock_selector is not None
+                and getattr_static(resolved, "get_chat_template", None)
+                is stock_selector
+                and "default" not in templates
+                and (request_tools is None or "tool_use" not in templates)
+            ):
+                return  # Stock named templates have no usable implicit selection.
         try:
             masks = _recorded_prompt_role_masks(
                 request_messages,
