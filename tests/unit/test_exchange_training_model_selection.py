@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime, timedelta
+import math
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, SupportsIndex, cast, overload
@@ -18,7 +19,7 @@ from art import TrainableModel
 from art.dev.model import InternalModelConfig
 from art.local import LocalBackend
 from art.openai import ART_MOE_ROUTING_METADATA_KEY
-from art.preprocessing.moe_routing import MoeRouteArray
+from art.preprocessing.moe_routing import MoeRouteArray, MoeRouteSegments
 from art.preprocessing.tokenize import (
     TokenizedResult,
     _chat_choice_trace,
@@ -361,7 +362,10 @@ def test_training_tokenizes_each_exchange_trajectory_once(
     assert public_calls == len(group.trajectories)
 
 
-def test_overlength_history_does_not_claim_sources_from_fitting_history() -> None:
+@pytest.mark.parametrize("max_sequence_length", [None, 5])
+def test_overlength_history_does_not_promote_copied_context(
+    max_sequence_length: int | None,
+) -> None:
     results = list(
         tokenize_trajectory_groups(
             cast(PreTrainedTokenizerBase, _Tokenizer()),
@@ -371,17 +375,25 @@ def test_overlength_history_does_not_claim_sources_from_fitting_history() -> Non
             shuffle_group_trajectories=False,
             drop_zero_advantage_trajectories=False,
             model="policy",
-            _max_sequence_length=5,
+            _max_sequence_length=max_sequence_length,
         )
     )
 
     long = [result for result in results if len(result.token_ids) > 5]
     fitting = [result for result in results if len(result.token_ids) <= 5]
     assert len(long) == len(fitting) == 2
-    assert all(result.assistant_mask == [0] * 7 for result in long)
+    assert all(result.token_ids == [1, 2, 101, 102, 103, 104, 9] for result in long)
+    original_mask = [0] * 7 if max_sequence_length == 5 else [0, 1, 1, 1, 1, 1, 1]
+    assert all(result.assistant_mask == original_mask for result in long)
+    assert all(result.logprobs[1:] == [-0.1] * 6 for result in long)
     assert all(result.token_ids == [1, 9, 4, 5, 6] for result in fitting)
-    assert all(result.assistant_mask == [0, 1, 0, 1, 1] for result in fitting)
-    assert all(result.weight == pytest.approx(1 / 3) for result in results)
+    # Dropping the complete native occurrence cannot make token 9 sampled under
+    # [1]: its recorded logprob was conditioned on [1, 2, 101, 102, 103, 104].
+    assert all(result.assistant_mask == [0, 0, 0, 1, 1] for result in fitting)
+    assert all(math.isnan(result.logprobs[1]) for result in fitting)
+    assert all(result.logprobs[3:] == [-0.1, -0.1] for result in fitting)
+    denominator = 2 if max_sequence_length == 5 else 8
+    assert all(result.weight == pytest.approx(1 / denominator) for result in results)
 
 
 def test_local_backend_trains_retained_source_after_overlength_history(
@@ -424,7 +436,7 @@ def test_local_backend_trains_retained_source_after_overlength_history(
 
     assert packed is not None
     assert packed["tokens"].tolist() == [[1, 9, 4, 5, 6]] * 2
-    assert packed["assistant_mask"].tolist() == [[False, True, False, True, True]] * 2
+    assert packed["assistant_mask"].tolist() == [[False, False, False, True, True]] * 2
 
 
 def test_training_rejects_multiple_concrete_policy_versions() -> None:
@@ -800,19 +812,30 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     assert len(initial) == 2
     assert len(stripped) == 2
     assert all(result.choice_offsets == [1] for result in initial)
-    # The retained response has a different complete visible prefix after its
-    # reasoning is stripped, so it is independently eligible in this history.
-    assert all(result.choice_offsets == [1, 5] for result in stripped)
+    # The copied suffix has different conditioning, so only the later complete
+    # response is sampled here. Its recorded prompt still supplies MoE routes.
+    assert all(result.choice_offsets == [5] for result in stripped)
     assert all(result.assistant_mask == [0, 1, 1, 1, 1] for result in initial)
-    assert all(result.assistant_mask == [0, 1, 1, 1, 0, 1, 1] for result in stripped)
-    assert all(result.weight == pytest.approx(1 / 9) for result in results)
+    assert all(result.logprobs[1:] == [-0.2, -10.1, -10.2, -0.9] for result in initial)
+    assert all(result.assistant_mask == [0, 0, 0, 0, 0, 1, 1] for result in stripped)
+    assert all(all(math.isnan(lp) for lp in result.logprobs[:5]) for result in stripped)
+    assert all(result.logprobs[5:] == [-0.5, -0.6] for result in stripped)
+    assert all(result.weight == pytest.approx(1 / 6) for result in results)
     expected_routes = np.asarray(
         [[[10]], [[1010]], [[1020]], [[90]], [[40]], [[50]], [[60]]],
         dtype=np.uint16,
     )
     for result in stripped:
-        assert isinstance(result.moe_routed_experts, MoeRouteArray)
-        assert np.array_equal(result.moe_routed_experts, expected_routes)
+        assert isinstance(result.moe_routed_experts, MoeRouteSegments)
+        assert np.array_equal(
+            np.concatenate(result.moe_routed_experts.segments), expected_routes
+        )
+    for result in initial:
+        assert isinstance(result.moe_routed_experts, MoeRouteSegments)
+        assert np.array_equal(
+            np.concatenate(result.moe_routed_experts.segments),
+            np.asarray([[[10]], [[20]], [[1010]], [[1020]], [[90]]], dtype=np.uint16),
+        )
 
     datums = trajectory_groups_to_datums(
         [group],
@@ -824,7 +847,7 @@ def test_preprocessing_preserves_moe_routes_for_reasoning_stripped_suffix() -> N
     )
     masks = [datum.loss_fn_inputs["mask"].to_torch().tolist() for datum in datums]
     assert masks.count([1, 1, 1, 1]) == 2
-    assert masks.count([1, 1, 1, 0, 1, 1]) == 2
+    assert masks.count([0, 0, 0, 0, 1, 1]) == 2
 
 
 def test_ambiguous_non_moe_suffix_falls_back_to_sampled_spans() -> None:

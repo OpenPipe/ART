@@ -18,8 +18,8 @@ directory; these cases pin the paths the audit found repeatedly re-fixed:
   chat_multi_part_assistant_content       assistant ``content`` as a list of parts (#904)
   exchange_exact_sampled_multi_turn       exact projected path over three sampled
                                           exchanges (#886 sampled source identity)
-  exchange_length_stop_nonterminal        ``finish_reason="length"`` with a synthetic
-                                          stop (#829 #830 #847 #871)
+  exchange_length_stop_nonterminal        ``finish_reason="length"`` retains only
+                                          recorded tokens; no synthetic stop
   exchange_mixed_stop_captured            a length-stopped exchange whose captured
                                           history is re-prompted by a stopped one;
                                           exact coverage ends at the duplicated

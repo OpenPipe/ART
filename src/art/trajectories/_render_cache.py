@@ -10,7 +10,7 @@ from typing import cast
 def _render_context_key(value: object) -> object:
     """Snapshot plain JSON without losing mapping order or scalar types."""
     kind = type(value)
-    if kind in (str, int, bool, type(None)):
+    if kind is str or kind is int or kind is bool or kind is type(None):
         return kind, value
     if kind is float and math.isfinite(cast(float, value)):
         return kind, repr(value)
@@ -51,7 +51,10 @@ def cacheable_chat_template(tokenizer, template, tools, kwargs, messages) -> boo
             or base_module.render_jinja_template is not chat.render_jinja_template
             or not cls.__module__.startswith("transformers.")
             or getattr(module, cls.__name__, None) is not cls
-            or type(tokenizer.chat_template) not in (str, type(None))
+            or (
+                (template_type := type(tokenizer.chat_template)) is not str
+                and template_type is not type(None)
+            )
             or inspect.getattr_static(cls, "special_tokens_map")
             is not inspect.getattr_static(base, "special_tokens_map")
         ):
@@ -67,7 +70,12 @@ def cacheable_chat_template(tokenizer, template, tools, kwargs, messages) -> boo
         added_token = sys.modules["tokenizers"].AddedToken
         special = tokenizer._special_tokens_map
         if type(special) is not dict or any(
-            type(key) is not str or type(value) not in (str, type(None), added_token)
+            type(key) is not str
+            or (
+                type(value) is not str
+                and value is not None
+                and type(value) is not added_token
+            )
             for key, value in special.items()
         ):
             return False

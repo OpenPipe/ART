@@ -199,3 +199,46 @@ def test_generation_extension_override_bypasses(tokenizer, monkeypatch):
         tracker, "_generation_support", lambda *args, **kwargs: "changed"
     )
     assert not eligible(tokenizer, template)
+
+
+@pytest.mark.parametrize("target", [str, int, bool, type(None)])
+def test_metaclass_equality_cannot_admit_mutable_plain_context(target):
+    from art.trajectories._render_cache import _render_context_key
+
+    class Meta(type):
+        def __eq__(cls, other):
+            return other is target
+
+        __hash__ = type.__hash__
+
+    class Mutable(metaclass=Meta):
+        pass
+
+    with pytest.raises(TypeError, match="Not a plain JSON"):
+        _render_context_key(Mutable())
+
+
+@pytest.mark.parametrize(
+    "location", ["chat_template", "special", "messages", "tools", "kwargs"]
+)
+def test_metaclass_equality_cannot_admit_rich_render_cache_value(
+    tokenizer, monkeypatch, location
+):
+    class Meta(type):
+        def __eq__(cls, other):
+            return other is str
+
+        __hash__ = type.__hash__
+
+    class Rich(str, metaclass=Meta):
+        pass
+
+    value = Rich("mutable")
+    context = {}
+    if location == "chat_template":
+        monkeypatch.setattr(tokenizer, "chat_template", value)
+    elif location == "special":
+        monkeypatch.setitem(tokenizer._special_tokens_map, "eos_token", value)
+    else:
+        context[location] = {"mutable": value}
+    assert not eligible(tokenizer, "{{ messages }}", **context)

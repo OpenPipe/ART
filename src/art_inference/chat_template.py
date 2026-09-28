@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 import json
 import re
 from typing import Any
@@ -25,10 +26,496 @@ _MINIMAX_PRESERVE_PRIOR_THINKING = (
     "reasoning_content and ((preserve_thinking is defined and preserve_thinking is "
     "true) or loop.index0 > ns.last_user_index)"
 )
+# These operations infer reasoning from arbitrary assistant content and can
+# discard everything before the last <think> or between repeated </think> tags.
+# Match the operations, not a model revision or the text of a particular answer.
+_QWEN_INLINE_STATEMENTS = (
+    "if '</think>' in content",
+    "set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n')",
+    "set content = content.split('</think>')[-1].lstrip('\\n')",
+    "endif",
+)
+_QWEN_INLINE_REASONING = re.compile(
+    r"\s*".join(
+        r"\{%[-+]?\s*" + re.escape(statement) + r"\s*[-+]?%\}"
+        for statement in _QWEN_INLINE_STATEMENTS
+    )
+)
+
+
+def _without_inline_reasoning_parser(template: str) -> str:
+    if "reasoning_content" not in template or "split" not in template:
+        return template
+    from jinja2 import Environment, TemplateSyntaxError, meta, nodes
+    from jinja2.visitor import NodeTransformer
+
+    # Compare parsed operations, not quote/spacing choices or a template hash.
+    # Only executable block tokens may be edited; quoted/raw/comment data stays.
+    class WithoutWhitespace(NodeTransformer):
+        def visit_Output(self, node: nodes.Output, *args: Any, **kwargs: Any):
+            if all(
+                isinstance(child, nodes.TemplateData) and not child.data.strip()
+                for child in node.nodes
+            ):
+                return None
+            return node
+
+    env = Environment()
+    # This environment only analyzes source. Treat even built-in globals as
+    # external bindings rather than hiding them from Jinja's scope analysis.
+    env.globals.clear()
+
+    def operations(text: str):
+        return WithoutWhitespace().visit(env.parse(text)).body
+
+    parser = "".join("{% " + statement + " %}" for statement in _QWEN_INLINE_STATEMENTS)
+    operation = operations(parser)
+    structured_operation = operations(
+        "{% if message.reasoning_content is string %}"
+        "{% set reasoning_content = message.reasoning_content %}{% else %}"
+        + parser
+        + "{% endif %}"
+    )[0]
+    normalized = re.sub(r"\r\n?", "\n", template)
+    offsets = [
+        i
+        for i, char in enumerate(template)
+        if not (char == "\n" and i and template[i - 1] == "\r")
+    ] + [len(template)]
+    blocks: list[tuple[int, int, int, int]] = []
+    cursor = 0
+    opening = None
+    try:
+        for _, kind, value in env.lex(template):
+            start = normalized.find(value, cursor)
+            if start < 0 or normalized[cursor:start].strip():
+                return template  # Lexer normalization could not be source-joined.
+            if kind == "block_begin":
+                opening = offsets[start], offsets[start + len(value)]
+            elif kind == "block_end" and opening is not None:
+                # The lexer can include whitespace following a right-trim tag.
+                end = start + value.index("%}") + 2
+                blocks.append((*opening, offsets[start], offsets[end]))
+                opening = None
+            cursor = start + len(value)
+    except TemplateSyntaxError:
+        return template  # Leave invalid templates to their existing renderer.
+    edits: dict[tuple[int, int], str] = {}
+    for index, (start, _, _, _) in enumerate(blocks):
+        selected = blocks[index : index + 4]
+        if len(selected) != 4 or "split" not in template[start : selected[-1][3]]:
+            continue
+        if any(
+            template[left[3] : right[0]].strip()
+            for left, right in zip(selected, selected[1:])
+        ):
+            continue
+        end = selected[-1][3]
+        try:
+            if operations(template[start:end]) == operation:
+                # The enclosing tags also control unrelated surrounding
+                # whitespace. Disable the parser without deleting those tags.
+                _, body_start, body_end, first_end = selected[0]
+                edits[start, end] = (
+                    template[start:body_start]
+                    + " if false "
+                    + template[body_end:first_end]
+                    + template[selected[-1][0] : end]
+                )
+        except TemplateSyntaxError:
+            continue
+    if not edits:
+        return template
+
+    def apply_edits() -> str:
+        result = template
+        for (start, end), replacement in sorted(edits.items(), reverse=True):
+            result = result[:start] + replacement + result[end:]
+        return result
+
+    # Only the content assignment consumed by a recognized parser may lose
+    # its trim. Independent preview macros/branches have their own bindings.
+    try:
+        tree = WithoutWhitespace().visit(env.parse(template))
+    except TemplateSyntaxError:
+        # Optional binding analysis must not undo independently proved parser
+        # edits when the renderer supports extensions absent from this parser.
+        result = apply_edits()
+        if (
+            "<think>" in template
+            and "reasoning_content|trim" in template
+            and "if not preserve_thinking or message.reasoning_content" not in template
+        ):
+            # Keep the pre-existing preservation rewrite when custom syntax
+            # prevents the narrower binding analysis below.
+            result = result.replace(
+                "set content = render_content(message.content, true)|trim",
+                "set content = (render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
+            )
+        return result
+
+    # Moving the role test ahead of a renderer is safe only for a local,
+    # data-only macro under the stock chat renderer. External callbacks and
+    # unknown macro effects retain the original trim and evaluation order.
+    # This permits ordinary chat data, built-in tests, integer vision counters
+    # and the stock raising helper, not custom finalizers or renderer globals.
+    renderers = [
+        node for node in tree.find_all(nodes.Macro) if node.name == "render_content"
+    ]
+    if len(renderers) != 1 or renderers[0] not in tree.body:
+        return apply_edits()
+    if any(tree.find_all(nodes.Extends)):
+        return apply_edits()  # A parent template can replace the local macro.
+    renderer = renderers[0]
+    preceding = tree.body[: tree.body.index(renderer)]
+    if any(
+        name.name == "render_content"
+        for node in preceding
+        for name in node.find_all(nodes.Name)
+    ):
+        return apply_edits()
+    isolated = nodes.Template([renderer])
+    isolated.set_environment(env)
+    try:
+        # Use Jinja's own scope analysis, including conditionally bound locals.
+        global_names = meta.find_undeclared_variables(isolated)
+    except TemplateSyntaxError:
+        return apply_edits()
+    counters = global_names - {"raise_exception", "add_vision_id"}
+    counter_targets: set[int] = set()
+    for name in counters:
+        declarations = [
+            node
+            for node in preceding
+            if isinstance(node, nodes.Assign)
+            and node.target == nodes.Name(name, "store")
+        ]
+        declaration = env.parse("{% set counter = namespace(value=0) %}").body[0]
+        assert isinstance(declaration, nodes.Assign)
+        expected = declaration.node
+        if len(declarations) != 1 or declarations[0].node != expected:
+            return apply_edits()
+        counter_targets.add(id(declarations[0].target))
+        inside = {id(node) for node in renderer.find_all(nodes.Node)}
+        if any(
+            node.name == name
+            and id(node) not in inside
+            and (isinstance(node, nodes.NSRef) or node.ctx == "load")
+            for node in tree.find_all((nodes.Name, nodes.NSRef))
+        ):
+            return apply_edits()
+    allowed = tuple(
+        getattr(nodes, name)
+        for name in (
+            "Add And Assign Call Compare Concat Const For Getattr If Name Not "
+            "NSRef Operand Or Output TemplateData Test"
+        ).split()
+    )
+    protected = {
+        "render_content",
+        "raise_exception",
+        "namespace",
+        "add_vision_id",
+        *counters,
+    }
+    if any(
+        not isinstance(node, allowed)
+        # Parameters and their local aliases can refer to the caller's message.
+        # Only the already-proven private counters may be mutated here.
+        or isinstance(node, nodes.NSRef)
+        and node.name not in counters
+        or isinstance(node, nodes.Call)
+        and not (
+            node.node == nodes.Name("raise_exception", "load")
+            and len(node.args) == 1
+            and isinstance(node.args[0], nodes.Const)
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+        )
+        or isinstance(node, nodes.Test)
+        and node.name not in {"string", "iterable", "mapping", "none", "undefined"}
+        for node in renderer.find_all(nodes.Node)
+    ):
+        return apply_edits()
+    if any(
+        node.name in protected - counters
+        and node.ctx != "load"
+        or node.name in counters
+        and node.ctx != "load"
+        and id(node) not in counter_targets
+        for node in tree.find_all(nodes.Name)
+    ) or any(
+        isinstance(node, nodes.Import)
+        and node.target in protected
+        or isinstance(node, nodes.FromImport)
+        and any(
+            (name if isinstance(name, str) else name[1]) in protected
+            for name in node.names
+        )
+        or isinstance(node, nodes.Macro)
+        and node is not renderer
+        and node.name in protected
+        for node in tree.find_all((nodes.Import, nodes.FromImport, nodes.Macro))
+    ):
+        return apply_edits()
+    # Macro callables and namespace counters are mutable. A context callback
+    # can replace either without a lexical reference, even for counter-free macros.
+    # Admit only the stock chat template's closed data/render operations.
+    closed = WithoutWhitespace().visit(env.parse(apply_edits()))
+    try:
+        external = meta.find_undeclared_variables(closed)
+    except TemplateSyntaxError:
+        return apply_edits()
+    if external.difference(
+        "messages tools message content reasoning_content preserve_thinking "
+        "enable_thinking add_generation_prompt add_vision_id raise_exception namespace".split()
+    ):
+        return apply_edits()
+    data_nodes = allowed + tuple(
+        getattr(nodes, name)
+        for name in "CondExpr Filter Getitem Keyword Macro Neg Slice Sub Tuple".split()
+    )
+    for node in closed.find_all(nodes.Node):
+        if not isinstance(node, data_nodes):
+            return apply_edits()
+        if isinstance(node, nodes.Call) and not (
+            isinstance(node.node, nodes.Name)
+            and node.node.name in {"render_content", "raise_exception", "namespace"}
+            or isinstance(node.node, nodes.Getattr)
+            and node.node.node == nodes.Name("content", "load")
+            and node.node.attr in {"startswith", "endswith"}
+        ):
+            return apply_edits()
+        if isinstance(node, nodes.Filter) and node.name not in (
+            "default items length safe string tojson trim".split()
+        ):
+            return apply_edits()
+        if isinstance(node, nodes.Test) and node.name not in (
+            "defined false iterable mapping none string true undefined".split()
+        ):
+            return apply_edits()
+    assignments = list(tree.find_all(nodes.Assign))
+    locations = []
+    parsed_assignments = []
+    for block in blocks:
+        start, body_start, body_end, end = block
+        if template[body_start:body_end].split(None, 1)[:1] != ["set"]:
+            continue
+        try:
+            body = env.parse(template[start:end]).body
+        except TemplateSyntaxError:
+            continue
+        if len(body) == 1 and isinstance(body[0], nodes.Assign):
+            locations.append(block)
+            parsed_assignments.append(body[0])
+    if assignments != parsed_assignments:
+        return apply_edits()  # Do not guess an assignment's source span.
+    # An AST-equivalent block with comments/data between its tags may not be
+    # one of the source spans removed above. Join If nodes in source order too.
+    conditions = []
+    for block in blocks:
+        statement = template[block[1] : block[2]].strip()
+        keyword = statement.split(None, 1)[:1]
+        if keyword not in (["if"], ["elif"]):
+            continue
+        try:
+            parsed = env.parse(
+                "{% if " + statement.split(None, 1)[1] + " %}{% endif %}"
+            )
+        except TemplateSyntaxError:
+            return apply_edits()
+        if len(parsed.body) != 1 or not isinstance(parsed.body[0], nodes.If):
+            return apply_edits()
+        conditions.append((block, parsed.body[0].test))
+    branches = list(tree.find_all(nodes.If))
+    if [node.test for node in branches] != [test for _, test in conditions]:
+        return apply_edits()
+    edited_parsers = {
+        id(node)
+        for node, (block, _) in zip(branches, conditions, strict=True)
+        if any(start == block[0] for start, _ in edits)
+    }
+    selected = set()
+    shared = set()
+
+    def writes_content(node: nodes.Assign | nodes.AssignBlock) -> bool:
+        target = node.target
+        return (
+            isinstance(target, nodes.Name)
+            and target.name == "content"
+            or any(n.name == "content" for n in target.find_all(nodes.Name))
+        )
+
+    def reads_content(node: nodes.Node, initialized: set[str] | None) -> bool:
+        # Only a fresh loop-local constant assignment is transparent. Rebinding
+        # an arbitrary old value can invoke its destructor. Calls,
+        # filters/tests, loaders, attributes/items, operators and even output
+        # conversion/finalization may invoke code that observes this scope.
+        # Keep the trim for unknown nodes instead of enumerating callbacks.
+        return not (
+            initialized is not None
+            and isinstance(node, nodes.Assign)
+            and isinstance(node.target, nodes.Name)
+            and node.target.name not in initialized
+            and node.target.name != "message"
+            and isinstance(node.node, nodes.Const)
+        )
+
+    def assistant_condition(test: nodes.Node) -> bool | None:
+        # The rewrite changes assistant content only. Ignore paths proved to
+        # handle a different role in an ordinary chat message dictionary.
+        # Every unknown condition retains the original trimmed binding.
+        if (
+            isinstance(test, nodes.Compare)
+            and test.expr
+            == nodes.Getattr(nodes.Name("message", "load"), "role", "load")
+            and len(test.ops) == 1
+            and test.ops[0].op in ("eq", "ne")
+            and isinstance(test.ops[0].expr, nodes.Const)
+        ):
+            equal = test.ops[0].expr.value == "assistant"
+            return equal if test.ops[0].op == "eq" else not equal
+        return None
+
+    def remember_stores(node: nodes.Node, initialized: set[str] | None) -> None:
+        if initialized is None:
+            return
+        initialized.update(
+            n.name for n in node.find_all(nodes.Name) if n.ctx == "store"
+        )
+        for child in (
+            node,
+            *node.find_all((nodes.Macro, nodes.Import, nodes.FromImport)),
+        ):
+            if isinstance(child, nodes.Macro):
+                initialized.add(child.name)
+            elif isinstance(child, nodes.Import):
+                initialized.add(child.target)
+            elif isinstance(child, nodes.FromImport):
+                initialized.update(
+                    name if isinstance(name, str) else name[1] for name in child.names
+                )
+
+    def visit(
+        body: Sequence[nodes.Node],
+        bindings: set[int],
+        initialized: set[str] | None = None,
+        loop_locals: bool = False,
+    ) -> set[int]:
+        bindings = bindings.copy()
+        # Store history belongs to every scope; only loop locals have the
+        # ownership proof allowing a fresh constant assignment to be ignored.
+        if initialized is None:
+            initialized = set()
+        for node in body:
+            if isinstance(node, nodes.If):
+                if (id(node) in edited_parsers and node == operation[0]) or (
+                    node == structured_operation
+                    and any(id(child) in edited_parsers for child in node.else_)
+                ):
+                    # The recognized structured/inline reasoning selector is
+                    # one normalization boundary too, preserving its existing
+                    # literal-content contract in either reasoning mode.
+                    if len(bindings) == 1:
+                        selected.update(bindings)
+                    else:
+                        shared.update(bindings)  # No unique consumed assignment.
+                    bindings.clear()
+                    remember_stores(node, initialized)
+                    continue
+                joined = set()
+                # If does not introduce a Jinja scope. Retain every binding
+                # reaching the join, including paths that skipped the parser.
+                for branch in (node, *node.elif_):
+                    condition = assistant_condition(branch.test)
+                    if condition is None:
+                        shared.update(bindings)
+                    if condition is not False:
+                        joined.update(
+                            visit(branch.body, bindings, initialized, loop_locals)
+                        )
+                    if condition is True:
+                        break
+                else:
+                    joined.update(visit(node.else_, bindings, initialized, loop_locals))
+                bindings = joined
+                # A role-pruned path may still have initialized a local before
+                # rebinding message. Freshness follows every syntactic store.
+                remember_stores(node, initialized)
+            else:
+                if reads_content(node, initialized if loop_locals else None):
+                    shared.update(bindings)
+                replacing_content = bool(bindings) or ("content" in initialized)
+                remember_stores(node, initialized)
+                if isinstance(node, nodes.Assign):
+                    if writes_content(node):
+                        bindings = {id(node)}
+                        if replacing_content:
+                            # Publishing a new binding can release an old
+                            # object whose destructor observes the new value.
+                            shared.update(bindings)
+                else:
+                    # Macro/loop/with/block bodies have independent bindings.
+                    for _, value in node.iter_fields():
+                        if isinstance(value, list) and all(
+                            isinstance(n, nodes.Node) for n in value
+                        ):
+                            # Jinja initializes loop locals before each body;
+                            # parameters/targets already have arbitrary values.
+                            local_names = (
+                                {
+                                    n.name
+                                    for n in (
+                                        node.target,
+                                        *node.target.find_all(nodes.Name),
+                                    )
+                                    if isinstance(n, nodes.Name)
+                                }
+                                if isinstance(node, nodes.For) and value is node.body
+                                else None
+                            )
+                            if isinstance(node, nodes.Macro):
+                                local_names = {arg.name for arg in node.args}
+                            elif isinstance(node, nodes.With):
+                                local_names = {
+                                    bound.name
+                                    for target in node.targets
+                                    for bound in (target, *target.find_all(nodes.Name))
+                                    if isinstance(bound, nodes.Name)
+                                }
+                            visit(
+                                value,
+                                set(),
+                                local_names,
+                                isinstance(node, nodes.For) and value is node.body,
+                            )
+                    if isinstance(node, nodes.AssignBlock) and writes_content(node):
+                        bindings.clear()
+        return bindings
+
+    visit(tree.body, set())
+    trims = [
+        env.parse("{% set content = " + content + " %}").body[0]
+        for content in (
+            "render_content(message.content, true)|trim",
+            "(render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
+        )
+    ]
+    for node, (start, body_start, body_end, end) in zip(
+        assignments, locations, strict=True
+    ):
+        if id(node) in selected - shared and node in trims:
+            edits[start, end] = (
+                template[start:body_start]
+                + " set content = (render_content(message.content, true) if message.role == 'assistant' else render_content(message.content, true)|trim) "
+                + template[body_end:end]
+            )
+    return apply_edits()
 
 
 def chat_template_with_preserved_thinking(chat_template: object) -> object:
-    """Preserve prior reasoning by default, while respecting explicit opt-outs."""
+    """Preserve structured reasoning without interpreting tags in plain content."""
     if isinstance(chat_template, dict):
         return {
             name: chat_template_with_preserved_thinking(template)
@@ -36,6 +523,9 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
         }
     if not isinstance(chat_template, str):
         return chat_template
+    literal_template = _without_inline_reasoning_parser(chat_template)
+    inline_parser_removed = literal_template != chat_template
+    chat_template = literal_template
     replacements = (
         (
             _QWEN_DROP_PRIOR_THINKING,
@@ -117,10 +607,19 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
             "reasoning_content + '\\n</think>\\n\\n'",
             "reasoning_content + ('</think>\\n\\n' if preserve_thinking and message.reasoning_content is string and reasoning_content else '\\n</think>\\n\\n')",
         )
-        chat_template = chat_template.replace(
-            "set content = render_content(message.content, true)|trim",
-            "set content = (render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
-        )
+        if (
+            not inline_parser_removed
+            and "{%- set reasoning_content = reasoning_content|trim %}"
+            in literal_template
+        ):
+            # The recognized parser path already preserved its own input. Do
+            # not apply the legacy trim rewrite without its recognized
+            # reasoning assignment: an unrelated inline filter can survive
+            # parser removal and must not activate this on a second call.
+            chat_template = chat_template.replace(
+                "set content = render_content(message.content, true)|trim",
+                "set content = (render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
+            )
     if "clear_thinking" in chat_template:
         chat_template = chat_template.replace(
             "{{ content.strip() }}",
