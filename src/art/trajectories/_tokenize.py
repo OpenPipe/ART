@@ -3,11 +3,12 @@ from __future__ import annotations
 from bisect import bisect_left
 import codecs
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, wraps
 from hashlib import sha256
 from inspect import getattr_static
 from io import BytesIO
@@ -1025,6 +1026,49 @@ class _UnsupportedTokenizationContext(TypeError):
     """An internal proof refusal, distinct from errors raised by observers."""
 
 
+@dataclass
+class _FailureScope:
+    active: bool = True
+    states: list[_ContextObserver | _RenderContextGuard] = field(default_factory=list)
+
+
+_FAILURE_SCOPE: ContextVar[_FailureScope | None] = ContextVar(
+    "art_tokenization_failure_scope", default=None
+)
+
+
+def _record_context_failure(
+    state: _ContextObserver | _RenderContextGuard, error: BaseException
+) -> BaseException:
+    state.failed = error
+    scope = _FAILURE_SCOPE.get()
+    if scope is not None and scope.active:
+        scope.states.append(state)
+    return error
+
+
+def _release_context_failures[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+    @wraps(function)
+    def owned(*args: P.args, **kwargs: P.kwargs) -> R:
+        outer = _FAILURE_SCOPE.get()
+        if outer is not None and outer.active:
+            return function(*args, **kwargs)
+        scope = _FailureScope()
+        token = _FAILURE_SCOPE.set(scope)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            # Nested histories must retain sticky failures through final validation.
+            # Restore ownership before releasing objects whose finalizers may reenter.
+            scope.active = False
+            _FAILURE_SCOPE.reset(token)
+            for state in scope.states:
+                state.failed = None
+            scope.states.clear()
+
+    return owned
+
+
 class _ContextObserver:
     failed: BaseException | None = None
 
@@ -1042,12 +1086,12 @@ class _ContextObserver:
         except _UnsupportedTokenizationContext as error:
             if not _required:
                 raise
-            self.failed = ValueError(
-                "Tokenization context cannot be checked after admission"
-            )
-            raise self.failed from error
+            raise _record_context_failure(
+                self,
+                ValueError("Tokenization context cannot be checked after admission"),
+            ) from error
         except BaseException as error:
-            self.failed = error
+            _record_context_failure(self, error)
             raise
 
 
@@ -1099,14 +1143,14 @@ class _RenderContextGuard:
             if expected[0] != "plain" or not isinstance(
                 error, (TypeError, ValueError, RecursionError, PicklingError)
             ):
-                self.failed = error
+                _record_context_failure(self, error)
                 raise
             unchanged = False
         if not unchanged:
-            self.failed = ValueError(
-                "Rendering context changed during tokenization callback"
+            raise _record_context_failure(
+                self,
+                ValueError("Rendering context changed during tokenization callback"),
             )
-            raise self.failed
 
     def check(self) -> None:
         if self.failed is not None:
@@ -1114,7 +1158,7 @@ class _RenderContextGuard:
         try:
             value = self.read()
         except BaseException as error:
-            self.failed = error
+            _record_context_failure(self, error)
             raise
         self.check_value(value, self.expected)
 
@@ -1133,7 +1177,7 @@ class _RenderContextGuard:
         except _UnsupportedTokenizationContext:
             raise
         except BaseException as error:
-            self.failed = error
+            _record_context_failure(self, error)
             raise
         try:
             result = function(*args, **kwargs)
@@ -1144,7 +1188,7 @@ class _RenderContextGuard:
             except BaseException:
                 # Optional renderer probes can catch the original exception.
                 # Keep its identity and prevent a later fallback blessing edits.
-                self.failed = error
+                _record_context_failure(self, error)
             raise
         self.check()
         self.check_value(arguments, expected)
@@ -5022,6 +5066,7 @@ def _tokenization_context(
         del snapshot, snapshot_compound, instance_state
 
 
+@_release_context_failures
 def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
     observe = _ContextObserver()
     try:
@@ -5058,6 +5103,7 @@ def _rendered_response_evidence(source: object) -> object:
     )
 
 
+@_release_context_failures
 def _sampled_source_validator(
     sources: Mapping[_SampledSourceKey, object]
     | Sequence[tuple[_SampledSourceKey, object]],
@@ -9138,6 +9184,7 @@ def _tokenize_history(
     )
 
 
+@_release_context_failures
 def tokenize_history(
     history: History | LegacyHistory,
     *,
@@ -9304,6 +9351,7 @@ def _complete_resolved_sampled_stops(
     _validate_completed_sources(builders)
 
 
+@_release_context_failures
 def tokenize_trajectory(
     trajectory: Trajectory,
     *,
@@ -9373,6 +9421,7 @@ def tokenize_trajectory(
     )
 
 
+@_release_context_failures
 def _tokenize_trajectory_with_trace(
     trajectory: Trajectory,
     *,
@@ -9428,6 +9477,7 @@ def _tokenize_trajectory_with_trace(
     )
 
 
+@_release_context_failures
 def tokenize_group(
     group: TrajectoryGroup,
     *,
