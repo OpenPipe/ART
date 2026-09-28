@@ -580,8 +580,9 @@ def test_context_snapshot_shared_values_are_fresh_between_observations():
 def test_context_snapshot_does_not_certify_cyclic_or_opaque_values():
     cyclic = []
     cyclic.append(cyclic)
-    with pytest.raises(RecursionError):
+    with pytest.raises(TypeError, match="Unsupported recursive") as failure:
         module._tokenization_context(cyclic)
+    assert isinstance(failure.value.__cause__, RecursionError)
     with pytest.raises(TypeError, match="Unsupported mutable"):
         module._tokenization_context([object()])
 
