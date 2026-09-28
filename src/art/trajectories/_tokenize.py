@@ -3397,7 +3397,10 @@ def _history_has_length_stop(
 
 
 def _history_needs_synthetic_stop(
-    history: History, tokenizer: Tokenizer | None
+    history: History,
+    tokenizer: Tokenizer | None,
+    *,
+    include_complete_terminal: bool = True,
 ) -> bool:
     if (
         tokenizer is None
@@ -3412,6 +3415,18 @@ def _history_needs_synthetic_stop(
         sources = history.input_sources
     else:
         return False
+    terminal = (
+        next(
+            (
+                _sampled_source_key(source)
+                for source in reversed(sources)
+                if source is not None and _source_is_sampled(source)
+            ),
+            None,
+        )
+        if not include_complete_terminal
+        else None
+    )
     seen: set[_SampledSourceKey] = set()
     for source in sources:
         if source is None or not _source_is_sampled(source):
@@ -3422,6 +3437,16 @@ def _history_needs_synthetic_stop(
         seen.add(source_key)
         if _source_stop_evidence(source, source_key)[0] != "stop":
             continue
+        if source_key == terminal:
+            prompt, output, logprobs = _source_native_record(source)
+            # A final complete native sample needs no synthetic turn boundary,
+            # regardless of whether its provider reports length or normal stop.
+            if (
+                prompt is not None
+                and output is not None
+                and len(logprobs) == len(output)
+            ):
+                continue
         output = _source_output_tokens(source, source_key)
         if output is not None and not _sampled_stop_suffix(
             output,
@@ -7706,7 +7731,13 @@ def _tokenize_history(
             isinstance(history, ChatCompletionsHistory) or _copied_context
         ),
     )
-    needs_synthetic_stop = _history_needs_synthetic_stop(history, tokenizer)
+    needs_synthetic_stop = _history_needs_synthetic_stop(
+        history,
+        tokenizer,
+        include_complete_terminal=(
+            isinstance(history, ChatCompletionsHistory) or _copied_context
+        ),
+    )
     needs_render = (
         render_state.needs_render
         or override_requires_render
