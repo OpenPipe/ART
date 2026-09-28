@@ -141,8 +141,10 @@ def test_gradient_is_not_absorbed_by_larger_head_workspace():
     cost = price(r, (n, out, sig, groups, head))
     boundaries = 67 * 40 * 2048 * 2
     gradient = 67 * 2048 * 2
-    assert cost.checkpoint_workspace == head + COLD
-    assert cost.required == int((out + head + COLD + boundaries + gradient) * 1.1)
+    # The head stage: two more gradient-row terms and TE's first-GEMM workspaces.
+    stage = head + 2 * gradient + r._te_workspace_growth_bytes()
+    assert cost.checkpoint_workspace == stage + COLD
+    assert cost.required == int((out + stage + COLD + boundaries + gradient) * 1.1)
     assert cost.retained == int((out + head + boundaries) * 1.1)
     r._memory_profiles[sig] = _MemoryProfile(
         bytes_per_token=10**9,

@@ -4939,9 +4939,20 @@ class TrainerRank:
         retained, _ = self._checkpoint_memory_floor(group_rows)
         if not retained:
             return 0
-        gradient_rows = sum(rows for rows, grad in group_rows if grad)
+        if self._checkpoint_gradient_covered(group_rows, slot_refs):
+            return (
+                sum(rows for rows, grad in group_rows if grad) * self._hidden_size * 2
+            )
+        return retained
+
+    def _checkpoint_gradient_covered(
+        self,
+        group_rows: tuple[tuple[int, bool], ...],
+        slot_refs: tuple["LoRASlotRef | None", ...] | None,
+    ) -> bool:
+        """Whether the traced MoE stage covers every gradient group's recompute."""
         refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
-        if (
+        return bool(
             self._topology_key()[2] <= 2
             and self._checkpoint_moe_bytes_per_token()
             and all(
@@ -4949,9 +4960,7 @@ class TrainerRank:
                 for (_, grad), ref in zip(group_rows, refs, strict=True)
                 if grad
             )
-        ):
-            return gradient_rows * self._hidden_size * 2
-        return retained
+        )
 
     @staticmethod
     def _gradient_slots(
@@ -5074,13 +5083,17 @@ class TrainerRank:
         self,
         groups: Sequence[tuple["LoRASlotRef | None", Sequence[int]]],
         pending_by_slot: Mapping["LoRASlotRef", tuple[int, ...]] | None = None,
+        *,
+        head: bool = False,
     ) -> int:
         """The recompute backward's adapter-gradient peak beyond released boundaries.
 
         ``groups`` gives each gradient group's adapter slot (None for the base
         model) and each decoder layer's saved-boundary bytes
         (``_adapter_gradient_walk``). ``pending_by_slot`` reuses slots' pending
-        gradients already resolved (``_pending_adapter_gradient_bytes``).
+        gradients already resolved (``_pending_adapter_gradient_bytes``). With
+        ``head``, those live while a group's head runs its backward instead
+        (``_adapter_gradient_head``).
         """
         chains = []
         for slot, boundaries in groups:
@@ -5094,7 +5107,32 @@ class TrainerRank:
             if pending and len(pending) != len(boundaries) + 1:
                 return 0
             chains.append((pending or (0,) * (len(boundaries) + 1), boundaries))
+        if head:
+            return self._adapter_gradient_head(chains)
         return self._adapter_gradient_walk(chains)
+
+    @staticmethod
+    def _adapter_gradient_head(
+        chains: Sequence[tuple[Sequence[int], Sequence[int]]],
+    ) -> int:
+        """Adapter gradients live while one group's head runs its backward.
+
+        Chains as ``_adapter_gradient_walk``. None of the group's decoder layers
+        has run yet; its gradients outside the decoder are live, and so is every
+        other group whose gradients outweigh its boundaries, as any may have run
+        first.
+        """
+        nets = [
+            max(0, sum(pending) - sum(boundaries)) for pending, boundaries in chains
+        ]
+        others = sum(nets)
+        return max(
+            (
+                pending[-1] + others - net
+                for (pending, _), net in zip(chains, nets, strict=True)
+            ),
+            default=0,
+        )
 
     @staticmethod
     def _adapter_gradient_walk(
@@ -5171,6 +5209,42 @@ class TrainerRank:
             ranks.append(tuple(groups))
         return tuple(ranks)
 
+    def _layout_adapter_gradient_bytes(
+        self,
+        group_rows: tuple[tuple[int, bool], ...],
+        slot_refs: tuple["LoRASlotRef | None", ...] | None,
+        layouts: tuple[_GroupLayout, ...] | None,
+        *,
+        head: bool = False,
+    ) -> list[int] | None:
+        """Each CP rank's ``_checkpoint_adapter_gradient_bytes`` on its own rows.
+
+        Over that rank's boundaries (``_layout_layer_boundaries``). None
+        without per-rank layouts: every layer then saves each gradient group's
+        rows (``_checkpoint_gradient_groups``).
+        """
+        if (
+            layouts is None
+            or self._topology_key()[1] > 1
+            or not all(grad for _, grad in group_rows)
+        ):
+            return None
+        slots = [
+            slot for slot, _ in self._checkpoint_gradient_groups(group_rows, slot_refs)
+        ]
+        # Every rank walks the same slots' gradients: resolve them once.
+        pending = {
+            slot: self._pending_adapter_gradient_bytes((slot,))
+            for slot in slots
+            if slot is not None
+        }
+        return [
+            self._checkpoint_adapter_gradient_bytes(
+                tuple(zip(slots, boundaries, strict=True)), pending, head=head
+            )
+            for boundaries in self._layout_layer_boundaries(layouts)
+        ]
+
     def _checkpoint_adapter_gradient_extra(
         self,
         floor: tuple[int, int],
@@ -5193,26 +5267,11 @@ class TrainerRank:
         rank) does not add one rank's extra to the other's floor.
         """
         retained, workspace = floor
-        groups = self._checkpoint_gradient_groups(group_rows, slot_refs)
-        if (
-            layouts is None
-            or self._topology_key()[1] > 1
-            or not all(grad for _, grad in group_rows)
-        ):
-            return self._checkpoint_adapter_gradient_bytes(groups)
-        slots = [slot for slot, _ in groups]
-        # Every rank walks the same slots' gradients: resolve them once.
-        pending = {
-            slot: self._pending_adapter_gradient_bytes((slot,))
-            for slot in slots
-            if slot is not None
-        }
-        extras = [
-            self._checkpoint_adapter_gradient_bytes(
-                tuple(zip(slots, boundaries, strict=True)), pending
+        extras = self._layout_adapter_gradient_bytes(group_rows, slot_refs, layouts)
+        if extras is None:
+            return self._checkpoint_adapter_gradient_bytes(
+                self._checkpoint_gradient_groups(group_rows, slot_refs)
             )
-            for boundaries in self._layout_layer_boundaries(layouts)
-        ]
         if not any(extras):
             return 0
         floors = self._layout_checkpoint_rank_floors(
@@ -5233,6 +5292,49 @@ class TrainerRank:
             )
             - retained
             - workspace,
+        )
+
+    def _checkpoint_head_stage_bytes(
+        self,
+        head_workspace_bytes: int,
+        gradient: int,
+        group_rows: tuple[tuple[int, bool], ...],
+        slot_refs: tuple["LoRASlotRef | None", ...] | None,
+        layouts: tuple[_GroupLayout, ...] | None = None,
+    ) -> int | None:
+        """The head backward's peak beyond the boundaries and ``gradient``.
+
+        The head finishes its backward before the decoder's recompute starts,
+        so its buffers never meet a recomputed layer's workspace or the adapter
+        gradients that recompute allocates. Where the MoE stage covers the
+        recompute, ``gradient`` is the gradient groups' rows x 2H, and each of
+        these is at most that: the final decoder outputs, the hidden rows each
+        checkpointed head chunk saved (this rank's rows), and the hidden-row
+        gradient. Beside them are the head's own buffers, TE's cuBLAS workspaces
+        from the forward's first GEMMs, and the adapter gradients of groups
+        whose backward ran first. Qwen3.6-35B-A3B CP2 traces (EP1 and EP2)
+        show these terms at the head's peak. Elsewhere None: the head shares
+        the decoder stage. On per-rank CP layouts, each rank's boundaries are
+        within the floor's, so the largest rank's adapter term bounds each.
+        """
+        if not head_workspace_bytes or not self._checkpoint_gradient_covered(
+            group_rows, slot_refs
+        ):
+            return None
+        adapters = self._layout_adapter_gradient_bytes(
+            group_rows, slot_refs, layouts, head=True
+        )
+        return (
+            head_workspace_bytes
+            + 2 * gradient
+            + self._te_workspace_growth_bytes()
+            + (
+                self._checkpoint_adapter_gradient_bytes(
+                    self._checkpoint_gradient_groups(group_rows, slot_refs), head=True
+                )
+                if adapters is None
+                else max(adapters, default=0)
+            )
         )
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
@@ -5320,24 +5422,27 @@ class TrainerRank:
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
-        checkpoint_workspace = max(
-            checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
-        )
-        if gradient and self._memory_profiles.get(signature) is None:
-            checkpoint_workspace += _COLD_RECOMPUTE_TRANSIENT_BYTES
+        decoder_workspace = max(checkpoint_workspace, checkpoint_floor[1])
+        checkpoint_workspace = max(decoder_workspace, head_workspace_bytes)
         forward_required = required
         if gradient:
+            head_stage = self._checkpoint_head_stage_bytes(
+                head_workspace_bytes, gradient, group_rows, slot_refs, group_layouts
+            )
+            if head_stage is None:
+                peak = checkpoint_workspace + adapter_gradient
+            else:
+                # A split adds its children's adapter gradients to the largest
+                # workspace, and one child's head can follow another's decoder
+                # backward: keep the whole head stage there.
+                checkpoint_workspace = max(decoder_workspace, head_stage)
+                peak = max(decoder_workspace + adapter_gradient, head_stage)
+            if self._memory_profiles.get(signature) is None:
+                checkpoint_workspace += _COLD_RECOMPUTE_TRANSIENT_BYTES
+                peak += _COLD_RECOMPUTE_TRANSIENT_BYTES
             required = max(
                 required,
-                int(
-                    (
-                        checkpoint_retained
-                        + checkpoint_workspace
-                        + gradient
-                        + adapter_gradient
-                    )
-                    * _MEMORY_SAFETY_FACTOR
-                ),
+                int((checkpoint_retained + gradient + peak) * _MEMORY_SAFETY_FACTOR),
             )
         # HybridEP buffer growth stays allocated through the forward and
         # backward peaks, but is not forward retention.
@@ -9157,27 +9262,30 @@ class TrainerRank:
             routed_rows=group_routed_rows,
             layouts=group_layouts,
         )
-        backward = 0
+        decoder_workspace = max(workspace, checkpoint_floor[1])
+        peak = max(decoder_workspace, head_workspace_bytes)
         if include_checkpoint_input_gradient and retained:
             # The input gradient, the backward's other end and cold transients,
-            # as _subforward_cost.
-            backward = self._checkpoint_input_gradient_bytes(
-                group_rows, slot_refs
-            ) + self._checkpoint_adapter_gradient_extra(
+            # staged as _subforward_cost.
+            gradient = self._checkpoint_input_gradient_bytes(group_rows, slot_refs)
+            adapter_gradient = self._checkpoint_adapter_gradient_extra(
                 (retained, workspace),
                 group_rows,
                 slot_refs,
                 group_routed_rows,
                 group_layouts,
             )
+            head_stage = self._checkpoint_head_stage_bytes(
+                head_workspace_bytes, gradient, group_rows, slot_refs, group_layouts
+            )
+            peak = gradient + (
+                peak + adapter_gradient
+                if head_stage is None
+                else max(decoder_workspace + adapter_gradient, head_stage)
+            )
             if profiled is None and any(grad for _, grad in group_rows):
-                backward += _COLD_RECOMPUTE_TRANSIENT_BYTES
-        static_compute = max(
-            static_compute,
-            max(retained, checkpoint_floor[0])
-            + max(workspace, head_workspace_bytes, checkpoint_floor[1])
-            + backward,
-        )
+                peak += _COLD_RECOMPUTE_TRANSIENT_BYTES
+        static_compute = max(static_compute, max(retained, checkpoint_floor[0]) + peak)
         if signature.topology[2] > 1:
             # Local head results coexist with full CP outputs during gathering.
             # Uneven rank plans can assign all of an item's rows to one rank.
