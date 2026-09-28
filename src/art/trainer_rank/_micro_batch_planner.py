@@ -1552,6 +1552,15 @@ def _fill_planner_snapshot(
                             reason = "token_structure_over_limit"
                             break
                         width *= size
+                # Leave room for report wrappers in the recursive JSON encoder.
+                # A zero extent ends list nesting, even if more dimensions follow.
+                if reason is None:
+                    for depth, size in enumerate(tensor.shape, 1):
+                        if depth > 128:
+                            reason = "token_nesting_over_limit"
+                            break
+                        if size == 0:
+                            break
                 if reason is not None:
                     incomplete.add(reason)
                     return {
