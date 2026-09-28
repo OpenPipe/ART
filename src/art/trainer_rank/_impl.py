@@ -4969,6 +4969,43 @@ class TrainerRank:
             )
         return tuple(layouts)
 
+    @staticmethod
+    def _te_workspace_sets() -> int | None:
+        """TE's cached cuBLAS workspace sets, or None without TE."""
+        try:
+            from transformer_engine.pytorch.cpp_extensions import gemm
+        except ImportError:
+            return None
+        info = getattr(gemm.get_cublas_workspace, "cache_info", None)
+        return int(info().currsize) if callable(info) else None
+
+    def _te_workspace_growth_since(self, sets: int | None) -> int:
+        """TE cuBLAS workspace bytes allocated since ``sets`` sets were cached.
+
+        TE caches one set per kind: the plain GEMMs' one workspace and the
+        grouped GEMMs' one per cuBLAS stream (userbuffers' only with TP comm
+        overlap). Growing from none to both is exact; any other growth is
+        ambiguous and counts one workspace per set, the least any holds.
+        """
+        now = self._te_workspace_sets()
+        if sets is None or now is None or now <= sets:
+            return 0
+        try:
+            from transformer_engine.pytorch.cpp_extensions import gemm
+
+            size = int(gemm.get_cublas_workspace_size_bytes())
+            streams = int(gemm.tex.get_num_cublas_streams())
+        except (AttributeError, ImportError, RuntimeError):
+            return 0
+        overlap = bool(
+            getattr(
+                getattr(self.runtime.model[0], "config", None), "tp_comm_overlap", False
+            )
+        )
+        if sets == 0 and now == 2 and not overlap:
+            return (1 + streams) * size
+        return (now - sets) * size
+
     def _te_workspace_growth_bytes(self) -> int:
         """Transformer Engine's cuBLAS workspaces, until its GEMMs allocate them.
 
@@ -7605,6 +7642,10 @@ class TrainerRank:
             baseline = int(torch.cuda.memory_allocated(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
             self._peak_resets = self.__dict__.get("_peak_resets", 0) + 1
+            self._te_workspaces_at_reset = (
+                self._peak_resets,
+                self._te_workspace_sets(),
+            )
         else:
             baseline = None
         observation = getattr(self, "_planner_observation", None)
@@ -7667,11 +7708,21 @@ class TrainerRank:
             observation["peak"] = max(observation["peak"], peak)
         resets = self.__dict__.get("_peak_resets", 0)
         self._peak_reading = (resets, peak)
+        # TE's cuBLAS workspaces this window allocated stay for the process:
+        # a one-time cost later plans never pay, so it teaches no rate.
+        at_reset = self.__dict__.get("_te_workspaces_at_reset")
+        growth = (
+            self._te_workspace_growth_since(at_reset[1])
+            if at_reset is not None and at_reset[0] == resets
+            else 0
+        )
         self._update_memory_profile(
             plan,
-            max(0, peak - baseline),
+            max(0, peak - baseline - growth),
             retained_bytes=(
-                None if retained_after is None else max(0, retained_after - baseline)
+                None
+                if retained_after is None
+                else max(0, retained_after - baseline - growth)
             ),
             # Only a whole wave: a nested forward resetting the counter during
             # the yield, or an untracked reset (the counter fell below this
