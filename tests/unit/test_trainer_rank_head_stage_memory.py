@@ -106,8 +106,9 @@ def test_cost_and_estimate_price_the_larger_stage(monkeypatch, head):
     with_pending(monkeypatch, r, pending)
     extra = oracle(pending, [boundary] * 40)
     te = r._te_workspace_growth_bytes()
+    state = 67 * r._backward_row_state_bytes()
     decoder = workspace + extra
-    stage = head + 2 * gradient + te if head else 0
+    stage = head + 2 * gradient + state + te if head else 0
     cost = priced(r, values, (POLICY, None))
     assert cost.checkpoint_input_gradient == gradient
     assert cost.required == int(
@@ -128,7 +129,7 @@ def test_cost_and_estimate_price_the_larger_stage(monkeypatch, head):
     r._memory_profiles[signature] = _MemoryProfile(bytes_per_token=1, packed_tokens=n)
     decoder = r._checkpoint_memory_floor(groups)[1] + extra
     assert decoder == workspace - te + extra
-    stage = head + 2 * gradient if head else 0
+    stage = head + 2 * gradient + state if head else 0
     assert priced(r, values, (POLICY, None)).required == int(
         (out + retained + gradient + max(decoder, stage)) * 1.1
     )
@@ -178,7 +179,12 @@ def test_split_keeps_each_head_stage_beside_every_adapter_gradient(monkeypatch):
     left = priced(r, (n, out, signature, groups, head), (POLICY, None))
     right = priced(r, (n, out, signature, groups, head), (POLICY, None))
     gradient = left.checkpoint_input_gradient
-    stage = head + 2 * gradient + r._te_workspace_growth_bytes()
+    stage = (
+        head
+        + 2 * gradient
+        + 67 * r._backward_row_state_bytes()
+        + r._te_workspace_growth_bytes()
+    )
     assert (
         left.checkpoint_workspace
         == max(r._checkpoint_memory_floor(groups)[1], stage) + COLD
@@ -195,3 +201,15 @@ def test_split_keeps_each_head_stage_beside_every_adapter_gradient(monkeypatch):
         )
         * 1.1
     )
+
+
+def test_each_row_keeps_its_rope_embedding_and_index_state():
+    import torch
+
+    r = rank()
+    model = r.runtime.model[0]
+    assert r._backward_row_state_bytes() == 256
+    # Qwen3.6-35B-A3B: a 64-wide rotary embedding (32 frequencies), FP32.
+    model.rotary_pos_emb = torch.nn.Module()
+    model.rotary_pos_emb.inv_freq = torch.ones(32)
+    assert r._backward_row_state_bytes() == 64 * 4 + 256

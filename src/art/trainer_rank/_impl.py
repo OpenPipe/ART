@@ -130,6 +130,11 @@ _HEAD_CHUNK_TOKENS = 512
 # 32 MiB transients live at its peak (Qwen3.6-35B-A3B CP2: the RoPE frequencies
 # and a frozen linear's output, at 2k to 20k tokens); warm waves do not.
 _COLD_RECOMPUTE_TRANSIENT_BYTES = 64 * 2**20
+# Per local row, index state the backward keeps beside the RoPE embedding and
+# hidden-width tensors: int64 positions and row maps, CP block masks and GDN
+# exchange plans. Qwen3.6-35B-A3B CP2 traces at the head's backward peak:
+# 106-181 bytes per row at 3.5k-8.7k rows.
+_BACKWARD_ROW_STATE_BYTES = 256
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -4776,24 +4781,38 @@ class TrainerRank:
         recompute, ``gradient`` is the gradient groups' rows x 2H, and each of
         these is at most that: the final decoder outputs, the hidden rows each
         checkpointed head chunk saved (this rank's rows), and the hidden-row
-        gradient. Beside them are the head's own buffers, TE's cuBLAS workspaces
-        from the forward's first GEMMs, and the adapter gradients of groups
-        whose backward ran first. Qwen3.6-35B-A3B CP2 traces (EP1 and EP2)
-        show these terms at the head's peak. Elsewhere None: the head shares
-        the decoder stage.
+        gradient. Beside them are each row's RoPE embedding and index state,
+        the head's own buffers, TE's cuBLAS workspaces from the forward's first
+        GEMMs, and the adapter gradients of groups whose backward ran first.
+        Qwen3.6-35B-A3B CP2 traces (EP1 and EP2, single and multi-request
+        waves) show these terms at the head's peak. Elsewhere None: the head
+        shares the decoder stage.
         """
         if not head_workspace_bytes or not self._checkpoint_gradient_covered(
             group_rows, slot_refs
         ):
             return None
+        rows = sum(rows for rows, grad in group_rows if grad)
         return (
             head_workspace_bytes
             + 2 * gradient
+            + rows * self._backward_row_state_bytes()
             + self._te_workspace_growth_bytes()
             + self._checkpoint_adapter_gradient_bytes(
                 self._checkpoint_gradient_groups(group_rows, slot_refs), head=True
             )
         )
+
+    def _backward_row_state_bytes(self) -> int:
+        """Per local row, what the backward keeps beside hidden-width tensors.
+
+        The FP32 RoPE embedding at the rotary width (256 bytes for
+        Qwen3.6-35B-A3B) and ``_BACKWARD_ROW_STATE_BYTES`` of index state.
+        """
+        rope = getattr(_language_model(self.runtime.model[0]), "rotary_pos_emb", None)
+        frequencies = getattr(rope, "inv_freq", None)
+        width = 2 * frequencies.numel() if isinstance(frequencies, torch.Tensor) else 0
+        return width * 4 + _BACKWARD_ROW_STATE_BYTES
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
