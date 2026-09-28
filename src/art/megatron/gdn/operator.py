@@ -837,10 +837,10 @@ class _TreeStateChunkCache:
         single_source_chunk = next(iter(sources_by_chunk.values()))
         if len(sources_by_chunk) == 1 and len(single_source_chunk) == batch_size:
             chunk_index, pairs = next(iter(sources_by_chunk.items()))
-            return (
-                _select_state_rows(self._conv_chunks[chunk_index], pairs),
-                _select_state_rows(self._rec_chunks[chunk_index], pairs),
+            conv, rec = _select_state_rows(
+                (self._conv_chunks[chunk_index], self._rec_chunks[chunk_index]), pairs
             )
+            return conv, rec
 
         conv = _zero_conv_state(gdn, state_reference, batch_size=batch_size)
         rec = _zero_recurrent_state(gdn, state_reference, batch_size=batch_size)
@@ -866,19 +866,23 @@ class _TreeStateChunkCache:
         return conv, rec
 
 
-def _select_state_rows(chunk: Tensor, pairs: Sequence[tuple[int, int]]) -> Tensor:
+def _select_state_rows(
+    chunks: Sequence[Tensor], pairs: Sequence[tuple[int, int]]
+) -> tuple[Tensor, ...]:
     source_rows = tuple(source_row for _, source_row in pairs)
     if len(set(source_rows)) == 1:
-        return chunk.narrow(0, source_rows[0], 1).expand(
-            len(source_rows),
-            *tuple(chunk.shape[1:]),
+        return tuple(
+            chunk.narrow(0, source_rows[0], 1).expand(
+                len(source_rows), *tuple(chunk.shape[1:])
+            )
+            for chunk in chunks
         )
     first_row = source_rows[0]
     if source_rows == tuple(range(first_row, first_row + len(source_rows))):
-        return chunk.narrow(0, first_row, len(source_rows))
-    return chunk.index_select(
-        0,
-        _long_tensor(source_rows, device=chunk.device),
+        return tuple(chunk.narrow(0, first_row, len(source_rows)) for chunk in chunks)
+    indices = _long_tensor(source_rows, device=chunks[0].device)
+    return tuple(
+        chunk.index_select(0, indices.to(device=chunk.device)) for chunk in chunks
     )
 
 
