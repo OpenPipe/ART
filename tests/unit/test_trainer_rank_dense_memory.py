@@ -691,3 +691,21 @@ def test_the_split_lower_bound_never_exceeds_the_exact_no_grad_price(monkeypatch
         chunk, tuple(q.input_tokens for q in chunk), checkpoint=Unset
     )
     assert modes == [True]
+
+
+def test_covered_dense_plans_are_never_marked_staged(monkeypatch):
+    from art.trainer_rank import _impl
+
+    monkeypatch.setattr(
+        _impl,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
+    )
+    r = _dense_rank()
+    monkeypatch.setattr(r, "_plan_head_workspace_bytes", lambda plan: 10**9)
+    monkeypatch.setattr(r, "_head_backward_traced", lambda *a, **k: True)
+    plan = r._plan_flat_forward(requests(67, 16))
+    _at_cp2(r)
+    # Eligible, but the dense head keeps the unstaged price: not strict.
+    assert r._plan_head_backward_traced(plan) is True
+    assert getattr(plan, "_head_staged", False) is False

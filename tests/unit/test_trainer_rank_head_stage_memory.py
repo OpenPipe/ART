@@ -368,7 +368,50 @@ def test_a_staged_plan_runs_its_fused_statistics_strictly(monkeypatch):
     assert _impl._try_triton_stats("local_logsumexp_stats", small, strict=True) is None
 
 
-def test_execution_binds_the_staging_its_latest_price_used(monkeypatch):
+def test_execution_binds_strictness_to_the_staged_admission(monkeypatch):
+    from test_trainer_rank_head_memory import rank as head_rank
+    from test_trainer_rank_head_memory import request
+
+    from art.trainer_rank import ForwardOutput, _impl
+
+    monkeypatch.setattr(
+        _impl,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
+    )
+    r = head_rank()
+    monkeypatch.setattr(r, "_moe_recompute_covered_for", lambda ref: True)
+    plan = r._plan_flat_forward([request(512, grad=True), request(16, hidden=True)])
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    monkeypatch.setattr(r, "_topology", lambda: None)
+    monkeypatch.setattr(r, "_validate_hybridep_topology", lambda: None)
+    monkeypatch.setattr(r, "_configure_hybridep", lambda *a, **k: None)
+    monkeypatch.setattr(r, "_prepare_packed_forward", lambda packed: None)
+    seen = []
+
+    def forward_packed(items, prepared):
+        seen.append(_impl._HEAD_STATISTICS_STRICT.get())
+        return [ForwardOutput(None, None, None, None)] * len(items)
+
+    monkeypatch.setattr(r, "_forward_packed", forward_packed)
+    r._execute_flat_plan(plan)
+    assert seen == [False, False]  # Never priced staged.
+    assert r._plan_head_backward_traced(plan) is True
+    assert plan._head_staged is True
+    seen.clear()
+    r._execute_flat_plan(plan)
+    # Only the gradient group runs strictly; nothing leaks past execution.
+    grad_first = [group.grad_enabled for group in plan.groups]
+    assert seen == grad_first
+    assert _impl._HEAD_STATISTICS_STRICT.get() is False
+    # A later price that no longer stages (a kernel failed since) cannot
+    # weaken the admission that relied on it.
+    _impl._TRITON_STATS_STATE["failed"] = True
+    assert r._plan_head_backward_traced(plan) is False
+    assert plan._head_staged is True
+
+
+def test_an_eligible_head_the_price_does_not_stage_is_not_strict(monkeypatch):
     from test_trainer_rank_head_memory import rank as head_rank
     from test_trainer_rank_head_memory import request
 
@@ -382,20 +425,10 @@ def test_execution_binds_the_staging_its_latest_price_used(monkeypatch):
     r = head_rank()
     plan = r._plan_flat_forward([request(512, grad=True)])
     monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
-    seen = []
-    monkeypatch.setattr(
-        r,
-        "_execute_flat_plan_groups",
-        lambda plan: seen.append(r._head_statistics_strict) or [],
-    )
+    # The recompute is not covered: the head keeps the unstaged price.
+    monkeypatch.setattr(r, "_checkpoint_gradient_covered", lambda *a, **k: False)
     assert r._plan_head_backward_traced(plan) is True
-    r._execute_flat_plan(plan)
-    # A later price that no longer stages (a kernel failed since) unbinds it.
-    _impl._TRITON_STATS_STATE["failed"] = True
-    assert r._plan_head_backward_traced(plan) is False
-    r._execute_flat_plan(plan)
-    assert seen == [True, False]
-    assert r._head_statistics_strict is False
+    assert getattr(plan, "_head_staged", False) is False
 
 
 def test_several_labels_per_row_are_not_traced(monkeypatch):
@@ -417,3 +450,6 @@ def test_several_labels_per_row_are_not_traced(monkeypatch):
     )
     assert r._head_backward_traced([single], 512) is True
     assert r._head_backward_traced([several], 512) is False
+    # One label per token over a leading batch axis is still one per row.
+    batched = replace(single, input_tokens=single.input_tokens.unsqueeze(0))
+    assert r._head_backward_traced([batched], 512) is True
