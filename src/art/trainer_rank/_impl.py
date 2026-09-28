@@ -113,7 +113,7 @@ if TYPE_CHECKING:
         _FinalizedSave,
         _PreparedSave,
     )
-    from art.trainer_rank._lora_export import _PreparedLoraExport
+    from art.trainer_rank._lora_export import _VllmLoraPublishInputs
 
     from ._heads import ModuleHandle
 
@@ -2080,7 +2080,7 @@ class TrainerRank:
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
         self._snapshot_checkpoint_names: set[str] = set()
-        self._prepared_lora_exports: dict[str, tuple[str, _PreparedLoraExport]] = {}
+        self._prepared_lora_exports: dict[str, tuple[str, _VllmLoraPublishInputs]] = {}
         self._checkpoint_prefetches: dict[str, Future[PreparedCheckpoint]] = {}
         self._checkpoint_prefetch_sources: dict[str, str] = {}
         self._checkpoint_prefetch_lock = threading.Lock()

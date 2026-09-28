@@ -296,7 +296,7 @@ def _gpt_oss_config_dict(base_model_name_or_path: str) -> dict[str, Any]:
 
 def _gpt_oss_padding_sizes_from_adapter_config(
     adapter_config: dict[str, Any],
-) -> tuple[int, int, int, int] | None:
+) -> tuple[int, int, int, int]:
     base_model = adapter_config.get("base_model_name_or_path")
     if not isinstance(base_model, str) or not base_model:
         raise RuntimeError("GPT OSS LoRA conversion requires base_model_name_or_path")
@@ -1244,8 +1244,6 @@ def _trim_gpt_oss_lora_for_vllm(
     adapter_config: dict[str, Any],
 ) -> torch.Tensor:
     sizes = _gpt_oss_padding_sizes_from_adapter_config(adapter_config)
-    if sizes is None:
-        return tensor.contiguous()
     logical_hidden, internal_hidden, logical_ffn, internal_ffn = sizes
     match = _ART_MOE_EXPERT_KEY_RE.match(key)
     if match is not None:
@@ -1290,8 +1288,6 @@ def _pad_gpt_oss_lora_from_vllm(
     adapter_config: dict[str, Any],
 ) -> torch.Tensor:
     sizes = _gpt_oss_padding_sizes_from_adapter_config(adapter_config)
-    if sizes is None:
-        return tensor.contiguous()
     _logical_hidden, internal_hidden, _logical_ffn, internal_ffn = sizes
     match = _ART_MOE_EXPERT_KEY_RE.match(key)
     if match is not None:
@@ -1308,19 +1304,6 @@ def _pad_gpt_oss_lora_from_vllm(
         if module == "down_proj" and lora == "lora_A":
             return _pad_dim_right(tensor, dim=-1, size=internal_ffn)
         if module == "down_proj" and lora == "lora_B":
-            return _pad_dim_right(tensor, dim=0, size=internal_hidden)
-    if _ART_PACKED_MOE_KEY_RE.match(key):
-        if key.endswith(".base_layer.lora_A.weight"):
-            return _pad_dim_right(tensor, dim=-1, size=internal_hidden)
-        if key.endswith(".base_layer.lora_B.weight"):
-            return _pad_gpt_oss_gate_up_dim0(
-                tensor,
-                logical=tensor.shape[0] // 2,
-                internal=internal_ffn,
-            )
-        if key.endswith(".lora_A.weight"):
-            return _pad_dim_right(tensor, dim=-1, size=internal_ffn)
-        if key.endswith(".lora_B.weight"):
             return _pad_dim_right(tensor, dim=0, size=internal_hidden)
     return tensor.contiguous()
 
