@@ -91,9 +91,9 @@ def _extend_dynamic_optimizer(
 
 
 def optim_step(
-    self: TrainerRank,
+    self: _impl.TrainerRank,
     *,
-    params: AdamParams | Mapping[str, AdamParams],
+    params: _impl.AdamParams | Mapping[str, _impl.AdamParams],
     scale_grads: float | Mapping[str, float] = 1.0,
     checkpoints: Sequence[str] | None = None,
     on_live_graphs: Literal["allow", "error"] = "allow",

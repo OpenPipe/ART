@@ -56,7 +56,7 @@ def _resolve_custom_checkpoint(self: TrainerRank, checkpoint: AdapterSelection) 
 
 
 def prefetch_checkpoints(
-    self: TrainerRank, *checkpoints: str | MaterializedCheckpoint
+    self: _impl.TrainerRank, *checkpoints: str | _impl.MaterializedCheckpoint
 ) -> asyncio.Task[None]:
     futures = []
     for checkpoint in checkpoints:
@@ -182,7 +182,7 @@ def _ensure_checkpoint_slots(self: TrainerRank, checkpoints: Iterable[str]) -> N
 
 
 def load_checkpoint(
-    self: TrainerRank, checkpoint: str | MaterializedCheckpoint | None
+    self: _impl.TrainerRank, checkpoint: str | _impl.MaterializedCheckpoint | None
 ) -> None:
     self._guard_forward_collective("load_checkpoint")
     logical, source = self._checkpoint_source(checkpoint)
@@ -232,7 +232,7 @@ def _push_checkpoint_sync(
         self._slot_stack.append(self._slot_ref(logical_path))
 
 
-def pop_checkpoint(self: TrainerRank) -> None:
+def pop_checkpoint(self: _impl.TrainerRank) -> None:
     with self._checkpoint_mutation_lock:
         if not self._slot_stack:
             raise RuntimeError("No pushed checkpoint to pop")

@@ -1660,7 +1660,7 @@ def _complete_planner_observation(
         _impl._planner_misses._warn("could not finish planner-miss observation")
 
 
-def finish_planner_observation(self: TrainerRank) -> None:
+def finish_planner_observation(self: _impl.TrainerRank) -> None:
     """Release execution context without sampling an unbounded caller peak.
 
     ART compares completed peaks at its existing profiling boundaries:
@@ -1675,7 +1675,7 @@ def finish_planner_observation(self: TrainerRank) -> None:
         _impl._planner_misses._warn("could not finish planner-miss execution")
 
 
-def report_planner_oom(self: TrainerRank, error: BaseException) -> None:
+def report_planner_oom(self: _impl.TrainerRank, error: BaseException) -> None:
     """Persist a caught CUDA OOM before caller cleanup, then leave it alone.
 
     This does not suppress, retry, or recover the original failure. An OOM
@@ -1767,7 +1767,7 @@ def report_planner_oom(self: TrainerRank, error: BaseException) -> None:
         _impl._planner_misses._warn("could not persist planner OOM report")
 
 
-def discard_planner_observation(self: TrainerRank) -> None:
+def discard_planner_observation(self: _impl.TrainerRank) -> None:
     try:
         observation = getattr(self, "_planner_observation", None)
         if observation is not None:
