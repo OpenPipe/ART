@@ -215,6 +215,33 @@ def _build_vllm_lora_tensors_from_inputs(
         packed_expert_metadata=inputs.packed_expert_metadata,
         packed_expert_tensors_by_owner_key=inputs.packed_expert_tensors_by_owner_key,
     )
+    interleaved_keys = frozenset(
+        meta.key
+        for meta in inputs.packed_expert_metadata
+        if meta.pack_layout == "interleaved_gate_up_rank_major_expert_cols"
+    )
+    if getattr(inputs.handler, "key", None) == "gpt_oss_moe" and interleaved_keys:
+        from art.megatron.model_support.handlers.gpt_oss import (
+            _gpt_oss_padding_sizes_from_adapter_config,
+            _trim_gpt_oss_interleaved_gate_up_last,
+        )
+
+        sizes = _gpt_oss_padding_sizes_from_adapter_config(inputs.adapter_config)
+        assert sizes is not None
+        _, _, logical, internal = sizes
+        for key in interleaved_keys:
+            tensor = merged_tensors[key]
+            if tensor.ndim != 2 or tensor.shape[0] not in {
+                2 * logical,
+                2 * internal,
+            }:
+                raise ValueError("GPT-OSS packed gate/up LoRA has an invalid shape")
+            if tensor.shape[0] != 2 * logical:
+                # Packed producers interleave gate/up before trimming; the
+                # regular handler's half-split trim is for canonical tensors.
+                merged_tensors[key] = _trim_gpt_oss_interleaved_gate_up_last(
+                    tensor.T, logical=logical, internal=internal
+                ).T.contiguous()
     return inputs.handler.to_vllm_lora_tensors(
         merged_tensors,
         adapter_config=inputs.adapter_config,
