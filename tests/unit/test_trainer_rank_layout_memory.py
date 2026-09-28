@@ -313,9 +313,15 @@ def _pending_adapter_rank(monkeypatch, layout, rows, per_layer=300 * H):
     monkeypatch.setattr(r, "_plan_group_routed_rows", lambda plan: (rows,))
     monkeypatch.setattr(r, "_plan_hybridep_growth_bytes", lambda plan: 0)
     monkeypatch.setattr(r, "_plan_retained_tokens", lambda plan: rows)
+    # The plan's gradient group trains the policy slot.
     policy = LoRASlotRef("checkpoint", "policy")
+    groups = r._checkpoint_gradient_groups
     monkeypatch.setattr(
-        r, "_gradient_slots", lambda group_rows, slot_refs: frozenset({policy})
+        r,
+        "_checkpoint_gradient_groups",
+        lambda group_rows, slot_refs: tuple(
+            (policy, boundaries) for _, boundaries in groups(group_rows, slot_refs)
+        ),
     )
     pending = (per_layer,) * 40 + (0,)
     monkeypatch.setattr(
@@ -358,8 +364,8 @@ def test_adapter_gradients_meet_each_ranks_own_layer_boundaries(monkeypatch):
         monkeypatch, layout, 400
     )
     assert r._layout_layer_boundaries((layout,)) == (
-        tuple(boundaries(0)),
-        tuple(boundaries(1)),
+        (tuple(boundaries(0)),),
+        (tuple(boundaries(1)),),
     )
     # Every rank's boundaries sum to its own floor's.
     assert [sum(boundaries(i)) for i in (0, 1)] == [floor[0] for floor in floors]
@@ -398,3 +404,66 @@ def test_a_rank_without_gdn_rows_pairs_its_extra_with_its_own_floor(monkeypatch)
             retained + workspace + cost
         )
     assert cost >= extras[0]
+
+
+def test_layout_gradient_groups_run_one_after_another_on_each_rank(monkeypatch):
+    from test_trainer_rank_adapter_gradient_memory import sequential_oracle
+
+    from art.megatron.lora import LoRASlotRef
+
+    r = qwen36(rank())
+    # A short policy sequence beside a longer sequence of another slot.
+    layouts = (
+        _GroupLayout((1536, 511), (2047, 0), (0, 0)),
+        _GroupLayout((400, 240), (160, 320), (0, 0)),
+    )
+    group_rows = ((2047, True), (640, True))
+    routed = (2047, 640)
+    slots = (LoRASlotRef("checkpoint", "policy"), LoRASlotRef("checkpoint", "other"))
+    groups = r._checkpoint_gradient_groups
+    monkeypatch.setattr(
+        r,
+        "_checkpoint_gradient_groups",
+        lambda group_rows, slot_refs: tuple(
+            (slot, boundaries)
+            for slot, (_, boundaries) in zip(slots, groups(group_rows, slot_refs))
+        ),
+    )
+    pending = {
+        (slots[0],): (6000 * H,) * 40 + (0,),
+        (slots[1],): (100 * H,) * 40 + (5 * H,),
+    }
+    monkeypatch.setattr(
+        r, "_pending_adapter_gradient_bytes", lambda refs: pending.get(tuple(refs), ())
+    )
+    floor = r._checkpoint_memory_floor(
+        group_rows, None, routed_rows=routed, layouts=layouts
+    )
+    layers = r.runtime.model[0].decoder.layers
+    floors = r._layout_checkpoint_rank_floors(layers, (None, None), routed, layouts)
+    per_rank = r._layout_layer_boundaries(layouts)
+    # Every rank's groups sum to its own floor's boundaries.
+    assert [sum(map(sum, rank_groups)) for rank_groups in per_rank] == [
+        rank_floor[0] for rank_floor in floors
+    ]
+    # On each rank, one group's backward runs after the other's, in the worst
+    # order; each rank's extra sits on its own floor.
+    extras = [
+        sequential_oracle(
+            [(pending[(slot,)], list(b)) for slot, b in zip(slots, rank_groups)]
+        )
+        for rank_groups in per_rank
+    ]
+    expected = max(
+        0,
+        max(
+            rank_retained + max(rank_workspace, floor[1]) + extra
+            for (rank_retained, rank_workspace), extra in zip(floors, extras)
+        )
+        - sum(floor),
+    )
+    assert (
+        r._checkpoint_adapter_gradient_extra(floor, group_rows, None, routed, layouts)
+        == expected
+        > 0
+    )
