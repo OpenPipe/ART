@@ -257,43 +257,42 @@ def _without_inline_reasoning_parser(template: str) -> str:
         for node in tree.find_all((nodes.Import, nodes.FromImport, nodes.Macro))
     ):
         return apply_edits()
-    if counters:
-        # Namespace counters are mutable. A context callback elsewhere could
-        # replace their values without a lexical reference to the namespace.
-        # Admit only the stock chat template's closed data/render operations.
-        closed = WithoutWhitespace().visit(env.parse(apply_edits()))
-        try:
-            external = meta.find_undeclared_variables(closed)
-        except TemplateSyntaxError:
+    # Macro callables and namespace counters are mutable. A context callback
+    # can replace either without a lexical reference, even for counter-free macros.
+    # Admit only the stock chat template's closed data/render operations.
+    closed = WithoutWhitespace().visit(env.parse(apply_edits()))
+    try:
+        external = meta.find_undeclared_variables(closed)
+    except TemplateSyntaxError:
+        return apply_edits()
+    if external.difference(
+        "messages tools message content reasoning_content preserve_thinking "
+        "enable_thinking add_generation_prompt add_vision_id raise_exception namespace".split()
+    ):
+        return apply_edits()
+    data_nodes = allowed + tuple(
+        getattr(nodes, name)
+        for name in "CondExpr Filter Getitem Keyword Macro Neg Slice Sub Tuple".split()
+    )
+    for node in closed.find_all(nodes.Node):
+        if not isinstance(node, data_nodes):
             return apply_edits()
-        if external.difference(
-            "messages tools message content reasoning_content preserve_thinking "
-            "enable_thinking add_generation_prompt add_vision_id raise_exception namespace".split()
+        if isinstance(node, nodes.Call) and not (
+            isinstance(node.node, nodes.Name)
+            and node.node.name in {"render_content", "raise_exception", "namespace"}
+            or isinstance(node.node, nodes.Getattr)
+            and node.node.node == nodes.Name("content", "load")
+            and node.node.attr in {"startswith", "endswith"}
         ):
             return apply_edits()
-        data_nodes = allowed + tuple(
-            getattr(nodes, name)
-            for name in "CondExpr Filter Getitem Keyword Macro Neg Slice Sub Tuple".split()
-        )
-        for node in closed.find_all(nodes.Node):
-            if not isinstance(node, data_nodes):
-                return apply_edits()
-            if isinstance(node, nodes.Call) and not (
-                isinstance(node.node, nodes.Name)
-                and node.node.name in {"render_content", "raise_exception", "namespace"}
-                or isinstance(node.node, nodes.Getattr)
-                and node.node.node == nodes.Name("content", "load")
-                and node.node.attr in {"startswith", "endswith"}
-            ):
-                return apply_edits()
-            if isinstance(node, nodes.Filter) and node.name not in (
-                "default items length safe string tojson trim".split()
-            ):
-                return apply_edits()
-            if isinstance(node, nodes.Test) and node.name not in (
-                "defined false iterable mapping none string true undefined".split()
-            ):
-                return apply_edits()
+        if isinstance(node, nodes.Filter) and node.name not in (
+            "default items length safe string tojson trim".split()
+        ):
+            return apply_edits()
+        if isinstance(node, nodes.Test) and node.name not in (
+            "defined false iterable mapping none string true undefined".split()
+        ):
+            return apply_edits()
     assignments = list(tree.find_all(nodes.Assign))
     locations = []
     parsed_assignments = []
