@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
 import hashlib
+import json
 import logging
 import math
 import os
@@ -125,6 +126,10 @@ _MEMORY_PROFILE_TRUST_GROWTH = 8
 _MEMORY_SAFETY_FACTOR = 1.10
 _MEMORY_RESERVE_FRACTION = 0.03
 _HEAD_CHUNK_TOKENS = 512
+# An unprofiled full-recompute gradient wave's first execution keeps two fixed
+# 32 MiB transients live at its peak (Qwen3.6-35B-A3B CP2: the RoPE frequencies
+# and a frozen linear's output, at 2k to 20k tokens); warm waves do not.
+_COLD_RECOMPUTE_TRANSIENT_BYTES = 64 * 2**20
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -1075,6 +1080,13 @@ class _SubforwardCost:
     # HybridEP buffer growth before the safety factor. It is in required, not
     # retained, and persists across a split, which charges the largest once.
     hybridep_growth: int = 0
+    # Adapter gradients the recompute backward holds beyond the boundaries it
+    # has released (``_checkpoint_adapter_gradient_bytes``), before the safety
+    # factor. Split children training the same slots share them, so a split
+    # charges the largest once; ``..._slots`` names those slots (sorted JSON
+    # of kind/name pairs, "" when none), keeping the cost JSON-serializable.
+    checkpoint_adapter_gradient: int = 0
+    checkpoint_adapter_gradient_slots: str = ""
 
     @property
     def ephemeral(self) -> int:
@@ -3607,12 +3619,32 @@ class TrainerRank:
         if any(cost.checkpoint_input_gradient for cost in costs):
             # The caller owns all returned graphs. A calibrated forward-retained
             # discount cannot replace the sum of their input-gradient extents.
+            # Children training the same slots share their adapter gradients,
+            # allocated once by whichever child's backward reaches a layer
+            # first; the largest child's extra covers any order. Different
+            # slots have disjoint gradients, charged per child.
+            adapter = [
+                cost.checkpoint_adapter_gradient
+                for cost in costs
+                if cost.checkpoint_adapter_gradient
+            ]
+            shared = (
+                len(
+                    {
+                        cost.checkpoint_adapter_gradient_slots
+                        for cost in costs
+                        if cost.checkpoint_adapter_gradient
+                    }
+                )
+                <= 1
+            )
             checkpoint = (
                 sum(
                     cost.checkpoint_retained + cost.checkpoint_input_gradient
                     for cost in costs
                 )
                 + max(cost.checkpoint_workspace for cost in costs)
+                + ((max(adapter) if shared else sum(adapter)) if adapter else 0)
                 + growth
             )
             required = max(required, int(checkpoint * _MEMORY_SAFETY_FACTOR))
@@ -4912,6 +4944,175 @@ class TrainerRank:
             return gradient_rows * self._hidden_size * 2
         return retained
 
+    @staticmethod
+    def _gradient_slots(
+        group_rows: Sequence[tuple[int, bool]],
+        slot_refs: Sequence["LoRASlotRef | None"] | None,
+    ) -> frozenset["LoRASlotRef"]:
+        """Gradient groups' adapter slots; the base model (no name) has none."""
+        return frozenset(
+            ref
+            for (_, grad), ref in zip(
+                group_rows, slot_refs or (None,) * len(group_rows), strict=True
+            )
+            if grad and ref is not None and ref.name is not None
+        )
+
+    def _pending_adapter_gradient_bytes(
+        self, refs: Iterable["LoRASlotRef"]
+    ) -> tuple[int, ...]:
+        """Local adapter gradient bytes the next backward allocates, per decoder layer.
+
+        One entry per decoder layer, then one for parameters outside the
+        decoder. Backward reaches a parameter's highest decoder layer first, so
+        a parameter shared across layers counts there once; those outside the
+        decoder count as live throughout. Only unallocated gradients count:
+        within a step, later waves find the rest in the availability baseline.
+        Empty when none is pending.
+        """
+        refs = tuple(dict.fromkeys(refs))
+        if not refs or len(self.runtime.model) != 1:
+            return ()
+        try:
+            from art.megatron.lora import LoRA
+        except ModuleNotFoundError as error:
+            if error.name != "megatron":
+                raise
+            return ()
+        chunk = self.runtime.model[0]
+        try:
+            layers = _language_model(chunk).decoder.layers
+        except (AttributeError, RuntimeError):
+            return ()
+        layer_of: dict[int, int] = {}
+        params: dict[int, torch.nn.Parameter] = {}
+
+        def slot_params(
+            modules: Iterable[torch.nn.Module],
+        ) -> Iterator[torch.nn.Parameter]:
+            for module in modules:
+                # A LoRA without slot tables holds no slot parameters.
+                if isinstance(module, LoRA) and "_slot_keys" in vars(module):
+                    for ref in refs:
+                        yield from module.lora_slot_params(ref)
+
+        for index, layer in enumerate(layers):
+            for param in slot_params(layer.modules()):
+                params[id(param)] = param
+                layer_of[id(param)] = max(layer_of.get(id(param), -1), index)
+        # Outside the decoder (a head runs its backward first) is live
+        # throughout, even for a parameter or module a decoder layer also uses:
+        # walk every path except through the layers themselves.
+        outside: list[torch.nn.Module] = []
+        visited: set[int] = set()
+        pending_modules: list[torch.nn.Module] = [chunk]
+        while pending_modules:
+            module = pending_modules.pop()
+            if module is layers or id(module) in visited:
+                continue
+            visited.add(id(module))
+            outside.append(module)
+            pending_modules.extend(module.children())
+        for param in slot_params(outside):
+            params[id(param)] = param
+            layer_of[id(param)] = len(layers)
+        # A checkpoint's other trainable parameters (custom objects) have no
+        # decoder position; count them as live throughout.
+        for ref in refs:
+            slot = (
+                None
+                if ref.name is None
+                else getattr(self, "_checkpoint_slots", {}).get(ref.name)
+            )
+            for param in () if slot is None else slot.params:
+                if id(param) not in params:
+                    params[id(param)] = param
+                    layer_of[id(param)] = len(layers)
+        sizes = [0] * (len(layers) + 1)
+        for param_id, param in params.items():
+            if (
+                param.requires_grad
+                and param.grad is None
+                and getattr(param, "main_grad", None) is None
+            ):
+                sizes[layer_of[param_id]] += param.numel() * param.element_size()
+        return tuple(sizes) if any(sizes) else ()
+
+    def _checkpoint_adapter_gradient_bytes(
+        self, slots: Iterable["LoRASlotRef"], boundaries: Sequence[int]
+    ) -> int:
+        """The recompute backward's adapter-gradient peak beyond released boundaries.
+
+        Backward recomputes the last layer first. While it recomputes layer i it
+        still holds the saved boundaries of layers 0..i and every adapter
+        gradient allocated so far: those of layers i..L-1 (a layer allocates its
+        own during its backward) and any outside the decoder. The floor already
+        prices all L boundaries at once, so the extra peak is
+        max(0, max over i of gradients(i..) - boundaries(i+1..)), taken at every
+        layer over the real per-layer gradient sizes and the caller's per-layer
+        boundaries, not along a uniform-layer line. A short
+        first wave peaks at layer 0 (Qwen3.6-35B-A3B CP2: 830-900 MB of expert
+        LoRA gradients live at its peak), a long one at the last layer.
+        ``boundaries`` gives each decoder layer's saved-boundary bytes;
+        ``slots`` are the gradient groups' adapter slots.
+        """
+        pending = self._pending_adapter_gradient_bytes(slots)
+        if not pending or len(pending) != len(boundaries) + 1:
+            return 0
+        extra = gradients = pending[-1]
+        released = 0
+        for index in range(len(boundaries) - 1, -1, -1):
+            gradients += pending[index]
+            extra = max(extra, gradients - released)
+            released += boundaries[index]
+        return extra
+
+    def _checkpoint_layer_boundaries(self, retained: int) -> tuple[int, ...]:
+        """Each decoder layer's saved-boundary bytes within the floor's retained term."""
+        return (retained // self._num_layers,) * self._num_layers
+
+    def _checkpoint_layer_boundary_sets(
+        self,
+        retained: int,
+        group_rows: tuple[tuple[int, bool], ...],
+        layouts: tuple[_GroupLayout, ...] | None,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Each rank's saved-boundary bytes per decoder layer, as the floor prices them.
+
+        On per-rank CP layouts (``_layout_checkpoint_floor``) a layer saves its
+        input in the GDN layout when it follows a GDN layer in its island and in
+        the attention layout otherwise, on that rank's rows. Elsewhere every
+        layer saves an equal share of the floor's ``retained``.
+        """
+        if (
+            layouts is None
+            or self._topology_key()[1] > 1
+            or not all(grad for _, grad in group_rows)
+        ):
+            return (self._checkpoint_layer_boundaries(retained),)
+        decoder = _language_model(self.runtime.model[0]).decoder
+        gdn_inputs = [
+            getattr(
+                getattr(layer, "_art_gdn_island_boundary", None), "input_layout", ""
+            )
+            == "gdn"
+            for layer in decoder.layers
+        ]
+        hidden = self._hidden_size * 2
+        sets = []
+        for rank in range(len(layouts[0].attention_rows)):
+            attention = sum(max(1, layout.attention_rows[rank]) for layout in layouts)
+            gdn = sum(
+                max(1, layout.attention_rows[rank])
+                if layout.gdn_rows is None
+                else max(1, layout.gdn_rows[rank])
+                for layout in layouts
+            )
+            sets.append(
+                tuple(hidden * (gdn if is_gdn else attention) for is_gdn in gdn_inputs)
+            )
+        return tuple(sets)
+
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
             packed_tokens=plan.packed_tokens,
@@ -4982,18 +5183,37 @@ class TrainerRank:
         # Input gradients live at the recomputed layer's peak; kept out of
         # forward retention, including the cold fallback above.
         gradient = self._checkpoint_input_gradient_bytes(group_rows, slot_refs)
+        gradient_slots = self._gradient_slots(group_rows, slot_refs)
+        # The busiest rank's extra, over each rank's own boundaries.
+        adapter_gradient = (
+            max(
+                self._checkpoint_adapter_gradient_bytes(gradient_slots, boundaries)
+                for boundaries in self._checkpoint_layer_boundary_sets(
+                    checkpoint_retained, group_rows, group_layouts
+                )
+            )
+            if gradient
+            else 0
+        )
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
         checkpoint_workspace = max(
             checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
+        if gradient and self._memory_profiles.get(signature) is None:
+            checkpoint_workspace += _COLD_RECOMPUTE_TRANSIENT_BYTES
         forward_required = required
         if gradient:
             required = max(
                 required,
                 int(
-                    (checkpoint_retained + checkpoint_workspace + gradient)
+                    (
+                        checkpoint_retained
+                        + checkpoint_workspace
+                        + gradient
+                        + adapter_gradient
+                    )
                     * _MEMORY_SAFETY_FACTOR
                 ),
             )
@@ -5007,6 +5227,22 @@ class TrainerRank:
             checkpoint_input_gradient=gradient,
             checkpoint_peak_increment=required - forward_required,
             hybridep_growth=hybridep_growth_bytes,
+            checkpoint_adapter_gradient=adapter_gradient,
+            checkpoint_adapter_gradient_slots=json.dumps(
+                [
+                    [ref.kind, ref.name]
+                    for ref in sorted(
+                        gradient_slots,
+                        key=lambda ref: (
+                            ref.kind,
+                            ref.name is not None,
+                            ref.name or "",
+                        ),
+                    )
+                ]
+            )
+            if adapter_gradient
+            else "",
         )
 
     def _retained_memory_bytes(
@@ -6773,6 +7009,19 @@ class TrainerRank:
             ):
                 # This cheap return type has no slot metadata. Materialize the
                 # exact plan instead of admitting with the constructor rank.
+                return None
+            gradient_slots = [
+                ref
+                for (ref, grad), _ in groups
+                if grad and ref is not None and ref.name is not None
+            ]
+            if (
+                gradient_slots
+                and getattr(self, "_recompute_granularity", None) == "full"
+                and self._pending_adapter_gradient_bytes(gradient_slots)
+            ):
+                # The step's first backward allocates adapter gradients that
+                # only slot metadata can price; the exact plan carries it.
                 return None
             if (
                 any(mode for (_, mode), _ in groups)
@@ -8786,15 +9035,27 @@ class TrainerRank:
             routed_rows=group_routed_rows,
             layouts=group_layouts,
         )
+        backward = 0
+        if include_checkpoint_input_gradient and retained:
+            # The input gradient, the backward's other end and cold transients,
+            # as _subforward_cost.
+            backward = self._checkpoint_input_gradient_bytes(
+                group_rows, slot_refs
+            ) + max(
+                self._checkpoint_adapter_gradient_bytes(
+                    self._gradient_slots(group_rows, slot_refs), boundaries
+                )
+                for boundaries in self._checkpoint_layer_boundary_sets(
+                    retained, group_rows, group_layouts
+                )
+            )
+            if profiled is None and any(grad for _, grad in group_rows):
+                backward += _COLD_RECOMPUTE_TRANSIENT_BYTES
         static_compute = max(
             static_compute,
             max(retained, checkpoint_floor[0])
             + max(workspace, head_workspace_bytes, checkpoint_floor[1])
-            + (
-                self._checkpoint_input_gradient_bytes(group_rows, slot_refs)
-                if include_checkpoint_input_gradient
-                else 0
-            ),
+            + backward,
         )
         if signature.topology[2] > 1:
             # Local head results coexist with full CP outputs during gathering.

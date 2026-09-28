@@ -11,6 +11,9 @@ import torch
 
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import (
+    _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD,
+)
+from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
     _ep_routed_row_allowance,
     _MemoryProfile,
@@ -847,15 +850,19 @@ def test_hybridep_recompute_prices_fresh_dense_output_without_buffer_growth(
     # The combine output, with the TE workspaces live beside it.
     assert workspace == 218752 * 2048 * 2 + rank._te_workspace_growth_bytes()
     cost = rank._subforward_cost(**values)
-    assert cost.required == int((8 + 2 * retained + workspace) * 1.1)
-    assert cost.checkpoint_workspace == workspace  # Maximum, not stage + output.
+    # Unprofiled: the first execution's transients sit beside the extent.
+    assert cost.required == int((8 + 2 * retained + workspace + COLD) * 1.1)
+    assert cost.checkpoint_workspace == workspace + COLD  # Not stage + output.
     rank._available_memory_bytes = lambda: 600000000
     assert rank._memory_check_required(baseline.required).fits
     assert not rank._memory_check_required(cost.required).fits
     rank._memory_profiles[signature] = _MemoryProfile(
         bytes_per_token=1, packed_tokens=2
     )
-    assert rank._subforward_cost(**values).required == cost.required
+    # Profiled: the floor alone, without first-execution transients.
+    assert rank._subforward_cost(**values).required == int(
+        (8 + 2 * retained + workspace) * 1.1
+    )
     rank._memory_profiles[signature] = _MemoryProfile(
         bytes_per_token=10**9, packed_tokens=2
     )
