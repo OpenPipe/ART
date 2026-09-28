@@ -1195,6 +1195,13 @@ class _RenderContextGuard:
         return result
 
 
+class _SourceRenderGuard(_RenderContextGuard):
+    """Validate original evidence while allowing disposable renderer arguments."""
+
+    def call(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        return super().call(lambda: function(*args, **kwargs))
+
+
 def _plain_tokenizer_attribute(tokenizer: object, name: str) -> tuple[bool, object]:
     kind = type(tokenizer)
     if type(kind) is not type:
@@ -3186,7 +3193,19 @@ def _tokenize_exchange_trajectory(
             # Selection and rendering are separate callbacks. The retained
             # projection must remain stable before either consumes it.
             args = (
-                _RenderingTokenizer(args[0], _RenderContextGuard(lambda: projection)),
+                _RenderingTokenizer(
+                    args[0],
+                    _RenderContextGuard(lambda: ledger.checked(lambda: projection)),
+                ),
+                *args[1:],
+            )
+        elif function is _template_ids:
+            # Conversion makes disposable messages, but tool schemas can still
+            # alias original requests. Check between selection and rendering.
+            args = (
+                _RenderingTokenizer(
+                    args[0], _SourceRenderGuard(lambda: ledger.checked(lambda: None))
+                ),
                 *args[1:],
             )
         if not callback_used:
