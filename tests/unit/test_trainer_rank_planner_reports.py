@@ -197,7 +197,8 @@ def test_spool_full_preserves_first_report_and_does_not_fail_training(
     monkeypatch.setattr(reports, "MAX_SPOOL_REPORTS", 1)
     assert report(tmp_path) is None
     assert path.read_bytes() == raw
-    assert "local persistence failed" in caplog.text
+    assert "report retention limit reached; report omitted" in caplog.text
+    assert "local persistence failed" not in caplog.text
 
 
 def test_uploaded_report_eviction_during_scan_keeps_new_report(tmp_path, monkeypatch):

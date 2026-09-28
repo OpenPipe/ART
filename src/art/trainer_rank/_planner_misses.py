@@ -372,7 +372,9 @@ def persist_report(
             count += 1
             size += item.st_size
             if count >= count_limit or size + len(raw) > byte_limit:
-                raise ValueError("report spool is full; preserve and export reports")
+                raise _planner_retention.RetentionLimitReached(
+                    "report spool is full; preserve and export reports"
+                )
         fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=spool_dir)
         try:
             with os.fdopen(fd, "wb") as output:
@@ -508,7 +510,11 @@ class Reporter:
             )
         except Exception as exc:
             self.failures += 1
-            _warn(f"local persistence failed ({type(exc).__name__})")
+            _warn(
+                "report retention limit reached; report omitted"
+                if isinstance(exc, _planner_retention.RetentionLimitReached)
+                else f"local persistence failed ({type(exc).__name__})"
+            )
             return None
         if not record["replay_complete"]:
             _warn(f"partial replay retained at {path}")
