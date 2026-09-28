@@ -18,11 +18,21 @@ jobs:
     outputs:
       required: ${{ steps.changes.outputs.required }}
       head_sha: ${{ steps.changes.outputs.head_sha }}
+      reused: ${{ steps.reuse.outputs.cache-hit }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
+
+      - id: reuse
+        name: Find exact prior GPU validation
+        if: github.event_name == 'pull_request' && github.event.action == 'ready_for_review'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/trainer-rank-gpu-success
+          key: trainer-rank-gpu-success-v1-${{ github.event.pull_request.base.sha }}-${{ github.event.pull_request.head.sha }}
+          lookup-only: true
 
       - id: changes
         name: Classify changed files
@@ -65,7 +75,7 @@ jobs:
   validate:
     name: Run on 2x H200
     needs: classify
-    if: needs.classify.outputs.required == 'true'
+    if: needs.classify.outputs.required == 'true' && needs.classify.outputs.reused != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: trainer-rank-gpu-validation
@@ -150,6 +160,23 @@ jobs:
           "${sky_venv}/bin/python" scripts/ci/trainer-rank-gpu.py \
             "${RUNNER_TEMP}/trainer-rank-result"
 
+      - name: Record successful validation
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/trainer-rank-gpu-success"
+          printf '%s %s\n' "${BASE_SHA}" "${HEAD_SHA}" \
+            > "${RUNNER_TEMP}/trainer-rank-gpu-success/passed"
+
+      - name: Publish exact successful validation
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/trainer-rank-gpu-success
+          key: trainer-rank-gpu-success-v1-${{ github.event.pull_request.base.sha }}-${{ github.event.pull_request.head.sha }}
+
       - name: Preserve remote result and diagnostic logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -167,17 +194,22 @@ jobs:
       - env:
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           REQUIRED: ${{ needs.classify.outputs.required }}
+          REUSED: ${{ needs.classify.outputs.reused }}
           RESULT: ${{ needs.validate.result }}
         run: |
           if [ "${CLASSIFY_RESULT}" != "success" ]; then
             echo "TrainerRank GPU classification failed." >&2
             exit 1
           fi
-          if [ "${REQUIRED}" = "true" ] && [ "${RESULT}" != "success" ]; then
+          if [ "${REQUIRED}" = "true" ] \
+            && [ "${REUSED}" != "true" ] \
+            && [ "${RESULT}" != "success" ]; then
             echo "TrainerRank GPU validation required but result was ${RESULT}." >&2
             exit 1
           fi
-          if [ "${REQUIRED}" = "true" ]; then
+          if [ "${REUSED}" = "true" ]; then
+            echo "TrainerRank GPU validation reused for this exact base and head."
+          elif [ "${REQUIRED}" = "true" ]; then
             echo "TrainerRank GPU validation passed."
           else
             echo "TrainerRank GPU validation was not required."
