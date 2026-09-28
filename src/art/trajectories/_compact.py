@@ -722,7 +722,13 @@ def _decode_value(value: object, strings: dict[str, str]) -> pydantic.JsonValue:
     if isinstance(value, str):
         return strings.get(value, value)
     if isinstance(value, list):
-        return [_decode_value(item, strings) for item in value]
+        # Token IDs and logprobs need copying, but no string-reference decoding.
+        return [
+            item
+            if type(item) is int or type(item) is float
+            else _decode_value(item, strings)
+            for item in value
+        ]
     if isinstance(value, dict):
         decoded: dict[str, pydantic.JsonValue] = {}
         for key, item in value.items():

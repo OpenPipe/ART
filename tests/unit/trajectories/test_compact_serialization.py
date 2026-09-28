@@ -16,6 +16,7 @@ import art
 import art.trajectories as tr
 from art.trajectories import _tokenize
 from art.trajectories._capture.core import begin, reset
+from art.trajectories._compact import _decode_value
 from art.trajectories._protocols import Endpoint, build_exchange
 
 
@@ -286,6 +287,70 @@ def test_compact_decode_is_one_level_and_unmatched_references_are_literal() -> N
     restored = art.trajectories.compact_validate(payload, type=art.Trajectory)
 
     assert restored.metadata == {"mapped": "$1", "literal": "$2"}
+
+
+def test_compact_decode_numeric_lists_preserve_values_and_copy_each_occurrence() -> (
+    None
+):
+    escaped = '\x00\n"\\\N{SNOWMAN}'
+    numbers = [0, -(2**100), 2**100, -0.0, float("inf"), float("nan")]
+    shared = [*numbers, True, False, None, "$0", "$2", {"$0": numbers}]
+    original = [shared, shared]
+
+    decoded = _decode_value(original, {"$0": escaped, "$1": "unused"})
+
+    assert isinstance(decoded, list)
+    assert decoded is not original
+    assert decoded[0] is not shared and decoded[1] is not shared
+    assert decoded[0] is not decoded[1]
+    for result in decoded:
+        assert isinstance(result, list)
+        assert all(
+            actual is expected for actual, expected in zip(result[:9], shared[:9])
+        )
+        assert result[9] is escaped and result[10] == "$2"
+        assert result[11][escaped] is not numbers
+        assert all(a is b for a, b in zip(result[11][escaped], numbers))
+    decoded[0].append("new")
+    decoded[0][11][escaped].append(123)
+    assert len(shared) == len(decoded[1]) == 12
+    assert len(numbers) == len(decoded[1][11][escaped]) == 6
+
+
+def test_compact_decode_preserves_numeric_subclasses_and_custom_list_iteration() -> (
+    None
+):
+    class Integer(int):
+        pass
+
+    class Float(float):
+        pass
+
+    number, probability = Integer(7), Float(-0.5)
+
+    class Values(list):
+        def __iter__(self):
+            return iter([number, probability, "$0"])
+
+    decoded = _decode_value(Values(["ignored"]), {"$0": "decoded"})
+    assert type(decoded) is list
+    assert decoded[0] is number and decoded[1] is probability
+    assert decoded[2] == "decoded"
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ([1, 0.5, (2,)], "JSON-compatible"),
+        ([1, 0.5, {2: "value"}], "keys must be strings"),
+        ([1, 0.5, {"$0": 1, "duplicate": object()}], "duplicate key"),
+    ],
+)
+def test_compact_decode_numeric_list_still_validates_later_values(
+    value, message
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        _decode_value(value, {"$0": "duplicate"})
 
 
 def test_compact_reference_literal_mapped_away_can_release_its_reference() -> None:
