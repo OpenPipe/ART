@@ -110,18 +110,12 @@ def _prepare_vllm_lora_publish(
     adapter_dtypes: dict[str, torch.dtype],
     handler: Any,
     adapter_config: dict[str, Any],
-    rank: int,
-    world_size: int,
+    runtime: tuple[int, torch.device],
     slot_ref: LoRASlotRef | None = None,
-    runtime: tuple[int, torch.device] | None = None,
 ) -> _VllmLoraPublishPlan:
     from art.megatron.weights import lora_publish
 
-    rank, device = (
-        _validate_vllm_lora_publish_runtime(rank, world_size)
-        if runtime is None
-        else runtime
-    )
+    rank, device = runtime
     packed_expert_groups = tuple(handler.expert_packed_lora_groups())
     local_tensors, local_metadata = lora_publish.collect_local_lora_entries(
         model,
@@ -243,8 +237,6 @@ def _capture_lora_publish_inputs(
             adapter_dtypes={},
             handler=trainer.runtime.model_support_handler,
             adapter_config=adapter_config,
-            rank=trainer.runtime.rank,
-            world_size=trainer.runtime.world_size,
             slot_ref=trainer._slot_ref(checkpoint_name),
             runtime=runtime,
         ),
