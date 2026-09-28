@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from functools import lru_cache
 import json
 import re
 from typing import Any
@@ -523,6 +524,32 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
         }
     if not isinstance(chat_template, str):
         return chat_template
+    if type(chat_template) is not str or len(chat_template) > _TEMPLATE_CACHE_MAX_CHARS:
+        return _normalize_chat_template(chat_template)
+    try:
+        return _cached_normalize_chat_template(chat_template)
+    except _UncachedTemplate as result:
+        return result.args[0]
+
+
+# Bound retained input and output strings, including their widest Unicode form.
+# Oversized templates still use the original normalization path without caching.
+_TEMPLATE_CACHE_MAX_CHARS = 32_768
+
+
+class _UncachedTemplate(Exception):
+    """Return an oversized result without retaining it in functools' cache."""
+
+
+@lru_cache(maxsize=64)
+def _cached_normalize_chat_template(template: str) -> str:
+    result = _normalize_chat_template(template)
+    if len(result) > _TEMPLATE_CACHE_MAX_CHARS:
+        raise _UncachedTemplate(result)
+    return result
+
+
+def _normalize_chat_template(chat_template: str) -> str:
     literal_template = _without_inline_reasoning_parser(chat_template)
     inline_parser_removed = literal_template != chat_template
     chat_template = literal_template
