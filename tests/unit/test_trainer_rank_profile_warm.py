@@ -8,6 +8,7 @@ first wave's one-time costs.
 
 from dataclasses import replace
 
+import pytest
 from test_trainer_rank_active_memory import _rank as packed_rank
 from test_trainer_rank_active_memory import _requests as packed_requests
 from test_trainer_rank_checkpoint_memory import rank, requests
@@ -471,3 +472,39 @@ def test_a_higher_reading_before_the_first_warm_plan_is_kept():
     profile = r._memory_profiles[first.signature]
     assert profile.warm_bytes_per_token == WARM + 300_000
     assert _required(r, larger) == int((WARM + 300_000) * larger.packed_tokens * 1.1)
+
+
+@pytest.mark.parametrize(
+    "before,after,excluded",
+    [
+        (0, 2, 5 * 1000),  # Plain and grouped sets: one + four stream workspaces.
+        (1, 2, 1000),  # Either kind: the least a set holds.
+        (0, 1, 1000),
+        (2, 2, 0),  # Already allocated: later waves never pay it.
+    ],
+)
+def test_te_workspaces_a_wave_grows_teach_no_rate(monkeypatch, before, after, excluded):
+    from transformer_engine.pytorch.cpp_extensions import gemm
+
+    r = rank()
+    first, _larger = _plans(r)
+    monkeypatch.setattr(gemm, "get_cublas_workspace_size_bytes", lambda: 1000)
+    monkeypatch.setattr(gemm.tex, "get_num_cublas_streams", lambda: 4)
+    sets = {"n": before}
+    monkeypatch.setattr(r, "_te_workspace_sets", lambda: sets["n"])
+    state, _ = _peak_reader(monkeypatch, r)
+    r._peak_resets = 7
+    r._te_workspaces_at_reset = (7, before)
+    rate = 300
+    state["peak"] = first.output_bytes + rate * first.packed_tokens + excluded
+    sets["n"] = after
+    r._update_peak_memory_profile(first, 0, 0)
+    profile = r._memory_profiles[first.signature]
+    assert profile.bytes_per_token == rate
+    # A reading outside the window that saw the sets grow keeps them.
+    del r._memory_profiles[first.signature]
+    r._te_workspaces_at_reset = (6, before)
+    r._update_peak_memory_profile(first, 0, 0)
+    assert r._memory_profiles[first.signature].bytes_per_token == (
+        rate + excluded / first.packed_tokens
+    )
