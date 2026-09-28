@@ -24,7 +24,11 @@ def test_context_preserves_mapping_order_aliases_and_fresh_mutable_reads(mapping
     )
     first, second = original[1]
     assert first is second
-    assert first[0] is mapping_type
+    if type(mapping_type) is type:
+        assert first[0] is mapping_type
+    else:
+        assert first[0][0] == id(mapping_type)
+        assert first[0][1] is mapping_type
     assert [entry[0] for entry in first[1]] == [(str, "first"), (str, "second")]
     assert first[1][0][1] is first[1][1][1]
     if isinstance(mapping, ObservedDict):
