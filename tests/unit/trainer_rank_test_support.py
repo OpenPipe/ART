@@ -39,8 +39,12 @@ def fake_rank(rank_type: type["TrainerRank"], model, **provider) -> "TrainerRank
     return rank_type(runtime)
 
 
-def full_recompute_config(hidden_size, num_layers, sequence_parallel, /, **config):
-    return SimpleNamespace(
+def recompute_model(
+    block_type, hidden_size, num_layers, sequence_parallel, /, *, layers=(), **config
+):
+    block = block_type.__new__(block_type)
+    torch.nn.Module.__init__(block)
+    block.config = SimpleNamespace(
         hidden_size=hidden_size,
         num_layers=num_layers,
         padded_vocab_size=32,
@@ -56,16 +60,6 @@ def full_recompute_config(hidden_size, num_layers, sequence_parallel, /, **confi
         fp8=None,
         fp4=None,
         **config,
-    )
-
-
-def recompute_model(
-    block_type, hidden_size, num_layers, sequence_parallel, /, *, layers=(), **config
-):
-    block = block_type.__new__(block_type)
-    torch.nn.Module.__init__(block)
-    block.config = full_recompute_config(
-        hidden_size, num_layers, sequence_parallel, **config
     )
     block.layers = torch.nn.ModuleList(
         list(layers)

@@ -122,28 +122,39 @@ def test_no_grad_enclosure_empty_and_unsupported():
 
 
 @pytest.mark.parametrize(
-    "field,value",
+    "mode,field,value",
     [
-        ("recompute_granularity", "selective"),
-        ("recompute_method", "block"),
-        ("recompute_num_layers", 2),
-        ("distribute_saved_activations", True),
-        ("sequence_parallel", True),
-        ("fp32_residual_connection", True),
-        ("cpu_offloading", True),
-        ("cuda_graph_impl", "local"),
-        ("params_dtype", torch.float32),
-        ("fp8", "hybrid"),
-        ("fp4", True),
-        ("num_layers", 39),
-        ("hidden_size", 1024),
+        ("grad", "recompute_granularity", "selective"),
+        ("grad", "recompute_method", "block"),
+        ("grad", "recompute_num_layers", 2),
+        ("grad", "distribute_saved_activations", True),
+        ("grad", "sequence_parallel", True),
+        ("grad", "fp32_residual_connection", True),
+        ("grad", "cpu_offloading", True),
+        ("grad", "cuda_graph_impl", "local"),
+        ("grad", "params_dtype", torch.float32),
+        ("grad", "fp8", "hybrid"),
+        ("grad", "fp4", True),
+        ("grad", "num_layers", 39),
+        ("grad", "hidden_size", 1024),
+        ("cold-grad", "recompute_num_layers", True),
+        ("cold-grad", "cpu_offloading", 0),
+        ("no-grad", "recompute_granularity", None),
+        ("no-grad", "recompute_granularity", "selective"),
+        ("no-grad", "recompute_method", "block"),
+        ("no-grad", "recompute_num_layers", True),
+        ("no-grad", "cpu_offloading", True),
+        ("no-grad", "params_dtype", torch.float32),
     ],
+    ids=str,
 )
-def test_actual_config_revalidated(field, value):
+def test_actual_config_revalidated(mode, field, value):
     r = rank()
-    assert r._checkpoint_memory_floor(((10, True),))[0] > 0
+    if mode == "grad":
+        assert r._checkpoint_memory_floor(((10, True),))[0] > 0
     setattr(r.runtime.model[0].decoder.config, field, value)
-    assert r._checkpoint_memory_floor(((10, True),)) == (0, 0)
+    groups = ((11, False),) if mode == "no-grad" else ((10, True),)
+    assert r._checkpoint_memory_floor(groups) == (0, 0)
 
 
 @pytest.mark.parametrize("axis", [1, 3])
@@ -329,15 +340,6 @@ def test_optimistic_split_profile_cliff_preserves_checkpoint_floor():
     assert cost.retained == int((full.output_bytes + retained) * 1.1)
 
 
-@pytest.mark.parametrize(
-    "field,value", [("recompute_num_layers", True), ("cpu_offloading", 0)]
-)
-def test_malformed_flag_types_do_not_claim_supported_schedule(field, value):
-    r = rank()
-    setattr(r.runtime.model[0].decoder.config, field, value)
-    assert r._checkpoint_memory_floor(((10, True),)) == (0, 0)
-
-
 @pytest.mark.parametrize("profile_rate", [None, 1, 1_000_000])
 def test_no_grad_enclosure_exact_lower_and_profile(profile_rate):
     r = rank()
@@ -445,20 +447,3 @@ def test_reference_prefix_search_agrees_with_mixed_demand(fits):
             == r._plan_cost(reference_plan).required
         )
     assert not r._memory_profiles
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("recompute_granularity", None),
-        ("recompute_granularity", "selective"),
-        ("recompute_method", "block"),
-        ("recompute_num_layers", True),
-        ("cpu_offloading", True),
-        ("params_dtype", torch.float32),
-    ],
-)
-def test_no_grad_enclosure_config_guard(field, value):
-    r = rank()
-    setattr(r.runtime.model[0].decoder.config, field, value)
-    assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)
