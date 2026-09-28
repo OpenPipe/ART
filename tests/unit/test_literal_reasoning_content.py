@@ -2,7 +2,7 @@ from copy import deepcopy
 import hashlib
 from pathlib import Path
 
-from jinja2 import DictLoader, pass_context
+from jinja2 import DictLoader, Environment, pass_context
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 import pytest
 
@@ -362,6 +362,59 @@ def test_inherited_renderer_does_not_prove_role_stability():
         .render(message=message, mutate=mutate)
         == "[answer]"
     )
+
+
+@pytest.mark.parametrize("environment", [Environment, ImmutableSandboxedEnvironment])
+@pytest.mark.parametrize(
+    "middle",
+    [
+        "{{ inject() }}",
+        "{{ ''|inject }}",
+        "{% if '' is inject %}{% endif %}",
+        "{% include 'setup' %}",
+    ],
+)
+def test_counter_free_renderer_rejects_implicit_macro_mutation(environment, middle):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    source = (
+        "{% macro render_content(content,count) %}{{ content }}{% endmacro %}"
+        + middle
+        + trim
+        + "{% if message.role == 'assistant' %}"
+        + match.group()
+        + "{% endif %}[{{ content }}]"
+    )
+
+    def render(template):
+        message = {"role": "assistant", "content": "  answer  "}
+        calls = []
+
+        @pass_context
+        def inject(context, value=None):
+            calls.append("inject")
+
+            def replacement(content, count):
+                calls.append("render:" + message["role"])
+                message["role"] = "user"
+                return content
+
+            context["render_content"]._func = replacement
+            return ""
+
+        env = environment(loader=DictLoader({"setup": "{{ inject() }}"}))
+        env.filters["inject"] = env.tests["inject"] = inject
+        output = env.from_string(template).render(message=message, inject=inject)
+        return output, calls, message["role"]
+
+    expected = "[answer]", ["inject", "render:assistant"], "user"
+    fixed = _without_inline_reasoning_parser(source)
+    assert render(source) == render(source.replace(match.group(), "")) == expected
+    assert render(fixed) == expected
+    assert trim in fixed
+    assert not _QWEN_INLINE_REASONING.search(fixed)
+    assert _without_inline_reasoning_parser(fixed) == fixed
 
 
 @pytest.mark.parametrize(
@@ -899,7 +952,7 @@ def test_plain_block_whitespace_keeps_prior_inline_parser_coverage(separator, qu
 @pytest.mark.parametrize("newline", ["\n", "\r\n"])
 @pytest.mark.parametrize("layout", ["macros", "same_line", "branches"])
 @pytest.mark.parametrize("inline_structured_reasoning", [False, True])
-def test_content_trim_is_scoped_to_the_recognized_parser(
+def test_custom_macro_calls_keep_trim_while_removing_recognized_parser(
     preserve, newline, layout, inline_structured_reasoning
 ):
     match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
@@ -929,18 +982,22 @@ def test_content_trim_is_scoped_to_the_recognized_parser(
     fixed = chat_template_with_preserved_thinking(template)
     assert isinstance(fixed, str)
     assert preview in fixed
+    # Other macro calls lack a closed callable-custody proof. Retain their
+    # original trims while still removing only the recognized parser.
+    assert trim in fixed
+    assert not _QWEN_INLINE_REASONING.search(fixed)
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
     kwargs = dict(
         message={"role": "assistant", "content": "  answer  "},
         preserve_thinking=preserve,
     )
-    assert env.from_string(fixed).render(**kwargs).endswith("[  answer  ]|[answer]")
+    assert env.from_string(fixed).render(**kwargs).endswith("[answer]|[answer]")
     kwargs["message"]["content"] = "  before<think>literal</think>after  "
     assert (
         env.from_string(fixed)
         .render(**kwargs)
         .endswith(
-            "[  before<think>literal</think>after  ]|[before<think>literal</think>after]"
+            "[before<think>literal</think>after]|[before<think>literal</think>after]"
         )
     )
     assert chat_template_with_preserved_thinking(fixed) == fixed
@@ -1121,7 +1178,7 @@ def test_shared_content_preview_prevents_ambiguous_trim_rewrite(consumer):
     )
 
 
-def test_only_source_edited_parser_authorizes_its_content_trim():
+def test_custom_macro_calls_keep_trim_and_unedited_parser():
     match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
     assert match is not None
     parser = match.group()
@@ -1142,8 +1199,10 @@ def test_only_source_edited_parser_authorizes_its_content_trim():
     )
     fixed = _without_inline_reasoning_parser(template)
     assert preview in fixed
+    assert answer not in fixed
+    assert trim in fixed
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
     rendered = env.from_string(fixed).render(
         message={"role": "assistant", "content": "  HEAD<think>literal</think>TAIL  "}
     )
-    assert rendered == "[  HEAD<think>literal</think>TAIL  ]|[TAIL]"
+    assert rendered == "[HEAD<think>literal</think>TAIL]|[TAIL]"
