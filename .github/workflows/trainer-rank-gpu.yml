@@ -38,6 +38,18 @@ jobs:
         with:
           script: |
             const pull = context.payload.pull_request;
+            const identity = [
+              pull?.head?.repo?.full_name,
+              pull?.head?.ref,
+              pull?.head?.sha,
+              pull?.base?.sha,
+            ];
+            if (!identity.every(value =>
+              typeof value === 'string' && value.length > 0
+            )) {
+              core.warning('Prior GPU validation identity is incomplete.');
+              return;
+            }
             const runs = await github.rest.actions.listWorkflowRuns({
               ...context.repo,
               workflow_id: 'trainer-rank-gpu.yml',
@@ -48,9 +60,10 @@ jobs:
             });
             const candidates = runs.data.workflow_runs.filter(run =>
               run.id !== context.runId &&
+              run.head_repository?.full_name === pull.head.repo.full_name &&
+              run.head_branch === pull.head.ref &&
               run.head_sha === pull.head.sha &&
-              run.path === '.github/workflows/trainer-rank-gpu.yml' &&
-              (run.pull_requests ?? []).some(previous => previous.number === pull.number)
+              run.path === '.github/workflows/trainer-rank-gpu.yml'
             ).slice(0, 10);
             for (const run of candidates) {
               const jobs = await github.rest.actions.listJobsForWorkflowRun({
