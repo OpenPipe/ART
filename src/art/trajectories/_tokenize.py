@@ -1164,6 +1164,9 @@ class _TraceBuilder:
     consumed_sources: dict[
         tuple[_SampledSourceKey, int], tuple[_SampledSourceKey, object]
     ] = field(default_factory=dict)
+    fingerprints: _RevalidatedFingerprints = field(
+        default_factory=lambda: _RevalidatedFingerprints()
+    )
 
     def consume_sources(
         self,
@@ -1202,6 +1205,7 @@ class _TraceBuilder:
                 list(self.consumed_sources.values()),
                 selected_request_fields=selected_request_fields,
                 rendered_evidence=self.rendered_evidence,
+                _fingerprints=self.fingerprints,
             )
 
     def consume_auxiliary(
@@ -3921,7 +3925,7 @@ def _history_needs_synthetic_stop(
     for source in sources:
         if source is None or not _source_is_sampled(source):
             continue
-        source_key = _sampled_source_key(source)
+        source_key = _sampled_source_key(source, _fingerprints=ledger.fingerprints)
         if source_key in seen:
             continue
         seen.add(source_key)
@@ -4947,6 +4951,7 @@ def _sampled_source_validator(
     *,
     selected_request_fields: tuple[str, ...] | None = None,
     rendered_evidence: bool = False,
+    _fingerprints: _RevalidatedFingerprints | None = None,
 ) -> _SampledSourceValidator:
     expected = {}
     observed: dict[int, tuple[object, object]] = {}
@@ -4993,7 +4998,9 @@ def _sampled_source_validator(
             )
         )
 
-    fingerprints = _RevalidatedFingerprints()
+    fingerprints = (
+        _RevalidatedFingerprints() if _fingerprints is None else _fingerprints
+    )
 
     def validate(
         selected: _SampledSourceKey | None,
@@ -5700,6 +5707,9 @@ def _tokenize_recorded_chat_boundaries(
         return None
     entries: list[tuple[int, object, list[int], list[int], list[float]]] = []
     sources: dict[_SampledSourceKey, object] = {}
+    fingerprints = (
+        _trace.fingerprints if _trace is not None else _RevalidatedFingerprints()
+    )
     for index, (message, source) in enumerate(
         zip(messages, history.message_sources, strict=True)
     ):
@@ -5707,7 +5717,7 @@ def _tokenize_recorded_chat_boundaries(
             continue
         if source is None or not _source_is_sampled(source):
             return None
-        key = _sampled_source_key(source)
+        key = _sampled_source_key(source, _fingerprints=fingerprints)
         prompt, output, logprobs = _chat_source_record(source)
         if key in sources or prompt is None or output is None:
             return None
@@ -5741,7 +5751,7 @@ def _tokenize_recorded_chat_boundaries(
     boundaries: dict[_SampledSourceKey, _RenderedLengthStopBoundary] = {}
     # Entries already consumed every native record. No callback may replace
     # that evidence before a later source or the final assembler reads it again.
-    validate_sources = _sampled_source_validator(sources)
+    validate_sources = _sampled_source_validator(sources, _fingerprints=fingerprints)
     validate_context = _tokenization_context_validator(history)
     keys = tuple(sources)
     selected_key: _SampledSourceKey | None = None
@@ -6098,7 +6108,7 @@ def _tokenize_chat_view(
         )
     # Current projected sources have already been inspected for admission.
     consumed_keys = {
-        id(source): _sampled_source_key(source)
+        id(source): _sampled_source_key(source, _fingerprints=ledger.fingerprints)
         for source in history.message_sources
         if source is not None and _source_is_sampled(source)
     }
@@ -8645,13 +8655,14 @@ def _tokenize_history(
         if _projection_validated
         else _history_render_state(history)
     )
-    # Without a tokenizer, the stop decision and first exact assembly have no
-    # user callback between them. Keep their evidence in one bounded phase;
-    # never carry it into a rendered or tokenizer-supplied path.
+    # Only a callback-free phase can memoize by identity. With a tokenizer,
+    # retain the encoding cache while freshly rereading evidence at every use.
     fingerprints: dict[tuple[int, str, int], tuple[Exchange, str]] | None = (
         {}
         if tokenizer is None and isinstance(history, ChatCompletionsHistory)
-        else None
+        else _trace.fingerprints
+        if _trace is not None
+        else _RevalidatedFingerprints()
     )
     has_length_stop = can_render and _history_has_length_stop(
         history, _fingerprints=fingerprints
@@ -8704,7 +8715,7 @@ def _tokenize_history(
                     _trace=_trace,
                     _strict_sources=True,
                     _prior=_prior,
-                    _fingerprints=fingerprints,
+                    _fingerprints=fingerprints if tokenizer is None else None,
                 )
             )
         ):
