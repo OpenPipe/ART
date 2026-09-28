@@ -4924,7 +4924,12 @@ def _tokenization_context(
                         slots.append((owner, name, True, snapshot(child)))
         return snapshot(dictionary), tuple(slots)
 
-    return snapshot(value)
+    try:
+        return snapshot(value)
+    except RecursionError as error:
+        # Recursive context cannot prove callback stability, but complete native
+        # records can still use the ordinary opaque-context bypass.
+        raise TypeError("Unsupported recursive tokenization context") from error
 
 
 def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
