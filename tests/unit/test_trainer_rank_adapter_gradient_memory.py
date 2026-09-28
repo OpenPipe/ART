@@ -146,11 +146,11 @@ def test_gradient_groups_run_their_backward_one_after_another(monkeypatch):
 def test_sequential_groups_match_every_order_for_random_sizes(monkeypatch):
     r = rank()
     generator = random.Random(1)
-    slots = [POLICY, OTHER, LoRASlotRef("checkpoint", "third")]
+    slots = [LoRASlotRef("checkpoint", f"slot{index}") for index in range(5)]
     for _ in range(200):
         layers = generator.randint(1, 6)
         chains, groups, by_slot = [], [], {}
-        for slot in slots[: generator.randint(1, 3)]:
+        for slot in slots[: generator.randint(1, 5)]:
             pending = [generator.randint(0, 30) for _ in range(layers + 1)]
             boundaries = [generator.randint(0, 30) for _ in range(layers)]
             if generator.random() < 0.25:
@@ -163,17 +163,18 @@ def test_sequential_groups_match_every_order_for_random_sizes(monkeypatch):
         assert r._checkpoint_adapter_gradient_bytes(groups) == sequential_oracle(chains)
 
 
-def test_many_gradient_groups_price_every_gradient_live(monkeypatch):
+def test_many_gradient_groups_price_exactly(monkeypatch):
     r = rank()
-    slots = [LoRASlotRef("checkpoint", f"slot{index}") for index in range(5)]
-    pending = [3, 1, 2]
-    with_slot_pending(monkeypatch, r, {(slot,): pending for slot in slots})
-    groups = [(slot, [100, 100]) for slot in slots]
-    # Too many orders to walk: all five slots' gradients, nothing released.
-    assert r._checkpoint_adapter_gradient_bytes(groups) == 5 * sum(pending)
-    assert r._checkpoint_adapter_gradient_bytes(groups[:4]) == sequential_oracle(
-        [(pending, [100, 100])] * 4
+    slots = [LoRASlotRef("checkpoint", f"slot{index}") for index in range(6)]
+    # Only groups whose gradients outweigh their boundaries raise another
+    # group's peak by having run first.
+    chains = [([3, 1, 2], [100, 100])] * 3 + [([90, 40, 5], [2, 1])] * 3
+    with_slot_pending(
+        monkeypatch, r, {(slot,): pending for slot, (pending, _) in zip(slots, chains)}
     )
+    groups = [(slot, boundaries) for slot, (_, boundaries) in zip(slots, chains)]
+    assert r._checkpoint_adapter_gradient_bytes(groups) == sequential_oracle(chains)
+    assert sequential_oracle(chains) < sum(sum(pending) for pending, _ in chains)
 
 
 def lora(**slots: list[torch.nn.Parameter]) -> LoRA:
