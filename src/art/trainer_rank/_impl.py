@@ -3048,6 +3048,49 @@ class TrainerRank:
         self._complete_planner_observation(phase="forward")
         return outputs
 
+    @contextmanager
+    def _forward_handoff(self, *, advance: bool) -> Iterator[None]:
+        # Only intermediate TP/CP frontiers can race the next model collective.
+        group = caller_group() if advance else None
+        if group is None or dist.get_world_size(group) == 1:
+            yield
+            return
+        error: BaseException | None = None
+        try:
+            yield
+        except BaseException as exc:
+            error = exc
+        try:
+            (failed,) = self._recovery_reduce(
+                [float(error is not None)], op="MAX", sync_across_dp=False
+            )
+        except BaseException as exchange_error:
+            if error is None:
+                raise
+            self._memory_error_with_reduction_note(
+                error, exchange_error, operation="forward handoff"
+            )
+        else:
+            if error is None and failed:
+                raise RuntimeError("Forward handoff failed on another rank")
+        if error is not None:
+            raise error
+
+    def _discard_forward_graphs(
+        self, previous: tuple[str, ...], error: BaseException
+    ) -> None:
+        cache = getattr(self, "_graph_cache", None)
+        if cache is not None:
+            previous_handles = set(previous)
+            for handle in cache.handles():
+                if handle not in previous_handles:
+                    try:
+                        cache.release(handle)
+                    except BaseException as cleanup_error:
+                        self._memory_error_with_reduction_note(
+                            error, cleanup_error, operation="forward graph release"
+                        )
+
     @_backward_region
     def _execute_split_plan_with_memory_tracking(
         self, plan: _SplitForwardPlan, *, check: _MemoryCheck, context: str
@@ -3055,40 +3098,51 @@ class TrainerRank:
         state = self._recovery_state()
         work_before = state.work
         self._begin_planner_observation(plan, check)
+        previous = self._graph_cache.handles() if hasattr(self, "_graph_cache") else ()
+        outputs: list[AnyForwardOutput] = []
+        output: AnyForwardOutput | None = None
+        merged: list[AnyForwardOutput | None] = []
         self._planner_observing_split = True
         try:
             baseline, peak = None, 0
-            merged: list[AnyForwardOutput | None] = [None] * plan.request_count
+            merged = [None] * plan.request_count
             for ordinal, (subforward, indices) in enumerate(
                 zip(plan.subforwards, plan.request_indices, strict=True)
             ):
-                try:
-                    outputs, child_baseline = self._run_flat_plan_with_memory_tracking(
-                        subforward, check=check, context=context
-                    )
-                    if child_baseline is not None:
-                        if baseline is None:
-                            baseline = child_baseline
-                        peak = max(
-                            peak, int(torch.cuda.max_memory_allocated(self.device))
+                with self._forward_handoff(advance=ordinal + 1 < plan.subforward_count):
+                    try:
+                        outputs, child_baseline = (
+                            self._run_flat_plan_with_memory_tracking(
+                                subforward, check=check, context=context
+                            )
                         )
-                except TrainerRankMemoryError as error:
-                    # Model execution already began, so no replanning is possible
-                    # and the caller must not mistake this for an up-front refusal.
-                    raise TrainerRankPartialExecutionError(
-                        f"{context}: subforward {ordinal + 1} of "
-                        f"{plan.subforward_count} failed during execution "
-                        f"({ordinal} of {plan.subforward_count} completed). {error}",
-                        predicted_peak_bytes=error.predicted_peak_bytes,
-                        usable_limit_bytes=error.usable_limit_bytes,
-                        suggestion=error.suggestion,
-                    ) from error
-                for index, output in zip(indices, outputs, strict=True):
-                    merged[index] = output
+                        if child_baseline is not None:
+                            if baseline is None:
+                                baseline = child_baseline
+                            peak = max(
+                                peak, int(torch.cuda.max_memory_allocated(self.device))
+                            )
+                    except TrainerRankMemoryError as error:
+                        # Model execution already began, so no replanning is possible
+                        # and the caller must not mistake this for an up-front refusal.
+                        raise TrainerRankPartialExecutionError(
+                            f"{context}: subforward {ordinal + 1} of "
+                            f"{plan.subforward_count} failed during execution "
+                            f"({ordinal} of {plan.subforward_count} completed). {error}",
+                            predicted_peak_bytes=error.predicted_peak_bytes,
+                            usable_limit_bytes=error.usable_limit_bytes,
+                            suggestion=error.suggestion,
+                        ) from error
+                    for index, output in zip(indices, outputs, strict=True):
+                        merged[index] = output
             if any(output is None for output in merged):
                 raise AssertionError("split execution did not cover every request")
             return cast(list[AnyForwardOutput], merged), baseline, peak
-        except BaseException:
+        except BaseException as error:
+            outputs.clear()
+            merged.clear()
+            output = None
+            self._discard_forward_graphs(previous, error)
             state.work = work_before
             raise
         finally:
@@ -3811,16 +3865,26 @@ class TrainerRank:
             if plan.groups
             else None
         )
+        previous = self._graph_cache.handles() if hasattr(self, "_graph_cache") else ()
+        item_outputs: list[AnyForwardOutput] = []
+        output: AnyForwardOutput | None = None
         try:
             for group_index, group in enumerate(plan.groups):
-                if hybridep is not None:
-                    self._set_hybridep_rows(hybridep[0][group_index])
-                with torch.set_grad_enabled(group.grad_enabled):
-                    item_outputs = self._execute_graph_group(group)
-                for index, output in zip(
-                    group.request_indices, item_outputs, strict=True
-                ):
-                    outputs[index] = output
+                with self._forward_handoff(advance=group_index + 1 < len(plan.groups)):
+                    if hybridep is not None:
+                        self._set_hybridep_rows(hybridep[0][group_index])
+                    with torch.set_grad_enabled(group.grad_enabled):
+                        item_outputs = self._execute_graph_group(group)
+                    for index, output in zip(
+                        group.request_indices, item_outputs, strict=True
+                    ):
+                        outputs[index] = output
+        except BaseException as error:
+            outputs.clear()
+            item_outputs.clear()
+            output = None
+            self._discard_forward_graphs(previous, error)
+            raise
         finally:
             if hybridep is not None:
                 self._set_hybridep_rows(hybridep[1])

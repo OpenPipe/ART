@@ -12,7 +12,12 @@ import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
 from trainer_rank_test_support import gloo_group, megatron_topology, spawn_and_join
 
-from art.trainer_rank import AdamParams, ModuleHandle, run_rank_callback
+from art.trainer_rank import (
+    AdamParams,
+    ModuleHandle,
+    run_rank_callback,
+    run_rank_callback_stream,
+)
 from art.trainer_rank._commands import join_rank_callback_release
 from art.trainer_rank._heads import (
     HeadRegistration,
@@ -1394,3 +1399,89 @@ def test_cuda_buffer_sync_stages_cpu_authority_before_comparison(tmp_path):
         synchronize_head_buffers(trainer)
         torch.testing.assert_close(buffer, torch.ones(2, device="cuda"))
         assert export_head(trainer, "student", "mean").buffer_revision == 0
+
+
+@pytest.mark.parametrize(
+    "style,error_type",
+    [
+        (style, error_type)
+        for style in ("callback", "sync", "async")
+        for error_type in (ValueError, asyncio.CancelledError, None)
+    ]
+    + [("close_sync", None), ("close_async", None)],
+)
+def test_callback_primary_survives_rejected_buffer_publication(style, error_type):
+    async def run():
+        factory = lambda: torch.tensor(1.0)
+        trainer, native = _native_head("buffer", "head", factory)
+        primary = error_type("callback primary") if error_type is not None else None
+        cause, ambient = KeyError("original cause"), LookupError("ambient exception")
+        views, retained, closed = [], [], []
+
+        def callback(view):
+            views.append(view)
+            logical = view.buffer("head", factory, checkpoint="student")
+            retained.append(logical)
+            logical.add_(1)
+            native.add_(5)
+            if primary is not None:
+                raise primary from cause
+            return 7
+
+        def sync_stream(view):
+            try:
+                yield callback(view)
+            finally:
+                closed.append(True)
+
+        async def async_stream(view):
+            try:
+                yield callback(view)
+            finally:
+                closed.append(True)
+
+        try:
+            raise ambient
+        except LookupError:
+            expected = error_type if primary is not None else RuntimeError
+            with pytest.raises(expected) as caught:
+                if style == "callback":
+                    await run_rank_callback(trainer, callback)
+                else:
+                    stream = run_rank_callback_stream(
+                        trainer,
+                        async_stream if style.endswith("async") else sync_stream,
+                    )
+                    try:
+                        assert (await anext(stream)).value == 7
+                        if style.startswith("close"):
+                            await stream.aclose()
+                        else:
+                            await anext(stream)
+                    finally:
+                        await stream.aclose()
+        if primary is not None:
+            assert caught.value is primary
+            assert primary.__cause__ is cause and primary.__context__ is ambient
+            assert any(
+                "Secondary callback cleanup failure" in note
+                and "changed before publication" in note
+                for note in primary.__notes__
+            )
+        else:
+            assert "changed before publication" in str(caught.value)
+        assert views[0]._executor.stopped
+        assert closed == ([] if style == "callback" else [True])
+        assert native.item() == 6
+        with pytest.raises(RuntimeError, match="publication failed"):
+            retained[0].item()
+
+        def recover(view):
+            fresh = view.buffer("head", factory, checkpoint="student")
+            assert fresh is not retained[0] and fresh.item() == 6
+            fresh.add_(2)
+
+        await run_rank_callback(trainer, recover)
+        assert native.item() == 8
+
+    asyncio.run(run())

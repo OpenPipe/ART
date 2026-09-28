@@ -1137,6 +1137,18 @@ def _view(executor: _Executor) -> _RankView:
     )
 
 
+@contextmanager
+def _preserve_callback_error(primary: BaseException | None) -> Iterator[None]:
+    try:
+        yield
+    except BaseException as cleanup:
+        if primary is None:
+            raise
+        _impl.TrainerRank._memory_error_with_reduction_note(
+            primary, cleanup, operation="callback cleanup"
+        )
+
+
 async def run_rank_callback(
     rank: TrainerRank, callback: Callable[[Any], Any], *, mode: Mode = "rank"
 ) -> RankCallbackResult:
@@ -1149,6 +1161,7 @@ async def run_rank_callback(
                 raise cancelled
             return RankCallbackResult(None)
         view = _view(executor)
+        primary: BaseException | None = None
         try:
             if cancelled is not None:
                 raise cancelled
@@ -1159,11 +1172,15 @@ async def run_rank_callback(
             if inspect.isgenerator(result) or inspect.isasyncgen(result):
                 raise TypeError("Use run_rank_callback_stream for generator callbacks")
             return RankCallbackResult(0 if mode == "zero" else executor.dp_rank, result)
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            try:
-                view._flush_heads()
-            finally:
-                executor.stop()
+            with _preserve_callback_error(primary):
+                try:
+                    view._flush_heads()
+                finally:
+                    executor.stop()
 
 
 async def run_rank_callback_stream(
@@ -1180,6 +1197,7 @@ async def run_rank_callback_stream(
         yield RankCallbackResult(None)
         return
     iterator = value = None
+    primary: BaseException | None = None
     view = _view(executor)
     async with executor.release_on_exit():
         try:
@@ -1207,13 +1225,19 @@ async def run_rank_callback_stream(
                 sent = yield RankCallbackResult(
                     0 if mode == "zero" else executor.dp_rank, value
                 )
+        except GeneratorExit:
+            raise
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            try:
-                if inspect.isasyncgen(iterator):
-                    await iterator.aclose()
-                elif inspect.isgenerator(iterator):
-                    iterator.close()
-                view._flush_heads()
-            finally:
-                value = None
-                executor.stop()
+            with _preserve_callback_error(primary):
+                try:
+                    if inspect.isasyncgen(iterator):
+                        await iterator.aclose()
+                    elif inspect.isgenerator(iterator):
+                        iterator.close()
+                    view._flush_heads()
+                finally:
+                    value = None
+                    executor.stop()

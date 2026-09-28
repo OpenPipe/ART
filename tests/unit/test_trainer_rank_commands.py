@@ -812,3 +812,53 @@ def test_nested_aggregate_outputs_admit_before_any_model_copy():
     request = replace(request, options=ForwardOptions(output_device="model"))
     with pytest.raises(MemoryError):
         view._place_outputs([(output, [[request]]) for output in outputs])
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("error_type", [ValueError, asyncio.CancelledError, None])
+def test_stream_close_keeps_primary_and_stops_executor(asynchronous, error_type):
+    rank: Any = _Rank()
+    primary = error_type("consumer failure") if error_type is not None else None
+    cleanup = LookupError("iterator close failed")
+    views, flushed = [], []
+
+    def prepare(view):
+        views.append(view)
+        view._flush_heads = lambda: flushed.append(True)
+
+    def callback(view):
+        prepare(view)
+        try:
+            yield 1
+        finally:
+            raise cleanup
+
+    async def async_callback(view):
+        prepare(view)
+        try:
+            yield 1
+        finally:
+            raise cleanup
+
+    async def run():
+        stream = run_rank_callback_stream(
+            rank, async_callback if asynchronous else callback
+        )
+        assert (await anext(stream)).value == 1
+        with pytest.raises(
+            error_type if primary is not None else LookupError
+        ) as caught:
+            if primary is None:
+                await stream.aclose()
+            else:
+                await stream.athrow(primary)
+        assert caught.value is (cleanup if primary is None else primary)
+        if primary is not None:
+            assert any("iterator close failed" in note for note in primary.__notes__)
+        assert views[0]._executor.stopped and not flushed
+        await stream.aclose()
+        assert (
+            await run_rank_callback(rank, lambda view: view.optim_step())
+        ).value == {"steps": 1}
+
+    asyncio.run(run())
