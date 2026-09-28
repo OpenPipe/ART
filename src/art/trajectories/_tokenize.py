@@ -1317,7 +1317,11 @@ def _chat_logprob_fingerprint_evidence(choice: Choice) -> dict[str, object] | No
     def values(items: Sequence[object] | None) -> list[dict[str, object]]:
         result: list[dict[str, object]] = []
         for item in items or []:
-            data = _token_logprob_data(item)
+            data = (
+                {**item.__dict__, **(item.model_extra or {})}
+                if type(item) is ChatCompletionTokenLogprob
+                else _token_logprob_data(item)
+            )
             result.append(
                 {
                     key: data[key]
