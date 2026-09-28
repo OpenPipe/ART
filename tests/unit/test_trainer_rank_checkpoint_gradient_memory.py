@@ -305,6 +305,7 @@ def test_one_moe_gradient_still_prices_pending_adapter_gradients(
     pending_rank, monkeypatch
 ):
     from art.megatron.lora import LoRASlotRef
+    from art.trainer_rank import _gdn_memory
 
     r = pending_rank
     plan = r._plan_flat_forward(full_requests())
@@ -319,15 +320,31 @@ def test_one_moe_gradient_still_prices_pending_adapter_gradients(
         "_pending_adapter_gradient_bytes",
         lambda refs: pending if tuple(refs) else (),
     )
-
-    def with_slot(slot):
-        return replace(
-            plan, groups=tuple(replace(g, slot_ref=slot) for g in plan.groups)
-        )
-
-    groups_with_slot = with_slot(LoRASlotRef("checkpoint", None))
-    base = r._plan_cost(with_slot(None))
-    cost = r._plan_cost(groups_with_slot)
+    # A named slot keeping the constructor's full MoE coverage. This fixture
+    # has no slot tables, so price the MoE stage with the constructor's adapters.
+    monkeypatch.setattr(r, "_moe_recompute_covered_for", lambda ref: True)
+    workspace = r._moe_workspace_bytes
+    monkeypatch.setattr(
+        r,
+        "_moe_workspace_bytes",
+        lambda rows, **kwargs: workspace(rows, **{**kwargs, "slot_ref": None}),
+    )
+    values = dict(
+        packed_tokens=plan.packed_tokens,
+        output_bytes=plan.output_bytes,
+        signature=plan.signature,
+        logical_tokens=plan.active_logical_tokens,
+        gdn_segments=plan.grad_segment_count,
+        group_rows=groups,
+        group_routed_rows=r._plan_group_routed_rows(plan),
+        head_workspace_bytes=r._plan_head_workspace_bytes(plan),
+        checkpoint_floor=_gdn_memory.plan_floor(r, plan),
+        retained_tokens=r._plan_retained_tokens(plan),
+    )
+    slotless = (None,) * len(groups)
+    named = (LoRASlotRef("checkpoint", "policy"),) * len(groups)
+    base = r._subforward_cost(**values, slot_refs=slotless)
+    cost = r._subforward_cost(**values, slot_refs=named)
     boundary = retained // 40
     extra = max(0, *(sum(pending[i:40]) - boundary * (39 - i) for i in range(40)))
     assert base.checkpoint_adapter_gradient == 0
@@ -341,4 +358,7 @@ def test_one_moe_gradient_still_prices_pending_adapter_gradients(
         )
         * 1.1
     )
-    assert r._memory_check(groups_with_slot).estimated_required_bytes == (cost.required)
+    assert (
+        r._estimate_required_memory_bytes_from_values(**values, slot_refs=named)
+        == cost.required
+    )

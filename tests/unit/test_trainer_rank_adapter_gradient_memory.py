@@ -150,6 +150,31 @@ def test_a_parameter_the_head_also_uses_is_live_throughout():
     assert r._pending_adapter_gradient_bytes([POLICY]) == (3 * 2, 5 * 2, 7 * 2)
 
 
+def test_a_module_the_head_also_uses_is_live_throughout():
+    shared = lora(policy=[parameter(7)])
+    r = adapter_rank([shared, torch.nn.Module()], shared)
+    assert r._pending_adapter_gradient_bytes([POLICY]) == (0, 0, 7 * 2)
+
+
+def test_base_model_groups_own_no_adapter_gradients(monkeypatch):
+    r = rank()
+    values = r._estimate_flat_forward(requests(67, 4096))
+    with_pending(monkeypatch, r, [23 * 2**20] * 40 + [0])
+    n, out, signature, groups, head = values
+    both = r._subforward_cost(
+        packed_tokens=n,
+        output_bytes=out,
+        signature=signature,
+        logical_tokens=n,
+        group_rows=((33, True), (34, True), (4096, False)),
+        slot_refs=(POLICY, LoRASlotRef("checkpoint", None), None),
+        head_workspace_bytes=head,
+    )
+    # The base group's slot has no adapter, so a split with or without it
+    # still shares one slot's gradients.
+    assert both.checkpoint_adapter_gradient_slots == '[["checkpoint", "policy"]]'
+
+
 def test_other_checkpoint_parameters_are_live_throughout():
     from art.trainer_rank._impl import _CheckpointSlot
 
@@ -275,3 +300,37 @@ def test_cheap_estimate_defers_while_a_gradient_slot_has_pending_gradients(
     assert seen == [(POLICY,)]
     monkeypatch.setattr(r, "_pending_adapter_gradient_bytes", lambda refs: ())
     assert r._estimate_flat_forward(requests(67, 4096)) is not None
+
+
+def test_a_base_only_gradient_group_prices_and_defers_nothing(monkeypatch):
+    r = rank()
+    values = r._estimate_flat_forward(requests(67, 4096))
+    n, out, signature, groups, head = values
+    base = LoRASlotRef("checkpoint", None)
+    with_pending(monkeypatch, r, [23 * 2**20] * 40 + [0])
+    cost = priced(r, values, (base, None))
+    # The base model has no adapter: no extra, no slot identity.
+    assert cost.checkpoint_adapter_gradient == 0
+    assert cost.checkpoint_adapter_gradient_slots == ""
+    estimate = r._estimate_required_memory_bytes_from_values(
+        packed_tokens=n,
+        output_bytes=out,
+        signature=signature,
+        logical_tokens=n,
+        group_rows=groups,
+        slot_refs=(base, None),
+        head_workspace_bytes=head,
+    )
+    assert estimate == cost.required
+    # Nor does the cheap estimate defer to the exact plan for it.
+    monkeypatch.setattr(r, "_ensure_checkpoint_slots_for", lambda *a, **k: None)
+    monkeypatch.setattr(r, "_resolve_slot_ref", lambda request, checkpoint: base)
+    seen: list[tuple[LoRASlotRef, ...]] = []
+
+    def pending(refs):
+        seen.append(tuple(refs))
+        return (1,) * 41
+
+    monkeypatch.setattr(r, "_pending_adapter_gradient_bytes", pending)
+    assert r._estimate_flat_forward(requests(67, 4096)) is not None
+    assert seen == []
