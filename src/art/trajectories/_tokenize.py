@@ -4839,12 +4839,13 @@ def _tokenization_context(
 
     def snapshot(item: object) -> object:
         kind = type(item)
-        previous = observed.get(id(item))
+        identity = id(item)
+        previous = observed.get(identity)
         if previous is not None and previous[0] is item:
             return previous[1]
         if kind in (str, int, bool, bytes, type(None), datetime, float):
             result = kind, repr(item) if kind is float else item
-            observed[id(item)] = item, result
+            observed[identity] = item, result
             return result
         if isinstance(item, Enum):
             if getattr(item, "__objclass__", kind) is not kind:
@@ -4869,13 +4870,13 @@ def _tokenization_context(
             return kind, scalar, instance_state(item, getattr(item, "__dict__", None))
         if kind in (list, tuple):
             result = kind, tuple(snapshot(child) for child in cast(Sequence, item))
-        elif isinstance(item, Mapping):
+        elif kind is dict or isinstance(item, Mapping):
             result = (
                 kind,
                 tuple((snapshot(key), snapshot(child)) for key, child in item.items()),
             )
         elif isinstance(item, Exchange):
-            result = kind, id(item), item.model, snapshot(item.request)
+            result = kind, identity, item.model, snapshot(item.request)
         elif isinstance(item, BaseModel):
             result = (
                 kind,
@@ -4887,7 +4888,7 @@ def _tokenization_context(
             )
         else:
             raise TypeError("Unsupported mutable tokenization context")
-        observed[id(item)] = item, result
+        observed[identity] = item, result
         return result
 
     def instance_state(item: object, dictionary: object) -> object:
