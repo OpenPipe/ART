@@ -3824,6 +3824,7 @@ class TrainerRank:
         packed_tokens = 0
         unshared_packed_tokens = 0
         head_workspace_bytes = 0
+        head_traced: list[bool | None] = []
         group_rows: list[tuple[int, bool]] = []
         group_physical_rows: list[int] = []
         for (_slot, grad_enabled), group_indices in groups:
@@ -3839,15 +3840,24 @@ class TrainerRank:
             cp = max(1, self._topology_key()[2])
             group_rows.append((-(-physical_rows // cp), grad_enabled))
             head_requests = tuple(requests[index] for index in group_indices)
+            lower = self._head_projection_rows(head_requests, lower_bound=True)
             head_workspace_bytes = max(
                 head_workspace_bytes,
                 self._group_head_workspace_bytes(
-                    self._head_projection_rows(head_requests, lower_bound=True),
+                    lower,
                     head_requests,
                     grad_enabled=grad_enabled,
                     lower_bound=True,
                 ),
             )
+            if grad_enabled:
+                head_traced.append(
+                    self._head_backward_traced(
+                        head_requests,
+                        lower,
+                        self._head_projection_rows(head_requests),
+                    )
+                )
             unshared_packed_tokens += self._physical_tokens(
                 sum(int(rows[index].numel()) for index in group_indices)
             )
@@ -3869,18 +3879,28 @@ class TrainerRank:
             )
             else None
         )
-        cost = self._subforward_cost(
-            packed_tokens=packed_tokens,
-            output_bytes=output_bytes,
-            signature=signature,
-            logical_tokens=logical_tokens,
-            group_rows=tuple(group_rows),
-            group_layouts=layouts,
-            slot_refs=tuple(ref for (ref, _), _ in groups),
-            head_workspace_bytes=head_workspace_bytes,
-            # The average CP load is an optimistic bound, not an admission cost.
-            retained_tokens=(packed_tokens + signature.topology[2] - 1)
-            // signature.topology[2],
+        # Whether the exact plan stages its head can depend on projected rows
+        # these bounds leave open; the lower of both prices bounds either.
+        cost = min(
+            (
+                self._subforward_cost(
+                    packed_tokens=packed_tokens,
+                    output_bytes=output_bytes,
+                    signature=signature,
+                    logical_tokens=logical_tokens,
+                    group_rows=tuple(group_rows),
+                    group_layouts=layouts,
+                    slot_refs=tuple(ref for (ref, _), _ in groups),
+                    head_workspace_bytes=head_workspace_bytes,
+                    head_backward_traced=traced,
+                    # The average CP load is an optimistic bound, not an
+                    # admission cost.
+                    retained_tokens=(packed_tokens + signature.topology[2] - 1)
+                    // signature.topology[2],
+                )
+                for traced in _traced_states(head_traced)
+            ),
+            key=lambda cost: cost.required,
         )
         profile = self._memory_profiles.get(signature)
         if (
@@ -4117,18 +4137,7 @@ class TrainerRank:
             or not any(request.target_tokens is not None for request in requests)
         ):
             return dense
-        from megatron.core.models.common.language_module.language_module import (
-            LanguageModule,
-        )
-
-        model = _language_model(self.runtime.model[0])
-        scale = getattr(model, "_scale_logits", None)
-        if (
-            type(scale) is MethodType
-            and scale.__self__ is model
-            and scale.__func__ is LanguageModule._scale_logits
-            and getattr(model.config, "use_mup", None) is False
-        ):
+        if self._standard_logit_scale():
             # IndexBackward's dense result overlaps saved logits and grad_logits.
             # The FP32 fallback already exceeds this three-buffer component.
             target_dense = (
@@ -4144,6 +4153,79 @@ class TrainerRank:
             )
             return max(dense, 3 * target_dense)
         return dense
+
+    def _standard_logit_scale(self) -> bool:
+        """Whether the head scales logits with Megatron's own, un-muP'd method."""
+        from megatron.core.models.common.language_module.language_module import (
+            LanguageModule,
+        )
+
+        model = _language_model(self.runtime.model[0])
+        scale = getattr(model, "_scale_logits", None)
+        return (
+            type(scale) is MethodType
+            and scale.__self__ is model
+            and scale.__func__ is LanguageModule._scale_logits
+            and getattr(model.config, "use_mup", None) is False
+        )
+
+    def _head_backward_traced(
+        self,
+        requests: Sequence[AnyForwardInput],
+        rows: int,
+        upper_rows: int | None = None,
+    ) -> bool | None:
+        """Whether a gradient group's head backward is the traced one.
+
+        The head stage (``_checkpoint_head_stage_bytes``) relies on
+        ``_group_head_workspace_bytes`` bounding the head's backward buffers.
+        Qwen3.6-35B-A3B CP2 traces establish that for target-only requests on
+        the standard logit scale through the fused Triton statistics, which
+        need at least ``ART_TRAINER_RANK_TRITON_MIN_ROWS`` rows in the first
+        projected chunk. Top-k, logits and hidden-state outputs keep further
+        dense gradients, and the FP32 fallback wider copies; other CP sizes
+        are untraced. ``rows`` bounds the first chunk's rows from below,
+        ``upper_rows`` from above: None when they straddle the threshold.
+        """
+        if (
+            not requests
+            or any(
+                request.target_tokens is None
+                or request.top_k is not None
+                or request.logits
+                or request.hidden_states
+                for request in requests
+            )
+            or os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower()
+            in {"0", "false"}
+            or self._topology_key()[2] != 2
+            or not self._head_workspace_bytes(1)
+            or not self._standard_logit_scale()
+        ):
+            return False
+        minimum = int(os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64"))
+        if rows >= minimum:
+            return True
+        if upper_rows is None or upper_rows < minimum:
+            return False
+        return None
+
+    def _plan_head_backward_traced(self, plan: _FlatForwardPlan) -> bool:
+        """Every gradient group's head backward is traced (``_head_backward_traced``)."""
+        traced = [
+            self._head_backward_traced(
+                requests,
+                self._head_projection_rows(
+                    requests,
+                    positions=group.packed.positions_by_sequence,
+                    lower_bound=True,
+                ),
+            )
+            for group in plan.groups
+            if group.grad_enabled
+            for requests in (tuple(item.request for item in group.items),)
+        ]
+        return bool(traced) and all(state is True for state in traced)
 
     def _plan_head_workspace_bytes(self, plan: _FlatForwardPlan) -> int:
         peak = 0
@@ -5320,9 +5402,11 @@ class TrainerRank:
         GEMMs, and the adapter gradients of groups whose backward ran first.
         Qwen3.6-35B-A3B CP2 traces (EP1 and EP2, single and multi-request
         waves) show these terms at the head's peak. Elsewhere None: the head
-        shares the decoder stage. On per-rank CP layouts, each rank's
-        boundaries are within the floor's, so the largest rank's adapter term
-        bounds each.
+        shares the decoder stage. That bounds heads whose backward is the
+        traced one (``_head_backward_traced``); callers keep the unstaged price
+        beside any other, whose buffers can exceed ``head_workspace_bytes``.
+        On per-rank CP layouts, each rank's boundaries are within the floor's,
+        so the largest rank's adapter term bounds each.
         """
         if not head_workspace_bytes or not self._checkpoint_gradient_covered(
             group_rows, slot_refs
@@ -5369,6 +5453,7 @@ class TrainerRank:
             group_layouts=self._plan_group_layouts(plan),
             slot_refs=tuple(g.slot_ref for g in plan.groups),
             head_workspace_bytes=self._plan_head_workspace_bytes(plan),
+            head_backward_traced=self._plan_head_backward_traced(plan),
             checkpoint_floor=_gdn_memory.plan_floor(self, plan),
             retained_tokens=self._plan_retained_tokens(plan),
             hybridep_growth_bytes=self._plan_hybridep_growth_bytes(plan),
@@ -5387,6 +5472,7 @@ class TrainerRank:
         group_layouts: tuple[_GroupLayout, ...] | None = None,
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
+        head_backward_traced: bool = False,
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
@@ -5449,14 +5535,16 @@ class TrainerRank:
             head_stage = self._checkpoint_head_stage_bytes(
                 head_workspace_bytes, gradient, group_rows, slot_refs, group_layouts
             )
-            if head_stage is None:
-                peak = checkpoint_workspace + adapter_gradient
-            else:
+            peak = checkpoint_workspace + adapter_gradient
+            if head_stage is not None:
                 # A split adds its children's adapter gradients to the largest
                 # workspace, and one child's head can follow another's decoder
                 # backward: keep the whole head stage there.
                 checkpoint_workspace = max(decoder_workspace, head_stage)
-                peak = max(decoder_workspace + adapter_gradient, head_stage)
+                # An untraced head's buffers can exceed head_workspace_bytes:
+                # it keeps the unstaged price as a floor.
+                staged = max(decoder_workspace + adapter_gradient, head_stage)
+                peak = staged if head_backward_traced else max(peak, staged)
             if self._memory_profiles.get(signature) is None:
                 checkpoint_workspace += _COLD_RECOMPUTE_TRANSIENT_BYTES
                 peak += _COLD_RECOMPUTE_TRANSIENT_BYTES
@@ -6483,11 +6571,13 @@ class TrainerRank:
             indices, local_inputs = local_slice(width)
             local_requests = list(_flatten(local_inputs))
             cheap_segments: list[int] = []
+            cheap_traced: list[bool | None] = []
             values = self._estimate_flat_forward(
                 local_requests,
                 checkpoint=checkpoint,
                 sync_planning_errors=True,
                 gdn_segments=cheap_segments,
+                head_traced=cheap_traced,
             )
             if not self._all_ranks_true(values is not None):
                 estimates[width] = None
@@ -6503,18 +6593,27 @@ class TrainerRank:
                 head_workspace_bytes: int,
                 *,
                 gdn_segments: int,
+                head_traced: Sequence[bool | None],
+                lower: bool,
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature]:
                 with self._planning_status(True):
-                    required = self._estimate_required_memory_bytes_from_values(
-                        packed_tokens=packed_tokens,
-                        output_bytes=output_bytes,
-                        signature=signature,
-                        logical_tokens=logical_tokens,
-                        # Gradient groups' segments: exact layouts' counts, else
-                        # a bound matching the estimate's (_estimate_flat_forward).
-                        gdn_segments=gdn_segments,
-                        group_rows=group_rows,
-                        head_workspace_bytes=head_workspace_bytes,
+                    # A bound over layouts whose head may or may not stage:
+                    # the higher price to accept, the lower to reject.
+                    required = (min if lower else max)(
+                        self._estimate_required_memory_bytes_from_values(
+                            packed_tokens=packed_tokens,
+                            output_bytes=output_bytes,
+                            signature=signature,
+                            logical_tokens=logical_tokens,
+                            # Gradient groups' segments: exact layouts' counts,
+                            # else a bound matching the estimate's
+                            # (_estimate_flat_forward).
+                            gdn_segments=gdn_segments,
+                            group_rows=group_rows,
+                            head_workspace_bytes=head_workspace_bytes,
+                            head_backward_traced=traced,
+                        )
+                        for traced in _traced_states(head_traced)
                     )
                 return (
                     self._memory_check_required(required, sync_across_dp=True),
@@ -6527,6 +6626,7 @@ class TrainerRank:
                 *, exact: bool, memory_minimal: bool
             ) -> tuple[_MemoryCheck, int, int, _MemorySignature] | None:
                 segments: list[int] = []
+                traced: list[bool | None] = []
                 estimated = self._estimate_flat_forward(
                     local_requests,
                     checkpoint=checkpoint,
@@ -6534,11 +6634,18 @@ class TrainerRank:
                     memory_minimal=memory_minimal,
                     sync_planning_errors=True,
                     gdn_segments=segments,
+                    head_traced=traced,
                 )
                 return (
                     None
                     if estimated is None
-                    else priced(*estimated, gdn_segments=sum(segments))
+                    else priced(
+                        *estimated,
+                        gdn_segments=sum(segments),
+                        head_traced=traced,
+                        # Only the cheap full-sharing count rejects.
+                        lower=memory_minimal and not exact,
+                    )
                 )
 
             def trusted(packed_tokens: int, signature: _MemorySignature) -> bool:
@@ -6552,7 +6659,12 @@ class TrainerRank:
             # reject on memory, or when it would reject on profile trust while
             # a profile exists — the selected layout may be far smaller than
             # the bound and squarely inside the profiled regime.
-            selected = priced(*values, gdn_segments=sum(cheap_segments))
+            selected = priced(
+                *values,
+                gdn_segments=sum(cheap_segments),
+                head_traced=cheap_traced,
+                lower=False,
+            )
             profiled = self._all_ranks_true(selected[3] in self._memory_profiles)
             needs_exact = not selected[0].fits or (
                 profiled and not trusted(selected[1], selected[3])
@@ -7226,6 +7338,7 @@ class TrainerRank:
         memory_minimal: bool = False,
         sync_planning_errors: bool = False,
         gdn_segments: list[int] | None = None,
+        head_traced: list[bool | None] | None = None,
     ) -> tuple[int, int, _MemorySignature, tuple[tuple[int, bool], ...], int] | None:
         """Estimate packed tokens for width probing.
 
@@ -7241,6 +7354,8 @@ class TrainerRank:
         ``gdn_segments`` receives each gradient group's segment count: exact
         layouts' actual counts; in cheap mode, the same kind of bound as the
         token count (twice the requests, as a radix tree has fewer, or one).
+        ``head_traced`` receives each gradient group's ``_head_backward_traced``
+        over its projected-row bounds.
         """
 
         if sync_planning_errors:
@@ -7289,6 +7404,10 @@ class TrainerRank:
                 head_requests = tuple(requests[index] for index in group_indices)
                 lower = self._head_projection_rows(head_requests, lower_bound=True)
                 upper = self._head_projection_rows(head_requests)
+                if grad_enabled and head_traced is not None:
+                    head_traced.append(
+                        self._head_backward_traced(head_requests, lower, upper)
+                    )
                 if exact:
                     tree, layout = self._select_group_layout(
                         tuple(
@@ -8338,6 +8457,7 @@ class TrainerRank:
                 group_layouts=self._plan_group_layouts(forward),
                 slot_refs=tuple(g.slot_ref for g in forward.groups),
                 head_workspace_bytes=self._plan_head_workspace_bytes(forward),
+                head_backward_traced=self._plan_head_backward_traced(forward),
                 checkpoint_floor=_gdn_memory.plan_floor(self, forward),
                 retained_tokens=self._plan_retained_tokens(forward),
             ) + int(self._plan_hybridep_growth_bytes(forward) * _MEMORY_SAFETY_FACTOR)
@@ -9186,6 +9306,7 @@ class TrainerRank:
         group_layouts: tuple[_GroupLayout, ...] | None = None,
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
+        head_backward_traced: bool = False,
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         include_checkpoint_input_gradient: bool = True,
@@ -9298,11 +9419,12 @@ class TrainerRank:
             head_stage = self._checkpoint_head_stage_bytes(
                 head_workspace_bytes, gradient, group_rows, slot_refs, group_layouts
             )
-            peak = gradient + (
-                peak + adapter_gradient
-                if head_stage is None
-                else max(decoder_workspace + adapter_gradient, head_stage)
-            )
+            peak += adapter_gradient
+            if head_stage is not None:
+                # An untraced head keeps the unstaged price as a floor.
+                staged = max(decoder_workspace + adapter_gradient, head_stage)
+                peak = staged if head_backward_traced else max(peak, staged)
+            peak += gradient
             if profiled is None and any(grad for _, grad in group_rows):
                 peak += _COLD_RECOMPUTE_TRANSIENT_BYTES
         static_compute = max(static_compute, max(retained, checkpoint_floor[0]) + peak)
@@ -10488,6 +10610,18 @@ _PACKED_PRICED_LOGICAL_ROW_BYTES = 12 * 512
 # Shorter single-target requests keep the logical extrapolation, so each
 # packed-priced request brings at least 384 KiB for per-request constants.
 _PACKED_PRICED_MIN_REQUEST_TOKENS = 64
+
+
+def _traced_states(traced: Sequence[bool | None]) -> tuple[bool, ...]:
+    """Head stagings a plan's gradient groups allow (``_head_backward_traced``).
+
+    Staged only when every group is traced; both when any is undecided.
+    """
+    if not traced or any(state is False for state in traced):
+        return (False,)
+    if all(state is True for state in traced):
+        return (True,)
+    return (True, False)
 
 
 def _packed_priced(signature: "_MemorySignature", one_layer_recompute: bool) -> bool:

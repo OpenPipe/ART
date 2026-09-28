@@ -590,11 +590,9 @@ def test_layout_head_stage_meets_each_ranks_other_groups(monkeypatch):
         + r._te_workspace_growth_bytes()
         + heads[1]
     )
-    # Each rank's own boundaries plus its head term stay within the floor's.
-    floor = r._checkpoint_memory_floor(
-        group_rows, slots, routed_rows=routed, layouts=layouts
+    # The busiest rank's boundaries (every layer saving each group's rows)
+    # would release more than the idle rank does: the per-rank walk matters.
+    busiest = r._checkpoint_adapter_gradient_bytes(
+        r._checkpoint_gradient_groups(group_rows, slots), head=True
     )
-    layers = r.runtime.model[0].decoder.layers
-    floors = r._layout_checkpoint_rank_floors(layers, slots, routed, layouts)
-    for (rank_retained, _), rank_head in zip(floors, heads):
-        assert rank_retained + rank_head <= floor[0] + max(heads)
+    assert heads[1] > busiest
