@@ -847,9 +847,9 @@ def _process_plain_models(
                 or (extra is not None and type(extra) is not dict)
                 or (private_state is not None and type(private_state) is not dict)
                 or not fields_are_plain(cls, state)
-                or "__pydantic_setattr_handlers__" in state
-                or "__private_attributes__" in state
-                or any(name in state for name in hooks)
+                # Class passivity does not cover instance attributes replacing
+                # methods. Preserve ordinary callback order on late fallback.
+                or any(name in attributes(cls) or name in hooks for name in state)
             ):
                 return None
             if isinstance(item, _StringInterningModel):
@@ -894,7 +894,10 @@ def _process_plain_models(
 def _serialize_process_result(
     result: TokenizedTrajectory | TokenizedMultiHistoryTrajectory,
 ) -> bytes:
-    if type(result) not in (TokenizedTrajectory, TokenizedMultiHistoryTrajectory):
+    if (
+        type(result) is not TokenizedTrajectory
+        and type(result) is not TokenizedMultiHistoryTrajectory
+    ):
         return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
     exchange_ids: set[int] = set()
     plain_models = _process_plain_models(result, exchange_ids=exchange_ids)

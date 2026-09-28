@@ -99,6 +99,160 @@ def history(result):
     )
 
 
+_result_equality_armed = False
+_result_equality_raises = False
+_result_equality_calls: list[str] = []
+
+
+class ResultEquality(type(tr.TokenizedTrajectory)):
+    def __eq__(cls, other):
+        if _result_equality_armed:
+            _result_equality_calls.append("result equality")
+            if _result_equality_raises:
+                raise RuntimeError("custom result class equality")
+        return cls is other
+
+    __hash__ = type.__hash__
+
+
+class CustomResult(tr.TokenizedTrajectory, metaclass=ResultEquality):
+    pass
+
+
+class CustomMultiResult(tr.TokenizedMultiHistoryTrajectory, metaclass=ResultEquality):
+    pass
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+def test_result_type_admission_does_not_call_custom_equality(multi, raises):
+    global _result_equality_armed, _result_equality_raises
+    _result_equality_raises = raises
+    outcomes = []
+    for optimized in (False, True):
+        parent, result = fixture(multi)
+        result = (CustomMultiResult if multi else CustomResult).model_construct(
+            **result.__dict__
+        )
+        _result_equality_calls.clear()
+        _result_equality_armed = True
+        phase = "serialize"
+        try:
+            payload = (
+                p._serialize_process_result(result)
+                if optimized
+                else pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+            )
+            phase = "restore"
+            restored = p._deserialize_process_result(payload, parent)
+            outcome = (
+                "success",
+                restored.model_dump_json(),
+                restored.trajectory is parent,
+            )
+        except Exception as error:
+            outcome = (phase, type(error).__name__, str(error))
+        finally:
+            _result_equality_armed = False
+        outcomes.append((outcome, list(_result_equality_calls)))
+    assert outcomes[0][0][0] == "success"
+    assert outcomes[0][1] == []
+    assert outcomes[1] == outcomes[0]
+
+
+@pytest.mark.parametrize("owner", ["result", "history", "trajectory"])
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize("raises", [False, True])
+def test_instance_method_shadow_preserves_callbacks_and_failure_phase(
+    monkeypatch, owner, alias, raises
+):
+    def count(source):
+        object.__setattr__(source, "prompt_index", source.prompt_index + 1)
+        if raises:
+            raise RuntimeError("instance interning callback")
+
+    outcomes = []
+    eligibility = []
+    for optimized in (False, True):
+        parent, result = fixture()
+        monkeypatch.setattr(tr.CompletionsSource, "__call__", count, raising=False)
+        probe = tr.CompletionsSource.model_construct(exchange=None, prompt_index=0)
+        target = {
+            "result": result,
+            "history": history(result),
+            "trajectory": result.trajectory,
+        }[owner]
+        target.__dict__["_mark_pickle_strings_interned"] = probe
+        history(result).chat_template_kwargs = {"probe": probe}
+        if alias:
+            history(result).chat_template_kwargs["alias"] = result.trajectory
+        eligibility.append(p._process_plain_models(result))
+        assert probe.prompt_index == 0
+        phase = "serialize"
+        try:
+            payload = (
+                p._serialize_process_result(result)
+                if optimized
+                else pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+            )
+            phase = "restore"
+            restored = p._deserialize_process_result(payload, parent)
+            outcome = (
+                "success",
+                history(restored).chat_template_kwargs["probe"].prompt_index,
+                restored.trajectory is parent,
+                type(pickle.loads(payload)) is tr.TokenizedTrajectory,
+            )
+        except Exception as error:
+            outcome = (phase, type(error).__name__, str(error))
+        outcomes.append((outcome, probe.prompt_index))
+    assert outcomes[0][0][0] == ("serialize" if raises else "success")
+    assert outcomes[1] == outcomes[0]
+    assert eligibility == [None, None]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model_dump",
+        "model_copy",
+        "__private_attributes__",
+        "__getnewargs__",
+        "__getnewargs_ex__",
+    ],
+)
+def test_instance_state_shadow_of_model_api_uses_ordinary_pickle(name):
+    # Some shadowed APIs are consulted by pickle itself: preserve its failure too.
+    outcomes = []
+    for encode in (pickle.dumps, p._serialize_process_result):
+        _, result = fixture()
+        result.__dict__[name] = None
+        assert p._process_plain_models(result) is None
+        try:
+            payload = encode(result)
+            outcomes.append(("success", type(pickle.loads(payload))))
+        except Exception as error:
+            outcomes.append((type(error), str(error)))
+    assert outcomes[1] == outcomes[0]
+
+
+@pytest.mark.parametrize("owner", ["result", "history", "trajectory"])
+def test_unshadowed_instance_data_keeps_source_elision(owner):
+    parent, result = fixture()
+    target = {
+        "result": result,
+        "history": history(result),
+        "trajectory": result.trajectory,
+    }[owner]
+    target.__dict__["public_fixture_data"] = {"value": [1, 2, 3]}
+    assert p._process_plain_models(result) is not None
+    payload = p._serialize_process_result(result)
+    assert pickle.loads(payload)[0] == b"art-process-sources-v1"
+    restored = p._deserialize_process_result(payload, parent)
+    assert restored.trajectory is parent
+    assert history(restored).messages == history(result).messages
+
+
 _registry_target = type(None)
 _registry_behavior = "raise"
 _registry_calls: list[str] = []
@@ -836,6 +990,26 @@ def _spawn_result_pair(payload, undeclared=False, metadata_flag=None):
             pickle.dumps(captured[0], protocol=pickle.HIGHEST_PROTOCOL),
             p._process_plain_models(captured[0]) is not None,
         )
+
+
+@pytest.mark.parametrize("shadow", [False, True])
+def test_parent_instance_resolution_contract_survives_spawn(shadow):
+    parent, _ = fixture()
+    parent.__dict__["model_copy" if shadow else "public_fixture_data"] = 7
+    payload = p._process_payloads(
+        [parent], p._ProcessOptions(False, False, None, None, None, None)
+    )[0]
+    assert pickle.loads(payload)[1].source_refs_allowed is not shadow
+    with ProcessPoolExecutor(max_workers=1, mp_context=p._process_context()) as pool:
+        encoded, ordinary, worker_plain = pool.submit(
+            _spawn_result_pair, payload
+        ).result(timeout=30)
+    assert worker_plain is not shadow
+    expected = p._deserialize_process_result(ordinary, parent)
+    restored = p._deserialize_process_result(encoded, parent)
+    assert type(pickle.loads(encoded)) is (tr.TokenizedTrajectory if shadow else tuple)
+    assert restored.model_dump_json() == expected.model_dump_json()
+    assert restored.trajectory is parent
 
 
 @pytest.mark.parametrize("hook", ["new", "missing", "numeric_repr"])
