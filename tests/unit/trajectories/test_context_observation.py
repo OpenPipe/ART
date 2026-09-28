@@ -5,12 +5,12 @@ import pytest
 
 from art.trajectories._tokenize import _tokenization_context
 
+_observed_mappings: list[object] = []
+
 
 class ObservedDict(dict):
-    reads: int
-
     def items(self):
-        self.reads += 1
+        _observed_mappings.append(self)
         return super().items()
 
 
@@ -18,8 +18,7 @@ class ObservedDict(dict):
 def test_context_preserves_mapping_order_aliases_and_fresh_mutable_reads(mapping_type):
     child = ["before"]
     mapping = mapping_type({"first": child, "second": child})
-    if isinstance(mapping, ObservedDict):
-        mapping.reads = 0
+    _observed_mappings.clear()
     original = cast(
         tuple[type, tuple[Any, Any]], _tokenization_context([mapping, mapping])
     )
@@ -29,7 +28,7 @@ def test_context_preserves_mapping_order_aliases_and_fresh_mutable_reads(mapping
     assert [entry[0] for entry in first[1]] == [(str, "first"), (str, "second")]
     assert first[1][0][1] is first[1][1][1]
     if isinstance(mapping, ObservedDict):
-        assert mapping.reads == 1
+        assert _observed_mappings == [mapping]
     child[0] = "after"
     assert _tokenization_context([mapping, mapping]) != original
     child[0] = "before"

@@ -17,7 +17,7 @@ from operator import attrgetter, is_
 from pickle import Pickler, PicklingError
 import re
 import threading
-from types import FunctionType, MemberDescriptorType
+from types import FunctionType, GetSetDescriptorType, MemberDescriptorType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 import warnings
 
@@ -4879,6 +4879,18 @@ def _tokenization_context(
                 kind,
                 tuple((snapshot(key), snapshot(child)) for key, child in item.items()),
             )
+            if kind is not dict:
+                # A renderer can read mapping attributes as well as its items.
+                # Inspect physical instance storage without invoking overrides.
+                dictionary = None
+                for owner in type.__getattribute__(kind, "__mro__"):
+                    descriptor = type.__getattribute__(owner, "__dict__").get(
+                        "__dict__"
+                    )
+                    if type(descriptor) is GetSetDescriptorType:
+                        dictionary = descriptor.__get__(item, kind)
+                        break
+                result = (*result, instance_state(item, dictionary))
         elif isinstance(item, Exchange):
             result = kind, identity, item.model, snapshot(item.request)
         elif isinstance(item, BaseModel):
@@ -4896,7 +4908,7 @@ def _tokenization_context(
         return result
 
     def instance_state(item: object, dictionary: object) -> object:
-        # Scalar subclasses and Enum members may keep mutable state in slots.
+        # Rich values may keep mutable state in inherited or shadowed slots.
         # Read actual slot storage, including inherited/shadowed slots, without
         # invoking an instance's attribute lookup or replacement properties.
         slots = []
