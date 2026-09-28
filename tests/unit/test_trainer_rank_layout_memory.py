@@ -283,13 +283,18 @@ def test_softmax_offset_leaves_the_busiest_rank_floor(monkeypatch):
     assert r._plan_group_layouts(plan) is None
 
 
+@pytest.mark.parametrize("per_layer", [0, 6000 * H])
 @pytest.mark.parametrize(
     "lengths",
     [(2048, 1536, 1024, 512), (4099, 3, 5, 7), (1, 2, 3, 4, 5, 6, 7), (8191,)],
 )
-def test_split_lower_bound_stays_below_the_layout_cost(monkeypatch, lengths):
-    # Even and skewed CP splits, odd row counts, and a single long sequence.
+def test_split_lower_bound_stays_below_the_layout_cost(monkeypatch, lengths, per_layer):
+    # Even and skewed CP splits, odd row counts, and a single long sequence;
+    # with pending policy gradients, even shares still price below each
+    # rank's paired extra.
     r = art_cp(rank(), monkeypatch)
+    if per_layer:
+        _with_policy_gradients(monkeypatch, r, (per_layer,) * 40 + (0,))
     requests = _requests(lengths)
     plan = _plan_with(r, requests)
     lower = r._split_chunk_lower_cost(
@@ -304,16 +309,10 @@ def _plan_with(r, requests):
     return r._plan_flat_forward(requests)
 
 
-def _pending_adapter_rank(monkeypatch, layout, rows, per_layer=300 * H):
+def _with_policy_gradients(monkeypatch, r, pending):
+    """Every gradient group trains the policy slot, with ``pending`` gradients."""
     from art.megatron.lora import LoRASlotRef
 
-    r = qwen36(rank())
-    monkeypatch.setattr(r, "_plan_group_layouts", lambda plan: (layout,))
-    monkeypatch.setattr(r, "_plan_group_rows", lambda plan: ((rows, True),))
-    monkeypatch.setattr(r, "_plan_group_routed_rows", lambda plan: (rows,))
-    monkeypatch.setattr(r, "_plan_hybridep_growth_bytes", lambda plan: 0)
-    monkeypatch.setattr(r, "_plan_retained_tokens", lambda plan: rows)
-    # The plan's gradient group trains the policy slot.
     policy = LoRASlotRef("checkpoint", "policy")
     groups = r._checkpoint_gradient_groups
     monkeypatch.setattr(
@@ -323,12 +322,22 @@ def _pending_adapter_rank(monkeypatch, layout, rows, per_layer=300 * H):
             (policy, boundaries) for _, boundaries in groups(group_rows, slot_refs)
         ),
     )
-    pending = (per_layer,) * 40 + (0,)
     monkeypatch.setattr(
         r,
         "_pending_adapter_gradient_bytes",
         lambda refs: pending if tuple(refs) else (),
     )
+
+
+def _pending_adapter_rank(monkeypatch, layout, rows, per_layer=300 * H):
+    r = qwen36(rank())
+    monkeypatch.setattr(r, "_plan_group_layouts", lambda plan: (layout,))
+    monkeypatch.setattr(r, "_plan_group_rows", lambda plan: ((rows, True),))
+    monkeypatch.setattr(r, "_plan_group_routed_rows", lambda plan: (rows,))
+    monkeypatch.setattr(r, "_plan_hybridep_growth_bytes", lambda plan: 0)
+    monkeypatch.setattr(r, "_plan_retained_tokens", lambda plan: rows)
+    pending = (per_layer,) * 40 + (0,)
+    _with_policy_gradients(monkeypatch, r, pending)
     layers = r.runtime.model[0].decoder.layers
     gdn_inputs = [
         layer._art_gdn_island_boundary.input_layout == "gdn" for layer in layers
@@ -404,6 +413,14 @@ def test_a_rank_without_gdn_rows_pairs_its_extra_with_its_own_floor(monkeypatch)
             retained + workspace + cost
         )
     assert cost >= extras[0]
+    # Admission prices the same extra: its gap to the plan cost stays the CP
+    # output coexistence alone (up to the safety factor's integer rounding).
+    plan = _plan(r)
+    gap = r._memory_check(plan).estimated_required_bytes - r._plan_cost(plan).required
+    monkeypatch.setattr(r, "_pending_adapter_gradient_bytes", lambda refs: ())
+    assert r._plan_cost(plan).checkpoint_adapter_gradient == 0
+    plain = r._memory_check(plan).estimated_required_bytes - r._plan_cost(plan).required
+    assert abs(gap - plain) <= 1
 
 
 def test_layout_gradient_groups_run_one_after_another_on_each_rank(monkeypatch):
