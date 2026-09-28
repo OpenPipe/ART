@@ -1047,13 +1047,15 @@ def _load_process_result(payload: bytes, trajectory: Trajectory) -> object:
     if packed[1] != tuple(type(x) for x in sources):
         raise ValueError("Source trajectory exchange structure has changed")
 
-    class Reader(pickle.Unpickler):
-        def persistent_load(self, index: object) -> object:
-            if type(index) is not int or not 0 <= index < len(sources):
-                raise pickle.UnpicklingError("Invalid process source reference")
-            return sources[index]
+    def persistent_load(index: object) -> object:
+        if type(index) is not int or not 0 <= index < len(sources):
+            raise pickle.UnpicklingError("Invalid process source reference")
+        return sources[index]
 
-    return Reader(io.BytesIO(packed[2])).load()
+    # A per-call class would keep this source closure alive through its MRO cycle.
+    reader = pickle.Unpickler(io.BytesIO(packed[2]))
+    reader.persistent_load = cast(Any, persistent_load)
+    return reader.load()
 
 
 def _tokenize_process_payload(payload: bytes) -> bytes:

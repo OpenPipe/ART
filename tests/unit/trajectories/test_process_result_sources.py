@@ -6,10 +6,12 @@ import copy
 import copyreg
 from datetime import UTC, datetime, timedelta, timezone
 from enum import Enum
+import gc
 import io
 import math
 import pickle
 from typing import Any, cast
+import weakref
 
 from openai.types.chat import ChatCompletion, ChatCompletionUserMessageParam
 from pydantic import BaseModel
@@ -22,6 +24,19 @@ from art.trajectories import _parallel as p
 def unpack_test_payload(payload):
     """Inspect either raw pickle or the private framed result in assertions."""
     return pickle.loads(payload[1:] if payload.startswith(b"\0") else payload)
+
+
+@pytest.fixture
+def without_cyclic_gc():
+    gc.collect()
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
+        gc.collect()
 
 
 def fixture(multi=False):
@@ -2361,3 +2376,80 @@ def test_unknown_standard_assignment_authority_uses_ordinary_pickle(monkeypatch)
     )
     payload = p._serialize_process_result(result)
     assert type(unpack_test_payload(payload)) is tr.TokenizedTrajectory
+
+
+def reader_lifetime_trial(multi, optimized, hold, invalid=False):
+    parent, result = fixture(multi)
+    references = [
+        weakref.ref(parent),
+        weakref.ref(parent.exchanges.chat_completions[0]),
+    ]
+    payload = (
+        p._serialize_process_result(result)
+        if optimized
+        else pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+    )
+    assert payload.startswith(b"\0") is optimized
+    if invalid:
+        tag, kinds, _ = unpack_test_payload(payload)
+        # Protocol 5, integer 255, persistent reference, STOP.
+        payload = b"\0" + pickle.dumps((tag, kinds, b"\x80\x05K\xffQ."))
+        with pytest.raises(pickle.UnpicklingError, match="Invalid process source"):
+            p._load_process_result(payload, parent)
+        return references, []
+    restored = p._deserialize_process_result(payload, parent)
+    assert restored.trajectory is parent
+    holders = [parent] if hold == "input" else [restored] if hold == "output" else []
+    return references, holders
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("optimized", [False, True])
+@pytest.mark.parametrize("hold", ["none", "input", "output"])
+def test_process_reader_releases_sources_without_cyclic_gc(
+    without_cyclic_gc, multi, optimized, hold
+):
+    references, holders = reader_lifetime_trial(multi, optimized, hold)
+    assert all(
+        (reference() is not None) == (hold != "none") for reference in references
+    )
+    holders.clear()
+    assert all(reference() is None for reference in references)
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_process_reader_failure_releases_sources_without_cyclic_gc(
+    without_cyclic_gc, multi
+):
+    references, _ = reader_lifetime_trial(multi, True, "none", invalid=True)
+    assert all(reference() is None for reference in references)
+
+
+def test_process_reader_repeated_success_does_not_retain_sources(without_cyclic_gc):
+    references = [
+        reference
+        for _ in range(16)
+        for reference in reader_lifetime_trial(False, True, "none")[0]
+    ]
+    assert all(reference() is None for reference in references)
+
+
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("optimized", [False, True])
+def test_process_writer_releases_sources_without_cyclic_gc(
+    without_cyclic_gc, multi, optimized
+):
+    def serialize():
+        _, result = fixture(multi)
+        reference = weakref.ref(result.trajectory)
+        payload = (
+            p._serialize_process_result(result)
+            if optimized
+            else pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+        )
+        assert payload.startswith(b"\0") is optimized
+        return reference, payload
+
+    reference, payload = serialize()
+    assert payload
+    assert reference() is None
