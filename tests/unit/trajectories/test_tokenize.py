@@ -542,8 +542,13 @@ def test_length_stop_mapping_allows_another_assistant_without_a_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[first, second])
     ).tokenize(tokenizer=tokenizer)
 
-    assert tokenized.tokens == [1, 2, 3, 4, 9]
-    assert tokenized.flags[-1] == tr.TokenFlag.STOP
+    assert tokenized.tokens == [1, 2, 3, 4]
+    assert tokenized.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
+    assert second.response.choices[0].logprobs is not None
+    assert second.response.choices[0].logprobs.content is not None
+    assert (
+        tokenized.logprobs[-1] == second.response.choices[0].logprobs.content[0].logprob
+    )
 
 
 def test_terminal_length_does_not_duplicate_or_relabel_sampled_eos() -> None:
@@ -1920,14 +1925,20 @@ def test_responses_length_status_applies_only_to_the_terminal_generation() -> No
     stops = [
         index for index, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.STOP
     ]
-    assert len(stops) == 2
+    assert len(stops) == 1
     assert tokenized.flags[stops[0]] == (
         tr.TokenFlag.EXACT
         | tr.TokenFlag.ASSISTANT
         | tr.TokenFlag.OUTPUT
         | tr.TokenFlag.STOP
     )
-    assert tokenized.flags[stops[1]] == tr.TokenFlag.STOP
+    final = data["token_generations"][-1]
+    final_output = [entry["token_id"] for entry in final["output_tokens"]]
+    assert tokenized.tokens == final["prompt_token_ids"] + final_output
+    assert tokenized.flags[-len(final_output) :] == [_SAMPLED_ASSISTANT_OUTPUT] * len(
+        final_output
+    )
+    assert tokenized.logprobs[-len(final_output) :] == [-0.4] * len(final_output)
 
 
 def test_exact_tokens_form_one_append_only_history_without_tokenizer(

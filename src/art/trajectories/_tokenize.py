@@ -5337,6 +5337,7 @@ class _ChatViewTokenizer:
         try:
             certify_fallback = False
             fallback_evidence = None
+            fallback_sources = None
             if (
                 self.recorded_boundaries
                 and self.chat_template is None
@@ -5361,12 +5362,42 @@ class _ChatViewTokenizer:
                 self.trace = self.trace or _TraceBuilder()
                 self.trace.enabled = True
                 certify_fallback = True
+                fallback_sources = _recorded_source_evidence(
+                    self.history.message_sources
+                )
                 try:
+                    # Rendering may rebind its owned reasoning/refusal aliases;
+                    # the original history and requests must remain unchanged.
                     fallback_evidence = _recorded_boundary_evidence(
-                        self.history, self.messages, [self.template, self.kwargs]
+                        self.history,
+                        cast(list[dict[str, Any]], self.history.messages),
+                        [self.template, self.kwargs],
                     )
                 except (TypeError, RecursionError):
                     pass
+
+            def verify_sources() -> None:
+                if not certify_fallback:
+                    return
+                try:
+                    unchanged = _recorded_source_evidence(
+                        self.history.message_sources
+                    ) == fallback_sources and (
+                        fallback_evidence is None
+                        or _recorded_boundary_evidence(
+                            self.history,
+                            cast(list[dict[str, Any]], self.history.messages),
+                            [self.template, self.kwargs],
+                        )
+                        == fallback_evidence
+                    )
+                except (TypeError, RecursionError):
+                    unchanged = False
+                if not unchanged:
+                    raise ValueError(
+                        "Sampled source changed during recorded boundary proof"
+                    )
+
             self._render_messages()
             self._render_canonical_masks()
             self._substitute_exact_prefix()
@@ -5374,12 +5405,12 @@ class _ChatViewTokenizer:
             self._prepare_span_search()
             self._prove_marked_bounds()
             self._prove_probed_bounds()
-            exact = self._tokenize_exact_length_stops()
-            if exact is not None:
-                return exact
-            self._collect_replacements()
-            tokenized = self._assemble()
+            tokenized = self._tokenize_exact_length_stops()
+            if tokenized is None:
+                self._collect_replacements()
+                tokenized = self._assemble()
             if certify_fallback:
+                verify_sources()
                 assert self.trace is not None and self.trace.trace is not None
                 try:
                     _certify_copied_context(
@@ -5389,27 +5420,49 @@ class _ChatViewTokenizer:
                         self.prior,
                         self.trace.rendered_outputs,
                     )
+                    final_source = next(
+                        (
+                            source
+                            for message, source in reversed(
+                                list(
+                                    zip(
+                                        self.messages,
+                                        self.history.message_sources,
+                                        strict=True,
+                                    )
+                                )
+                            )
+                            if message.get("role") == "assistant"
+                            and source is not None
+                            and _source_is_sampled(source)
+                        ),
+                        None,
+                    )
+                    prompt, output, _ = _source_native_record(final_source)
+                    if prompt is not None and output is not None:
+                        end = len(prompt) + len(output)
+                        if tokenized.tokens[:end] != [*prompt, *output] or any(
+                            key is not None
+                            for key in self.trace.trace.source_keys[end:]
+                        ):
+                            raise _NativeConditioningMismatch(
+                                "Recorded sampled tokens do not retain their original native conditioning"
+                            )
+                        # A complete final record ends the sequence; rendered
+                        # closing markup is not part of the recorded generation.
+                        del tokenized.tokens[end:]
+                        del tokenized.logprobs[end:]
+                        del tokenized.flags[end:]
+                        del self.trace.trace.source_keys[end:]
+                        self.trace.rendered_outputs = tuple(
+                            (start, min(stop, end), source)
+                            for start, stop, source in self.trace.rendered_outputs
+                            if start < end
+                        )
+                        self.trace.trace.validate(tokenized)
                 except _NativeConditioningMismatch:
                     if fallback_evidence is None:
                         raise
-
-                    def verify_sources() -> None:
-                        try:
-                            unchanged = (
-                                _recorded_boundary_evidence(
-                                    self.history,
-                                    self.messages,
-                                    [self.template, self.kwargs],
-                                )
-                                == fallback_evidence
-                            )
-                        except (TypeError, RecursionError):
-                            unchanged = False
-                        if not unchanged:
-                            raise ValueError(
-                                "Sampled source changed during recorded boundary proof"
-                            )
-
                     verify_sources()
                     # Keep complete native records; only optional gap roles are lost.
                     exact = _tokenize_exact_projected_chat_history(
@@ -5426,6 +5479,7 @@ class _ChatViewTokenizer:
                     if exact is None:
                         raise
                     return exact
+                verify_sources()
             return tokenized
         finally:
             # break self -> cache -> bound method -> self so the state is refcount-freed
