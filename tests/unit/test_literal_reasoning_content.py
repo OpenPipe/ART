@@ -2,6 +2,7 @@ from copy import deepcopy
 import hashlib
 from pathlib import Path
 
+from jinja2 import DictLoader, pass_context
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 import pytest
 
@@ -32,6 +33,125 @@ _LITERALS = (
     "\n  before <think> café 漢字 🦉 </think> after  \n",
     "",
 )
+
+
+@pytest.mark.parametrize(
+    "middle",
+    [
+        "{{ ''|peek }}",
+        "{% if '' is peek %}seen{% endif %}",
+        "{% include 'preview' %}",
+        "{% import 'module' as p with context %}{{ p.stored }}",
+        "{% from 'module' import stored with context %}{{ stored }}",
+        "{% set observed = probe.value %}",
+        "{% set observed = probe['value'] %}",
+        "{{ probe }}",
+        "{% if probe %}seen{% endif %}",
+        "{% set observed = probe + 1 %}",
+        "{% if probe == 1 %}seen{% endif %}",
+        "{% for item in probe %}seen{% endfor %}",
+        "{{ 42 }}",
+    ],
+)
+@pytest.mark.parametrize("content", ["  answer  ", "  before<think>x</think>after  "])
+def test_implicit_context_consumers_keep_original_shared_trim(middle, content):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    parser = match.group()
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    template = (
+        "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+        "{% set probe = bind() %}" + trim + middle + parser + "[{{ content }}]"
+    )
+    seen = []
+
+    class Probe:
+        def __init__(self, context):
+            self.context = context
+
+        def observe(self):
+            value = self.context["content"]
+            seen.append(value)
+            return value
+
+        @property
+        def value(self):
+            return self.observe()
+
+        def __getitem__(self, key):
+            return self.observe()
+
+        def __str__(self):
+            return self.observe()
+
+        def __bool__(self):
+            self.observe()
+            return True
+
+        def __add__(self, other):
+            return self.observe()
+
+        def __eq__(self, other):
+            self.observe()
+            return True
+
+        def __iter__(self):
+            self.observe()
+            return iter([1])
+
+    @pass_context
+    def peek(context, value):
+        seen.append(context["content"])
+        return context["content"]
+
+    @pass_context
+    def finalize(context, value):
+        if value == 42:
+            seen.append(context["content"])
+        return value
+
+    env = ImmutableSandboxedEnvironment(
+        loader=DictLoader(
+            {"preview": "{{ content }}", "module": "{% set stored=content %}"}
+        ),
+        finalize=finalize,
+    )
+    bind = pass_context(lambda context: Probe(context))
+    env.filters["peek"] = env.tests["peek"] = peek
+    fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
+    assert not _QWEN_INLINE_REASONING.search(fixed)
+    message = {"role": "assistant", "content": content}
+    # Removing the destructive parser is intentional; all surrounding consumers
+    # must continue observing the same original trimmed binding.
+    expected = env.from_string(template.replace(parser, "")).render(
+        message=message, bind=bind
+    )
+    before = seen[:]
+    seen.clear()
+    assert env.from_string(fixed).render(message=message, bind=bind) == expected
+    assert seen == before
+    assert all(value == content.strip() for value in seen)
+    assert trim in fixed
+
+
+def test_role_guard_is_not_proof_after_message_reassignment():
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    template = (
+        "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+        + trim
+        + "{% set message = none %}{% if message.role == 'assistant' %}"
+        + match.group()
+        + "{% else %}[{{ content }}]{% endif %}"
+    )
+    fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
+    env = ImmutableSandboxedEnvironment()
+    message = {"role": "assistant", "content": "  answer  "}
+    assert env.from_string(fixed).render(message=message) == "[answer]"
+    assert trim in fixed
 
 
 @pytest.mark.parametrize("trim_blocks,lstrip_blocks", [(False, False), (True, True)])
