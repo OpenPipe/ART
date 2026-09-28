@@ -4923,18 +4923,25 @@ class TrainerRank:
         )
 
     def _checkpoint_adapter_gradient_bytes(
-        self, groups: Sequence[tuple["LoRASlotRef | None", Sequence[int]]]
+        self,
+        groups: Sequence[tuple["LoRASlotRef | None", Sequence[int]]],
+        pending_by_slot: Mapping["LoRASlotRef", tuple[int, ...]] | None = None,
     ) -> int:
         """The recompute backward's adapter-gradient peak beyond released boundaries.
 
         ``groups`` gives each gradient group's adapter slot (None for the base
         model) and each decoder layer's saved-boundary bytes
-        (``_adapter_gradient_walk``).
+        (``_adapter_gradient_walk``). ``pending_by_slot`` reuses slots' pending
+        gradients already resolved (``_pending_adapter_gradient_bytes``).
         """
         chains = []
         for slot, boundaries in groups:
             pending = (
-                () if slot is None else self._pending_adapter_gradient_bytes((slot,))
+                ()
+                if slot is None
+                else pending_by_slot[slot]
+                if pending_by_slot is not None
+                else self._pending_adapter_gradient_bytes((slot,))
             )
             if pending and len(pending) != len(boundaries) + 1:
                 return 0
@@ -5046,9 +5053,15 @@ class TrainerRank:
         ):
             return self._checkpoint_adapter_gradient_bytes(groups)
         slots = [slot for slot, _ in groups]
+        # Every rank walks the same slots' gradients: resolve them once.
+        pending = {
+            slot: self._pending_adapter_gradient_bytes((slot,))
+            for slot in slots
+            if slot is not None
+        }
         extras = [
             self._checkpoint_adapter_gradient_bytes(
-                tuple(zip(slots, boundaries, strict=True))
+                tuple(zip(slots, boundaries, strict=True)), pending
             )
             for boundaries in self._layout_layer_boundaries(layouts)
         ]

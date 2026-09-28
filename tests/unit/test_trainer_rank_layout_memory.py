@@ -450,9 +450,13 @@ def test_layout_gradient_groups_run_one_after_another_on_each_rank(monkeypatch):
         (slots[0],): (6000 * H,) * 40 + (0,),
         (slots[1],): (100 * H,) * 40 + (5 * H,),
     }
-    monkeypatch.setattr(
-        r, "_pending_adapter_gradient_bytes", lambda refs: pending.get(tuple(refs), ())
-    )
+    walks = []
+
+    def pending_gradients(refs):
+        walks.append(tuple(refs))
+        return pending.get(tuple(refs), ())
+
+    monkeypatch.setattr(r, "_pending_adapter_gradient_bytes", pending_gradients)
     floor = r._checkpoint_memory_floor(
         group_rows, None, routed_rows=routed, layouts=layouts
     )
@@ -484,3 +488,5 @@ def test_layout_gradient_groups_run_one_after_another_on_each_rank(monkeypatch):
         == expected
         > 0
     )
+    # Each slot's module walk runs once, not once per rank.
+    assert walks == [(slot,) for slot in slots]
