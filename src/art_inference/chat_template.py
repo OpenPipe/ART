@@ -182,6 +182,7 @@ def _without_inline_reasoning_parser(template: str) -> str:
     except TemplateSyntaxError:
         return apply_edits()
     counters = global_names - {"raise_exception", "add_vision_id"}
+    counter_targets: set[int] = set()
     for name in counters:
         declarations = [
             node
@@ -194,6 +195,7 @@ def _without_inline_reasoning_parser(template: str) -> str:
         expected = declaration.node
         if len(declarations) != 1 or declarations[0].node != expected:
             return apply_edits()
+        counter_targets.add(id(declarations[0].target))
         inside = {id(node) for node in renderer.find_all(nodes.Node)}
         if any(
             node.name == name
@@ -241,11 +243,7 @@ def _without_inline_reasoning_parser(template: str) -> str:
         and node.ctx != "load"
         or node.name in counters
         and node.ctx != "load"
-        and not any(
-            node is declaration.target
-            for declaration in tree.body
-            if isinstance(declaration, nodes.Assign)
-        )
+        and id(node) not in counter_targets
         for node in tree.find_all(nodes.Name)
     ) or any(
         isinstance(node, nodes.Import)
