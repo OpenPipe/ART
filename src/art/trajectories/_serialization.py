@@ -57,16 +57,15 @@ def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
 
 
 def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> object:
-    if isinstance(value, str):
+    if type(value) is str:
         return pool.setdefault(value, value)
     if value is None or isinstance(
         value, (bytes, bytearray, memoryview, bool, int, float, complex)
     ):
         return value
-    if type(value) in (bool, float, int):
-        return value
     if isinstance(value, list) and all(
-        item is None or type(item) in (bool, float, int) for item in value
+        item is None or type(item) is bool or type(item) is float or type(item) is int
+        for item in value
     ):
         return value
 
@@ -129,7 +128,7 @@ def _intern_mapping(
 ) -> None:
     replacements: list[tuple[str, str]] = []
     for key, item in value.items():
-        if isinstance(key, str):
+        if type(key) is str:
             interned = pool.setdefault(key, key)
             if interned is not key:
                 replacements.append((key, interned))
@@ -176,7 +175,7 @@ def serialize_history(history: object) -> dict[str, pydantic.JsonValue]:
         CompletionsTokenHistory: "completions_token",
         CompletionsStringHistory: "completions_string",
     }
-    kind = kinds.get(type(history))
+    kind = next((kind for model, kind in kinds.items() if type(history) is model), None)
     if kind is None:
         raise TypeError(f"Unsupported history type: {type(history).__name__}")
     if not isinstance(history, BaseModel):
@@ -348,7 +347,11 @@ def _rebind_history_sources(
             for item in value:
                 visit(item)
 
-    visit(history)
+    try:
+        visit(history)
+    finally:
+        # Break the recursive closure's ownership of completed source graphs.
+        del visit
 
 
 class _CompactModel(_StringInterningModel):

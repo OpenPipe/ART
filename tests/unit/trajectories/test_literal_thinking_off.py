@@ -142,9 +142,12 @@ def test_native_thinking_off_retains_literal_content(
 ) -> None:
     history, tokenizer = _history(content=content)
     original = history.model_dump(mode="python")
-    # The pre-fix history path misrenders literal content even when later native
-    # token splicing can recover the terminal output.
+    # Render the original template without either the general parser correction
+    # or the old hash-specific workaround to retain the destructive baseline.
     with monkeypatch.context() as patch:
+        patch.setattr(
+            _tokenize, "chat_template_with_preserved_thinking", lambda value: value
+        )
         patch.setattr(
             _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
         )
@@ -162,7 +165,7 @@ def test_native_thinking_off_retains_literal_content(
     required = tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
     assert all(tokenized.flags[i] & required == required for i in sampled)
     assert not any(flag & tr.TokenFlag.STOP for flag in tokenized.flags)
-    assert tokenizer.calls[0][-1]["reasoning_content"] == ""
+    assert tokenizer.calls[0][-1].get("reasoning_content", "") == ""
     assert tokenizer.calls[0][-1]["content"] == content
     assert history.model_dump(mode="python") == original
 
@@ -249,7 +252,8 @@ def test_explicit_empty_reasoning_is_preserved(field: str) -> None:
         )
         == _LITERAL
     )
-    assert tokenizer.calls[0][-1]["reasoning_content"] == ""
+    assert tokenizer.calls[0][-1].get("reasoning_content", "") == ""
+    assert _LITERAL in tokenizer.rendered[0]
     assert history.model_dump(mode="python") == original
 
 
@@ -278,7 +282,8 @@ def test_mixed_history_uses_each_generations_own_request(
     _outcome(history, tokenizer)
     rendered_messages = tokenizer.calls[0]
     assert "reasoning_content" not in rendered_messages[1]
-    assert rendered_messages[3]["reasoning_content"] == ""
+    assert "reasoning_content" not in rendered_messages[3]
+    assert _LITERAL in tokenizer.rendered[0]
     assert [message["content"] for message in rendered_messages] == [
         message["content"] for message in history.messages
     ]
@@ -402,6 +407,9 @@ def test_literal_next_turn_preserves_preceding_length_stop_boundary(
 
     monkeypatch.setattr(_tokenize, "_tokenize_exact_projected_chat_history", observe)
     with monkeypatch.context() as patch:
+        patch.setattr(
+            _tokenize, "chat_template_with_preserved_thinking", lambda value: value
+        )
         patch.setattr(
             _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
         )

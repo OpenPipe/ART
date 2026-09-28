@@ -127,6 +127,34 @@ def test_mixed_slot_context_and_exact_search_fallback(layer):
     assert cost.required <= rank._plan_cost(plan).required
 
 
+def test_subforward_cost_reuses_floor_without_caching_across_slot_changes(
+    layer, monkeypatch
+):
+    rank, _ = rank_with_moe(weights(layer, 1))
+    load_slot(rank, "selected", 1)
+    plan = rank._plan_flat_forward([request("selected", rows=8, grad=True)])
+    original = rank._checkpoint_memory_floor
+    calls = []
+
+    def floor(*args):
+        result = original(*args)
+        calls.append(result)
+        return result
+
+    monkeypatch.setattr(rank, "_checkpoint_memory_floor", floor)
+    before = rank._plan_cost(plan)
+    assert len(calls) == 1
+    assert before.checkpoint_input_gradient == calls[0][0]
+    load_slot(rank, "selected", 64)
+    after = rank._plan_cost(plan)
+    assert len(calls) == 2
+    assert after.checkpoint_input_gradient == calls[1][0]
+    assert calls[1][1] > calls[0][1]
+    assert after.checkpoint_workspace > before.checkpoint_workspace
+    assert after.required > before.required
+    assert not torch.cuda.is_initialized()
+
+
 def test_gdn_pending_uses_selected_output_rank(layer):
     rank, gd = rank_with_moe(weights(layer, 8))
     small, large = load_slot(rank, "small", 1), load_slot(rank, "large", 64)
