@@ -133,3 +133,37 @@ def test_rebinding_preserves_callbacks_and_error_ownership(
     assert reference() is None
     if error_reference is not None:
         assert error_reference() is None
+
+
+def test_finalizer_can_reenter_source_rebinding(no_cyclic_gc):
+    references = []
+    events = []
+    errors = []
+
+    class Payload(dict):
+        kind: str
+
+        def __del__(self):
+            try:
+                events.append(self.kind)
+                if self.kind == "outer":
+                    _serialization._rebind_history_sources([], make("nested"))
+            except BaseException as error:
+                errors.append(type(error).__name__)
+
+    def make(kind: str) -> tr.Trajectory:
+        value = Payload(key=["stable"])
+        value.kind = kind
+        references.append(weakref.ref(value))
+        exchange = _chat_exchange([1], [2])
+        exchange.request["metadata"] = {"shared": value}
+        return tr.Trajectory(
+            exchanges=tr.TrajectoryExchanges(chat_completions=[exchange])
+        )
+
+    _serialization._rebind_history_sources([], make("outer"))
+
+    assert events == ["outer", "nested"]
+    assert errors == []
+    assert len(references) == 2
+    assert all(reference() is None for reference in references)
