@@ -305,6 +305,52 @@ def test_split_lower_bound_stays_below_the_layout_cost(monkeypatch, lengths, per
     assert r._layout_pricing_supported((1, 1, 2, 1), gradient_groups=True)
 
 
+@pytest.mark.parametrize(
+    "lengths", [(2048, 1536, 1024, 512), (4099, 3, 5, 7), (8191, 64)]
+)
+def test_split_lower_bound_stays_below_two_slots_layout_cost(monkeypatch, lengths):
+    # Two gradient groups of different slots (the first request alone, then
+    # the rest), each with pending gradients, one outweighing its boundaries.
+    from art.megatron.lora import LoRASlotRef
+
+    r = art_cp(rank(), monkeypatch)
+    base = LoRASlotRef("checkpoint", None)
+    monkeypatch.setattr(
+        r,
+        "_group_active_request_indices",
+        lambda requests, **_: (
+            ((None, True), (0,)),
+            ((base, True), tuple(range(1, len(requests)))),
+        ),
+    )
+    slots = (LoRASlotRef("checkpoint", "policy"), LoRASlotRef("checkpoint", "other"))
+    groups = r._checkpoint_gradient_groups
+    monkeypatch.setattr(
+        r,
+        "_checkpoint_gradient_groups",
+        lambda group_rows, slot_refs: tuple(
+            (slot, boundaries)
+            for slot, (_, boundaries) in zip(slots, groups(group_rows, slot_refs))
+        ),
+    )
+    pending = {
+        (slots[0],): (6000 * H,) * 40 + (0,),
+        (slots[1],): (300 * H,) * 40 + (7 * H,),
+    }
+    monkeypatch.setattr(
+        r, "_pending_adapter_gradient_bytes", lambda refs: pending.get(tuple(refs), ())
+    )
+    requests = _requests(lengths)
+    plan = _plan_with(r, requests)
+    assert len(plan.groups) == 2 and r._plan_group_layouts(plan) is not None
+    exact = r._plan_cost(plan)
+    assert exact.checkpoint_adapter_gradient > 0
+    lower = r._split_chunk_lower_cost(
+        requests, tuple(item.input_tokens for item in requests), checkpoint=Unset
+    )
+    assert lower.required <= exact.required
+
+
 def _plan_with(r, requests):
     return r._plan_flat_forward(requests)
 
