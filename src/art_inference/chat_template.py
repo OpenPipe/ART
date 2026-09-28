@@ -233,6 +233,25 @@ def _without_inline_reasoning_parser(template: str) -> str:
             return equal if test.ops[0].op == "eq" else not equal
         return None
 
+    def remember_stores(node: nodes.Node, initialized: set[str] | None) -> None:
+        if initialized is None:
+            return
+        initialized.update(
+            n.name for n in node.find_all(nodes.Name) if n.ctx == "store"
+        )
+        for child in (
+            node,
+            *node.find_all((nodes.Macro, nodes.Import, nodes.FromImport)),
+        ):
+            if isinstance(child, nodes.Macro):
+                initialized.add(child.name)
+            elif isinstance(child, nodes.Import):
+                initialized.add(child.target)
+            elif isinstance(child, nodes.FromImport):
+                initialized.update(
+                    name if isinstance(name, str) else name[1] for name in child.names
+                )
+
     def visit(
         body: Sequence[nodes.Node],
         bindings: set[int],
@@ -253,12 +272,7 @@ def _without_inline_reasoning_parser(template: str) -> str:
                     else:
                         shared.update(bindings)  # No unique consumed assignment.
                     bindings.clear()
-                    if initialized is not None:
-                        initialized.update(
-                            n.name
-                            for n in node.find_all(nodes.Name)
-                            if n.ctx == "store"
-                        )
+                    remember_stores(node, initialized)
                     continue
                 joined = set()
                 # If does not introduce a Jinja scope. Retain every binding
@@ -274,22 +288,13 @@ def _without_inline_reasoning_parser(template: str) -> str:
                 else:
                     joined.update(visit(node.else_, bindings, initialized))
                 bindings = joined
+                # A role-pruned path may still have initialized a local before
+                # rebinding message. Freshness follows every syntactic store.
+                remember_stores(node, initialized)
             else:
                 if reads_content(node, initialized):
                     shared.update(bindings)
-                if initialized is not None:
-                    initialized.update(
-                        n.name for n in node.find_all(nodes.Name) if n.ctx == "store"
-                    )
-                    if isinstance(node, nodes.Macro):
-                        initialized.add(node.name)
-                    elif isinstance(node, nodes.Import):
-                        initialized.add(node.target)
-                    elif isinstance(node, nodes.FromImport):
-                        initialized.update(
-                            name if isinstance(name, str) else name[1]
-                            for name in node.names
-                        )
+                remember_stores(node, initialized)
                 if isinstance(node, nodes.Assign):
                     if writes_content(node):
                         bindings = {id(node)}
