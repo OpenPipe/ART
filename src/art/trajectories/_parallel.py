@@ -21,11 +21,13 @@ import sys
 import threading
 import time
 from types import ModuleType
+import typing
 from typing import Any, Literal, TypeVar, cast, get_args
 import warnings
 
 from pydantic import BaseModel
 from pydantic import main as pydantic_main
+from pydantic.fields import FieldInfo
 
 from . import (
     ChatCompletionsExchange,
@@ -583,23 +585,54 @@ def _process_sources(trajectory: Trajectory) -> tuple[object, ...]:
     )
 
 
+def _process_model_fields(cls: type) -> dict[str, FieldInfo] | None:
+    """Read only the standard declaration descriptor and plain metadata slots."""
+    if type(cls) is not type(BaseModel):
+        return None
+    attributes: dict[str, object] = {}
+    for base in cls.__mro__:
+        for name in ("model_fields", "__pydantic_fields__"):
+            if name in vars(base):
+                attributes.setdefault(name, vars(base)[name])
+    fields = attributes.get("__pydantic_fields__")
+    if (
+        attributes.get("model_fields") is not vars(BaseModel)["model_fields"]
+        or type(fields) is not dict
+        or any(
+            type(name) is not str or type(field) is not FieldInfo
+            for name, field in fields.items()
+        )
+    ):
+        return None
+    return cast(dict[str, FieldInfo], fields)
+
+
 @lru_cache(maxsize=1)
 def _process_schema_models() -> frozenset[type[BaseModel]]:
     """Exact ART/provider types in the declared result schema, never subclasses."""
     models: set[type[BaseModel]] = set()
     pending: list[object] = [TokenizedTrajectory, TokenizedMultiHistoryTrajectory]
     seen: set[int] = set()
+    aliases = (
+        type(list[object]),
+        type(object | None),
+        type(typing.Iterable[object]),
+        type(Literal[0]),
+        type(typing.Annotated[object, None]),
+        type(typing.Union[object, None]),
+    )
     while pending:
         annotation = pending.pop()
         if id(annotation) in seen:
             continue
         seen.add(id(annotation))
-        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
-            models.add(annotation)
-            pending.extend(
-                field.annotation for field in annotation.model_fields.values()
-            )
-        else:
+        if type(annotation) is type(BaseModel):
+            fields = _process_model_fields(cast(type, annotation))
+            if fields is None:
+                raise _ProcessSourceAlias
+            models.add(cast(type[BaseModel], annotation))
+            pending.extend(field.annotation for field in fields.values())
+        elif any(type(annotation) is alias for alias in aliases):
             pending.extend(get_args(annotation))
     return frozenset(models)
 
@@ -627,6 +660,10 @@ def _process_plain_models(
         and type(key) is not type(Enum)
         for key in copyreg.dispatch_table
     ):
+        return None
+    try:
+        schema_models = _process_schema_models()
+    except _ProcessSourceAlias:
         return None
 
     @lru_cache(maxsize=None)
@@ -695,6 +732,9 @@ def _process_plain_models(
     def model_is_plain(cls: type) -> bool:
         if cls not in models:
             attrs = attributes(cls)
+            fields = _process_model_fields(cls)
+            if fields is None:
+                return False
             if cls in (TokenizedTrajectory, TokenizedMultiHistoryTrajectory):
                 setters = attrs.get("__pydantic_setattr_handlers__")
                 config = attrs.get("model_config")
@@ -758,7 +798,7 @@ def _process_plain_models(
                 or not fields_are_plain(
                     cls,
                     (
-                        *cast(type[BaseModel], cls).model_fields,
+                        *fields,
                         # The parent may not have a history instance yet. Check
                         # every replacement role even if its field is undeclared.
                         "system_source",
@@ -777,7 +817,7 @@ def _process_plain_models(
             type(cls) is not type(BaseModel)
             or cls in copyreg.dispatch_table
             or not model_is_plain(cls)
-            for cls in _process_schema_models()
+            for cls in schema_models
         )
     ):
         return None
@@ -828,7 +868,7 @@ def _process_plain_models(
         elif type(cls) is type(BaseModel):
             # Keys/set members run hashing and equality during reconstruction.
             # Decline all model keys, including models nested in key containers.
-            if hashed or cls not in _process_schema_models():
+            if hashed or cls not in schema_models:
                 return None
             if not model_is_plain(cls):
                 return None

@@ -15,6 +15,7 @@ import weakref
 
 from openai.types.chat import ChatCompletion, ChatCompletionUserMessageParam
 from pydantic import BaseModel
+from pydantic.fields import FieldInfo
 import pytest
 
 import art.trajectories as tr
@@ -2453,3 +2454,162 @@ def test_process_writer_releases_sources_without_cyclic_gc(
     reference, payload = serialize()
     assert payload
     assert reference() is None
+
+
+@pytest.mark.parametrize("attribute", ["model_fields", "__pydantic_fields__"])
+@pytest.mark.parametrize("kind", ["mapping", "descriptor"])
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("route", ["worker", "parent"])
+def test_schema_metadata_resolution_preserves_ordinary_callbacks(
+    attribute, kind, raises, warm, route
+):
+    outcomes = []
+    for optimized in (False, True):
+        parent, result = fixture()
+        fields = tr.TokenizedTrajectory.model_fields
+        events = []
+        error = RuntimeError("schema metadata callback")
+
+        def observe():
+            events.append("metadata")
+            if raises:
+                raise error
+
+        class Fields(dict):
+            def __iter__(self):
+                observe()
+                return super().__iter__()
+
+            def values(self):
+                observe()
+                return super().values()
+
+        class Descriptor:
+            def __get__(self, instance, owner):
+                observe()
+                return fields
+
+        p._process_schema_models.cache_clear()
+        if warm:
+            p._process_schema_models()
+        try:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(
+                    tr.TokenizedTrajectory,
+                    attribute,
+                    Fields(fields) if kind == "mapping" else Descriptor(),
+                )
+                if route == "parent":
+                    options = p._ProcessOptions(False, False, None, None, None, None)
+                    with p._without_pickle_string_interning():
+                        payload = (
+                            p._process_payloads([parent], options)[0]
+                            if optimized
+                            else pickle.dumps(
+                                (parent, options), protocol=pickle.HIGHEST_PROTOCOL
+                            )
+                        )
+                    value, received_options = pickle.loads(payload)
+                    assert not received_options.source_refs_allowed
+                    answer = value.reward
+                else:
+                    payload = (
+                        p._serialize_process_result(result)
+                        if optimized
+                        else pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+                    )
+                    assert not payload.startswith(b"\0")
+                    answer = pickle.loads(payload).tokens
+                outcomes.append((events, answer))
+        finally:
+            p._process_schema_models.cache_clear()
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0][0] == []
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_schema_field_objects_decline_before_observing_annotations(warm):
+    parent, result = fixture()
+    events = []
+    armed = False
+
+    class CustomField(cast(Any, FieldInfo)):
+        def __getattribute__(self, name):
+            if name == "annotation" and armed:
+                events.append(name)
+                raise RuntimeError("field annotation callback")
+            return super().__getattribute__(name)
+
+    field = CustomField(annotation=list[int])
+    armed = True
+    fields = {**tr.TokenizedTrajectory.model_fields, "tokens": field}
+    p._process_schema_models.cache_clear()
+    if warm:
+        p._process_schema_models()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(tr.TokenizedTrajectory, "__pydantic_fields__", fields)
+            ordinary = pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+            candidate = p._serialize_process_result(result)
+            assert not candidate.startswith(b"\0")
+            assert pickle.loads(ordinary).tokens == pickle.loads(candidate).tokens
+            assert events == []
+    finally:
+        p._process_schema_models.cache_clear()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+def test_unknown_annotation_resolution_is_not_observed(raises, warm):
+    parent, result = fixture()
+    events = []
+
+    class Annotation:
+        @property
+        def __class__(self):
+            events.append("annotation class")
+            if raises:
+                raise RuntimeError("annotation class callback")
+            return object
+
+    field = copy.copy(tr.TokenizedTrajectory.model_fields["tokens"])
+    field.annotation = Annotation()
+    fields = {**tr.TokenizedTrajectory.model_fields, "tokens": field}
+    p._process_schema_models.cache_clear()
+    if warm:
+        p._process_schema_models()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(tr.TokenizedTrajectory, "__pydantic_fields__", fields)
+            ordinary = pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+            candidate = p._serialize_process_result(result)
+            assert candidate.startswith(b"\0")
+            expected = p._deserialize_process_result(ordinary, parent)
+            actual = p._deserialize_process_result(candidate, parent)
+            assert isinstance(expected, tr.TokenizedTrajectory)
+            assert isinstance(actual, tr.TokenizedTrajectory)
+            assert expected.tokens == actual.tokens
+            assert events == []
+    finally:
+        p._process_schema_models.cache_clear()
+
+
+@pytest.mark.parametrize("warm", [False, True])
+def test_exact_schema_metadata_copy_keeps_source_elision(warm):
+    parent, result = fixture()
+    p._process_schema_models.cache_clear()
+    if warm:
+        p._process_schema_models()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                tr.TokenizedTrajectory,
+                "__pydantic_fields__",
+                dict(tr.TokenizedTrajectory.model_fields),
+            )
+            payload = p._serialize_process_result(result)
+            assert payload.startswith(b"\0")
+            assert p._deserialize_process_result(payload, parent).trajectory is parent
+    finally:
+        p._process_schema_models.cache_clear()
