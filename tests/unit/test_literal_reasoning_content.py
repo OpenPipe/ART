@@ -257,6 +257,7 @@ def test_macro_capture_keeps_shared_content_trim(indirect, content):
         + "[{{ content }}]"
     )
     fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
     assert (
         env.from_string(fixed).render(message={"role": "assistant", "content": content})
