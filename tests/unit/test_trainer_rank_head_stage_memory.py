@@ -337,3 +337,74 @@ def test_head_stage_covers_a_small_chunks_fp32_fallback(monkeypatch):
     monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "512")
     stage = r._checkpoint_head_stage_bytes(3 * 512 * dense, 0, groups, None)
     assert stage == 9 * 511 * dense + state
+
+
+def test_a_staged_plan_runs_its_fused_statistics_strictly(monkeypatch):
+    from types import SimpleNamespace
+
+    from art.trainer_rank import _impl, topk
+
+    state = {"succeeded": True, "failed": False}
+    monkeypatch.setattr(_impl, "_TRITON_STATS_STATE", state)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("kernel launch failed")
+
+    monkeypatch.setattr(topk, "local_logsumexp_stats", fail)
+    chunk = SimpleNamespace(is_cuda=True, shape=(512, 248320))
+    # Unstaged: the FP32 fallback, and no later plan stages again.
+    assert _impl._try_triton_stats("local_logsumexp_stats", chunk) is None
+    assert state["failed"] is True
+    # Staged: the plan's price assumed the fused path, so it raises instead.
+    with pytest.raises(RuntimeError, match="admitted on their memory"):
+        _impl._try_triton_stats("local_logsumexp_stats", chunk, strict=True)
+    # Too few rows is a predictable fallback the head stage prices.
+    small = SimpleNamespace(is_cuda=True, shape=(63, 248320))
+    assert _impl._try_triton_stats("local_logsumexp_stats", small, strict=True) is None
+
+
+def test_execution_binds_the_staging_its_latest_price_used(monkeypatch):
+    from test_trainer_rank_head_memory import rank as head_rank
+    from test_trainer_rank_head_memory import request
+
+    from art.trainer_rank import _impl
+
+    monkeypatch.setattr(
+        _impl, "_TRITON_STATS_STATE", {"succeeded": True, "failed": False}
+    )
+    r = head_rank()
+    plan = r._plan_flat_forward([request(512, grad=True)])
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    seen = []
+    monkeypatch.setattr(
+        r,
+        "_execute_flat_plan_groups",
+        lambda plan: seen.append(r._head_statistics_strict) or [],
+    )
+    assert r._plan_head_backward_traced(plan) is True
+    r._execute_flat_plan(plan)
+    # A later price that no longer stages (a kernel failed since) unbinds it.
+    _impl._TRITON_STATS_STATE["failed"] = True
+    assert r._plan_head_backward_traced(plan) is False
+    r._execute_flat_plan(plan)
+    assert seen == [True, False]
+    assert r._head_statistics_strict is False
+
+
+def test_several_labels_per_row_are_not_traced(monkeypatch):
+    from test_trainer_rank_head_memory import rank as head_rank
+    from test_trainer_rank_head_memory import request
+
+    from art.trainer_rank import _impl
+
+    monkeypatch.setattr(
+        _impl, "_TRITON_STATS_STATE", {"succeeded": True, "failed": False}
+    )
+    r = head_rank()
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    single = request(512, grad=True)
+    several = replace(
+        single, target_tokens=single.target_tokens.unsqueeze(1).repeat(1, 4)
+    )
+    assert r._head_backward_traced([single], 512) is True
+    assert r._head_backward_traced([several], 512) is False
