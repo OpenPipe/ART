@@ -4338,8 +4338,9 @@ class TrainerRank:
         projected chunk. Top-k, logits and hidden-state outputs keep further
         dense gradients, and the FP32 fallback wider copies; other CP sizes
         are untraced. The fused statistics must have run in this process and
-        never fallen back after an error: a failed kernel takes the FP32 path
-        silently. ``rows`` bounds the first chunk's rows from below,
+        never fallen back after an error; a plan priced on them then runs them
+        strictly (``_plan_head_backward_traced``), so a later failure raises
+        rather than taking the wider FP32 path. ``rows`` bounds the first chunk's rows from below,
         ``upper_rows`` from above: None when they straddle the threshold.
         A CP rank projecting fewer rows falls back on its own; the head stage
         prices that (``_HEAD_FALLBACK_BUFFERS``).
@@ -4348,6 +4349,8 @@ class TrainerRank:
             not requests
             or any(
                 request.target_tokens is None
+                # Several labels per row save gather indices and masks per label.
+                or request.target_tokens.shape != request.input_tokens.shape
                 or request.top_k is not None
                 or request.logits
                 or request.hidden_states
@@ -4370,7 +4373,11 @@ class TrainerRank:
         return None
 
     def _plan_head_backward_traced(self, plan: _FlatForwardPlan) -> bool:
-        """Every gradient group's head backward is traced (``_head_backward_traced``)."""
+        """Every gradient group's head backward is traced (``_head_backward_traced``).
+
+        Records the answer on the plan: its execution runs the fused statistics
+        strictly exactly when its latest price staged the head.
+        """
         traced = [
             self._head_backward_traced(
                 requests,
@@ -4384,7 +4391,9 @@ class TrainerRank:
             if group.grad_enabled
             for requests in (tuple(item.request for item in group.items),)
         ]
-        return bool(traced) and all(state is True for state in traced)
+        staged = bool(traced) and all(state is True for state in traced)
+        object.__setattr__(plan, "_head_staged", staged)
+        return staged
 
     def _plan_head_workspace_bytes(self, plan: _FlatForwardPlan) -> int:
         peak = 0
@@ -5085,43 +5094,6 @@ class TrainerRank:
                 )
             )
         return tuple(layouts)
-
-    @staticmethod
-    def _te_workspace_sets() -> int | None:
-        """TE's cached cuBLAS workspace sets, or None without TE."""
-        try:
-            from transformer_engine.pytorch.cpp_extensions import gemm
-        except ImportError:
-            return None
-        info = getattr(gemm.get_cublas_workspace, "cache_info", None)
-        return int(info().currsize) if callable(info) else None
-
-    def _te_workspace_growth_since(self, sets: int | None) -> int:
-        """TE cuBLAS workspace bytes allocated since ``sets`` sets were cached.
-
-        TE caches one set per kind: the plain GEMMs' one workspace and the
-        grouped GEMMs' one per cuBLAS stream (userbuffers' only with TP comm
-        overlap). Growing from none to both is exact; any other growth is
-        ambiguous and counts one workspace per set, the least any holds.
-        """
-        now = self._te_workspace_sets()
-        if sets is None or now is None or now <= sets:
-            return 0
-        try:
-            from transformer_engine.pytorch.cpp_extensions import gemm
-
-            size = int(gemm.get_cublas_workspace_size_bytes())
-            streams = int(gemm.tex.get_num_cublas_streams())
-        except (AttributeError, ImportError, RuntimeError):
-            return 0
-        overlap = bool(
-            getattr(
-                getattr(self.runtime.model[0], "config", None), "tp_comm_overlap", False
-            )
-        )
-        if sets == 0 and now == 2 and not overlap:
-            return (1 + streams) * size
-        return (now - sets) * size
 
     def _te_workspace_growth_bytes(self) -> int:
         """Transformer Engine's cuBLAS workspaces, until its GEMMs allocate them.
@@ -7802,10 +7774,6 @@ class TrainerRank:
             baseline = int(torch.cuda.memory_allocated(self.device))
             torch.cuda.reset_peak_memory_stats(self.device)
             self._peak_resets = self.__dict__.get("_peak_resets", 0) + 1
-            self._te_workspaces_at_reset = (
-                self._peak_resets,
-                self._te_workspace_sets(),
-            )
         else:
             baseline = None
         observation = getattr(self, "_planner_observation", None)
@@ -7868,21 +7836,11 @@ class TrainerRank:
             observation["peak"] = max(observation["peak"], peak)
         resets = self.__dict__.get("_peak_resets", 0)
         self._peak_reading = (resets, peak)
-        # TE's cuBLAS workspaces this window allocated stay for the process:
-        # a one-time cost later plans never pay, so it teaches no rate.
-        at_reset = self.__dict__.get("_te_workspaces_at_reset")
-        growth = (
-            self._te_workspace_growth_since(at_reset[1])
-            if at_reset is not None and at_reset[0] == resets
-            else 0
-        )
         self._update_memory_profile(
             plan,
-            max(0, peak - baseline - growth),
+            max(0, peak - baseline),
             retained_bytes=(
-                None
-                if retained_after is None
-                else max(0, retained_after - baseline - growth)
+                None if retained_after is None else max(0, retained_after - baseline)
             ),
             # Only a whole wave: a nested forward resetting the counter during
             # the yield, or an untracked reset (the counter fell below this
@@ -8363,6 +8321,17 @@ class TrainerRank:
         }
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
+        # A head priced as staged must not silently widen (_head_backward_traced).
+        previous_strict = self.__dict__.get("_head_statistics_strict", False)
+        self._head_statistics_strict = bool(getattr(plan, "_head_staged", False))
+        try:
+            return self._execute_flat_plan_groups(plan)
+        finally:
+            self._head_statistics_strict = previous_strict
+
+    def _execute_flat_plan_groups(
+        self, plan: _FlatForwardPlan
+    ) -> list[AnyForwardOutput]:
         outputs = [
             ForwardOutput(None, None, None, None, checkpoint, no_grad)
             for checkpoint, no_grad in plan.output_metadata
@@ -10354,6 +10323,7 @@ class TrainerRank:
         from torch.utils.checkpoint import checkpoint
 
         model = _language_model(self.runtime.model[0])
+        strict_statistics = bool(self.__dict__.get("_head_statistics_strict", False))
         max_top_k = max((int(item.request.top_k or 0) for item in items), default=0)
         need_log_z = any(
             item.labels is not None or item.request.top_k is not None for item in items
@@ -10371,6 +10341,8 @@ class TrainerRank:
                 output_weight=output_weight,
                 need_log_z=need_log_z,
                 max_top_k=max_top_k,
+                # Captured now: the backward recompute keeps this plan's mode.
+                strict_statistics=strict_statistics,
                 use_reentrant=False,
             )
             logit_start, logit_end = logit_bounds[chunk_index : chunk_index + 2]
@@ -10451,6 +10423,7 @@ class TrainerRank:
         output_weight: torch.Tensor | None,
         need_log_z: bool,
         max_top_k: int,
+        strict_statistics: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -10464,11 +10437,17 @@ class TrainerRank:
         log_z: torch.Tensor | None = None
         local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
         if need_log_z:
-            topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
+            topk_stats = _try_triton_local_topk_stats(
+                local_logits, k=max_top_k, strict=strict_statistics
+            )
             logsumexp_stats = (
                 cast(
                     tuple[torch.Tensor, torch.Tensor] | None,
-                    _try_triton_stats("local_logsumexp_stats", local_logits),
+                    _try_triton_stats(
+                        "local_logsumexp_stats",
+                        local_logits,
+                        strict=strict_statistics,
+                    ),
                 )
                 if topk_stats is None
                 else None
@@ -11413,6 +11392,7 @@ def _try_triton_local_topk_stats(
     local_logits: torch.Tensor,
     *,
     k: int,
+    strict: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     if k <= 0 or k > int(
         os.environ.get("ART_TRAINER_RANK_TRITON_FUSED_TOPK_MAX", "10")
@@ -11423,6 +11403,7 @@ def _try_triton_local_topk_stats(
         _try_triton_stats(
             "local_topk_stats",
             local_logits,
+            strict=strict,
             k=min(k, int(local_logits.shape[1])),
         ),
     )
@@ -11431,8 +11412,16 @@ def _try_triton_local_topk_stats(
 def _try_triton_stats(
     name: str,
     local_logits: torch.Tensor,
+    *,
+    strict: bool = False,
     **kwargs: object,
 ) -> object | None:
+    """The fused statistics, or None for the FP32 fallback.
+
+    ``strict``: a plan whose price relied on them raises instead of falling
+    back after an error (``_head_backward_traced``). Too few rows still fall
+    back: the head stage prices that (``_HEAD_FALLBACK_BUFFERS``).
+    """
     if not local_logits.is_cuda:
         return None
     if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() in {
@@ -11446,8 +11435,13 @@ def _try_triton_stats(
         from art.trainer_rank import topk
 
         result = getattr(topk, name)(local_logits, **kwargs)
-    except Exception:
+    except Exception as error:
         _TRITON_STATS_STATE["failed"] = True
+        if strict:
+            raise RuntimeError(
+                "Fused head statistics failed in a plan admitted on their "
+                "memory; the FP32 fallback would exceed its price"
+            ) from error
         if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict":
             raise
         return None
