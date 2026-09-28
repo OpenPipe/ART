@@ -304,22 +304,20 @@ def _plan_with(r, requests):
     return r._plan_flat_forward(requests)
 
 
-def test_adapter_gradients_meet_each_ranks_own_layer_boundaries(monkeypatch):
+def _pending_adapter_rank(monkeypatch, layout, rows, per_layer=300 * H):
     from art.megatron.lora import LoRASlotRef
 
     r = qwen36(rank())
-    plan = _plan(r)
-    layout = _GroupLayout((400, 240), (160, 320), (0, 0))
     monkeypatch.setattr(r, "_plan_group_layouts", lambda plan: (layout,))
-    monkeypatch.setattr(r, "_plan_group_rows", lambda plan: ((400, True),))
-    monkeypatch.setattr(r, "_plan_group_routed_rows", lambda plan: (320,))
+    monkeypatch.setattr(r, "_plan_group_rows", lambda plan: ((rows, True),))
+    monkeypatch.setattr(r, "_plan_group_routed_rows", lambda plan: (rows,))
     monkeypatch.setattr(r, "_plan_hybridep_growth_bytes", lambda plan: 0)
-    monkeypatch.setattr(r, "_plan_retained_tokens", lambda plan: 320)
+    monkeypatch.setattr(r, "_plan_retained_tokens", lambda plan: rows)
     policy = LoRASlotRef("checkpoint", "policy")
     monkeypatch.setattr(
         r, "_gradient_slots", lambda group_rows, slot_refs: frozenset({policy})
     )
-    pending = (300 * H,) * 40 + (0,)
+    pending = (per_layer,) * 40 + (0,)
     monkeypatch.setattr(
         r,
         "_pending_adapter_gradient_bytes",
@@ -333,7 +331,8 @@ def test_adapter_gradients_meet_each_ranks_own_layer_boundaries(monkeypatch):
     def boundaries(rank_index):
         assert layout.gdn_rows is not None
         return [
-            H * (layout.gdn_rows if is_gdn else layout.attention_rows)[rank_index]
+            H
+            * max(1, (layout.gdn_rows if is_gdn else layout.attention_rows)[rank_index])
             for is_gdn in gdn_inputs
         ]
 
@@ -346,13 +345,56 @@ def test_adapter_gradients_meet_each_ranks_own_layer_boundaries(monkeypatch):
             ),
         )
 
-    # Each rank releases its own boundaries in layer order; the busiest extra wins.
-    expected = max(extra(boundaries(0)), extra(boundaries(1)))
-    assert r._plan_cost(plan).checkpoint_adapter_gradient == expected > 0
-    # An even share of the busiest rank's boundaries would misplace the peak.
-    retained, _ = r._layout_checkpoint_floor(layers, (None,), (320,), (layout,))
-    assert extra([retained // 40] * 40) != expected
-    assert r._checkpoint_layer_boundary_sets(retained, ((400, True),), (layout,)) == (
+    floor = r._checkpoint_memory_floor(
+        ((rows, True),), None, routed_rows=(rows,), layouts=(layout,)
+    )
+    floors = r._layout_checkpoint_rank_floors(layers, (None,), (rows,), (layout,))
+    return r, boundaries, extra, floor, floors
+
+
+def test_adapter_gradients_meet_each_ranks_own_layer_boundaries(monkeypatch):
+    layout = _GroupLayout((400, 240), (160, 320), (0, 0))
+    r, boundaries, extra, (retained, workspace), floors = _pending_adapter_rank(
+        monkeypatch, layout, 400
+    )
+    assert r._layout_layer_boundaries((layout,)) == (
         tuple(boundaries(0)),
         tuple(boundaries(1)),
     )
+    # Every rank's boundaries sum to its own floor's.
+    assert [sum(boundaries(i)) for i in (0, 1)] == [floor[0] for floor in floors]
+    assert retained == max(floor[0] for floor in floors)
+    # Each rank releases its own boundaries in layer order; each extra sits on
+    # that rank's own floor, bounded by the floor's workspace.
+    expected = (
+        max(
+            floor[0] + max(floor[1], workspace) + extra(boundaries(i))
+            for i, floor in enumerate(floors)
+        )
+        - retained
+        - workspace
+    )
+    assert r._plan_cost(_plan(r)).checkpoint_adapter_gradient == expected > 0
+    # An even share of the busiest rank's boundaries would misplace the peak.
+    assert extra([retained // 40] * 40) != expected
+
+
+def test_a_rank_without_gdn_rows_pairs_its_extra_with_its_own_floor(monkeypatch):
+    # A single short sequence at CP2: every GDN row on rank 0 (Qwen3.6 2,047
+    # tokens), with about 24 MB of expert LoRA gradients per layer.
+    layout = _GroupLayout((1536, 511), (2047, 0), (0, 0))
+    r, boundaries, extra, (retained, workspace), floors = _pending_adapter_rank(
+        monkeypatch, layout, 2047, per_layer=6000 * H
+    )
+    extras = [extra(boundaries(i)) for i in (0, 1)]
+    # Rank 1 releases almost nothing, so its extra is almost every gradient...
+    assert extras[1] > extras[0] and extras[1] > 6000 * H * 38
+    cost = r._plan_cost(_plan(r)).checkpoint_adapter_gradient
+    # ...but it sits on rank 1's much smaller floor, not on rank 0's.
+    assert cost < extras[1]
+    # Every rank's own floor plus its own extra stays within the price.
+    for (rank_retained, rank_workspace), rank_extra in zip(floors, extras):
+        assert rank_retained + rank_workspace + rank_extra <= (
+            retained + workspace + cost
+        )
+    assert cost >= extras[0]
