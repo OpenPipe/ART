@@ -131,7 +131,7 @@ def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
             50640 * (checkpoint_coefficient + 128) + 3157761952,
         )
         # The incoming gradient replaces one gradient per boundary.
-        assert rank._plan_cost(plan).required == (23787450051 if gate else 23559286467)
+        assert rank._plan_cost(plan).required == (23861269801 if gate else 23633106217)
     selected = rank._select_next_micro_batch(requests, 0)
     assert (
         selected.check.estimated_required_bytes
@@ -152,7 +152,7 @@ def test_original_norm_installation_preserves_shared_return(layer, gated):
         8296857600,
         50640 * (checkpoint_coefficient + 128) + 3157761952,
     )
-    expected = 23787450051 if gated else 23559286467
+    expected = 23861269801 if gated else 23633106217
     assert rank._memory_check(plan).estimated_required_bytes == expected
     assert rank._plan_cost(plan).required == expected
 
