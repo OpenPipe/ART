@@ -87,6 +87,20 @@ def test_no_pending_gradients_add_nothing(monkeypatch):
     assert r._checkpoint_adapter_gradient_bytes(((POLICY, [4] * 40),)) == 0
 
 
+def test_a_layer_count_mismatch_prices_no_extra(monkeypatch):
+    r = rank()
+    with_slot_pending(
+        monkeypatch, r, {(POLICY,): [5] * 4 + [0], (OTHER,): [9] * 3 + [0]}
+    )
+    # Pending gradients and boundaries must describe the same decoder layers;
+    # otherwise the whole term is left out rather than misplaced.
+    assert r._checkpoint_adapter_gradient_bytes(((POLICY, [1] * 4),)) > 0
+    assert r._checkpoint_adapter_gradient_bytes(((OTHER, [1] * 4),)) == 0
+    assert (
+        r._checkpoint_adapter_gradient_bytes(((POLICY, [1] * 4), (OTHER, [1] * 4))) == 0
+    )
+
+
 def sequential_oracle(chains):
     """Worst live bytes beyond the floor, one group's backward after another.
 
