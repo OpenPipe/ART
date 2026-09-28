@@ -102,42 +102,26 @@ def test_rows_are_sharded_with_ceiling_and_only_gradient_groups_save_them():
 
 
 @pytest.mark.parametrize(
-    "case",
+    "case,kwargs",
     [
-        "tp2",
-        "tp8",
-        "cp2",
-        "pp2",
-        "no_sequence_parallel",
-        "sequence_parallel_at_tp1",
-        "selective_recompute",
-        "moe",
-        "moe_geometry",
-        "replicated_qkv",
-        "missing_attention_geometry",
-        "missing_conv_kernel",
-        "shallow",
-        "wide_ffn",
+        ("tp2", dict(topology=(1, 2, 1, 1))),
+        ("tp8", dict(topology=(1, 8, 1, 1))),
+        ("cp2", dict(topology=(1, 4, 2, 1))),
+        ("pp2", dict(topology=(1, 4, 1, 2))),
+        ("no_sequence_parallel", dict(sequence_parallel=False)),
+        ("sequence_parallel_at_tp1", dict(topology=(1, 1, 1, 1))),
+        ("selective_recompute", dict()),
+        ("moe", dict()),
+        ("moe_geometry", dict()),
+        ("replicated_qkv", dict()),
+        ("missing_attention_geometry", dict()),
+        ("missing_conv_kernel", dict()),
+        ("shallow", dict(layers=48)),
+        ("wide_ffn", dict(ffn=4 * F)),
     ],
 )
-def test_unproven_shapes_keep_todays_pricing(case):
-    shapes = {
-        "tp2": dict(topology=(1, 2, 1, 1)),
-        "tp8": dict(topology=(1, 8, 1, 1)),
-        "cp2": dict(topology=(1, 4, 2, 1)),
-        "pp2": dict(topology=(1, 4, 1, 2)),
-        "no_sequence_parallel": dict(sequence_parallel=False),
-        "sequence_parallel_at_tp1": dict(topology=(1, 1, 1, 1)),
-        "selective_recompute": dict(),
-        "moe": dict(),
-        "moe_geometry": dict(),
-        "replicated_qkv": dict(),
-        "missing_attention_geometry": dict(),
-        "missing_conv_kernel": dict(),
-        "shallow": dict(layers=48),
-        "wide_ffn": dict(ffn=4 * F),
-    }
-    r = tp_rank(**shapes[case])
+def test_unproven_shapes_keep_todays_pricing(case, kwargs):
+    r = tp_rank(**kwargs)
     if case == "selective_recompute":
         r.runtime.model[0].decoder.config.recompute_granularity = "selective"
     if case == "moe":

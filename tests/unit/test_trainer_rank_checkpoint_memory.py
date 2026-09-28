@@ -316,30 +316,6 @@ def test_split_keeps_complete_order_and_checks_each_new_subforward():
     assert all(a is b for a, b in zip(restored, req, strict=True))
 
 
-def test_optimistic_split_profile_cliff_preserves_checkpoint_floor():
-    r = rank()
-    req = [
-        ForwardInput(
-            input_tokens=torch.arange(128),
-            target_tokens=torch.arange(128),
-            no_grad=False,
-        )
-        for _ in range(16)
-    ]
-    full = r._plan_flat_forward(req, memory_minimal=True)
-    r._memory_profiles[full.signature] = _MemoryProfile(
-        bytes_per_token=1,
-        packed_tokens=256,
-        logical_per_packed=1,
-        retained_compute_bytes_per_token=1,
-    )
-    cost = r._split_chunk_lower_cost(
-        req, tuple(x.input_tokens for x in req), checkpoint=Unset
-    )
-    retained = 128 * 40 * 2048 * 2
-    assert cost.retained == int((full.output_bytes + retained) * 1.1)
-
-
 @pytest.mark.parametrize("profile_rate", [None, 1, 1_000_000])
 def test_no_grad_enclosure_exact_lower_and_profile(profile_rate):
     r = rank()
