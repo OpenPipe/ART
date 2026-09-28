@@ -172,34 +172,6 @@ def _gate_up_from_etp_shard_order(tensor: torch.Tensor, etp_size: int) -> torch.
     )
 
 
-def _pad_gpt_oss_interleaved_gate_up_last(
-    tensor: torch.Tensor,
-    *,
-    logical: int,
-    internal: int,
-) -> torch.Tensor:
-    if logical == internal:
-        return tensor.contiguous()
-    if int(tensor.shape[-1]) != 2 * logical:
-        raise RuntimeError(
-            "Expected GPT OSS interleaved gate/up logical dim "
-            f"{2 * logical}, got {tuple(tensor.shape)}"
-        )
-    gate = tensor[..., 0::2]
-    up = tensor[..., 1::2]
-    return (
-        torch.stack(
-            [
-                _pad_dim_right(gate, dim=-1, size=internal),
-                _pad_dim_right(up, dim=-1, size=internal),
-            ],
-            dim=-1,
-        )
-        .flatten(-2)
-        .contiguous()
-    )
-
-
 def _trim_gpt_oss_interleaved_gate_up_last(
     tensor: torch.Tensor,
     *,
