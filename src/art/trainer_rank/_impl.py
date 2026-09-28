@@ -16,10 +16,9 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import lru_cache, partial
-import hashlib
 import logging
 import math
 import os
@@ -73,7 +72,6 @@ from art.trainer_rank._options import (
     resolve_forward_options,
 )
 from art.trainer_rank._planner_cost import (
-    COEFFICIENT_VERSION_FALLBACK,
     ModelGeometry,
     ParallelShape,
     select_scoring,
@@ -82,9 +80,6 @@ from art.trainer_rank._prefix_tree_materializer import materialize_prefix_tree_l
 from art.trainer_rank._prefix_tree_planner import (
     CanonicalPrefixTree,
     PrefixTreeLayout,
-    build_canonical_prefix_tree,
-    prefix_tree_layout_candidates,
-    select_prefix_tree_layout,
 )
 from art.trainer_rank._rng import TrainerRNG, caller_group
 from art.trainer_rank._telemetry import phase as _telemetry_phase
@@ -107,7 +102,6 @@ if TYPE_CHECKING:
     from art.megatron.train import TrainingRuntime
     from art.trainer_rank._checkpoint import (
         CustomOptimizerState,
-        LocalOptimizerState,
         PreparedCheckpoint,
         PreparedCustomPayload,
         _FinalizedSave,
@@ -5750,9 +5744,6 @@ class TrainerRank:
             tensor_parallel.gather_from_tensor_model_parallel_region(logits),
         )
 
-    # Memory estimation, profiling and admission accounting live in
-    # ``_memory``; binding the functions here keeps ``self._x(...)`` dispatch
-    # and per-instance overrides (tests monkeypatch these) behaving as before.
     _split_required_memory = staticmethod(_memory._split_required_memory)
     _split_memory_key = staticmethod(_memory._split_memory_key)
     _record_split_memory_floor = _memory._record_split_memory_floor
@@ -5782,10 +5773,6 @@ class TrainerRank:
     _all_ranks_have_memory_profile = _memory._all_ranks_have_memory_profile
     _update_memory_profile = _memory._update_memory_profile
 
-    # Micro-batch planning, split search and admission live in
-    # ``_micro_batch_planner``; binding the functions here keeps ``self._x(...)``
-    # dispatch and per-instance overrides (tests monkeypatch these) behaving as
-    # before.
     _forward_batches = _micro_batch_planner._forward_batches
     _plan_admissible_forward = _micro_batch_planner._plan_admissible_forward
     _find_admissible_forward = _micro_batch_planner._find_admissible_forward
@@ -5823,9 +5810,6 @@ class TrainerRank:
     _plan_retained_tokens = _micro_batch_planner._plan_retained_tokens
     _planning_status = _micro_batch_planner._planning_status
 
-    # Checkpoint-slot bookkeeping lives in ``_slots``; binding the
-    # functions here keeps ``self._x(...)`` dispatch and per-instance
-    # overrides (tests monkeypatch these) behaving as before.
     _resolve_custom_checkpoint = _slots._resolve_custom_checkpoint
     prefetch_checkpoints = _slots.prefetch_checkpoints
     _register_checkpoint_prefetch = _slots._register_checkpoint_prefetch
@@ -5858,9 +5842,6 @@ class TrainerRank:
     _guard_checkpoint_can_step = _slots._guard_checkpoint_can_step
     _guard_checkpoints_can_step = _slots._guard_checkpoints_can_step
 
-    # Dynamic-optimizer management lives in ``_optimizer``; binding the
-    # functions here keeps ``self._x(...)`` dispatch and per-instance
-    # overrides (tests monkeypatch these) behaving as before.
     _extend_dynamic_optimizer = _optimizer._extend_dynamic_optimizer
     optim_step = _optimizer.optim_step
     _guard_optim_step_configuration = _optimizer._guard_optim_step_configuration

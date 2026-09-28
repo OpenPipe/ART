@@ -1,16 +1,6 @@
 """TrainerRank dynamic (per-checkpoint) optimizer management: optim_step,
 its configuration guard, and dynamic optimizer creation, extension,
 restore, padding masks and step flags.
-
-These are ``TrainerRank`` method bodies moved out of ``_impl`` verbatim: each
-function takes the owning rank as ``self`` and ``TrainerRank`` binds them as
-methods, so ``self._x(...)`` dispatch and per-instance overrides keep working.
-
-Module globals the bodies used to read from ``_impl`` (``torch``, ``dist``,
-sibling helpers) are still resolved through ``_impl`` at call time, so tests
-that patch ``_impl.torch`` and friends keep intercepting them; only pure
-stdlib helpers are imported here directly. Referencing ``_impl`` as a module
-also lets the circular import resolve lazily.
 """
 
 from __future__ import annotations

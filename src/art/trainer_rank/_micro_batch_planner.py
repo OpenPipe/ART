@@ -1,16 +1,4 @@
-"""TrainerRank micro-batch planning, split search and admission.
-
-These are ``TrainerRank`` method bodies moved out of ``_impl`` verbatim: each
-function takes the owning rank as ``self`` and ``TrainerRank`` binds them as
-methods, so ``self._x(...)`` dispatch and per-instance overrides keep working.
-
-Module globals the bodies used to read from ``_impl`` (``torch``, ``dist``,
-``time``, ``_telemetry_phase``, sibling helpers, plan/cost types) are still
-resolved through ``_impl`` at call time, so tests that patch ``_impl.dist`` and
-friends keep intercepting them. Only pure stdlib helpers and prefix-tree /
-planner-cost functions that nothing patches are imported here directly.
-Referencing ``_impl`` as a module also lets the circular import resolve lazily.
-"""
+"""TrainerRank micro-batch planning, split search and admission."""
 
 from __future__ import annotations
 
