@@ -4931,6 +4931,9 @@ def _tokenization_context(
         # Recursive context cannot prove callback stability, but complete native
         # records can still use the ordinary opaque-context bypass.
         raise TypeError("Unsupported recursive tokenization context") from error
+    finally:
+        # Release the recursive closures and their observation memo promptly.
+        del snapshot, instance_state
 
 
 def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
