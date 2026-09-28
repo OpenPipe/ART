@@ -26,6 +26,9 @@ class DemoService:
         await asyncio.sleep(0)
         return "pong"
 
+    async def nested(self) -> str:
+        return asyncio.run(self.ping())
+
     async def ticker(self, n: int = 1_000):
         for i in range(n):
             await asyncio.sleep(0)
@@ -69,6 +72,22 @@ async def test_proxy_supports_sync_async_and_attribute_access() -> None:
         assert await proxy.ping() == "pong"
     finally:
         close_proxy(proxy)
+
+
+async def test_nested_child_call_does_not_patch_parent_loop() -> None:
+    loop = asyncio.get_running_loop()
+    before = (asyncio.run, asyncio.Task, type(loop).run_until_complete)
+    proxy: Any = move_to_child_process(
+        DemoService(), process_name="test-mp-actors-nested-child"
+    )
+    try:
+        assert await asyncio.wait_for(proxy.nested(), timeout=3.0) == "pong"
+        assert before == (asyncio.run, asyncio.Task, type(loop).run_until_complete)
+    finally:
+        close_proxy(proxy)
+    assert not proxy._process.is_alive()
+    assert not proxy._dispatcher.is_alive()
+    assert not proxy._futures
 
 
 async def test_child_exit_error_is_sticky_for_followup_calls() -> None:
