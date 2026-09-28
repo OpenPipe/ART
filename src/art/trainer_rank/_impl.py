@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -5202,8 +5203,31 @@ class TrainerRank:
                 sizes[layer_of[param_id]] += param.numel() * param.element_size()
         return tuple(sizes) if any(sizes) else ()
 
+    def _checkpoint_gradient_groups(
+        self,
+        group_rows: Sequence[tuple[int, bool]],
+        slot_refs: Sequence["LoRASlotRef | None"] | None,
+    ) -> tuple[tuple["LoRASlotRef | None", tuple[int, ...]], ...]:
+        """Each gradient group's adapter slot and per-layer saved boundaries.
+
+        In execution order, as ``_checkpoint_memory_floor`` prices them: every
+        decoder layer saves the group's rows (this rank's TP shard). The base
+        model (no name) has no adapter slot.
+        """
+        tp = self._topology_key()[1]
+        return tuple(
+            (
+                ref if ref is not None and ref.name is not None else None,
+                (-(-rows // tp) * self._hidden_size * 2,) * self._num_layers,
+            )
+            for (rows, grad), ref in zip(
+                group_rows, slot_refs or (None,) * len(group_rows), strict=True
+            )
+            if grad
+        )
+
     def _checkpoint_adapter_gradient_bytes(
-        self, slots: Iterable["LoRASlotRef"], boundaries: Sequence[int]
+        self, groups: Sequence[tuple["LoRASlotRef | None", Sequence[int]]]
     ) -> int:
         """The recompute backward's adapter-gradient peak beyond released boundaries.
 
@@ -5217,32 +5241,48 @@ class TrainerRank:
         boundaries, not along a uniform-layer line. A short
         first wave peaks at layer 0 (Qwen3.6-35B-A3B CP2: 830-900 MB of expert
         LoRA gradients live at its peak), a long one at the last layer.
-        ``boundaries`` gives each decoder layer's saved-boundary bytes;
-        ``slots`` are the gradient groups' adapter slots.
+        ``groups`` gives each gradient group's adapter slot (None for the base
+        model) and each decoder layer's saved-boundary bytes. Groups run their
+        backward one after another, not layer by layer together: autograd
+        drains the last-forwarded group's chain first, and separate backward
+        calls can come in either order. While one group runs, a group yet to
+        run still holds all its boundaries and one already run all its
+        gradients, so take the worst order.
         """
-        pending = self._pending_adapter_gradient_bytes(slots)
-        if not pending or len(pending) != len(boundaries) + 1:
+        chains = []
+        for slot, boundaries in groups:
+            pending = (
+                () if slot is None else self._pending_adapter_gradient_bytes((slot,))
+            )
+            if pending and len(pending) != len(boundaries) + 1:
+                return 0
+            chains.append((pending or (0,) * (len(boundaries) + 1), boundaries))
+        if not any(any(pending) for pending, _ in chains):
             return 0
-        extra = gradients = pending[-1]
-        released = 0
-        for index in range(len(boundaries) - 1, -1, -1):
-            gradients += pending[index]
-            extra = max(extra, gradients - released)
-            released += boundaries[index]
-        return extra
-
-    def _checkpoint_layer_boundaries(self, retained: int) -> tuple[int, ...]:
-        """Each decoder layer's saved-boundary bytes within the floor's retained term."""
-        return (retained // self._num_layers,) * self._num_layers
+        if len(chains) > 4:
+            # Too many orders to walk: every gradient live, nothing released.
+            return sum(sum(pending) for pending, _ in chains)
+        worst = 0
+        for order in itertools.permutations(chains):
+            allocated = released = 0
+            for pending, boundaries in order:
+                gradients = allocated + pending[-1]
+                worst = max(worst, gradients - released)
+                for index in range(len(boundaries) - 1, -1, -1):
+                    gradients += pending[index]
+                    worst = max(worst, gradients - released)
+                    released += boundaries[index]
+                allocated = gradients
+        return worst
 
     def _layout_layer_boundaries(
         self, layouts: tuple[_GroupLayout, ...]
-    ) -> tuple[tuple[int, ...], ...]:
-        """Each CP rank's saved-boundary bytes per decoder layer on its layouts.
+    ) -> tuple[tuple[tuple[int, ...], ...], ...]:
+        """Each CP rank's saved-boundary bytes per group and decoder layer.
 
         As ``_layout_checkpoint_rank_floors`` prices them: a layer saves its
         input in the GDN layout when it follows a GDN layer in its island and in
-        the attention layout otherwise, on that rank's rows.
+        the attention layout otherwise, on that rank's rows of the group.
         """
         decoder = _language_model(self.runtime.model[0]).decoder
         gdn_inputs = [
@@ -5253,23 +5293,26 @@ class TrainerRank:
             for layer in decoder.layers
         ]
         hidden = self._hidden_size * 2
-        sets = []
+        ranks = []
         for rank in range(len(layouts[0].attention_rows)):
-            attention = sum(max(1, layout.attention_rows[rank]) for layout in layouts)
-            gdn = sum(
-                max(1, layout.attention_rows[rank])
-                if layout.gdn_rows is None
-                else max(1, layout.gdn_rows[rank])
-                for layout in layouts
-            )
-            sets.append(
-                tuple(hidden * (gdn if is_gdn else attention) for is_gdn in gdn_inputs)
-            )
-        return tuple(sets)
+            groups = []
+            for layout in layouts:
+                attention = max(1, layout.attention_rows[rank])
+                gdn = (
+                    attention
+                    if layout.gdn_rows is None
+                    else max(1, layout.gdn_rows[rank])
+                )
+                groups.append(
+                    tuple(
+                        hidden * (gdn if is_gdn else attention) for is_gdn in gdn_inputs
+                    )
+                )
+            ranks.append(tuple(groups))
+        return tuple(ranks)
 
     def _checkpoint_adapter_gradient_extra(
         self,
-        slots: frozenset["LoRASlotRef"],
         floor: tuple[int, int],
         group_rows: tuple[tuple[int, bool], ...],
         slot_refs: tuple["LoRASlotRef | None", ...] | None,
@@ -5279,9 +5322,10 @@ class TrainerRank:
         """Adapter gradients at the recompute backward's peak beyond ``floor``.
 
         ``floor`` is ``_checkpoint_memory_floor``'s (boundaries, workspace).
-        Every layer saves an equal share of its boundaries, except on per-rank
-        CP layouts (``_layout_checkpoint_floor``), where each rank releases its
-        own (``_layout_layer_boundaries``). A rank with fewer rows releases less
+        Every layer saves each gradient group's rows
+        (``_checkpoint_gradient_groups``), except on per-rank CP layouts
+        (``_layout_checkpoint_floor``), where each rank releases its own
+        (``_layout_layer_boundaries``). A rank with fewer rows releases less
         as backward proceeds, so its extra is larger, but its own floor is
         smaller by what it never saved. Pair each rank's extra with its own
         boundaries plus the larger of its workspace and the floor's, which
@@ -5289,16 +5333,18 @@ class TrainerRank:
         rank) does not add one rank's extra to the other's floor.
         """
         retained, workspace = floor
+        groups = self._checkpoint_gradient_groups(group_rows, slot_refs)
         if (
             layouts is None
             or self._topology_key()[1] > 1
             or not all(grad for _, grad in group_rows)
         ):
-            return self._checkpoint_adapter_gradient_bytes(
-                slots, self._checkpoint_layer_boundaries(retained)
-            )
+            return self._checkpoint_adapter_gradient_bytes(groups)
+        slots = [slot for slot, _ in groups]
         extras = [
-            self._checkpoint_adapter_gradient_bytes(slots, boundaries)
+            self._checkpoint_adapter_gradient_bytes(
+                tuple(zip(slots, boundaries, strict=True))
+            )
             for boundaries in self._layout_layer_boundaries(layouts)
         ]
         if not any(extras):
@@ -5399,7 +5445,6 @@ class TrainerRank:
         gradient_slots = self._gradient_slots(group_rows, slot_refs)
         adapter_gradient = (
             self._checkpoint_adapter_gradient_extra(
-                gradient_slots,
                 (checkpoint_retained, checkpoint_workspace),
                 group_rows,
                 slot_refs,
@@ -9269,7 +9314,6 @@ class TrainerRank:
             backward = self._checkpoint_input_gradient_bytes(
                 group_rows, slot_refs
             ) + self._checkpoint_adapter_gradient_extra(
-                self._gradient_slots(group_rows, slot_refs),
                 (retained, workspace),
                 group_rows,
                 slot_refs,
