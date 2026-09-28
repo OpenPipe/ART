@@ -20,9 +20,9 @@ import pickle
 import sys
 import threading
 import time
-from types import ModuleType
+from types import GenericAlias, ModuleType, UnionType
 import typing
-from typing import Any, Literal, TypeVar, cast, get_args
+from typing import Any, Literal, TypeVar, cast
 import warnings
 
 from pydantic import BaseModel
@@ -613,13 +613,14 @@ def _process_schema_models() -> frozenset[type[BaseModel]]:
     models: set[type[BaseModel]] = set()
     pending: list[object] = [TokenizedTrajectory, TokenizedMultiHistoryTrajectory]
     seen: set[int] = set()
-    aliases = (
-        type(list[object]),
-        type(object | None),
-        type(typing.Iterable[object]),
-        type(Literal[0]),
-        type(typing.Annotated[object, None]),
-        type(typing.Union[object, None]),
+    aliases = tuple(
+        vars(typing).get(name)
+        for name in (
+            "_GenericAlias",
+            "_LiteralGenericAlias",
+            "_AnnotatedAlias",
+            "_UnionGenericAlias",
+        )
     )
     while pending:
         annotation = pending.pop()
@@ -632,8 +633,23 @@ def _process_schema_models() -> frozenset[type[BaseModel]]:
                 raise _ProcessSourceAlias
             models.add(cast(type[BaseModel], annotation))
             pending.extend(field.annotation for field in fields.values())
-        elif any(type(annotation) is alias for alias in aliases):
-            pending.extend(get_args(annotation))
+        else:
+            if type(annotation) is GenericAlias or type(annotation) is UnionType:
+                args = object.__getattribute__(annotation, "__args__")
+            elif any(type(annotation) is alias for alias in aliases):
+                # typing aliases have mutable instance state. Only plain storage
+                # may be inspected; get_args() can traverse customized containers.
+                state = object.__getattribute__(annotation, "__dict__")
+                if type(state) is not dict or any(
+                    type(key) is not str for key in state
+                ):
+                    raise _ProcessSourceAlias
+                args = state.get("__args__")
+            else:
+                continue
+            if type(args) is not tuple:
+                raise _ProcessSourceAlias
+            pending.extend(args)
     return frozenset(models)
 
 
@@ -745,6 +761,11 @@ def _process_plain_models(
                     type(setters) is not dict
                     or type(config) is not dict
                     or type(standard_setters) is not dict
+                    or any(
+                        type(key) is not str
+                        for mapping in (setters, config, standard_setters)
+                        for key in mapping
+                    )
                 ):
                     return False
                 setter = setters.get("trajectory")

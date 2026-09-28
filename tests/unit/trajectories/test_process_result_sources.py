@@ -10,6 +10,7 @@ import gc
 import io
 import math
 import pickle
+import typing
 from typing import Any, cast
 import weakref
 
@@ -2608,6 +2609,193 @@ def test_exact_schema_metadata_copy_keeps_source_elision(warm):
                 "__pydantic_fields__",
                 dict(tr.TokenizedTrajectory.model_fields),
             )
+            payload = p._serialize_process_result(result)
+            assert payload.startswith(b"\0")
+            assert p._deserialize_process_result(payload, parent).trajectory is parent
+    finally:
+        p._process_schema_models.cache_clear()
+
+
+@pytest.mark.parametrize("storage", ["args", "state", "key"])
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("route", ["worker", "parent"])
+def test_typing_alias_storage_preserves_ordinary_callbacks(
+    storage, raises, warm, route
+):
+    outcomes = []
+    for optimized in (False, True):
+        parent, result = fixture()
+        events = []
+
+        def observe():
+            events.append(storage)
+            if raises:
+                raise RuntimeError("typing metadata callback")
+
+        class Args(tuple):
+            def __iter__(self):
+                observe()
+                return super().__iter__()
+
+        class State(dict):
+            def get(self, key, default=None):
+                observe()
+                return super().get(key, default)
+
+        class Key(str):
+            __hash__ = str.__hash__
+
+            def __eq__(self, other):
+                observe()
+                return super().__eq__(other)
+
+        alias = cast(Any, typing.List[int]).copy_with((int,))
+        if storage == "args":
+            alias.__args__ = Args((int,))
+        elif storage == "state":
+            alias.__dict__ = State(alias.__dict__)
+        else:
+            alias.__dict__ = {
+                Key(key) if key == "__args__" else key: value
+                for key, value in alias.__dict__.items()
+            }
+        field = copy.copy(tr.TokenizedTrajectory.model_fields["tokens"])
+        field.annotation = alias
+        p._process_schema_models.cache_clear()
+        if warm:
+            p._process_schema_models()
+        try:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(
+                    tr.TokenizedTrajectory,
+                    "__pydantic_fields__",
+                    {**tr.TokenizedTrajectory.model_fields, "tokens": field},
+                )
+                if route == "parent":
+                    options = p._ProcessOptions(False, False, None, None, None, None)
+                    with p._without_pickle_string_interning():
+                        payload = (
+                            p._process_payloads([parent], options)[0]
+                            if optimized
+                            else pickle.dumps((parent, options))
+                        )
+                    restored, received = pickle.loads(payload)
+                    assert received.source_refs_allowed is (optimized and warm)
+                    answer = restored.reward
+                else:
+                    payload = (
+                        p._serialize_process_result(result)
+                        if optimized
+                        else pickle.dumps(result)
+                    )
+                    assert payload.startswith(b"\0") is (optimized and warm)
+                    restored = p._load_process_result(payload, parent)
+                    assert type(restored) is tr.TokenizedTrajectory
+                    answer = restored.tokens
+                outcomes.append((events, answer))
+        finally:
+            p._process_schema_models.cache_clear()
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0][0] == []
+
+
+@pytest.mark.parametrize("mapping", ["setters", "config", "authority"])
+@pytest.mark.parametrize("raises", [False, True])
+@pytest.mark.parametrize("warm", [False, True])
+@pytest.mark.parametrize("route", ["worker", "parent"])
+def test_assignment_metadata_keys_preserve_ordinary_callbacks(
+    mapping, raises, warm, route
+):
+    outcomes = []
+    for optimized in (False, True):
+        parent, result = fixture()
+        events = []
+
+        class Key(str):
+            __hash__ = str.__hash__
+
+            def __eq__(self, other):
+                events.append("metadata key equality")
+                if raises:
+                    raise RuntimeError("assignment metadata callback")
+                return super().__eq__(other)
+
+        authority = p.pydantic_main._SIMPLE_SETATTR_HANDLERS
+        if mapping == "setters":
+            owner, name = tr.TokenizedTrajectory, "__pydantic_setattr_handlers__"
+            contents = {Key("trajectory"): authority["model_field"]}
+        elif mapping == "config":
+            owner, name = tr.TokenizedTrajectory, "model_config"
+            contents = {Key("validate_assignment"): False}
+        else:
+            owner, name = p.pydantic_main, "_SIMPLE_SETATTR_HANDLERS"
+            contents = {
+                Key(key) if key == "model_field" else key: value
+                for key, value in authority.items()
+            }
+        p._process_schema_models.cache_clear()
+        if warm:
+            p._process_schema_models()
+        try:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(owner, name, contents)
+                if route == "parent":
+                    options = p._ProcessOptions(False, False, None, None, None, None)
+                    with p._without_pickle_string_interning():
+                        payload = (
+                            p._process_payloads([parent], options)[0]
+                            if optimized
+                            else pickle.dumps((parent, options))
+                        )
+                    restored, received = pickle.loads(payload)
+                    assert not received.source_refs_allowed
+                    answer = restored.reward
+                else:
+                    payload = (
+                        p._serialize_process_result(result)
+                        if optimized
+                        else pickle.dumps(result)
+                    )
+                    assert not payload.startswith(b"\0")
+                    answer = pickle.loads(payload).tokens
+                outcomes.append((events, answer))
+        finally:
+            p._process_schema_models.cache_clear()
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[0][0] == []
+
+
+@pytest.mark.parametrize(
+    "annotation",
+    [
+        list[int],
+        int | None,
+        typing.Iterable[int],
+        typing.Literal[1],
+        typing.Annotated[int, "public"],
+        typing.Union[int, None],
+    ],
+)
+def test_standard_typing_aliases_and_metadata_keys_keep_source_elision(annotation):
+    parent, result = fixture()
+    field = copy.copy(tr.TokenizedTrajectory.model_fields["tokens"])
+    field.annotation = annotation
+    p._process_schema_models.cache_clear()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                tr.TokenizedTrajectory,
+                "__pydantic_fields__",
+                {**tr.TokenizedTrajectory.model_fields, "tokens": field},
+            )
+            patch.setattr(tr.TokenizedTrajectory, "model_config", {"frozen": False})
+            patch.setattr(
+                tr.TokenizedTrajectory,
+                "__pydantic_setattr_handlers__",
+                {"trajectory": p.pydantic_main._SIMPLE_SETATTR_HANDLERS["model_field"]},
+            )
+            assert p._process_plain_models(parent, check_schema=True) is not None
             payload = p._serialize_process_result(result)
             assert payload.startswith(b"\0")
             assert p._deserialize_process_result(payload, parent).trajectory is parent
