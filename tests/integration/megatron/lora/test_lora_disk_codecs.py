@@ -1584,12 +1584,9 @@ def test_runtime_resolution_failure_uses_trainer_failure_group(
     assert synchronized_groups == [failure_group]
 
 
-def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
-    tmp_path: Path,
-):
-    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
-    lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    baseline = (lora.A_T.detach().clone(), lora.B_T.detach().clone())
+def _named_lora_checkpoint(
+    prefix: str, lora: LoRA
+) -> tuple[TrainerRank, dict[str, torch.Tensor], dict[str, Any]]:
     adapter = {
         f"{prefix}.lora_A.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
         f"{prefix}.lora_B.weight": torch.arange(8, dtype=torch.float32).reshape(4, 2),
@@ -1615,6 +1612,16 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
         tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
         cast(_AdapterConfig, config),
     )
+    return trainer, adapter, config
+
+
+def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
+    tmp_path: Path,
+):
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    baseline = (lora.A_T.detach().clone(), lora.B_T.detach().clone())
+    trainer, adapter, config = _named_lora_checkpoint(prefix, lora)
     output_dir = tmp_path / "checkpoint"
 
     assert trainer.export_lora(str(output_dir), "student") == 0
@@ -1631,31 +1638,7 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
 def test_prepared_lora_export_is_immutable_and_abortable(tmp_path: Path):
     prefix = "base_model.model.model.layers.0.self_attn.q_proj"
     lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    adapter = {
-        f"{prefix}.lora_A.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
-        f"{prefix}.lora_B.weight": torch.arange(8, dtype=torch.float32).reshape(4, 2),
-    }
-    trainer = TrainerRank.__new__(TrainerRank)
-    trainer.runtime = SimpleNamespace(
-        model=[lora],
-        model_support_handler=DEFAULT_DENSE_HANDLER,
-        rank=0,
-        world_size=1,
-    )
-    trainer._slot_stack = []
-    trainer._pending_slot_graphs = {}
-    trainer._checkpoint_slots = {}
-    trainer._skipped_forward_waves = {}
-    trainer._snapshot_checkpoint_names = set()
-    trainer._checkpoint_prefetch_sources = {}
-    trainer._checkpoint_prefetch_lock = threading.Lock()
-    trainer._checkpoint_mutation_lock = threading.RLock()
-    config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
-    assert trainer._load_checkpoint_slot("student", adapter, alpha=2) == 1
-    trainer._checkpoint_slots["student"] = _CheckpointSlot(
-        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
-        cast(_AdapterConfig, config),
-    )
+    trainer, adapter, config = _named_lora_checkpoint(prefix, lora)
 
     revision, capture_timings = trainer._prepare_lora_export(
         "first", "student", owner_id="owner"
@@ -1812,9 +1795,11 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
     )
 
 
+@pytest.mark.parametrize("internal_ffn", [128, 1024])
 def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     tmp_path: Path,
     monkeypatch,
+    internal_ffn: int,
 ):
     monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
@@ -1834,7 +1819,7 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     gate_up_lora = LoRA(
         adapter_model_prefix=f"{group_prefix}.{{expert}}.gate_up_proj",
         in_features=hidden,
-        out_features=2 * intermediate,
+        out_features=2 * internal_ffn,
         rank=rank,
         alpha=rank,
         dtype=torch.float32,
@@ -1843,7 +1828,7 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     )
     down_lora = LoRA(
         adapter_model_prefix=f"{group_prefix}.{{expert}}.down_proj",
-        in_features=intermediate,
+        in_features=internal_ffn,
         out_features=hidden,
         rank=rank,
         alpha=rank,
@@ -1857,10 +1842,18 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
             full[f"{expert_prefix}.gate_up_proj.lora_A.weight"].T
         )
         gate_up_lora.B_T.data[expert].copy_(
-            full[f"{expert_prefix}.gate_up_proj.lora_B.weight"].T
+            torch.nn.functional.pad(
+                full[f"{expert_prefix}.gate_up_proj.lora_B.weight"].T.reshape(
+                    rank, 2, intermediate
+                ),
+                (0, internal_ffn - intermediate),
+            ).flatten(1)
         )
         down_lora.A_T.data[expert].copy_(
-            full[f"{expert_prefix}.down_proj.lora_A.weight"].T
+            torch.nn.functional.pad(
+                full[f"{expert_prefix}.down_proj.lora_A.weight"].T,
+                (0, 0, 0, internal_ffn - intermediate),
+            )
         )
         down_lora.B_T.data[expert].copy_(
             full[f"{expert_prefix}.down_proj.lora_B.weight"].T
