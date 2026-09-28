@@ -400,6 +400,33 @@ def test_renderer_cannot_mutate_parameter_namespace_aliases(mutation, text):
     assert _without_inline_reasoning_parser(fixed) == fixed
 
 
+@pytest.mark.parametrize("text", ["  answer  ", "  <think>literal</think>after  "])
+def test_private_renderer_counter_cannot_be_rebound_to_message(text):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    source = (
+        "{% set counter = namespace(value=0) %}"
+        "{% macro render_content(content,count) %}"
+        "{% set counter.role = 'user' %}{{ content }}{% endmacro %}"
+        "{% set message = namespace(role=message.role, content=message.content) %}"
+        "{% set counter = message %}"
+        + trim
+        + "{% if message.role == 'assistant' %}"
+        + match.group()
+        + "{% else %}[{{ content }}]{% endif %}"
+    )
+    env = ImmutableSandboxedEnvironment()
+    kwargs = {"message": {"role": "assistant", "content": text}}
+    original = env.from_string(source).render(**kwargs)
+    fixed = _without_inline_reasoning_parser(source)
+    assert original == "[" + text.strip() + "]"
+    assert env.from_string(fixed).render(**kwargs) == original
+    assert trim in fixed
+    assert not _QWEN_INLINE_REASONING.search(fixed)
+    assert _without_inline_reasoning_parser(fixed) == fixed
+
+
 @pytest.mark.parametrize("environment", [Environment, ImmutableSandboxedEnvironment])
 @pytest.mark.parametrize(
     "middle",
