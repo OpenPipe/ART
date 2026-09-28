@@ -5002,9 +5002,9 @@ def _tokenization_context(
                             for key, child in dict.items(item)
                         ),
                     )
-        elif isinstance(item, Exchange):
+        elif isinstance(item, Exchange) and issubclass(kind, Exchange):
             result = tag, identity, item.model, snapshot(item.request)
-        elif isinstance(item, BaseModel):
+        elif isinstance(item, BaseModel) and issubclass(kind, BaseModel):
             result = (
                 tag,
                 tuple(
