@@ -7,10 +7,10 @@ HybridEP growth and custom estimator overrides deliberately remain unsupported.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict
 import json
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from typing import Any
 
 from . import _gdn_memory, _impl, _memory
@@ -96,7 +96,15 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_plan_retained_tokens",
     ):
         method = getattr(rank, name)
-        if getattr(method, "__func__", method) is not getattr(_impl.TrainerRank, name):
+        expected = getattr(_impl.TrainerRank, name)
+        supported = (
+            method is expected
+            if name == "_split_required_memory"  # The sole static estimator.
+            else type(method) is MethodType
+            and method.__self__ is rank
+            and method.__func__ is expected
+        )
+        if not supported:
             raise ValueError("custom_runtime_estimator_unsupported")
     if sum(int(g.packed.tokens.numel()) for g in plan.groups) > _MAX_INPUT_VALUES:
         raise ValueError("runtime_token_inventory_over_limit")
@@ -365,6 +373,32 @@ def validate(facts: Any) -> None:
         raise ValueError("runtime_facts_over_limit")
 
 
+def validate_tokens(inventories: Iterable[Any]) -> None:
+    """Bound a whole subforward before layouts or tensors are constructed."""
+    remaining = _MAX_INPUT_VALUES
+    containers = 8 * _MAX_INPUT_VALUES + 8192
+
+    def count(value: Any, depth: int = 0) -> None:
+        nonlocal remaining, containers
+        if depth > 8:
+            raise ValueError("runtime_token_inventory_over_limit")
+        if type(value) is list:
+            containers -= 1
+            if containers < 0 or len(value) > remaining + containers:
+                raise ValueError("runtime_token_inventory_over_limit")
+            for child in value:
+                count(child, depth + 1)
+        else:
+            remaining -= 1
+            if remaining < 0:
+                raise ValueError("runtime_token_inventory_over_limit")
+            if type(value) is not int or not -(2**63) <= value < 2**63:
+                raise ValueError("invalid replay token primitive")
+
+    for value in inventories:
+        count(value)
+
+
 class ReplayRank(_impl.TrainerRank):
     """The real estimator with runtime metadata readers replaced by frozen facts."""
 
@@ -380,30 +414,12 @@ class ReplayRank(_impl.TrainerRank):
         assert self._facts is not None
         if len(records) != len(group["request_indices"]):
             raise ValueError("runtime request membership mismatch")
-        remaining = _MAX_INPUT_VALUES
-        containers = 8 * _MAX_INPUT_VALUES + 8192
-
-        def count(value: Any, depth: int = 0) -> None:
-            nonlocal remaining, containers
-            if depth > 8:
-                raise ValueError("runtime_token_inventory_over_limit")
-            if type(value) is list:
-                containers -= 1
-                if containers < 0 or len(value) > remaining + containers:
-                    raise ValueError("runtime_token_inventory_over_limit")
-                for child in value:
-                    count(child, depth + 1)
-            else:
-                remaining -= 1
-                if remaining < 0:
-                    raise ValueError("runtime_token_inventory_over_limit")
-                if type(value) is not int or not -(2**63) <= value < 2**63:
-                    raise ValueError("invalid replay token primitive")
-
-        for record in records:
-            count(record["input_tokens"])
-            if record["target_tokens"] is not None:
-                count(record["target_tokens"])
+        validate_tokens(
+            value
+            for record in records
+            for value in (record["input_tokens"], record["target_tokens"])
+            if value is not None
+        )
         requests = tuple(
             _impl.ForwardInput(
                 input_tokens=_impl.torch.tensor(

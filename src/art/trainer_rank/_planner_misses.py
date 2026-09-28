@@ -604,6 +604,63 @@ def replay(
     rank._geometry = ModelGeometry(**values["geometry"])
     dp, tp, cp, pp = values["topology"]
     rank._topology_key = lambda: (dp, tp, cp, pp)
+    # Check the same shared subforward inventories as capture, including the
+    # independently retained layout inputs, before constructing any prefix tree.
+    group_offset = request_offset = 0
+    for index, item in enumerate(state["estimates"]):
+        rows = item["arguments"].get("group_rows")
+        if rows in ([], ()):
+            continue
+        facts = item.get("runtime_facts")
+        if type(rows) not in (list, tuple) or facts is None:
+            raise ValueError(
+                "incomplete replay: immutable runtime estimator facts unavailable"
+            )
+        _planner_replay.validate(facts)
+        groups = facts["groups"]
+        count = len(groups)
+        if (
+            len(rows) != count
+            or type(payload.get("subforward_group_counts")) is not list
+            or index >= len(payload["subforward_group_counts"])
+            or payload["subforward_group_counts"][index] != count
+            or any(
+                type(payload.get(name)) is not list
+                or len(payload[name]) < group_offset + count
+                for name in ("layouts", "checkpoint_slots", "group_request_indices")
+            )
+        ):
+            raise ValueError("invalid grouped replay inventory")
+        requests = sum(len(g["request_indices"]) for g in groups)
+        if (
+            type(payload.get("requests")) is not list
+            or len(payload["requests"]) < request_offset + requests
+        ):
+            raise ValueError("invalid grouped replay request inventory")
+        _planner_replay.validate_tokens(
+            value
+            for record in payload["requests"][
+                request_offset : request_offset + requests
+            ]
+            for value in (record["input_tokens"], record["target_tokens"])
+            if value is not None
+        )
+        _planner_replay.validate_tokens(
+            layout["input_tokens"]
+            for layout in payload["layouts"][group_offset : group_offset + count]
+        )
+        group_offset += count
+        request_offset += requests
+    if group_offset and (
+        len(payload["subforward_group_counts"]) != len(state["estimates"])
+        or sum(payload["subforward_group_counts"]) != group_offset
+        or any(
+            len(payload[name]) != group_offset
+            for name in ("checkpoint_slots", "group_request_indices", "layouts")
+        )
+        or request_offset != len(payload["requests"])
+    ):
+        raise ValueError("unused grouped replay metadata")
     selected_layouts = [
         plan_prefix_tree_layout(
             build_canonical_prefix_tree(item["input_tokens"]),
@@ -685,16 +742,6 @@ def replay(
                 and asdict(cost) == item["cost_components"],
             }
         )
-    if group_cursor and (
-        len(payload["subforward_group_counts"]) != len(state["estimates"])
-        or sum(payload["subforward_group_counts"]) != group_cursor
-        or any(
-            len(payload[name]) != group_cursor
-            for name in ("checkpoint_slots", "group_request_indices", "layouts")
-        )
-        or request_cursor != len(payload["requests"])
-    ):
-        raise ValueError("unused grouped replay metadata")
     safety = _impl._MEMORY_SAFETY_FACTOR
     required = max(
         rank._split_required_memory(costs),
