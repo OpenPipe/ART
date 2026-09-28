@@ -4923,6 +4923,48 @@ class TrainerRank:
         """Each decoder layer's saved-boundary bytes within the floor's retained term."""
         return (retained // self._num_layers,) * self._num_layers
 
+    def _checkpoint_layer_boundary_sets(
+        self,
+        retained: int,
+        group_rows: tuple[tuple[int, bool], ...],
+        layouts: tuple[_GroupLayout, ...] | None,
+    ) -> tuple[tuple[int, ...], ...]:
+        """Each rank's saved-boundary bytes per decoder layer, as the floor prices them.
+
+        On per-rank CP layouts (``_layout_checkpoint_floor``) a layer saves its
+        input in the GDN layout when it follows a GDN layer in its island and in
+        the attention layout otherwise, on that rank's rows. Elsewhere every
+        layer saves an equal share of the floor's ``retained``.
+        """
+        if (
+            layouts is None
+            or self._topology_key()[1] > 1
+            or not all(grad for _, grad in group_rows)
+        ):
+            return (self._checkpoint_layer_boundaries(retained),)
+        decoder = _language_model(self.runtime.model[0]).decoder
+        gdn_inputs = [
+            getattr(
+                getattr(layer, "_art_gdn_island_boundary", None), "input_layout", ""
+            )
+            == "gdn"
+            for layer in decoder.layers
+        ]
+        hidden = self._hidden_size * 2
+        sets = []
+        for rank in range(len(layouts[0].attention_rows)):
+            attention = sum(max(1, layout.attention_rows[rank]) for layout in layouts)
+            gdn = sum(
+                max(1, layout.attention_rows[rank])
+                if layout.gdn_rows is None
+                else max(1, layout.gdn_rows[rank])
+                for layout in layouts
+            )
+            sets.append(
+                tuple(hidden * (gdn if is_gdn else attention) for is_gdn in gdn_inputs)
+            )
+        return tuple(sets)
+
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
             packed_tokens=plan.packed_tokens,
@@ -4994,9 +5036,13 @@ class TrainerRank:
         # forward retention, including the cold fallback above.
         gradient = self._checkpoint_input_gradient_bytes(group_rows, slot_refs)
         gradient_slots = self._gradient_slots(group_rows, slot_refs)
+        # The busiest rank's extra, over each rank's own boundaries.
         adapter_gradient = (
-            self._checkpoint_adapter_gradient_bytes(
-                gradient_slots, self._checkpoint_layer_boundaries(checkpoint_retained)
+            max(
+                self._checkpoint_adapter_gradient_bytes(gradient_slots, boundaries)
+                for boundaries in self._checkpoint_layer_boundary_sets(
+                    checkpoint_retained, group_rows, group_layouts
+                )
             )
             if gradient
             else 0
@@ -8834,9 +8880,13 @@ class TrainerRank:
             # as _subforward_cost.
             backward = self._checkpoint_input_gradient_bytes(
                 group_rows, slot_refs
-            ) + self._checkpoint_adapter_gradient_bytes(
-                self._gradient_slots(group_rows, slot_refs),
-                self._checkpoint_layer_boundaries(retained),
+            ) + max(
+                self._checkpoint_adapter_gradient_bytes(
+                    self._gradient_slots(group_rows, slot_refs), boundaries
+                )
+                for boundaries in self._checkpoint_layer_boundary_sets(
+                    retained, group_rows, group_layouts
+                )
             )
             if profiled is None and any(grad for _, grad in group_rows):
                 backward += _COLD_RECOMPUTE_TRANSIENT_BYTES

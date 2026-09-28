@@ -302,3 +302,57 @@ def test_split_lower_bound_stays_below_the_layout_cost(monkeypatch, lengths):
 
 def _plan_with(r, requests):
     return r._plan_flat_forward(requests)
+
+
+def test_adapter_gradients_meet_each_ranks_own_layer_boundaries(monkeypatch):
+    from art.megatron.lora import LoRASlotRef
+
+    r = qwen36(rank())
+    plan = _plan(r)
+    layout = _GroupLayout((400, 240), (160, 320), (0, 0))
+    monkeypatch.setattr(r, "_plan_group_layouts", lambda plan: (layout,))
+    monkeypatch.setattr(r, "_plan_group_rows", lambda plan: ((400, True),))
+    monkeypatch.setattr(r, "_plan_group_routed_rows", lambda plan: (320,))
+    monkeypatch.setattr(r, "_plan_hybridep_growth_bytes", lambda plan: 0)
+    monkeypatch.setattr(r, "_plan_retained_tokens", lambda plan: 320)
+    policy = LoRASlotRef("checkpoint", "policy")
+    monkeypatch.setattr(
+        r, "_gradient_slots", lambda group_rows, slot_refs: frozenset({policy})
+    )
+    pending = (300 * H,) * 40 + (0,)
+    monkeypatch.setattr(
+        r,
+        "_pending_adapter_gradient_bytes",
+        lambda refs: pending if tuple(refs) else (),
+    )
+    layers = r.runtime.model[0].decoder.layers
+    gdn_inputs = [
+        layer._art_gdn_island_boundary.input_layout == "gdn" for layer in layers
+    ]
+
+    def boundaries(rank_index):
+        assert layout.gdn_rows is not None
+        return [
+            H * (layout.gdn_rows if is_gdn else layout.attention_rows)[rank_index]
+            for is_gdn in gdn_inputs
+        ]
+
+    def extra(saved):
+        return max(
+            0,
+            *(
+                sum(pending[i:40]) + pending[40] - sum(saved[i + 1 :])
+                for i in range(40)
+            ),
+        )
+
+    # Each rank releases its own boundaries in layer order; the busiest extra wins.
+    expected = max(extra(boundaries(0)), extra(boundaries(1)))
+    assert r._plan_cost(plan).checkpoint_adapter_gradient == expected > 0
+    # An even share of the busiest rank's boundaries would misplace the peak.
+    retained, _ = r._layout_checkpoint_floor(layers, (None,), (320,), (layout,))
+    assert extra([retained // 40] * 40) != expected
+    assert r._checkpoint_layer_boundary_sets(retained, ((400, True),), (layout,)) == (
+        tuple(boundaries(0)),
+        tuple(boundaries(1)),
+    )
