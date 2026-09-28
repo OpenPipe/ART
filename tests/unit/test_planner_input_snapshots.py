@@ -238,3 +238,28 @@ def test_device_swap_after_capture_is_not_read(monkeypatch, tmp_path, inference)
     payload = replay()
     assert payload["requests"][0]["input_tokens"]["unavailable"] == "device_input"
     assert payload["layouts"] == []
+
+
+@pytest.mark.parametrize("inference", [False, True])
+def test_emission_canonicalization_ignores_default_device(
+    monkeypatch, tmp_path, inference
+):
+    rank, plan = _plan(monkeypatch, tmp_path, inference=inference)
+    original = plan.groups[0].items[0].input_ids.tolist()
+    replay = _snapshot(rank, plan)
+    cpu = torch.Tensor.cpu
+
+    def no_readback(value, *args, **kwargs):
+        assert value.device.type == "cpu", "Diagnostic device readback"
+        return cpu(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", no_readback)
+    with torch.device("meta"):
+        payload = replay()
+    assert payload["requests"][0]["input_tokens"] == original
+    assert len(payload["layouts"]) == 1
+    assert payload["layouts"][0]["expected_fingerprint"] == (
+        plan.groups[0].layout.fingerprint
+    )
+    assert not torch.cuda.is_initialized()
+    rank.finish_planner_observation()

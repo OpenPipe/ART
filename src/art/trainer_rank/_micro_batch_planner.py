@@ -1573,7 +1573,10 @@ def _fill_planner_snapshot(
                 elif not all(isinstance(row, list) for row in rows):
                     incomplete.add("layout_inputs_unavailable")
                 elif (
-                    build_canonical_prefix_tree(rows).fingerprint
+                    build_canonical_prefix_tree(
+                        _impl.torch.tensor(row, dtype=_impl.torch.long, device="cpu")
+                        for row in rows
+                    ).fingerprint
                     != group.layout.tree_fingerprint
                 ):
                     # Inputs may have changed after the selected layout was
