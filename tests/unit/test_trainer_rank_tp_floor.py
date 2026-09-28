@@ -8,10 +8,11 @@ other shapes keep today's pricing.
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
+from trainer_rank_test_support import fake_rank
 
 from art.trainer_rank import TrainerRank
 from art.trainer_rank._impl import _MemorySignature
@@ -55,17 +56,7 @@ def tp_rank(layers=LAYERS, *, ffn=F, topology=TP4, sequence_parallel=True, **con
     model.config = block.config
     model.decoder = block
     model._preprocess = lambda: None
-    r: Any = TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[model],
-                optimizer=None,
-                provider=SimpleNamespace(hidden_size=H, num_layers=layers),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
-    )
+    r: Any = fake_rank(TrainerRank, [model], hidden_size=H, num_layers=layers)
     # Qwen3.8-27B: gated attention every fourth layer, GDN otherwise.
     r._geometry = replace(
         r._geometry,

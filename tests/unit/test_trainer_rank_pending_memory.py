@@ -8,6 +8,7 @@ import pytest
 from test_trainer_rank_moe_memory import _enclosing_moe
 from test_trainer_rank_moe_memory import layer as layer
 import torch
+from trainer_rank_test_support import fake_rank
 
 from art.megatron.prefix_tree_packing import prefix_tree_pack
 from art.trainer_rank import ForwardInput, TrainerRank
@@ -84,17 +85,7 @@ def rank_with_moe(moe_layer, *, install_hooks=False):
         from art.megatron.gdn.operator import install_gdn_island_hooks
 
         install_gdn_island_hooks([model])
-    r: Any = TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[model],
-                optimizer=None,
-                provider=SimpleNamespace(hidden_size=2048, num_layers=40),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
-    )
+    r: Any = fake_rank(TrainerRank, [model], hidden_size=2048, num_layers=40)
     r._dp_rank_and_size = lambda: (0, 1)  # Uninitialized MCore has no CPU DP group.
     return r, gd
 

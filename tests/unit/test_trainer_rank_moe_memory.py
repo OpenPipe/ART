@@ -2,11 +2,12 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 import weakref
 
 import pytest
 import torch
+from trainer_rank_test_support import fake_rank
 
 from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank
 from art.trainer_rank._impl import (
@@ -70,22 +71,14 @@ def layer() -> Any:
 
 def _rank(layer=None):
     model = layer if layer is not None else torch.nn.Linear(1, 1).bfloat16()
-    return TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[model],
-                optimizer=None,
-                provider=SimpleNamespace(
-                    hidden_size=2048,
-                    num_layers=40,
-                    recompute_granularity="full",
-                    recompute_method="uniform",
-                    recompute_num_layers=1,
-                ),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
+    return fake_rank(
+        TrainerRank,
+        [model],
+        hidden_size=2048,
+        num_layers=40,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
     )
 
 
@@ -678,24 +671,14 @@ def hybrid_checkpoint_rank(layer, monkeypatch):
         # Only distributed topology is mocked. Real constructor metadata selects
         # the HybridEP coefficient, without loading a model or initializing CUDA.
         monkeypatch.setattr(TrainerRank, "_topology_key", lambda self: (1, 1, 2, 1))
-        rank = TrainerRank(
-            cast(
-                Any,
-                SimpleNamespace(
-                    model=[model],
-                    optimizer=None,
-                    provider=SimpleNamespace(
-                        hidden_size=2048,
-                        num_layers=40,
-                        expert_model_parallel_size=2,
-                        expert_tensor_parallel_size=1,
-                        num_moe_experts=256,
-                    ),
-                    model_support_handler=SimpleNamespace(
-                        build_gdn_execution_spec=False
-                    ),
-                ),
-            )
+        rank = fake_rank(
+            TrainerRank,
+            [model],
+            hidden_size=2048,
+            num_layers=40,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+            num_moe_experts=256,
         )
     assert rank._moe_output_bytes_per_token == 282624
     assert rank._moe_memory_supported

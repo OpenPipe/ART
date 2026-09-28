@@ -6,7 +6,7 @@ from datetime import timedelta
 import sys
 import time
 from types import ModuleType, SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import torch
@@ -27,6 +27,16 @@ class _FakeGPT(torch.nn.Module):
 
     def _preprocess(self, *args: object, **kwargs: object) -> None:
         return None
+
+
+def fake_rank(rank_type: type["TrainerRank"], model, **provider) -> "TrainerRank":
+    runtime: Any = SimpleNamespace(
+        model=model,
+        optimizer=None,
+        provider=SimpleNamespace(**provider),
+        model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
+    )
+    return rank_type(runtime)
 
 
 def checkpoint_runtime(

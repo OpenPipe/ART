@@ -2,10 +2,11 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
+from trainer_rank_test_support import fake_rank
 
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import Unset, _ForwardRefusal, _MemoryProfile
@@ -40,17 +41,7 @@ def rank():
     model.config = block.config
     model.decoder = block
     model._preprocess = lambda: None
-    result = TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[model],
-                optimizer=None,
-                provider=SimpleNamespace(hidden_size=2048, num_layers=40),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
-    )
+    result = fake_rank(TrainerRank, [model], hidden_size=2048, num_layers=40)
     result._moe_output_bytes_per_token = 188416
     result._moe_checkpoint_grad_bytes_per_token = 188416
     return result

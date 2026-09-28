@@ -3,10 +3,10 @@
 import builtins
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, cast
 
 import pytest
 import torch
+from trainer_rank_test_support import fake_rank
 
 from art.trainer_rank import (
     ForwardInput,
@@ -41,22 +41,14 @@ class _Model(torch.nn.Module):
 
 
 def _rank():
-    return TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[_Model()],
-                optimizer=None,
-                provider=SimpleNamespace(
-                    hidden_size=8,
-                    num_layers=4,
-                    recompute_granularity="full",
-                    recompute_method="uniform",
-                    recompute_num_layers=1,
-                ),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
+    return fake_rank(
+        TrainerRank,
+        [_Model()],
+        hidden_size=8,
+        num_layers=4,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
     )
 
 
