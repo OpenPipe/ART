@@ -142,14 +142,10 @@ def test_native_thinking_off_retains_literal_content(
 ) -> None:
     history, tokenizer = _history(content=content)
     original = history.model_dump(mode="python")
-    # Render the original template without either the general parser correction
-    # or the old hash-specific workaround to retain the destructive baseline.
+    # Disable the general correction to retain the destructive original render.
     with monkeypatch.context() as patch:
         patch.setattr(
             _tokenize, "chat_template_with_preserved_thinking", lambda value: value
-        )
-        patch.setattr(
-            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
         )
         _outcome(history, tokenizer)
     assert content not in tokenizer.rendered[0]
@@ -186,9 +182,7 @@ def test_native_thinking_off_retains_literal_content(
         "visible_only",
     ],
 )
-def test_unrelated_histories_keep_original_rendering(
-    case: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_unrelated_histories_keep_original_rendering(case: str) -> None:
     history, tokenizer = _history(
         thinking=True
         if case == "source_on"
@@ -225,17 +219,29 @@ def test_unrelated_histories_keep_original_rendering(
     if case == "visible_only":
         cast(dict[str, Any], history.messages[-1]).pop("reasoning")
     original = history.model_dump(mode="python")
-    candidate = _outcome(history, tokenizer)
-    calls = deepcopy(tokenizer.calls)
-    tokenizer.calls.clear()
-    with monkeypatch.context() as patch:
-        patch.setattr(
-            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
-        )
-        baseline = _outcome(history, tokenizer)
-    assert candidate == baseline
-    assert len(calls) == len(tokenizer.calls)
-    assert calls[0] == tokenizer.calls[0]
+    tokenized = history.tokenize(tokenizer=tokenizer)
+    # Independent public transcript and source-field oracles, not a second run
+    # with an already-inert workaround disabled.
+    expected = (
+        "<|im_start|>user\nPublic query.<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n" + _LITERAL
+    )
+    assert tokenizer.rendered[0] == expected + "<|im_end|>\n"
+    structured = case in {"structured", "alias"}
+    assert tokenizer.decode(tokenized.tokens) == expected + (
+        "" if structured else "<|im_end|>\n"
+    )
+    assert tokenizer.calls[0][-1] == {
+        "role": "assistant",
+        "content": _LITERAL,
+        **({"reasoning": "explicit reasoning"} if structured else {}),
+    }
+    sampled = [
+        i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED
+    ]
+    expected_sampled = "" if case in {"no_source", "request_source"} else _LITERAL
+    assert tokenizer.decode([tokenized.tokens[i] for i in sampled]) == expected_sampled
+    assert [tokenized.logprobs[i] for i in sampled] == [-0.5] * len(expected_sampled)
     assert history.model_dump(mode="python") == original
 
 
@@ -409,9 +415,6 @@ def test_literal_next_turn_preserves_preceding_length_stop_boundary(
     with monkeypatch.context() as patch:
         patch.setattr(
             _tokenize, "chat_template_with_preserved_thinking", lambda value: value
-        )
-        patch.setattr(
-            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
         )
         _outcome(history, tokenizer)
     boundary, old_exact = observed[0]
