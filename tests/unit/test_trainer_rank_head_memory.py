@@ -150,9 +150,12 @@ def test_outputs_retention_and_empirical_peak_are_counted_once():
     head = 3 * 512 * 248320 * 2
     cost = r._plan_cost(plan)
     assert cost.retained == int((plan.output_bytes + retained + head) * 1.1)
-    # Unprofiled: the first execution's transients beside the head workspace.
+    # Unprofiled head stage: the head workspace, the final output, saved
+    # selected rows and hidden-row gradient beside the incoming one, TE's
+    # first-GEMM workspaces and the first execution's transients.
+    te = r._te_workspace_growth_bytes()
     assert cost.required == int(
-        (plan.output_bytes + retained + gradient + head + COLD) * 1.1
+        (plan.output_bytes + retained + 3 * gradient + head + te + COLD) * 1.1
     )
     r._memory_profiles[plan.signature] = _MemoryProfile(
         bytes_per_token=2_000_000,
@@ -320,8 +323,10 @@ def test_target_backward_refuses_budget_below_logits_and_both_gradients(rows):
     retained, _ = r._checkpoint_memory_floor(r._plan_group_rows(plan))
     gradient = rows * 2048 * 2
     dense = min(rows, 512) * 248320 * 2
-    before = int((plan.output_bytes + retained + gradient + 2 * dense + COLD) * 1.1)
-    expected = int((plan.output_bytes + retained + gradient + 3 * dense + COLD) * 1.1)
+    before = int((plan.output_bytes + retained + 3 * gradient + 2 * dense + COLD) * 1.1)
+    expected = int(
+        (plan.output_bytes + retained + 3 * gradient + 3 * dense + COLD) * 1.1
+    )
     r._available_memory_bytes = lambda: (before + expected) // 2
     check = r._memory_check(plan)
     assert check.estimated_required_bytes == expected

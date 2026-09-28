@@ -538,3 +538,57 @@ def test_layout_gradient_groups_run_one_after_another_on_each_rank(monkeypatch):
     )
     # Each slot's module walk runs once, not once per rank.
     assert walks == [(slot,) for slot in slots]
+
+
+def test_layout_head_stage_meets_each_ranks_other_groups(monkeypatch):
+    from test_trainer_rank_head_stage_memory import head_oracle
+
+    from art.megatron.lora import LoRASlotRef
+
+    r = qwen36(rank())
+    monkeypatch.setattr(r, "_moe_recompute_covered_for", lambda ref: True)
+    # A long policy sequence whose gradients outweigh its boundaries only on
+    # the rank with no GDN rows, beside a short sequence of another slot.
+    layouts = (
+        _GroupLayout((1536, 511), (2047, 0), (0, 0)),
+        _GroupLayout((400, 240), (160, 320), (0, 0)),
+    )
+    group_rows = ((2047, True), (640, True))
+    routed = (2047, 640)
+    slots = (LoRASlotRef("checkpoint", "policy"), LoRASlotRef("checkpoint", "other"))
+    groups = r._checkpoint_gradient_groups
+    monkeypatch.setattr(
+        r,
+        "_checkpoint_gradient_groups",
+        lambda group_rows, slot_refs: tuple(
+            (slot, boundaries)
+            for slot, (_, boundaries) in zip(slots, groups(group_rows, slot_refs))
+        ),
+    )
+    pending = {
+        (slots[0],): (600 * H,) * 40 + (0,),
+        (slots[1],): (1 * H,) * 40 + (5 * H,),
+    }
+    monkeypatch.setattr(
+        r, "_pending_adapter_gradient_bytes", lambda refs: pending.get(tuple(refs), ())
+    )
+    per_rank = r._layout_layer_boundaries(layouts)
+    heads = [
+        head_oracle(
+            [(pending[(slot,)], list(b)) for slot, b in zip(slots, rank_groups)]
+        )
+        for rank_groups in per_rank
+    ]
+    # The policy group raises the other's head on the rank that saved fewer rows.
+    assert heads[1] > heads[0]
+    head, gradient = 10**9, r._checkpoint_input_gradient_bytes(group_rows, slots)
+    stage = r._checkpoint_head_stage_bytes(head, gradient, group_rows, slots, layouts)
+    assert stage == head + 2 * gradient + r._te_workspace_growth_bytes() + heads[1]
+    # Each rank's own boundaries plus its head term stay within the floor's.
+    floor = r._checkpoint_memory_floor(
+        group_rows, slots, routed_rows=routed, layouts=layouts
+    )
+    layers = r.runtime.model[0].decoder.layers
+    floors = r._layout_checkpoint_rank_floors(layers, slots, routed, layouts)
+    for (rank_retained, _), rank_head in zip(floors, heads):
+        assert rank_retained + rank_head <= floor[0] + max(heads)
