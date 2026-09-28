@@ -138,7 +138,9 @@ def test_responses_selection_does_not_change_reused_projection(
     assert rendered[0]["consumed"] == "turn 0"
     if mode in ("consumed_then_restored", "lasting"):
         assert row["error"]["class"] == "ValueError"
-        assert "context changed" in row["error"]["message"]
+        assert row["error"]["message"] == (
+            "Consumed source text changed during tokenization callback"
+        )
         # The changed projection never reaches the completion renderer.
         assert len(rendered) == 1
     else:
