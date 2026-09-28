@@ -20,6 +20,10 @@ _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LEDGER_LIMIT = 512 * 1024
 
 
+class RetentionLimitReached(ValueError):
+    """Expected refusal when a bounded report allowance is exhausted."""
+
+
 @dataclass(frozen=True)
 class RetentionLimits:
     spool_dir: Path
@@ -192,7 +196,7 @@ def charge(
                 if len(charges) >= min(limits.max_reports, count_limit) or total + len(
                     raw
                 ) > min(limits.max_bytes, byte_limit):
-                    raise ValueError("assigned planner retention exhausted")
+                    raise RetentionLimitReached("assigned planner retention exhausted")
                 charges[event_id] = identity
                 _write(path, ledger)
             yield
