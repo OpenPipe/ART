@@ -1525,12 +1525,13 @@ def _fill_planner_snapshot(
 
         def replay() -> dict[str, Any]:
             remaining = input_limit
+            structure_remaining = 4096
             incomplete = {
                 reason for item in estimates for reason in item["missing_inputs"]
             }
 
             def tensor_data(snapshot: InputSnapshot) -> Any:
-                nonlocal remaining
+                nonlocal remaining, structure_remaining
                 tensor, original_version, frozen, reason = snapshot
                 if tensor is None:
                     return None
@@ -1546,6 +1547,16 @@ def _fill_planner_snapshot(
                     reason = "modified_input"
                 if reason is None and tensor.numel() > remaining:
                     reason = "token_inventory_over_limit"
+                # Count every list produced by tolist(), including empty lists:
+                # numel() alone cannot bound shapes such as (large, 0).
+                containers, width = 0, 1
+                if reason is None:
+                    for size in tensor.shape:
+                        containers += width
+                        if containers > structure_remaining:
+                            reason = "token_structure_over_limit"
+                            break
+                        width *= size
                 if reason is not None:
                     incomplete.add(reason)
                     return {
@@ -1555,6 +1566,7 @@ def _fill_planner_snapshot(
                         "device": str(tensor.device),
                     }
                 remaining -= tensor.numel()
+                structure_remaining -= containers
                 return (frozen if frozen is not None else tensor).tolist()
 
             requests = [
