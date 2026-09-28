@@ -7,6 +7,7 @@ HybridEP growth and custom estimator overrides deliberately remain unsupported.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict
 import json
 from types import SimpleNamespace
@@ -50,6 +51,20 @@ def refusal_reason(error: Exception) -> str:
     return type(error).__name__[:64]
 
 
+def _fact_budget() -> Callable[[int], None]:
+    # Conservative JSON bounds, shared by capture (before copying containers)
+    # and validation (before walking inventories or constructing an encoding).
+    remaining = _MAX_BYTES - 256
+
+    def reserve(size: int) -> None:
+        nonlocal remaining
+        remaining -= size
+        if remaining < 0:
+            raise ValueError("runtime_facts_over_limit")
+
+    return reserve
+
+
 def capture(rank: Any, plan: Any) -> dict[str, Any]:
     if rank._num_layers > 1024 or not 0 < len(plan.groups) <= _MAX_GROUPS:
         raise ValueError("runtime_group_inventory_over_limit")
@@ -60,6 +75,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         raise ValueError("hybridep_runtime_facts_unsupported")
     for name in (
         "_subforward_cost",
+        "_split_required_memory",
         "_estimate_required_memory_bytes_from_values",
         "_retained_memory_bytes",
         "_checkpoint_memory_floor",
@@ -72,10 +88,15 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_plan_cost",
         "_plan_head_workspace_bytes",
         "_plan_hybridep_growth_bytes",
+        "_gdn_segment_layer_bytes",
+        "_one_layer_recompute",
+        "_topology_key",
+        "_physical_tokens",
+        "_plan_group_rows",
+        "_plan_retained_tokens",
     ):
-        if getattr(getattr(rank, name), "__func__", None) is not getattr(
-            _impl.TrainerRank, name
-        ):
+        method = getattr(rank, name)
+        if getattr(method, "__func__", method) is not getattr(_impl.TrainerRank, name):
             raise ValueError("custom_runtime_estimator_unsupported")
     if sum(int(g.packed.tokens.numel()) for g in plan.groups) > _MAX_INPUT_VALUES:
         raise ValueError("runtime_token_inventory_over_limit")
@@ -96,14 +117,8 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     target_backward = bool(vocabulary and _memory._head_target_backward(rank))
     groups = []
     remaining = _MAX_SEGMENTS
-    byte_budget = _MAX_BYTES - 256
+    reserve = _fact_budget()
     head_values = _MAX_INPUT_VALUES
-
-    def reserve(size: int) -> None:
-        nonlocal byte_budget
-        byte_budget -= size
-        if byte_budget < 0:
-            raise ValueError("runtime_facts_over_limit")
 
     def terms(checkpoint_grad: bool, ref: Any) -> list[Any]:
         coefficient, stages = _memory._moe_workspace_terms(
@@ -134,7 +149,12 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         if name is not None and (type(name) is not str or len(name) > 4096):
             raise ValueError("runtime_slot_identity_unsupported")
         slot = str(group.slot_ref)
-        reserve(512 + len(slot) + 32 * len(group.request_indices))
+        fingerprint = None if group.layout is None else group.layout.fingerprint
+        reserve(
+            512
+            + 12 * (len(slot) + len(fingerprint or ""))
+            + 32 * len(group.request_indices)
+        )
         requests = tuple(item.request for item in group.items)
         positions = group.packed.positions_by_sequence
         head_values -= sum(p.numel() for p in positions) + sum(
@@ -177,9 +197,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 "grad": group.grad_enabled,
                 "slot": slot,
                 "request_indices": list(group.request_indices),
-                "layout_fingerprint": None
-                if group.layout is None
-                else group.layout.fingerprint,
+                "layout_fingerprint": fingerprint,
                 "forward": terms(False, group.slot_ref),
                 "gradient": terms(True, group.slot_ref),
                 "head_rows": projected,
@@ -225,7 +243,7 @@ def validate(facts: Any) -> None:
     """Accept only a finite primitive schema, never an executable reconstruction."""
 
     def fields(value: Any, names: set[str]) -> None:
-        if type(value) is not dict or set(value) != names:
+        if type(value) is not dict or len(value) != len(names) or set(value) != names:
             raise ValueError("invalid runtime facts fields")
 
     def integer(value: Any, *, minimum: int = 0) -> None:
@@ -257,6 +275,7 @@ def validate(facts: Any) -> None:
     if type(groups) is not list or not 0 < len(groups) <= _MAX_GROUPS:
         raise ValueError("invalid runtime groups")
     remaining = _MAX_SEGMENTS
+    reserve = _fact_budget()
     for group in groups:
         fields(
             group,
@@ -287,13 +306,18 @@ def validate(facts: Any) -> None:
             or len(group["request_indices"]) > 4096
         ):
             raise ValueError("invalid runtime request inventory")
-        for index in group["request_indices"]:
-            integer(index)
         fingerprint = group["layout_fingerprint"]
         if fingerprint is not None and (
             type(fingerprint) is not str or len(fingerprint) > 128
         ):
             raise ValueError("invalid runtime layout identity")
+        reserve(
+            512
+            + 12 * (len(group["slot"]) + len(fingerprint or ""))
+            + 32 * len(group["request_indices"])
+        )
+        for index in group["request_indices"]:
+            integer(index)
         for key in ("forward", "gradient"):
             terms = group[key]
             if (
@@ -303,6 +327,7 @@ def validate(facts: Any) -> None:
                 or len(terms[1]) > 4096
             ):
                 raise ValueError("invalid MoE terms")
+            reserve(64 + 72 * len(terms[1]))
             integer(terms[0])
             for stage in terms[1]:
                 if type(stage) is not list or len(stage) != 2:
@@ -315,6 +340,12 @@ def validate(facts: Any) -> None:
             integer(gdn["layers"], minimum=1)
             if type(gdn["shapes"]) is not list or not 0 < len(gdn["shapes"]) <= 1024:
                 raise ValueError("invalid GDN shape inventory")
+            if type(gdn["segments"]) is not list:
+                raise ValueError("invalid GDN segments")
+            remaining -= len(gdn["segments"])
+            if remaining < 0:
+                raise ValueError("runtime_segment_inventory_over_limit")
+            reserve(128 + 512 * len(gdn["shapes"]) + 256 * len(gdn["segments"]))
             for shape in gdn["shapes"]:
                 fields(shape, set(_gdn_memory.Shape.__dataclass_fields__))
                 for name, value in shape.items():
@@ -324,11 +355,6 @@ def validate(facts: Any) -> None:
                         if name in {"output_lora_rank", "moe_bytes_per_row"}
                         else 1,
                     )
-            if type(gdn["segments"]) is not list:
-                raise ValueError("invalid GDN segments")
-            remaining -= len(gdn["segments"])
-            if remaining < 0:
-                raise ValueError("runtime_segment_inventory_over_limit")
             for segment in gdn["segments"]:
                 fields(
                     segment, {"start", "end", "packed_start", "group_id", "parent_id"}
