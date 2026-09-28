@@ -1024,20 +1024,25 @@ def _serialize_process_result(
         Writer(stream, protocol=pickle.HIGHEST_PROTOCOL).dump(result)
     except _ProcessSourceAlias:
         return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
-    return pickle.dumps(
+    # Ordinary highest-protocol pickle starts with PROTO, never this frame byte.
+    # Recognize our format before unpickling arbitrary fallback return values.
+    return b"\0" + pickle.dumps(
         (b"art-process-sources-v1", tuple(type(x) for x in sources), stream.getvalue()),
         protocol=pickle.HIGHEST_PROTOCOL,
     )
 
 
 def _load_process_result(payload: bytes, trajectory: Trajectory) -> object:
-    packed = pickle.loads(payload)
+    if not payload.startswith(b"\0"):
+        return pickle.loads(payload)
+    packed = pickle.loads(payload[1:])
     if not (
         type(packed) is tuple
         and len(packed) == 3
+        and type(packed[0]) is bytes
         and packed[0] == b"art-process-sources-v1"
     ):
-        return packed
+        raise ValueError("Invalid process source envelope")
     sources = _process_sources(trajectory)
     if packed[1] != tuple(type(x) for x in sources):
         raise ValueError("Source trajectory exchange structure has changed")

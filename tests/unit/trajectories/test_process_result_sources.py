@@ -19,6 +19,11 @@ import art.trajectories as tr
 from art.trajectories import _parallel as p
 
 
+def unpack_test_payload(payload):
+    """Inspect either raw pickle or the private framed result in assertions."""
+    return pickle.loads(payload[1:] if payload.startswith(b"\0") else payload)
+
+
 def fixture(multi=False):
     response = ChatCompletion.model_validate(
         {
@@ -62,7 +67,7 @@ def fixture(multi=False):
         reward=2.0,
         start_time=datetime(2026, 1, 1, tzinfo=UTC),
     )
-    worker = pickle.loads(pickle.dumps(parent))
+    worker = unpack_test_payload(pickle.dumps(parent))
     e = worker.exchanges.chat_completions[0]
     history = tr.ChatCompletionsHistory(
         model="toy",
@@ -97,6 +102,114 @@ def history(result):
         if isinstance(result, tr.TokenizedMultiHistoryTrajectory)
         else result.history
     )
+
+
+_fallback_callbacks: list[str] = []
+
+
+class FallbackTag:
+    def __init__(self, behavior):
+        self.behavior = behavior
+
+    def __eq__(self, other):
+        _fallback_callbacks.append("tag equality")
+        if self.behavior == "runtime":
+            raise RuntimeError("ordinary tuple equality callback")
+        if self.behavior == "interrupt":
+            raise KeyboardInterrupt("ordinary tuple equality callback")
+        return False
+
+
+class FallbackBytes(bytes):
+    def __eq__(self, other):
+        _fallback_callbacks.append("bytes equality")
+        return bytes.__eq__(self, other)
+
+
+class FallbackTuple(tuple):
+    def __len__(self):
+        _fallback_callbacks.append("tuple length")
+        return super().__len__()
+
+
+def restore_fallback(value):
+    return value
+
+
+class FallbackResult(tr.TokenizedTrajectory):
+    def __reduce_ex__(self, protocol):
+        return restore_fallback, (self.__dict__["fallback_value"],)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "false",
+        "runtime",
+        "interrupt",
+        "matching_invalid",
+        "matching_valid",
+        "bytes_subclass",
+        "tuple_subclass",
+        "frame_bytes",
+    ],
+)
+def test_ordinary_fallback_result_cannot_be_mistaken_for_optimized_frame(
+    monkeypatch, kind
+):
+    outcomes = []
+    for optimized in (False, True):
+        parent, result = fixture()
+        if kind in {"false", "runtime", "interrupt"}:
+            value = (FallbackTag(kind), 0, b"")
+        elif kind == "matching_invalid":
+            value = (b"art-process-sources-v1", 0, b"")
+        elif kind == "matching_valid":
+            value = (
+                b"art-process-sources-v1",
+                tuple(type(x) for x in p._process_sources(parent)),
+                pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL),
+            )
+        elif kind == "bytes_subclass":
+            value = (FallbackBytes(b"art-process-sources-v1"), 0, b"")
+        elif kind == "tuple_subclass":
+            value = FallbackTuple((0, 0, b""))
+        else:
+            value = b"\0" + pickle.dumps((b"art-process-sources-v1", 0, b""))
+        result = FallbackResult.model_construct(**result.__dict__)
+        result.__dict__["fallback_value"] = value
+        _fallback_callbacks.clear()
+        payload = p._serialize_process_result(result)
+        assert payload.startswith(pickle.PROTO)
+        with monkeypatch.context() as patch:
+            if not optimized:
+                # The original receiver differs only at this loading boundary.
+                patch.setattr(
+                    p, "_load_process_result", lambda data, parent: pickle.loads(data)
+                )
+            try:
+                restored = p._deserialize_process_result(payload, parent)
+                outcome = ("success", type(restored).__name__)
+            except BaseException as error:
+                outcome = (type(error).__name__, str(error))
+        outcomes.append((outcome, list(_fallback_callbacks)))
+    assert outcomes[0][0][0] == "_ProcessTransferError"
+    assert "unexpected process result" in outcomes[0][0][1]
+    assert outcomes[0][1] == []
+    assert outcomes[1] == outcomes[0]
+
+
+def test_optimized_frame_is_distinct_from_ordinary_pickle():
+    parent, result = fixture()
+    payload = p._serialize_process_result(result)
+    assert payload.startswith(b"\0")
+    assert unpack_test_payload(payload)[0] == b"art-process-sources-v1"
+    with pytest.raises(pickle.UnpicklingError):
+        pickle.loads(payload)
+    restored = p._deserialize_process_result(payload, parent)
+    assert isinstance(restored, tr.TokenizedTrajectory)
+    assert restored.trajectory is parent
+    assert restored.tokens == result.tokens
 
 
 _result_equality_armed = False
@@ -201,7 +314,7 @@ def test_instance_method_shadow_preserves_callbacks_and_failure_phase(
                 "success",
                 history(restored).chat_template_kwargs["probe"].prompt_index,
                 restored.trajectory is parent,
-                type(pickle.loads(payload)) is tr.TokenizedTrajectory,
+                type(unpack_test_payload(payload)) is tr.TokenizedTrajectory,
             )
         except Exception as error:
             outcome = (phase, type(error).__name__, str(error))
@@ -230,7 +343,7 @@ def test_instance_state_shadow_of_model_api_uses_ordinary_pickle(name):
         assert p._process_plain_models(result) is None
         try:
             payload = encode(result)
-            outcomes.append(("success", type(pickle.loads(payload))))
+            outcomes.append(("success", type(unpack_test_payload(payload))))
         except Exception as error:
             outcomes.append((type(error), str(error)))
     assert outcomes[1] == outcomes[0]
@@ -247,7 +360,7 @@ def test_unshadowed_instance_data_keeps_source_elision(owner):
     target.__dict__["public_fixture_data"] = {"value": [1, 2, 3]}
     assert p._process_plain_models(result) is not None
     payload = p._serialize_process_result(result)
-    assert pickle.loads(payload)[0] == b"art-process-sources-v1"
+    assert unpack_test_payload(payload)[0] == b"art-process-sources-v1"
     restored = p._deserialize_process_result(payload, parent)
     assert restored.trajectory is parent
     assert history(restored).messages == history(result).messages
@@ -309,7 +422,7 @@ def test_reducer_registry_callbacks_keep_ordinary_order(target, behavior, bounda
                                 (parent, options), protocol=pickle.HIGHEST_PROTOCOL
                             )
                     phase = "restore"
-                    actual, actual_options = pickle.loads(payload)
+                    actual, actual_options = unpack_test_payload(payload)
                     outcome = (
                         "success",
                         actual.model_dump_json(),
@@ -368,7 +481,7 @@ def test_registry_mapping_subclass_uses_ordinary_pickle(monkeypatch):
         restored = p._deserialize_process_result(payload, parent)
         outcomes.append((restored.model_dump_json(), list(calls)))
     assert outcomes[0] == outcomes[1]
-    assert type(pickle.loads(payload)) is tr.TokenizedTrajectory
+    assert type(unpack_test_payload(payload)) is tr.TokenizedTrajectory
 
 
 class OrdinaryRegistryKey:
@@ -391,7 +504,7 @@ def test_unrelated_passive_registry_key_keeps_source_elision(key):
     try:
         parent, result = fixture()
         payload = p._serialize_process_result(result)
-        assert type(pickle.loads(payload)) is tuple
+        assert type(unpack_test_payload(payload)) is tuple
         restored = p._deserialize_process_result(payload, parent)
         assert (
             history(restored).message_sources[0].exchange
@@ -430,7 +543,7 @@ def test_actual_parent_inventory_is_checked_before_spawn(name):
     options = p._ProcessOptions(False, False, None, None, None, None)
     payload = p._process_payloads([parents[0]], options)[0]
     assert all(values.iterations == 0 for values in inventories)
-    worker, worker_options = pickle.loads(payload)
+    worker, worker_options = unpack_test_payload(payload)
     if name is not None:
         assert type(getattr(worker.exchanges, name)) is list
     with ProcessPoolExecutor(max_workers=1, mp_context=p._process_context()) as pool:
@@ -442,7 +555,7 @@ def test_actual_parent_inventory_is_checked_before_spawn(name):
     restored = p._deserialize_process_result(encoded, parents[0])
     assert restored.model_dump_json() == expected.model_dump_json()
     assert worker_options.source_refs_allowed is (name is None)
-    assert type(pickle.loads(encoded)) is (
+    assert type(unpack_test_payload(encoded)) is (
         tuple if name is None else tr.TokenizedTrajectory
     )
     assert all(values.iterations == 1 for values in inventories)
@@ -489,7 +602,7 @@ def test_marker_attribute_fallback_preserves_fresh_graph_effects(
         )
     assert outcomes[0] == outcomes[1]
     if slot is None:
-        assert type(pickle.loads(payload)) is tr.TokenizedMultiHistoryTrajectory
+        assert type(unpack_test_payload(payload)) is tr.TokenizedMultiHistoryTrajectory
 
 
 @pytest.mark.parametrize("slot", [None, False, True])
@@ -693,7 +806,7 @@ def test_parent_only_undeclared_descriptor_survives_fresh_spawn(monkeypatch, inh
         == {"setter_calls": 1}
     )
     assert len(calls) == 2
-    assert type(pickle.loads(encoded)) is tr.TokenizedTrajectory
+    assert type(unpack_test_payload(encoded)) is tr.TokenizedTrajectory
 
 
 @pytest.mark.parametrize("mismatch", [False, True])
@@ -737,7 +850,7 @@ def test_noninventory_exchange_equality_keeps_original_alias_order(
             outcome = (type(error), str(error))
         outcomes.append(outcome)
     assert outcomes[0] == outcomes[1]
-    assert type(pickle.loads(payload)) is tr.TokenizedTrajectory
+    assert type(unpack_test_payload(payload)) is tr.TokenizedTrajectory
 
 
 def test_passive_undeclared_source_and_inventory_alias_keep_fast_path():
@@ -747,7 +860,7 @@ def test_passive_undeclared_source_and_inventory_alias_keep_fast_path():
     h.__dict__["instructions_source"] = source.exchange
     h.chat_template_kwargs = {"source_alias": source}
     payload = p._serialize_process_result(result)
-    assert type(pickle.loads(payload)) is tuple
+    assert type(unpack_test_payload(payload)) is tuple
     restored = p._deserialize_process_result(payload, parent)
     restored_h = history(restored)
     assert (
@@ -824,7 +937,7 @@ def test_aliased_replaced_state_uses_legacy_pickle(owner):
     value = result if owner == "result" else h.message_sources[0]
     h.chat_template_kwargs = {"state": value.__dict__}
     payload = p._serialize_process_result(result)
-    assert isinstance(pickle.loads(payload), tr.TokenizedTrajectory)
+    assert isinstance(unpack_test_payload(payload), tr.TokenizedTrajectory)
     restored = p._deserialize_process_result(payload, parent)
     target = restored if owner == "result" else history(restored).message_sources[0]
     assert history(restored).chat_template_kwargs["state"] is target.__dict__
@@ -898,7 +1011,7 @@ def test_unvalidated_source_roles_preserve_detached_objects(role, target):
         )
     result = result.model_copy(update={"history": h})
     expected, restored, _, payload = roundtrip(parent, result)
-    assert type(pickle.loads(payload)) is tr.TokenizedTrajectory
+    assert type(unpack_test_payload(payload)) is tr.TokenizedTrajectory
     for output in (expected, restored):
         h = history(output)
         if role == "message":
@@ -940,7 +1053,7 @@ def test_shared_model_state_preserves_all_alias_paths(path):
         value["cycle"] = value
         h.chat_template_kwargs = {"value": value}
     expected, restored, _, payload = roundtrip(parent, result)
-    assert type(pickle.loads(payload)) is tr.TokenizedTrajectory
+    assert type(unpack_test_payload(payload)) is tr.TokenizedTrajectory
     for output in (expected, restored):
         actual = history(output)
         first, second = actual.message_sources
@@ -999,7 +1112,7 @@ def test_parent_instance_resolution_contract_survives_spawn(shadow):
     payload = p._process_payloads(
         [parent], p._ProcessOptions(False, False, None, None, None, None)
     )[0]
-    assert pickle.loads(payload)[1].source_refs_allowed is not shadow
+    assert unpack_test_payload(payload)[1].source_refs_allowed is not shadow
     with ProcessPoolExecutor(max_workers=1, mp_context=p._process_context()) as pool:
         encoded, ordinary, worker_plain = pool.submit(
             _spawn_result_pair, payload
@@ -1007,7 +1120,9 @@ def test_parent_instance_resolution_contract_survives_spawn(shadow):
     assert worker_plain is not shadow
     expected = p._deserialize_process_result(ordinary, parent)
     restored = p._deserialize_process_result(encoded, parent)
-    assert type(pickle.loads(encoded)) is (tr.TokenizedTrajectory if shadow else tuple)
+    assert type(unpack_test_payload(encoded)) is (
+        tr.TokenizedTrajectory if shadow else tuple
+    )
     assert restored.model_dump_json() == expected.model_dump_json()
     assert restored.trajectory is parent
 
@@ -1089,9 +1204,9 @@ def test_standard_flag_construction_keeps_source_elision(value):
     payload = p._process_payloads(
         [parent], p._ProcessOptions(False, False, None, None, None, None)
     )[0]
-    assert pickle.loads(payload)[1].source_refs_allowed
+    assert unpack_test_payload(payload)[1].source_refs_allowed
     encoded = p._serialize_process_result(result)
-    assert type(pickle.loads(encoded)) is tuple
+    assert type(unpack_test_payload(encoded)) is tuple
     restored = p._deserialize_process_result(encoded, parent)
     assert restored.trajectory is parent
     assert restored.trajectory.metadata["flag"] == value
@@ -1132,7 +1247,7 @@ def test_spawn_checks_parent_before_eliding_sources(monkeypatch, callback):
     restored = p._deserialize_process_result(encoded, parent)
     assert parent.metadata == {}
     assert restored.model_dump_json() == expected.model_dump_json()
-    assert type(pickle.loads(encoded)) is (
+    assert type(unpack_test_payload(encoded)) is (
         tuple if callback is None else tr.TokenizedTrajectory
     )
     assert history(restored).messages[0]["content"] == (
@@ -1186,7 +1301,7 @@ def test_malformed_reference_is_transfer_error(index):
             return index if value is result else None
 
     Writer(stream).dump(result)
-    payload = pickle.dumps(
+    payload = b"\0" + pickle.dumps(
         (
             b"art-process-sources-v1",
             tuple(type(x) for x in p._process_sources(parent)),
@@ -1239,7 +1354,7 @@ def test_unmapped_canonical_reference_uses_legacy_graph():
     # The receiver traverses models/lists outside the normal source fields too.
     history(result).messages.append(source)
     payload = p._serialize_process_result(result)
-    assert isinstance(pickle.loads(payload), tr.TokenizedTrajectory)
+    assert isinstance(unpack_test_payload(payload), tr.TokenizedTrajectory)
     restored = p._deserialize_process_result(payload, parent)
     assert (
         history(restored).messages[-1].exchange is parent.exchanges.chat_completions[1]
@@ -1350,9 +1465,9 @@ def test_protocol_history_source_fields(protocol):
         logprobs=[math.nan],
         flags=[tr.TokenFlag.EXACT],
     )
-    worker = pickle.loads(pickle.dumps(result))
+    worker = unpack_test_payload(pickle.dumps(result))
     expected, restored, _, new = roundtrip(parent, worker)
-    assert pickle.loads(new)[0] == b"art-process-sources-v1"
+    assert unpack_test_payload(new)[0] == b"art-process-sources-v1"
     assert expected.model_dump_json() == restored.model_dump_json()
     if protocol == "responses":
         assert restored.history.instructions_source is e
@@ -1588,7 +1703,7 @@ def test_nonpublic_interning_effects_match_on_independent_fresh_graphs(
                 ],
             )
         )
-        payload_types.append(type(pickle.loads(payload)))
+        payload_types.append(type(unpack_test_payload(payload)))
     assert outcomes[0] == outcomes[1] == (["L", "K"], True, ["L", "K"])
     if not public_alias:
         assert payload_types == [tr.TokenizedMultiHistoryTrajectory] * 2
@@ -1598,7 +1713,7 @@ def test_nonpublic_interning_effects_match_on_independent_fresh_graphs(
 def test_passive_private_state_keeps_source_elision(private):
     parent, result = fixture()
     result.trajectory._policy_token_counts = private
-    assert type(pickle.loads(p._serialize_process_result(result))) is tuple
+    assert type(unpack_test_payload(p._serialize_process_result(result))) is tuple
 
 
 @pytest.mark.parametrize(
@@ -1655,7 +1770,7 @@ def test_public_interning_effects_are_preserved_without_private_fallback():
         payload = encode(result)
         restored = p._deserialize_process_result(payload, parent)
         outcomes.append(list(history(restored).chat_template_kwargs))
-        assert type(pickle.loads(payload)) is (
+        assert type(unpack_test_payload(payload)) is (
             tuple
             if encode is p._serialize_process_result
             else tr.TokenizedMultiHistoryTrajectory
@@ -1704,7 +1819,7 @@ def test_interning_marker_matrix_uses_independent_graphs(
         if encode is p._serialize_process_result and (
             root_marker is not True or child_marker is True
         ):
-            assert type(pickle.loads(payload)) is tuple
+            assert type(unpack_test_payload(payload)) is tuple
     order = (
         [key, "second-key"]
         if skip or (root_marker is True and child_marker is True)
@@ -1772,7 +1887,7 @@ def test_specialized_result_retains_legacy_pickle():
     parent, result = fixture()
     special = SpecializedResult.model_validate(result.model_dump())
     payload = p._serialize_process_result(special)
-    assert type(pickle.loads(payload)) is SpecializedResult
+    assert type(unpack_test_payload(payload)) is SpecializedResult
     restored = p._deserialize_process_result(payload, parent)
     assert type(restored) is SpecializedResult
     assert restored.trajectory is parent
@@ -1930,7 +2045,7 @@ def test_nested_omitted_sdk_hook_retains_shared_kwargs_effect():
         "message": exchange.response.choices[0].message
     }
     payload = p._serialize_process_result(result)
-    assert isinstance(pickle.loads(payload), tr.TokenizedTrajectory)
+    assert isinstance(unpack_test_payload(payload), tr.TokenizedTrajectory)
     restored = p._deserialize_process_result(payload, parent)
     assert history(restored).chat_template_kwargs["message"].content == "Hello!"
     assert (
@@ -2073,7 +2188,7 @@ def test_builtin_key_containers_and_timezones_keep_source_elision(zone):
     }
     assert p._process_plain_models(result) is not None
     expected, restored, _, new = roundtrip(parent, result)
-    assert pickle.loads(new)[0] == b"art-process-sources-v1"
+    assert unpack_test_payload(new)[0] == b"art-process-sources-v1"
     assert (
         history(restored).chat_template_kwargs == history(expected).chat_template_kwargs
     )
@@ -2087,7 +2202,7 @@ def test_user_model_as_value_retains_ordinary_pickle_contract():
     }
     before = parent.model_dump_json()
     expected, restored, _, new = roundtrip(parent, result)
-    assert type(pickle.loads(new)) is tr.TokenizedTrajectory
+    assert type(unpack_test_payload(new)) is tr.TokenizedTrajectory
     assert history(restored).messages == history(expected).messages
     assert parent.model_dump_json() == before
 
@@ -2194,7 +2309,7 @@ def test_plain_user_model_outside_schema_also_uses_ordinary_pickle():
     parent, result = fixture()
     result.trajectory.metadata["value"] = UserMetadata(value=1)
     expected, restored, _, new = roundtrip(parent, result)
-    assert type(pickle.loads(new)) is tr.TokenizedTrajectory
+    assert type(unpack_test_payload(new)) is tr.TokenizedTrajectory
     assert history(restored).messages == history(expected).messages
 
 
@@ -2245,4 +2360,4 @@ def test_unknown_standard_assignment_authority_uses_ordinary_pickle(monkeypatch)
         },
     )
     payload = p._serialize_process_result(result)
-    assert type(pickle.loads(payload)) is tr.TokenizedTrajectory
+    assert type(unpack_test_payload(payload)) is tr.TokenizedTrajectory
