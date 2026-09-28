@@ -35,6 +35,8 @@ _REFUSALS = frozenset(
         "runtime_shape_inventory_over_limit",
         "runtime_slot_identity_unsupported",
         "runtime_dimension_unsupported",
+        "selected_request_input_mismatch",
+        "runtime_request_inputs_unavailable",
     }
 )
 
@@ -174,6 +176,25 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             r.target_tokens is not None and r.target_tokens.ndim > 8 for r in requests
         ):
             raise ValueError("runtime_token_inventory_over_limit")
+        # The live head estimator reads requests, but replay retains the inputs
+        # selected by the planner. Refuse replacements that normalize differently
+        # before reading head rows; never copy device tensors for diagnostics.
+        for item in group.items:
+            for selected, current in (
+                (item.input_ids, item.request.input_tokens),
+                (item.labels, item.request.target_tokens),
+            ):
+                if selected is None or current is None:
+                    if selected is not current:
+                        raise ValueError("selected_request_input_mismatch")
+                    continue
+                if selected.device.type != "cpu" or current.device.type != "cpu":
+                    raise ValueError("runtime_request_inputs_unavailable")
+                if selected.numel() != current.numel() or not _impl.torch.equal(
+                    selected.reshape(-1),
+                    current.detach().reshape(-1).to(dtype=_impl.torch.long),
+                ):
+                    raise ValueError("selected_request_input_mismatch")
         if vocabulary and any(p.device.type != "cpu" for p in positions):
             raise ValueError("head_positions_unavailable")
         projected = (

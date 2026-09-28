@@ -2,6 +2,7 @@
 
 import pytest
 from test_grouped_planner_replay import emitted, head_rank, request
+import torch
 
 from art.trainer_rank import _planner_misses as reports
 from art.trainer_rank import _planner_replay as runtime
@@ -74,3 +75,54 @@ def test_combined_inventory_at_limit_still_replays(monkeypatch, tmp_path):
     )
     assert report["replay_complete"]
     assert reports.replay(report)["aggregate"]["matches"]
+
+
+@pytest.mark.parametrize(
+    "change", ["targets", "missing_targets", "inputs", "meta_targets"]
+)
+def test_replaced_request_tensors_cannot_claim_selected_input_parity(change, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    item = request(65, grad=True)
+    plan = rank._plan_flat_forward([item])
+    assert item.target_tokens is not None
+    if change == "targets":
+        item.target_tokens = torch.full_like(item.target_tokens, -100)
+    elif change == "missing_targets":
+        item.target_tokens = None
+    elif change == "inputs":
+        item.input_tokens = item.input_tokens + 1
+    else:
+        item.target_tokens = torch.empty(65, dtype=torch.long, device="meta")
+    report, _ = emitted(rank, plan, tmp_path)
+    assert not report["replay_complete"]
+    expected = (
+        "runtime_request_inputs_unavailable"
+        if change == "meta_targets"
+        else "selected_request_input_mismatch"
+    )
+    assert "runtime_facts_unavailable:" + expected in report["incomplete_reasons"]
+
+
+@pytest.mark.parametrize(
+    "change", ["input_clone", "target_clone", "target_shape", "target_dtype"]
+)
+def test_equivalent_normalized_request_tensors_remain_replayable(change, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    item = request(65, grad=True)
+    plan = rank._plan_flat_forward([item])
+    assert item.target_tokens is not None
+    if change == "input_clone":
+        item.input_tokens = item.input_tokens.clone()
+    elif change == "target_clone":
+        item.target_tokens = item.target_tokens.clone()
+    elif change == "target_shape":
+        item.target_tokens = item.target_tokens.reshape(1, 65)
+    else:
+        item.target_tokens = item.target_tokens.to(torch.float32) + 0.25
+    report, _ = emitted(rank, plan, tmp_path)
+    assert report["replay_complete"]
+    result = reports.replay(report)
+    assert result["aggregate"]["matches"]
+    assert all(row["matches"] for row in result["estimates"])
