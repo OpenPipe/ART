@@ -48,9 +48,10 @@ jobs:
             });
             const candidates = runs.data.workflow_runs.filter(run =>
               run.id !== context.runId &&
+              run.head_repository?.full_name === pull.head.repo.full_name &&
+              run.head_branch === pull.head.ref &&
               run.head_sha === pull.head.sha &&
-              run.path === '.github/workflows/trainer-rank-gpu.yml' &&
-              (run.pull_requests ?? []).some(previous => previous.number === pull.number)
+              run.path === '.github/workflows/trainer-rank-gpu.yml'
             ).slice(0, 10);
             for (const run of candidates) {
               const jobs = await github.rest.actions.listJobsForWorkflowRun({
