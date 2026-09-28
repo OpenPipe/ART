@@ -226,6 +226,7 @@ jobs:
           REUSED_RUN: ${{ needs.classify.outputs.reused_run }}
           RESULT: ${{ needs.validate.result }}
         run: |
+          set -euo pipefail
           if [ "${CLASSIFY_RESULT}" != "success" ]; then
             echo "TrainerRank GPU classification failed." >&2
             exit 1
