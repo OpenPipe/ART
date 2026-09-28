@@ -46,7 +46,7 @@ _QWEN_INLINE_REASONING = re.compile(
 def _without_inline_reasoning_parser(template: str) -> str:
     if "reasoning_content" not in template or "split" not in template:
         return template
-    from jinja2 import Environment, TemplateSyntaxError, nodes
+    from jinja2 import Environment, TemplateSyntaxError, meta, nodes
     from jinja2.visitor import NodeTransformer
 
     # Compare parsed operations, not quote/spacing choices or a template hash.
@@ -61,6 +61,9 @@ def _without_inline_reasoning_parser(template: str) -> str:
             return node
 
     env = Environment()
+    # This environment only analyzes source. Treat even built-in globals as
+    # external bindings rather than hiding them from Jinja's scope analysis.
+    env.globals.clear()
 
     def operations(text: str):
         return WithoutWhitespace().visit(env.parse(text)).body
@@ -150,6 +153,147 @@ def _without_inline_reasoning_parser(template: str) -> str:
                 "set content = (render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
             )
         return result
+
+    # Moving the role test ahead of a renderer is safe only for a local,
+    # data-only macro under the stock chat renderer. External callbacks and
+    # unknown macro effects retain the original trim and evaluation order.
+    # This permits ordinary chat data, built-in tests, integer vision counters
+    # and the stock raising helper, not custom finalizers or renderer globals.
+    renderers = [
+        node for node in tree.find_all(nodes.Macro) if node.name == "render_content"
+    ]
+    if len(renderers) != 1 or renderers[0] not in tree.body:
+        return apply_edits()
+    if any(tree.find_all(nodes.Extends)):
+        return apply_edits()  # A parent template can replace the local macro.
+    renderer = renderers[0]
+    preceding = tree.body[: tree.body.index(renderer)]
+    if any(
+        name.name == "render_content"
+        for node in preceding
+        for name in node.find_all(nodes.Name)
+    ):
+        return apply_edits()
+    isolated = nodes.Template([renderer])
+    isolated.set_environment(env)
+    try:
+        # Use Jinja's own scope analysis, including conditionally bound locals.
+        global_names = meta.find_undeclared_variables(isolated)
+    except TemplateSyntaxError:
+        return apply_edits()
+    counters = global_names - {"raise_exception", "add_vision_id"}
+    for name in counters:
+        declarations = [
+            node
+            for node in preceding
+            if isinstance(node, nodes.Assign)
+            and node.target == nodes.Name(name, "store")
+        ]
+        declaration = env.parse("{% set counter = namespace(value=0) %}").body[0]
+        assert isinstance(declaration, nodes.Assign)
+        expected = declaration.node
+        if len(declarations) != 1 or declarations[0].node != expected:
+            return apply_edits()
+        inside = {id(node) for node in renderer.find_all(nodes.Node)}
+        if any(
+            node.name == name
+            and id(node) not in inside
+            and (isinstance(node, nodes.NSRef) or node.ctx == "load")
+            for node in tree.find_all((nodes.Name, nodes.NSRef))
+        ):
+            return apply_edits()
+    allowed = tuple(
+        getattr(nodes, name)
+        for name in (
+            "Add And Assign Call Compare Concat Const For Getattr If Name Not "
+            "NSRef Operand Or Output TemplateData Test"
+        ).split()
+    )
+    protected = {
+        "render_content",
+        "raise_exception",
+        "namespace",
+        "add_vision_id",
+        *counters,
+    }
+    if any(
+        not isinstance(node, allowed)
+        or isinstance(node, nodes.Call)
+        and not (
+            node.node == nodes.Name("raise_exception", "load")
+            and len(node.args) == 1
+            and isinstance(node.args[0], nodes.Const)
+            and not node.kwargs
+            and node.dyn_args is None
+            and node.dyn_kwargs is None
+        )
+        or isinstance(node, nodes.Test)
+        and node.name not in {"string", "iterable", "mapping", "none", "undefined"}
+        for node in renderer.find_all(nodes.Node)
+    ):
+        return apply_edits()
+    if any(
+        node.name in protected - counters
+        and node.ctx != "load"
+        or node.name in counters
+        and node.ctx != "load"
+        and not any(
+            node is declaration.target
+            for declaration in tree.body
+            if isinstance(declaration, nodes.Assign)
+        )
+        for node in tree.find_all(nodes.Name)
+    ) or any(
+        isinstance(node, nodes.Import)
+        and node.target in protected
+        or isinstance(node, nodes.FromImport)
+        and any(
+            (name if isinstance(name, str) else name[1]) in protected
+            for name in node.names
+        )
+        or isinstance(node, nodes.Macro)
+        and node is not renderer
+        and node.name in protected
+        for node in tree.find_all((nodes.Import, nodes.FromImport, nodes.Macro))
+    ):
+        return apply_edits()
+    if counters:
+        # Namespace counters are mutable. A context callback elsewhere could
+        # replace their values without a lexical reference to the namespace.
+        # Admit only the stock chat template's closed data/render operations.
+        closed = WithoutWhitespace().visit(env.parse(apply_edits()))
+        try:
+            external = meta.find_undeclared_variables(closed)
+        except TemplateSyntaxError:
+            return apply_edits()
+        if external.difference(
+            "messages tools message content reasoning_content preserve_thinking "
+            "enable_thinking add_generation_prompt add_vision_id raise_exception namespace".split()
+        ):
+            return apply_edits()
+        data_nodes = allowed + tuple(
+            getattr(nodes, name)
+            for name in "CondExpr Filter Getitem Keyword Macro Neg Slice Sub Tuple".split()
+        )
+        for node in closed.find_all(nodes.Node):
+            if not isinstance(node, data_nodes):
+                return apply_edits()
+            if isinstance(node, nodes.Call) and not (
+                isinstance(node.node, nodes.Name)
+                and node.node.name in {"render_content", "raise_exception", "namespace"}
+                or isinstance(node.node, nodes.Getattr)
+                and node.node.node == nodes.Name("content", "load")
+                and node.node.attr in {"startswith", "endswith"}
+            ):
+                return apply_edits()
+            if isinstance(node, nodes.Filter) and node.name not in (
+                "default items length safe string tojson trim".split()
+            ):
+                return apply_edits()
+            if isinstance(node, nodes.Test) and node.name not in (
+                "defined false iterable mapping none string true undefined".split()
+            ):
+                return apply_edits()
     assignments = list(tree.find_all(nodes.Assign))
     locations = []
     parsed_assignments = []
@@ -256,8 +400,13 @@ def _without_inline_reasoning_parser(template: str) -> str:
         body: Sequence[nodes.Node],
         bindings: set[int],
         initialized: set[str] | None = None,
+        loop_locals: bool = False,
     ) -> set[int]:
         bindings = bindings.copy()
+        # Store history belongs to every scope; only loop locals have the
+        # ownership proof allowing a fresh constant assignment to be ignored.
+        if initialized is None:
+            initialized = set()
         for node in body:
             if isinstance(node, nodes.If):
                 if (id(node) in edited_parsers and node == operation[0]) or (
@@ -282,22 +431,29 @@ def _without_inline_reasoning_parser(template: str) -> str:
                     if condition is None:
                         shared.update(bindings)
                     if condition is not False:
-                        joined.update(visit(branch.body, bindings, initialized))
+                        joined.update(
+                            visit(branch.body, bindings, initialized, loop_locals)
+                        )
                     if condition is True:
                         break
                 else:
-                    joined.update(visit(node.else_, bindings, initialized))
+                    joined.update(visit(node.else_, bindings, initialized, loop_locals))
                 bindings = joined
                 # A role-pruned path may still have initialized a local before
                 # rebinding message. Freshness follows every syntactic store.
                 remember_stores(node, initialized)
             else:
-                if reads_content(node, initialized):
+                if reads_content(node, initialized if loop_locals else None):
                     shared.update(bindings)
+                replacing_content = bool(bindings) or ("content" in initialized)
                 remember_stores(node, initialized)
                 if isinstance(node, nodes.Assign):
                     if writes_content(node):
                         bindings = {id(node)}
+                        if replacing_content:
+                            # Publishing a new binding can release an old
+                            # object whose destructor observes the new value.
+                            shared.update(bindings)
                 else:
                     # Macro/loop/with/block bodies have independent bindings.
                     for _, value in node.iter_fields():
@@ -318,7 +474,21 @@ def _without_inline_reasoning_parser(template: str) -> str:
                                 if isinstance(node, nodes.For) and value is node.body
                                 else None
                             )
-                            visit(value, set(), local_names)
+                            if isinstance(node, nodes.Macro):
+                                local_names = {arg.name for arg in node.args}
+                            elif isinstance(node, nodes.With):
+                                local_names = {
+                                    bound.name
+                                    for target in node.targets
+                                    for bound in (target, *target.find_all(nodes.Name))
+                                    if isinstance(bound, nodes.Name)
+                                }
+                            visit(
+                                value,
+                                set(),
+                                local_names,
+                                isinstance(node, nodes.For) and value is node.body,
+                            )
                     if isinstance(node, nodes.AssignBlock) and writes_content(node):
                         bindings.clear()
         return bindings

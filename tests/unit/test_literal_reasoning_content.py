@@ -240,6 +240,223 @@ def test_role_pruning_keeps_prior_store_history(branch):
     assert trim in fixed
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "",
+        "{% macro render_content(content, count) %}{{ mutate(content, count) }}{% endmacro %}",
+        "{% macro render_content(content, count) %}{{ content|mutate }}{% endmacro %}",
+        "{% macro render_content(content, count) %}{% if content is mutate %}{{ content }}{% endif %}{% endmacro %}",
+        "{% macro render_content(content, count) %}{{ probe.value }}{% endmacro %}",
+        "{% set dict = probe %}{% macro render_content(content, count) %}{{ dict.value }}{% endmacro %}",
+        "{% macro render_content(content, count) %}{{ probe.value }}{% if false %}{% set probe = 0 %}{% endif %}{% endmacro %}",
+        "{% macro render_content(content, count) %}{{ probe['value'] }}{% endmacro %}",
+        "{% macro render_content(content, count) %}{{ content }}{% endmacro %}{% set render_content = mutate %}",
+    ],
+)
+@pytest.mark.parametrize("mutate_role", [False, True])
+def test_unknown_renderer_effects_keep_trim_and_call_order(prefix, mutate_role):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    source = (
+        prefix
+        + trim
+        + "{% if message.role == 'assistant' %}"
+        + match.group()
+        + "{% endif %}[{{ content }}]"
+    )
+    env = ImmutableSandboxedEnvironment()
+
+    def render(template):
+        message = {"role": "assistant", "content": "  before<think>x</think>after  "}
+        calls = []
+
+        def mutate(value, count=None):
+            calls.append(message["role"])
+            if mutate_role:
+                message["role"] = "user"
+            return value
+
+        class Probe:
+            @property
+            def value(self):
+                return mutate(message["content"])
+
+            def __getitem__(self, key):
+                return self.value
+
+        env.filters["mutate"] = mutate
+        env.tests["mutate"] = lambda value: bool(mutate(value))
+        result = env.from_string(template).render(
+            message=message, render_content=mutate, mutate=mutate, probe=Probe()
+        )
+        return result, calls
+
+    fixed = _without_inline_reasoning_parser(source)
+    assert not _QWEN_INLINE_REASONING.search(fixed)
+    assert trim in fixed
+    assert render(fixed) == render(source.replace(match.group(), ""))
+    assert render(fixed) == ("[before<think>x</think>after]", ["assistant"])
+    assert chat_template_with_preserved_thinking(source) == fixed
+    assert chat_template_with_preserved_thinking(fixed) == fixed
+
+
+def test_renderer_declared_after_use_does_not_prove_role_stability():
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    source = (
+        trim
+        + "{% if message.role == 'assistant' %}"
+        + match.group()
+        + "{% else %}[{{ content }}]{% endif %}"
+        "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+    )
+    env = ImmutableSandboxedEnvironment()
+
+    def render(template):
+        message = {"role": "assistant", "content": "  answer  "}
+
+        def render_content(value, count):
+            message["role"] = "user"
+            return value
+
+        return env.from_string(template).render(
+            message=message, render_content=render_content
+        )
+
+    fixed = _without_inline_reasoning_parser(source)
+    assert trim in fixed
+    assert render(source) == render(fixed) == "[answer]"
+
+
+def test_inherited_renderer_does_not_prove_role_stability():
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    source = (
+        "{% extends 'parent' %}"
+        "{% macro render_content(content,count) %}{{ content }}{% endmacro %}"
+        "{% block body %}"
+        + trim
+        + "{% if message.role == 'assistant' %}"
+        + match.group()
+        + "{% endif %}[{{ content }}]{% endblock %}"
+    )
+    parent = (
+        "{% macro render_content(content,count) %}{{ mutate(content,count) }}{% endmacro %}"
+        "{% block body %}{% endblock %}"
+    )
+    message = {"role": "assistant", "content": "  answer  "}
+
+    def mutate(value, count):
+        message["role"] = "user"
+        return value
+
+    fixed = _without_inline_reasoning_parser(source)
+    assert trim in fixed
+    assert (
+        ImmutableSandboxedEnvironment(loader=DictLoader({"parent": parent}))
+        .from_string(fixed)
+        .render(message=message, mutate=mutate)
+        == "[answer]"
+    )
+
+
+@pytest.mark.parametrize(
+    "middle",
+    [
+        "{% include 'setup' %}",
+        "{{ inject() }}",
+        "{{ ''|inject }}",
+        "{% if '' is inject %}{% endif %}",
+    ],
+)
+def test_counter_renderer_rejects_implicit_context_exports(middle):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    source = (
+        "{% set counter=namespace(value=0) %}"
+        "{% macro render_content(content,count) %}{% set counter.value=counter.value+1 %}{{ content }}{% endmacro %}"
+        + middle
+        + trim
+        + "{% if message.role == 'assistant' %}"
+        + match.group()
+        + "{% endif %}[{{ content }}]"
+    )
+    message = {"role": "assistant", "content": "  answer  "}
+
+    class Probe:
+        def __add__(self, other):
+            message["role"] = "user"
+            return 1
+
+    @pass_context
+    def inject(context, value=None):
+        context["counter"]["value"] = Probe()
+        return ""
+
+    env = ImmutableSandboxedEnvironment(
+        loader=DictLoader({"setup": "{% set counter.value=probe %}"})
+    )
+    env.filters["inject"] = env.tests["inject"] = inject
+    fixed = _without_inline_reasoning_parser(source)
+    assert trim in fixed
+    assert (
+        env.from_string(fixed).render(message=message, inject=inject, probe=Probe())
+        == "[answer]"
+    )
+
+
+@pytest.mark.parametrize("scope", ["top", "loop", "macro", "with"])
+def test_replacing_content_keeps_trim_for_its_own_observers(scope):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    seen = []
+
+    class Probe:
+        def __init__(self, reader):
+            self.reader = reader
+
+        def __del__(self):
+            seen.append(self.reader())
+
+    trim = "{% set content = render_content(message.content,true)|trim %}"
+    body = (
+        "{% macro read_content() %}{{ content }}{% endmacro %}"
+        "{% if message.role == 'user' %}{% set content = make_probe(read_content) %}"
+        "{% set message = {'role': 'assistant', 'content': message.content} %}{% endif %}"
+        + trim
+        + match.group()
+    )
+    if scope == "loop":
+        body = "{% for message in messages %}" + body + "{% endfor %}"
+    elif scope == "macro":
+        body = "{% macro run(message) %}" + body + "{% endmacro %}{{ run(message) }}"
+    elif scope == "with":
+        body = "{% with message=message %}" + body + "{% endwith %}"
+    source = (
+        "{% macro render_content(content,count) %}{{ content }}{% endmacro %}"
+        + body
+        + "{{ seen|join('|') }}"
+    )
+    fixed = _without_inline_reasoning_parser(source)
+    assert trim in fixed
+    assert (
+        ImmutableSandboxedEnvironment()
+        .from_string(fixed)
+        .render(
+            messages=[{"role": "user", "content": "  answer  "}],
+            message={"role": "user", "content": "  answer  "},
+            make_probe=Probe,
+            seen=seen,
+        )
+        == "answer"
+    )
+
+
 @pytest.mark.parametrize("trim_blocks,lstrip_blocks", [(False, False), (True, True)])
 @pytest.mark.parametrize(
     "left,right", [("", ""), ("-", ""), ("", "-"), ("-", "-"), ("+", "+")]
@@ -758,7 +975,9 @@ def test_qwen_content_preview_macro_is_unchanged(preserve, raw):
         [_USER, {"role": "assistant", "content": content}],
         preserve_thinking=preserve,
     )
-    assert content + "<|im_end|>\n" in rendered
+    # The extra renderer reference before its declaration prevents the closed
+    # stock-template proof. Keep its existing preservation/trim behavior.
+    assert (content if preserve else content.strip()) + "<|im_end|>\n" in rendered
     assert rendered.endswith("[before<think>literal</think>after]")
 
 
@@ -827,6 +1046,48 @@ def test_optional_trim_binding_parse_keeps_proven_parser_removal(extension):
     assert prefix in fixed
     assert env.from_string(fixed).render(**kwargs).endswith(content)
     assert chat_template_with_preserved_thinking(fixed) == fixed
+
+
+def test_tuple_scope_content_replacement_retains_trim():
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    seen = []
+
+    class Probe:
+        def __init__(self):
+            self.reader = lambda: "unbound"
+
+        def __del__(self):
+            seen.append(self.reader())
+
+    def bind(probe, reader):
+        probe.reader = reader
+        return ""
+
+    trim = "{% set content = render_content(message.content,true)|trim %}"
+    source = (
+        "{% macro render_content(content,count) %}{{ content }}{% endmacro %}"
+        "{% with (content, spare)=make_pair() %}"
+        "{% macro read_content() %}{{ content }}{% endmacro %}"
+        "{{ bind(content,read_content) }}"
+        + trim
+        + match.group()
+        + "{% endwith %}{{ seen|join('|') }}"
+    )
+    fixed = _without_inline_reasoning_parser(source)
+    assert trim in fixed
+    assert (
+        ImmutableSandboxedEnvironment()
+        .from_string(fixed)
+        .render(
+            message={"role": "assistant", "content": "  answer  "},
+            make_pair=lambda: (Probe(), None),
+            bind=bind,
+            seen=seen,
+        )
+        == "answer"
+    )
+    assert seen == ["answer"]
 
 
 @pytest.mark.parametrize("consumer", ["output", "alias", "condition", "other_branch"])
