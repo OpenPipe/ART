@@ -310,7 +310,7 @@ def test_split_lower_bound_stays_below_the_layout_cost(monkeypatch, lengths, per
 )
 def test_split_lower_bound_stays_below_two_slots_layout_cost(monkeypatch, lengths):
     # Two gradient groups of different slots (the first request alone, then
-    # the rest), each with pending gradients, one outweighing its boundaries.
+    # the rest), each with pending gradients.
     from art.megatron.lora import LoRASlotRef
 
     r = art_cp(rank(), monkeypatch)
@@ -348,6 +348,8 @@ def test_split_lower_bound_stays_below_two_slots_layout_cost(monkeypatch, length
     lower = r._split_chunk_lower_cost(
         requests, tuple(item.input_tokens for item in requests), checkpoint=Unset
     )
+    # The even-share lower bound prices both slots' extra too, and stays below.
+    assert lower.checkpoint_adapter_gradient > 0
     assert lower.required <= exact.required
 
 
