@@ -293,7 +293,7 @@ def test_changed_tokens_mark_replay_incomplete(monkeypatch, tmp_path):
     rank._complete_planner_observation()
     [record] = _records(tmp_path)
     assert not record["replay_complete"]
-    assert "device_or_modified_input" in record["incomplete_reasons"]
+    assert "modified_input" in record["incomplete_reasons"]
 
 
 def test_disabled_reports_do_not_sample_extra_counters(monkeypatch, tmp_path):
