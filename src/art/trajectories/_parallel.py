@@ -5,8 +5,12 @@ import atexit
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from dataclasses import dataclass, field
+import copyreg
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timedelta, timezone
+from enum import Enum, IntFlag
 from functools import lru_cache
+import io
 import math
 import multiprocessing
 from multiprocessing.process import BaseProcess
@@ -17,18 +21,32 @@ import sys
 import threading
 import time
 from types import ModuleType
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast, get_args
 import warnings
 
+from pydantic import BaseModel
+from pydantic import main as pydantic_main
+
 from . import (
+    ChatCompletionsExchange,
+    CompletionsExchange,
+    MessagesExchange,
+    ResponsesExchange,
+    TokenFlag,
     TokenizedMultiHistoryTrajectory,
     TokenizedTrajectory,
     TokenizedTrajectoryGroup,
     Tokenizer,
     Trajectory,
+    TrajectoryExchanges,
     TrajectoryGroup,
+    _HistorySource,
 )
-from ._serialization import _rebind_history_sources, _without_pickle_string_interning
+from ._serialization import (
+    _rebind_history_sources,
+    _StringInterningModel,
+    _without_pickle_string_interning,
+)
 
 _ResultT = TypeVar("_ResultT")
 _ValueT = TypeVar("_ValueT")
@@ -535,6 +553,7 @@ class _ProcessOptions:
     base_model: str | None
     chat_template: str | None
     chat_template_kwargs: Mapping[str, object] | None
+    source_refs_allowed: bool = False
 
 
 class _ProcessTransferError(RuntimeError):
@@ -543,6 +562,490 @@ class _ProcessTransferError(RuntimeError):
 
 class _ProcessBackendError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class _ProcessSourceRef:
+    index: int
+
+
+class _ProcessSourceAlias(Exception):
+    pass
+
+
+def _process_sources(trajectory: Trajectory) -> tuple[object, ...]:
+    return (
+        trajectory,
+        *trajectory.exchanges.chat_completions,
+        *trajectory.exchanges.completions,
+        *trajectory.exchanges.responses,
+        *trajectory.exchanges.messages,
+    )
+
+
+@lru_cache(maxsize=1)
+def _process_schema_models() -> frozenset[type[BaseModel]]:
+    """Exact ART/provider types in the declared result schema, never subclasses."""
+    models: set[type[BaseModel]] = set()
+    pending: list[object] = [TokenizedTrajectory, TokenizedMultiHistoryTrajectory]
+    seen: set[int] = set()
+    while pending:
+        annotation = pending.pop()
+        if id(annotation) in seen:
+            continue
+        seen.add(id(annotation))
+        if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            models.add(annotation)
+            pending.extend(
+                field.annotation for field in annotation.model_fields.values()
+            )
+        else:
+            pending.extend(get_args(annotation))
+    return frozenset(models)
+
+
+def _process_plain_models(
+    value: object, *, check_schema: bool = False, exchange_ids: set[int] | None = None
+) -> set[type] | None:
+    """Require passive reconstruction, retirement and field rebinding.
+
+    This assumes the inspected framework/stdlib bases and generated enum member
+    state are unmodified; customized enum behavior instead uses ordinary pickle.
+    Only exact schema model types qualify. Arbitrary user models/mixins retain
+    ordinary pickle semantics even if no currently known pickle hook is present.
+    Inspect omitted graphs too: their retirement can affect retained aliases.
+    The parent checks its graph and the full schema before dispatch; classes,
+    registrations and graphs must not be externally mutated during transfer.
+    This is not a lock.
+    """
+
+    # Even an unrelated registry key can run metaclass hashing/equality during
+    # lookup. Preserve ordinary pickle's own callbacks and ordering in that case.
+    if type(copyreg.dispatch_table) is not dict or any(
+        type(key) is not type
+        and type(key) is not type(BaseModel)
+        and type(key) is not type(Enum)
+        for key in copyreg.dispatch_table
+    ):
+        return None
+
+    @lru_cache(maxsize=None)
+    def attributes(cls: type) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for base in cls.__mro__:
+            for name, item in vars(base).items():
+                result.setdefault(name, item)
+        return result
+
+    standard = attributes(BaseModel)
+    interned = attributes(_StringInterningModel)
+    hooks = (
+        "__reduce__",
+        "__reduce_ex__",
+        "__getstate__",
+        "__setstate__",
+        "__getnewargs__",
+        "__getnewargs_ex__",
+    )
+    models: set[type] = set()
+    # Omitted flags must preserve constructor and reducer callbacks too. Compare
+    # behavior with the inspected framework base, not just __reduce_ex__.
+    flag_safe = True
+    for name, item in attributes(IntFlag).items():
+        if callable(item) or hasattr(type(item), "__get__"):
+            actual = attributes(TokenFlag).get(name)
+            # Enum construction copies staticmethod wrappers for the standard
+            # member-value generator; their underlying function must match.
+            if type(item) is staticmethod and type(actual) is staticmethod:
+                actual, item = actual.__func__, item.__func__
+            if actual is not item:
+                flag_safe = False
+                break
+
+    @lru_cache(maxsize=None)
+    def field_is_plain(cls: type, name: str) -> bool:
+        descriptor_type = type(attributes(cls).get(name))
+        return type(descriptor_type) is type and not any(
+            hook in vars(base)
+            for base in descriptor_type.__mro__
+            for hook in ("__set__", "__delete__")
+        )
+
+    def fields_are_plain(cls: type, names: Iterable[object]) -> bool:
+        return all(type(name) is str and field_is_plain(cls, name) for name in names)
+
+    def interning_marker(item: object, extra: dict[str, object] | None) -> object:
+        try:
+            return object.__getattribute__(item, "_art_pickle_strings_interned")
+        except AttributeError:
+            # BaseModel.__getattr__ can resolve an absent slot through private
+            # attributes or extras. Decline those paths without invoking them.
+            private = attributes(type(item)).get("__private_attributes__")
+            if any(
+                type(mapping) is not dict
+                or any(type(key) is not str for key in mapping)
+                or "_art_pickle_strings_interned" in mapping
+                for mapping in (private, extra if extra is not None else {})
+            ):
+                return None
+            return False
+
+    root_interned: object = False
+
+    def model_is_plain(cls: type) -> bool:
+        if cls not in models:
+            attrs = attributes(cls)
+            if cls in (TokenizedTrajectory, TokenizedMultiHistoryTrajectory):
+                setters = attrs.get("__pydantic_setattr_handlers__")
+                config = attrs.get("model_config")
+                standard_setters = getattr(
+                    pydantic_main, "_SIMPLE_SETATTR_HANDLERS", None
+                )
+                if (
+                    type(setters) is not dict
+                    or type(config) is not dict
+                    or type(standard_setters) is not dict
+                ):
+                    return False
+                setter = setters.get("trajectory")
+                field_setter = standard_setters.get("model_field")
+                if (
+                    field_setter is None
+                    or (setter is not None and setter is not field_setter)
+                    or "trajectory" in attrs
+                    or any(
+                        config.get(name) is not None and config.get(name) is not False
+                        for name in ("validate_assignment", "frozen")
+                    )
+                ):
+                    return False
+            if (
+                any(
+                    attrs.get(name) is not standard.get(name)
+                    for name in (
+                        "__new__",
+                        "__getattribute__",
+                        "__getattr__",
+                        "__setattr__",
+                        "_setattr_handler",
+                        "__reduce__",
+                        "__getstate__",
+                        "__setstate__",
+                        "__dict__",
+                        "__pydantic_fields_set__",
+                        "__pydantic_extra__",
+                        "__pydantic_private__",
+                    )
+                )
+                or (
+                    attrs.get("__reduce_ex__") is not standard.get("__reduce_ex__")
+                    and attrs.get("__reduce_ex__") is not interned.get("__reduce_ex__")
+                )
+                or "__del__" in attrs
+                or any(
+                    name in attrs for name in ("__getnewargs__", "__getnewargs_ex__")
+                )
+                or (
+                    issubclass(cls, _StringInterningModel)
+                    and any(
+                        attrs.get(name) is not interned.get(name)
+                        for name in (
+                            "_mark_pickle_strings_interned",
+                            "_art_pickle_strings_interned",
+                        )
+                    )
+                )
+                or not fields_are_plain(
+                    cls,
+                    (
+                        *cast(type[BaseModel], cls).model_fields,
+                        # The parent may not have a history instance yet. Check
+                        # every replacement role even if its field is undeclared.
+                        "system_source",
+                        "instructions_source",
+                        "exchange",
+                    ),
+                )
+            ):
+                return False
+            models.add(cls)
+        return True
+
+    if check_schema and (
+        not flag_safe
+        or any(
+            type(cls) is not type(BaseModel)
+            or cls in copyreg.dispatch_table
+            or not model_is_plain(cls)
+            for cls in _process_schema_models()
+        )
+    ):
+        return None
+    state_owners: dict[int, object] = {}
+    seen: set[tuple[int, bool, bool]] = set()
+    pending = [(value, False, False)]
+    while pending:
+        item, hashed, outside_interning = pending.pop()
+        cls = type(item)
+        if (
+            type(cls) is not type
+            and type(cls) is not type(BaseModel)
+            and type(cls) is not type(Enum)
+        ):
+            return None
+        if cls in copyreg.dispatch_table:
+            return None
+        if cls in (type(None), bool, int, float, str, bytes, bytearray):
+            continue
+        if cls is TokenFlag:
+            if not flag_safe:
+                return None
+            continue
+        if cls is datetime:
+            pending.append((cast(datetime, item).tzinfo, False, outside_interning))
+            continue
+        if cls is timezone:
+            # Even an exact timezone can retain subclass offsets or names.
+            pending.extend(
+                (arg, False, outside_interning) for arg in timezone.__reduce__(item)[1]
+            )
+            continue
+        if cls is timedelta:
+            continue
+        if (id(item), hashed, outside_interning) in seen:
+            continue
+        seen.add((id(item), hashed, outside_interning))
+        if cls in (list, tuple, set, frozenset):
+            pending.extend(
+                (child, hashed or cls in (set, frozenset), outside_interning)
+                for child in cast(Iterable[object], item)
+            )
+        elif cls is dict:
+            for key, child in cast(dict[object, object], item).items():
+                pending.extend(
+                    ((key, True, outside_interning), (child, False, outside_interning))
+                )
+        elif type(cls) is type(BaseModel):
+            # Keys/set members run hashing and equality during reconstruction.
+            # Decline all model keys, including models nested in key containers.
+            if hashed or cls not in _process_schema_models():
+                return None
+            if not model_is_plain(cls):
+                return None
+            try:
+                state = object.__getattribute__(item, "__dict__")
+                fields_set = object.__getattribute__(item, "__pydantic_fields_set__")
+                extra = object.__getattribute__(item, "__pydantic_extra__")
+                private_state = object.__getattribute__(item, "__pydantic_private__")
+            except AttributeError:
+                return None
+            # Omitted __getstate__ and interning must accept the same slot shapes.
+            # Public construction/mutation need not respect Pydantic annotations.
+            if (
+                type(state) is not dict
+                or type(fields_set) is not set
+                or (extra is not None and type(extra) is not dict)
+                or (private_state is not None and type(private_state) is not dict)
+                or not fields_are_plain(cls, state)
+                or "__pydantic_setattr_handlers__" in state
+                or "__private_attributes__" in state
+                or any(name in state for name in hooks)
+            ):
+                return None
+            if isinstance(item, _StringInterningModel):
+                marker = interning_marker(item, extra)
+                if item is value:
+                    root_interned = marker
+                # A fresh root prepares public models before elision, but skips
+                # fields-set/private state. A marked root skips preparation entirely.
+                # Do not invoke arbitrary truth callbacks in an unexpected marker.
+                if (
+                    type(marker) is not bool
+                    or outside_interning
+                    or (root_interned is True and marker is False)
+                ):
+                    return None
+            if exchange_ids is not None and isinstance(
+                item,
+                (
+                    ChatCompletionsExchange,
+                    CompletionsExchange,
+                    ResponsesExchange,
+                    MessagesExchange,
+                ),
+            ):
+                exchange_ids.add(id(item))
+            if state_owners.setdefault(id(state), item) is not item:
+                # Copying replaced state must not split aliases between models.
+                return None
+            pending.extend(
+                (child, False, outside_interning) for child in (state, extra)
+            )
+            # Match _intern_value's exact BaseModel traversal: only field state
+            # and extras are prepared. These other pickle-state slots are not.
+            pending.extend(
+                (child, False, True) for child in (fields_set, private_state)
+            )
+        else:
+            return None
+    return models
+
+
+def _serialize_process_result(
+    result: TokenizedTrajectory | TokenizedMultiHistoryTrajectory,
+) -> bytes:
+    if type(result) not in (TokenizedTrajectory, TokenizedMultiHistoryTrajectory):
+        return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+    exchange_ids: set[int] = set()
+    plain_models = _process_plain_models(result, exchange_ids=exchange_ids)
+    if plain_models is None:
+        return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+    # Prove traversal shapes before reducers: public construct/copy/mutation can
+    # retain values outside their annotations. The receiver has broader traversal.
+    trajectory = result.__dict__.get("trajectory")
+    exchanges = (
+        trajectory.__dict__.get("exchanges") if type(trajectory) is Trajectory else None
+    )
+    if type(exchanges) is not TrajectoryExchanges or any(
+        type(exchanges.__dict__.get(name)) not in (list, tuple)
+        for name in ("chat_completions", "completions", "responses", "messages")
+    ):
+        return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+    sources = _process_sources(cast(Trajectory, trajectory))
+    if any(
+        type(value)
+        not in (
+            ChatCompletionsExchange,
+            CompletionsExchange,
+            ResponsesExchange,
+            MessagesExchange,
+        )
+        for value in sources[1:]
+    ):
+        return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+    indices = {id(value): index for index, value in enumerate(sources)}
+    if not exchange_ids.issubset(indices):
+        # Noninventory exchanges use the receiver's equality search. Injecting
+        # shared sources early can change that search's values or exceptions.
+        return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+    replacements = {id(result): {"trajectory": _ProcessSourceRef(0)}}
+    replaced_states = {id(result.__dict__)}
+
+    def bind(owner: Any, name: str) -> None:
+        value = owner.__dict__.get(name)
+        # Match the receiver's role predicate even for unvalidated model state.
+        if not isinstance(
+            value,
+            (
+                ChatCompletionsExchange,
+                CompletionsExchange,
+                ResponsesExchange,
+                MessagesExchange,
+            ),
+        ):
+            return
+        index = indices.get(id(value))
+        if index is not None:
+            replacements.setdefault(id(owner), {})[name] = _ProcessSourceRef(index)
+            replaced_states.add(id(owner.__dict__))
+
+    histories = (
+        [result]
+        if isinstance(result, TokenizedTrajectory)
+        else result.__dict__.get("histories")
+    )
+    if type(histories) not in (list, tuple):
+        return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+    for tokenized in cast(Sequence[object], histories):
+        history = (
+            tokenized.__dict__.get("history")
+            if isinstance(tokenized, BaseModel)
+            else None
+        )
+        if not isinstance(history, BaseModel):
+            return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+        for name in ("system_source", "instructions_source"):
+            bind(history, name)
+        for name in ("message_sources", "input_sources", "prompt_sources"):
+            values = history.__dict__.get(name, ())
+            if type(values) not in (list, tuple):
+                return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+            for source in values:
+                if isinstance(source, _HistorySource):
+                    bind(source, "exchange")
+                    nested = source.__dict__.get("source")
+                    if isinstance(nested, _HistorySource):
+                        bind(nested, "exchange")
+
+    stream = io.BytesIO()
+
+    class Writer(pickle.Pickler):
+        def persistent_id(self, value: object) -> int | None:
+            if id(value) in replaced_states or id(value) in indices:
+                # A source or replaced state was reached through another alias.
+                # Preserve the receiver's complete old graph semantics.
+                raise _ProcessSourceAlias
+            return value.index if type(value) is _ProcessSourceRef else None
+
+        def reducer_override(self, value: Any) -> Any:
+            cls = type(value)
+            if cls in copyreg.dispatch_table:
+                raise _ProcessSourceAlias
+            if (
+                isinstance(value, type)
+                or value is getattr(copyreg, "__newobj__")
+                or value is getattr(copyreg, "__newobj_ex__")
+                or cls is TokenFlag
+            ):
+                return NotImplemented
+            if cls not in plain_models:
+                raise _ProcessSourceAlias
+            replacement = replacements.get(id(value))
+            if replacement is None:
+                return NotImplemented
+            reduced = value.__reduce_ex__(pickle.HIGHEST_PROTOCOL)
+            if (
+                type(reduced) is not tuple
+                or len(reduced) < 3
+                or type(reduced[2]) is not dict
+                or type(reduced[2].get("__dict__")) is not dict
+            ):
+                raise _ProcessSourceAlias
+            state = reduced[2].copy()
+            state["__dict__"] = {**state["__dict__"], **replacement}
+            return (*reduced[:2], state, *reduced[3:])
+
+    # Replace only fields that the existing receiver canonicalizes. Other
+    # references to the same source (e.g. arbitrary kwargs) stay detached copies.
+    try:
+        Writer(stream, protocol=pickle.HIGHEST_PROTOCOL).dump(result)
+    except _ProcessSourceAlias:
+        return pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL)
+    return pickle.dumps(
+        (b"art-process-sources-v1", tuple(type(x) for x in sources), stream.getvalue()),
+        protocol=pickle.HIGHEST_PROTOCOL,
+    )
+
+
+def _load_process_result(payload: bytes, trajectory: Trajectory) -> object:
+    packed = pickle.loads(payload)
+    if not (
+        type(packed) is tuple
+        and len(packed) == 3
+        and packed[0] == b"art-process-sources-v1"
+    ):
+        return packed
+    sources = _process_sources(trajectory)
+    if packed[1] != tuple(type(x) for x in sources):
+        raise ValueError("Source trajectory exchange structure has changed")
+
+    class Reader(pickle.Unpickler):
+        def persistent_load(self, index: object) -> object:
+            if type(index) is not int or not 0 <= index < len(sources):
+                raise pickle.UnpicklingError("Invalid process source reference")
+            return sources[index]
+
+    return Reader(io.BytesIO(packed[2])).load()
 
 
 def _tokenize_process_payload(payload: bytes) -> bytes:
@@ -566,6 +1069,8 @@ def _tokenize_process_payload(payload: bytes) -> bytes:
         chat_template_kwargs=options.chat_template_kwargs,
     )
     try:
+        if options.source_refs_allowed:
+            return _serialize_process_result(tokenized)
         return pickle.dumps(tokenized, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as error:
         raise _ProcessTransferError(
@@ -578,9 +1083,20 @@ def _process_payloads(
     values: Sequence[Trajectory], options: _ProcessOptions
 ) -> list[bytes]:
     try:
+        schema_plain = _process_plain_models(None, check_schema=True) is not None
         with _without_pickle_string_interning():
             return [
-                pickle.dumps((value, options), protocol=pickle.HIGHEST_PROTOCOL)
+                pickle.dumps(
+                    (
+                        value,
+                        replace(
+                            options,
+                            source_refs_allowed=schema_plain
+                            and _process_plain_models(value) is not None,
+                        ),
+                    ),
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
                 for value in values
             ]
     except Exception as error:
@@ -671,7 +1187,7 @@ def _deserialize_process_result(
     payload: bytes, trajectory: Trajectory
 ) -> TokenizedTrajectory | TokenizedMultiHistoryTrajectory:
     try:
-        result = pickle.loads(payload)
+        result = _load_process_result(payload, trajectory)
         if not isinstance(
             result, (TokenizedTrajectory, TokenizedMultiHistoryTrajectory)
         ):
