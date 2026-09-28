@@ -11,6 +11,7 @@ import torch
 
 from art.trainer_rank import _impl as tr
 from art.trainer_rank._planner_misses import Reporter, validate_report
+from art.trainer_rank._planner_retention import report_retention_scope
 
 
 def _plan(monkeypatch, tmp_path, *, inference=False):
@@ -143,7 +144,9 @@ def test_snapshot_budget_and_lifetime_are_owned(monkeypatch, tmp_path):
     replay = _snapshot(rank, plan)
     assert len(copies) == 1 and copies[0]() is not None
     payload = replay()
-    assert len(payload["requests"][0]["input_tokens"]) == 600_000
+    assert payload["requests"][0]["input_tokens"]["unavailable"] == (
+        "selected_layout_input_mismatch"
+    )
     assert (
         payload["requests"][0]["target_tokens"]["unavailable"]
         == "token_inventory_over_limit"
@@ -178,3 +181,60 @@ def test_versioned_cpu_inputs_do_not_require_a_snapshot_copy(monkeypatch, tmp_pa
     payload = _snapshot(rank, plan)()
     assert payload["requests"][0]["input_tokens"] == original
     assert len(payload["layouts"]) == 1
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_suppressed_scope_captures_no_cpu_inputs(monkeypatch, tmp_path, nested):
+    rank, plan = _plan(monkeypatch, tmp_path, inference=True)
+    clone = torch.Tensor.clone
+    copies = []
+
+    def tracked(value, *args, **kwargs):
+        copies.append(value.numel())
+        return clone(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", tracked)
+    with report_retention_scope(None, capture=False):
+        with report_retention_scope(None, capture=True) if nested else nullcontext():
+            rank._begin_planner_observation(plan, tr._MemoryCheck(1000, 2000, True))
+    assert copies == []
+    assert rank._planner_observation is not None
+    assert rank._planner_observation["comparable"] is False
+    rank.finish_planner_observation()
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("inference", [False, True])
+def test_input_changed_before_observation_is_not_claimed_as_selected(
+    monkeypatch, tmp_path, inference
+):
+    rank, plan = _plan(monkeypatch, tmp_path, inference=inference)
+    tensor = plan.groups[0].items[0].input_ids
+    with torch.inference_mode(inference):
+        tensor[0] += 1
+    payload = _snapshot(rank, plan)()
+    value = payload["requests"][0]["input_tokens"]
+    assert isinstance(value, dict), value
+    assert value["unavailable"] == "selected_layout_input_mismatch"
+    assert payload["layouts"] == []
+    assert "selected_layout_input_mismatch" in payload["incomplete_reasons"]
+
+
+@pytest.mark.parametrize("inference", [False, True])
+def test_device_swap_after_capture_is_not_read(monkeypatch, tmp_path, inference):
+    rank, plan = _plan(monkeypatch, tmp_path, inference=inference)
+    replay = _snapshot(rank, plan)
+    tensor = plan.groups[0].items[0].input_ids
+    with torch.inference_mode(inference):
+        replacement = torch.empty_like(tensor, device="meta")
+    torch.utils.swap_tensors(tensor, replacement)
+    original = torch.Tensor.tolist
+
+    def no_device_read(value, *args, **kwargs):
+        assert value.device.type == "cpu", "device materialization attempted"
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", no_device_read)
+    payload = replay()
+    assert payload["requests"][0]["input_tokens"]["unavailable"] == "device_input"
+    assert payload["layouts"] == []

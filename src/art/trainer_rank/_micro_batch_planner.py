@@ -1382,6 +1382,8 @@ def _fill_planner_snapshot(
 ) -> None:
     """Freeze the selected estimator without opening a measurement window."""
     try:
+        if not _impl._planner_misses._planner_retention.capture_enabled():
+            return
         children = (
             plan.subforwards if isinstance(plan, _impl._SplitForwardPlan) else (plan,)
         )
@@ -1527,6 +1529,10 @@ def _fill_planner_snapshot(
                 tensor, original_version, frozen, reason = snapshot
                 if tensor is None:
                     return None
+                # Storage can be replaced without incrementing the version.
+                # Recheck before equality or materialization; never read D2H.
+                if tensor.device.type != "cpu":
+                    reason = "device_input"
                 if reason is None and (
                     not _impl.torch.equal(tensor, frozen)
                     if frozen is not None
@@ -1557,7 +1563,7 @@ def _fill_planner_snapshot(
             layouts = []
             cursor = 0
             for group in plan.groups:
-                rows = [
+                rows: list[Any] = [
                     item["input_tokens"]
                     for item in requests[cursor : cursor + len(group.items)]
                 ]
@@ -1566,6 +1572,18 @@ def _fill_planner_snapshot(
                     incomplete.add("selected_layout_unavailable")
                 elif not all(isinstance(row, list) for row in rows):
                     incomplete.add("layout_inputs_unavailable")
+                elif (
+                    build_canonical_prefix_tree(rows).fingerprint
+                    != group.layout.tree_fingerprint
+                ):
+                    # Inputs may have changed after the selected layout was
+                    # materialized but before observation started. Never pair
+                    # later rows with that layout's immutable fingerprint.
+                    incomplete.add("selected_layout_input_mismatch")
+                    for item in requests[cursor - len(group.items) : cursor]:
+                        item["input_tokens"] = {
+                            "unavailable": "selected_layout_input_mismatch"
+                        }
                 else:
                     layouts.append(
                         {
