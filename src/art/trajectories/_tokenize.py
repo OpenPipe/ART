@@ -7708,8 +7708,9 @@ def _recorded_source_evidence(sources: Sequence[object]) -> tuple[object, ...]:
 
 def _recorded_request_settings(
     exchange: ChatCompletionsExchange, tokenizer: Tokenizer
-) -> tuple[str | None, dict[str, Any], dict | None]:
-    candidate = getattr(tokenizer, "chat_template", None)
+) -> tuple[str | None, dict[str, Any], dict | None, bool]:
+    missing = object()
+    candidate = getattr(tokenizer, "chat_template", missing)
     template = exchange.request.get("chat_template")
     if template is None:
         template = candidate if isinstance(candidate, str) else None
@@ -7720,6 +7721,7 @@ def _recorded_request_settings(
             **(exchange.request.get("chat_template_kwargs") or {}),
         },
         candidate if isinstance(candidate, dict) else None,
+        candidate is not missing,
     )
 
 
@@ -7785,14 +7787,23 @@ def _restore_recorded_request_roles(
         if tokenizer is None:
             return  # Optional role annotations must not introduce a tokenizer load.
         resolved = tokenizer
-        template, kwargs, templates = _recorded_request_settings(exchange, resolved)
-        if template is None and templates is None:
+        template, kwargs, templates, metadata_present = _recorded_request_settings(
+            exchange, resolved
+        )
+        if metadata_present and template is None and templates is None:
             return  # A callable renderer may still have no template to render.
         if not callable(getattr(resolved, "apply_chat_template", None)):
             return
         try:
             request_context = _render_context_key(
-                [request_messages, request_tools, template, kwargs, templates]
+                [
+                    request_messages,
+                    request_tools,
+                    template,
+                    kwargs,
+                    templates,
+                    metadata_present,
+                ]
             )
         except (TypeError, RecursionError):
             return  # The exact native prefix is usable without role annotations.
