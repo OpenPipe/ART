@@ -202,14 +202,17 @@ def _without_inline_reasoning_parser(template: str) -> str:
             or any(n.name == "content" for n in target.find_all(nodes.Name))
         )
 
-    def reads_content(node: nodes.Node) -> bool:
-        # Only a plain constant assignment is binding-transparent. Calls,
+    def reads_content(node: nodes.Node, initialized: set[str] | None) -> bool:
+        # Only a fresh loop-local constant assignment is transparent. Rebinding
+        # an arbitrary old value can invoke its destructor. Calls,
         # filters/tests, loaders, attributes/items, operators and even output
         # conversion/finalization may invoke code that observes this scope.
         # Keep the trim for unknown nodes instead of enumerating callbacks.
         return not (
-            isinstance(node, nodes.Assign)
+            initialized is not None
+            and isinstance(node, nodes.Assign)
             and isinstance(node.target, nodes.Name)
+            and node.target.name not in initialized
             and node.target.name != "message"
             and isinstance(node.node, nodes.Const)
         )
@@ -230,7 +233,11 @@ def _without_inline_reasoning_parser(template: str) -> str:
             return equal if test.ops[0].op == "eq" else not equal
         return None
 
-    def visit(body: Sequence[nodes.Node], bindings: set[int]) -> set[int]:
+    def visit(
+        body: Sequence[nodes.Node],
+        bindings: set[int],
+        initialized: set[str] | None = None,
+    ) -> set[int]:
         bindings = bindings.copy()
         for node in body:
             if isinstance(node, nodes.If):
@@ -246,6 +253,12 @@ def _without_inline_reasoning_parser(template: str) -> str:
                     else:
                         shared.update(bindings)  # No unique consumed assignment.
                     bindings.clear()
+                    if initialized is not None:
+                        initialized.update(
+                            n.name
+                            for n in node.find_all(nodes.Name)
+                            if n.ctx == "store"
+                        )
                     continue
                 joined = set()
                 # If does not introduce a Jinja scope. Retain every binding
@@ -255,15 +268,28 @@ def _without_inline_reasoning_parser(template: str) -> str:
                     if condition is None:
                         shared.update(bindings)
                     if condition is not False:
-                        joined.update(visit(branch.body, bindings))
+                        joined.update(visit(branch.body, bindings, initialized))
                     if condition is True:
                         break
                 else:
-                    joined.update(visit(node.else_, bindings))
+                    joined.update(visit(node.else_, bindings, initialized))
                 bindings = joined
             else:
-                if reads_content(node):
+                if reads_content(node, initialized):
                     shared.update(bindings)
+                if initialized is not None:
+                    initialized.update(
+                        n.name for n in node.find_all(nodes.Name) if n.ctx == "store"
+                    )
+                    if isinstance(node, nodes.Macro):
+                        initialized.add(node.name)
+                    elif isinstance(node, nodes.Import):
+                        initialized.add(node.target)
+                    elif isinstance(node, nodes.FromImport):
+                        initialized.update(
+                            name if isinstance(name, str) else name[1]
+                            for name in node.names
+                        )
                 if isinstance(node, nodes.Assign):
                     if writes_content(node):
                         bindings = {id(node)}
@@ -273,7 +299,21 @@ def _without_inline_reasoning_parser(template: str) -> str:
                         if isinstance(value, list) and all(
                             isinstance(n, nodes.Node) for n in value
                         ):
-                            visit(value, set())
+                            # Jinja initializes loop locals before each body;
+                            # parameters/targets already have arbitrary values.
+                            local_names = (
+                                {
+                                    n.name
+                                    for n in (
+                                        node.target,
+                                        *node.target.find_all(nodes.Name),
+                                    )
+                                    if isinstance(n, nodes.Name)
+                                }
+                                if isinstance(node, nodes.For) and value is node.body
+                                else None
+                            )
+                            visit(value, set(), local_names)
                     if isinstance(node, nodes.AssignBlock) and writes_content(node):
                         bindings.clear()
         return bindings

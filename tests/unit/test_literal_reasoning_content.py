@@ -51,6 +51,7 @@ _LITERALS = (
         "{% if probe == 1 %}seen{% endif %}",
         "{% for item in probe %}seen{% endfor %}",
         "{{ 42 }}",
+        "{% set probe = none %}",
     ],
 )
 @pytest.mark.parametrize("content", ["  answer  ", "  before<think>x</think>after  "])
@@ -98,6 +99,10 @@ def test_implicit_context_consumers_keep_original_shared_trim(middle, content):
         def __iter__(self):
             self.observe()
             return iter([1])
+
+        def __del__(self):
+            if middle == "{% set probe = none %}":
+                self.observe()
 
     @pass_context
     def peek(context, value):
@@ -152,6 +157,38 @@ def test_role_guard_is_not_proof_after_message_reassignment():
     message = {"role": "assistant", "content": "  answer  "}
     assert env.from_string(fixed).render(message=message) == "[answer]"
     assert trim in fixed
+
+
+@pytest.mark.parametrize("prior_binding", [False, True])
+def test_only_fresh_loop_local_initialization_is_transparent(prior_binding):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    template = (
+        "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+        "{% for message in messages %}"
+        + ("{% set probe = make_probe() %}" if prior_binding else "")
+        + trim
+        + "{% set probe = none %}"
+        + match.group()
+        + "[{{ content }}]{% endfor %}"
+    )
+    destroyed = []
+
+    class Probe:
+        def __del__(self):
+            destroyed.append(True)
+
+    fixed = chat_template_with_preserved_thinking(template)
+    assert isinstance(fixed, str)
+    content = "  before<think>x</think>after  "
+    env = ImmutableSandboxedEnvironment()
+    actual = env.from_string(fixed).render(
+        messages=[{"role": "assistant", "content": content}], make_probe=Probe
+    )
+    assert actual == "[" + (content.strip() if prior_binding else content) + "]"
+    assert bool(destroyed) is prior_binding
+    assert (trim in fixed) is prior_binding
 
 
 @pytest.mark.parametrize("trim_blocks,lstrip_blocks", [(False, False), (True, True)])
