@@ -4868,7 +4868,7 @@ def _tokenization_context(
                 item,
                 {
                     key: child
-                    for key, child in vars(item).items()
+                    for key, child in cast(dict, instance_dictionary(item)).items()
                     if key != "__objclass__"
                 },
             )
@@ -4881,7 +4881,7 @@ def _tokenization_context(
                 scalar = repr(float.__float__(item))
             else:
                 scalar = bytes.__bytes__(item)
-            return kind, scalar, instance_state(item, getattr(item, "__dict__", None))
+            return kind, scalar, instance_state(item, instance_dictionary(item))
         if kind in (list, tuple, set, frozenset):
             result = kind, tuple(snapshot(child) for child in cast(Iterable, item))
         elif type(item) is dict or isinstance(item, Mapping):
@@ -4912,10 +4912,12 @@ def _tokenization_context(
 
     def instance_dictionary(item: object) -> object:
         kind = type(item)
-        for owner in type.__getattribute__(kind, "__mro__"):
-            descriptor = type.__getattribute__(owner, "__dict__").get("__dict__")
+        for owner in type.__dict__["__mro__"].__get__(kind):
+            descriptor = type.__dict__["__dict__"].__get__(owner).get("__dict__")
             if type(descriptor) is GetSetDescriptorType:
                 return descriptor.__get__(item, kind)
+        if type.__dict__["__dictoffset__"].__get__(kind):
+            raise TypeError("Unsupported hidden instance dictionary")
         return None
 
     def instance_state(item: object, dictionary: object) -> object:
@@ -4924,8 +4926,8 @@ def _tokenization_context(
         # invoking an instance's attribute lookup or replacement properties.
         slots = []
         kind = type(item)
-        for owner in type.__getattribute__(kind, "__mro__"):
-            for name, descriptor in type.__getattribute__(owner, "__dict__").items():
+        for owner in type.__dict__["__mro__"].__get__(kind):
+            for name, descriptor in type.__dict__["__dict__"].__get__(owner).items():
                 if type(descriptor) is MemberDescriptorType:
                     try:
                         child = descriptor.__get__(item, kind)
