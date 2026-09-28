@@ -317,10 +317,14 @@ def test_tied_standard_head_weight_uses_the_same_capacity():
 
 
 @pytest.mark.parametrize("rows", [128, 512])
-def test_target_backward_refuses_budget_below_logits_and_both_gradients(rows):
+def test_target_backward_refuses_budget_below_logits_and_both_gradients(
+    monkeypatch, rows
+):
     r = rank()
-    # Isolate the head term from TE's one-time cuBLAS workspace growth.
+    # Isolate the head term from TE's one-time cuBLAS workspace growth, and
+    # the three target-backward buffers from the small-chunk fallback cover.
     r._te_workspace_growth_bytes = lambda: 0
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "1")
     plan = r._plan_flat_forward([request(rows, grad=True)])
     retained, _ = r._checkpoint_memory_floor(r._plan_group_rows(plan))
     gradient = rows * 2048 * 2
