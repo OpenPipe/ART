@@ -36,8 +36,6 @@ from ..preprocessing.pack import (
 from ..preprocessing.tokenize import SFTBatch
 from ..types import TrainConfig
 
-nest_asyncio.apply()
-
 __all__ = [
     "CausalLM",
     "StopTrainingLoop",
@@ -737,6 +735,8 @@ def create_unsloth_train_context(
         async def get_inputs() -> _TrainLoopInput:
             return await inputs_queue.get()
 
+        # Importing training helpers must not patch unrelated event loops.
+        nest_asyncio.apply()
         inputs = asyncio.run(get_inputs())
         if isinstance(inputs, _StopTrainInputs):
             raise StopTrainingLoop()
