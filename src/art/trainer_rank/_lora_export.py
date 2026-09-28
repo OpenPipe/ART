@@ -101,23 +101,7 @@ def _validate_vllm_lora_publish_runtime(
 ) -> tuple[int, torch.device]:
     from art.megatron.weights import lora_publish
 
-    actual_rank, device = lora_publish._rank_and_device()
-    if lora_publish._distributed_ready():
-        actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
-        if actual_rank != rank or actual_world_size != world_size:
-            raise RuntimeError(
-                "LoRA publisher rank/world-size mismatch: "
-                f"runtime=({rank}, {world_size}) "
-                f"distributed=({actual_rank}, {actual_world_size})"
-            )
-    else:
-        if rank != 0 or world_size != 1:
-            raise RuntimeError(
-                "Non-distributed LoRA publish requires rank=0 and world_size=1, "
-                f"got rank={rank} world_size={world_size}"
-            )
-        rank = 0
-    return rank, device
+    return lora_publish._validate_vllm_lora_publish_runtime(rank, world_size)
 
 
 def _prepare_vllm_lora_publish(
