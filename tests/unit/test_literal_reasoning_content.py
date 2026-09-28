@@ -191,6 +191,55 @@ def test_only_fresh_loop_local_initialization_is_transparent(prior_binding):
     assert (trim in fixed) is prior_binding
 
 
+@pytest.mark.parametrize(
+    "branch",
+    [
+        "{% if message.role == 'user' %}BODY{% endif %}",
+        "{% if message.role == 'assistant' %}{% else %}BODY{% endif %}",
+        "{% if message.role == 'system' %}{% elif message.role == 'user' %}BODY{% endif %}",
+    ],
+)
+def test_role_pruning_keeps_prior_store_history(branch):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    seen = []
+
+    class Probe:
+        def __init__(self, reader):
+            self.reader = reader
+
+        def __del__(self):
+            seen.append(self.reader())
+
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    template = (
+        "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+        "{% for message in messages %}"
+        "{% macro read_content() %}{{ content }}{% endmacro %}"
+        + branch.replace(
+            "BODY",
+            "{% set probe = make_probe(read_content) %}"
+            "{% set message = {'role': 'assistant', 'content': message.content} %}",
+        )
+        + trim
+        + "{% set probe = none %}"
+        + match.group()
+        + "{% endfor %}{{ seen|join('|') }}"
+    )
+    env = ImmutableSandboxedEnvironment()
+    kwargs = dict(
+        messages=[{"role": "user", "content": "  answer  "}],
+        make_probe=Probe,
+        seen=seen,
+    )
+    assert env.from_string(template).render(**kwargs) == "answer"
+    seen.clear()
+    fixed = _without_inline_reasoning_parser(template)
+    assert env.from_string(fixed).render(**kwargs) == "answer"
+    assert seen == ["answer"]
+    assert trim in fixed
+
+
 @pytest.mark.parametrize("trim_blocks,lstrip_blocks", [(False, False), (True, True)])
 @pytest.mark.parametrize(
     "left,right", [("", ""), ("-", ""), ("", "-"), ("-", "-"), ("+", "+")]
