@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 import torch
-from trainer_rank_test_support import fake_rank
+from trainer_rank_test_support import fake_rank, full_recompute_config
 
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import Unset, _ForwardRefusal, _MemoryProfile
@@ -17,22 +17,7 @@ def rank():
 
     block = TransformerBlock.__new__(TransformerBlock)
     torch.nn.Module.__init__(block)
-    block.config = SimpleNamespace(
-        hidden_size=2048,
-        num_layers=40,
-        padded_vocab_size=32,
-        params_dtype=torch.bfloat16,
-        recompute_granularity="full",
-        recompute_method="uniform",
-        recompute_num_layers=1,
-        distribute_saved_activations=False,
-        sequence_parallel=False,
-        fp32_residual_connection=False,
-        cpu_offloading=False,
-        cuda_graph_impl="none",
-        fp8=None,
-        fp4=None,
-    )
+    block.config = full_recompute_config(2048, 40, False)
     block.layers = torch.nn.ModuleList(
         [torch.nn.Linear(1, 1).bfloat16() for _ in range(40)]
     )

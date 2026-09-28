@@ -7,12 +7,11 @@ other shapes keep today's pricing.
 """
 
 from dataclasses import replace
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
-from trainer_rank_test_support import fake_rank
+from trainer_rank_test_support import fake_rank, full_recompute_config
 
 from art.trainer_rank import TrainerRank
 from art.trainer_rank._impl import _MemorySignature
@@ -31,23 +30,7 @@ def tp_rank(layers=LAYERS, *, ffn=F, topology=TP4, sequence_parallel=True, **con
 
     block = TransformerBlock.__new__(TransformerBlock)
     torch.nn.Module.__init__(block)
-    block.config = SimpleNamespace(
-        hidden_size=H,
-        num_layers=layers,
-        padded_vocab_size=32,
-        params_dtype=torch.bfloat16,
-        recompute_granularity="full",
-        recompute_method="uniform",
-        recompute_num_layers=1,
-        distribute_saved_activations=False,
-        sequence_parallel=sequence_parallel,
-        fp32_residual_connection=False,
-        cpu_offloading=False,
-        cuda_graph_impl="none",
-        fp8=None,
-        fp4=None,
-        **config,
-    )
+    block.config = full_recompute_config(H, layers, sequence_parallel, **config)
     block.layers = torch.nn.ModuleList(
         [torch.nn.Linear(1, 1).bfloat16() for _ in range(layers)]
     )

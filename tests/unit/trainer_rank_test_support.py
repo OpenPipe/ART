@@ -39,6 +39,26 @@ def fake_rank(rank_type: type["TrainerRank"], model, **provider) -> "TrainerRank
     return rank_type(runtime)
 
 
+def full_recompute_config(hidden_size, num_layers, sequence_parallel, /, **config):
+    return SimpleNamespace(
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        padded_vocab_size=32,
+        params_dtype=torch.bfloat16,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        distribute_saved_activations=False,
+        sequence_parallel=sequence_parallel,
+        fp32_residual_connection=False,
+        cpu_offloading=False,
+        cuda_graph_impl="none",
+        fp8=None,
+        fp4=None,
+        **config,
+    )
+
+
 def checkpoint_runtime(
     model: torch.nn.Module | None = None,
     *,
