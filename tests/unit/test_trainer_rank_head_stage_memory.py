@@ -239,9 +239,16 @@ def test_traced_head_backward_is_target_only_on_the_traced_path(monkeypatch):
     from test_trainer_rank_head_memory import rank as head_rank
     from test_trainer_rank_head_memory import request
 
+    from art.trainer_rank import _impl
+
     r = head_rank()
     monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
     target = request(512, grad=True)
+    # Until the fused statistics have run in this process, nothing is traced.
+    state = {"succeeded": False, "failed": False}
+    monkeypatch.setattr(_impl, "_TRITON_STATS_STATE", state)
+    assert r._head_backward_traced([target], 512) is False
+    state["succeeded"] = True
     assert r._head_backward_traced([target], 512) is True
     # Top-k, logits and hidden-state outputs keep further dense gradients.
     for extra in ({"top_k": 2}, {"logits": True}, {"hidden_states": True}):
@@ -260,6 +267,10 @@ def test_traced_head_backward_is_target_only_on_the_traced_path(monkeypatch):
     monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 1, 1))
     assert r._head_backward_traced([target], 512) is False
     monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    # One error sent a kernel to the FP32 fallback silently: never again.
+    state["failed"] = True
+    assert r._head_backward_traced([target], 512) is False
+    state["failed"] = False
     r.runtime.model[0].config.use_mup = True
     assert r._head_backward_traced([target], 512) is False
 
@@ -290,6 +301,11 @@ def test_plan_stages_only_traced_gradient_heads(monkeypatch):
     from test_trainer_rank_head_memory import rank as head_rank
     from test_trainer_rank_head_memory import request
 
+    from art.trainer_rank import _impl
+
+    monkeypatch.setattr(
+        _impl, "_TRITON_STATS_STATE", {"succeeded": True, "failed": False}
+    )
     r = head_rank()
     target = request(512, grad=True)
     topk_only = replace(target, target_tokens=None, top_k=2)
@@ -300,3 +316,24 @@ def test_plan_stages_only_traced_gradient_heads(monkeypatch):
     assert [r._plan_head_backward_traced(plan) for plan in plans] == [True, False]
     no_grad = r._plan_flat_forward([request(512)])
     assert r._plan_head_backward_traced(no_grad) is False
+
+
+def test_head_stage_covers_a_small_chunks_fp32_fallback(monkeypatch):
+    from test_trainer_rank_head_memory import rank as head_rank
+
+    r = head_rank()
+    monkeypatch.setattr(r, "_moe_recompute_covered_for", lambda ref: True)
+    monkeypatch.setattr(r, "_checkpoint_gradient_covered", lambda *a, **k: True)
+    r._te_workspace_growth_bytes = lambda: 0
+    groups = ((8, True),)
+    dense = 248320 * 2
+    state = 8 * r._backward_row_state_bytes()
+    # However the CP split leaves a rank's projected rows, a chunk below the
+    # fused minimum takes the FP32 fallback: nine buffers of up to 63 rows.
+    stage = r._checkpoint_head_stage_bytes(3 * 8 * dense, 0, groups, None)
+    assert stage == 9 * 63 * dense + state
+    stage = r._checkpoint_head_stage_bytes(3 * 512 * dense, 0, groups, None)
+    assert stage == 3 * 512 * dense + state
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "512")
+    stage = r._checkpoint_head_stage_bytes(3 * 512 * dense, 0, groups, None)
+    assert stage == 9 * 511 * dense + state
