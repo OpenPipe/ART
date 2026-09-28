@@ -5,6 +5,7 @@ Qwen3.6-35B-A3B CP2 allocator traces: a short first wave peaks at layer 0 with
 """
 
 from collections.abc import Sequence
+import itertools
 import random
 
 import pytest
@@ -61,7 +62,7 @@ def test_extra_is_the_worst_backward_layer_over_real_sizes(
 ):
     r = rank()
     with_pending(monkeypatch, r, pending)
-    assert r._checkpoint_adapter_gradient_bytes((POLICY,), boundaries) == oracle(
+    assert r._checkpoint_adapter_gradient_bytes(((POLICY, boundaries),)) == oracle(
         pending, boundaries
     )
 
@@ -76,14 +77,103 @@ def test_extra_matches_every_layer_for_random_sizes(monkeypatch):
         ]
         boundaries = [generator.randint(0, 40) for _ in range(layers)]
         with_pending(monkeypatch, r, pending)
-        extra = r._checkpoint_adapter_gradient_bytes((POLICY,), boundaries)
+        extra = r._checkpoint_adapter_gradient_bytes(((POLICY, boundaries),))
         assert extra == oracle(pending, boundaries)
 
 
 def test_no_pending_gradients_add_nothing(monkeypatch):
     r = rank()
     with_pending(monkeypatch, r, ())
-    assert r._checkpoint_adapter_gradient_bytes((POLICY,), [4] * 40) == 0
+    assert r._checkpoint_adapter_gradient_bytes(((POLICY, [4] * 40),)) == 0
+
+
+def sequential_oracle(chains):
+    """Worst live bytes beyond the floor, one group's backward after another.
+
+    While a group recomputes layer i, groups run before it hold all their
+    gradients and none of their boundaries; groups yet to run hold all their
+    boundaries; the running group releases its boundaries above i.
+    """
+    worst = 0
+    for order in itertools.permutations(chains):
+        for position, (pending, boundaries) in enumerate(order):
+            done = order[:position]
+            layers = len(boundaries)
+            for index in range(layers):
+                gradients = (
+                    sum(sum(p) for p, _ in done)
+                    + pending[layers]
+                    + sum(pending[index:layers])
+                )
+                released = sum(sum(b) for _, b in done) + sum(boundaries[index + 1 :])
+                worst = max(worst, gradients - released)
+    return worst
+
+
+def with_slot_pending(monkeypatch, r, by_slot):
+    monkeypatch.setattr(
+        r,
+        "_pending_adapter_gradient_bytes",
+        lambda refs: by_slot.get(tuple(refs), ()),
+    )
+
+
+def test_gradient_groups_run_their_backward_one_after_another(monkeypatch):
+    r = rank()
+    # A short policy group beside a long group of another slot: whichever
+    # runs first, the other keeps its boundaries (or its gradients) meanwhile.
+    policy = ([30] * 4 + [0], [2] * 4)
+    other = ([5] * 4 + [1], [40] * 4)
+    with_slot_pending(monkeypatch, r, {(POLICY,): policy[0], (OTHER,): other[0]})
+    extra = r._checkpoint_adapter_gradient_bytes(
+        ((POLICY, policy[1]), (OTHER, other[1]))
+    )
+    assert extra == sequential_oracle([policy, other])
+    # One chain with every group's boundaries released together would have
+    # priced far less.
+    combined = [a + b for a, b in zip(policy[0], other[0])]
+    assert extra > oracle(combined, [a + b for a, b in zip(policy[1], other[1])])
+    # A base-model group owns no gradients, but its boundaries stay live
+    # while the policy group runs first.
+    base = ([0] * 5, [40] * 4)
+    assert (
+        r._checkpoint_adapter_gradient_bytes(((POLICY, policy[1]), (None, base[1])))
+        == sequential_oracle([policy, base])
+        == oracle(*policy)
+    )
+
+
+def test_sequential_groups_match_every_order_for_random_sizes(monkeypatch):
+    r = rank()
+    generator = random.Random(1)
+    slots = [POLICY, OTHER, LoRASlotRef("checkpoint", "third")]
+    for _ in range(200):
+        layers = generator.randint(1, 6)
+        chains, groups, by_slot = [], [], {}
+        for slot in slots[: generator.randint(1, 3)]:
+            pending = [generator.randint(0, 30) for _ in range(layers + 1)]
+            boundaries = [generator.randint(0, 30) for _ in range(layers)]
+            if generator.random() < 0.25:
+                slot, pending = None, [0] * (layers + 1)
+            else:
+                by_slot[(slot,)] = pending
+            chains.append((pending, boundaries))
+            groups.append((slot, boundaries))
+        with_slot_pending(monkeypatch, r, by_slot)
+        assert r._checkpoint_adapter_gradient_bytes(groups) == sequential_oracle(chains)
+
+
+def test_many_gradient_groups_price_every_gradient_live(monkeypatch):
+    r = rank()
+    slots = [LoRASlotRef("checkpoint", f"slot{index}") for index in range(5)]
+    pending = [3, 1, 2]
+    with_slot_pending(monkeypatch, r, {(slot,): pending for slot in slots})
+    groups = [(slot, [100, 100]) for slot in slots]
+    # Too many orders to walk: all five slots' gradients, nothing released.
+    assert r._checkpoint_adapter_gradient_bytes(groups) == 5 * sum(pending)
+    assert r._checkpoint_adapter_gradient_bytes(groups[:4]) == sequential_oracle(
+        [(pending, [100, 100])] * 4
+    )
 
 
 def lora(**slots: list[torch.nn.Parameter]) -> LoRA:
@@ -159,9 +249,10 @@ def test_a_module_the_head_also_uses_is_live_throughout():
 def test_base_model_groups_own_no_adapter_gradients(monkeypatch):
     r = rank()
     values = r._estimate_flat_forward(requests(67, 4096))
-    with_pending(monkeypatch, r, [23 * 2**20] * 40 + [0])
+    pending = [23 * 2**20] * 40 + [0]
+    with_pending(monkeypatch, r, pending)
     n, out, signature, groups, head = values
-    both = r._subforward_cost(
+    values = dict(
         packed_tokens=n,
         output_bytes=out,
         signature=signature,
@@ -170,9 +261,22 @@ def test_base_model_groups_own_no_adapter_gradients(monkeypatch):
         slot_refs=(POLICY, LoRASlotRef("checkpoint", None), None),
         head_workspace_bytes=head,
     )
+    both = r._subforward_cost(**values)
     # The base group's slot has no adapter, so a split with or without it
     # still shares one slot's gradients.
     assert both.checkpoint_adapter_gradient_slots == '[["checkpoint", "policy"]]'
+    # But its boundaries stay live while the policy group's backward runs.
+    boundary = 2048 * 2 * 40
+    expected = sequential_oracle(
+        [(pending, [33 * 2048 * 2] * 40), ([0] * 41, [34 * 2048 * 2] * 40)]
+    )
+    assert (
+        both.checkpoint_adapter_gradient
+        == expected
+        == oracle(pending, [33 * 2048 * 2] * 40)
+    )
+    assert expected > oracle(pending, [(33 + 34) * boundary // 40] * 40)
+    assert r._estimate_required_memory_bytes_from_values(**values) == both.required
 
 
 def test_other_checkpoint_parameters_are_live_throughout():

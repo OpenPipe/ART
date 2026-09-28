@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -4339,8 +4340,31 @@ class TrainerRank:
                 sizes[layer_of[param_id]] += param.numel() * param.element_size()
         return tuple(sizes) if any(sizes) else ()
 
+    def _checkpoint_gradient_groups(
+        self,
+        group_rows: Sequence[tuple[int, bool]],
+        slot_refs: Sequence["LoRASlotRef | None"] | None,
+    ) -> tuple[tuple["LoRASlotRef | None", tuple[int, ...]], ...]:
+        """Each gradient group's adapter slot and per-layer saved boundaries.
+
+        In execution order, as ``_checkpoint_memory_floor`` prices them: every
+        decoder layer saves the group's rows (this rank's TP shard). The base
+        model (no name) has no adapter slot.
+        """
+        tp = self._topology_key()[1]
+        return tuple(
+            (
+                ref if ref is not None and ref.name is not None else None,
+                (-(-rows // tp) * self._hidden_size * 2,) * self._num_layers,
+            )
+            for (rows, grad), ref in zip(
+                group_rows, slot_refs or (None,) * len(group_rows), strict=True
+            )
+            if grad
+        )
+
     def _checkpoint_adapter_gradient_bytes(
-        self, slots: Iterable["LoRASlotRef"], boundaries: Sequence[int]
+        self, groups: Sequence[tuple["LoRASlotRef | None", Sequence[int]]]
     ) -> int:
         """The recompute backward's adapter-gradient peak beyond released boundaries.
 
@@ -4354,19 +4378,39 @@ class TrainerRank:
         boundaries, not along a uniform-layer line. A short
         first wave peaks at layer 0 (Qwen3.6-35B-A3B CP2: 830-900 MB of expert
         LoRA gradients live at its peak), a long one at the last layer.
-        ``boundaries`` gives each decoder layer's saved-boundary bytes;
-        ``slots`` are the gradient groups' adapter slots.
+        ``groups`` gives each gradient group's adapter slot (None for the base
+        model) and each decoder layer's saved-boundary bytes. Groups run their
+        backward one after another, not layer by layer together: autograd
+        drains the last-forwarded group's chain first, and separate backward
+        calls can come in either order. While one group runs, a group yet to
+        run still holds all its boundaries and one already run all its
+        gradients, so take the worst order.
         """
-        pending = self._pending_adapter_gradient_bytes(slots)
-        if not pending or len(pending) != len(boundaries) + 1:
+        chains = []
+        for slot, boundaries in groups:
+            pending = (
+                () if slot is None else self._pending_adapter_gradient_bytes((slot,))
+            )
+            if pending and len(pending) != len(boundaries) + 1:
+                return 0
+            chains.append((pending or (0,) * (len(boundaries) + 1), boundaries))
+        if not any(any(pending) for pending, _ in chains):
             return 0
-        extra = gradients = pending[-1]
-        released = 0
-        for index in range(len(boundaries) - 1, -1, -1):
-            gradients += pending[index]
-            extra = max(extra, gradients - released)
-            released += boundaries[index]
-        return extra
+        if len(chains) > 4:
+            # Too many orders to walk: every gradient live, nothing released.
+            return sum(sum(pending) for pending, _ in chains)
+        worst = 0
+        for order in itertools.permutations(chains):
+            allocated = released = 0
+            for pending, boundaries in order:
+                gradients = allocated + pending[-1]
+                worst = max(worst, gradients - released)
+                for index in range(len(boundaries) - 1, -1, -1):
+                    gradients += pending[index]
+                    worst = max(worst, gradients - released)
+                    released += boundaries[index]
+                allocated = gradients
+        return worst
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
@@ -4433,7 +4477,7 @@ class TrainerRank:
         gradient_slots = self._gradient_slots(group_rows, slot_refs)
         adapter_gradient = (
             self._checkpoint_adapter_gradient_bytes(
-                gradient_slots, (gradient // self._num_layers,) * self._num_layers
+                self._checkpoint_gradient_groups(group_rows, slot_refs)
             )
             if gradient
             else 0
@@ -8274,8 +8318,7 @@ class TrainerRank:
         if include_checkpoint_input_gradient and retained:
             # The backward's other end and cold transients, as _subforward_cost.
             backward = retained + self._checkpoint_adapter_gradient_bytes(
-                self._gradient_slots(group_rows, slot_refs),
-                (retained // self._num_layers,) * self._num_layers,
+                self._checkpoint_gradient_groups(group_rows, slot_refs)
             )
             if profiled is None and any(grad for _, grad in group_rows):
                 backward += _COLD_RECOMPUTE_TRANSIENT_BYTES
