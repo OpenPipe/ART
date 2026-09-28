@@ -340,6 +340,7 @@ def test_sparse_tool_indices_can_be_filled_by_later_deltas():
     assert message["tool_calls"][1] == {}
     merge_chat_delta(message, {"tool_calls": [part(1, "middle")]})
     request = StrictRequest.model_validate({"messages": [message]})
+    assert request.messages[0].tool_calls is not None
     assert [call.id for call in request.messages[0].tool_calls] == [
         "first",
         "middle",
