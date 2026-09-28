@@ -4840,6 +4840,7 @@ def _tokenization_context(
     # Shared message dictionaries occur in many recorded request prefixes.
     # Intern only within this one observation, never across callback checks.
     observed: dict[int, tuple[object, object]] = {} if _observed is None else _observed
+    active: set[int] = set()
 
     def snapshot(item: object) -> object:
         kind = type(item)
@@ -4851,6 +4852,15 @@ def _tokenization_context(
             result = kind, repr(item) if kind is float else item
             observed[identity] = item, result
             return result
+        if identity in active:
+            raise TypeError("Unsupported recursive tokenization context")
+        active.add(identity)
+        try:
+            return snapshot_compound(item, kind, identity)
+        finally:
+            active.remove(identity)
+
+    def snapshot_compound(item: object, kind: type, identity: int) -> object:
         if isinstance(item, Enum):
             if getattr(item, "__objclass__", kind) is not kind:
                 raise TypeError("Unsupported enum tokenization context")
@@ -4927,13 +4937,9 @@ def _tokenization_context(
 
     try:
         return snapshot(value)
-    except RecursionError as error:
-        # Recursive context cannot prove callback stability, but complete native
-        # records can still use the ordinary opaque-context bypass.
-        raise TypeError("Unsupported recursive tokenization context") from error
     finally:
         # Release the recursive closures and their observation memo promptly.
-        del snapshot, instance_state
+        del snapshot, snapshot_compound, instance_state
 
 
 def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
