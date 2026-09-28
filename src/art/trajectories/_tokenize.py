@@ -4872,8 +4872,8 @@ def _tokenization_context(
             else:
                 scalar = bytes.__bytes__(item)
             return kind, scalar, instance_state(item, getattr(item, "__dict__", None))
-        if kind in (list, tuple):
-            result = kind, tuple(snapshot(child) for child in cast(Sequence, item))
+        if kind in (list, tuple, set, frozenset):
+            result = kind, tuple(snapshot(child) for child in cast(Iterable, item))
         elif type(item) is dict or isinstance(item, Mapping):
             result = (
                 kind,
@@ -4882,15 +4882,7 @@ def _tokenization_context(
             if kind is not dict:
                 # A renderer can read mapping attributes as well as its items.
                 # Inspect physical instance storage without invoking overrides.
-                dictionary = None
-                for owner in type.__getattribute__(kind, "__mro__"):
-                    descriptor = type.__getattribute__(owner, "__dict__").get(
-                        "__dict__"
-                    )
-                    if type(descriptor) is GetSetDescriptorType:
-                        dictionary = descriptor.__get__(item, kind)
-                        break
-                result = (*result, instance_state(item, dictionary))
+                result = (*result, instance_state(item, instance_dictionary(item)))
         elif isinstance(item, Exchange):
             result = kind, identity, item.model, snapshot(item.request)
         elif isinstance(item, BaseModel):
@@ -4901,11 +4893,20 @@ def _tokenization_context(
                     for name in type(item).model_fields
                 ),
                 snapshot(item.model_extra),
+                instance_state(item, instance_dictionary(item)),
             )
         else:
             raise TypeError("Unsupported mutable tokenization context")
         observed[identity] = item, result
         return result
+
+    def instance_dictionary(item: object) -> object:
+        kind = type(item)
+        for owner in type.__getattribute__(kind, "__mro__"):
+            descriptor = type.__getattribute__(owner, "__dict__").get("__dict__")
+            if type(descriptor) is GetSetDescriptorType:
+                return descriptor.__get__(item, kind)
+        return None
 
     def instance_state(item: object, dictionary: object) -> object:
         # Rich values may keep mutable state in inherited or shadowed slots.
