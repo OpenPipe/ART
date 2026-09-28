@@ -1385,8 +1385,8 @@ def _fill_planner_snapshot(
         children = (
             plan.subforwards if isinstance(plan, _impl._SplitForwardPlan) else (plan,)
         )
-        # Freeze scalar calibration before forward updates it. Keep owned
-        # request references, not new token copies or autograd outputs.
+        # Freeze calibration before forward updates it. Versioned CPU inputs
+        # remain references; versionless CPU inputs need an owned bounded copy.
         costs = [self._plan_cost(child) for child in children]
         estimates: list[dict[str, Any]] = []
         for child, cost in zip(children, costs, strict=True):
@@ -1454,11 +1454,37 @@ def _fill_planner_snapshot(
             except RuntimeError:
                 return None
 
+        type InputSnapshot = tuple[
+            torch.Tensor | None, int | None, torch.Tensor | None, str | None
+        ]
+        input_limit = 1_000_000
+        snapshot_remaining = input_limit
+
+        def capture(tensor: torch.Tensor | None) -> InputSnapshot:
+            nonlocal snapshot_remaining
+            original_version = version(tensor)
+            frozen = None
+            reason = None
+            if tensor is not None and tensor.device.type != "cpu":
+                reason = "device_input"
+            elif tensor is not None and original_version is None:
+                if tensor.numel() > snapshot_remaining:
+                    reason = "token_inventory_over_limit"
+                else:
+                    try:
+                        # No D2H or autograd retention, even if the caller has
+                        # inference mode enabled. Bind this plan's actual input.
+                        with _impl.torch.inference_mode(False):
+                            frozen = tensor.detach().clone()
+                        snapshot_remaining -= tensor.numel()
+                    except Exception:
+                        reason = "input_snapshot_unavailable"
+            return tensor, original_version, frozen, reason
+
         tensors = [
             (
-                item,
-                version(item.input_ids),
-                version(item.labels),
+                capture(item.input_ids),
+                capture(item.labels),
                 {
                     "top_k": item.request.top_k,
                     "logits": item.request.logits,
@@ -1491,25 +1517,23 @@ def _fill_planner_snapshot(
         }
 
         def replay() -> dict[str, Any]:
-            remaining = 1_000_000
+            remaining = input_limit
             incomplete = {
                 reason for item in estimates for reason in item["missing_inputs"]
             }
 
-            def tensor_data(
-                tensor: torch.Tensor | None, original_version: int | None
-            ) -> Any:
+            def tensor_data(snapshot: InputSnapshot) -> Any:
                 nonlocal remaining
+                tensor, original_version, frozen, reason = snapshot
                 if tensor is None:
                     return None
-                reason = None
-                if (
-                    tensor.device.type != "cpu"
-                    or original_version is None
-                    or version(tensor) != original_version
+                if reason is None and (
+                    not _impl.torch.equal(tensor, frozen)
+                    if frozen is not None
+                    else version(tensor) != original_version
                 ):
-                    reason = "device_or_modified_input"
-                elif tensor.numel() > remaining:
+                    reason = "modified_input"
+                if reason is None and tensor.numel() > remaining:
                     reason = "token_inventory_over_limit"
                 if reason is not None:
                     incomplete.add(reason)
@@ -1517,17 +1541,18 @@ def _fill_planner_snapshot(
                         "unavailable": reason,
                         "shape": list(tensor.shape),
                         "dtype": str(tensor.dtype),
+                        "device": str(tensor.device),
                     }
                 remaining -= tensor.numel()
-                return tensor.tolist()
+                return (frozen if frozen is not None else tensor).tolist()
 
             requests = [
                 {
                     **options,
-                    "input_tokens": tensor_data(item.input_ids, input_version),
-                    "target_tokens": tensor_data(item.labels, label_version),
+                    "input_tokens": tensor_data(input_snapshot),
+                    "target_tokens": tensor_data(label_snapshot),
                 }
-                for item, input_version, label_version, options in tensors
+                for input_snapshot, label_snapshot, options in tensors
             ]
             layouts = []
             cursor = 0

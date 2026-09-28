@@ -889,6 +889,15 @@ wave/participant identities, execution breadcrumbs, reserved summary storage,
 exact delivery ACKs, and aggregate spool budgets remain follow-up work. Current
 spool-full/process-loss limits still apply. The selected-plan replay keeps its
 existing completeness limits; this is not a full GPU failure reproduction claim.
+Selected-plan diagnostics retain versioned CPU inputs by reference and reject
+later mutation. CPU inference tensors have no version counter, so reporting
+owns up to one million input/target elements of CPU clones before execution;
+emission compares them with the same admitted tensor objects and refuses changed
+values. This adds bounded CPU work when reporting is enabled, without device
+readback. Device inputs, changed inputs, exhausted inventory and failed snapshots
+have separate omission reasons and device metadata. Recovering these rows does
+not supply the still-missing grouped estimator's runtime/slot/head/checkpoint/GDN
+facts or make those reports replay-complete.
 Planning-event reports cap size at 256KiB. Oversized replay drops bulk request
 and layout arrays first, retaining whole compact source, rank/device, model and
 estimator fields that fit. Omission names and optional field inspection are
