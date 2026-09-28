@@ -245,10 +245,13 @@ def test_traced_head_backward_is_target_only_on_the_traced_path(monkeypatch):
     monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
     target = request(512, grad=True)
     # Until the fused statistics have run in this process, nothing is traced.
-    state = {"succeeded": False, "failed": False}
+    state = {"succeeded": set(), "failed": False}
     monkeypatch.setattr(_impl, "_TRITON_STATS_STATE", state)
     assert r._head_backward_traced([target], 512) is False
-    state["succeeded"] = True
+    # The top-k kernel's success does not prove the target-only one.
+    state["succeeded"].add("local_topk_stats")
+    assert r._head_backward_traced([target], 512) is False
+    state["succeeded"].add("local_logsumexp_stats")
     assert r._head_backward_traced([target], 512) is True
     # Top-k, logits and hidden-state outputs keep further dense gradients.
     for extra in ({"top_k": 2}, {"logits": True}, {"hidden_states": True}):
@@ -304,7 +307,9 @@ def test_plan_stages_only_traced_gradient_heads(monkeypatch):
     from art.trainer_rank import _impl
 
     monkeypatch.setattr(
-        _impl, "_TRITON_STATS_STATE", {"succeeded": True, "failed": False}
+        _impl,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
     )
     r = head_rank()
     target = request(512, grad=True)
@@ -344,7 +349,7 @@ def test_a_staged_plan_runs_its_fused_statistics_strictly(monkeypatch):
 
     from art.trainer_rank import _impl, topk
 
-    state = {"succeeded": True, "failed": False}
+    state = {"succeeded": {"local_logsumexp_stats"}, "failed": False}
     monkeypatch.setattr(_impl, "_TRITON_STATS_STATE", state)
 
     def fail(*args, **kwargs):
@@ -370,7 +375,9 @@ def test_execution_binds_the_staging_its_latest_price_used(monkeypatch):
     from art.trainer_rank import _impl
 
     monkeypatch.setattr(
-        _impl, "_TRITON_STATS_STATE", {"succeeded": True, "failed": False}
+        _impl,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
     )
     r = head_rank()
     plan = r._plan_flat_forward([request(512, grad=True)])
@@ -398,7 +405,9 @@ def test_several_labels_per_row_are_not_traced(monkeypatch):
     from art.trainer_rank import _impl
 
     monkeypatch.setattr(
-        _impl, "_TRITON_STATS_STATE", {"succeeded": True, "failed": False}
+        _impl,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
     )
     r = head_rank()
     monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
