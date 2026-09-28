@@ -1021,6 +1021,36 @@ class _SampledSourceValidator(Protocol):
     ) -> None: ...
 
 
+class _UnsupportedTokenizationContext(TypeError):
+    """An internal proof refusal, distinct from errors raised by observers."""
+
+
+class _ContextObserver:
+    failed: BaseException | None = None
+
+    def __call__(
+        self,
+        value: object,
+        *,
+        _observed: dict[int, tuple[object, object]] | None = None,
+        _required: bool = False,
+    ) -> object:
+        if self.failed is not None:
+            raise self.failed
+        try:
+            return _tokenization_context(value, _observed=_observed)
+        except _UnsupportedTokenizationContext as error:
+            if not _required:
+                raise
+            self.failed = ValueError(
+                "Tokenization context cannot be checked after admission"
+            )
+            raise self.failed from error
+        except BaseException as error:
+            self.failed = error
+            raise
+
+
 class _PlainRenderPickler(Pickler):
     def reducer_override(self, value: object) -> Any:
         # Exact builtins use the C traversal. Never call custom reducers.
@@ -1063,7 +1093,14 @@ class _RenderContextGuard:
                 if expected[0] == "plain"
                 else _tokenization_context(value) == expected[1]
             )
-        except (TypeError, ValueError, RecursionError, PicklingError):
+        except _UnsupportedTokenizationContext:
+            unchanged = False
+        except BaseException as error:
+            if expected[0] != "plain" or not isinstance(
+                error, (TypeError, ValueError, RecursionError, PicklingError)
+            ):
+                self.failed = error
+                raise
             unchanged = False
         if not unchanged:
             self.failed = ValueError(
@@ -1091,7 +1128,13 @@ class _RenderContextGuard:
     def call(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         self.check()
         arguments = [list(args), kwargs]
-        expected = self.snapshot(arguments)
+        try:
+            expected = self.snapshot(arguments)
+        except _UnsupportedTokenizationContext:
+            raise
+        except BaseException as error:
+            self.failed = error
+            raise
         try:
             result = function(*args, **kwargs)
         except BaseException as error:
@@ -4853,7 +4896,9 @@ def _tokenization_context(
             observed[identity] = item, result
             return result
         if identity in active:
-            raise TypeError("Unsupported recursive tokenization context")
+            raise _UnsupportedTokenizationContext(
+                "Unsupported recursive tokenization context"
+            )
         active.add(identity)
         try:
             return snapshot_compound(item, kind, identity)
@@ -4863,7 +4908,9 @@ def _tokenization_context(
     def snapshot_compound(item: object, kind: type, identity: int) -> object:
         if isinstance(item, Enum):
             if getattr(item, "__objclass__", kind) is not kind:
-                raise TypeError("Unsupported enum tokenization context")
+                raise _UnsupportedTokenizationContext(
+                    "Unsupported enum tokenization context"
+                )
             return kind, instance_state(
                 item,
                 {
@@ -4893,6 +4940,15 @@ def _tokenization_context(
                 # A renderer can read mapping attributes as well as its items.
                 # Inspect physical instance storage without invoking overrides.
                 result = (*result, instance_state(item, instance_dictionary(item)))
+                if isinstance(item, dict):
+                    # Semantic items may hide payload still visible to native lookup.
+                    result = (
+                        *result,
+                        tuple(
+                            (snapshot(key), snapshot(child))
+                            for key, child in dict.items(item)
+                        ),
+                    )
         elif isinstance(item, Exchange):
             result = kind, identity, item.model, snapshot(item.request)
         elif isinstance(item, BaseModel):
@@ -4906,7 +4962,9 @@ def _tokenization_context(
                 instance_state(item, instance_dictionary(item)),
             )
         else:
-            raise TypeError("Unsupported mutable tokenization context")
+            raise _UnsupportedTokenizationContext(
+                "Unsupported mutable tokenization context"
+            )
         observed[identity] = item, result
         return result
 
@@ -4915,9 +4973,16 @@ def _tokenization_context(
         for owner in type.__dict__["__mro__"].__get__(kind):
             descriptor = type.__dict__["__dict__"].__get__(owner).get("__dict__")
             if type(descriptor) is GetSetDescriptorType:
-                return descriptor.__get__(item, kind)
+                dictionary = descriptor.__get__(item, kind)
+                if type(dictionary) is not dict:
+                    raise _UnsupportedTokenizationContext(
+                        "Unsupported physical instance dictionary"
+                    )
+                return dictionary
         if type.__dict__["__dictoffset__"].__get__(kind):
-            raise TypeError("Unsupported hidden instance dictionary")
+            raise _UnsupportedTokenizationContext(
+                "Unsupported hidden instance dictionary"
+            )
         return None
 
     def instance_state(item: object, dictionary: object) -> object:
@@ -4945,9 +5010,10 @@ def _tokenization_context(
 
 
 def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
+    observe = _ContextObserver()
     try:
-        expected = _tokenization_context(value)
-    except TypeError:
+        expected = observe(value)
+    except _UnsupportedTokenizationContext:
         # An opaque, complete native history still works without a tokenizer.
         # A callback-bearing path cannot claim an uncheckable context proof.
         expected = None
@@ -4957,7 +5023,7 @@ def _tokenization_context_validator(value: object) -> Callable[[bool], None]:
             return
         if expected is None:
             raise ValueError("Tokenization context cannot be checked for callbacks")
-        if _tokenization_context(value) != expected:
+        if observe(value, _required=True) != expected:
             raise ValueError(
                 "Tokenization context changed during tokenization callback"
             )
@@ -4987,6 +5053,7 @@ def _sampled_source_validator(
     rendered_evidence: bool = False,
     _fingerprints: _RevalidatedFingerprints | None = None,
 ) -> _SampledSourceValidator:
+    observe = _ContextObserver()
     expected = {}
     observed: dict[int, tuple[object, object]] = {}
     items: Iterable[tuple[_SampledSourceKey, object]] = (
@@ -4999,8 +5066,8 @@ def _sampled_source_validator(
         if exchange is None:
             raise ValueError("Sampled source has no exchange")
         try:
-            request = _tokenization_context(exchange.request, _observed=observed)
-        except TypeError:
+            request = observe(exchange.request, _observed=observed)
+        except _UnsupportedTokenizationContext:
             request = None
         try:
             plain_request = (
@@ -5018,7 +5085,7 @@ def _sampled_source_validator(
                 _source_stop_evidence(source, key),
                 request,
                 plain_request,
-                _tokenization_context(
+                observe(
                     {
                         name: exchange.request.get(name)
                         for name in selected_request_fields
@@ -5026,7 +5093,7 @@ def _sampled_source_validator(
                 )
                 if selected_request_fields is not None
                 else None,
-                _tokenization_context(_rendered_response_evidence(source))
+                observe(_rendered_response_evidence(source))
                 if rendered_evidence and isinstance(exchange, ResponsesExchange)
                 else None,
             )
@@ -5071,7 +5138,7 @@ def _sampled_source_validator(
                     )
                 if (
                     visible is not None
-                    and _tokenization_context(_rendered_response_evidence(source))
+                    and observe(_rendered_response_evidence(source), _required=True)
                     != visible
                 ):
                     raise ValueError(
@@ -5102,7 +5169,7 @@ def _sampled_source_validator(
                     }
                     request = selected_request
                 if (
-                    _tokenization_context(current_request, _observed=observed)
+                    observe(current_request, _observed=observed, _required=True)
                     != request
                 ):
                     raise ValueError(
