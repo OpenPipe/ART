@@ -4456,6 +4456,8 @@ def _certify_copied_context(
     copied: Sequence[object],
     prior: Sequence[tuple[TokenizedHistory, _HistoryTokenizationTrace]],
     rendered_outputs: Sequence[tuple[int, int, object]] = (),
+    *,
+    required_sources: Sequence[object] = (),
 ) -> None:
     """A rendered copy may keep output provenance, never its old prediction LP."""
     copied_keys = {_sampled_source_key(source) for source in copied}
@@ -4480,8 +4482,13 @@ def _certify_copied_context(
     for index, key in enumerate(trace.source_keys):
         if key is not None:
             positions.setdefault(key, []).append(index)
+    sources = dict(trace.sources)
+    for source in required_sources:
+        key = _sampled_source_key(source)
+        sources[key] = source
+        positions.setdefault(key, [])
     for key, offsets in positions.items():
-        source = trace.sources[key]
+        source = sources[key]
         prompt, output, logprobs = _source_native_record(source)
         if prompt is None or output is None:
             continue
@@ -5371,6 +5378,7 @@ class _ChatViewTokenizer:
             certify_fallback = False
             fallback_evidence = None
             fallback_sources = None
+            sampled_sources = []
             if (
                 self.recorded_boundaries
                 and self.chat_template is None
@@ -5398,6 +5406,17 @@ class _ChatViewTokenizer:
                 fallback_sources = _recorded_source_evidence(
                     self.history.message_sources
                 )
+                sampled_sources = [
+                    source
+                    for message, source in zip(
+                        self.history.messages,
+                        self.history.message_sources,
+                        strict=True,
+                    )
+                    if message.get("role") == "assistant"
+                    and source is not None
+                    and _source_is_sampled(source)
+                ]
                 try:
                     # Rendering may rebind its owned reasoning/refusal aliases;
                     # the original history and requests must remain unchanged.
@@ -5452,25 +5471,9 @@ class _ChatViewTokenizer:
                         _partial_native_context(self.history),
                         self.prior,
                         self.trace.rendered_outputs,
+                        required_sources=sampled_sources,
                     )
-                    final_source = next(
-                        (
-                            source
-                            for message, source in reversed(
-                                list(
-                                    zip(
-                                        self.messages,
-                                        self.history.message_sources,
-                                        strict=True,
-                                    )
-                                )
-                            )
-                            if message.get("role") == "assistant"
-                            and source is not None
-                            and _source_is_sampled(source)
-                        ),
-                        None,
-                    )
+                    final_source = sampled_sources[-1] if sampled_sources else None
                     prompt, output, _ = _source_native_record(final_source)
                     if prompt is not None and output is not None:
                         end = len(prompt) + len(output)
