@@ -4643,6 +4643,9 @@ class TrainerRank:
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
     ) -> _SubforwardCost:
+        checkpoint_memory = self._checkpoint_memory_floor(
+            group_rows, slot_refs, gdn_segments
+        )
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
@@ -4655,10 +4658,9 @@ class TrainerRank:
             checkpoint_floor=checkpoint_floor,
             retained_tokens=retained_tokens,
             include_checkpoint_input_gradient=False,
+            checkpoint_memory=checkpoint_memory,
         )
-        checkpoint_retained, checkpoint_workspace = self._checkpoint_memory_floor(
-            group_rows, slot_refs, gdn_segments
-        )
+        checkpoint_retained, checkpoint_workspace = checkpoint_memory
         retained = self._retained_memory_bytes(
             signature,
             packed_tokens=packed_tokens,
@@ -9094,6 +9096,7 @@ class TrainerRank:
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         include_checkpoint_input_gradient: bool = True,
+        checkpoint_memory: tuple[int, int] | None = None,
     ) -> int:
         if packed_tokens <= 0:
             return output_bytes
@@ -9199,8 +9202,10 @@ class TrainerRank:
                 for ref in (slot_refs or (None,))
             ),
         )
-        retained, workspace = self._checkpoint_memory_floor(
-            group_rows, slot_refs, gdn_segments
+        retained, workspace = (
+            self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments)
+            if checkpoint_memory is None
+            else checkpoint_memory
         )
         static_compute = max(
             static_compute,
