@@ -346,6 +346,10 @@ async def train(
     trainer: "GRPOTrainer",
     results_queue: asyncio.Queue[dict[str, float]],
 ) -> None:
+    nest_asyncio.apply()
+    # Let any active, unpatched loop iteration finish before entering a nested
+    # queue read: it still owns a fixed count of ready callbacks.
+    await asyncio.sleep(0)
     _compute_loss = trainer.compute_loss
     _log = trainer.log
     trainer.compute_loss = get_compute_loss_fn(trainer)
@@ -735,8 +739,6 @@ def create_unsloth_train_context(
         async def get_inputs() -> _TrainLoopInput:
             return await inputs_queue.get()
 
-        # Importing training helpers must not patch unrelated event loops.
-        nest_asyncio.apply()
         inputs = asyncio.run(get_inputs())
         if isinstance(inputs, _StopTrainInputs):
             raise StopTrainingLoop()
