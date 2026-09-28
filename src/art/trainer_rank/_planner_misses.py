@@ -4,11 +4,11 @@ The sink must enqueue paths, not upload on the training thread. Reports survive
 sink failure and are JSON only; CPU replay never loads a checkpoint or executes
 training. In particular an OOM's partial peak is not a completed measurement.
 
-Grouped-plan reports retain observed cost components and plan provenance, but
-estimator replay is incomplete until immutable model/slot eligibility and
-head/checkpoint/GDN inputs can be reconstructed. Scalar ungrouped estimates use
-the maintained arithmetic and a frozen MoE stage inventory; recorded totals are
-comparison targets, never replacements for missing estimator inputs.
+Grouped plans can freeze bounded primitive model/slot eligibility and
+head/checkpoint/GDN inputs at selection. CPU replay recomputes their shared
+arithmetic and verifies request/layout provenance. Unsupported or historical
+reports without those facts remain incomplete. Recorded costs are comparison
+targets, never replacements for missing estimator inputs.
 """
 
 from __future__ import annotations
@@ -52,6 +52,7 @@ _SOURCE_NAMES = (
     "_prefix_tree_performance_search.py",
     "_planner_misses.py",
     "_gdn_memory.py",
+    "_planner_replay.py",
     "_planner_evidence.py",
     "_planner_retention.py",
 )
@@ -572,7 +573,7 @@ def replay(
             "report has incomplete replay inputs: "
             + "; ".join(report.get("incomplete_reasons", []))
         )
-    from . import _impl
+    from . import _impl, _planner_replay
     from ._planner_cost import ModelGeometry
     from ._prefix_tree_planner import (
         build_canonical_prefix_tree,
@@ -593,7 +594,7 @@ def replay(
         raise ValueError(
             "incomplete replay: immutable rank fields differ (including MoE stages)"
         )
-    rank = _impl.TrainerRank.__new__(_impl.TrainerRank)
+    rank = _planner_replay.ReplayRank.__new__(_planner_replay.ReplayRank)
     for name in _RANK_FIELDS - {"one_layer_recompute"}:
         setattr(rank, "_" + name, values[name])
     if type(values["one_layer_recompute"]) is not bool:
@@ -603,17 +604,36 @@ def replay(
     rank._geometry = ModelGeometry(**values["geometry"])
     dp, tp, cp, pp = values["topology"]
     rank._topology_key = lambda: (dp, tp, cp, pp)
+    selected_layouts = [
+        plan_prefix_tree_layout(
+            build_canonical_prefix_tree(item["input_tokens"]),
+            frozenset(item["selected_decisions"]),
+        )
+        for item in payload.get("layouts", [])
+    ]
     estimates = []
     costs = []
-    for item in state["estimates"]:
+    group_cursor = 0
+    request_cursor = 0
+    for estimate_index, item in enumerate(state["estimates"]):
         if "cost_components" not in item:
             raise ValueError("incomplete replay: expected cost components unavailable")
         arguments = item["arguments"]
-        # Only the scalar, ungrouped estimator is currently reconstructible.
-        # Even an observed zero floor cannot prove runtime eligibility declined.
+        grouped = arguments.get("group_rows") not in ([], ())
         if (
             item.get("missing_inputs")
-            or arguments.get("group_rows") not in ([], ())
+            or (grouped and item.get("runtime_facts") is None)
+            or (
+                grouped
+                and any(
+                    name in arguments
+                    for name in (
+                        "slot_refs",
+                        "head_workspace_bytes",
+                        "checkpoint_floor",
+                    )
+                )
+            )
             or arguments.get("slot_refs")
             or arguments.get("head_workspace_bytes", 0)
             or any(arguments.get("checkpoint_floor", (0, 0)))
@@ -621,6 +641,33 @@ def replay(
             raise ValueError(
                 "incomplete replay: immutable runtime estimator facts unavailable"
             )
+        rank._facts = None
+        if grouped:
+            arguments = rank.runtime_arguments(item["runtime_facts"], arguments)
+            groups = item["runtime_facts"]["groups"]
+            if len(groups) != payload["subforward_group_counts"][estimate_index]:
+                raise ValueError("runtime facts disagree with selected subforward")
+            for group in groups:
+                if (
+                    group["slot"] != payload["checkpoint_slots"][group_cursor]
+                    or group["request_indices"]
+                    != payload["group_request_indices"][group_cursor]
+                    or group["layout_fingerprint"]
+                    != payload["layouts"][group_cursor]["expected_fingerprint"]
+                    or group["packed_rows"]
+                    != payload["layouts"][group_cursor]["expected_packed_tokens"]
+                ):
+                    raise ValueError(
+                        "runtime facts disagree with selected group/layout"
+                    )
+                count = len(group["request_indices"])
+                rank.verify_group(
+                    group,
+                    selected_layouts[group_cursor],
+                    payload["requests"][request_cursor : request_cursor + count],
+                )
+                request_cursor += count
+                group_cursor += 1
         key = _impl._MemorySignature(**_signature_values(item["signature"]))
         rank._memory_profiles = (
             {key: _impl._MemoryProfile(**item["profile"])}
@@ -638,6 +685,16 @@ def replay(
                 and asdict(cost) == item["cost_components"],
             }
         )
+    if group_cursor and (
+        len(payload["subforward_group_counts"]) != len(state["estimates"])
+        or sum(payload["subforward_group_counts"]) != group_cursor
+        or any(
+            len(payload[name]) != group_cursor
+            for name in ("checkpoint_slots", "group_request_indices", "layouts")
+        )
+        or request_cursor != len(payload["requests"])
+    ):
+        raise ValueError("unused grouped replay metadata")
     safety = _impl._MEMORY_SAFETY_FACTOR
     required = max(
         rank._split_required_memory(costs),
@@ -655,9 +712,7 @@ def replay(
         and report["admission_peak_bytes"] == payload["reduced_admission_peak_bytes"],
     }
     layouts = []
-    for item in payload.get("layouts", []):
-        tree = build_canonical_prefix_tree(item["input_tokens"])
-        layout = plan_prefix_tree_layout(tree, frozenset(item["selected_decisions"]))
+    for item, layout in zip(payload.get("layouts", []), selected_layouts, strict=True):
         layouts.append(
             {
                 "fingerprint": layout.fingerprint,

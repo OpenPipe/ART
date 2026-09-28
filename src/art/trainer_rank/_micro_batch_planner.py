@@ -1390,8 +1390,18 @@ def _fill_planner_snapshot(
         # Freeze calibration before forward updates it. Versioned CPU inputs
         # remain references; versionless CPU inputs need an owned bounded copy.
         costs = [self._plan_cost(child) for child in children]
+        from . import _planner_replay
+
         estimates: list[dict[str, Any]] = []
         for child, cost in zip(children, costs, strict=True):
+            facts, missing = None, []
+            if child.groups:
+                try:
+                    facts = _planner_replay.capture(self, child)
+                except (AttributeError, TypeError, ValueError, RuntimeError) as error:
+                    missing = [
+                        f"runtime_facts_unavailable:{_planner_replay.refusal_reason(error)}"
+                    ]
             estimates.append(
                 {
                     "signature": asdict(child.signature),
@@ -1412,13 +1422,8 @@ def _fill_planner_snapshot(
                     "expected_required_bytes": cost.required,
                     "retained_bytes": cost.retained,
                     "cost_components": asdict(cost),
-                    # Observed costs do not reconstruct model/slot eligibility
-                    # or the head/GDN/checkpoint inputs used to derive them.
-                    "missing_inputs": [
-                        "immutable runtime group/slot, head, checkpoint and GDN facts"
-                    ]
-                    if child.groups
-                    else [],
+                    "runtime_facts": facts,
+                    "missing_inputs": missing,
                 }
             )
         floor = 0
