@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import nullcontext
 import gc
+import traceback
 from typing import Literal
+import weakref
 
 import pytest
 from test_trainer_rank_custom_tensors import _trainer
@@ -43,7 +46,7 @@ def ambient_hooks(request):
         yield saved if request.param == "detach" else None
 
 
-def _forward(monkeypatch, retention, output_device, *, grad_enabled=True):
+def _prepare_forward(monkeypatch, retention, output_device, *, grad_enabled=True):
     trainer, _ = _trainer("student")
     ref = trainer._slot_ref("student")
     weight = torch.nn.Parameter(torch.tensor(2.0))
@@ -77,8 +80,69 @@ def _forward(monkeypatch, retention, output_device, *, grad_enabled=True):
             )
         ],
     )
+    return trainer, ref, weight, group
+
+
+def _forward(monkeypatch, retention, output_device, *, grad_enabled=True):
+    trainer, ref, weight, group = _prepare_forward(
+        monkeypatch, retention, output_device, grad_enabled=grad_enabled
+    )
     output = trainer._execute_graph_group(group)[0]
     return trainer, ref, weight, output
+
+
+@pytest.mark.parametrize("failure_type", [MemoryError, asyncio.CancelledError])
+def test_failed_correction_capture_releases_unattached_graph(monkeypatch, failure_type):
+    trainer, ref, weight, group = _prepare_forward(monkeypatch, "cpu", "cpu")
+    monkeypatch.setattr(
+        trainer,
+        "_forward_packed",
+        lambda items, prepared: [ForwardOutput(weight.square(), None, None, None)],
+    )
+    cache = trainer._forward_graph_cache()
+    primary = failure_type("correction CPU snapshot failed")
+    primary.__cause__ = cause = RuntimeError("original cause")
+    saved, outputs, versions = [], [], []
+    to = torch.Tensor.to
+
+    def fail_snapshot(value, *args, **kwargs):
+        if args == ("cpu",) and kwargs.get("copy") and cache.handles():
+            (handle,) = cache.handles()
+            record = cache._records[handle]
+            saved.extend(record.saved or ())
+            outputs.extend(weakref.ref(output) for output in record.outputs or ())
+            versions.extend(
+                weakref.ref(v) for v in trainer._version_state().lora.values()
+            )
+            assert saved and outputs and len(versions) == 1
+            assert record.checkpoint_versions == (
+                trainer._capture_checkpoint_version("student"),
+            )
+            raise primary
+        return to(value, *args, **kwargs)
+
+    with monkeypatch.context() as allocation:
+        allocation.setattr(torch.Tensor, "to", fail_snapshot)
+        with pytest.raises(failure_type) as caught:
+            trainer._execute_graph_group(group)
+    assert caught.value is primary and primary.__cause__ is cause
+    assert not cache.handles()
+    assert all(reference() is None for reference in (*saved, *outputs))
+    assert not trainer._has_live_slot_graph(ref)
+    # The original traceback owns function locals; the cache must not keep the
+    # checkpoint capture alive once those independent references are released.
+    traceback.clear_frames(primary.__traceback__)
+    gc.collect()
+    assert all(reference() is None for reference in versions)
+    assert not trainer._version_state().lora
+    trainer._guard_slot_can_load(ref)
+    assert weight.grad is None
+    output = trainer._execute_graph_group(group)[0].target_logprobs
+    assert output is not None and output.item() == 4
+    assert len(cache.handles()) == 1
+    trainer.backward(output)
+    torch.testing.assert_close(weight.grad, torch.tensor(4.0))
+    assert not cache.handles()
 
 
 @pytest.mark.parametrize("retention", ["gpu", "cpu", "replay"])

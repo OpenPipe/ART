@@ -3963,62 +3963,67 @@ class TrainerRank:
             output_device=output_device,
             execution_peak_bytes=getattr(placement, "execution_peak_bytes", 0),
         )
-        if topology.cp > 1 and retention != "replay":
-            residual = cache.state(handle).non_offloadable_bytes
-            if residual is not None:
-                profiles = getattr(self, "_graph_residency", None)
-                if profiles is None:
-                    self._graph_residency = profiles = OrderedDict()
-                key = self._graph_residency_key(group)
-                profiles[key] = max(residual, profiles.pop(key, 0))
-                if len(profiles) > 256:
-                    profiles.popitem(last=False)
-        assert spec is not None
-        if version is not None:
+        try:
+            if topology.cp > 1 and retention != "replay":
+                residual = cache.state(handle).non_offloadable_bytes
+                if residual is not None:
+                    profiles = getattr(self, "_graph_residency", None)
+                    if profiles is None:
+                        self._graph_residency = profiles = OrderedDict()
+                    key = self._graph_residency_key(group)
+                    profiles[key] = max(residual, profiles.pop(key, 0))
+                    if len(profiles) > 256:
+                        profiles.popitem(last=False)
+            assert spec is not None
+            if version is not None:
 
-            @contextmanager
-            def current_context():
-                current = self._capture_lora_version(
-                    ref, options.max_gradient_staleness, origin=version.version
-                )
-                assert current is not None
-                previous_storages = storages.copy()
-                storages.update(
-                    (parameter.device, parameter.untyped_storage().data_ptr())
-                    for slot in current.slots.values()
-                    for parameter in slot.parameters()
-                )
-                try:
-                    with use_lora_slot(ref, version=current):
-                        yield
-                finally:
-                    storages.clear()
-                    storages.update(previous_storages)
+                @contextmanager
+                def current_context():
+                    current = self._capture_lora_version(
+                        ref, options.max_gradient_staleness, origin=version.version
+                    )
+                    assert current is not None
+                    previous_storages = storages.copy()
+                    storages.update(
+                        (parameter.device, parameter.untyped_storage().data_ptr())
+                        for slot in current.slots.values()
+                        for parameter in slot.parameters()
+                    )
+                    try:
+                        with use_lora_slot(ref, version=current):
+                            yield
+                    finally:
+                        storages.clear()
+                        storages.update(previous_storages)
 
-            cache.set_corrections(
-                handle,
-                capture_forward_corrections(
-                    unflatten_tensors(spec, tensors), tensors, options
-                ),
-                is_stale=lambda: (
-                    self._capture_checkpoint_version(
-                        version.version.checkpoint
-                    ).revision
-                    != version.weight_version.revision
-                ),
-                current_context_factory=current_context,
+                cache.set_corrections(
+                    handle,
+                    capture_forward_corrections(
+                        unflatten_tensors(spec, tensors), tensors, options
+                    ),
+                    is_stale=lambda: (
+                        self._capture_checkpoint_version(
+                            version.version.checkpoint
+                        ).revision
+                        != version.weight_version.revision
+                    ),
+                    current_context_factory=current_context,
+                )
+            packet = TensorPacket(
+                handle, spec, tensors, tuple(tensor.requires_grad for tensor in tensors)
             )
-        packet = TensorPacket(
-            handle, spec, tensors, tuple(tensor.requires_grad for tensor in tensors)
-        )
-        outputs = self._forward_cotangent_collector().attach(
-            packet,
-            managed=output_device is not None,
-            on_release=partial(cache.release, handle),
-        )
-        # Track the caller graph outside saved-state hooks, which detach markers.
-        # Consumption also ends the lifetime of unused sibling outputs.
-        return self._track_slot_graph_outputs(ref, outputs)
+            outputs = self._forward_cotangent_collector().attach(
+                packet,
+                managed=output_device is not None,
+                on_release=partial(cache.release, handle),
+            )
+            # Track the caller graph outside saved-state hooks, which detach markers.
+            # Consumption also ends the lifetime of unused sibling outputs.
+            return self._track_slot_graph_outputs(ref, outputs)
+        except BaseException:
+            # No caller owns a failed handoff; a partial bridge may also release.
+            cache.release(handle)
+            raise
 
     def _forward_output_metadata(
         self,
