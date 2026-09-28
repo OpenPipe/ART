@@ -37,6 +37,7 @@ class Message(BaseModel):
     role: str = "assistant"
     reasoning_content: str
     content: str
+    tool_calls: list[dict] = []
 
 
 @pytest.fixture
@@ -90,6 +91,7 @@ def serving(monkeypatch):
             self.chat_template = None
             self.chat_template_content_format = "string"
             self.parser = None
+            self.message = Message(reasoning_content="\nthought\n", content="action")
 
         async def preprocess_chat(self, request, messages, **kwargs):
             return await self.render_chat_request(request)
@@ -119,7 +121,7 @@ def serving(monkeypatch):
 
         async def create_chat_completion(self, request, raw_request=None):
             _, inputs = await self.render_chat_request(request)
-            message = Message(reasoning_content="\nthought\n", content="action")
+            message = self.message
 
             async def stream():
                 params = SimpleNamespace(output_kind=SimpleNamespace(name="DELTA"))
@@ -128,7 +130,16 @@ def serving(monkeypatch):
                 yield (
                     "data: "
                     + json.dumps(
-                        {"choices": [{"index": 0, "delta": message.model_dump()}]}
+                        {
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": message.model_dump(),
+                                    "token_ids": list(b"\nthought\n#action~"),
+                                }
+                            ],
+                            "usage": {"completion_tokens": len(b"\nthought\n#action~")},
+                        }
                     )
                     + "\n\n"
                 )
@@ -470,3 +481,69 @@ def test_responses_observe_rendered_tool_history_without_rejecting_result(
         )
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_unrenderable_streamed_tool_calls_keep_usage_and_done(
+    serving, monkeypatch, partial
+):
+    server, _ = serving
+
+    class StrictRequest(Request):
+        @model_validator(mode="after")
+        def validate_calls(self):
+            for message in self.messages:
+                for call in message.get("tool_calls") or []:
+                    TypeAdapter(ChatCompletionMessageToolCallParam).validate_python(
+                        call
+                    )
+            return self
+
+    server.message = Message(
+        reasoning_content="thought",
+        content="",
+        tool_calls=[
+            {
+                "index": 0,
+                "id": "first",
+                "type": "function",
+                "function": {"name": "first", "arguments": "{}"},
+            },
+            {
+                "index": 1 if partial else 2,
+                "id": "last",
+                "type": "function",
+                **(
+                    {} if partial else {"function": {"name": "last", "arguments": "{}"}}
+                ),
+            },
+        ],
+    )
+    original = copy.deepcopy(server.message.model_dump())
+    observed = []
+    observe = vllm.chat_response_prefixes
+
+    async def record(*args):
+        entries = await observe(*args)
+        observed.append(entries)
+        return entries
+
+    monkeypatch.setattr(vllm, "chat_response_prefixes", record)
+
+    async def run():
+        response = await server.create_chat_completion(
+            StrictRequest(
+                messages=[{"role": "user", "content": "question"}],
+                stream=True,
+            )
+        )
+        chunks = [chunk async for chunk in response]
+        assert chunks[-1] == "data: [DONE]\n\n"
+        payload = json.loads(chunks[0][6:])
+        assert payload["choices"][0]["delta"] == original
+        assert payload["choices"][0]["token_ids"] == list(b"\nthought\n#action~")
+        assert payload["usage"] == {"completion_tokens": len(b"\nthought\n#action~")}
+
+    asyncio.run(run())
+    assert observed == [[]]  # No certificate of a valid completed tool response.
+    assert server.message.model_dump() == original
