@@ -413,7 +413,7 @@ def test_exact_sampled_tool_stop_is_stop_when_tokenizer_identifies_it() -> None:
     assert tokenized.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP)
 
 
-def test_length_stop_keeps_sampled_content_and_adds_synthetic_stop() -> None:
+def test_length_stop_ends_at_complete_native_output() -> None:
     exchange = _chat_exchange([1], [2])
     exchange.response.choices[0].finish_reason = "length"
 
@@ -421,11 +421,10 @@ def test_length_stop_keeps_sampled_content_and_adds_synthetic_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[exchange])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 2, 9]
+    assert tokenized.tokens == [1, 2]
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
         _SAMPLED_ASSISTANT_OUTPUT,
-        tr.TokenFlag.STOP,
     ]
 
 
@@ -547,7 +546,7 @@ def test_length_stop_mapping_allows_another_assistant_without_a_stop() -> None:
     assert tokenized.flags[-1] == tr.TokenFlag.STOP
 
 
-def test_terminal_length_with_sampled_eos_still_adds_synthetic_stop() -> None:
+def test_terminal_length_does_not_duplicate_or_relabel_sampled_eos() -> None:
     exchange = _chat_exchange([1], [2, 9])
     exchange.response.choices[0].finish_reason = "length"
 
@@ -555,10 +554,10 @@ def test_terminal_length_with_sampled_eos_still_adds_synthetic_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[exchange])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 2, 9, 9]
+    assert tokenized.tokens == [1, 2, 9]
     assert tokenized.flags[-2:] == [
         _SAMPLED_ASSISTANT_OUTPUT,
-        tr.TokenFlag.STOP,
+        _SAMPLED_ASSISTANT_OUTPUT,
     ]
 
 
@@ -570,10 +569,10 @@ def test_exact_coverage_stops_at_a_duplicated_length_terminator() -> None:
     tokenized = art.Trajectory(
         exchanges=TrajectoryExchanges(chat_completions=[first, second])
     ).tokenize(tokenizer=_StopTokenizer())
-
-    assert tokenized.tokens == [1, 2, 9, 9, 3, 4, 9]
-    assert tokenized.flags[3] == tr.TokenFlag.STOP
-    assert not tokenized.flags[4] & tr.TokenFlag.EXACT
+    assert tokenized.tokens == [1, 2, 9, 3, 4, 9]
+    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags)
+    assert tokenized.logprobs[1:3] == [-0.2, -0.9]
+    assert tokenized.logprobs[4:] == [-0.4, -0.9]
 
 
 def test_terminal_length_stays_exact_after_an_earlier_length_stop() -> None:
@@ -821,7 +820,7 @@ def test_public_exact_chain_preserves_raw_drift_across_proven_length_boundary() 
 
 
 @pytest.mark.parametrize("finish_reason", ["stop", "tool_calls"])
-def test_length_chain_retains_exact_prefix_with_terminal_synthetic_stop(
+def test_length_chain_retains_exact_prefix_without_terminal_footer(
     finish_reason: Literal["stop", "tool_calls"],
 ) -> None:
     history, tokenizer, captured = _character_template_history(
@@ -834,11 +833,9 @@ def test_length_chain_retains_exact_prefix_with_terminal_synthetic_stop(
 
     tokenized = history.tokenize(tokenizer=tokenizer)
 
-    assert tokenized.tokens == [*captured, 9]
-    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags[:-1])
-    assert tokenized.flags[-1] == (
-        tr.TokenFlag.STOP | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT
-    )
+    assert tokenized.tokens == captured
+    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags)
+    assert tokenized.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT)
     assert sum(bool(flag & tr.TokenFlag.SAMPLED) for flag in tokenized.flags) == 19
 
 
@@ -855,8 +852,9 @@ def test_terminal_synthetic_stop_does_not_relax_nonterminal_length_proof(
     )
     with pytest.warns(UserWarning, match="retokenized an earlier sampled response"):
         tokenized = history.tokenize(tokenizer=tokenizer)
-    assert tokenized.tokens != [*captured, 9]
-    assert not all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags[:-1])
+    assert tokenized.tokens == captured
+    assert all(flag & tr.TokenFlag.EXACT for flag in tokenized.flags)
+    assert tokenized.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
 
 
 @pytest.mark.parametrize("mismatch", [False, True])
@@ -924,22 +922,20 @@ def test_length_boundary_ends_before_next_assistant_tool_prefix(
         exchanges=TrajectoryExchanges(chat_completions=[first, second])
     ).chat_completions_history()
     tokenized = history.tokenize(tokenizer=tokenizer)
-    expected = [
-        *next_prompt,
-        *tokenizer._encode("<tool>lookup{}" + closing_markup + "§"),
-    ]
     if mismatch:
-        assert tokenized.tokens != expected
+        assert tokenized.tokens == [*next_prompt, *tool_output]
+        assert tokenized.flags[len(prompt) + len(output)] == tr.TokenFlag.EXACT
+        assert math.isnan(tokenized.logprobs[len(prompt) + len(output)])
+        assert all(
+            flag & tr.TokenFlag.SAMPLED for flag in tokenized.flags[len(next_prompt) :]
+        )
         return
-    assert tokenized.tokens == expected
+    assert tokenized.tokens == [*next_prompt, *tool_output]
     assert all(
         flag & tr.TokenFlag.EXACT
         for flag in tokenized.flags[: len(next_prompt) + len(tool_output)]
     )
-    assert (
-        tokenized.flags[-1]
-        == tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP
-    )
+    assert tokenized.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
     sampled = [
         index
         for index, flag in enumerate(tokenized.flags)
@@ -986,15 +982,10 @@ def test_public_exact_chain_rejects_user_token_colliding_with_missing_tail(
 
     with pytest.warns(UserWarning, match="retokenized an earlier sampled response"):
         tokenized = history.tokenize(tokenizer=tokenizer)
-
-    assert tokenized.tokens != authoritative
-    length_start = tokenized.tokens.index(7002)
-    boundary = length_start + len("answer")
-    assert tokenized.tokens[boundary : boundary + 2] == [9, 9]
-    assert not tokenized.flags[boundary] & tr.TokenFlag.ASSISTANT
-    assert tokenized.flags[boundary] & tr.TokenFlag.STOP
-    assert not tokenized.flags[boundary + 1] & tr.TokenFlag.ASSISTANT
-    assert not tokenized.flags[boundary + 1] & tr.TokenFlag.STOP
+    assert tokenized.tokens == authoritative
+    boundary = tokenized.tokens.index(7002) + len("answer")
+    assert tokenized.flags[boundary] == tr.TokenFlag.EXACT
+    assert math.isnan(tokenized.logprobs[boundary])
 
 
 def test_exact_chain_preserves_raw_output_across_proven_length_tail() -> None:
@@ -1380,7 +1371,7 @@ def test_metadata_only_final_token_is_preserved_as_sampled_stop() -> None:
     assert tokenized.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP)
 
 
-def test_empty_output_materializes_a_synthetic_stop() -> None:
+def test_recorded_empty_output_does_not_invent_a_response_token() -> None:
     exchange = _chat_exchange([1], [])
     exchange.response.choices[0].message.content = ""
 
@@ -1388,10 +1379,9 @@ def test_empty_output_materializes_a_synthetic_stop() -> None:
         exchanges=TrajectoryExchanges(chat_completions=[exchange])
     ).tokenize(tokenizer=_StopTokenizer())
 
-    assert tokenized.tokens == [1, 9]
+    assert tokenized.tokens == [1]
     assert tokenized.flags == [
         tr.TokenFlag.EXACT,
-        tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP,
     ]
 
 
@@ -1671,15 +1661,16 @@ def test_messages_sampled_stop_and_length_stop_provenance() -> None:
         .anthropic_messages_history()
         .tokenize(tokenizer=_StopTokenizer())
     )
-    synthetic = (
+    terminal = (
         art.Trajectory(exchanges=TrajectoryExchanges(messages=[length]))
         .anthropic_messages_history()
         .tokenize(tokenizer=_StopTokenizer())
     )
 
     assert sampled.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP)
-    assert synthetic.tokens == [1, 2, 9]
-    assert synthetic.flags[-1] == tr.TokenFlag.STOP
+    assert terminal.tokens == [1, 2]
+    assert terminal.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
+    assert terminal.logprobs[-1] == -0.2
 
 
 def test_messages_later_exact_prompt_upgrades_length_stop() -> None:
@@ -1796,15 +1787,16 @@ def test_responses_sampled_stop_and_length_stop_provenance() -> None:
         .responses_history()
         .tokenize(tokenizer=_StopTokenizer())
     )
-    synthetic = (
+    terminal = (
         art.Trajectory(exchanges=TrajectoryExchanges(responses=[length]))
         .responses_history()
         .tokenize(tokenizer=_StopTokenizer())
     )
 
     assert sampled.flags[-1] == (_SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP)
-    assert synthetic.tokens == [1, 2, 9]
-    assert synthetic.flags[-1] == tr.TokenFlag.STOP
+    assert terminal.tokens == [1, 2]
+    assert terminal.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
+    assert terminal.logprobs[-1] == -0.1
 
 
 def test_responses_later_exact_prompt_upgrades_length_stop() -> None:
@@ -3698,19 +3690,32 @@ def test_reasoning_stripped_messages_history_preserves_exact_tokens(
             }
             return by_length[len(messages)]
 
-    history = art.Trajectory(
-        exchanges=TrajectoryExchanges(messages=[first, second])
-    ).anthropic_messages_histories()[1]
-    tokenized = history.tokenize(tokenizer=Tokenizer())
+    trajectory = art.Trajectory(exchanges=TrajectoryExchanges(messages=[first, second]))
+    history = trajectory.anthropic_messages_histories()[1]
+    if top_level_only:
+        with pytest.raises(ValueError, match="complete original sampled occurrence"):
+            history.tokenize(tokenizer=Tokenizer())
+        original, tokenized = trajectory.tokenize(
+            multi_history=True, tokenizer=Tokenizer()
+        ).histories
+        assert original.tokens == [10, 90, 101, 102]
+        assert original.logprobs[1:] == pytest.approx([-9.0, -10.1, -10.2])
+        assert original.flags[1:] == [_SAMPLED_ASSISTANT_OUTPUT] * 3
+        assert all(math.isnan(value) for value in tokenized.logprobs[1:3])
+        assert (
+            tokenized.flags[1:3]
+            == [tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT] * 2
+        )
+    else:
+        # Block-level output evidence has no native prompt. Preserve this
+        # existing generic rendered path rather than invent conditioning.
+        tokenized = history.tokenize(tokenizer=Tokenizer())
+        assert tokenized.logprobs[1:3] == pytest.approx([-10.1, -10.2])
+        assert tokenized.flags[1:3] == [_SAMPLED_ASSISTANT_OUTPUT] * 2
 
     assert tokenized.tokens == [10, 101, 102, 11, 91, 201]
-    assert tokenized.logprobs[1:3] == pytest.approx([-10.1, -10.2])
     assert tokenized.logprobs[-2] == pytest.approx(-10.0)
     assert tokenized.logprobs[-1] == pytest.approx(-20.1)
-    assert tokenized.flags[1:3] == [
-        _SAMPLED_ASSISTANT_OUTPUT,
-        _SAMPLED_ASSISTANT_OUTPUT,
-    ]
     assert tokenized.flags[-2:] == [
         _SAMPLED_ASSISTANT_OUTPUT,
         _SAMPLED_ASSISTANT_OUTPUT,
@@ -4624,12 +4629,14 @@ def test_cross_exchange_responses_reasoning_split_uses_later_prompt_backbone() -
         [1, 3, 4, 5],
     ]
     assert math.isnan(tokenized.histories[1].logprobs[0])
-    assert tokenized.histories[1].logprobs[1] == -0.3
+    # The copied 3 was sampled after [1, 2], never after [1].
+    assert tokenized.histories[0].logprobs[1:] == [-0.2, -0.3]
+    assert math.isnan(tokenized.histories[1].logprobs[1])
     assert math.isnan(tokenized.histories[1].logprobs[2])
     assert tokenized.histories[1].logprobs[3] == -0.1
     assert tokenized.histories[1].flags == [
         tr.TokenFlag.EXACT,
-        _SAMPLED_ASSISTANT_OUTPUT,
+        tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT,
         tr.TokenFlag.EXACT,
         _SAMPLED_ASSISTANT_OUTPUT,
     ]
@@ -7215,13 +7222,19 @@ def test_reasoning_stripped_chat_histories_tokenize_authoritative_views() -> Non
         [1, 2, 101, 102, 9],
         [1, 101, 102, 9, 4, 5, 6, 9],
     ]
-    assert tokenized.histories[1].flags[1] & tr.TokenFlag.SAMPLED
+    assert not tokenized.histories[1].flags[1] & tr.TokenFlag.SAMPLED
+    assert tokenized.histories[1].flags[1] & tr.TokenFlag.OUTPUT
+    assert tokenized.histories[0].logprobs[2:4] == [-10.1, -10.2]
     assert tokenized.histories[1].flags[1] & tr.TokenFlag.EXACT
-    assert tokenized.histories[1].logprobs[1:3] == [-10.1, -10.2]
+    assert all(math.isnan(value) for value in tokenized.histories[1].logprobs[1:3])
     assert tokenized.histories[1].flags[3] == (
-        _SAMPLED_ASSISTANT_OUTPUT | tr.TokenFlag.STOP
+        tr.TokenFlag.EXACT
+        | tr.TokenFlag.ASSISTANT
+        | tr.TokenFlag.OUTPUT
+        | tr.TokenFlag.STOP
     )
-    assert tokenized.histories[1].logprobs[3] == -0.9
+    assert math.isnan(tokenized.histories[1].logprobs[3])
+    assert tokenized.histories[0].logprobs[4] == -0.9
     assert 2 not in tokenized.histories[1].tokens
     assert 500 not in tokenized.histories[1].tokens
 
@@ -7381,13 +7394,21 @@ def test_reasoning_stripped_tool_call_keeps_exact_evidence_for_strict_training(
         multi_history=True,
         tokenizer=Tokenizer(),
     )
-    second_history = tokenized.histories[1]
+    first_history, second_history = tokenized.histories
+    assert first_history.tokens == [1, 2, 7, 8]
+    assert first_history.logprobs[1:] == [-0.2, -0.7, -0.8]
+    assert first_history.flags[1:] == [_SAMPLED_ASSISTANT_OUTPUT] * 3
     assert second_history.tokens == [1, 7, 8, 4, 5]
-    assert second_history.logprobs[1:3] == [-0.7, -0.8]
-    assert second_history.flags[1:3] == [
-        _SAMPLED_ASSISTANT_OUTPUT,
-        _SAMPLED_ASSISTANT_OUTPUT,
-    ]
+    assert all(math.isnan(lp) for lp in second_history.logprobs[1:3])
+    assert (
+        second_history.flags[1:3]
+        == [
+            tr.TokenFlag.EXACT | tr.TokenFlag.ASSISTANT | tr.TokenFlag.OUTPUT,
+        ]
+        * 2
+    )
+    assert second_history.logprobs[-1] == -0.5
+    assert second_history.flags[-1] == _SAMPLED_ASSISTANT_OUTPUT
 
     preprocessing = list(
         tokenize_trajectory_groups(
@@ -7410,7 +7431,12 @@ def test_reasoning_stripped_tool_call_keeps_exact_evidence_for_strict_training(
     assert len(datums) == 4
 
 
-def test_responses_prompt_repair_opt_in_uses_native_text_and_source_position() -> None:
+def test_responses_prompt_repair_opt_in_uses_native_text_and_source_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "art.trajectories._tokenize._WARNED_PREFIX_RETOKENIZATION", False
+    )
     exchange = _response_exchange("repeated-retokenization", 101)
     data = exchange.response.model_dump(mode="python")
     data["output"].append(
@@ -8964,6 +8990,8 @@ def test_length_boundary_preserves_output_despite_probe_suffix_collision(
             _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
         return
 
+    # A branch's leading request context keeps its recorded conditioning even
+    # when a renderer cannot reconstruct optional historical role annotations.
     tokenized, traces = _tokenize_trajectory_with_trace(trajectory, tokenizer=tokenizer)
     assert len(tokenized.histories) == (
         2 if corruption == "changed_sampled_token" else 1
