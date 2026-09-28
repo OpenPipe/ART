@@ -276,7 +276,11 @@ def test_literal_content_is_not_inferred_from_source_thinking_mode(case: str) ->
         if structured
         else (
             tokenized.tokens,
-            tokenized.flags,
+            # The override does not certify the recorded prompt as exact.
+            [tr.TokenFlag(0)] * (len(expected) - len(_LITERAL))
+            + tokenized.flags[len(expected) - len(_LITERAL) :]
+            if case == "visible_only"
+            else tokenized.flags,
             [None if x != x else x for x in tokenized.logprobs],
         )
     )
