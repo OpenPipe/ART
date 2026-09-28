@@ -7,7 +7,7 @@ import weakref
 
 import pytest
 import torch
-from trainer_rank_test_support import fake_rank, full_recompute_config
+from trainer_rank_test_support import fake_rank, recompute_model
 
 from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank
 from art.trainer_rank._impl import (
@@ -629,7 +629,6 @@ def test_split_charges_the_largest_hybridep_growth_beside_any_child_peak():
 def hybrid_checkpoint_rank(layer, monkeypatch):
     from megatron.core.transformer.transformer_block import TransformerBlock
     from test_trainer_rank_converted_memory import weights
-    from test_trainer_rank_pending_memory import module
 
     with torch.device("meta"):
         moe = _hybridep(weights(layer, 8), 2)
@@ -644,15 +643,7 @@ def hybrid_checkpoint_rank(layer, monkeypatch):
             fc.lora.B_T = torch.nn.Parameter(
                 torch.empty(128, 8, outputs, dtype=torch.bfloat16)
             )
-        decoder = module(TransformerBlock)
-        decoder.config = full_recompute_config(2048, 40, False)
-        decoder.num_layers_per_pipeline_rank = 40
-        decoder.layers = torch.nn.ModuleList(
-            [moe] + [torch.nn.Linear(1, 1).bfloat16() for _ in range(39)]
-        )
-        model: Any = torch.nn.Module()
-        model.config, model.decoder = decoder.config, decoder
-        model._preprocess = lambda: None
+        model = recompute_model(TransformerBlock, 2048, 40, False, layers=(moe,))
         # Only distributed topology is mocked. Real constructor metadata selects
         # the HybridEP coefficient, without loading a model or initializing CUDA.
         monkeypatch.setattr(TrainerRank, "_topology_key", lambda self: (1, 1, 2, 1))

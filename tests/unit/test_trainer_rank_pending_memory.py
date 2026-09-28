@@ -8,7 +8,7 @@ import pytest
 from test_trainer_rank_moe_memory import _enclosing_moe
 from test_trainer_rank_moe_memory import layer as layer
 import torch
-from trainer_rank_test_support import fake_rank, full_recompute_config
+from trainer_rank_test_support import fake_rank, recompute_model
 
 from art.megatron.prefix_tree_packing import prefix_tree_pack
 from art.trainer_rank import ForwardInput, TrainerRank
@@ -30,12 +30,7 @@ def rank_with_moe(moe_layer, *, install_hooks=False):
     from art.megatron.gdn.operator import _prefix_tree_forward
     from art.megatron.lora import LoRA, SelfAttentionLinearProjLoRA
 
-    decoder = module(TransformerBlock)
-    decoder.config = full_recompute_config(2048, 40, False)
-    decoder.layers = torch.nn.ModuleList(
-        [torch.nn.Linear(1, 1).bfloat16() for _ in range(40)]
-    )
-    decoder.num_layers_per_pipeline_rank = 40
+    model = recompute_model(TransformerBlock, 2048, 40, False)
     layer = torch.nn.Module()
     layer.mlp = moe_layer
     gd = module(GatedDeltaNet)
@@ -61,11 +56,7 @@ def rank_with_moe(moe_layer, *, install_hooks=False):
         torch.empty(1, 2048, dtype=torch.bfloat16)
     )
     layer.self_attention = gd
-    decoder.layers[38] = layer
-    model: Any = torch.nn.Module()
-    model.config = decoder.config
-    model.decoder = decoder
-    model._preprocess = lambda: None
+    model.decoder.layers[38] = layer
     if install_hooks:
         from art.megatron.gdn.operator import install_gdn_island_hooks
 

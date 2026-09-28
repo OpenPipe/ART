@@ -59,6 +59,25 @@ def full_recompute_config(hidden_size, num_layers, sequence_parallel, /, **confi
     )
 
 
+def recompute_model(
+    block_type, hidden_size, num_layers, sequence_parallel, /, *, layers=(), **config
+):
+    block = block_type.__new__(block_type)
+    torch.nn.Module.__init__(block)
+    block.config = full_recompute_config(
+        hidden_size, num_layers, sequence_parallel, **config
+    )
+    block.layers = torch.nn.ModuleList(
+        list(layers)
+        + [torch.nn.Linear(1, 1).bfloat16() for _ in range(num_layers - len(layers))]
+    )
+    block.num_layers_per_pipeline_rank = num_layers
+    model: Any = torch.nn.Module()
+    model.config, model.decoder = block.config, block
+    model._preprocess = lambda: None
+    return model
+
+
 def checkpoint_runtime(
     model: torch.nn.Module | None = None,
     *,

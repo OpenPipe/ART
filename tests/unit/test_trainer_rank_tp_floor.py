@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 import torch
-from trainer_rank_test_support import fake_rank, full_recompute_config
+from trainer_rank_test_support import fake_rank, recompute_model
 
 from art.trainer_rank import TrainerRank
 from art.trainer_rank._impl import _MemorySignature
@@ -28,17 +28,7 @@ SEGMENT = (4 * 12 * 128 * 128 + 2 * (2 * 4 * 128 + 12 * 128) * 3) * 2
 def tp_rank(layers=LAYERS, *, ffn=F, topology=TP4, sequence_parallel=True, **config):
     from megatron.core.transformer.transformer_block import TransformerBlock
 
-    block = TransformerBlock.__new__(TransformerBlock)
-    torch.nn.Module.__init__(block)
-    block.config = full_recompute_config(H, layers, sequence_parallel, **config)
-    block.layers = torch.nn.ModuleList(
-        [torch.nn.Linear(1, 1).bfloat16() for _ in range(layers)]
-    )
-    block.num_layers_per_pipeline_rank = layers
-    model: Any = torch.nn.Module()
-    model.config = block.config
-    model.decoder = block
-    model._preprocess = lambda: None
+    model = recompute_model(TransformerBlock, H, layers, sequence_parallel, **config)
     r: Any = fake_rank(TrainerRank, [model], hidden_size=H, num_layers=layers)
     # Qwen3.8-27B: gated attention every fourth layer, GDN otherwise.
     r._geometry = replace(

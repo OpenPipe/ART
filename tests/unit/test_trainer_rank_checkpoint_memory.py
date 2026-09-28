@@ -2,11 +2,10 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 import torch
-from trainer_rank_test_support import fake_rank, full_recompute_config
+from trainer_rank_test_support import fake_rank, recompute_model
 
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import Unset, _ForwardRefusal, _MemoryProfile
@@ -15,17 +14,7 @@ from art.trainer_rank._impl import Unset, _ForwardRefusal, _MemoryProfile
 def rank():
     from megatron.core.transformer.transformer_block import TransformerBlock
 
-    block = TransformerBlock.__new__(TransformerBlock)
-    torch.nn.Module.__init__(block)
-    block.config = full_recompute_config(2048, 40, False)
-    block.layers = torch.nn.ModuleList(
-        [torch.nn.Linear(1, 1).bfloat16() for _ in range(40)]
-    )
-    block.num_layers_per_pipeline_rank = 40
-    model: Any = torch.nn.Module()
-    model.config = block.config
-    model.decoder = block
-    model._preprocess = lambda: None
+    model = recompute_model(TransformerBlock, 2048, 40, False)
     result = fake_rank(TrainerRank, [model], hidden_size=2048, num_layers=40)
     result._moe_output_bytes_per_token = 188416
     result._moe_checkpoint_grad_bytes_per_token = 188416
