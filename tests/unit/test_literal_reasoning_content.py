@@ -364,6 +364,42 @@ def test_inherited_renderer_does_not_prove_role_stability():
     )
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "{% set content.role = 'user' %}",
+        "{% set alias = content %}{% set alias.role = 'user' %}",
+    ],
+)
+@pytest.mark.parametrize(
+    "text", ["  answer  ", "  before<think>literal</think>after  "]
+)
+def test_renderer_cannot_mutate_parameter_namespace_aliases(mutation, text):
+    match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert match is not None
+    trim = "{% set content = render_content(message.content, true)|trim %}"
+    source = (
+        "{% macro render_content(content,count) %}"
+        + mutation
+        + "{{ content.text }}{% endmacro %}"
+        + "{% set message = namespace(role=message.role, text=message.content) %}"
+        + "{% set message.content = message %}"
+        + trim
+        + "{% if message.role == 'assistant' %}"
+        + match.group()
+        + "{% else %}[{{ content }}]{% endif %}"
+    )
+    env = ImmutableSandboxedEnvironment()
+    kwargs = {"message": {"role": "assistant", "content": text}}
+    original = env.from_string(source).render(**kwargs)
+    fixed = _without_inline_reasoning_parser(source)
+    assert original == "[" + text.strip() + "]"
+    assert env.from_string(fixed).render(**kwargs) == original
+    assert trim in fixed
+    assert not _QWEN_INLINE_REASONING.search(fixed)
+    assert _without_inline_reasoning_parser(fixed) == fixed
+
+
 @pytest.mark.parametrize("environment", [Environment, ImmutableSandboxedEnvironment])
 @pytest.mark.parametrize(
     "middle",
