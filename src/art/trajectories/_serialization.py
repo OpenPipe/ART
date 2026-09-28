@@ -57,7 +57,7 @@ def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
 
 
 def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> object:
-    if isinstance(value, str):
+    if type(value) is str:
         return pool.setdefault(value, value)
     if value is None or isinstance(
         value, (bytes, bytearray, memoryview, bool, int, float, complex)
@@ -128,7 +128,7 @@ def _intern_mapping(
 ) -> None:
     replacements: list[tuple[str, str]] = []
     for key, item in value.items():
-        if isinstance(key, str):
+        if type(key) is str:
             interned = pool.setdefault(key, key)
             if interned is not key:
                 replacements.append((key, interned))
