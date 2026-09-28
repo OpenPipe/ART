@@ -1575,7 +1575,7 @@ def _fill_planner_snapshot(
                 elif not all(isinstance(row, list) for row in rows):
                     incomplete.add("layout_inputs_unavailable")
                     reason = "selected_layout_input_unverified"
-                elif (
+                elif any(not row for row in rows) or (
                     build_canonical_prefix_tree(
                         _impl.torch.tensor(row, dtype=_impl.torch.long, device="cpu")
                         for row in rows

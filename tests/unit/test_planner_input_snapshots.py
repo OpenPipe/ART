@@ -311,3 +311,42 @@ def test_missing_layout_does_not_certify_observed_inputs(monkeypatch, tmp_path):
     assert payload["layouts"] == []
     assert "selected_layout_unavailable" in payload["incomplete_reasons"]
     rank.finish_planner_observation()
+
+
+@pytest.mark.parametrize("inference", [False, True])
+def test_empty_storage_replacement_retains_other_replay_metadata(
+    monkeypatch, tmp_path, inference
+):
+    rank = _rank(monkeypatch)
+    rank._planner_reporter = Reporter(10, spool_dir=tmp_path)
+    with torch.inference_mode() if inference else nullcontext():
+        requests = [_request(0), replace(_request(1), no_grad=True)]
+    plan = rank._plan_flat_forward(requests)
+    assert len(plan.groups) == 2
+    replay = _snapshot(rank, plan)
+    tensor = plan.groups[0].items[0].input_ids
+    with torch.inference_mode(inference):
+        torch.utils.swap_tensors(tensor, torch.empty(0, dtype=torch.long))
+    rank._planner_reporter.report(
+        predicted_peak_bytes=1000,
+        observed_peak_bytes=2000,
+        phase="forward",
+        replay_factory=replay,
+    )
+    [path] = list(tmp_path.glob("*.json"))
+    report = validate_report(path.read_bytes())
+    assert report["replay_complete"] is False
+    retained = report["replay"]
+    assert retained["memory_replay"]
+    assert len(retained["layouts"]) == 1
+    assert retained["requests"][0]["input_tokens"]["unavailable"] == (
+        "modified_input" if inference else "selected_layout_input_mismatch"
+    )
+    assert retained["requests"][1]["input_tokens"] == (
+        plan.groups[1].items[0].input_ids.tolist()
+    )
+    assert (
+        "immutable runtime group/slot, head, checkpoint and GDN facts"
+        in (report["incomplete_reasons"])
+    )
+    rank.finish_planner_observation()
