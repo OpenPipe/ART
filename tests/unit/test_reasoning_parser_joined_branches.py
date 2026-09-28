@@ -1,11 +1,11 @@
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 import pytest
-from test_literal_reasoning_content import _TEMPLATE
 
 from art_inference.chat_template import (
     _QWEN_INLINE_REASONING,
     _without_inline_reasoning_parser,
 )
+from tests.unit.test_literal_reasoning_content import _TEMPLATE
 
 
 @pytest.mark.parametrize("scope", ["top", "macro"])
