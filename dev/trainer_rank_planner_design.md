@@ -889,6 +889,18 @@ wave/participant identities, execution breadcrumbs, reserved summary storage,
 exact delivery ACKs, and aggregate spool budgets remain follow-up work. Current
 spool-full/process-loss limits still apply. The selected-plan replay keeps its
 existing completeness limits; this is not a full GPU failure reproduction claim.
+Selected-plan diagnostics retain versioned CPU inputs by reference and reject
+version-visible mutation. CPU inference tensors have no version counter, so reporting
+owns up to one million input/target elements of CPU clones before execution;
+emission compares them with the same admitted tensor objects and refuses changed
+values. This adds bounded CPU work when reporting is enabled, without device
+readback. The clone and emitted inventory budgets are independent: ordinary
+versioned inputs consume only the latter, so a bounded clone can still be omitted
+when earlier emitted fields exhaust that budget. Device inputs, changed inputs,
+exhausted inventory and failed snapshots
+have separate omission reasons and device metadata. Recovering these rows does
+not supply the still-missing grouped estimator's runtime/slot/head/checkpoint/GDN
+facts or make those reports replay-complete.
 Planning-event reports cap size at 256KiB. Oversized replay drops bulk request
 and layout arrays first, retaining whole compact source, rank/device, model and
 estimator fields that fit. Omission names and optional field inspection are
@@ -937,3 +949,13 @@ owner's responsibilities. It adds no GPU operation or full-input capture.
 
 Caladan's format-2 reader must land before this producer is enabled, and both
 rank and driver need the updated ART validator. Old format-1 JSON remains readable.
+
+Capture suppression also skips the early input snapshots. Emission checks the
+current device again before any equality or materialization. Bounded CPU rows
+are checked against the selected layout's canonical tree fingerprint.
+`selected_layout_input_unverified` omits available rows when any sibling input
+or the selected layout is unavailable: a group fingerprint cannot certify a
+partial inventory. Other groups and precise sibling omission reasons remain.
+`selected_layout_input_mismatch` omits rows and the layout when the input changed
+between planning and observation. These checks cannot reconstruct absent grouped
+estimator facts and do not mark those reports replay-complete.
