@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from functools import lru_cache
 import json
 import re
 from typing import Any
@@ -446,34 +447,18 @@ def _without_inline_reasoning_parser(template: str) -> str:
                             # Publishing a new binding can release an old
                             # object whose destructor observes the new value.
                             shared.update(bindings)
-                else:
-                    # Macro/loop bodies have independent bindings.
-                    for _, value in node.iter_fields():
-                        if isinstance(value, list) and all(
-                            isinstance(n, nodes.Node) for n in value
-                        ):
-                            # Jinja initializes loop locals before each body;
-                            # parameters/targets already have arbitrary values.
-                            local_names = (
-                                {
-                                    n.name
-                                    for n in (
-                                        node.target,
-                                        *node.target.find_all(nodes.Name),
-                                    )
-                                    if isinstance(n, nodes.Name)
-                                }
-                                if isinstance(node, nodes.For) and value is node.body
-                                else None
-                            )
-                            if isinstance(node, nodes.Macro):
-                                local_names = {arg.name for arg in node.args}
-                            visit(
-                                value,
-                                set(),
-                                local_names,
-                                isinstance(node, nodes.For) and value is node.body,
-                            )
+                elif isinstance(node, nodes.Macro):
+                    # Macro parameters already have arbitrary values.
+                    visit(node.body, set(), {arg.name for arg in node.args})
+                elif isinstance(node, nodes.For):
+                    # Only the loop body has fresh loop-local bindings.
+                    local_names = {
+                        n.name
+                        for n in (node.target, *node.target.find_all(nodes.Name))
+                        if isinstance(n, nodes.Name)
+                    }
+                    visit(node.body, set(), local_names, True)
+                    visit(node.else_, set())
         return bindings
 
     visit(tree.body, set())
@@ -505,6 +490,32 @@ def chat_template_with_preserved_thinking(chat_template: object) -> object:
         }
     if not isinstance(chat_template, str):
         return chat_template
+    if type(chat_template) is not str or len(chat_template) > _TEMPLATE_CACHE_MAX_CHARS:
+        return _normalize_chat_template(chat_template)
+    try:
+        return _cached_normalize_chat_template(chat_template)
+    except _UncachedTemplate as result:
+        return result.args[0]
+
+
+# Bound retained input and output strings, including their widest Unicode form.
+# Oversized templates still use the original normalization path without caching.
+_TEMPLATE_CACHE_MAX_CHARS = 32_768
+
+
+class _UncachedTemplate(Exception):
+    """Return an oversized result without retaining it in functools' cache."""
+
+
+@lru_cache(maxsize=64)
+def _cached_normalize_chat_template(template: str) -> str:
+    result = _normalize_chat_template(template)
+    if len(result) > _TEMPLATE_CACHE_MAX_CHARS:
+        raise _UncachedTemplate(result)
+    return result
+
+
+def _normalize_chat_template(chat_template: str) -> str:
     literal_template = _without_inline_reasoning_parser(chat_template)
     inline_parser_removed = literal_template != chat_template
     chat_template = literal_template

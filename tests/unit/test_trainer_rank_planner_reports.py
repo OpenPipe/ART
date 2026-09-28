@@ -361,6 +361,7 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
         )
     assert "_gdn_memory.py" in reports._source_files()
     assert "_memory.py" in reports._source_files()
+    assert "_micro_batch_planner.py" in reports._source_files()
     # Frozen stages are independent inputs, not a recorded total substituted
     # for the estimator. Changing a fixed stage changes actual recomputation.
     staged = json.loads(path.read_bytes())
