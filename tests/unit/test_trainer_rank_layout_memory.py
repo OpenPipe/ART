@@ -583,7 +583,13 @@ def test_layout_head_stage_meets_each_ranks_other_groups(monkeypatch):
     assert heads[1] > heads[0]
     head, gradient = 10**9, r._checkpoint_input_gradient_bytes(group_rows, slots)
     stage = r._checkpoint_head_stage_bytes(head, gradient, group_rows, slots, layouts)
-    assert stage == head + 2 * gradient + r._te_workspace_growth_bytes() + heads[1]
+    assert stage == (
+        head
+        + 2 * gradient
+        + (2047 + 640) * r._backward_row_state_bytes()
+        + r._te_workspace_growth_bytes()
+        + heads[1]
+    )
     # Each rank's own boundaries plus its head term stay within the floor's.
     floor = r._checkpoint_memory_floor(
         group_rows, slots, routed_rows=routed, layouts=layouts
