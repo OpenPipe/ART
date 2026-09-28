@@ -142,9 +142,9 @@ _BACKWARD_ROW_STATE_BYTES = 256
 # BF16 logits-sized buffers of that chunk (about 18 bytes per logit); derived
 # from the code, not traced.
 _HEAD_FALLBACK_BUFFERS = 9
-# Whether the fused head statistics have run in this process, and whether any
+# Which fused head statistics kernels have run in this process, and whether any
 # call fell back to FP32 after an error: staging trusts only a proven path.
-_TRITON_STATS_STATE = {"succeeded": False, "failed": False}
+_TRITON_STATS_STATE: dict[str, Any] = {"succeeded": set(), "failed": False}
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -4107,7 +4107,9 @@ class TrainerRank:
             )
             or os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower()
             in {"0", "false"}
-            or not _TRITON_STATS_STATE["succeeded"]
+            # Target-only heads run the logsumexp kernel; another kernel's
+            # success does not prove it.
+            or "local_logsumexp_stats" not in _TRITON_STATS_STATE["succeeded"]
             or _TRITON_STATS_STATE["failed"]
             or self._topology_key()[2] != 2
             or not self._head_workspace_bytes(1)
@@ -10679,7 +10681,7 @@ def _try_triton_stats(
         if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict":
             raise
         return None
-    _TRITON_STATS_STATE["succeeded"] = True
+    _TRITON_STATS_STATE["succeeded"].add(name)
     return result
 
 
