@@ -607,9 +607,8 @@ def _process_model_fields(cls: type) -> dict[str, FieldInfo] | None:
     return cast(dict[str, FieldInfo], fields)
 
 
-@lru_cache(maxsize=1)
 def _process_schema_models() -> frozenset[type[BaseModel]]:
-    """Exact ART/provider types in the declared result schema, never subclasses."""
+    """Resolve exact declared types afresh; declarations can change between transfers."""
     models: set[type[BaseModel]] = set()
     pending: list[object] = [TokenizedTrajectory, TokenizedMultiHistoryTrajectory]
     seen: set[int] = set()

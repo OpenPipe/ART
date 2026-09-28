@@ -23,6 +23,13 @@ import art.trajectories as tr
 from art.trajectories import _parallel as p
 
 
+def clear_schema_cache():
+    # Retained baseline comparisons also exercise older cached implementations.
+    clear = getattr(p._process_schema_models, "cache_clear", None)
+    if clear is not None:
+        clear()
+
+
 def unpack_test_payload(payload):
     """Inspect either raw pickle or the private framed result in assertions."""
     return pickle.loads(payload[1:] if payload.startswith(b"\0") else payload)
@@ -2491,7 +2498,7 @@ def test_schema_metadata_resolution_preserves_ordinary_callbacks(
                 observe()
                 return fields
 
-        p._process_schema_models.cache_clear()
+        clear_schema_cache()
         if warm:
             p._process_schema_models()
         try:
@@ -2524,7 +2531,7 @@ def test_schema_metadata_resolution_preserves_ordinary_callbacks(
                     answer = pickle.loads(payload).tokens
                 outcomes.append((events, answer))
         finally:
-            p._process_schema_models.cache_clear()
+            clear_schema_cache()
     assert outcomes[0] == outcomes[1]
     assert outcomes[0][0] == []
 
@@ -2545,7 +2552,7 @@ def test_schema_field_objects_decline_before_observing_annotations(warm):
     field = CustomField(annotation=list[int])
     armed = True
     fields = {**tr.TokenizedTrajectory.model_fields, "tokens": field}
-    p._process_schema_models.cache_clear()
+    clear_schema_cache()
     if warm:
         p._process_schema_models()
     try:
@@ -2557,7 +2564,7 @@ def test_schema_field_objects_decline_before_observing_annotations(warm):
             assert pickle.loads(ordinary).tokens == pickle.loads(candidate).tokens
             assert events == []
     finally:
-        p._process_schema_models.cache_clear()
+        clear_schema_cache()
 
 
 @pytest.mark.parametrize("raises", [False, True])
@@ -2577,7 +2584,7 @@ def test_unknown_annotation_resolution_is_not_observed(raises, warm):
     field = copy.copy(tr.TokenizedTrajectory.model_fields["tokens"])
     field.annotation = Annotation()
     fields = {**tr.TokenizedTrajectory.model_fields, "tokens": field}
-    p._process_schema_models.cache_clear()
+    clear_schema_cache()
     if warm:
         p._process_schema_models()
     try:
@@ -2593,13 +2600,13 @@ def test_unknown_annotation_resolution_is_not_observed(raises, warm):
             assert expected.tokens == actual.tokens
             assert events == []
     finally:
-        p._process_schema_models.cache_clear()
+        clear_schema_cache()
 
 
 @pytest.mark.parametrize("warm", [False, True])
 def test_exact_schema_metadata_copy_keeps_source_elision(warm):
     parent, result = fixture()
-    p._process_schema_models.cache_clear()
+    clear_schema_cache()
     if warm:
         p._process_schema_models()
     try:
@@ -2613,7 +2620,7 @@ def test_exact_schema_metadata_copy_keeps_source_elision(warm):
             assert payload.startswith(b"\0")
             assert p._deserialize_process_result(payload, parent).trajectory is parent
     finally:
-        p._process_schema_models.cache_clear()
+        clear_schema_cache()
 
 
 @pytest.mark.parametrize("storage", ["args", "state", "key"])
@@ -2662,7 +2669,7 @@ def test_typing_alias_storage_preserves_ordinary_callbacks(
             }
         field = copy.copy(tr.TokenizedTrajectory.model_fields["tokens"])
         field.annotation = alias
-        p._process_schema_models.cache_clear()
+        clear_schema_cache()
         if warm:
             p._process_schema_models()
         try:
@@ -2681,7 +2688,7 @@ def test_typing_alias_storage_preserves_ordinary_callbacks(
                             else pickle.dumps((parent, options))
                         )
                     restored, received = pickle.loads(payload)
-                    assert received.source_refs_allowed is (optimized and warm)
+                    assert not received.source_refs_allowed
                     answer = restored.reward
                 else:
                     payload = (
@@ -2689,13 +2696,13 @@ def test_typing_alias_storage_preserves_ordinary_callbacks(
                         if optimized
                         else pickle.dumps(result)
                     )
-                    assert payload.startswith(b"\0") is (optimized and warm)
+                    assert not payload.startswith(b"\0")
                     restored = p._load_process_result(payload, parent)
                     assert type(restored) is tr.TokenizedTrajectory
                     answer = restored.tokens
                 outcomes.append((events, answer))
         finally:
-            p._process_schema_models.cache_clear()
+            clear_schema_cache()
     assert outcomes[0] == outcomes[1]
     assert outcomes[0][0] == []
 
@@ -2734,7 +2741,7 @@ def test_assignment_metadata_keys_preserve_ordinary_callbacks(
                 Key(key) if key == "model_field" else key: value
                 for key, value in authority.items()
             }
-        p._process_schema_models.cache_clear()
+        clear_schema_cache()
         if warm:
             p._process_schema_models()
         try:
@@ -2761,7 +2768,7 @@ def test_assignment_metadata_keys_preserve_ordinary_callbacks(
                     answer = pickle.loads(payload).tokens
                 outcomes.append((events, answer))
         finally:
-            p._process_schema_models.cache_clear()
+            clear_schema_cache()
     assert outcomes[0] == outcomes[1]
     assert outcomes[0][0] == []
 
@@ -2781,7 +2788,7 @@ def test_standard_typing_aliases_and_metadata_keys_keep_source_elision(annotatio
     parent, result = fixture()
     field = copy.copy(tr.TokenizedTrajectory.model_fields["tokens"])
     field.annotation = annotation
-    p._process_schema_models.cache_clear()
+    clear_schema_cache()
     try:
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(
@@ -2800,4 +2807,89 @@ def test_standard_typing_aliases_and_metadata_keys_keep_source_elision(annotatio
             assert payload.startswith(b"\0")
             assert p._deserialize_process_result(payload, parent).trajectory is parent
     finally:
-        p._process_schema_models.cache_clear()
+        clear_schema_cache()
+
+
+@pytest.mark.parametrize("included", [False, True])
+@pytest.mark.parametrize("storage", ["field", "alias"])
+def test_schema_reachability_tracks_between_transfer_declarations(included, storage):
+    source = tr.ChatCompletionsMessageSource
+    field = copy.copy(tr.ChatCompletionsHistory.model_fields["message_sources"])
+    alias = cast(Any, typing.List[object]).copy_with((object,))
+    clear_schema_cache()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                tr.ChatCompletionsHistory,
+                "__pydantic_fields__",
+                {**tr.ChatCompletionsHistory.model_fields, "message_sources": field},
+            )
+            for present in (included, not included, included):
+                child = source if present else object
+                if storage == "alias":
+                    alias.__args__ = (child,)
+                    field.annotation = alias
+                else:
+                    field.annotation = list[child]
+                assert (source in p._process_schema_models()) is present
+    finally:
+        clear_schema_cache()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_schema_changes_between_transfers_preserve_parent_callbacks_under_spawn(raises):
+    parents = [fixture()[0] for _ in range(2)]
+    source = tr.ChatCompletionsMessageSource
+    field = copy.copy(tr.ChatCompletionsHistory.model_fields["message_sources"])
+    field.annotation = list[object]
+    clear_schema_cache()
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                tr.ChatCompletionsHistory,
+                "__pydantic_fields__",
+                {**tr.ChatCompletionsHistory.model_fields, "message_sources": field},
+            )
+            assert source not in p._process_schema_models()
+        calls = []
+        original_error = RuntimeError("parent source callback")
+
+        def assign(owner, exchange):
+            calls.append("exchange")
+            if raises:
+                raise original_error
+            owner.__dict__["exchange"] = exchange
+
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                source,
+                "exchange",
+                property(lambda owner: owner.__dict__["exchange"], assign),
+                raising=False,
+            )
+            payload = p._process_payloads(
+                [parents[0]], p._ProcessOptions(False, False, None, None, None, None)
+            )[0]
+            with ProcessPoolExecutor(
+                max_workers=1, mp_context=p._process_context()
+            ) as pool:
+                encoded, ordinary, worker_plain = pool.submit(
+                    _spawn_result_pair, payload
+                ).result(timeout=30)
+            outcomes = []
+            for packed, parent in ((ordinary, parents[1]), (encoded, parents[0])):
+                calls.clear()
+                try:
+                    restored = p._deserialize_process_result(packed, parent)
+                    assert type(restored) is tr.TokenizedTrajectory
+                    outcome = ("success", restored.tokens)
+                except p._ProcessTransferError as error:
+                    outcome = ("error", str(error), error.__cause__ is original_error)
+                outcomes.append((list(calls), outcome))
+            assert outcomes[0] == outcomes[1]
+            assert outcomes[0][0] == ["exchange"]
+            assert not unpack_test_payload(payload)[1].source_refs_allowed
+            assert worker_plain
+            assert not encoded.startswith(b"\0")
+    finally:
+        clear_schema_cache()
