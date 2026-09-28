@@ -4501,6 +4501,21 @@ class TrainerRank:
         routed: tuple[int | None, ...],
         layouts: tuple[_GroupLayout, ...],
     ) -> tuple[int, int]:
+        """The largest rank's boundaries and the rest of the largest rank total.
+
+        The two sum to the largest of ``_layout_checkpoint_rank_floors``' totals.
+        """
+        floors = self._layout_checkpoint_rank_floors(layers, refs, routed, layouts)
+        retained = max(retained for retained, _ in floors)
+        return retained, max(map(sum, floors)) - retained
+
+    def _layout_checkpoint_rank_floors(
+        self,
+        layers: Sequence[torch.nn.Module],
+        refs: tuple["LoRASlotRef | None", ...],
+        routed: tuple[int | None, ...],
+        layouts: tuple[_GroupLayout, ...],
+    ) -> tuple[tuple[int, int], ...]:
         """Each CP rank's boundaries and recomputed layer on its own layouts.
 
         A saved layer input arrives in the GDN layout when the layer follows a
@@ -4510,8 +4525,7 @@ class TrainerRank:
         backward; a GDN layer keeps the GDN width on its GDN rows. Either one's
         residual, norm, routing state and MoE stage use that layer's rows, and
         routed rows the EP share. Traced CP2 ranks: boundaries match exactly and
-        attention within 0.3%. Returns the largest rank's boundaries and the
-        rest of the largest rank total, so the two sum to that total.
+        attention within 0.3%. Returns each rank's (boundaries, workspace).
         """
         hidden = self._hidden_size * 2
         gdn_inputs = sum(
@@ -4525,8 +4539,7 @@ class TrainerRank:
         widths = self._recomputed_mixer_widths(stage_buffers=False)
         moe = self._checkpoint_moe_bytes_per_token()
         beside = 2 * hidden + self._moe_checkpoint_state_bytes_per_token() if moe else 0
-        retained_by_rank: list[int] = []
-        totals: list[int] = []
+        floors: list[tuple[int, int]] = []
         for rank in range(len(layouts[0].attention_rows)):
             retained = workspace = 0
             for ref, dispatched, layout in zip(refs, routed, layouts, strict=True):
@@ -4554,13 +4567,9 @@ class TrainerRank:
                         )
                     )
                     workspace = max(workspace, stage)
-            retained_by_rank.append(retained)
-            totals.append(retained + workspace)
-        retained = max(retained_by_rank)
-        workspace = max(totals) - retained
-        if moe:
-            workspace += self._te_workspace_growth_bytes()
-        return retained, workspace
+            floors.append((retained, workspace))
+        growth = self._te_workspace_growth_bytes() if moe else 0
+        return tuple((retained, workspace + growth) for retained, workspace in floors)
 
     def _layout_pricing_supported(
         self, topology: tuple[int, int, int, int], *, gradient_groups: bool
@@ -4923,25 +4932,15 @@ class TrainerRank:
         """Each decoder layer's saved-boundary bytes within the floor's retained term."""
         return (retained // self._num_layers,) * self._num_layers
 
-    def _checkpoint_layer_boundary_sets(
-        self,
-        retained: int,
-        group_rows: tuple[tuple[int, bool], ...],
-        layouts: tuple[_GroupLayout, ...] | None,
+    def _layout_layer_boundaries(
+        self, layouts: tuple[_GroupLayout, ...]
     ) -> tuple[tuple[int, ...], ...]:
-        """Each rank's saved-boundary bytes per decoder layer, as the floor prices them.
+        """Each CP rank's saved-boundary bytes per decoder layer on its layouts.
 
-        On per-rank CP layouts (``_layout_checkpoint_floor``) a layer saves its
+        As ``_layout_checkpoint_rank_floors`` prices them: a layer saves its
         input in the GDN layout when it follows a GDN layer in its island and in
-        the attention layout otherwise, on that rank's rows. Elsewhere every
-        layer saves an equal share of the floor's ``retained``.
+        the attention layout otherwise, on that rank's rows.
         """
-        if (
-            layouts is None
-            or self._topology_key()[1] > 1
-            or not all(grad for _, grad in group_rows)
-        ):
-            return (self._checkpoint_layer_boundaries(retained),)
         decoder = _language_model(self.runtime.model[0]).decoder
         gdn_inputs = [
             getattr(
@@ -4964,6 +4963,62 @@ class TrainerRank:
                 tuple(hidden * (gdn if is_gdn else attention) for is_gdn in gdn_inputs)
             )
         return tuple(sets)
+
+    def _checkpoint_adapter_gradient_extra(
+        self,
+        slots: frozenset["LoRASlotRef"],
+        floor: tuple[int, int],
+        group_rows: tuple[tuple[int, bool], ...],
+        slot_refs: tuple["LoRASlotRef | None", ...] | None,
+        routed_rows: tuple[int, ...] | None,
+        layouts: tuple[_GroupLayout, ...] | None,
+    ) -> int:
+        """Adapter gradients at the recompute backward's peak beyond ``floor``.
+
+        ``floor`` is ``_checkpoint_memory_floor``'s (boundaries, workspace).
+        Every layer saves an equal share of its boundaries, except on per-rank
+        CP layouts (``_layout_checkpoint_floor``), where each rank releases its
+        own (``_layout_layer_boundaries``). A rank with fewer rows releases less
+        as backward proceeds, so its extra is larger, but its own floor is
+        smaller by what it never saved. Pair each rank's extra with its own
+        boundaries plus the larger of its workspace and the floor's, which
+        bounds that rank's floor, so a short CP2 sequence (all GDN rows on one
+        rank) does not add one rank's extra to the other's floor.
+        """
+        retained, workspace = floor
+        if (
+            layouts is None
+            or self._topology_key()[1] > 1
+            or not all(grad for _, grad in group_rows)
+        ):
+            return self._checkpoint_adapter_gradient_bytes(
+                slots, self._checkpoint_layer_boundaries(retained)
+            )
+        extras = [
+            self._checkpoint_adapter_gradient_bytes(slots, boundaries)
+            for boundaries in self._layout_layer_boundaries(layouts)
+        ]
+        if not any(extras):
+            return 0
+        floors = self._layout_checkpoint_rank_floors(
+            _language_model(self.runtime.model[0]).decoder.layers,
+            (None,) * len(group_rows) if slot_refs is None else slot_refs,
+            (None,) * len(group_rows) if routed_rows is None else routed_rows,
+            layouts,
+        )
+        # No rank's pairing exceeds the floor, so every rank's own floor plus
+        # its extra fits within the floor plus this.
+        return max(
+            0,
+            max(
+                rank_retained + max(rank_workspace, workspace) + extra
+                for (rank_retained, rank_workspace), extra in zip(
+                    floors, extras, strict=True
+                )
+            )
+            - retained
+            - workspace,
+        )
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
         return self._subforward_cost(
@@ -5036,13 +5091,14 @@ class TrainerRank:
         # forward retention, including the cold fallback above.
         gradient = self._checkpoint_input_gradient_bytes(group_rows, slot_refs)
         gradient_slots = self._gradient_slots(group_rows, slot_refs)
-        # The busiest rank's extra, over each rank's own boundaries.
         adapter_gradient = (
-            max(
-                self._checkpoint_adapter_gradient_bytes(gradient_slots, boundaries)
-                for boundaries in self._checkpoint_layer_boundary_sets(
-                    checkpoint_retained, group_rows, group_layouts
-                )
+            self._checkpoint_adapter_gradient_extra(
+                gradient_slots,
+                (checkpoint_retained, checkpoint_workspace),
+                group_rows,
+                slot_refs,
+                group_routed_rows,
+                group_layouts,
             )
             if gradient
             else 0
@@ -8880,13 +8936,13 @@ class TrainerRank:
             # as _subforward_cost.
             backward = self._checkpoint_input_gradient_bytes(
                 group_rows, slot_refs
-            ) + max(
-                self._checkpoint_adapter_gradient_bytes(
-                    self._gradient_slots(group_rows, slot_refs), boundaries
-                )
-                for boundaries in self._checkpoint_layer_boundary_sets(
-                    retained, group_rows, group_layouts
-                )
+            ) + self._checkpoint_adapter_gradient_extra(
+                self._gradient_slots(group_rows, slot_refs),
+                (retained, workspace),
+                group_rows,
+                slot_refs,
+                group_routed_rows,
+                group_layouts,
             )
             if profiled is None and any(grad for _, grad in group_rows):
                 backward += _COLD_RECOMPUTE_TRANSIENT_BYTES
