@@ -248,6 +248,7 @@ def test_emission_canonicalization_ignores_default_device(
     original = plan.groups[0].items[0].input_ids.tolist()
     replay = _snapshot(rank, plan)
     cpu = torch.Tensor.cpu
+    cuda_initialized = torch.cuda.is_initialized()
 
     def no_readback(value, *args, **kwargs):
         assert value.device.type == "cpu", "Diagnostic device readback"
@@ -261,5 +262,52 @@ def test_emission_canonicalization_ignores_default_device(
     assert payload["layouts"][0]["expected_fingerprint"] == (
         plan.groups[0].layout.fingerprint
     )
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == cuda_initialized
+    rank.finish_planner_observation()
+
+
+@pytest.mark.parametrize("inference", [False, True])
+@pytest.mark.parametrize("changed_before_observation", [False, True])
+def test_partial_group_inputs_are_not_claimed_as_selected(
+    monkeypatch, tmp_path, inference, changed_before_observation
+):
+    rank = _rank(monkeypatch)
+    rank._planner_reporter = Reporter(10, spool_dir=tmp_path)
+    with torch.inference_mode() if inference else nullcontext():
+        requests = [_request(0), _request(1), replace(_request(2), no_grad=True)]
+    plan = rank._plan_flat_forward(requests)
+    assert [len(group.items) for group in plan.groups] == [2, 1]
+    assert plan.groups[1].layout is not None
+    first, second = plan.groups[0].items
+    unaffected = plan.groups[1].items[0].input_ids.tolist()
+    if changed_before_observation:
+        with torch.inference_mode(inference):
+            first.input_ids[0] += 1
+    replay = _snapshot(rank, plan)
+    with torch.inference_mode(inference):
+        second.input_ids[0] += 1
+    payload = replay()
+    assert payload["requests"][0]["input_tokens"] == {
+        "unavailable": "selected_layout_input_unverified"
+    }
+    assert payload["requests"][1]["input_tokens"]["unavailable"] == "modified_input"
+    assert payload["requests"][2]["input_tokens"] == unaffected
+    assert len(payload["layouts"]) == 1
+    assert payload["layouts"][0]["expected_fingerprint"] == (
+        plan.groups[1].layout.fingerprint
+    )
+    assert "layout_inputs_unavailable" in payload["incomplete_reasons"]
+    assert "selected_layout_input_unverified" in payload["incomplete_reasons"]
+    rank.finish_planner_observation()
+
+
+def test_missing_layout_does_not_certify_observed_inputs(monkeypatch, tmp_path):
+    rank, plan = _plan(monkeypatch, tmp_path)
+    plan = replace(plan, groups=(replace(plan.groups[0], layout=None),))
+    payload = _snapshot(rank, plan)()
+    assert payload["requests"][0]["input_tokens"] == {
+        "unavailable": "selected_layout_input_unverified"
+    }
+    assert payload["layouts"] == []
+    assert "selected_layout_unavailable" in payload["incomplete_reasons"]
     rank.finish_planner_observation()

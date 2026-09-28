@@ -1568,10 +1568,13 @@ def _fill_planner_snapshot(
                     for item in requests[cursor : cursor + len(group.items)]
                 ]
                 cursor += len(group.items)
+                reason = None
                 if group.layout is None:
                     incomplete.add("selected_layout_unavailable")
+                    reason = "selected_layout_input_unverified"
                 elif not all(isinstance(row, list) for row in rows):
                     incomplete.add("layout_inputs_unavailable")
+                    reason = "selected_layout_input_unverified"
                 elif (
                     build_canonical_prefix_tree(
                         _impl.torch.tensor(row, dtype=_impl.torch.long, device="cpu")
@@ -1582,11 +1585,7 @@ def _fill_planner_snapshot(
                     # Inputs may have changed after the selected layout was
                     # materialized but before observation started. Never pair
                     # later rows with that layout's immutable fingerprint.
-                    incomplete.add("selected_layout_input_mismatch")
-                    for item in requests[cursor - len(group.items) : cursor]:
-                        item["input_tokens"] = {
-                            "unavailable": "selected_layout_input_mismatch"
-                        }
+                    reason = "selected_layout_input_mismatch"
                 else:
                     layouts.append(
                         {
@@ -1598,6 +1597,13 @@ def _fill_planner_snapshot(
                             "expected_packed_tokens": group.layout.packed_tokens,
                         }
                     )
+                if reason is not None:
+                    for item in requests[cursor - len(group.items) : cursor]:
+                        if isinstance(item["input_tokens"], list):
+                            # A group fingerprint cannot certify a partial row
+                            # inventory. Keep more precise sibling omissions.
+                            incomplete.add(reason)
+                            item["input_tokens"] = {"unavailable": reason}
             return {
                 "memory_replay": {"rank": rank_fields, "estimates": estimates},
                 "layouts": layouts,

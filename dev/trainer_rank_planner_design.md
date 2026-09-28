@@ -952,7 +952,10 @@ rank and driver need the updated ART validator. Old format-1 JSON remains readab
 
 Capture suppression also skips the early input snapshots. Emission checks the
 current device again before any equality or materialization. Bounded CPU rows
-are checked against the selected layout's canonical tree fingerprint; a
+are checked against the selected layout's canonical tree fingerprint.
+`selected_layout_input_unverified` omits available rows when any sibling input
+or the selected layout is unavailable: a group fingerprint cannot certify a
+partial inventory. Other groups and precise sibling omission reasons remain.
 `selected_layout_input_mismatch` omits rows and the layout when the input changed
 between planning and observation. These checks cannot reconstruct absent grouped
 estimator facts and do not mark those reports replay-complete.
