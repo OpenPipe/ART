@@ -23,9 +23,6 @@ from .traceback import streamline_tracebacks
 if mp.get_start_method(allow_none=True) != "spawn":
     mp.set_start_method("spawn", force=True)
 
-nest_asyncio.apply()
-
-
 T = TypeVar("T")
 
 # Special ID to signal shutdown
@@ -368,6 +365,7 @@ def _target(
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
         sys.stdout = sys.stderr = open(log_file, "a", buffering=1)
+    nest_asyncio.apply()
     asyncio.run(_handle_requests(obj, requests, responses))
 
 
