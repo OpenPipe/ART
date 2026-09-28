@@ -4874,7 +4874,7 @@ def _tokenization_context(
             return kind, scalar, instance_state(item, getattr(item, "__dict__", None))
         if kind in (list, tuple):
             result = kind, tuple(snapshot(child) for child in cast(Sequence, item))
-        elif kind is dict or isinstance(item, Mapping):
+        elif type(item) is dict or isinstance(item, Mapping):
             result = (
                 kind,
                 tuple((snapshot(key), snapshot(child)) for key, child in item.items()),
