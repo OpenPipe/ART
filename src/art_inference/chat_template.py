@@ -203,22 +203,21 @@ def _without_inline_reasoning_parser(template: str) -> str:
         )
 
     def reads_content(node: nodes.Node) -> bool:
-        # A macro/context-aware callable may capture this binding without a
-        # Name at the call site. Do not move its trim across an unknown call.
-        if isinstance(node, nodes.Call) or any(node.find_all(nodes.Call)):
-            return True
-        return (
-            isinstance(node, nodes.Name)
-            and node.name == "content"
-            and node.ctx == "load"
-        ) or any(
-            n.name == "content" and n.ctx == "load" for n in node.find_all(nodes.Name)
+        # Only a plain constant assignment is binding-transparent. Calls,
+        # filters/tests, loaders, attributes/items, operators and even output
+        # conversion/finalization may invoke code that observes this scope.
+        # Keep the trim for unknown nodes instead of enumerating callbacks.
+        return not (
+            isinstance(node, nodes.Assign)
+            and isinstance(node.target, nodes.Name)
+            and node.target.name != "message"
+            and isinstance(node.node, nodes.Const)
         )
 
     def assistant_condition(test: nodes.Node) -> bool | None:
         # The rewrite changes assistant content only. Ignore paths proved to
-        # handle a different role, but inspect every unknown branch for users
-        # of the original trimmed value before the destructive parser.
+        # handle a different role in an ordinary chat message dictionary.
+        # Every unknown condition retains the original trimmed binding.
         if (
             isinstance(test, nodes.Compare)
             and test.expr
@@ -252,9 +251,9 @@ def _without_inline_reasoning_parser(template: str) -> str:
                 # If does not introduce a Jinja scope. Retain every binding
                 # reaching the join, including paths that skipped the parser.
                 for branch in (node, *node.elif_):
-                    if reads_content(branch.test):
-                        shared.update(bindings)
                     condition = assistant_condition(branch.test)
+                    if condition is None:
+                        shared.update(bindings)
                     if condition is not False:
                         joined.update(visit(branch.body, bindings))
                     if condition is True:

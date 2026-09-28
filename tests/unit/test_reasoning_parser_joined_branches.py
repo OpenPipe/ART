@@ -62,7 +62,7 @@ def test_joined_preview_retains_its_original_trim(scope, layout, content):
 
 
 @pytest.mark.parametrize("mode", ["a", "b", "c"])
-def test_all_joined_paths_consuming_parser_can_preserve_assistant_whitespace(mode):
+def test_unknown_comparison_keeps_shared_trim_even_when_all_paths_have_parser(mode):
     match = _QWEN_INLINE_REASONING.search(_TEMPLATE)
     assert match is not None
     parser = match.group()
@@ -84,6 +84,6 @@ def test_all_joined_paths_consuming_parser_can_preserve_assistant_whitespace(mod
         env.from_string(fixed).render(
             mode=mode, message={"role": "assistant", "content": content}
         )
-        == "[" + content + "]"
+        == "[" + content.strip() + "]"
     )
     assert _without_inline_reasoning_parser(fixed) == fixed
