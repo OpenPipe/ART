@@ -240,6 +240,9 @@ jobs:
             tests/unit/test_trainer_rank_slot_memory.py \
             tests/unit/test_trainer_rank_moe_memory.py \
             tests/unit/test_trainer_rank_head_memory.py \
+            tests/unit/test_grouped_planner_replay.py \
+            tests/unit/test_planner_runtime_fact_guards.py \
+            tests/unit/test_planner_replay_owner_budget.py \
             tests/unit/test_trainer_rank_mixed_head_memory.py \
             tests/unit/test_trainer_rank_ignored_mixed_head.py \
             tests/unit/test_trainer_rank_pending_memory.py \
@@ -291,6 +294,9 @@ jobs:
             --ignore=tests/unit/test_trainer_rank_slot_memory.py \
             --ignore=tests/unit/test_trainer_rank_moe_memory.py \
             --ignore=tests/unit/test_trainer_rank_head_memory.py \
+            --ignore=tests/unit/test_grouped_planner_replay.py \
+            --ignore=tests/unit/test_planner_runtime_fact_guards.py \
+            --ignore=tests/unit/test_planner_replay_owner_budget.py \
             --ignore=tests/unit/test_trainer_rank_mixed_head_memory.py \
             --ignore=tests/unit/test_trainer_rank_ignored_mixed_head.py \
             --ignore=tests/unit/test_trainer_rank_pending_memory.py \

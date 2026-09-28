@@ -336,6 +336,11 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
     }
     assert result["layouts"][0]["matches"]
     assert result["source_matches"] is True
+    neutral = json.loads(path.read_bytes())
+    neutral["replay"]["memory_replay"]["estimates"][0]["arguments"].update(
+        slot_refs=None, head_workspace_bytes=0, checkpoint_floor=[0, 0]
+    )
+    assert reports.replay(neutral) == result
     for field in (
         "local_admission_peak_bytes",
         "split_memory_floor_bytes",
@@ -413,7 +418,7 @@ def test_incomplete_replay_refuses(tmp_path):
 
 
 @pytest.mark.parametrize("floor", [0, 10_000])
-def test_actual_emitted_split_retains_evidence_but_refuses_missing_runtime_facts(
+def test_actual_emitted_split_recomputes_frozen_runtime_facts(
     monkeypatch, tmp_path, floor
 ):
     from test_trainer_rank_split import _rank
@@ -463,8 +468,8 @@ def test_actual_emitted_split_retains_evidence_but_refuses_missing_runtime_facts
     rank._complete_planner_observation(phase="forward")
     [path] = list(rank._planner_reporter.spool_dir.glob("*.json"))
     original = reports.validate_report(path.read_bytes())
-    assert original["replay_complete"] is False
-    assert "immutable runtime" in original["incomplete_reasons"][0]
+    assert original["replay_complete"] is True
+    assert original["incomplete_reasons"] == []
     snapshot = original["replay"]
     assert snapshot["memory_replay"]["rank"]["moe_forward_stages"] == []
     assert len(snapshot["layouts"]) == 2
@@ -473,16 +478,17 @@ def test_actual_emitted_split_retains_evidence_but_refuses_missing_runtime_facts
     assert [
         item["cost_components"] for item in snapshot["memory_replay"]["estimates"]
     ] == [asdict(cost) for cost in costs]
-    with pytest.raises(ValueError, match="immutable runtime"):
-        reports.replay(original)
+    replayed = reports.replay(original)
+    assert replayed["aggregate"]["matches"]
+    assert all(item["matches"] for item in replayed["estimates"] + replayed["layouts"])
     monkeypatch.setattr("sys.argv", ["planner-replay", str(path)])
-    with pytest.raises(ValueError, match="immutable runtime"):
-        reports.main()
+    reports.main()
     # Flipping the top-level completeness bit cannot authorize missing facts,
     # including a family whose observed checkpoint floor happened to be zero.
     original["replay_complete"] = True
     for item in snapshot["memory_replay"]["estimates"]:
         item["missing_inputs"] = []
+        del item["runtime_facts"]
     with pytest.raises(ValueError, match="immutable runtime"):
         reports.replay(original)
 

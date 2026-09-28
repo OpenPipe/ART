@@ -322,21 +322,30 @@ def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
             return 0, 0
         layers, shapes = model
         if not group.grad_enabled:
-            # Earlier gradient groups remain live during a later reference
-            # group. Only its existing MoE component enters this stage.
             workspace = max(
                 workspace, rank._moe_workspace_bytes(rows, slot_ref=group.slot_ref)
             )
             continue
-        buckets = cp1_buckets(group.packed.segments)
-        if sum(s.length for s in group.packed.segments) != rows:
-            raise ValueError("GDN packed rows disagree with segment geometry")
-        retained += rows * layers * rank._hidden_size * 2
+        saved, pending = pending_floor(
+            rank._hidden_size, rows, layers, shapes, group.packed.segments
+        )
+        retained += saved
         moe = rank._moe_workspace_bytes(
             rows, checkpoint_grad=True, slot_ref=group.slot_ref
         )
-        workspace = max(
-            workspace,
-            *(moe + s.pending(rows, buckets) for s in shapes),
-        )
+        workspace = max(workspace, moe + pending)
     return retained, workspace
+
+
+def pending_floor(
+    hidden: int,
+    rows: int,
+    layers: int,
+    shapes: tuple[Shape, ...],
+    segments: Sequence[Any],
+) -> tuple[int, int]:
+    """Shared CPU arithmetic over admitted dimensions and segment metadata."""
+    buckets = cp1_buckets(segments)
+    if sum(s.end - s.start for s in segments) != rows:
+        raise ValueError("GDN packed rows disagree with segment geometry")
+    return rows * layers * hidden * 2, max(s.pending(rows, buckets) for s in shapes)

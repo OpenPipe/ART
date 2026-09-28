@@ -45,9 +45,7 @@ def test_inference_cpu_inputs_retain_original_layout(
         payload["layouts"][0]["expected_fingerprint"]
         == plan.groups[0].layout.fingerprint
     )
-    assert payload["incomplete_reasons"] == [
-        "immutable runtime group/slot, head, checkpoint and GDN facts"
-    ]
+    assert payload["incomplete_reasons"] == []
     rank._planner_reporter.report(
         predicted_peak_bytes=1000,
         observed_peak_bytes=2000,
@@ -55,7 +53,7 @@ def test_inference_cpu_inputs_retain_original_layout(
         replay_factory=replay,
     )
     [path] = list(tmp_path.glob("*.json"))
-    assert validate_report(path.read_bytes())["replay_complete"] is False
+    assert validate_report(path.read_bytes())["replay_complete"] is True
     rank.finish_planner_observation()
 
 
@@ -345,8 +343,5 @@ def test_empty_storage_replacement_retains_other_replay_metadata(
     assert retained["requests"][1]["input_tokens"] == (
         plan.groups[1].items[0].input_ids.tolist()
     )
-    assert (
-        "immutable runtime group/slot, head, checkpoint and GDN facts"
-        in (report["incomplete_reasons"])
-    )
+    assert not any("runtime_facts" in reason for reason in report["incomplete_reasons"])
     rank.finish_planner_observation()
