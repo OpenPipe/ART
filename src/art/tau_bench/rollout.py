@@ -34,6 +34,7 @@ async def rollout(
     /,
     *,
     client: TauBenchClient | None = None,
+    idle_timeout_seconds: float | None = None,
     max_turns: int | None = None,
     chat_completion_kwargs: dict[str, Any] | None = None,
     user_model_name: str = "gpt-4.1-2025-04-14",
@@ -53,6 +54,7 @@ async def rollout(
     /,
     *,
     client: TauBenchClient | None = None,
+    idle_timeout_seconds: float | None = None,
     base_model: str | None = None,
     max_turns: int | None = None,
     chat_completion_kwargs: dict[str, Any] | None = None,
@@ -72,6 +74,7 @@ async def rollout(
     /,
     *,
     client: TauBenchClient | None = None,
+    idle_timeout_seconds: float | None = None,
     base_model: str | None = None,
     max_turns: int | None = None,
     chat_completion_kwargs: dict[str, Any] | None = None,
@@ -84,6 +87,12 @@ async def rollout(
     started = time.perf_counter()
     client = _get_default_client(client)
     task_id = scenario.task.id
+    if (
+        idle_timeout_seconds is None
+        and isinstance(base_url_or_model, str)
+        and (chat_completion_kwargs is None or "timeout" not in chat_completion_kwargs)
+    ):
+        idle_timeout_seconds = _STRING_POLICY_ENV_IDLE_TIMEOUT_SECONDS
     async with client.environment(
         domain=scenario.domain,
         task_id=task_id,
@@ -95,15 +104,7 @@ async def rollout(
         ),
         retrieval_config=retrieval_config,
         retrieval_config_kwargs=retrieval_config_kwargs,
-        idle_timeout_seconds=(
-            _STRING_POLICY_ENV_IDLE_TIMEOUT_SECONDS
-            if isinstance(base_url_or_model, str)
-            and (
-                chat_completion_kwargs is None
-                or "timeout" not in chat_completion_kwargs
-            )
-            else None
-        ),
+        idle_timeout_seconds=idle_timeout_seconds,
     ) as env:
         environment_startup = time.perf_counter() - started
         chat_completion_kwargs = dict(chat_completion_kwargs or {})
