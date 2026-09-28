@@ -218,6 +218,10 @@ def _without_inline_reasoning_parser(template: str) -> str:
     }
     if any(
         not isinstance(node, allowed)
+        # Parameters and their local aliases can refer to the caller's message.
+        # Only the already-proven private counters may be mutated here.
+        or isinstance(node, nodes.NSRef)
+        and node.name not in counters
         or isinstance(node, nodes.Call)
         and not (
             node.node == nodes.Name("raise_exception", "load")
