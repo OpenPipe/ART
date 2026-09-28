@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager, nullcontext
 import gc
 from types import SimpleNamespace
@@ -505,4 +506,90 @@ def test_replay_failure_discards_transaction_and_releases_participating_records(
     assert parameter.grad.item() == 7
     assert snapshot.grad is None
     assert not trainer._version_state()._origins
+    assert cache.handles() == ()
+
+
+@pytest.mark.parametrize("failure_type", [MemoryError, asyncio.CancelledError])
+@pytest.mark.parametrize("retention", ["gpu", "cpu", "replay"])
+@pytest.mark.parametrize("copy_index", [1, 2])
+def test_initial_output_copy_failure_releases_only_failed_graph(
+    monkeypatch, failure_type, retention, copy_index
+):
+    from art.trainer_rank._graphs import _ForwardRecord
+
+    trainer = TrainerRank.__new__(TrainerRank)
+    parameter = torch.nn.Parameter(torch.tensor(2.0))
+    trainer._checkpoint_slots = {"student": _CheckpointSlot(params=(parameter,))}
+    trainer.runtime = SimpleNamespace(model=[], optimizer=None)
+    cache = GraphCache()
+    older = torch.nn.Parameter(torch.tensor(3.0))
+    old_handle, (old_output,) = cache.run(lambda _: (older.square(),), None)
+    old_record = weakref.ref(cache._records[old_handle])
+    records, physical, saved, snapshots, versions, copies = [], [], [], [], [], []
+    primary = failure_type("initial output copy failed")
+    primary.__cause__ = cause = RuntimeError("original cause")
+    run, to = _ForwardRecord.run, torch.Tensor.to
+    attempted = 0
+
+    def arguments():
+        version = trainer._capture_checkpoint_version("student")
+        snapshot = trainer._snapshot_parameter(parameter, version)
+        snapshots.append(weakref.ref(snapshot))
+        versions.append(weakref.ref(version))
+        return dict(
+            execute=lambda x: (snapshot * x, snapshot.square()),
+            inputs=torch.tensor(3.0),
+            context_factory=lambda: nullcontext(snapshot),
+            validate_backward=lambda: trainer._version_state().validate(version),
+            checkpoint_versions=(version,),
+            keep_on_device=lambda value: value is snapshot,
+            retention=retention,
+        )
+
+    def observe(record):
+        outputs = run(record)
+        records.append(weakref.ref(record))
+        physical.extend(weakref.ref(output) for output in outputs)
+        saved.extend(record.saved or ())
+        return outputs
+
+    def fail_copy(value, *args, **kwargs):
+        nonlocal attempted
+        if kwargs.get("copy") and "device" in kwargs:
+            attempted += 1
+            if attempted == copy_index:
+                # The injected hook must not add its own tensor owner to the
+                # retained traceback; only ART's failed attempt is under test.
+                del value
+                raise primary
+            result = to(value, *args, **kwargs)
+            copies.append(weakref.ref(result))
+            return result
+        return to(value, *args, **kwargs)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(_ForwardRecord, "run", observe)
+        failure.setattr(torch.Tensor, "to", fail_copy)
+        with pytest.raises(failure_type) as caught:
+            cache.run(**arguments())
+    assert caught.value is primary and primary.__cause__ is cause
+    assert primary.__traceback__ is not None and attempted == copy_index
+    assert len(records) == len(snapshots) == len(versions) == 1
+    assert len(physical) == 2 and saved and len(copies) == copy_index - 1
+    assert cache.handles() == (old_handle,)
+    assert cache._records[old_handle] is old_record()
+    assert all(
+        reference() is None
+        for reference in (*records, *physical, *saved, *snapshots, *versions, *copies)
+    )
+    assert parameter.grad is None
+    assert old_output.item() == 9 and old_output.requires_grad
+    cache.backward(old_handle, (torch.tensor(1.0),))
+    torch.testing.assert_close(older.grad, torch.tensor(6.0))
+
+    handle, outputs = cache.run(**arguments())
+    assert tuple(output.item() for output in outputs) == (6, 4)
+    with trainer._gradient_transaction():
+        cache.backward(handle, (torch.tensor(1.0), torch.tensor(1.0)))
+    torch.testing.assert_close(parameter.grad, torch.tensor(7.0))
     assert cache.handles() == ()

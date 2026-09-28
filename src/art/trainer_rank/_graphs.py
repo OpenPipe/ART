@@ -232,6 +232,17 @@ class _ForwardRecord:
     )
     execution_peak_bytes: int = 0
 
+    def release(self) -> None:
+        # Saved-variable hooks can outlive their Python outputs. Break all
+        # ownership edges even when a caller retains a failure traceback.
+        self.outputs = self.saved = self.resident = None
+        self.restored.clear()
+        self.inputs = self.corrections = None
+        self.execute = lambda _: ()
+        self.context_factory = nullcontext
+        self.validate_backward = self.current_context_factory = None
+        self.is_stale = self.keep_on_device = None
+
     def run(
         self,
         *,
@@ -370,12 +381,25 @@ class GraphCache:
             for value in physical
         )
         # clone: a detached view may still pin a much larger model activation.
-        detached = tuple(
-            value.detach()
-            .to(device=output_device, copy=True)
-            .requires_grad_(value.requires_grad)
-            for value in physical
-        )
+        copied: list[torch.Tensor] = []
+        value = None
+        try:
+            for value in physical:
+                copied.append(
+                    value.detach()
+                    .to(device=output_device, copy=True)
+                    .requires_grad_(value.requires_grad)
+                )
+            detached = tuple(copied)
+        except BaseException:
+            record.release()
+            copied.clear()
+            # Unlike a generator expression, these output aliases can be
+            # cleared while preserving the caller's original traceback.
+            del record, physical, value
+            del execute, inputs, context_factory, validate_backward
+            del checkpoint_versions, options, rng_tracker, keep_on_device
+            raise
         handle = uuid4().hex
         self._records[handle] = record
         if retention == "replay":
@@ -476,15 +500,7 @@ class GraphCache:
 
     def release(self, handle: ForwardHandle) -> None:
         if (record := self._records.pop(handle, None)) is not None:
-            # Saved-variable hooks can outlive their Python outputs. Break all
-            # ownership edges even when a caller retains a failure traceback.
-            record.outputs = record.saved = record.resident = None
-            record.restored.clear()
-            record.inputs = record.corrections = None
-            record.execute = lambda _: ()
-            record.context_factory = nullcontext
-            record.validate_backward = record.current_context_factory = None
-            record.is_stale = record.keep_on_device = None
+            record.release()
 
     def backward(
         self,

@@ -1409,6 +1409,8 @@ def _fill_planner_snapshot(
                     missing = [
                         f"runtime_facts_unavailable:{_planner_replay.refusal_reason(error)}"
                     ]
+            if any(g.memory_placement is not None for g in child.groups):
+                missing.append("graph_placement_admission_unavailable")
             estimates.append(
                 {
                     "signature": asdict(child.signature),
