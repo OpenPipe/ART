@@ -24,6 +24,7 @@ def with_labels(plan, labels):
 def test_tensor_nesting_preserves_complete_surrounding_report(
     monkeypatch, tmp_path, inference, depth
 ):
+    cuda_before = torch.cuda.is_initialized()
     rank, plan = _plan(monkeypatch, tmp_path, inference=inference)
     original = plan.groups[0].items[0].input_ids.tolist()
     with torch.inference_mode() if inference else nullcontext():
@@ -57,7 +58,7 @@ def test_tensor_nesting_preserves_complete_surrounding_report(
         assert "token_nesting_over_limit" in report["incomplete_reasons"]
         assert report["replay_complete"] is False
     assert sys.getrecursionlimit() == before_limit
-    assert not torch.cuda.is_initialized()
+    assert torch.cuda.is_initialized() == cuda_before
 
 
 @pytest.mark.parametrize("shape", [(), (3,), (0,) + (1,) * 1999, (1, 0) + (1,) * 1998])
