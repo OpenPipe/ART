@@ -4891,7 +4891,15 @@ def _tokenization_context(
         previous = observed.get(identity)
         if previous is not None and previous[0] is item:
             return previous[1]
-        if kind in (str, int, bool, bytes, type(None), datetime, float):
+        if (
+            kind is str
+            or kind is int
+            or kind is bool
+            or kind is bytes
+            or kind is type(None)
+            or kind is datetime
+            or kind is float
+        ):
             result = kind, repr(item) if kind is float else item
             observed[identity] = item, result
             return result
@@ -4906,12 +4914,13 @@ def _tokenization_context(
             active.remove(identity)
 
     def snapshot_compound(item: object, kind: type, identity: int) -> object:
+        tag = type_tag(kind)
         if isinstance(item, Enum):
             if getattr(item, "__objclass__", kind) is not kind:
                 raise _UnsupportedTokenizationContext(
                     "Unsupported enum tokenization context"
                 )
-            return kind, instance_state(
+            return tag, instance_state(
                 item,
                 {
                     key: child
@@ -4928,12 +4937,12 @@ def _tokenization_context(
                 scalar = repr(float.__float__(item))
             else:
                 scalar = bytes.__bytes__(item)
-            return kind, scalar, instance_state(item, instance_dictionary(item))
-        if kind in (list, tuple, set, frozenset):
-            result = kind, tuple(snapshot(child) for child in cast(Iterable, item))
+            return tag, scalar, instance_state(item, instance_dictionary(item))
+        if kind is list or kind is tuple or kind is set or kind is frozenset:
+            result = tag, tuple(snapshot(child) for child in cast(Iterable, item))
         elif type(item) is dict or isinstance(item, Mapping):
             result = (
-                kind,
+                tag,
                 tuple((snapshot(key), snapshot(child)) for key, child in item.items()),
             )
             if kind is not dict:
@@ -4950,10 +4959,10 @@ def _tokenization_context(
                         ),
                     )
         elif isinstance(item, Exchange):
-            result = kind, identity, item.model, snapshot(item.request)
+            result = tag, identity, item.model, snapshot(item.request)
         elif isinstance(item, BaseModel):
             result = (
-                kind,
+                tag,
                 tuple(
                     (name, snapshot(getattr(item, name)))
                     for name in type(item).model_fields
@@ -4967,6 +4976,10 @@ def _tokenization_context(
             )
         observed[identity] = item, result
         return result
+
+    def type_tag(kind: type) -> object:
+        # Preserve class lifetime while comparing custom metaclasses by identity.
+        return kind if type(kind) is type else (id(kind), kind)
 
     def instance_dictionary(item: object) -> object:
         kind = type(item)
@@ -4997,9 +5010,9 @@ def _tokenization_context(
                     try:
                         child = descriptor.__get__(item, kind)
                     except AttributeError:
-                        slots.append((owner, name, False))
+                        slots.append((type_tag(owner), name, False))
                     else:
-                        slots.append((owner, name, True, snapshot(child)))
+                        slots.append((type_tag(owner), name, True, snapshot(child)))
         return snapshot(dictionary), tuple(slots)
 
     try:
@@ -6286,8 +6299,8 @@ class _ChatViewTokenizer:
         )
         if (
             pure_template
-            and type(tokenizer_template) in (str, type(None))
-            and type(template) in (str, type(None))
+            and (type(tokenizer_template) is str or tokenizer_template is None)
+            and (type(template) is str or template is None)
         ):
             # Plain unnamed template normalization has no tokenizer callback.
             template, normalization_template, defaults = _resolved_chat_template(
