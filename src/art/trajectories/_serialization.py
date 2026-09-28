@@ -348,7 +348,11 @@ def _rebind_history_sources(
             for item in value:
                 visit(item)
 
-    visit(history)
+    try:
+        visit(history)
+    finally:
+        # Break the recursive closure's ownership of completed source graphs.
+        del visit
 
 
 class _CompactModel(_StringInterningModel):
