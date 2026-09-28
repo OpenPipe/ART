@@ -167,3 +167,51 @@ def test_finalizer_can_reenter_source_rebinding(no_cyclic_gc):
     assert errors == []
     assert len(references) == 2
     assert all(reference() is None for reference in references)
+
+
+@dataclass
+class CopiedSource:
+    exchange: tr.ChatCompletionsExchange
+
+
+def _actual_rebind(mode: str):
+    canonical = _chat_exchange([1], [2])
+    canonical.request["metadata"] = {"tracked": Options(key=["stable"])}
+    copied = canonical.model_copy(deep=True)
+    canonical_ref = weakref.ref(canonical)
+    copied_ref = weakref.ref(copied)
+    sidecar = CopiedSource(copied)
+    target = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(chat_completions=[canonical])
+    )
+    if mode == "position":
+        source = tr.Trajectory(
+            exchanges=tr.TrajectoryExchanges(chat_completions=[copied])
+        )
+        _serialization._rebind_history_sources(
+            sidecar, target, source_trajectory=source
+        )
+    elif mode == "unfixed":
+        _serialization._rebind_history_sources(sidecar)
+    else:
+        if mode == "nan":
+            canonical.request["temperature"] = float("nan")
+            copied.request["temperature"] = float("nan")
+            assert canonical != copied
+        _serialization._rebind_history_sources(sidecar, target)
+    assert sidecar.exchange is (copied if mode == "unfixed" else canonical)
+    return canonical_ref, copied_ref, sidecar
+
+
+@pytest.mark.parametrize("mode", ["position", "equal", "nan", "unfixed"])
+def test_actual_rebinding_releases_detached_and_canonical_sources(no_cyclic_gc, mode):
+    canonical, copied, sidecar = _actual_rebind(mode)
+    if mode == "unfixed":
+        assert canonical() is None
+        assert sidecar.exchange is copied()
+    else:
+        assert copied() is None
+        assert sidecar.exchange is canonical()
+    del sidecar
+    assert canonical() is None
+    assert copied() is None
