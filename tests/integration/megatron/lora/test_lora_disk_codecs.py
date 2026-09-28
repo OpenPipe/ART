@@ -1590,8 +1590,9 @@ def test_runtime_resolution_failure_uses_trainer_failure_group(
 
 
 def _export_preparation_failure_worker(
-    rank: int, init_method: str, failure_site: str
+    rank: int, init_method: str, failure_case: tuple[str, int, int]
 ) -> None:
+    failure_site, failure_call, failing_rank = failure_case
     with (
         gloo_group(rank, init_method, timeout=10),
         pytest.MonkeyPatch.context() as monkeypatch,
@@ -1622,7 +1623,11 @@ def _export_preparation_failure_worker(
         def metadata(local: list[Any]) -> list[Any]:
             metadata_calls.append(local)
             result = canonical(local)
-            if rank == 0 and failure_site == "metadata":
+            if (
+                rank == failing_rank
+                and failure_site == "metadata"
+                and len(metadata_calls) == failure_call
+            ):
                 raise failure
             return result
 
@@ -1641,7 +1646,7 @@ def _export_preparation_failure_worker(
 
                 def collect_or_fail(*args: Any, **kwargs: Any):
                     result = collect(*args, **kwargs)
-                    if rank == 0:
+                    if rank == failing_rank:
                         raise failure
                     return result
 
@@ -1652,12 +1657,14 @@ def _export_preparation_failure_worker(
             )
             with pytest.raises(BaseException, match="injected") as caught:
                 trainer._prepare_lora_export("retry", "student", owner_id="owner")
-            if rank == 0:
+            if rank == failing_rank:
                 assert caught.value is failure
             else:
                 assert isinstance(caught.value, RuntimeError)
                 assert "Another rank failed" in str(caught.value)
-            assert len(metadata_calls) == (1 if failure_site == "metadata" else 0)
+            assert len(metadata_calls) == (
+                failure_call if failure_site == "metadata" else 0
+            )
             assert exchanges == []
             assert not getattr(trainer, "_prepared_lora_exports", {})
 
@@ -1687,16 +1694,22 @@ def _export_preparation_failure_worker(
             assert completed.item() == 2
 
 
-@pytest.mark.parametrize("failure_site", ("dense", "packed", "metadata"))
+@pytest.mark.parametrize(
+    "failure_case",
+    [("dense", 1, 0), ("packed", 1, 0), ("metadata", 1, 0), ("metadata", 2, 1)],
+    ids=["dense", "packed", "metadata", "metadata-2-rank1"],
+)
 def test_export_preparation_failure_is_collective_and_retryable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_site: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_case: tuple[str, int, int],
 ) -> None:
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     spawn_and_join(
         _export_preparation_failure_worker,
-        args=(f"file://{tmp_path / 'export'}", failure_site),
+        args=(f"file://{tmp_path / 'export'}", failure_case),
         timeout=90,
-        failure=f"collective export {failure_site} failure test hung",
+        failure=f"collective export {failure_case[0]} failure test hung",
     )
 
 
