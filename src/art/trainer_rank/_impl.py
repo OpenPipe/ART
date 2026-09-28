@@ -135,6 +135,16 @@ _COLD_RECOMPUTE_TRANSIENT_BYTES = 64 * 2**20
 # exchange plans. Qwen3.6-35B-A3B CP2 traces at the head's backward peak:
 # 106-181 bytes per row at 3.5k-8.7k rows.
 _BACKWARD_ROW_STATE_BYTES = 256
+# A head chunk below the fused statistics' row minimum takes the FP32 fallback
+# (_vocab_parallel_log_z): the BF16 logits, their FP32 copy, the shifted copy
+# and its saved exponent in the recompute, then the exponent's gradient, its
+# BF16 cast and the target gather's gradient in backward. At most this many
+# BF16 logits-sized buffers of that chunk (about 18 bytes per logit); derived
+# from the code, not traced.
+_HEAD_FALLBACK_BUFFERS = 9
+# Whether the fused head statistics have run in this process, and whether any
+# call fell back to FP32 after an error: staging trusts only a proven path.
+_TRITON_STATS_STATE = {"succeeded": False, "failed": False}
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -4184,8 +4194,12 @@ class TrainerRank:
         need at least ``ART_TRAINER_RANK_TRITON_MIN_ROWS`` rows in the first
         projected chunk. Top-k, logits and hidden-state outputs keep further
         dense gradients, and the FP32 fallback wider copies; other CP sizes
-        are untraced. ``rows`` bounds the first chunk's rows from below,
+        are untraced. The fused statistics must have run in this process and
+        never fallen back after an error: a failed kernel takes the FP32 path
+        silently. ``rows`` bounds the first chunk's rows from below,
         ``upper_rows`` from above: None when they straddle the threshold.
+        A CP rank projecting fewer rows falls back on its own; the head stage
+        prices that (``_HEAD_FALLBACK_BUFFERS``).
         """
         if (
             not requests
@@ -4198,6 +4212,8 @@ class TrainerRank:
             )
             or os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower()
             in {"0", "false"}
+            or not _TRITON_STATS_STATE["succeeded"]
+            or _TRITON_STATS_STATE["failed"]
             or self._topology_key()[2] != 2
             or not self._head_workspace_bytes(1)
             or not self._standard_logit_scale()
@@ -5416,8 +5432,16 @@ class TrainerRank:
         adapters = self._layout_adapter_gradient_bytes(
             group_rows, slot_refs, layouts, head=True
         )
+        # A rank's chunk below the fused minimum (CP splits the projected rows
+        # unevenly) takes the FP32 fallback.
+        fallback = _HEAD_FALLBACK_BUFFERS * self._head_workspace_bytes(
+            min(
+                int(os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64")) - 1,
+                _HEAD_CHUNK_TOKENS,
+            )
+        )
         return (
-            head_workspace_bytes
+            max(head_workspace_bytes, fallback)
             + 2 * gradient
             + rows * self._backward_row_state_bytes()
             + self._te_workspace_growth_bytes()
@@ -11190,11 +11214,14 @@ def _try_triton_stats(
     try:
         from art.trainer_rank import topk
 
-        return getattr(topk, name)(local_logits, **kwargs)
+        result = getattr(topk, name)(local_logits, **kwargs)
     except Exception:
+        _TRITON_STATS_STATE["failed"] = True
         if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict":
             raise
         return None
+    _TRITON_STATS_STATE["succeeded"] = True
+    return result
 
 
 def _vocab_parallel_topk_from_local(
