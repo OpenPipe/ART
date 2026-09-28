@@ -16,6 +16,9 @@ import torch
 
 from art.trainer_rank import ForwardInput, _impl
 from art.trainer_rank._impl import (
+    _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD,
+)
+from art.trainer_rank._impl import (
     Unset,
     _dense_mlp_recompute_bytes_per_token,
     _GroupLayout,
@@ -385,6 +388,23 @@ def test_covered_dense_recompute_charges_one_gradient_and_its_stage(rows):
     # Without the traced stage, dense keeps one gradient per boundary.
     plain = price(_at_cp2(_dense_rank(0, 0)), values)
     assert plain.checkpoint_input_gradient == rows * LAYERS * HIDDEN * 2
+
+
+def test_covered_dense_head_stays_in_the_decoder_stage():
+    r = _dense_rank()
+    n, out, signature, groups, _ = r._estimate_flat_forward(requests(67, 16))
+    _at_cp2(r)
+    # Staged head pricing was traced on the MoE model only.
+    head = 10**9
+    cost = price(r, (n, out, signature, groups, head))
+    gradient = cost.checkpoint_input_gradient
+    assert gradient == 67 * HIDDEN * 2
+    assert r._checkpoint_head_stage_bytes(head, gradient, groups, None) is None
+    workspace = r._checkpoint_memory_floor(groups)[1]
+    assert cost.checkpoint_workspace == max(workspace, head) + COLD
+    assert cost.required == int(
+        (cost.checkpoint_retained + max(workspace, head) + COLD + gradient) * 1.1
+    )
 
 
 def test_a_larger_no_grad_group_keeps_its_transient_beside_gradient_boundaries():
