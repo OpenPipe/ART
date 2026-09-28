@@ -18,6 +18,9 @@ from test_trainer_rank_pending_memory import (  # noqa: F401
 import torch
 
 from art.trainer_rank import ForwardInput
+from art.trainer_rank._impl import (
+    _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD,
+)
 from art.trainer_rank._impl import Unset, _MemoryProfile, _SplitForwardPlan
 
 
@@ -46,7 +49,11 @@ def test_pending_cold_peak_does_not_become_forward_retention(pending_rank):
     profile(r, plan)
     warm = r._plan_cost(plan)
     assert warm.retained == int((plan.output_bytes + boundaries) * 1.1)
-    assert warm.required == cost.required
+    # Profiled: no first-execution transients.
+    assert warm.required == int(
+        (plan.output_bytes + boundaries + gradient + cost.checkpoint_workspace - COLD)
+        * 1.1
+    )
 
 
 BOUNDARY_GRADIENTS = 8 * 6330 * 40 * 2048 * 2
@@ -134,8 +141,8 @@ def test_gradient_is_not_absorbed_by_larger_head_workspace():
     cost = price(r, (n, out, sig, groups, head))
     boundaries = 67 * 40 * 2048 * 2
     gradient = 67 * 2048 * 2
-    assert cost.checkpoint_workspace == head
-    assert cost.required == int((out + head + boundaries + gradient) * 1.1)
+    assert cost.checkpoint_workspace == head + COLD
+    assert cost.required == int((out + head + COLD + boundaries + gradient) * 1.1)
     assert cost.retained == int((out + head + boundaries) * 1.1)
     r._memory_profiles[sig] = _MemoryProfile(
         bytes_per_token=10**9,
@@ -269,16 +276,18 @@ def test_split_priority_subtracts_only_uncovered_gradient_peak(fully_masked):
     r = rank()
     plan = r._plan_flat_forward(requests(17, 19))
     cold = r._plan_cost(plan)
+    # Once profiled, the static estimate has no first-execution transients.
+    profile(r, plan)
+    static = r._plan_cost(plan).required
+    assert static < cold.required
     # Place a real learned peak between the two static estimates, or above both.
-    measured = (
-        cold.required + 10**7 if fully_masked else (cold.retained + cold.required) / 2
-    )
+    measured = static + 10**7 if fully_masked else (cold.retained + static) / 2
     rate = (measured / 1.1 - plan.output_bytes) / plan.packed_tokens
     profile(r, plan, rate=rate)
     cost = r._plan_cost(plan)
     old_required = int((plan.output_bytes + int(plan.packed_tokens * rate)) * 1.1)
     assert cold.retained < old_required
-    assert cost.required == max(cold.required, old_required)
+    assert cost.required == max(static, old_required)
     assert (
         cost.ephemeral - cost.checkpoint_peak_increment == old_required - cost.retained
     )
@@ -290,3 +299,66 @@ def test_split_priority_subtracts_only_uncovered_gradient_peak(fully_masked):
             < cost.checkpoint_peak_increment
             < int(cost.checkpoint_input_gradient * 1.1)
         )
+
+
+def test_one_moe_gradient_still_prices_pending_adapter_gradients(
+    pending_rank, monkeypatch
+):
+    from art.megatron.lora import LoRASlotRef
+    from art.trainer_rank import _gdn_memory
+
+    r = pending_rank
+    plan = r._plan_flat_forward(full_requests())
+    groups = r._plan_group_rows(plan)
+    retained, _ = r._checkpoint_memory_floor(groups)
+    # The MoE stage covers recompute: one incoming gradient, no per-boundary
+    # slack left to absorb gradients the backward allocates.
+    assert r._checkpoint_input_gradient_bytes(groups) < retained
+    pending = (23 * 2**20,) * 40 + (0,)
+    monkeypatch.setattr(
+        r,
+        "_pending_adapter_gradient_bytes",
+        lambda refs: pending if tuple(refs) else (),
+    )
+    # A named slot keeping the constructor's full MoE coverage. This fixture
+    # has no slot tables, so price the MoE stage with the constructor's adapters.
+    monkeypatch.setattr(r, "_moe_recompute_covered_for", lambda ref: True)
+    workspace = r._moe_workspace_bytes
+    monkeypatch.setattr(
+        r,
+        "_moe_workspace_bytes",
+        lambda rows, **kwargs: workspace(rows, **{**kwargs, "slot_ref": None}),
+    )
+    values = dict(
+        packed_tokens=plan.packed_tokens,
+        output_bytes=plan.output_bytes,
+        signature=plan.signature,
+        logical_tokens=plan.active_logical_tokens,
+        gdn_segments=plan.grad_segment_count,
+        group_rows=groups,
+        group_routed_rows=r._plan_group_routed_rows(plan),
+        head_workspace_bytes=r._plan_head_workspace_bytes(plan),
+        checkpoint_floor=_gdn_memory.plan_floor(r, plan),
+        retained_tokens=r._plan_retained_tokens(plan),
+    )
+    slotless = (None,) * len(groups)
+    named = (LoRASlotRef("checkpoint", "policy"),) * len(groups)
+    base = r._subforward_cost(**values, slot_refs=slotless)
+    cost = r._subforward_cost(**values, slot_refs=named)
+    boundary = retained // 40
+    extra = max(0, *(sum(pending[i:40]) - boundary * (39 - i) for i in range(40)))
+    assert base.checkpoint_adapter_gradient == 0
+    assert cost.checkpoint_adapter_gradient == extra > 0
+    assert cost.required == int(
+        (
+            cost.checkpoint_retained
+            + cost.checkpoint_workspace
+            + cost.checkpoint_input_gradient
+            + extra
+        )
+        * 1.1
+    )
+    assert (
+        r._estimate_required_memory_bytes_from_values(**values, slot_refs=named)
+        == cost.required
+    )
