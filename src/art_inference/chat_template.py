@@ -137,7 +137,19 @@ def _without_inline_reasoning_parser(template: str) -> str:
     except TemplateSyntaxError:
         # Optional binding analysis must not undo independently proved parser
         # edits when the renderer supports extensions absent from this parser.
-        return apply_edits()
+        result = apply_edits()
+        if (
+            "<think>" in template
+            and "reasoning_content|trim" in template
+            and "if not preserve_thinking or message.reasoning_content" not in template
+        ):
+            # Keep the pre-existing preservation rewrite when custom syntax
+            # prevents the narrower binding analysis below.
+            result = result.replace(
+                "set content = render_content(message.content, true)|trim",
+                "set content = (render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
+            )
+        return result
     assignments = list(tree.find_all(nodes.Assign))
     locations = []
     parsed_assignments = []
@@ -191,6 +203,10 @@ def _without_inline_reasoning_parser(template: str) -> str:
         )
 
     def reads_content(node: nodes.Node) -> bool:
+        # A macro/context-aware callable may capture this binding without a
+        # Name at the call site. Do not move its trim across an unknown call.
+        if isinstance(node, nodes.Call) or any(node.find_all(nodes.Call)):
+            return True
         return (
             isinstance(node, nodes.Name)
             and node.name == "content"

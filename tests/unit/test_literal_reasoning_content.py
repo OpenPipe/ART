@@ -242,6 +242,56 @@ def test_unconfigured_template_receives_the_same_correction():
     assert chat_template_with_preserved_thinking(raw) == _FIXED
 
 
+@pytest.mark.parametrize("indirect", [False, True])
+@pytest.mark.parametrize("content", ["  answer  ", "  before<think>x</think>after  "])
+def test_macro_capture_keeps_shared_content_trim(indirect, content):
+    parser = _QWEN_INLINE_REASONING.search(_TEMPLATE)
+    assert parser is not None
+    template = (
+        "{% macro render_content(content, count) %}{{ content }}{% endmacro %}"
+        "{% macro preview() %}[{{ content }}]{% endmacro %}"
+        "{% macro wrapper() %}{{ preview() }}{% endmacro %}"
+        "{% set content = render_content(message.content, true)|trim %}"
+        + ("{{ wrapper() }}" if indirect else "{{ preview() }}")
+        + parser.group()
+        + "[{{ content }}]"
+    )
+    fixed = chat_template_with_preserved_thinking(template)
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
+    assert (
+        env.from_string(fixed).render(message={"role": "assistant", "content": content})
+        == "[" + content.strip() + "][" + content.strip() + "]"
+    )
+    assert chat_template_with_preserved_thinking(fixed) == fixed
+
+
+@pytest.mark.parametrize("preserve", [False, True])
+def test_extension_fallback_keeps_prior_structured_content_whitespace(preserve):
+    template = "{% for item in [1] %}{% break %}{% endfor %}" + _TEMPLATE.replace(
+        "(render_content(message.content, true) if preserve_thinking and message.role == 'assistant' else render_content(message.content, true)|trim)",
+        "render_content(message.content, true)|trim",
+    ).replace(
+        "{%- if not preserve_thinking or message.reasoning_content is not string %}{%- set reasoning_content = reasoning_content|trim %}{%- endif %}",
+        "{%- set reasoning_content = reasoning_content|trim %}",
+    )
+    fixed = chat_template_with_preserved_thinking(template)
+    rendered = _render(
+        fixed,
+        [
+            _USER,
+            {
+                "role": "assistant",
+                "content": "  answer  ",
+                "reasoning_content": "reasoned\n",
+            },
+        ],
+        enable_thinking=False,
+        preserve_thinking=preserve,
+    )
+    assert rendered.endswith(("  answer  " if preserve else "answer") + "<|im_end|>\n")
+    assert chat_template_with_preserved_thinking(fixed) == fixed
+
+
 @pytest.mark.parametrize("wrapper", [("{% raw %}", "{% endraw %}"), ("{#", "#}")])
 def test_inline_operation_as_raw_or_comment_text_is_not_rewritten(wrapper):
     from art_inference.chat_template import _QWEN_INLINE_REASONING
