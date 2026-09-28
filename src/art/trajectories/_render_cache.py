@@ -10,7 +10,7 @@ from typing import cast
 def _render_context_key(value: object) -> object:
     """Snapshot plain JSON without losing mapping order or scalar types."""
     kind = type(value)
-    if kind in (str, int, bool, type(None)):
+    if kind is str or kind is int or kind is bool or kind is type(None):
         return kind, value
     if kind is float and math.isfinite(cast(float, value)):
         return kind, repr(value)

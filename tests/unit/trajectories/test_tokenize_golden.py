@@ -22,8 +22,8 @@ directory; these cases pin the paths the audit found repeatedly re-fixed:
                                           stop (#829 #830 #847 #871)
   exchange_mixed_stop_captured            a length-stopped exchange whose captured
                                           history is re-prompted by a stopped one;
-                                          exact coverage ends at the duplicated
-                                          terminator (#882)
+                                          native conditioning excludes an invented
+                                          duplicate terminator (#882)
   exchange_nan_logprobs                   sampled logprobs containing ``NaN`` (#903)
   exchange_inexact_length_stop            length stop without token ids (inexact
                                           assistant attribution)
