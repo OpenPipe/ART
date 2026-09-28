@@ -20,7 +20,6 @@ from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
 import hashlib
-import itertools
 import json
 import logging
 import math
@@ -4368,23 +4367,9 @@ class TrainerRank:
     ) -> int:
         """The recompute backward's adapter-gradient peak beyond released boundaries.
 
-        Backward recomputes the last layer first. While it recomputes layer i it
-        still holds the saved boundaries of layers 0..i and every adapter
-        gradient allocated so far: those of layers i..L-1 (a layer allocates its
-        own during its backward) and any outside the decoder. The floor already
-        prices all L boundaries at once, so the extra peak is
-        max(0, max over i of gradients(i..) - boundaries(i+1..)), taken at every
-        layer over the real per-layer gradient sizes and the caller's per-layer
-        boundaries, not along a uniform-layer line. A short
-        first wave peaks at layer 0 (Qwen3.6-35B-A3B CP2: 830-900 MB of expert
-        LoRA gradients live at its peak), a long one at the last layer.
         ``groups`` gives each gradient group's adapter slot (None for the base
-        model) and each decoder layer's saved-boundary bytes. Groups run their
-        backward one after another, not layer by layer together: autograd
-        drains the last-forwarded group's chain first, and separate backward
-        calls can come in either order. While one group runs, a group yet to
-        run still holds all its boundaries and one already run all its
-        gradients, so take the worst order.
+        model) and each decoder layer's saved-boundary bytes
+        (``_adapter_gradient_walk``).
         """
         chains = []
         for slot, boundaries in groups:
@@ -4394,22 +4379,45 @@ class TrainerRank:
             if pending and len(pending) != len(boundaries) + 1:
                 return 0
             chains.append((pending or (0,) * (len(boundaries) + 1), boundaries))
-        if not any(any(pending) for pending, _ in chains):
-            return 0
-        if len(chains) > 4:
-            # Too many orders to walk: every gradient live, nothing released.
-            return sum(sum(pending) for pending, _ in chains)
+        return self._adapter_gradient_walk(chains)
+
+    @staticmethod
+    def _adapter_gradient_walk(
+        chains: Sequence[tuple[Sequence[int], Sequence[int]]],
+    ) -> int:
+        """The adapter-gradient peak beyond the floor over gradient groups' backward.
+
+        Each chain is a gradient group's pending gradient bytes (per decoder
+        layer, then outside the decoder) and saved-boundary bytes per layer.
+        Backward recomputes the last layer first. While it recomputes layer i it
+        still holds the saved boundaries of layers 0..i and every adapter
+        gradient allocated so far: those of layers i..L-1 (a layer allocates its
+        own during its backward) and any outside the decoder. The floor already
+        prices all L boundaries at once, so one group's extra peak is
+        max(0, max over i of gradients(i..) - boundaries(i+1..)), taken at every
+        layer over the real per-layer gradient sizes and the caller's per-layer
+        boundaries, not along a uniform-layer line. A short
+        first wave peaks at layer 0 (Qwen3.6-35B-A3B CP2: 830-900 MB of expert
+        LoRA gradients live at its peak), a long one at the last layer.
+        Groups run their backward one after another, not layer by layer
+        together: autograd drains the last-forwarded group's chain first, and
+        separate backward calls can come in either order. While one group runs,
+        each group already run holds all its gradients and none of its
+        boundaries, and each group yet to run all its boundaries. Any set of the
+        other groups can have run first, so the worst adds every other group
+        whose gradients outweigh its boundaries.
+        """
+        nets = [sum(pending) - sum(boundaries) for pending, boundaries in chains]
+        others = sum(max(0, net) for net in nets)
         worst = 0
-        for order in itertools.permutations(chains):
-            allocated = released = 0
-            for pending, boundaries in order:
-                gradients = allocated + pending[-1]
-                worst = max(worst, gradients - released)
-                for index in range(len(boundaries) - 1, -1, -1):
-                    gradients += pending[index]
-                    worst = max(worst, gradients - released)
-                    released += boundaries[index]
-                allocated = gradients
+        for (pending, boundaries), net in zip(chains, nets, strict=True):
+            extra = gradients = pending[-1]
+            released = 0
+            for index in range(len(boundaries) - 1, -1, -1):
+                gradients += pending[index]
+                extra = max(extra, gradients - released)
+                released += boundaries[index]
+            worst = max(worst, extra + others - max(0, net))
         return worst
 
     def _plan_cost(self, plan: _FlatForwardPlan) -> _SubforwardCost:
