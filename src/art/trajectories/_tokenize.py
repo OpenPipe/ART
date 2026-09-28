@@ -6909,6 +6909,7 @@ class _ChatViewTokenizer:
                             signature = _source_signature(source)
                             request_context = None
                             full_prompt_proven = False
+                            request_messages = None
                             try:
                                 # Canonical tool validation may reorder JSON keys.
                                 # Prove the historical prompt with the recorded
@@ -6947,6 +6948,7 @@ class _ChatViewTokenizer:
                             if (
                                 needs_request_roles
                                 and self.recorded_prompt_masks is None
+                                and request_messages is not None
                             ):
                                 try:
                                     raw_prompt = _recorded_prompt_tokens(

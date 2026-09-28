@@ -181,7 +181,9 @@ For supported Chat boundaries, ART decodes the recorded body and encodes only th
 unrecorded separator instead of re-tokenizing the whole conversation. It checks
 that the separator reproduces the next recorded prompt exactly. Edited contexts,
 explicit template overrides, incomplete projections, and unsupported templates
-continue through the generic rendering path and its source validation.
+continue through the generic rendering path and its source validation. That
+fallback can still refuse copied response context when it cannot prove the
+original conditioning of the sampled tokens that follow it.
 
 Correcting literal-content rendering does not rewrite a recorded request. When
 the original request and template reproduce its complete native prompt, ART can
@@ -247,7 +249,10 @@ logprob. This requires the complete original sampled occurrence to remain in an
 earlier selected history; otherwise unchanged native replay is refused. The
 original occurrence retains its logprobs and ownership, including recorded NaNs
 before finite-value filtering. Tokenizing only the shortened view cannot prove
-that coverage; tokenize the containing trajectory instead. This correction does
+that coverage; tokenize the containing trajectory with `multi_history=True`
+and keep `reconcile_text_equivalent_tokenizations=False` (the default) so the
+complete original occurrence remains in a selected history. Reconciliation can
+collapse that owner into a shortened view, which ART safely refuses. This correction does
 not change how generic output/SFT masks include copied assistant content.
 
 ## How It Works

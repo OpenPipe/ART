@@ -923,3 +923,27 @@ def test_malformed_native_record_is_still_rejected(monkeypatch):
             _trace=None,
         )
     assert not called
+
+
+def test_reconciliation_cannot_remove_complete_copied_sample_owner() -> None:
+    from test_tokenize import _chat_exchange
+
+    import art.trajectories as tr
+
+    first = _chat_exchange([1], [2, 3])
+    second = _chat_exchange([1, 3, 4], [5], offset=1)
+    second.request["messages"] = [
+        {"role": "user", "content": "turn 0"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "turn 1"},
+    ]
+    trajectory = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(chat_completions=[first, second])
+    )
+    result = trajectory.tokenize(multi_history=True)
+    assert [item.tokens for item in result.histories] == [[1, 2, 3], [1, 3, 4, 5]]
+    assert len(trajectory.histories(reconcile_text_equivalent_tokenizations=True)) == 1
+    with pytest.raises(ValueError, match="complete original sampled occurrence"):
+        trajectory.tokenize(
+            multi_history=True, reconcile_text_equivalent_tokenizations=True
+        )

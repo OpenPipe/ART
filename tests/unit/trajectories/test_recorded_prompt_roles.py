@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import math
+from types import SimpleNamespace
 from typing import Any, cast
 
 from openai.types.chat import ChatCompletionMessageParam
@@ -630,3 +631,41 @@ def test_named_original_request_proof_normalizes_tool_arguments(selection):
             flag & tr.TokenFlag.SAMPLED
             for flag in history.flags[len(prompt) : len(prompt) + len(output)]
         )
+
+
+@pytest.mark.parametrize("failure", [TypeError, KeyError, NotImplementedError])
+def test_unavailable_original_request_refuses_role_proof_without_unbound_locals(
+    monkeypatch: pytest.MonkeyPatch, failure: type[Exception]
+) -> None:
+    trajectory, _, _, _ = _case("Historical assistant")
+    history = trajectory.chat_completions_history()
+    calls = []
+
+    def unavailable(exchange):
+        calls.append(exchange)
+        raise failure("Unavailable historical request projection")
+
+    monkeypatch.setattr(module, "_request_messages", unavailable)
+    stage = SimpleNamespace(
+        rendered=[1, 2],
+        chat_template=None,
+        chat_template_kwargs=None,
+        projection_matches=True,
+        history=history,
+        messages=history.messages,
+        canonical_assistant_mask=[True],
+        canonical_stop_mask=[False],
+        original_template="template",
+        template="template",
+        validate_consumed=lambda _: None,
+        _source_prompt_tokens=lambda source: (
+            [9] if module._source_is_sampled(source) else None
+        ),
+        _source_matches_context=lambda _: True,
+        _probe_render=lambda *args, **kwargs: [1],
+        prompt_cache={},
+        output_cache={},
+    )
+    with pytest.raises(ValueError, match="Cannot preserve request roles"):
+        module._ChatViewTokenizer._substitute_exact_prefix(cast(Any, stage))
+    assert len(calls) == 1
