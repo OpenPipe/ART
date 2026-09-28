@@ -20,6 +20,7 @@ jobs:
       required: ${{ steps.changes.outputs.required }}
       head_sha: ${{ steps.changes.outputs.head_sha }}
       reused: ${{ steps.reuse.outputs.reused }}
+      reused_run: ${{ steps.reuse.outputs.run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,6 +70,7 @@ jobs:
               );
               if (passed && base) {
                 core.setOutput('reused', 'true');
+                core.setOutput('run_id', String(run.id));
                 core.info(`Reusing successful workflow run ${run.id}.`);
                 return;
               }
@@ -218,6 +220,7 @@ jobs:
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           REQUIRED: ${{ needs.classify.outputs.required }}
           REUSED: ${{ needs.classify.outputs.reused }}
+          REUSED_RUN: ${{ needs.classify.outputs.reused_run }}
           RESULT: ${{ needs.validate.result }}
         run: |
           if [ "${CLASSIFY_RESULT}" != "success" ]; then
@@ -231,7 +234,8 @@ jobs:
             exit 1
           fi
           if [ "${REUSED}" = "true" ]; then
-            echo "TrainerRank GPU validation reused for this exact base and head."
+            echo "TrainerRank GPU validation reused from exact run ${REUSED_RUN}." \
+              | tee -a "${GITHUB_STEP_SUMMARY}"
           elif [ "${REQUIRED}" = "true" ]; then
             echo "TrainerRank GPU validation passed."
           else
