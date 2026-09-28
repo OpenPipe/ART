@@ -79,7 +79,9 @@ def test_staged_tokenizer_releases_callback_cycle_without_gc(monkeypatch, fail):
 
     monkeypatch.setattr(_tokenize._ChatViewTokenizer, "__init__", observe)
     exchange = _chat_exchange([1], [2, 9])
-    exchange.response.choices[0].model_extra.pop("prompt_token_ids")
+    extra = exchange.response.choices[0].model_extra
+    assert extra is not None
+    extra.pop("prompt_token_ids")
     history = tr.Trajectory(
         exchanges=tr.TrajectoryExchanges(chat_completions=[exchange])
     ).chat_completions_history()

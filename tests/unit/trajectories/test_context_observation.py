@@ -1,4 +1,5 @@
 from collections import UserDict
+from typing import Any, cast
 
 import pytest
 
@@ -6,6 +7,8 @@ from art.trajectories._tokenize import _tokenization_context
 
 
 class ObservedDict(dict):
+    reads: int
+
     def items(self):
         self.reads += 1
         return super().items()
@@ -17,7 +20,9 @@ def test_context_preserves_mapping_order_aliases_and_fresh_mutable_reads(mapping
     mapping = mapping_type({"first": child, "second": child})
     if isinstance(mapping, ObservedDict):
         mapping.reads = 0
-    original = _tokenization_context([mapping, mapping])
+    original = cast(
+        tuple[type, tuple[Any, Any]], _tokenization_context([mapping, mapping])
+    )
     first, second = original[1]
     assert first is second
     assert first[0] is mapping_type
@@ -34,14 +39,20 @@ def test_context_preserves_mapping_order_aliases_and_fresh_mutable_reads(mapping
 
 def test_context_rejects_stale_identity_entry_without_borrowing_its_value():
     value = {"request": [1, True, "1"]}
-    observed = {id(value): (object(), "stale")}
-    assert _tokenization_context(value, _observed=observed) == _tokenization_context(value)
+    observed: dict[int, tuple[object, object]] = {id(value): (object(), "stale")}
+    assert _tokenization_context(value, _observed=observed) == _tokenization_context(
+        value
+    )
     assert observed[id(value)][0] is value
 
 
-@pytest.mark.parametrize("left,right", [(1, True), (0.0, -0.0), ("x", b"x"), (None, "None")])
+@pytest.mark.parametrize(
+    "left,right", [(1, True), (0.0, -0.0), ("x", b"x"), (None, "None")]
+)
 def test_context_retains_typed_scalar_distinctions(left, right):
-    assert _tokenization_context({"value": left}) != _tokenization_context({"value": right})
+    assert _tokenization_context({"value": left}) != _tokenization_context(
+        {"value": right}
+    )
 
 
 def test_context_preserves_custom_mapping_exception_identity():
