@@ -145,6 +145,11 @@ _HEAD_FALLBACK_BUFFERS = 9
 # Which fused head statistics kernels have run in this process, and whether any
 # call fell back to FP32 after an error: staging trusts only a proven path.
 _TRITON_STATS_STATE: dict[str, Any] = {"succeeded": set(), "failed": False}
+# Set while a gradient group of a plan priced with a staged head projects it;
+# per thread, and captured into each chunk's checkpoint for its recompute.
+_HEAD_STATISTICS_STRICT: ContextVar[bool] = ContextVar(
+    "trainer_rank_head_statistics_strict", default=False
+)
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -4092,14 +4097,17 @@ class TrainerRank:
         rather than taking the wider FP32 path. ``rows`` bounds the first chunk's rows from below,
         ``upper_rows`` from above: None when they straddle the threshold.
         A CP rank projecting fewer rows falls back on its own; the head stage
-        prices that (``_HEAD_FALLBACK_BUFFERS``).
+        prices that (``_HEAD_FALLBACK_BUFFERS``). ``ART_TRAINER_RANK_TRITON_*``
+        settings are process-wide: changing them while a plan is in flight is
+        unsupported (a staged chunk could then fall back unpriced).
         """
         if (
             not requests
             or any(
                 request.target_tokens is None
-                # Several labels per row save gather indices and masks per label.
-                or request.target_tokens.shape != request.input_tokens.shape
+                # Several labels per row save gather indices and masks per label;
+                # one label per input token, in either accepted layout, does not.
+                or request.target_tokens.numel() != request.input_tokens.numel()
                 or request.top_k is not None
                 or request.logits
                 or request.hidden_states
@@ -4126,8 +4134,16 @@ class TrainerRank:
     def _plan_head_backward_traced(self, plan: _FlatForwardPlan) -> bool:
         """Every gradient group's head backward is traced (``_head_backward_traced``).
 
-        Records the answer on the plan: its execution runs the fused statistics
-        strictly exactly when its latest price staged the head.
+        When that stages the plan's head price (``_checkpoint_head_stage_bytes``
+        applies), marks the plan: its gradient groups then run the fused
+        statistics strictly (``_execute_flat_plan``). The mark stays once set:
+        a later re-pricing cannot weaken the admission that relied on it.
+        Every plan admitted on a staged price has been priced here: staging
+        needs CP2, where the cheap width estimate declines and admission
+        prices the materialized plan (``_estimate_flat_forward``). Strictness
+        trades the FP32 fallback's availability for memory safety: a fused
+        kernel error then fails the wave, and a CP peer waits in its next
+        collective like after a rank-local OOM.
         """
         traced = [
             self._head_backward_traced(
@@ -4142,9 +4158,16 @@ class TrainerRank:
             if group.grad_enabled
             for requests in (tuple(item.request for item in group.items),)
         ]
-        staged = bool(traced) and all(state is True for state in traced)
-        object.__setattr__(plan, "_head_staged", staged)
-        return staged
+        eligible = bool(traced) and all(state is True for state in traced)
+        if (
+            eligible
+            and self._plan_head_workspace_bytes(plan)
+            and self._checkpoint_gradient_covered(
+                self._plan_group_rows(plan), tuple(g.slot_ref for g in plan.groups)
+            )
+        ):
+            object.__setattr__(plan, "_head_staged", True)
+        return eligible
 
     def _plan_head_workspace_bytes(self, plan: _FlatForwardPlan) -> int:
         peak = 0
@@ -7599,16 +7622,7 @@ class TrainerRank:
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
         # A head priced as staged must not silently widen (_head_backward_traced).
-        previous_strict = self.__dict__.get("_head_statistics_strict", False)
-        self._head_statistics_strict = bool(getattr(plan, "_head_staged", False))
-        try:
-            return self._execute_flat_plan_groups(plan)
-        finally:
-            self._head_statistics_strict = previous_strict
-
-    def _execute_flat_plan_groups(
-        self, plan: _FlatForwardPlan
-    ) -> list[AnyForwardOutput]:
+        staged = bool(getattr(plan, "_head_staged", False))
         outputs = [
             ForwardOutput(None, None, None, None, checkpoint, no_grad)
             for checkpoint, no_grad in plan.output_metadata
@@ -7630,7 +7644,13 @@ class TrainerRank:
                 with torch.set_grad_enabled(group.grad_enabled):
                     with use_lora_slot(group.slot_ref):
                         prepared = self._prepare_packed_forward(group.packed)
-                        item_outputs = self._forward_packed(group.items, prepared)
+                        strict = _HEAD_STATISTICS_STRICT.set(
+                            staged and group.grad_enabled
+                        )
+                        try:
+                            item_outputs = self._forward_packed(group.items, prepared)
+                        finally:
+                            _HEAD_STATISTICS_STRICT.reset(strict)
                     item_outputs = [
                         replace(
                             output,
@@ -9559,7 +9579,7 @@ class TrainerRank:
         from torch.utils.checkpoint import checkpoint
 
         model = _language_model(self.runtime.model[0])
-        strict_statistics = bool(self.__dict__.get("_head_statistics_strict", False))
+        strict_statistics = _HEAD_STATISTICS_STRICT.get()
         max_top_k = max((int(item.request.top_k or 0) for item in items), default=0)
         need_log_z = any(
             item.labels is not None or item.request.top_k is not None for item in items
