@@ -3465,6 +3465,7 @@ def _history_render_state(history: History) -> _HistoryRenderState:
     if isinstance(history, ChatCompletionsHistory):
         if any(source is None for source in history.message_sources):
             return _HistoryRenderState(needs_render=True, projection_matches=False)
+        reasoning_stripped = False
         for message, source in zip(
             history.messages, history.message_sources, strict=True
         ):
@@ -3473,7 +3474,8 @@ def _history_render_state(history: History) -> _HistoryRenderState:
             if dict(message) != original and dict(message) == _without_reasoning(
                 original
             ):
-                return _HistoryRenderState(needs_render=True)
+                reasoning_stripped = True
+                break
         exchange = _last_source_exchange(history.message_sources)
         if not isinstance(exchange, ChatCompletionsExchange):
             return _HistoryRenderState(
@@ -3489,10 +3491,10 @@ def _history_render_state(history: History) -> _HistoryRenderState:
         if context_changed:
             return _HistoryRenderState(needs_render=True, context_changed=True)
         projection_matches = _matches_final_chat_exchange(history)
-        if projection_matches is None:
+        if projection_matches is None or reasoning_stripped:
             projection_matches = _history_matches_projection(history)
         return _HistoryRenderState(
-            needs_render=not projection_matches,
+            needs_render=reasoning_stripped or not projection_matches,
             projection_matches=projection_matches,
         )
     if isinstance(history, AnthropicMessagesHistory):
@@ -4692,7 +4694,12 @@ def _tokenize_exact_projected_chat_history(
                     *boundary.tail,
                     *boundary.following,
                 ]:
-                    return None
+                    if not _native_gaps:
+                        return None
+                    # The selected original owns the sampled loss; this retained
+                    # suffix is context, and an unproved gap keeps unknown roles.
+                    sources[source_key] = source
+                    continue
                 stop_kind = _source_stop_evidence(source, source_key)[0]
                 boundary_flags = TokenFlag.EXACT | TokenFlag.ASSISTANT
                 if stop_kind == "stop":
