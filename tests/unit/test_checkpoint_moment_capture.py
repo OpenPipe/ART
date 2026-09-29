@@ -145,7 +145,8 @@ def test_moment_capture(captured_state, monkeypatch, present, allocation_guard):
                 value.add_(100)
     for model in trainer.runtime.model:
         if hasattr(model, "expert_ids"):
-            model.expert_ids = (99, 98, 97)
+            if model.is_expert:
+                model.bind_expert_layout((99, 98, 97), ())
             model.adapter_model_prefix = "changed"
     shards = cp._expand_local_state(captured, payloads)
     if allocation_guard:
@@ -247,7 +248,8 @@ def test_expert_expansion_releases_capture_and_preserves_snapshot(
             for value in (*params, *masters):
                 value.add_(100)
         for model in trainer.runtime.model:
-            model.expert_ids = (90, 91, 92)
+            if model.is_expert:
+                model.bind_expert_layout((90, 91, 92), ())
             model.adapter_model_prefix = "changed"
         config["r"] = 99
         assert prepared.config["r"] == 2
