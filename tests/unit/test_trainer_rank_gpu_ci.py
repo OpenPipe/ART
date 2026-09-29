@@ -28,6 +28,10 @@ def owner(tmp_path):
         "head": "a" * 40,
         "attempt": "2",
         "infra": "k8s/cks-wb3",
+        "label": "a" * 32,
+        "admission_deadline": time.time() + 1800,
+        "work_deadline": time.time() + 2100,
+        "cleanup_deadline": time.time() + 2400,
     }
     ci.write_json(tmp_path / "owner.json", value)
     return value
@@ -43,9 +47,16 @@ def sky(monkeypatch):
         job_status=Mock(return_value="status-request"),
         cancel=Mock(return_value="cancel-request"),
         api_cancel=Mock(return_value="api-cancel-request"),
+        api_status=Mock(return_value=[NS(request_id="request-17", status="CANCELLED")]),
+        api_stop=Mock(),
         tail_logs=Mock(return_value=0),
     )
     monkeypatch.setitem(sys.modules, "sky", api)
+    monkeypatch.setitem(
+        sys.modules,
+        "sky.provision.kubernetes",
+        NS(utils=NS(get_namespace=lambda **_: "default")),
+    )
     return api
 
 
@@ -65,9 +76,14 @@ def test_submit_once_records_request_before_wait_and_actual_job(
     sky.get.side_effect = get
     ci.worker(tmp_path, "launch")
     task = sky.Task.from_yaml.return_value
-    task.set_resources_override.assert_called_once_with({"infra": infra})
+    assert task.set_resources_override.call_args.args[0] == {
+        "infra": infra,
+        "_cluster_config_overrides": {
+            "kubernetes": {"custom_metadata": {"labels": {ci.LABEL: owner["label"]}}}
+        },
+    }
     sky.launch.assert_called_once_with(
-        task, cluster_name=owner["cluster"], retry_until_up=False
+        task, cluster_name=owner["cluster"], retry_until_up=True
     )
     assert ci.read_bound(tmp_path, "job.json", owner)["job_id"] == 17
     sky.tail_logs.assert_not_called()
@@ -279,7 +295,14 @@ def test_launch_receipt_failure_cancels_request_and_preserves_error(
     tmp_path, owner, sky, monkeypatch
 ):
     primary = OSError("disk full")
-    monkeypatch.setattr(ci, "write_json", Mock(side_effect=primary))
+    write = ci.write_json
+
+    def fail_receipt(path, data):
+        if path.name == "request.json":
+            raise primary
+        write(path, data)
+
+    monkeypatch.setattr(ci, "write_json", fail_receipt)
     sky.api_cancel.side_effect = OSError("cancel failed")
     with pytest.raises(OSError) as raised:
         ci.worker(tmp_path, "launch")
@@ -313,6 +336,23 @@ def test_launch_timeout_cancels_only_recorded_request(
         ci.supervise(tmp_path, owner)
     assert raised.value is error
     assert calls == (["launch", "cancel_request"] if known_request else ["launch"])
+    # A lost launch reply does not prove the remote test never started.
+    assert ci.read_bound(tmp_path, "result.json", owner)["status"] == "UNCONFIRMED"
+
+
+def test_capacity_wait_uses_original_admission_expiry(tmp_path, owner, monkeypatch):
+    owner["admission_deadline"] = 107
+    monkeypatch.setattr(ci.time, "time", lambda: 100)
+    calls = []
+
+    def run(root, operation, timeout):
+        calls.append((operation, timeout))
+        raise TimeoutError("capacity wait expired")
+
+    monkeypatch.setattr(ci, "run_worker", run)
+    with pytest.raises(TimeoutError):
+        ci.supervise(tmp_path, owner, timeout=2100)
+    assert calls == [("launch", 7)]
 
 
 @pytest.mark.parametrize(
@@ -350,14 +390,16 @@ def test_real_worker_round_trip_with_fake_sdk(tmp_path, infra):
     """Exercise the actual direct Python parent/worker JSON transport, without Sky."""
     (tmp_path / "sky.py").write_text("""
 import os
+import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
+sys.modules["sky.provision.kubernetes"] = NS(utils=NS(get_namespace=lambda **_: "default"))
 class Task:
     @classmethod
     def from_yaml(cls, path): return cls()
-    def set_resources_override(self, options): assert options == {"infra":os.environ["SKY_INFRA"]}
+    def set_resources_override(self, options): assert options["infra"] == os.environ["SKY_INFRA"]
 def launch(task, *, cluster_name, retry_until_up):
-    assert retry_until_up is False
+    assert retry_until_up is True
     Path(os.environ["FAKE_CLUSTER"]).write_text(cluster_name)
     return "launch-request"
 def get(value):
@@ -386,6 +428,7 @@ def tail_logs(cluster, *, job_id, follow):
         "GITHUB_EVENT_NAME": "pull_request",
         "SKY_INFRA": infra,
         "EXPECTED_HEAD_SHA": head,
+        "ADMISSION_DEADLINE": str(int(time.time()) + 1800),
     }
     root = tmp_path / "evidence"
     result = subprocess.run(
@@ -541,3 +584,199 @@ def test_interrupt_boundaries_retire_worker_before_propagating(
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=2)
+
+
+def admission_environment(monkeypatch, *, deadline):
+    for key, value in {
+        "GITHUB_RUN_ID": "42",
+        "GITHUB_RUN_ATTEMPT": "2",
+        "GITHUB_REPOSITORY": "OpenPipe/ART",
+        "GITHUB_EVENT_NAME": "pull_request",
+        "EXPECTED_HEAD_SHA": "a" * 40,
+        "SKY_INFRA": "k8s/cks-wb3",
+        "ADMISSION_DEADLINE": str(deadline),
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(ci.subprocess, "check_output", lambda *a, **kw: "a" * 40)
+
+
+def test_expired_queue_admission_cannot_later_launch(tmp_path, monkeypatch):
+    admission_environment(monkeypatch, deadline=100)
+    monkeypatch.setattr(ci.time, "time", lambda: 101)
+    launch = Mock()
+    monkeypatch.setattr(ci, "supervise", launch)
+    root = tmp_path / "expired"
+    assert ci.admit(root) == 104
+    assert ci.main(root) == 104
+    assert ci.cleanup(root) == 0
+    launch.assert_not_called()
+    result = json.loads((root / "result.json").read_text())
+    assert result["status"] == "NOT_RUN" and result["reason"] == "admission_expired"
+
+
+def test_setup_consumes_original_admitted_work_window(tmp_path, monkeypatch):
+    admission_environment(monkeypatch, deadline=1300)
+    now = [100]
+    monkeypatch.setattr(ci.time, "time", lambda: now[0])
+    root = tmp_path / "admitted"
+    assert ci.admit(root) == 0
+    now[0] = 400
+    run = Mock(return_value=0)
+    monkeypatch.setattr(ci, "supervise", run)
+    assert ci.main(root) == 0
+    assert run.call_args.kwargs["timeout"] == 1800
+    assert json.loads((root / "owner.json").read_text())["cleanup_deadline"] == 2500
+
+
+def test_admission_expiring_during_setup_does_not_launch(tmp_path, monkeypatch):
+    admission_environment(monkeypatch, deadline=300)
+    now = [100]
+    monkeypatch.setattr(ci.time, "time", lambda: now[0])
+    root = tmp_path / "admitted"
+    assert ci.admit(root) == 0
+    now[0] = 301
+    run = Mock()
+    monkeypatch.setattr(ci, "supervise", run)
+    assert ci.main(root) == 104
+    run.assert_not_called()
+    assert json.loads((root / "result.json").read_text())["status"] == "NOT_RUN"
+
+
+@pytest.mark.parametrize("deadline", ["admission_deadline", "work_deadline"])
+def test_worker_does_not_submit_after_cutoff(
+    tmp_path, owner, sky, monkeypatch, deadline
+):
+    monkeypatch.setattr(ci.time, "time", lambda: owner[deadline])
+    with pytest.raises(TimeoutError, match="launch deadline"):
+        ci.worker(tmp_path, "launch")
+    sky.launch.assert_not_called()
+    assert not (tmp_path / "launch-attempt.json").exists()
+
+
+def test_request_cancellation_waits_for_exact_terminal_state(
+    tmp_path, owner, sky, monkeypatch
+):
+    ci.write_json(tmp_path / "request.json", {**owner, "request_id": "request-17"})
+    sky.api_status.side_effect = [
+        [NS(request_id="request-17", status="PENDING")],
+        [NS(request_id="request-17", status="RUNNING")],
+        [NS(request_id="request-17", status="CANCELLED")],
+    ]
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+    ci.worker(tmp_path, "cancel_request")
+    assert sky.api_status.call_count == 3
+    assert (
+        ci.read_bound(tmp_path, "request-terminal.json", owner)["status"] == "CANCELLED"
+    )
+    sky.launch.assert_not_called()
+
+
+@pytest.mark.parametrize("records", [[], [NS(request_id="peer", status="CANCELLED")]])
+def test_request_cancellation_does_not_claim_unknown_terminal(
+    tmp_path, owner, sky, records
+):
+    ci.write_json(tmp_path / "request.json", {**owner, "request_id": "request-17"})
+    sky.api_status.return_value = records
+    with pytest.raises(ValueError, match="exact launch request"):
+        ci.worker(tmp_path, "cancel_request")
+    assert not (tmp_path / "request-terminal.json").exists()
+
+
+def test_cleanup_is_finite_and_reports_unknown_cancel(tmp_path, owner, monkeypatch):
+    ci.write_json(tmp_path / "launch-attempt.json", owner)
+    now = [owner["cleanup_deadline"] - 5]
+    monkeypatch.setattr(ci.time, "time", lambda: now[0])
+    calls = []
+
+    def run(root, operation, timeout):
+        calls.append((operation, timeout))
+        now[0] += 1
+        if operation == "cancel_request":
+            raise TimeoutError("request state unknown")
+
+    monkeypatch.setattr(ci, "run_worker", run)
+    assert ci.cleanup(tmp_path) == 105
+    assert calls == [
+        ("cancel_request", 5),
+        ("resources", 4),
+        ("down", 3),
+        ("stop_api", 2),
+        ("remove_resources", 1),
+    ]
+    receipt = ci.read_bound(tmp_path, "cleanup.json", owner)
+    assert receipt["confirmed"] is False
+    assert receipt["operations"]["remove_resources"]["success"] is True
+
+
+def test_api_cleanup_is_limited_to_its_ephemeral_runner(
+    tmp_path, owner, sky, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("RUNNER_ENVIRONMENT", "self-hosted")
+    with pytest.raises(ValueError, match="isolated GitHub-hosted"):
+        ci.worker(tmp_path, "stop_api")
+    sky.api_stop.assert_not_called()
+    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
+    sky.api_status.return_value = []
+    ci.worker(tmp_path, "stop_api")
+    sky.api_stop.assert_called_once_with()
+
+
+@pytest.mark.parametrize("foreign", [False, True])
+def test_cleanup_resources_records_uids_and_confines_deletion(
+    tmp_path, owner, monkeypatch, foreign
+):
+    ci.write_json(tmp_path / "allocation.json", {**owner, "namespace": "ci"})
+    pod = NS(
+        metadata=NS(
+            name="pod",
+            uid="original-uid",
+            namespace="ci",
+            labels={ci.LABEL: "peer" if foreign else owner["label"]},
+        )
+    )
+    api = NS(
+        list_namespaced_pod=Mock(side_effect=[NS(items=[pod]), NS(items=[])]),
+        list_namespaced_service=Mock(return_value=NS(items=[])),
+        delete_namespaced_pod=Mock(),
+    )
+    connection = NS(close=Mock())
+
+    class ApiException(Exception):
+        pass
+
+    client = NS(
+        CoreV1Api=lambda c: api,
+        V1DeleteOptions=NS,
+        V1Preconditions=NS,
+        ApiException=ApiException,
+    )
+    config = NS(new_client_from_config=Mock(return_value=connection))
+    monkeypatch.setitem(sys.modules, "kubernetes", NS(client=client, config=config))
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+    if foreign:
+        with pytest.raises(ValueError, match="unowned"):
+            ci.resources(tmp_path, owner, delete=True)
+        api.delete_namespaced_pod.assert_not_called()
+    else:
+
+        def delete(name, namespace, *, body, _request_timeout):
+            assert (name, namespace, body.preconditions.uid) == (
+                "pod",
+                "ci",
+                "original-uid",
+            )
+            recorded = ci.read_bound(tmp_path, "resources-cleanup.json", owner)
+            assert recorded["remaining"][0]["uid"] == "original-uid"
+
+        api.delete_namespaced_pod.side_effect = delete
+        ci.resources(tmp_path, owner, delete=True)
+        assert (
+            ci.read_bound(tmp_path, "resources-cleanup.json", owner)["remaining"] == []
+        )
+        api.list_namespaced_pod.assert_called_with(
+            "ci",
+            label_selector=f"{ci.LABEL}={owner['label']}",
+            _request_timeout=(3, 10),
+        )
+    connection.close.assert_called_once()

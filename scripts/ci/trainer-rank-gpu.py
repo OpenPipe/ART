@@ -1,8 +1,8 @@
 """Run the CI job without making an attached log stream its result gate.
 
-SkyPilot 0.12 returns an actual job ID from launch. Each SDK operation runs in a
-bounded child; only that job's SUCCEEDED status passes. The workflow EXIT trap
-still owns cluster teardown, including launch failures before a job ID is known.
+SkyPilot returns an actual job ID from launch. Each SDK operation runs in a
+bounded child; only that job's SUCCEEDED status passes. An always-run workflow
+step cancels pending admission and verifies cleanup of owned resources.
 """
 
 import json
@@ -12,9 +12,11 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
 NONTERMINAL = {"INIT", "PENDING", "SETTING_UP", "RUNNING"}
 INFRAS = {"k8s/cks-wb3", "k8s/ext-collab2"}
+LABEL = "art-ci-execution"
 EXIT_CODES = {
     "SUCCEEDED": 0,
     "FAILED": 100,
@@ -42,15 +44,96 @@ def read_bound(root, filename, owner):
     return data
 
 
+def launch_task(root, owner):
+    import sky
+    from sky.provision.kubernetes import utils as kube_utils
+
+    context = owner["infra"].split("/", 1)[1]
+    write_json(
+        root / "allocation.json",
+        {**owner, "namespace": kube_utils.get_namespace(context=context)},
+    )
+    task = sky.Task.from_yaml("scripts/ci/trainer-rank-gpu.sky.yaml")
+    task.set_resources_override(
+        {
+            "infra": owner["infra"],
+            "_cluster_config_overrides": {
+                "kubernetes": {"custom_metadata": {"labels": {LABEL: owner["label"]}}}
+            },
+        }
+    )
+    return task
+
+
+def resources(root, owner, *, delete):
+    """Observe/delete only this attempt's nonce-labelled Pods and Services."""
+    from kubernetes import client, config
+
+    allocation = read_bound(root, "allocation.json", owner)
+    namespace = allocation["namespace"]
+    connection = config.new_client_from_config(context=owner["infra"].split("/", 1)[1])
+    api = client.CoreV1Api(connection)
+    retained = []
+    try:
+        while True:
+            found = []
+            for kind in ("pod", "service"):
+                items = getattr(api, f"list_namespaced_{kind}")(
+                    namespace,
+                    label_selector=f"{LABEL}={owner['label']}",
+                    _request_timeout=(3, 10),
+                ).items
+                for item in items:
+                    metadata = item.metadata
+                    if (
+                        metadata.labels.get(LABEL) != owner["label"]
+                        or metadata.namespace != namespace
+                        or not metadata.uid
+                    ):
+                        raise ValueError("Kubernetes returned an unowned resource")
+                    identity = {
+                        "kind": kind,
+                        "name": metadata.name,
+                        "uid": metadata.uid,
+                    }
+                    found.append(identity)
+                    if identity not in retained:
+                        retained.append(identity)
+            write_json(
+                root / ("resources-cleanup.json" if delete else "resources.json"),
+                {**allocation, "observed": retained, "remaining": found},
+            )
+            if not delete or not found:
+                return
+            for item in found:
+                try:
+                    getattr(api, f"delete_namespaced_{item['kind']}")(
+                        item["name"],
+                        namespace,
+                        body=client.V1DeleteOptions(
+                            preconditions=client.V1Preconditions(uid=item["uid"])
+                        ),
+                        _request_timeout=(3, 10),
+                    )
+                except client.ApiException as error:
+                    if error.status != 404:
+                        raise
+            time.sleep(1)
+    finally:
+        connection.close()
+
+
 def worker(root, operation):
     import sky
 
     owner = json.loads((root / "owner.json").read_text())
     cluster = owner["cluster"]
     if operation == "launch":
-        task = sky.Task.from_yaml("scripts/ci/trainer-rank-gpu.sky.yaml")
-        task.set_resources_override({"infra": owner["infra"]})
-        request_id = sky.launch(task, cluster_name=cluster, retry_until_up=False)
+        task = launch_task(root, owner)
+        if time.time() >= min(owner["admission_deadline"], owner["work_deadline"]):
+            raise TimeoutError("CI launch deadline reached")
+        write_json(root / "launch-attempt.json", owner)
+        request_id = sky.launch(task, cluster_name=cluster, retry_until_up=True)
         try:
             write_json(root / "request.json", {**owner, "request_id": request_id})
             job_id, handle = sky.get(request_id)
@@ -75,6 +158,41 @@ def worker(root, operation):
     if operation == "cancel_request":
         request = read_bound(root, "request.json", owner)["request_id"]
         sky.get(sky.api_cancel(request_ids=[request]))
+        while True:
+            records = sky.api_status(request_ids=[request])
+            if len(records) != 1 or records[0].request_id != request:
+                raise ValueError("Sky did not return the exact launch request")
+            status = records[0].status
+            if status in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+                write_json(
+                    root / "request-terminal.json",
+                    {**owner, "request_id": request, "status": status},
+                )
+                break
+            time.sleep(1)
+        return
+    if operation == "down":
+        clusters = sky.get(sky.status([cluster]))
+        if any(item["name"] != cluster for item in clusters):
+            raise ValueError("Sky returned a different cluster")
+        if clusters:
+            sky.get(sky.down(cluster))
+        return
+    if operation == "stop_api":
+        # This workflow owns the entire ephemeral runner and its local API.
+        # Stop its workers before the final physical census, including when a
+        # cancelled launch has not yet unwound. Never stop a developer's API.
+        if (
+            os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+        ):
+            raise ValueError("API cleanup requires an isolated GitHub-hosted runner")
+        sky.api_stop()  # The maintained SDK rejects remote API endpoints.
+        if sky.api_status():
+            raise RuntimeError("The CI API still reports requests after stopping")
+        return
+    if operation in {"resources", "remove_resources"}:
+        resources(root, owner, delete=operation == "remove_resources")
         return
     job_id = read_bound(root, "job.json", owner)["job_id"]
     if operation == "status":
@@ -198,7 +316,11 @@ def supervise(root, owner, timeout=35 * 60, poll_seconds=10):
     job = None
     errors = 0
     try:
-        run_worker(root, "launch", deadline - time.monotonic())
+        run_worker(
+            root,
+            "launch",
+            min(deadline - time.monotonic(), owner["admission_deadline"] - time.time()),
+        )
         job = read_bound(root, "job.json", owner)
         while True:
             try:
@@ -231,12 +353,21 @@ def supervise(root, owner, timeout=35 * 60, poll_seconds=10):
                 root / "failure.json",
                 {**owner, "remote_status": remote_status, "error": repr(error)},
             )
+            if job is None:
+                write_json(
+                    root / "result.json",
+                    {
+                        **owner,
+                        "status": "UNCONFIRMED",
+                        "reason": "launch_result_unavailable",
+                    },
+                )
         except Exception as receipt_error:
             print(f"Failure receipt also failed: {receipt_error}", file=sys.stderr)
         raise
     finally:
         # Also recover the exact ID if a receipt read failed after launch.
-        # No guessed/latest job is ever cancelled. The outer trap handles unknown ID.
+        # No guessed/latest job is cancelled. The workflow reconciles unknown IDs.
         if job is None:
             try:
                 job = read_bound(root, "job.json", owner)
@@ -259,7 +390,7 @@ def supervise(root, owner, timeout=35 * 60, poll_seconds=10):
             print(f"::warning::Diagnostic receipt failed: {error}", flush=True)
 
 
-def main(root):
+def admit(root):
     root.mkdir(parents=True, exist_ok=False)
     run_id, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
     if not run_id.isdecimal() or not attempt.isdecimal():
@@ -280,18 +411,82 @@ def main(root):
     }
     if owner["head"] != os.environ["EXPECTED_HEAD_SHA"]:
         raise ValueError("Checkout differs from classified CI head")
+    now = time.time()
+    admission_deadline = int(os.environ["ADMISSION_DEADLINE"])
+    owner.update(
+        label=uuid.uuid4().hex,
+        admitted_at=now,
+        admission_deadline=admission_deadline,
+        work_deadline=now + 35 * 60,
+        cleanup_deadline=now + 40 * 60,
+    )
     write_json(root / "owner.json", owner)
+    if now >= admission_deadline:
+        write_json(
+            root / "result.json",
+            {**owner, "status": "NOT_RUN", "reason": "admission_expired"},
+        )
+        print("::error::GPU validation did not run: its queue admission expired.")
+        return 104
+    return 0
+
+
+def cleanup(root):
+    if not (root / "launch-attempt.json").exists():
+        return 0
+    owner = json.loads((root / "owner.json").read_text())
+
+    read_bound(root, "launch-attempt.json", owner)
+    outcomes = {}
+    # A failed/unknown cancellation must not prevent best-effort physical cleanup.
+    for operation, limit in [
+        ("cancel_request", 30),
+        ("resources", 20),
+        ("down", 90),
+        ("stop_api", 30),
+        ("remove_resources", 90),
+    ]:
+        try:
+            run_worker(
+                root, operation, min(limit, owner["cleanup_deadline"] - time.time())
+            )
+            outcomes[operation] = {"success": True}
+        except BaseException as error:
+            outcomes[operation] = {"success": False, "error": repr(error)}
+    confirmed = all(outcome["success"] for outcome in outcomes.values())
+    write_json(
+        root / "cleanup.json", {**owner, "confirmed": confirmed, "operations": outcomes}
+    )
+    return 0 if confirmed else 105
+
+
+def main(root):
+    if not (root / "owner.json").exists():
+        code = admit(root)
+        if code:
+            return code
+    owner = json.loads((root / "owner.json").read_text())
+    if time.time() >= owner["admission_deadline"]:
+        write_json(
+            root / "result.json",
+            {**owner, "status": "NOT_RUN", "reason": "admission_expired"},
+        )
+        return 104
 
     def interrupted(signum, frame):
         raise InterruptedError(f"CI interrupted by signal {signum}")
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
-    return supervise(root, owner)
+    return supervise(root, owner, timeout=max(0, owner["work_deadline"] - time.time()))
 
 
 if __name__ == "__main__":
     if sys.argv[1] == "worker":
         worker(Path(sys.argv[2]), sys.argv[3])
+    elif sys.argv[1] == "admit":
+        sys.exit(admit(Path(sys.argv[2])))
+    elif sys.argv[1] == "cleanup":
+        sys.exit(cleanup(Path(sys.argv[2])))
     else:
         sys.exit(main(Path(sys.argv[1])))

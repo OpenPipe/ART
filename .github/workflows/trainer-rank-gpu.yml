@@ -31,7 +31,12 @@ jobs:
       head_sha: ${{ steps.changes.outputs.head_sha }}
       reused: ${{ steps.reuse.outputs.reused }}
       reused_run: ${{ steps.reuse.outputs.run_id }}
+      admission_deadline: ${{ steps.admission.outputs.deadline }}
     steps:
+      - id: admission
+        name: Bound GPU queue admission
+        run: echo "deadline=$(( $(date +%s) + 1800 ))" >> "${GITHUB_OUTPUT}"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -144,13 +149,22 @@ jobs:
     if: needs.classify.outputs.required == 'true' && needs.classify.outputs.reused != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    concurrency:
+      group: trainer-rank-gpu-capacity-${{ inputs.context || 'cks-wb3' }}
+      cancel-in-progress: false
+      queue: max
     environment: trainer-rank-gpu-validation
     env:
       SKY_INFRA: k8s/${{ inputs.context || 'cks-wb3' }}
+      EXPECTED_HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
+      ADMISSION_DEADLINE: ${{ needs.classify.outputs.admission_deadline }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.classify.outputs.head_sha }}
+
+      - name: Check admission deadline
+        run: python3 scripts/ci/trainer-rank-gpu.py admit "${RUNNER_TEMP}/trainer-rank-result"
 
       - name: Install launch dependencies
         run: |
@@ -221,14 +235,21 @@ jobs:
           set -euo pipefail
           sky_venv="${RUNNER_TEMP}/skypilot"
           uv venv --python 3.10 "${sky_venv}"
+          # Preserve cancelled requests before retry callbacks can reschedule them.
           uv pip install --python "${sky_venv}/bin/python" \
-            'skypilot[kubernetes,remote]==0.12.0' 'kubernetes==34.1.0'
+            'skypilot[kubernetes,remote] @ git+https://github.com/OpenPipe/skypilot-modal.git@9792e52a66dbe8c1c2636476103ec90654ac71e3' \
+            'kubernetes==34.1.0'
           sky="${sky_venv}/bin/sky"
-          cluster="trainer-rank-gpu-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          cleanup() { "${sky}" down -y "${cluster}" || true; }
-          trap cleanup EXIT
           "${sky}" check kubernetes
           "${sky_venv}/bin/python" scripts/ci/trainer-rank-gpu.py \
+            "${RUNNER_TEMP}/trainer-rank-result"
+
+      - name: Reconcile owned GPU resources
+        if: always()
+        run: |
+          python="${RUNNER_TEMP}/skypilot/bin/python"
+          if [ ! -x "${python}" ]; then python=python3; fi
+          "${python}" scripts/ci/trainer-rank-gpu.py cleanup \
             "${RUNNER_TEMP}/trainer-rank-result"
 
       - name: Preserve remote result and diagnostic logs
