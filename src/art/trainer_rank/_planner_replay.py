@@ -523,6 +523,13 @@ def validate(facts: Any) -> None:
             group["gradient"][0] and facts["checkpoint_moe_bytes_per_token"]
         ):
             raise ValueError("MoE coverage without a checkpoint coefficient")
+        # One walk prices both modes: the checkpoint coefficient is at least
+        # the forward one, and the same storage gates both modes' stages.
+        forward, gradient = group["forward"], group["gradient"]
+        if gradient[0] < forward[0] or (
+            forward[0] and bool(forward[1]) != bool(gradient[1])
+        ):
+            raise ValueError("invalid MoE terms")
         layout = group["layout"]
         if layout is not None:
             fields(layout, {"attention_rows", "gdn_rows", "attention_retained"})
@@ -597,6 +604,14 @@ def validate(facts: Any) -> None:
     }
     if len(kinds) > 1:
         raise ValueError("invalid adapter gradient facts")
+    # Unnamed gradient groups all read the constructor's coverage flag, and a
+    # named slot is covered only where that flag is set.
+    unnamed = {g["moe_covered"] for g in groups if g["grad"] and g["adapter"] is None}
+    if len(unnamed) > 1 or (
+        False in unnamed
+        and any(g["moe_covered"] for g in groups if g["adapter"] is not None)
+    ):
+        raise ValueError("inconsistent MoE recompute coverage")
     # Live layouts cover every group of a plan on the same ranks, or none.
     layouts = [group["layout"] for group in groups]
     laid_out = any(layout is not None for layout in layouts)
