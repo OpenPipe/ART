@@ -74,7 +74,7 @@ class _AdapterOutputLifetime(TorchDispatchMode):
         self.adapter = None
         self.at_add = []
 
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    def __torch_dispatch__(self, func, types, args: tuple = (), kwargs=None):
         if (
             func is torch.ops.aten.add.Tensor
             and self.adapter is not None
