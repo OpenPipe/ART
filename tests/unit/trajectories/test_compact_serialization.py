@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import copy
 from datetime import datetime
+import gc
 import json
 import pickle
 import random
 import sys
 from typing import Any
+import weakref
 
+import orjson
 import pydantic
 import pytest
 
@@ -287,6 +290,80 @@ def test_compact_decode_is_one_level_and_unmatched_references_are_literal() -> N
     restored = art.trajectories.compact_validate(payload, type=art.Trajectory)
 
     assert restored.metadata == {"mapped": "$1", "literal": "$2"}
+
+
+@pytest.mark.parametrize("input_type", [str, bytes, bytearray, memoryview])
+def test_compact_json_preserves_references_and_isolates_outputs(input_type) -> None:
+    payload = {
+        "format": "art.trajectories",
+        "version": 1,
+        "kind": "trajectory",
+        "strings": {"$0": "$0", "$1": "$2", "$2": "not recursive"},
+        "data": {"metadata": {"$0": "$0", "nested": [[1, 2], {"x": "$1"}]}},
+    }
+    raw = json.dumps(payload)
+    argument = raw if input_type is str else input_type(raw.encode())
+    first = tr.compact_validate_json(argument, type=tr.Trajectory)
+    second = tr.compact_validate_json(argument, type=tr.Trajectory)
+    key = next(key for key in first.metadata if key == "$0")
+    assert key is first.metadata[key]
+    assert first.metadata["nested"][1]["x"] == "$2"
+    first.metadata["nested"][0].append(3)
+    assert second.metadata["nested"][0] == [1, 2]
+    assert json.loads(raw) == payload
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"format":"art.trajectories","version":1,"kind":"trajectory",'
+        b'"strings":{},"data":{"metadata":{"n":18446744073709551616}}}',
+        b'{"format":"art.trajectories","version":1,"kind":"trajectory",'
+        b'"strings":{},"data":{"metadata":{"n":1,"n":2}}}',
+        b'{"format":"art.trajectories","version":1,"kind":"trajectory",'
+        b'"strings":{"$0":"duplicate"},"data":{"metadata":{"$0":1,"duplicate":2}}}',
+        b'{"format":"art.trajectories","version":1,"kind":"trajectory",'
+        b'"strings":{},"data":{"metadata":[]}}',
+        b'{"format":"art.trajectories","version":true,"kind":"trajectory",'
+        b'"strings":{},"data":{}}',
+        b'{"n":NaN}',
+        b'{"n":Infinity}',
+        b'{"n":"\\ud800"}',
+        b"null",
+        b"[]",
+        b"{",
+    ],
+)
+def test_compact_json_matches_existing_orjson_acceptance_and_errors(raw: bytes) -> None:
+    results = []
+    for validate in (
+        lambda value: tr.compact_validate(orjson.loads(value)),
+        tr.compact_validate_json,
+    ):
+        try:
+            value = validate(raw)
+        except Exception as error:
+            results.append((type(error), str(error)))
+        else:
+            assert isinstance(value, tr.Trajectory)
+            results.append(value.model_dump())
+    assert results[0] == results[1]
+
+
+def test_compact_json_does_not_retain_models_or_disable_cycle_collection() -> None:
+    raw = json.dumps(tr.compact_dump(tr.Trajectory())).encode()
+    enabled, thresholds = gc.isenabled(), gc.get_threshold()
+    value = tr.compact_validate_json(raw, type=tr.Trajectory)
+    reference = weakref.ref(value)
+    del value
+    assert reference() is None
+    value = tr.compact_validate_json(raw, type=tr.Trajectory)
+    value.metadata["cycle"] = value
+    reference = weakref.ref(value)
+    del value
+    gc.collect()
+    assert reference() is None
+    assert (gc.isenabled(), gc.get_threshold()) == (enabled, thresholds)
 
 
 def test_compact_decode_numeric_lists_preserve_values_and_copy_each_occurrence() -> (
@@ -746,6 +823,76 @@ def test_tokenized_compact_round_trip_all_protocol_source_shapes() -> None:
             assert _json_size(tokenized.compact_dump()) < len(
                 tokenized.model_dump_json().encode()
             )
+
+
+def test_compact_json_round_trips_all_kinds_and_protocol_source_joins() -> None:
+    combined = _protocol_trajectory()
+    for protocol in ("chat_completions", "completions", "responses", "messages"):
+        source = tr.Trajectory()
+        getattr(source.exchanges, protocol).extend(
+            getattr(combined.exchanges, protocol)
+        )
+        history = source.histories()[0]
+        assert isinstance(history, tr.History) and history.model is not None
+        tokenized = tr.TokenizedTrajectory(
+            trajectory=source,
+            history=history,
+            model=history.model,
+            tokens=[1, 2],
+            logprobs=[0.0, -0.1],
+            flags=[tr.TokenFlag.EXACT, tr.TokenFlag.EXACT | tr.TokenFlag.SAMPLED],
+        )
+        tokenized_history = tr.TokenizedHistory(
+            **{
+                name: getattr(tokenized, name)
+                for name in ("history", "model", "tokens", "logprobs", "flags")
+            }
+        )
+        multi = tr.TokenizedMultiHistoryTrajectory(
+            trajectory=source, histories=[tokenized_history]
+        )
+        group = tr.TrajectoryGroup([source])
+        tokenized_group = tr.TokenizedTrajectoryGroup[
+            tr.TokenizedMultiHistoryTrajectory
+        ](trajectory_group=group, trajectories=[multi])
+        values = [source, group, tokenized_history, tokenized, multi, tokenized_group]
+        values.extend(value.tensorize(device="cpu") for value in values[2:])
+        for value in values:
+            for collection in (False, True):
+                raw = json.dumps(
+                    tr.compact_dump([value] if collection else value), allow_nan=False
+                ).encode()
+                expected = tr.compact_validate(orjson.loads(raw))
+                actual = tr.compact_validate_json(raw)
+                if collection:
+                    assert isinstance(expected, list) and isinstance(actual, list)
+                    expected, actual = expected[0], actual[0]
+                assert not isinstance(expected, list) and not isinstance(actual, list)
+                assert type(actual) is type(expected)
+                assert actual.model_dump_json() == expected.model_dump_json()
+                if isinstance(actual, tr.TokenizedMultiHistoryTrajectory):
+                    owner = getattr(actual.trajectory.exchanges, protocol)[0]
+                    source_history = actual.histories[0].history
+                    if isinstance(source_history, tr.ChatCompletionsHistory):
+                        assert (
+                            next(
+                                s for s in source_history.message_sources if s
+                            ).exchange
+                            is owner
+                        )
+                    elif isinstance(source_history, tr.AnthropicMessagesHistory):
+                        assert source_history.system_source is owner
+                    elif isinstance(source_history, tr.ResponsesHistory):
+                        assert source_history.instructions_source is owner
+                    else:
+                        assert (
+                            next(
+                                s.source
+                                for s in source_history.prompt_sources
+                                if s.source
+                            ).exchange
+                            is owner
+                        )
 
 
 def test_pickle_interning_reduces_pickle_and_compact_json_sizes() -> None:

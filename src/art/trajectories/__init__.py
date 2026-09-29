@@ -1462,6 +1462,40 @@ def compact_validate[T](
 
 
 @overload
+def compact_validate_json[T](
+    payload: str | bytes | bytearray | memoryview,
+    *,
+    type: TypeForm[T],
+    device: torch.device | str | None = None,
+) -> T: ...
+
+
+@overload
+def compact_validate_json(
+    payload: str | bytes | bytearray | memoryview,
+    *,
+    type: None = None,
+    device: torch.device | str | None = None,
+) -> _CompactValidated: ...
+
+
+def compact_validate_json[T](
+    payload: str | bytes | bytearray | memoryview,
+    *,
+    type: TypeForm[T] | None = None,
+    device: torch.device | str | None = None,
+) -> T | _CompactValidated:
+    """Validate compact JSON without copying its privately parsed containers.
+
+    Uses orjson's JSON syntax and numeric behavior. NaN/Infinity literals are
+    rejected; use compact_validate() for Python payloads containing those values.
+    """
+    from ._compact import validate_json
+
+    return validate_json(payload, type=type, device=device)
+
+
+@overload
 def current_trajectory(*, require: Literal[True]) -> Trajectory: ...
 
 
@@ -1927,6 +1961,7 @@ __all__ = [
     "compact_memory",
     "compact_dump",
     "compact_validate",
+    "compact_validate_json",
     "current_trajectory",
     "no_capture",
     "trajectory",
