@@ -37,6 +37,21 @@ uv run prek run pytest
 
 These checks are automatically run in CI for all pull requests. If your PR fails these checks, re-run the corresponding `prek` hook locally and commit any fixes.
 
+### TrainerRank GPU Validation
+
+GPU validation uses two H200s on free `cks-wb3` Kubernetes infrastructure by default.
+To select `ext-collab2` for a manual validation of a branch:
+
+```bash
+gh workflow run trainer-rank-gpu.yml --ref BRANCH -f context=ext-collab2
+```
+
+These are the only supported contexts; there is no automatic fallback. The default
+uses `CKS_WB3_KUBECONFIG`; `ext-collab2` uses the existing `GPU_IMAGE_KUBECONFIG`
+secret and requires its `skypilot-workload` service account. The selected infrastructure
+is recorded in the job's owner and result receipts. Source checks, time limits,
+job-status validation, and teardown apply equally to both contexts.
+
 ### CI uv Cache
 
 The PR `prek` workflow uses a prebuilt full `uv` cache (stored as a GitHub release asset) to avoid rebuilding heavy dependencies on every run.
