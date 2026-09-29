@@ -318,11 +318,11 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
             def reduce(value, op, group=None):
                 trace.append(("global" if group is None else "local", str(op)))
                 if group is None:
-                    value.fill_(
-                        max(value.item(), 100 if search_finished else 200)
-                        if op == tr.dist.ReduceOp.MAX
-                        else min(value.item(), 100)
-                    )
+                    if op == tr.dist.ReduceOp.MAX:
+                        value.fill_(max(value.item(), 100 if search_finished else 200))
+                    else:
+                        value[0] = min(value[0].item(), 100)
+                        value[1] = float(bool(search_finished))
 
             patch.setattr(tr.dist, "is_available", lambda: True)
             patch.setattr(tr.dist, "is_initialized", lambda: True)
