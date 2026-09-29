@@ -8,7 +8,7 @@ from typing import Literal
 import weakref
 
 import pytest
-from test_trainer_rank_custom_tensors import _trainer
+from test_trainer_rank_custom_tensors import _real_lora_trainer, _trainer
 import torch
 
 from art.megatron.context_parallel.types import ParallelTopology
@@ -142,6 +142,118 @@ def test_failed_correction_capture_releases_unattached_graph(monkeypatch, failur
     assert len(cache.handles()) == 1
     trainer.backward(output)
     torch.testing.assert_close(weight.grad, torch.tensor(4.0))
+    assert not cache.handles()
+
+
+@pytest.mark.parametrize(
+    "phase,shared",
+    [
+        (phase, shared)
+        for phase in ("copy", "correction", "handoff")
+        for shared in (False, True)
+    ]
+    + [("cancel", False)],
+)
+def test_native_failed_handoff_drops_only_its_capture_owners(
+    monkeypatch, phase, shared
+):
+    trainer, ref, _, group = _prepare_forward(monkeypatch, "cpu", "cpu")
+    real, _ = _real_lora_trainer()
+    from art.megatron.lora import LoRA
+
+    trainer.runtime, trainer._checkpoint_slots = real.runtime, real._checkpoint_slots
+    lora = trainer.runtime.model[0]
+    assert isinstance(lora, LoRA)
+    current = lora.lora_slot_params(ref)
+    with torch.no_grad():
+        current[0].fill_(1)
+        current[1].fill_(2)
+    versions, snapshots, delivered = [], [], []
+
+    def forward(items, prepared):
+        active = lora.active_lora_tensors()
+        assert active is not None
+        a, b, _ = active
+        assert a is not current[0] and b is not current[1]
+        versions.extend(weakref.ref(v) for v in trainer._version_state().lora.values())
+        snapshots.extend((weakref.ref(a), weakref.ref(b)))
+        return [ForwardOutput(a.square().sum() + b.square().sum(), None, None, None)]
+
+    monkeypatch.setattr(trainer, "_forward_packed", forward)
+    cache = trainer._forward_graph_cache()
+    older = torch.nn.Parameter(torch.tensor(3.0))
+    if shared:
+        old_output = trainer._execute_graph_group(group)[0].target_logprobs
+        (old_handle,) = cache.handles()
+    else:
+        old_handle, (old_output,) = cache.run(lambda _: (older.square(),), None)
+    old_record = weakref.ref(cache._records[old_handle])
+    versions.clear()
+    snapshots.clear()
+    error_type = asyncio.CancelledError if phase == "cancel" else MemoryError
+    primary = error_type("native handoff failed")
+    primary.__cause__ = cause = RuntimeError("original cause")
+    to = torch.Tensor.to
+
+    def fail_copy(value, *args, **kwargs):
+        if kwargs.get("copy") and (
+            (phase in ("copy", "cancel") and "device" in kwargs)
+            or (
+                phase == "correction" and args == ("cpu",) and len(cache.handles()) == 2
+            )
+        ):
+            del value
+            raise primary
+        return to(value, *args, **kwargs)
+
+    def fail_handoff(_ref, outputs):
+        delivered.extend(weakref.ref(output.target_logprobs) for output in outputs)
+        del outputs
+        raise primary
+
+    with monkeypatch.context() as failure:
+        failure.setattr(torch.Tensor, "to", fail_copy)
+        if phase == "handoff":
+            failure.setattr(trainer, "_track_slot_graph_outputs", fail_handoff)
+        with pytest.raises(error_type) as caught:
+            trainer._execute_graph_group(group)
+    assert caught.value is primary and primary.__cause__ is cause
+    assert primary.__traceback__ is not None
+    assert (
+        cache.handles() == (old_handle,) and cache._records[old_handle] is old_record()
+    )
+    assert len(versions) == 1 and len(snapshots) == 2
+    assert all(
+        (reference() is not None) == shared for reference in (*versions, *snapshots)
+    ), (
+        "retained version and snapshots",
+        tuple(reference() is not None for reference in (*versions, *snapshots)),
+    )
+    assert all(reference() is None for reference in delivered)
+    assert all(parameter.grad is None for parameter in current)
+    if shared:
+        assert old_output is not None and old_output.item() == 38
+        cache.evict(old_handle)
+        trainer.backward(old_output)
+        torch.testing.assert_close(current[0].grad, torch.full_like(current[0], 2))
+        torch.testing.assert_close(current[1].grad, torch.full_like(current[1], 4))
+        for parameter in current:
+            parameter.grad = None
+    else:
+        assert old_output is not None and old_output.item() == 9
+        cache.backward(old_handle, (torch.tensor(1.0),))
+        torch.testing.assert_close(older.grad, torch.tensor(6.0))
+    assert all(reference() is None for reference in (*versions, *snapshots))
+    assert not trainer._version_state().lora
+    trainer._guard_slot_can_load(ref)
+
+    output = trainer._execute_graph_group(group)[0].target_logprobs
+    assert output is not None and output.item() == 38
+    (handle,) = cache.handles()
+    cache.evict(handle)
+    trainer.backward(output)
+    torch.testing.assert_close(current[0].grad, torch.full_like(current[0], 2))
+    torch.testing.assert_close(current[1].grad, torch.full_like(current[1], 4))
     assert not cache.handles()
 
 

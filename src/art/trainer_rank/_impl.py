@@ -4011,23 +4011,24 @@ class TrainerRank:
                 else torch.cuda.current_device(),
             )
         cache = self._forward_graph_cache()
-        handle, tensors = cache.run(
-            execute,
-            group,
-            context_factory=lambda: use_lora_slot(ref, version=version),
-            validate_backward=None if version is None else version.validate,
-            retention=retention,
-            checkpoint_versions=() if version is None else (version.version,),
-            options=options,
-            cuda_devices=devices,
-            rng_tracker=tracker,
-            keep_on_device=lambda tensor: (
-                (tensor.device, tensor.untyped_storage().data_ptr()) in storages
-            ),
-            output_device=output_device,
-            execution_peak_bytes=getattr(placement, "execution_peak_bytes", 0),
-        )
+        handle = None
         try:
+            handle, tensors = cache.run(
+                execute,
+                group,
+                context_factory=lambda: use_lora_slot(ref, version=version),
+                validate_backward=None if version is None else version.validate,
+                retention=retention,
+                checkpoint_versions=() if version is None else (version.version,),
+                options=options,
+                cuda_devices=devices,
+                rng_tracker=tracker,
+                keep_on_device=lambda tensor: (
+                    (tensor.device, tensor.untyped_storage().data_ptr()) in storages
+                ),
+                output_device=output_device,
+                execution_peak_bytes=getattr(placement, "execution_peak_bytes", 0),
+            )
             if topology.cp > 1 and retention != "replay":
                 residual = cache.state(handle).non_offloadable_bytes
                 if residual is not None:
@@ -4086,7 +4087,16 @@ class TrainerRank:
             return self._track_slot_graph_outputs(ref, outputs)
         except BaseException:
             # No caller owns a failed handoff; a partial bridge may also release.
-            cache.release(handle)
+            try:
+                if handle is not None:
+                    cache.release(handle)
+            finally:
+                # A retained traceback must not own this failed call's captures.
+                # Clear its closure cell, never the shared version or live graphs.
+                del version
+                packet = outputs = None
+                tensors = ()
+                parameters.clear()
             raise
 
     def _forward_output_metadata(
