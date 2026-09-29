@@ -226,7 +226,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             else 0
         )
         adapter = None
-        if group.grad_enabled and getattr(group.slot_ref, "name", None) is not None:
+        if group.grad_enabled and name is not None:
             # The live estimator reads this slot's unallocated gradient bytes
             # per decoder layer; freeze them with the selection.
             kind = getattr(group.slot_ref, "kind", None)
