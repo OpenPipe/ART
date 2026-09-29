@@ -534,6 +534,78 @@ def _moe_workspace_bytes(
     )
 
 
+def _checkpoint_floor_decoder(
+    self: TrainerRank, *, sequence_parallel: bool = False
+) -> Any | None:
+    """The decoder whose saved boundaries the checkpoint floor prices, or None.
+
+    Every local layer recomputed full/uniform/1 in BF16 at PP1, with no
+    custom checkpointed forward: at TP1 by default, which the dense widths
+    also require, so a discount never outlives the floor that carries its
+    TE growth; or, with ``sequence_parallel``, at a TP > 1 that
+    ``_sequence_parallel_floor_covered`` holds for.
+    """
+    if len(self.runtime.model) != 1:
+        return None
+    try:
+        decoder = _impl._language_model(self.runtime.model[0]).decoder
+    except (AttributeError, RuntimeError):
+        return None
+    try:
+        from megatron.core.transformer.transformer_block import TransformerBlock
+    except ModuleNotFoundError as error:
+        if error.name != "megatron":
+            raise
+        return None
+
+    if type(decoder) is not TransformerBlock:
+        return None
+    config = decoder.config
+    layers = len(decoder.layers)
+    _, tp, cp, pp = self._topology_key()
+    expected = {
+        "recompute_granularity": "full",
+        "recompute_method": "uniform",
+        "recompute_num_layers": 1,
+        "distribute_saved_activations": False,
+        "sequence_parallel": sequence_parallel,
+        "fp32_residual_connection": False,
+        "cpu_offloading": False,
+        "cuda_graph_impl": "none",
+    }
+    if (
+        decoder.training is not True
+        or layers <= 0
+        or layers != decoder.num_layers_per_pipeline_rank
+        or layers != config.num_layers
+        or config.hidden_size != self._hidden_size
+        or config.params_dtype is not _impl.torch.bfloat16
+        or self._param_dtype_size != 2
+        or next(self.runtime.model[0].parameters()).dtype is not _impl.torch.bfloat16
+        or pp != 1
+        or (
+            not (tp > 1 and self._sequence_parallel_floor_covered(layers, tp, cp))
+            if sequence_parallel
+            else tp != 1
+        )
+        or any(
+            type(getattr(config, name, None)) is not type(value)
+            or getattr(config, name) != value
+            for name, value in expected.items()
+        )
+        or getattr(config, "fp8", None)
+        or getattr(config, "fp4", None)
+        or any(
+            name in vars(decoder)
+            for name in ("forward", "_checkpointed_forward", "_get_layer")
+        )
+        or getattr(decoder, "_forward_hooks", None)
+        or getattr(decoder, "_forward_pre_hooks", None)
+    ):
+        return None
+    return decoder
+
+
 def _checkpoint_layers(
     self: TrainerRank,
     group_rows: tuple[tuple[int, bool], ...],
@@ -552,61 +624,11 @@ def _checkpoint_layers(
     and there, for gradient waves, the recomputed GDN layer's recurrent
     states for ``gdn_segments`` (gradient groups' segments) plus padding.
     """
-    if not group_rows or len(self.runtime.model) != 1:
+    if not group_rows:
         return 0
-    try:
-        decoder = _impl._language_model(self.runtime.model[0]).decoder
-    except (AttributeError, RuntimeError):
-        return 0
-    try:
-        from megatron.core.transformer.transformer_block import TransformerBlock
-    except ModuleNotFoundError as error:
-        if error.name != "megatron":
-            raise
-        return 0
-
-    if type(decoder) is not TransformerBlock:
-        return 0
-    config = decoder.config
-    layers = len(decoder.layers)
-    _, tp, cp, pp = self._topology_key()
-    expected = {
-        "recompute_granularity": "full",
-        "recompute_method": "uniform",
-        "recompute_num_layers": 1,
-        "distribute_saved_activations": False,
-        "sequence_parallel": tp > 1,
-        "fp32_residual_connection": False,
-        "cpu_offloading": False,
-        "cuda_graph_impl": "none",
-    }
-    if (
-        decoder.training is not True
-        or layers <= 0
-        or layers != decoder.num_layers_per_pipeline_rank
-        or layers != config.num_layers
-        or config.hidden_size != self._hidden_size
-        or config.params_dtype is not _impl.torch.bfloat16
-        or self._param_dtype_size != 2
-        or next(self.runtime.model[0].parameters()).dtype is not _impl.torch.bfloat16
-        or pp != 1
-        or (tp > 1 and not self._sequence_parallel_floor_covered(layers, tp, cp))
-        or any(
-            type(getattr(config, name, None)) is not type(value)
-            or getattr(config, name) != value
-            for name, value in expected.items()
-        )
-        or getattr(config, "fp8", None)
-        or getattr(config, "fp4", None)
-        or any(
-            name in vars(decoder)
-            for name in ("forward", "_checkpointed_forward", "_get_layer")
-        )
-        or getattr(decoder, "_forward_hooks", None)
-        or getattr(decoder, "_forward_pre_hooks", None)
-    ):
-        return 0
-    return layers
+    _, tp, _, _ = self._topology_key()
+    decoder = self._checkpoint_floor_decoder(sequence_parallel=tp > 1)
+    return 0 if decoder is None else len(decoder.layers)
 
 
 def _checkpoint_memory_floor(
@@ -713,13 +735,18 @@ def _checkpoint_floor_from_facts(
     # Boundaries on the busiest rank's rows and one recomputed layer.
     retained = gradient_rows * layers * self._hidden_size * 2
     moe = self._checkpoint_moe_bytes_per_token() if gradient_rows else 0
+    dense, no_grad = self._dense_mlp_widths(refs)
+    dense = dense if gradient_rows else 0
     # Beside the mixer, the recomputed layer keeps its post-mixer residual
-    # and pre-MLP norm output, and its MoE stage its routing state.
+    # and pre-MLP norm output, and its MoE stage its routing state; a
+    # covered dense layer keeps its MLP stage.
     mixer = (
         self._recomputed_mixer_bytes_per_token()
         + (
             2 * self._hidden_size * 2 + self._moe_checkpoint_state_bytes_per_token()
             if moe
+            else 2 * self._hidden_size * 2 + dense
+            if dense
             else 0
         )
         if gradient_rows
@@ -729,12 +756,47 @@ def _checkpoint_floor_from_facts(
         self._moe_workspace_bytes(
             rows, routed_rows=dispatched, checkpoint_grad=grad, slot_ref=ref
         )
-        + (mixer * rows if grad else 4 * rows * self._hidden_size * 2)
+        + (mixer * rows if grad else rows * max(no_grad, 4 * self._hidden_size * 2))
         for (rows, grad), ref, dispatched in zip(group_rows, refs, routed, strict=True)
     )
-    if moe:
+    if moe or dense or no_grad:
         workspace += self._te_workspace_growth_bytes()
     return retained, workspace
+
+
+def _dense_mlp_widths(
+    self: TrainerRank, slot_refs: Sequence["LoRASlotRef | None"] | None = None
+) -> tuple[int, int]:
+    """The covered dense (gradient stage, no-grad transient) per row, or 0s.
+
+    Only at CP2, where it was traced: at CP1 the attention allowance's
+    slack is smaller, and above CP2 a rank's remote attention stages may
+    keep more than the CP2 allowance; the per-boundary gradient allowance
+    still covers both. Named slots are rechecked: their adapters must stay
+    within the priced rank. Only where the checkpoint floor prices the
+    decoder, which also carries the TE workspace growth.
+    """
+    stage = getattr(self, "_dense_recompute_bytes_per_token", 0)
+    no_grad = getattr(self, "_dense_no_grad_bytes_per_token", 0)
+    if (
+        type(stage) is not int
+        or type(no_grad) is not int
+        or stage <= 0
+        or no_grad <= 0
+        or self._topology_key()[2] != 2
+        or self._checkpoint_floor_decoder() is None
+    ):
+        return 0, 0
+    for ref in slot_refs or ():
+        if ref is None or ref.name is None:
+            continue
+        slot = _impl._dense_mlp_recompute_bytes_per_token(
+            self.runtime.model, ref, hidden_size=self._hidden_size
+        )
+        if not all(slot):
+            return 0, 0
+        stage, no_grad = max(stage, slot[0]), max(no_grad, slot[1])
+    return stage, no_grad
 
 
 def _gradient_slots(
@@ -1064,8 +1126,11 @@ def _checkpoint_input_gradient_bytes(
     CP2/EP1 and EP2/CP2), charge that gradient. Elsewhere, including above
     CP2 (more remote attention stages than the mixer's CP2 allowance), keep
     one gradient per boundary: that allowance also covers dense MLP and
-    other recompute work the floor does not price. ``retained`` is the
-    floor's boundary charge where the caller already has it.
+    other recompute work the floor does not price. A covered dense model
+    (every layer the traced gated MLP, ``_dense_mlp_widths``) also holds
+    one: Qwen3.8-27B CP2 traces show one H-wide input gradient at the peak.
+    ``retained`` is the floor's boundary charge where the caller already has
+    it.
     """
     if retained is None:
         retained, _ = self._checkpoint_memory_floor(group_rows)
@@ -1080,16 +1145,26 @@ def _checkpoint_gradient_covered(
     self: TrainerRank,
     group_rows: tuple[tuple[int, bool], ...],
     slot_refs: tuple["LoRASlotRef | None", ...] | None,
+    *,
+    dense: bool = True,
 ) -> bool:
-    """Whether the traced MoE stage covers every gradient group's recompute."""
+    """Whether a traced stage covers every gradient group's recompute.
+
+    The MoE stage, or with ``dense`` the covered dense MLP.
+    """
     refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
+    # The same slots as the floor: if any group's slot falls back there,
+    # the per-boundary allowance must stay here too.
     return bool(
-        self._topology_key()[2] <= 2
-        and self._checkpoint_moe_bytes_per_token()
-        and all(
-            self._moe_recompute_covered_for(ref)
-            for (_, grad), ref in zip(group_rows, refs, strict=True)
-            if grad
+        (dense and self._dense_mlp_widths(refs)[0])
+        or (
+            self._topology_key()[2] <= 2
+            and self._checkpoint_moe_bytes_per_token()
+            and all(
+                self._moe_recompute_covered_for(ref)
+                for (_, grad), ref in zip(group_rows, refs, strict=True)
+                if grad
+            )
         )
     )
 
@@ -1114,15 +1189,16 @@ def _checkpoint_head_stage_bytes(
     the head's own buffers, TE's cuBLAS workspaces from the forward's first
     GEMMs, and the adapter gradients of groups whose backward ran first.
     Qwen3.6-35B-A3B CP2 traces (EP1 and EP2, single and multi-request
-    waves) show these terms at the head's peak. Elsewhere None: the head
-    shares the decoder stage. That bounds heads whose backward is the
-    traced one (``_head_backward_traced``); callers keep the unstaged price
-    beside any other, whose buffers can exceed ``head_workspace_bytes``.
-    On per-rank CP layouts, each rank's boundaries are within the floor's,
-    so the largest rank's adapter term bounds each.
+    waves) show these terms at the head's peak. Elsewhere None, a covered
+    dense model included (untraced here): the head shares the decoder
+    stage. That bounds heads whose backward is the traced one
+    (``_head_backward_traced``); callers keep the unstaged price beside
+    any other, whose buffers can exceed ``head_workspace_bytes``. On
+    per-rank CP layouts, each rank's boundaries are within the floor's, so
+    the largest rank's adapter term bounds each.
     """
     if not head_workspace_bytes or not self._checkpoint_gradient_covered(
-        group_rows, slot_refs
+        group_rows, slot_refs, dense=False
     ):
         return None
     rows = sum(rows for rows, grad in group_rows if grad)
@@ -1278,7 +1354,14 @@ def _layout_checkpoint_rank_floors(
     attention_inputs = len(inputs) - gdn_inputs
     widths = self._recomputed_mixer_widths(stage_buffers=False)
     moe = self._checkpoint_moe_bytes_per_token()
-    beside = 2 * hidden + self._moe_checkpoint_state_bytes_per_token() if moe else 0
+    dense, _ = self._dense_mlp_widths(refs)
+    beside = (
+        2 * hidden + self._moe_checkpoint_state_bytes_per_token()
+        if moe
+        else 2 * hidden + dense
+        if dense
+        else 0
+    )
     floors: list[tuple[int, int]] = []
     for rank in range(len(layouts[0].attention_rows)):
         retained = workspace = 0
@@ -1306,7 +1389,7 @@ def _layout_checkpoint_rank_floors(
                 )
                 workspace = max(workspace, stage)
         floors.append((retained, workspace))
-    growth = self._te_workspace_growth_bytes() if moe else 0
+    growth = self._te_workspace_growth_bytes() if moe or dense else 0
     return tuple((retained, workspace + growth) for retained, workspace in floors)
 
 
@@ -2017,6 +2100,7 @@ def _estimate_required_memory_bytes_from_values(
     retained_tokens: int | None = None,
     include_checkpoint_input_gradient: bool = True,
     checkpoint_memory: tuple[int, int] | None = None,
+    lower_bound: bool = False,
 ) -> int:
     if packed_tokens <= 0:
         return output_bytes
@@ -2025,6 +2109,29 @@ def _estimate_required_memory_bytes_from_values(
     static_compute = (
         packed_tokens * self._hidden_size * self._param_dtype_size * activation_factor
     )
+    _dense_stage, no_grad = (
+        self._dense_mlp_widths(slot_refs)
+        if not signature.grad_enabled
+        and signature.topology[2] == 2
+        and len(group_rows) > 1
+        else (0, 0)
+    )
+    if no_grad:
+        # No-grad groups run one after another and keep only their outputs
+        # (charged below): price the largest group's own physical rows at
+        # the traced width. The per-packed-token floor is kept only as that
+        # group's share, which it matched for one group on Qwen3.8-27B.
+        # That share falls as another group's rows grow, so a lower bound
+        # on optimistic rows keeps only the largest group's own rows.
+        rows = [rows for rows, _ in group_rows]
+        static_compute = (
+            max(rows) * no_grad
+            if lower_bound
+            else max(
+                max(rows) * no_grad,
+                -(-static_compute * max(rows) // max(1, sum(rows))),
+            )
+        )
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry
         hidden = self._hidden_size

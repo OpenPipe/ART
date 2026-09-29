@@ -147,6 +147,8 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_layout_adapter_gradient_bytes",
         "_checkpoint_adapter_gradient_extra",
         "_recomputed_mixer_widths",
+        "_checkpoint_floor_decoder",
+        "_dense_mlp_widths",
         # Producers of recorded arguments replay checks against the facts.
         "_plan_group_routed_rows",
         "_plan_head_backward_traced",
@@ -342,8 +344,14 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     if len(inputs) > MAX_LAYERS:
         raise ValueError("runtime_shape_inventory_over_limit")
     reserve(8 * len(inputs))
+    # The covered dense stage for this plan's slots, and for no named slot
+    # (the layout-free floor behind the input-gradient allowance).
+    dense = [
+        [int(v) for v in rank._dense_mlp_widths(refs)]
+        for refs in (tuple(g.slot_ref for g in plan.groups), None)
+    ]
     facts = {
-        "version": 4,
+        "version": 5,
         "checkpoint_layers": layers,
         "checkpoint_moe_bytes_per_token": rank._checkpoint_moe_bytes_per_token(),
         # Model and process readers of the recomputed layer and staged head,
@@ -353,6 +361,8 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             for name in _RECOMPUTE_READERS
         },
         "layer_gdn_inputs": list(inputs),
+        "dense_widths": dense[0],
+        "dense_base_widths": dense[1],
         "head_vocabulary": vocabulary,
         "head_target_backward": target_backward,
         "groups": groups,
@@ -385,12 +395,14 @@ def validate(facts: Any) -> None:
             "backward_row_state_bytes",
             "triton_min_rows",
             "layer_gdn_inputs",
+            "dense_widths",
+            "dense_base_widths",
             "head_vocabulary",
             "head_target_backward",
             "groups",
         },
     )
-    if type(facts["version"]) is not int or facts["version"] != 4:
+    if type(facts["version"]) is not int or facts["version"] != 5:
         raise ValueError("unsupported runtime facts version")
     for key in (
         "checkpoint_layers",
@@ -398,6 +410,11 @@ def validate(facts: Any) -> None:
         "head_vocabulary",
     ):
         integer(facts[key])
+    for key in ("dense_widths", "dense_base_widths"):
+        if type(facts[key]) is not list or len(facts[key]) != 2:
+            raise ValueError("invalid dense stage facts")
+        for value in facts[key]:
+            integer(value)
     for key in _RECOMPUTE_READERS:
         if not facts["checkpoint_layers"]:
             if facts[key] is not None:
@@ -762,6 +779,18 @@ class ReplayRank(_impl.TrainerRank):
             routed_rows,
             layouts,
         )
+
+    def _dense_mlp_widths(self, slot_refs: Any = None) -> tuple[int, int]:
+        if self._facts is None:
+            return _memory._dense_mlp_widths(self, slot_refs)
+        refs = tuple(slot_refs or ())
+        if all(ref is None for ref in refs):
+            stage, no_grad = self._facts["dense_base_widths"]
+        elif refs == tuple(range(len(self._facts["groups"]))):
+            stage, no_grad = self._facts["dense_widths"]
+        else:
+            raise ValueError("replayed dense widths are frozen per plan")
+        return stage, no_grad
 
     def _layer_gdn_inputs(self) -> tuple[bool, ...]:
         if self._facts is None:

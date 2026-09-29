@@ -26,7 +26,7 @@ import struct
 import threading
 import time
 import traceback
-from types import TracebackType
+from types import MethodType, TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1675,6 +1675,220 @@ def _hybridep_buffer_bytes(capacity: int, ranks: int, hidden: int, experts: int)
     return tokens * (2 * hidden + 5 * experts + 4 * (hidden // 128))
 
 
+# Largest LoRA rank the dense stage prices (rank-wide intermediates included).
+_DENSE_LORA_RANK_LIMIT = 256
+
+
+def _dense_mlp_recompute_bytes_per_token(
+    model: Sequence[torch.nn.Module],
+    slot_ref: "LoRASlotRef | None" = None,
+    *,
+    hidden_size: int | None = None,
+) -> tuple[int, int]:
+    """Per-row dense MLP bytes: (gradient recompute stage, no-grad transient).
+
+    Qwen3.8-27B CP2 allocator traces (dense, gated SwiGLU, LoRA on FC1 and FC2):
+
+    - A recomputed layer's peak sits in its FC1 stage: the base output, the
+      LoRA gate/up output and their sum (2F each) plus one F-wide tensor, 7F
+      per row (238 KB measured). Early in real q062 runs one rank at a time
+      held about one more FC1 triplet (6F; +4.8 GB at 23,552 rows), as a
+      recompile can leave a graph's outputs live; that is priced too.
+    - A no-grad layer holds its three 2F FC1 tensors, residual, norm and CP
+      gather rows: 263 KB per row measured, priced as 6F + 6H.
+
+    Both add the rank intermediates of every adapter in the layer. Every
+    decoder layer, all it runs and ``slot_ref``'s adapters must match the
+    traced execution (ART's own GDN layer, mixer and norm wrappers included);
+    otherwise (0, 0) keeps today's allowances.
+    """
+    if len(model) != 1:
+        return 0, 0
+    try:
+        decoder = _language_model(model[0]).decoder
+    except (AttributeError, RuntimeError):
+        return 0, 0
+    layers = getattr(decoder, "layers", None)
+    if not layers or not all(hasattr(layer, "mlp") for layer in layers):
+        return 0, 0
+    try:
+        from megatron.core.extensions.transformer_engine import (
+            TELayerNormColumnParallelLinear,
+            TERowParallelLinear,
+        )
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+        from megatron.core.transformer.attention import SelfAttention
+        from megatron.core.transformer.mlp import MLP
+        from megatron.core.transformer.transformer_block import TransformerBlock
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        from art.megatron.gdn.operator import (
+            _empty_safe_norm_forward,
+            _gdn_island_layer_forward,
+            _prefix_tree_forward,
+        )
+        from art.megatron.lora import (
+            LoRA,
+            SelfAttentionLinearProjLoRA,
+            SharedExpertsLinearFC1LoRA,
+            SharedExpertsLinearFC2LoRA,
+        )
+    except ImportError:
+        # Without the traced owner types nothing can match; keep the allowance.
+        return 0, 0
+
+    def plain(module: Any, wrapper: Any = None, delegate: str = "") -> bool:
+        """No hooks, and no forward but the class's or ART's traced wrapper,
+        which must still call the class's own forward."""
+        forward = vars(module).get("forward")
+        if module._forward_hooks or module._forward_pre_hooks:
+            return False
+        if forward is None:
+            return True
+        inner = vars(module).get(delegate)
+        # Training compile replaces the delegate with Dynamo's wrapper (the
+        # traced run was compiled); judge the callable it wraps.
+        while hasattr(inner, "_torchdynamo_orig_callable"):
+            inner = inner._torchdynamo_orig_callable
+        return (
+            wrapper is not None
+            and type(forward) is MethodType
+            and forward.__self__ is module
+            and forward.__func__ is wrapper
+            and type(inner) is MethodType
+            and inner.__self__ is module
+            and inner.__func__ is type(module).forward
+        )
+
+    # The traced hybrid's exact mixer types (Qwen3.5-family attention is
+    # Megatron Bridge's Qwen3VLSelfAttention); subclasses are unmeasured.
+    mixers: set[type] = {SelfAttention, GatedDeltaNet}
+    try:
+        from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.attention import (
+            Qwen3VLSelfAttention,
+        )
+    except ImportError:
+        pass
+    else:
+        mixers.add(Qwen3VLSelfAttention)
+
+    if type(decoder) is not TransformerBlock or not plain(decoder):
+        return 0, 0
+    expected = {
+        "gated_linear_unit": True,
+        "params_dtype": torch.bfloat16,
+        "add_bias_linear": False,
+        "sequence_parallel": False,
+        # Fused SwiGLU (bias_swiglu_impl), as Megatron Bridge's Qwen3.5
+        # providers configure it and the traced run executed.
+        "bias_activation_fusion": True,
+        "use_te_activation_func": False,
+        "cpu_offloading": False,
+        "cuda_graph_impl": "none",
+        "tensor_model_parallel_size": 1,
+        "pipeline_model_parallel_size": 1,
+    }
+    width = hidden = rank = 0
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        config = getattr(mlp, "config", None)
+        fc1, fc2 = getattr(mlp, "linear_fc1", None), getattr(mlp, "linear_fc2", None)
+        row = getattr(fc2, "row_parallel_lora", None)
+        adapters = (
+            getattr(fc1, "gate_lora", None),
+            getattr(fc1, "up_lora", None),
+            getattr(row, "lora", None),
+        )
+        sites = (
+            (mlp, MLP),
+            (fc1, SharedExpertsLinearFC1LoRA),
+            (getattr(fc1, "linear_fc1", None), TELayerNormColumnParallelLinear),
+            (fc2, SharedExpertsLinearFC2LoRA),
+            (row, SelfAttentionLinearProjLoRA),
+            (getattr(row, "linear_proj", None), TERowParallelLinear),
+            *((adapter, LoRA) for adapter in adapters),
+        )
+        ffn = getattr(config, "ffn_hidden_size", None)
+        size = getattr(config, "hidden_size", None)
+        mixer = getattr(layer, "self_attention", None)
+        if (
+            type(layer) is not TransformerLayer
+            or not plain(
+                layer, _gdn_island_layer_forward, "_art_gdn_island_physical_forward"
+            )
+            or type(mixer) not in mixers
+            or not plain(mixer, _prefix_tree_forward, "_art_physical_forward")
+            or any(type(site) is not cls for site, cls in sites)
+            or not all(plain(site) for site, _ in sites)
+            or type(ffn) is not int
+            or ffn <= 0
+            or type(size) is not int
+            or size <= 0
+            or (hidden_size is not None and size != hidden_size)
+            or getattr(fc1, "non_gated", None) is not False
+            or getattr(fc1, "out_features", None) != 2 * ffn
+            or any(
+                type(getattr(config, name, None)) is not type(value)
+                or getattr(config, name) != value
+                for name, value in expected.items()
+            )
+            or getattr(config, "fp8", None)
+            or getattr(config, "fp4", None)
+            or getattr(config, "activation_func", None) is not torch.nn.functional.silu
+            or getattr(mlp, "activation_func", None) is not torch.nn.functional.silu
+            or getattr(config, "activation_func_clamp_value", None) is not None
+            or getattr(config, "glu_linear_offset", 0.0) != 0.0
+        ):
+            return 0, 0
+        # Everything else the layer runs, the mixer's children included, must
+        # be the traced execution too: no hooks, and no forward but ART's
+        # empty-safe norm wrapper. Every adapter must be an exact LoRA whose
+        # selector is the one execution uses, within the priced rank.
+        layer_rank = 0
+        for child in layer.modules():
+            if child is layer or child is mixer:
+                continue
+            if not (
+                plain(child)
+                or plain(
+                    child,
+                    _empty_safe_norm_forward,
+                    "_art_empty_safe_norm_physical_forward",
+                )
+            ):
+                return 0, 0
+            if not isinstance(child, LoRA):
+                continue
+            if type(child) is not LoRA or any(
+                name in vars(child) for name in ("_slot", "active_lora_tensors")
+            ):
+                return 0, 0
+            tensors = _slot_lora_tensors(child, slot_ref)
+            if tensors is None:
+                if slot_ref is None or slot_ref.name is None:
+                    return 0, 0
+                continue  # This slot has no adapter here: base output only.
+            a, b = tensors
+            if (
+                not isinstance(a, torch.Tensor)
+                or not isinstance(b, torch.Tensor)
+                or a.ndim != 2
+                or b.ndim != 2
+                or a.shape[1] != b.shape[0]
+                or not 0 < a.shape[1] <= _DENSE_LORA_RANK_LIMIT
+            ):
+                return 0, 0
+            layer_rank += int(a.shape[1])
+        rank = max(rank, layer_rank)
+        width, hidden = max(width, ffn), max(hidden, size)
+    # Each of a layer's adapters, the mixer's too, keeps its rank-wide input
+    # product and gradient.
+    adapters = 2 * rank
+    return (7 * width + 6 * width + adapters) * 2, (
+        6 * width + 6 * hidden + adapters
+    ) * 2
+
+
 def _moe_output_bytes_per_token(
     model: Sequence[torch.nn.Module],
     shape: ParallelShape,
@@ -2141,6 +2355,18 @@ class TrainerRank:
         self._moe_recompute_covered = len(
             self._moe_gradient_enclosed
         ) == self._num_layers and all(self._moe_gradient_enclosed)
+        # Dense models whose every layer is the traced gated MLP price that
+        # stage instead, and with it one input gradient.
+        (
+            self._dense_recompute_bytes_per_token,
+            self._dense_no_grad_bytes_per_token,
+        ) = (
+            (0, 0)
+            if self._moe_layers
+            else _dense_mlp_recompute_bytes_per_token(
+                runtime.model, hidden_size=self._hidden_size
+            )
+        )
         self._ep_group_is_cp_group = _ep_group_is_cp_group(self._parallel_shape)
         selection = select_scoring(
             device_capability=capability,
@@ -3059,7 +3285,9 @@ class TrainerRank:
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
+        lower_bound: bool = False,
     ) -> _SubforwardCost:
+        """``lower_bound`` prices optimistic rows from below (split pruning)."""
         checkpoint_memory = self._checkpoint_memory_floor(
             group_rows,
             slot_refs,
@@ -3082,6 +3310,7 @@ class TrainerRank:
             retained_tokens=retained_tokens,
             include_checkpoint_input_gradient=False,
             checkpoint_memory=checkpoint_memory,
+            lower_bound=lower_bound,
         )
         checkpoint_retained, checkpoint_workspace = checkpoint_memory
         retained = self._retained_memory_bytes(
@@ -4985,6 +5214,8 @@ class TrainerRank:
     _plan_hybridep_growth_bytes = _memory._plan_hybridep_growth_bytes
     _checkpoint_moe_bytes_per_token = _memory._checkpoint_moe_bytes_per_token
     _moe_workspace_bytes = _memory._moe_workspace_bytes
+    _checkpoint_floor_decoder = _memory._checkpoint_floor_decoder
+    _dense_mlp_widths = _memory._dense_mlp_widths
     _checkpoint_memory_floor = _memory._checkpoint_memory_floor
     _gradient_slots = staticmethod(_memory._gradient_slots)
     _pending_adapter_gradient_bytes = _memory._pending_adapter_gradient_bytes

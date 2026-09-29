@@ -409,20 +409,14 @@ def test_staged_head_needs_recorded_cp2_target_backward(tmp_path):
         reports.replay(report)
 
 
-def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        tr,
-        "_TRITON_STATS_STATE",
-        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
-    )
+def cp2(monkeypatch, rank):
+    """Plan and price ``rank`` at CP2 through the stock topology reader (as
+    capture requires), over a CPU CP2 topology and planning config."""
     from types import SimpleNamespace
 
     from art.megatron.context_parallel.types import ParallelTopology
 
-    # CP2 through the stock topology reader (as capture requires), over a CPU
-    # CP2 topology and planning config.
     monkeypatch.setattr(tr.TrainerRank, "_topology_key", lambda self: (1, 1, 2, 1))
-    rank = head_rank()
     rank._topology = lambda: ParallelTopology(tp=1, cp=2)
     for name, value in {
         "linear_num_key_heads": 16,
@@ -436,6 +430,16 @@ def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
         build_gdn_execution_spec=True,
         context_parallel_workload_profile=lambda provider: None,
     )
+    return rank
+
+
+def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        tr,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
+    )
+    rank = cp2(monkeypatch, head_rank())
     rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
     plan = rank._plan_flat_forward([request(512, grad=True)])
     assert plan.signature.topology[2] == 2
@@ -445,6 +449,62 @@ def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
     result = reports.replay(report)
     assert result["aggregate"]["matches"]
     assert result["estimates"][0]["required_bytes"] == costs[0].required
+
+
+def test_dense_stage_is_replayed_and_frozen(monkeypatch, tmp_path):
+    from test_trainer_rank_dense_memory import NO_GRAD, STAGE, _dense_rank
+
+    rank = cp2(monkeypatch, _dense_rank())
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward([request(512, grad=True)])
+    report, costs = emitted(rank, plan, tmp_path)
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    assert facts["dense_widths"] == facts["dense_base_widths"] == [STAGE, NO_GRAD]
+    actual = reports.replay(report)
+    assert actual["aggregate"]["matches"]
+    assert actual["estimates"][0]["required_bytes"] == costs[0].required
+    # The live constructor widths cannot change the replayed answer.
+    rank._dense_recompute_bytes_per_token = rank._dense_no_grad_bytes_per_token = 0
+    assert reports.replay(report) == actual
+    changed = deepcopy(report)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["dense_widths"][
+        0
+    ] += 10**6
+    result = reports.replay(changed)["estimates"][0]
+    assert not result["matches"]
+    assert result["required_bytes"] > actual["estimates"][0]["required_bytes"]
+
+
+@pytest.mark.parametrize("change", ["length", "value"])
+def test_dense_fact_validation_rejects_forged_input(change, monkeypatch, tmp_path):
+    from test_trainer_rank_dense_memory import _dense_rank
+
+    rank = cp2(monkeypatch, _dense_rank())
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(512, grad=True)]), tmp_path
+    )
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    if change == "length":
+        facts["dense_widths"].append(0)
+        message = "invalid dense stage facts"
+    else:
+        facts["dense_base_widths"][1] = 1.5
+        message = "invalid runtime dimension"
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("name", ["_dense_mlp_widths", "_checkpoint_floor_decoder"])
+def test_custom_dense_reader_is_explicitly_incomplete(name, monkeypatch):
+    from art.trainer_rank import _planner_replay
+
+    rank = _rank(monkeypatch)
+    plan = rank._plan_flat_forward([_request(1)])
+    original = getattr(rank, name)
+    monkeypatch.setattr(rank, name, lambda *args, **kwargs: original(*args, **kwargs))
+    with pytest.raises(ValueError, match="custom_runtime_estimator"):
+        _planner_replay.capture(rank, plan)
 
 
 @pytest.mark.parametrize("change", ["omit_default", "omit_required", "extra"])
