@@ -777,6 +777,7 @@ def test_cp_layouts_are_replayed_and_frozen(monkeypatch, tmp_path):
         "inputs_type",
         "ranks",
         "argument",
+        "empty_gdn",
     ],
 )
 def test_cp_layout_fact_validation_rejects_forged_input(change, monkeypatch, tmp_path):
@@ -805,10 +806,32 @@ def test_cp_layout_fact_validation_rejects_forged_input(change, monkeypatch, tmp
         for key in ("attention_rows", "gdn_rows", "attention_retained"):
             layout[key].append(1)
         message = "recorded topology"
-    else:
+    elif change == "argument":
         item["arguments"]["group_layouts"] = [dict(layout)]
         message = "immutable runtime"
+    else:
+        layout["gdn_rows"] = []
+        message = "invalid CP layout facts"
     with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+def test_cp_layouts_need_the_live_cp2_topology(tmp_path):
+    # Layout pricing is CP2-only: layouts forged onto a CP1 report are refused.
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    (group,) = facts["groups"]
+    group["layout"] = {
+        "attention_rows": [group["rows"]],
+        "gdn_rows": None,
+        "attention_retained": [0],
+    }
+    facts["layer_gdn_inputs"] = [False] * facts["checkpoint_layers"]
+    with pytest.raises(ValueError, match="recorded topology"):
         reports.replay(report)
 
 
