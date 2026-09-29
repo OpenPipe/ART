@@ -320,9 +320,11 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
                 if group is None:
                     if op == tr.dist.ReduceOp.MAX:
                         value.fill_(max(value.item(), 100 if search_finished else 200))
-                    else:
+                    elif value.numel() == 2:
                         value[0] = min(value[0].item(), 100)
                         value[1] = float(bool(search_finished))
+                    else:
+                        value.fill_(min(value.item(), 100))
 
             patch.setattr(tr.dist, "is_available", lambda: True)
             patch.setattr(tr.dist, "is_initialized", lambda: True)
