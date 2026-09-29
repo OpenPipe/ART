@@ -184,10 +184,24 @@ def _completion_response(body: bytes, *, stream: bool) -> Completion:
             current["text"] += raw.get("text") or ""
             if raw.get("finish_reason") is not None:
                 current["finish_reason"] = raw["finish_reason"]
-            for key in ("token_ids", "tokens", "token_logprobs", "text_offset"):
+            for key in (
+                "token_ids",
+                "tokens",
+                "token_logprobs",
+                "text_offset",
+                "compact_logprobs",
+                "routed_experts",
+            ):
                 values = raw.get(key)
                 if isinstance(values, list):
                     current.setdefault(key, []).extend(values)
+            top = raw.get("compact_top_logprobs")
+            if top is not None:
+                target = current.setdefault(
+                    "compact_top_logprobs", {"token_ids": [], "logprobs": []}
+                )
+                for key in ("token_ids", "logprobs"):
+                    target[key].extend(top[key])
             logprobs = raw.get("logprobs")
             if isinstance(logprobs, dict):
                 target = current.setdefault("logprobs", {})
@@ -206,6 +220,9 @@ def _completion_response(body: bytes, *, stream: bool) -> Completion:
                     "token_ids",
                     "token_logprobs",
                     "tokens",
+                    "compact_logprobs",
+                    "compact_top_logprobs",
+                    "routed_experts",
                 }:
                     current[key] = value
     data["object"] = "text_completion"
