@@ -272,7 +272,9 @@ def test_custom_adapter_gradient_reader_is_explicitly_incomplete(monkeypatch):
     rank = _rank(monkeypatch)
     plan = rank._plan_flat_forward([_request(1)])
     original = rank._pending_adapter_gradient_bytes
-    rank._pending_adapter_gradient_bytes = lambda refs: original(refs)
+    monkeypatch.setattr(
+        rank, "_pending_adapter_gradient_bytes", lambda refs: original(refs)
+    )
     with pytest.raises(ValueError, match="custom_runtime_estimator"):
         _planner_replay.capture(rank, plan)
 
