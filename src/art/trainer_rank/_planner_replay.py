@@ -395,7 +395,6 @@ def validate(facts: Any) -> None:
             fields(adapter, {"kind", "name", "pending"})
             if (
                 not group["grad"]
-                or (adapter["kind"] is None and any(adapter["pending"] or ()))
                 or (adapter["kind"] is not None and type(adapter["kind"]) is not str)
                 or len(adapter["kind"] or "") > 64
                 or type(adapter["name"]) is not str
@@ -407,6 +406,9 @@ def validate(facts: Any) -> None:
             reserve(128 + 12 * len(adapter["name"]) + 24 * len(adapter["pending"]))
             for value in adapter["pending"]:
                 integer(value)
+            # A slot without a kind (megatron-less reference) has none pending.
+            if adapter["kind"] is None and any(adapter["pending"]):
+                raise ValueError("invalid adapter gradient facts")
         gdn = group["gdn"]
         if gdn is not None:
             fields(gdn, {"layers", "shapes", "segments"})
