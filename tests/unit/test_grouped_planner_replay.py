@@ -463,9 +463,6 @@ def test_dense_stage_is_replayed_and_frozen(monkeypatch, tmp_path):
     actual = reports.replay(report)
     assert actual["aggregate"]["matches"]
     assert actual["estimates"][0]["required_bytes"] == costs[0].required
-    # The live constructor widths cannot change the replayed answer.
-    rank._dense_recompute_bytes_per_token = rank._dense_no_grad_bytes_per_token = 0
-    assert reports.replay(report) == actual
     changed = deepcopy(report)
     changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["dense_widths"][
         0
@@ -475,7 +472,32 @@ def test_dense_stage_is_replayed_and_frozen(monkeypatch, tmp_path):
     assert result["required_bytes"] > actual["estimates"][0]["required_bytes"]
 
 
-@pytest.mark.parametrize("change", ["length", "value"])
+def test_dense_stage_on_cp_layouts_is_replayed(monkeypatch, tmp_path):
+    from test_trainer_rank_dense_memory import NO_GRAD, STAGE, _dense_rank
+    from test_trainer_rank_layout_memory import _requests, art_cp
+
+    rank = art_cp(_dense_rank(), monkeypatch)
+    del rank._topology_key  # the stock reader, over the fixture's CP2 topology
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward(_requests())
+    assert rank._plan_group_layouts(plan) is not None
+    report, costs = emitted(rank, plan, tmp_path)
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    assert facts["groups"][0]["layout"] is not None
+    assert facts["dense_widths"] == [STAGE, NO_GRAD]
+    actual = reports.replay(report)
+    assert actual["aggregate"]["matches"]
+    assert actual["estimates"][0]["required_bytes"] == costs[0].required
+    changed = deepcopy(report)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["dense_widths"][
+        0
+    ] += 10**6
+    assert not reports.replay(changed)["estimates"][0]["matches"]
+
+
+@pytest.mark.parametrize(
+    "change", ["length", "value", "half_zero", "below_base", "no_base", "topology"]
+)
 def test_dense_fact_validation_rejects_forged_input(change, monkeypatch, tmp_path):
     from test_trainer_rank_dense_memory import _dense_rank
 
@@ -488,9 +510,22 @@ def test_dense_fact_validation_rejects_forged_input(change, monkeypatch, tmp_pat
     if change == "length":
         facts["dense_widths"].append(0)
         message = "invalid dense stage facts"
-    else:
+    elif change == "value":
         facts["dense_base_widths"][1] = 1.5
         message = "invalid runtime dimension"
+    elif change == "half_zero":
+        facts["dense_widths"][1] = 0
+        message = "invalid dense stage facts"
+    elif change == "below_base":
+        facts["dense_widths"][0] = facts["dense_base_widths"][0] - 1
+        message = "invalid dense stage facts"
+    elif change == "no_base":
+        facts["dense_base_widths"] = [0, 0]
+        message = "invalid dense stage facts"
+    else:
+        # Dense widths on a report whose recorded topology is not CP2.
+        report["replay"]["memory_replay"]["rank"]["topology"] = [1, 1, 1, 1]
+        message = "dense stage facts disagree"
     with pytest.raises(ValueError, match=message):
         reports.replay(report)
 

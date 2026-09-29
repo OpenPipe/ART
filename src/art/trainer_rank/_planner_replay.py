@@ -415,6 +415,15 @@ def validate(facts: Any) -> None:
             raise ValueError("invalid dense stage facts")
         for value in facts[key]:
             integer(value)
+    # Live widths are both zero or both positive; a plan's named slots only
+    # raise the constructor's, and only a checkpointed decoder has any.
+    plan, base = facts["dense_widths"], facts["dense_base_widths"]
+    if (
+        any(all(pair) != any(pair) for pair in (plan, base))
+        or (any(plan) and not (all(base) and plan[0] >= base[0] and plan[1] >= base[1]))
+        or (any(base) and not facts["checkpoint_layers"])
+    ):
+        raise ValueError("invalid dense stage facts")
     for key in _RECOMPUTE_READERS:
         if not facts["checkpoint_layers"]:
             if facts[key] is not None:
@@ -852,6 +861,9 @@ class ReplayRank(_impl.TrainerRank):
             and facts["head_vocabulary"]
         ):
             raise ValueError("head backward staging disagrees with recorded facts")
+        # Live dense widths exist only at TP1/CP2/PP1 (_dense_mlp_widths).
+        if any(facts["dense_base_widths"]) and self._topology_key()[1:] != (1, 2, 1):
+            raise ValueError("dense stage facts disagree with the recorded topology")
         layouts = None
         if groups[0]["layout"] is not None:
             # Live layout pricing is CP2 at TP1/PP1 only (_layout_pricing_supported).
