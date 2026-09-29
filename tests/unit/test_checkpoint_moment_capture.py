@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 import safetensors.torch
-from test_trainer_rank_validation import _save_state_trainer
+from test_trainer_rank_validation import _adapter_config, _save_state_trainer
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 
@@ -181,12 +181,9 @@ def test_moment_capture(captured_state, monkeypatch, present, allocation_guard):
 @pytest.mark.parametrize("captured_state", ("custom", "dense"), indirect=True)
 def test_failed_capture_releases_partial_copies(captured_state, tmp_path, monkeypatch):
     trainer, params, masters, _, _, expected, _ = captured_state
-    trainer._checkpoint_slots["a"].config = {
-        "base_model_name_or_path": "test/model",
-        "r": 2,
-        "lora_alpha": 2,
-        "target_modules": ["q_proj"],
-    }
+    trainer._checkpoint_slots["a"].config = _adapter_config(
+        rank=2, alpha=2, target_modules=("q_proj",)
+    )
     borrowed = [
         StorageWeakRef(value.untyped_storage()) for value in (*params, *masters)
     ]

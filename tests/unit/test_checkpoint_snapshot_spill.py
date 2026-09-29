@@ -11,7 +11,11 @@ import weakref
 
 import pytest
 import safetensors.torch
-from test_trainer_rank_validation import _prepared_save, _save_state_trainer
+from test_trainer_rank_validation import (
+    _adapter_config,
+    _prepared_save,
+    _save_state_trainer,
+)
 import torch
 
 from art.trainer_rank import _checkpoint as cp
@@ -24,12 +28,7 @@ def _snapshot_trainer(monkeypatch, parameter=None):
         parameter = torch.nn.Parameter(torch.tensor([1.0]))
     trainer._checkpoint_slots["a"] = _CheckpointSlot(
         params=(parameter,),
-        config={
-            "base_model_name_or_path": "test/model",
-            "r": 1,
-            "lora_alpha": 1,
-            "target_modules": ["q_proj"],
-        },
+        config=_adapter_config(target_modules=("q_proj",)),
         custom={"p": _CustomObject("parameter", parameter, object())},
     )
     monkeypatch.setattr(trainer, "_slot_ref", lambda _: None)
@@ -252,12 +251,7 @@ def test_start_failure_is_owned_until_collective_finalization(
 ):
     trainer = _save_state_trainer()
     trainer._checkpoint_slots["a"] = _CheckpointSlot(
-        config={
-            "base_model_name_or_path": "test/model",
-            "r": 1,
-            "lora_alpha": 1,
-            "target_modules": ["q_proj"],
-        }
+        config=_adapter_config(target_modules=("q_proj",))
     )
     monkeypatch.setattr(cp, "_validate_save_state", lambda *_: {})
     refs = []

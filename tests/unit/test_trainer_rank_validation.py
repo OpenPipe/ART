@@ -1428,12 +1428,18 @@ def test_prepared_snapshot_loads_forward_only_without_replacing_slots(
         snapshot_prepared_checkpoint(trainer, source, "loaded")
 
 
-def _adapter_config(model: str = "test/model") -> _AdapterConfig:
+def _adapter_config(
+    model: str = "test/model",
+    *,
+    rank: int = 1,
+    alpha: float = 1,
+    target_modules: tuple[str, ...] = (),
+) -> _AdapterConfig:
     return {
         "base_model_name_or_path": model,
-        "r": 1,
-        "lora_alpha": 1,
-        "target_modules": [],
+        "r": rank,
+        "lora_alpha": alpha,
+        "target_modules": list(target_modules),
     }
 
 
@@ -2446,15 +2452,7 @@ def test_real_checkpoint_codec_round_trips_with_optional_optimizer(
         "get_data_parallel_rank",
         lambda **_kwargs: 0,
     )
-    config = cast(
-        Any,
-        {
-            "base_model_name_or_path": "test/model",
-            "r": 2,
-            "lora_alpha": 2,
-            "target_modules": ["q_proj"],
-        },
-    )
+    config = _adapter_config(rank=2, alpha=2, target_modules=("q_proj",))
     adapter = {
         "layer.q_proj.lora_A.weight": torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]),
         "layer.q_proj.lora_B.weight": torch.tensor(
