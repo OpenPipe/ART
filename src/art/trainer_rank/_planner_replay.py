@@ -17,6 +17,8 @@ from . import _gdn_memory, _impl, _memory
 
 _MAX_BYTES = 262144
 _MAX_GROUPS = 1024
+# Replay sizes per-layer tuples from this recorded rank field; bound it as capture does.
+MAX_LAYERS = 1024
 _MAX_SEGMENTS = 4096
 _MAX_INPUT_VALUES = 1_000_000
 
@@ -74,7 +76,7 @@ def _fact_budget() -> Callable[[int], None]:
 
 
 def capture(rank: Any, plan: Any) -> dict[str, Any]:
-    if rank._num_layers > 1024 or not 0 < len(plan.groups) <= _MAX_GROUPS:
+    if rank._num_layers > MAX_LAYERS or not 0 < len(plan.groups) <= _MAX_GROUPS:
         raise ValueError("runtime_group_inventory_over_limit")
     if (
         getattr(rank.runtime.provider, "expert_model_parallel_size", 1) > 1
@@ -393,6 +395,7 @@ def validate(facts: Any) -> None:
             fields(adapter, {"kind", "name", "pending"})
             if (
                 not group["grad"]
+                or (adapter["kind"] is None and any(adapter["pending"] or ()))
                 or (adapter["kind"] is not None and type(adapter["kind"]) is not str)
                 or len(adapter["kind"] or "") > 64
                 or type(adapter["name"]) is not str

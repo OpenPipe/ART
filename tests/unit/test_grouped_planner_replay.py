@@ -171,7 +171,8 @@ def test_selected_slot_terms_are_replayed_and_frozen(layer, tmp_path):
     )
 
 
-def test_selected_adapter_gradients_are_replayed_and_frozen(layer, tmp_path):
+def adapter_report(layer, tmp_path):
+    """A grouped report whose gradient slot has pending adapter gradients."""
     from test_trainer_rank_adapter_gradient_memory import lora, parameter
     from test_trainer_rank_converted_memory import weights
     from test_trainer_rank_pending_memory import rank_with_moe
@@ -197,6 +198,11 @@ def test_selected_adapter_gradients_are_replayed_and_frozen(layer, tmp_path):
         ensure_slots=False,
     )
     original, costs = emitted(rank, plan, tmp_path)
+    return original, costs, params
+
+
+def test_selected_adapter_gradients_are_replayed_and_frozen(layer, tmp_path):
+    original, costs, params = adapter_report(layer, tmp_path)
     assert costs[0].checkpoint_adapter_gradient > 0
     groups = original["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
         "groups"
@@ -222,6 +228,53 @@ def test_selected_adapter_gradients_are_replayed_and_frozen(layer, tmp_path):
         result["estimates"][0]["required_bytes"]
         > actual["estimates"][0]["required_bytes"]
     )
+
+
+@pytest.mark.parametrize(
+    "change", ["gradient", "length", "value", "kind_length", "kindless_pending"]
+)
+def test_adapter_fact_validation_rejects_forged_input(change, layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    group = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ][1]
+    adapter = group["adapter"]
+    if change == "gradient":
+        group["grad"] = False
+    elif change == "length":
+        adapter["pending"] = [0] * 1026
+    elif change == "value":
+        adapter["pending"][0] = 1.5
+    elif change == "kind_length":
+        adapter["kind"] = "k" * 65
+    else:
+        adapter["kind"] = None
+    with pytest.raises(ValueError):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("layers", [2**10 + 1, 0, 40.0])
+def test_replay_bounds_the_recorded_layer_count(layers, pending_rank, tmp_path):
+    rank = pending_rank
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    # Replay sizes per-layer tuples from this field; refuse it before costing.
+    report["replay"]["memory_replay"]["rank"]["num_layers"] = layers
+    with pytest.raises(ValueError, match="layer count"):
+        reports.replay(report)
+
+
+def test_custom_adapter_gradient_reader_is_explicitly_incomplete(monkeypatch):
+    from art.trainer_rank import _planner_replay
+
+    rank = _rank(monkeypatch)
+    plan = rank._plan_flat_forward([_request(1)])
+    original = rank._pending_adapter_gradient_bytes
+    rank._pending_adapter_gradient_bytes = lambda refs: original(refs)
+    with pytest.raises(ValueError, match="custom_runtime_estimator"):
+        _planner_replay.capture(rank, plan)
 
 
 @pytest.mark.parametrize(
