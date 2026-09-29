@@ -276,3 +276,96 @@ def test_custom_digest_failure_is_reported_before_next_collective(
     assert caught.value is error
     # The local failure is the collective payload; no rank advances to metadata.
     assert seen == [repr(error)]
+
+
+@pytest.mark.parametrize("wrapped", ("plain", "cause", "context", "group"))
+def test_failed_future_releases_payload_while_preserving_error(
+    tmp_path, monkeypatch, wrapped
+):
+    import gc
+
+    spill = cp._SnapshotSpill()
+    value = torch.ones(8)
+    ref = weakref.ref(value)
+    original = OSError("snapshot disk failed")
+    expected = original if wrapped == "plain" else RuntimeError("wrapper")
+    if wrapped == "group":
+        expected = ExceptionGroup("snapshot failures", [original])
+
+    def inner(tensors):
+        assert tensors["v"] is ref()
+        raise original
+
+    def fail(tensors, path):
+        try:
+            inner(tensors)
+        except OSError:
+            if wrapped == "plain":
+                raise
+            if wrapped == "cause":
+                raise expected from original
+            raise expected
+
+    monkeypatch.setattr(safetensors.torch, "save_file", fail)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        result = spill.submit(tmp_path / "failed", {"v.safetensors": {"v": value}})
+        del value
+        worker = spill.thread
+        if worker is not None:
+            worker.join(3)
+            assert not worker.is_alive()
+        assert result.exception(3) is expected
+        assert expected.__traceback__ is not None
+        assert ref() is None
+        if wrapped == "cause":
+            assert expected.__cause__ is original
+        if wrapped == "context":
+            assert expected.__context__ is original
+        if wrapped == "group":
+            assert isinstance(expected, ExceptionGroup)
+            assert expected.exceptions == (original,)
+    finally:
+        if enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("fails", (False, True))
+def test_noncontiguous_cpu_packing_is_owned_by_writer(tmp_path, monkeypatch, fails):
+    value = torch.arange(12.0).reshape(3, 4).T.to("cpu", copy=True)
+    assert not value.is_contiguous()
+    raw = weakref.ref(value)
+    packed = []
+    threads = []
+    entered, release = threading.Event(), threading.Event()
+
+    def save(tensors, path):
+        threads.append(threading.current_thread())
+        selected = tensors["v"]
+        packed.append(weakref.ref(selected))
+        assert selected.device.type == "cpu" and selected.is_contiguous()
+        source = raw()
+        assert source is not None
+        torch.testing.assert_close(selected, source)
+        assert selected.data_ptr() != source.data_ptr()
+        entered.set()
+        assert release.wait(3)
+        if fails:
+            raise OSError("packed snapshot write failed")
+
+    monkeypatch.setattr(safetensors.torch, "save_file", save)
+    spill = cp._SnapshotSpill()
+    result = spill.submit(tmp_path / "packed", {"v.safetensors": {"v": value}})
+    worker = spill.thread
+    try:
+        assert entered.wait(3)
+        del value
+    finally:
+        release.set()
+        assert worker is not None
+        worker.join(3)
+    assert not worker.is_alive()
+    assert threads == [worker]
+    assert raw() is None and all(ref() is None for ref in packed)
+    assert isinstance(result.exception(), OSError) if fails else result.result() is None

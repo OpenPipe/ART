@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import struct
 import threading
+import traceback
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 import uuid
 import weakref
@@ -161,9 +162,29 @@ class _SnapshotSpill:
                 for relative, tensors in payloads.items():
                     path = snapshot / relative
                     path.parent.mkdir(exist_ok=True)
-                    save(tensors, path)
+                    save(
+                        {key: value.contiguous() for key, value in tensors.items()},
+                        path,
+                    )
             except BaseException as failure:
                 error = failure
+                # Keep exception identity/causes/stack, not completed serializer
+                # frame locals that would retain CPU tensors until finalization.
+                pending = [failure]
+                seen: set[int] = set()
+                while pending:
+                    failure = pending.pop()
+                    if id(failure) in seen:
+                        continue
+                    seen.add(id(failure))
+                    traceback.clear_frames(failure.__traceback__)
+                    pending.extend(
+                        e
+                        for e in (failure.__cause__, failure.__context__)
+                        if e is not None
+                    )
+                    if isinstance(failure, BaseExceptionGroup):
+                        pending.extend(failure.exceptions)
             finally:
                 payloads.clear()
                 tensors = None
@@ -755,11 +776,11 @@ def _custom_snapshot(
     if records:
         assert slot.custom_payload is not None
         tensors.update(
-            (key, value.detach().to("cpu", copy=True).contiguous())
+            (key, value.detach().to("cpu", copy=True))
             for key, value in slot.custom_payload.tensors.items()
         )
         optimizer.update(
-            (key, value.detach().to("cpu", copy=True).contiguous())
+            (key, value.detach().to("cpu", copy=True))
             for key, value in slot.custom_payload.optimizer.items()
         )
 
@@ -802,7 +823,7 @@ def _custom_snapshot(
             "persistent_buffer_keys": list(persistent_buffer_keys),
         }
         tensors.update(
-            (key, value.detach().to("cpu", copy=True).contiguous())
+            (key, value.detach().to("cpu", copy=True))
             for key, value in flattened.items()
         )
         for key, param in trainable.items():
@@ -811,20 +832,16 @@ def _custom_snapshot(
                 continue
             assert dynamic is not None
             state = dynamic.optimizer.state.get(master, {})
-            optimizer[f"master/{key}"] = (
-                master.detach().to("cpu", copy=True).contiguous()
-            )
+            optimizer[f"master/{key}"] = master.detach().to("cpu", copy=True)
             optimizer[f"exp_avg/{key}"] = (
                 cast(torch.Tensor, state.get("exp_avg", torch.zeros_like(master)))
                 .detach()
                 .to("cpu", copy=True)
-                .contiguous()
             )
             optimizer[f"exp_avg_sq/{key}"] = (
                 cast(torch.Tensor, state.get("exp_avg_sq", torch.zeros_like(master)))
                 .detach()
                 .to("cpu", copy=True)
-                .contiguous()
             )
             optimizer[f"step/{key}"] = torch.tensor(float(state.get("step", 0.0)))
 
@@ -882,7 +899,7 @@ def _local_state(
     metadata_by_block: dict[str, list[LoraShardMeta]] = {}
     for item in metadata:
         payloads.setdefault(item.block, {})[f"lora/{item.key}"] = (
-            tensors[item.key].detach().to("cpu", copy=True).contiguous()
+            tensors[item.key].detach().to("cpu", copy=True)
         )
         metadata_by_block.setdefault(item.block, []).append(item)
     if dynamic is not None:
@@ -907,9 +924,9 @@ def _local_state(
                         value = torch.zeros_like(master) if value is None else value
                         local = value if expert is None else value[expert]
                         payloads[item.block][f"{component}/{key}"] = (
-                            local.T.detach()
-                            .to(device="cpu", dtype=torch.float32, copy=True)
-                            .contiguous()
+                            local.T.detach().to(
+                                device="cpu", dtype=torch.float32, copy=True
+                            )
                         )
                     step = state.get("step", 0.0)
                     payloads[item.block][f"step/{key}"] = torch.tensor(float(step))
