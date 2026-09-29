@@ -695,6 +695,7 @@ def replay(
                     name in arguments
                     for name in (
                         "slot_refs",
+                        "group_layouts",
                         "head_workspace_bytes",
                         "checkpoint_floor",
                     )

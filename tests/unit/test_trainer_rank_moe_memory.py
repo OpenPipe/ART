@@ -609,7 +609,10 @@ def test_hybridep_buffer_growth_is_charged_before_forward(monkeypatch):
     monkeypatch.setattr(
         rank,
         "_checkpoint_memory_floor",
-        lambda rows, refs=None, segments=0, routed_rows=None: (10**7, 10**6),
+        lambda rows, refs=None, segments=0, routed_rows=None, layouts=None: (
+            10**7,
+            10**6,
+        ),
     )
     grown = rank._plan_cost(plan)
     monkeypatch.setattr(rank, "_plan_hybridep_growth_bytes", lambda plan: 0)
@@ -869,6 +872,58 @@ def test_hybridep_recompute_prices_fresh_dense_output_without_buffer_growth(
     assert rank._pending_hybridep_graphs is refs and refs == [weakref.ref(marker)]
     assert rank._hybridep_rows_high_water == 218751
     assert not torch.cuda.is_initialized()
+
+
+def test_hybridep_combine_extent_floors_the_layout_path(
+    hybrid_checkpoint_rank, monkeypatch
+):
+    rank = hybrid_checkpoint_rank
+    groups = ((2, True),)
+    calls = []
+
+    def layout_floor(refs, routed, layouts):
+        calls.append(layouts)
+        return 7, 11
+
+    def generic_floor(*args):
+        raise AssertionError("per-rank layouts must take the layout path")
+
+    monkeypatch.setattr(rank, "_layout_checkpoint_floor", layout_floor)
+    # Only the busiest-rank floor prices the recomputed mixer this way.
+    monkeypatch.setattr(rank, "_recomputed_mixer_bytes_per_token", generic_floor)
+    layouts = (object(),)
+    te = rank._te_workspace_growth_bytes()
+    # Two rows round up to four; the layout floor's small workspace loses.
+    assert rank._checkpoint_memory_floor(groups, layouts=layouts) == (
+        7,
+        4 * 2048 * 2 + te,
+    )
+    marker = torch.empty(0)
+    rank._pending_hybridep_graphs.append(weakref.ref(marker))
+    rank._hybridep_rows_high_water = 218751
+    assert rank._checkpoint_memory_floor(groups, layouts=layouts) == (
+        7,
+        218752 * 2048 * 2 + te,
+    )
+    # The stage already carries its TE growth; the combine floor adds its own
+    # only when it wins, including over a stage between the two.
+    assert te > 0
+    combine = 218752 * 2048 * 2
+    for stage, workspace in (
+        (combine + te - 1, combine + te),
+        (combine + te + 1, combine + te + 1),
+    ):
+
+        def stage_layout_floor(refs, routed, layouts, stage=stage):
+            calls.append(layouts)
+            return 7, stage
+
+        monkeypatch.setattr(rank, "_layout_checkpoint_floor", stage_layout_floor)
+        assert rank._checkpoint_memory_floor(groups, layouts=layouts) == (
+            7,
+            workspace,
+        )
+    assert calls == [layouts] * 4
 
 
 @pytest.mark.parametrize("reference", ["absent", "expired", "smaller"])

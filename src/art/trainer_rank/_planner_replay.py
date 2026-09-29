@@ -128,6 +128,16 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_recomputed_mixer_bytes_per_token",
         "_mixer_activation_widths",
         "_triton_min_rows",
+        "_plan_group_layouts",
+        "_compute_group_layouts",
+        "_layout_pricing_supported",
+        "_layer_gdn_inputs",
+        "_layout_checkpoint_floor",
+        "_layout_checkpoint_rank_floors",
+        "_layout_layer_boundaries",
+        "_layout_adapter_gradient_bytes",
+        "_checkpoint_adapter_gradient_extra",
+        "_recomputed_mixer_widths",
     ):
         method = getattr(rank, name)
         expected = getattr(_impl.TrainerRank, name)
@@ -178,8 +188,10 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         return [coefficient, [list(stage) for stage in stages], shared]
 
     has_grad = any(g.grad_enabled for g in plan.groups)
-    for group, (physical_rows, _) in zip(
-        plan.groups, rank._plan_group_rows(plan), strict=True
+    # Every rank's CP layouts come from the live runtime's CP configuration.
+    plan_layouts = rank._plan_group_layouts(plan)
+    for index, (group, (physical_rows, _)) in enumerate(
+        zip(plan.groups, rank._plan_group_rows(plan), strict=True)
     ):
         segments = group.packed.segments
         remaining -= len(segments)
@@ -258,6 +270,17 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 raise ValueError("runtime_shape_inventory_over_limit")
             reserve(128 + 12 * len(name) + 24 * len(pending))
             adapter = {"kind": kind, "name": name, "pending": [int(v) for v in pending]}
+        layout = None
+        if plan_layouts is not None:
+            chosen = plan_layouts[index]
+            if len(chosen.attention_rows) > 64:
+                raise ValueError("runtime_shape_inventory_over_limit")
+            reserve(96 + 72 * len(chosen.attention_rows))
+            layout = {
+                "attention_rows": list(chosen.attention_rows),
+                "gdn_rows": None if chosen.gdn_rows is None else list(chosen.gdn_rows),
+                "attention_retained": list(chosen.attention_retained),
+            }
         model = _gdn_memory.model_shapes(rank, group.slot_ref) if has_grad else None
         if model is not None:
             if len(model[1]) > 1024:
@@ -278,6 +301,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 "adapter": adapter,
                 "moe_covered": group.grad_enabled
                 and rank._moe_recompute_covered_for(group.slot_ref),
+                "layout": layout,
                 "gdn": None
                 if model is None
                 else {
@@ -300,8 +324,13 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             }
         )
     layers = _memory._checkpoint_layers(rank, rank._plan_group_rows(plan))
+    # Per-rank layout pricing reads each decoder layer's input layout.
+    inputs = rank._layer_gdn_inputs() if plan_layouts is not None and layers else ()
+    if len(inputs) > MAX_LAYERS:
+        raise ValueError("runtime_shape_inventory_over_limit")
+    reserve(8 * len(inputs))
     facts = {
-        "version": 3,
+        "version": 4,
         "checkpoint_layers": layers,
         "checkpoint_moe_bytes_per_token": rank._checkpoint_moe_bytes_per_token(),
         # Model and process readers of the recomputed layer and staged head.
@@ -312,6 +341,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         # Only a checkpointed Megatron decoder stages the head and has this.
         "backward_row_state_bytes": rank._backward_row_state_bytes() if layers else 0,
         "triton_min_rows": rank._triton_min_rows(),
+        "layer_gdn_inputs": list(inputs),
         "head_vocabulary": vocabulary,
         "head_target_backward": target_backward,
         "groups": groups,
@@ -343,12 +373,13 @@ def validate(facts: Any) -> None:
             "te_workspace_growth_bytes",
             "backward_row_state_bytes",
             "triton_min_rows",
+            "layer_gdn_inputs",
             "head_vocabulary",
             "head_target_backward",
             "groups",
         },
     )
-    if type(facts["version"]) is not int or facts["version"] != 3:
+    if type(facts["version"]) is not int or facts["version"] != 4:
         raise ValueError("unsupported runtime facts version")
     for key in (
         "checkpoint_layers",
@@ -383,6 +414,7 @@ def validate(facts: Any) -> None:
                 "head_target_rows",
                 "adapter",
                 "moe_covered",
+                "layout",
                 "gdn",
             },
         )
@@ -436,6 +468,24 @@ def validate(facts: Any) -> None:
             integer(terms[2])
             if terms[2] > terms[0]:
                 raise ValueError("invalid MoE terms")
+        layout = group["layout"]
+        if layout is not None:
+            fields(layout, {"attention_rows", "gdn_rows", "attention_retained"})
+            ranks = layout["attention_rows"]
+            gdn_rows = layout["gdn_rows"]
+            if (
+                not group["grad"]
+                or type(ranks) is not list
+                or not 0 < len(ranks) <= 64
+                or (gdn_rows is not None and type(gdn_rows) is not list)
+                or len(gdn_rows or ranks) != len(ranks)
+                or type(layout["attention_retained"]) is not list
+                or len(layout["attention_retained"]) != len(ranks)
+            ):
+                raise ValueError("invalid CP layout facts")
+            reserve(96 + 72 * len(ranks))
+            for value in (*ranks, *(gdn_rows or ()), *layout["attention_retained"]):
+                integer(value)
         adapter = group["adapter"]
         if adapter is not None:
             fields(adapter, {"kind", "name", "pending"})
@@ -490,6 +540,23 @@ def validate(facts: Any) -> None:
     }
     if len(kinds) > 1:
         raise ValueError("invalid adapter gradient facts")
+    # Live layouts cover every group of a plan on the same ranks, or none.
+    layouts = [group["layout"] for group in groups]
+    laid_out = any(layout is not None for layout in layouts)
+    if laid_out and (
+        any(layout is None for layout in layouts)
+        or len({len(layout["attention_rows"]) for layout in layouts}) != 1
+    ):
+        raise ValueError("invalid CP layout facts")
+    inputs = facts["layer_gdn_inputs"]
+    if (
+        type(inputs) is not list
+        or len(inputs) > MAX_LAYERS
+        or len(inputs) != (facts["checkpoint_layers"] if laid_out else 0)
+        or any(type(value) is not bool for value in inputs)
+    ):
+        raise ValueError("invalid layer input layout facts")
+    reserve(8 * len(inputs))
     if len(json.dumps(facts, separators=(",", ":"))) > _MAX_BYTES:
         raise ValueError("runtime_facts_over_limit")
 
@@ -664,10 +731,11 @@ class ReplayRank(_impl.TrainerRank):
         slot_refs: Any = None,
         gdn_segments: int = 0,
         routed_rows: Any = None,
+        layouts: Any = None,
     ) -> tuple[int, int]:
         if self._facts is None:
             return _memory._checkpoint_memory_floor(
-                self, group_rows, slot_refs, gdn_segments, routed_rows
+                self, group_rows, slot_refs, gdn_segments, routed_rows, layouts
             )
         return _memory._checkpoint_floor_from_facts(
             self,
@@ -676,7 +744,13 @@ class ReplayRank(_impl.TrainerRank):
             gdn_segments,
             self._facts["checkpoint_layers"],
             routed_rows,
+            layouts,
         )
+
+    def _layer_gdn_inputs(self) -> tuple[bool, ...]:
+        if self._facts is None:
+            return _memory._layer_gdn_inputs(self)
+        return tuple(self._facts["layer_gdn_inputs"])
 
     def _moe_recompute_covered_for(self, slot_ref: Any) -> bool:
         if self._facts is None:
@@ -723,6 +797,20 @@ class ReplayRank(_impl.TrainerRank):
             raise ValueError("runtime facts disagree with selected routed rows")
         if type(arguments.get("head_backward_traced")) is not bool:
             raise ValueError("head backward staging is not recorded")
+        layouts = None
+        if groups[0]["layout"] is not None:
+            if len(groups[0]["layout"]["attention_rows"]) != self._topology_key()[2]:
+                raise ValueError("CP layout facts disagree with the recorded topology")
+            layouts = tuple(
+                _impl._GroupLayout(
+                    attention_rows=tuple(g["layout"]["attention_rows"]),
+                    gdn_rows=None
+                    if g["layout"]["gdn_rows"] is None
+                    else tuple(g["layout"]["gdn_rows"]),
+                    attention_retained=tuple(g["layout"]["attention_retained"]),
+                )
+                for g in groups
+            )
         head = max(
             max(
                 _memory._dense_head_bytes(facts["head_vocabulary"], g["head_rows"]),
@@ -755,6 +843,7 @@ class ReplayRank(_impl.TrainerRank):
             **arguments,
             "group_rows": rows,
             "group_routed_rows": routed,
+            "group_layouts": layouts,
             "slot_refs": tuple(range(len(groups))),
             "head_workspace_bytes": head,
             "checkpoint_floor": (retained, workspace),
