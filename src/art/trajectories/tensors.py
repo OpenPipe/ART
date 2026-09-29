@@ -25,6 +25,7 @@ from . import (
     TrajectoryGroup,
     TrajectoryHistory,
     _FirstOccurrenceTrie,
+    _single_history_mask,
     _StringInterningModel,
 )
 from ._serialization import (
@@ -240,11 +241,41 @@ def first_occurrence_masks(
 
     trie = _FirstOccurrenceTrie()
     result: list[torch.Tensor] = []
+    pending = None
     for history in histories:
+        if pending is not None:
+            # Output callbacks can append another history after the fast mask.
+            trie.mask(*pending, where=cast(TokenFlag, 1))
+            pending = None
         tokens, flags = (
             torch.stack((history.tokens, history.flags)).detach().cpu().tolist()
         )
-        mask = trie.mask(history.model, tokens, flags, where=where)
+        if (
+            type(histories) is list
+            and len(histories) == 1
+            and not result
+            and type(history) is TensorizedHistory
+            and (where is None or type(where) is TokenFlag)
+        ):
+            model = history.model
+            # Custom conversions can append histories to this caller-owned list.
+            plain = (
+                type(tokens) is list
+                and type(flags) is list
+                and all(
+                    type(value) is int or type(value) is float or type(value) is bool
+                    for values in (tokens, flags)
+                    for value in values
+                )
+            )
+            if type(model) is str and len(histories) == 1 and plain:
+                mask = _single_history_mask(tokens, flags, where=where)
+                # Save passive values and the actual claims before output callbacks.
+                pending = (model, tuple(tokens), tuple(mask))
+            else:
+                mask = trie.mask(model, tokens, flags, where=where)
+        else:
+            mask = trie.mask(history.model, tokens, flags, where=where)
         result.append(
             torch.tensor(mask, dtype=torch.bool, device=history.tokens.device)
         )
