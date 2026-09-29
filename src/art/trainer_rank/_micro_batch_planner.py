@@ -505,6 +505,7 @@ def _split_chunk_lower_cost(
                 # admission cost.
                 retained_tokens=(packed_tokens + signature.topology[2] - 1)
                 // signature.topology[2],
+                lower_bound=True,
             )
             for traced in _impl._traced_states(head_traced)
         ),
@@ -601,7 +602,9 @@ def _plan_head_backward_traced(self: TrainerRank, plan: _FlatForwardPlan) -> boo
         eligible
         and self._plan_head_workspace_bytes(plan)
         and self._checkpoint_gradient_covered(
-            self._plan_group_rows(plan), tuple(g.slot_ref for g in plan.groups)
+            self._plan_group_rows(plan),
+            tuple(g.slot_ref for g in plan.groups),
+            dense=False,
         )
     ):
         object.__setattr__(plan, "_head_staged", True)

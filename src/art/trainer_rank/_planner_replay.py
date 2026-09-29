@@ -147,6 +147,8 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_layout_adapter_gradient_bytes",
         "_checkpoint_adapter_gradient_extra",
         "_recomputed_mixer_widths",
+        "_checkpoint_floor_decoder",
+        "_dense_mlp_widths",
         # Producers of recorded arguments replay checks against the facts.
         "_plan_group_routed_rows",
         "_plan_head_backward_traced",
@@ -342,8 +344,14 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     if len(inputs) > MAX_LAYERS:
         raise ValueError("runtime_shape_inventory_over_limit")
     reserve(8 * len(inputs))
+    # The covered dense stage for this plan's slots, and for no named slot
+    # (the layout-free floor behind the input-gradient allowance).
+    dense = [
+        [int(v) for v in rank._dense_mlp_widths(refs)]
+        for refs in (tuple(g.slot_ref for g in plan.groups), None)
+    ]
     facts = {
-        "version": 4,
+        "version": 5,
         "checkpoint_layers": layers,
         "checkpoint_moe_bytes_per_token": rank._checkpoint_moe_bytes_per_token(),
         # Model and process readers of the recomputed layer and staged head,
@@ -353,6 +361,8 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             for name in _RECOMPUTE_READERS
         },
         "layer_gdn_inputs": list(inputs),
+        "dense_widths": dense[0],
+        "dense_base_widths": dense[1],
         "head_vocabulary": vocabulary,
         "head_target_backward": target_backward,
         "groups": groups,
@@ -385,12 +395,14 @@ def validate(facts: Any) -> None:
             "backward_row_state_bytes",
             "triton_min_rows",
             "layer_gdn_inputs",
+            "dense_widths",
+            "dense_base_widths",
             "head_vocabulary",
             "head_target_backward",
             "groups",
         },
     )
-    if type(facts["version"]) is not int or facts["version"] != 4:
+    if type(facts["version"]) is not int or facts["version"] != 5:
         raise ValueError("unsupported runtime facts version")
     for key in (
         "checkpoint_layers",
@@ -398,6 +410,20 @@ def validate(facts: Any) -> None:
         "head_vocabulary",
     ):
         integer(facts[key])
+    for key in ("dense_widths", "dense_base_widths"):
+        if type(facts[key]) is not list or len(facts[key]) != 2:
+            raise ValueError("invalid dense stage facts")
+        for value in facts[key]:
+            integer(value)
+    # Live widths are both zero or both positive; a plan's named slots only
+    # raise the constructor's, and only a checkpointed decoder has any.
+    plan, base = facts["dense_widths"], facts["dense_base_widths"]
+    if (
+        any(all(pair) != any(pair) for pair in (plan, base))
+        or (any(plan) and not (all(base) and plan[0] >= base[0] and plan[1] >= base[1]))
+        or (any(base) and not facts["checkpoint_layers"])
+    ):
+        raise ValueError("invalid dense stage facts")
     for key in _RECOMPUTE_READERS:
         if not facts["checkpoint_layers"]:
             if facts[key] is not None:
@@ -481,8 +507,32 @@ def validate(facts: Any) -> None:
                     integer(value)
             # The shared expert's part of the coefficient (live invariant).
             integer(terms[2])
-            if terms[2] > terms[0]:
+            # Live keeps no stage or shared part beside a zero coefficient.
+            if terms[2] > terms[0] or (terms[1] and not terms[0]):
                 raise ValueError("invalid MoE terms")
+        # Only gradient groups record a named slot's adapter. Live freezes an
+        # unnamed one's gradient terms from the constructor coefficient, and
+        # covers a group only with its own positive coefficient.
+        if (
+            group["grad"]
+            and group["adapter"] is None
+            and group["gradient"][0] != facts["checkpoint_moe_bytes_per_token"]
+        ):
+            raise ValueError("invalid MoE terms")
+        if group["moe_covered"] and not (
+            group["gradient"][0] and facts["checkpoint_moe_bytes_per_token"]
+        ):
+            raise ValueError("MoE coverage without a checkpoint coefficient")
+        # One walk prices both modes under the same gates: its checkpoint
+        # pass only raises the coefficient and adds a stage per converted FC2.
+        forward, gradient = group["forward"], group["gradient"]
+        if (
+            gradient[0] < forward[0]
+            or bool(gradient[0]) != bool(forward[0])
+            or bool(gradient[1]) != bool(forward[1])
+            or (forward[1] and len(gradient[1]) <= len(forward[1]))
+        ):
+            raise ValueError("invalid MoE terms")
         layout = group["layout"]
         if layout is not None:
             fields(layout, {"attention_rows", "gdn_rows", "attention_retained"})
@@ -557,6 +607,14 @@ def validate(facts: Any) -> None:
     }
     if len(kinds) > 1:
         raise ValueError("invalid adapter gradient facts")
+    # Unnamed gradient groups all read the constructor's coverage flag, and a
+    # named slot is covered only where that flag is set.
+    unnamed = {g["moe_covered"] for g in groups if g["grad"] and g["adapter"] is None}
+    if len(unnamed) > 1 or (
+        False in unnamed
+        and any(g["moe_covered"] for g in groups if g["adapter"] is not None)
+    ):
+        raise ValueError("inconsistent MoE recompute coverage")
     # Live layouts cover every group of a plan on the same ranks, or none.
     layouts = [group["layout"] for group in groups]
     laid_out = any(layout is not None for layout in layouts)
@@ -765,6 +823,18 @@ class ReplayRank(_impl.TrainerRank):
             layouts,
         )
 
+    def _dense_mlp_widths(self, slot_refs: Any = None) -> tuple[int, int]:
+        if self._facts is None:
+            return _memory._dense_mlp_widths(self, slot_refs)
+        refs = tuple(slot_refs or ())
+        if all(ref is None for ref in refs):
+            stage, no_grad = self._facts["dense_base_widths"]
+        elif refs == tuple(range(len(self._facts["groups"]))):
+            stage, no_grad = self._facts["dense_widths"]
+        else:
+            raise ValueError("replayed dense widths are frozen per plan")
+        return stage, no_grad
+
     def _layer_gdn_inputs(self) -> tuple[bool, ...]:
         if self._facts is None:
             return _memory._layer_gdn_inputs(self)
@@ -823,6 +893,30 @@ class ReplayRank(_impl.TrainerRank):
             and facts["head_vocabulary"]
         ):
             raise ValueError("head backward staging disagrees with recorded facts")
+        # Live dense widths exist only at TP1/CP2/PP1 (_dense_mlp_widths).
+        if any(facts["dense_base_widths"]) and self._topology_key()[1:] != (1, 2, 1):
+            raise ValueError("dense stage facts disagree with the recorded topology")
+        # Live MoE coefficients are all 0 above TP1 (_moe_output_bytes_per_token)
+        # and on a dense rank, which has no MoE layers (_dense_mlp_widths).
+        if (self._topology_key()[1] != 1 or any(facts["dense_base_widths"])) and (
+            self._moe_output_bytes_per_token
+            or self._moe_forward_stages
+            or facts["checkpoint_moe_bytes_per_token"]
+            or any(group[key][0] for group in groups for key in ("forward", "gradient"))
+        ):
+            raise ValueError("MoE facts disagree with the recorded rank")
+        # An unnamed gradient group's forward terms are the constructor's.
+        for group in groups:
+            if (
+                group["grad"]
+                and group["adapter"] is None
+                and (
+                    group["forward"][0] != self._moe_output_bytes_per_token
+                    or tuple(map(tuple, group["forward"][1]))
+                    != self._moe_forward_stages
+                )
+            ):
+                raise ValueError("invalid MoE terms")
         layouts = None
         if groups[0]["layout"] is not None:
             # Live layout pricing is CP2 at TP1/PP1 only (_layout_pricing_supported).

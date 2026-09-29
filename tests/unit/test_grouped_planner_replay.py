@@ -341,6 +341,173 @@ def test_recomputed_layer_fact_validation_rejects_forged_input(change, layer, tm
         reports.replay(report)
 
 
+def test_named_slot_coverage_needs_its_gradient_coefficient(layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    group = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ][1]
+    assert group["adapter"] is not None and group["moe_covered"]
+    # A named slot without a coefficient (an unsupported owner, zero in both
+    # modes) keeps the per-boundary gradient live; coverage would discount it.
+    group["forward"] = [0, [], 0]
+    group["gradient"] = [0, [], 0]
+    group["moe_covered"] = False
+    uncovered = reports.replay(report)["estimates"][0]["required_bytes"]
+    assert uncovered > 0
+    group["moe_covered"] = True
+    with pytest.raises(ValueError, match="MoE coverage without a checkpoint"):
+        reports.replay(report)
+    # Relabelled unnamed, its terms must be the constructor's.
+    group["adapter"] = None
+    with pytest.raises(ValueError, match="invalid MoE terms"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("covered", [True, False])
+def test_unnamed_gradient_terms_are_the_constructor_coefficient(covered, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    group = facts["groups"][0]
+    assert group["adapter"] is None and group["moe_covered"]
+    assert group["gradient"][0] == facts["checkpoint_moe_bytes_per_token"] > 0
+    group["moe_covered"] = covered
+    group["gradient"] = [0, [], 0]
+    with pytest.raises(ValueError, match="invalid MoE terms"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("change", ["forward_stage", "gradient_stage", "constructor"])
+def test_zero_moe_coefficients_carry_no_stage_or_coverage(change, layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    named = facts["groups"][1]
+    assert named["adapter"] is not None and named["moe_covered"]
+    if change == "constructor":
+        # Live coverage needs the constructor's coefficient too (zero it
+        # whole, forward included, so only coverage is inconsistent).
+        facts["checkpoint_moe_bytes_per_token"] = 0
+        rank_fields = report["replay"]["memory_replay"]["rank"]
+        rank_fields["moe_output_bytes_per_token"] = 0
+        rank_fields["moe_forward_stages"] = []
+        message = "MoE coverage without a checkpoint"
+    else:
+        named["moe_covered"] = False
+        named[change.split("_")[0]] = [0, [[0, 2**40]], 0]
+        message = "invalid MoE terms"
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "below_forward",
+        "stages",
+        "zero_forward",
+        "stage_count",
+        "coverage",
+        "unnamed_coverage",
+    ],
+)
+def test_moe_terms_agree_across_modes_and_groups(change, layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    groups = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ]
+    named = groups[1]
+    assert named["adapter"] is not None and named["moe_covered"]
+    assert named["forward"][0] <= named["gradient"][0]
+    assert 0 < len(named["forward"][1]) < len(named["gradient"][1])
+    if change == "below_forward":
+        # Stages kept, so only the coefficient order is wrong.
+        named["gradient"][0] = named["forward"][0] - 1
+        message = "invalid MoE terms"
+    elif change == "stages":
+        named["forward"][1] = []
+        message = "invalid MoE terms"
+    elif change == "zero_forward":
+        named["forward"] = [0, [], 0]
+        message = "invalid MoE terms"
+    elif change == "stage_count":
+        named["gradient"][1] = named["gradient"][1][: len(named["forward"][1])]
+        message = "invalid MoE terms"
+    else:
+        from art.trainer_rank import _planner_replay
+
+        # Validation refuses these before the recorded arguments are compared:
+        # an uncovered unnamed gradient group beside a covered named slot, or
+        # two unnamed gradient groups that disagree.
+        facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+        groups[0]["grad"] = True
+        groups[0]["gradient"] = deepcopy(named["gradient"])
+        groups[0]["gradient"][0] = facts["checkpoint_moe_bytes_per_token"]
+        if change == "unnamed_coverage":
+            named["moe_covered"] = False
+            groups.append(deepcopy(groups[0]))
+            groups[-1]["moe_covered"] = True
+        with pytest.raises(ValueError, match="inconsistent MoE recompute coverage"):
+            _planner_replay.validate(facts)
+        return
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+def test_moe_facts_need_the_recorded_tp1(tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    memory = report["replay"]["memory_replay"]
+    assert memory["estimates"][0]["runtime_facts"]["checkpoint_moe_bytes_per_token"]
+    memory["rank"]["topology"][1] = 2
+    with pytest.raises(ValueError, match="MoE facts disagree with the recorded"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("fact", ["rank", "checkpoint"])
+def test_dense_ranks_record_no_moe_facts(fact, monkeypatch, tmp_path):
+    from test_trainer_rank_dense_memory import _dense_rank
+
+    rank = cp2(monkeypatch, _dense_rank())
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(512, grad=True)]), tmp_path
+    )
+    memory = report["replay"]["memory_replay"]
+    facts = memory["estimates"][0]["runtime_facts"]
+    assert any(facts["dense_base_widths"])
+    if fact == "rank":
+        memory["rank"]["moe_forward_stages"] = [[0, 1]]
+    else:
+        # Consistent with itself (unnamed terms equal the coefficient in
+        # both modes).
+        facts["checkpoint_moe_bytes_per_token"] = 1
+        facts["groups"][0]["forward"] = [1, [], 0]
+        facts["groups"][0]["gradient"] = [1, [], 0]
+    with pytest.raises(ValueError, match="MoE facts disagree with the recorded"):
+        reports.replay(report)
+
+
+def test_unnamed_forward_terms_are_the_constructor_coefficient(tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    group = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ][0]
+    assert group["adapter"] is None and group["forward"][0]
+    group["forward"] = [0, [], 0]
+    with pytest.raises(ValueError, match="invalid MoE terms"):
+        reports.replay(report)
+
+
 @pytest.mark.parametrize("value", [None, 1.5, -1])
 def test_replay_refuses_invalid_recorded_geometry(value, tmp_path):
     rank = head_rank()
@@ -409,20 +576,14 @@ def test_staged_head_needs_recorded_cp2_target_backward(tmp_path):
         reports.replay(report)
 
 
-def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
-    monkeypatch.setattr(
-        tr,
-        "_TRITON_STATS_STATE",
-        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
-    )
+def cp2(monkeypatch, rank):
+    """Plan and price ``rank`` at CP2 through the stock topology reader (as
+    capture requires), over a CPU CP2 topology and planning config."""
     from types import SimpleNamespace
 
     from art.megatron.context_parallel.types import ParallelTopology
 
-    # CP2 through the stock topology reader (as capture requires), over a CPU
-    # CP2 topology and planning config.
     monkeypatch.setattr(tr.TrainerRank, "_topology_key", lambda self: (1, 1, 2, 1))
-    rank = head_rank()
     rank._topology = lambda: ParallelTopology(tp=1, cp=2)
     for name, value in {
         "linear_num_key_heads": 16,
@@ -436,6 +597,16 @@ def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
         build_gdn_execution_spec=True,
         context_parallel_workload_profile=lambda provider: None,
     )
+    return rank
+
+
+def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        tr,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
+    )
+    rank = cp2(monkeypatch, head_rank())
     rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
     plan = rank._plan_flat_forward([request(512, grad=True)])
     assert plan.signature.topology[2] == 2
@@ -445,6 +616,110 @@ def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
     result = reports.replay(report)
     assert result["aggregate"]["matches"]
     assert result["estimates"][0]["required_bytes"] == costs[0].required
+
+
+def test_dense_stage_is_replayed_and_frozen(monkeypatch, tmp_path):
+    from test_trainer_rank_dense_memory import NO_GRAD, STAGE, _dense_rank
+
+    rank = cp2(monkeypatch, _dense_rank())
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward([request(512, grad=True)])
+    report, costs = emitted(rank, plan, tmp_path)
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    assert facts["dense_widths"] == facts["dense_base_widths"] == [STAGE, NO_GRAD]
+    actual = reports.replay(report)
+    assert actual["aggregate"]["matches"]
+    assert actual["estimates"][0]["required_bytes"] == costs[0].required
+    changed = deepcopy(report)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["dense_widths"][
+        0
+    ] += 10**6
+    result = reports.replay(changed)["estimates"][0]
+    assert not result["matches"]
+    assert result["required_bytes"] > actual["estimates"][0]["required_bytes"]
+
+
+def test_dense_stage_on_cp_layouts_is_replayed(monkeypatch, tmp_path):
+    from test_trainer_rank_dense_memory import NO_GRAD, STAGE, _dense_rank
+    from test_trainer_rank_layout_memory import _requests, art_cp
+
+    rank = art_cp(_dense_rank(), monkeypatch)
+    del rank._topology_key  # the stock reader, over the fixture's CP2 topology
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward(_requests())
+    assert rank._plan_group_layouts(plan) is not None
+    report, costs = emitted(rank, plan, tmp_path)
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    assert facts["groups"][0]["layout"] is not None
+    assert facts["dense_widths"] == [STAGE, NO_GRAD]
+    actual = reports.replay(report)
+    assert actual["aggregate"]["matches"]
+    assert actual["estimates"][0]["required_bytes"] == costs[0].required
+    changed = deepcopy(report)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["dense_widths"][
+        0
+    ] += 10**6
+    assert not reports.replay(changed)["estimates"][0]["matches"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "length",
+        "value",
+        "half_zero",
+        "below_base",
+        "no_base",
+        "no_checkpoint",
+        "topology",
+    ],
+)
+def test_dense_fact_validation_rejects_forged_input(change, monkeypatch, tmp_path):
+    from test_trainer_rank_dense_memory import _dense_rank
+
+    rank = cp2(monkeypatch, _dense_rank())
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(512, grad=True)]), tmp_path
+    )
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    if change == "length":
+        facts["dense_widths"].append(0)
+        message = "invalid dense stage facts"
+    elif change == "value":
+        facts["dense_base_widths"][1] = 1.5
+        message = "invalid runtime dimension"
+    elif change == "half_zero":
+        facts["dense_widths"][1] = 0
+        message = "invalid dense stage facts"
+    elif change == "below_base":
+        facts["dense_widths"][0] = facts["dense_base_widths"][0] - 1
+        message = "invalid dense stage facts"
+    elif change == "no_base":
+        facts["dense_base_widths"] = [0, 0]
+        message = "invalid dense stage facts"
+    elif change == "no_checkpoint":
+        # Only a checkpointed decoder has dense widths.
+        facts["checkpoint_layers"] = 0
+        message = "invalid dense stage facts"
+    else:
+        # Dense widths on a report whose recorded topology is not CP2.
+        report["replay"]["memory_replay"]["rank"]["topology"] = [1, 1, 1, 1]
+        message = "dense stage facts disagree"
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("name", ["_dense_mlp_widths", "_checkpoint_floor_decoder"])
+def test_custom_dense_reader_is_explicitly_incomplete(name, monkeypatch):
+    from art.trainer_rank import _planner_replay
+
+    rank = _rank(monkeypatch)
+    plan = rank._plan_flat_forward([_request(1)])
+    original = getattr(rank, name)
+    monkeypatch.setattr(rank, name, lambda *args, **kwargs: original(*args, **kwargs))
+    with pytest.raises(ValueError, match="custom_runtime_estimator"):
+        _planner_replay.capture(rank, plan)
 
 
 @pytest.mark.parametrize("change", ["omit_default", "omit_required", "extra"])
