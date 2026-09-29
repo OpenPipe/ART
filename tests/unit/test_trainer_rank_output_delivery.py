@@ -127,7 +127,7 @@ def test_failed_delivery_releases_registered_graph_and_native_cache(
 
 
 @pytest.mark.parametrize(
-    "phase", ["peer", "snapshot", "serialization", "transfer", "exchange"]
+    "phase", ["peer", "snapshot", "copy", "serialization", "transfer", "exchange"]
 )
 @pytest.mark.parametrize("operation", ["forward", "next", "batches_next"])
 def test_peer_rejection_releases_undelivered_packet_storage(
@@ -148,23 +148,25 @@ def test_peer_rejection_releases_undelivered_packet_storage(
     with pytest.raises(MemoryError, match="output snapshot") as rejected:
         peer.invoke("forward", _input(5))
     assert not peer.state.graphs
+    inputs = [_input(3), _input(5)] if phase == "copy" else _input(3)
     argument = (
-        _input(3)
+        inputs
         if operation == "forward"
         else executor.invoke(
-            "batches" if operation == "next" else "batches_open", [_input(3)]
+            "batches" if operation == "next" else "batches_open", [inputs]
         )
     )
     storages, packets, exchanges = [], [], []
+    copy_targets, copy_calls, copy_error = set(), 0, None
     packet = executor._packet
 
     def observe(*args):
         try:
-            if phase == "snapshot":
-                storages.extend(
-                    StorageWeakRef(t.untyped_storage())
-                    for t in _tensors.flatten_tensors(args[0])[0]
-                )
+            if phase in ("snapshot", "copy"):
+                for tensor in _tensors.flatten_tensors(args[0])[0]:
+                    storages.append(StorageWeakRef(tensor.untyped_storage()))
+                    copy_targets.add(tensor.untyped_storage().data_ptr())
+                tensor = None
             value = packet(*args)
             packets.append(weakref.ref(value))
             storages.extend(
@@ -173,6 +175,27 @@ def test_peer_rejection_releases_undelivered_packet_storage(
             return value
         finally:
             args = ()  # Observation must not retain the failed call's input tree.
+
+    to = torch.Tensor.to
+
+    def copy(tensor, *args, **kwargs):
+        nonlocal copy_calls, copy_error
+        try:
+            targeted = tensor.untyped_storage().data_ptr() in copy_targets
+            if targeted:
+                copy_calls += 1
+                if copy_calls == 2:
+                    # Real CPU Tensor.to failure after one successful owned copy.
+                    kwargs["memory_format"] = torch.channels_last
+            copied = to(tensor, *args, **kwargs)
+            if targeted:
+                storages.append(StorageWeakRef(copied.untyped_storage()))
+            return copied
+        except RuntimeError as error:
+            copy_error = error
+            raise
+        finally:
+            tensor = None  # The fault injector must not own the failing tensor.
 
     exchange_error = RuntimeError("status exchange failed")
 
@@ -185,6 +208,8 @@ def test_peer_rejection_releases_undelivered_packet_storage(
     monkeypatch.setattr(executor, "_packet", observe)
     with monkeypatch.context() as patch:
         patch.setattr(executor, "_gather", gather)
+        if phase == "copy":
+            patch.setattr(torch.Tensor, "to", copy)
         if phase == "snapshot":
             patch.setattr(executor, "_available_host_memory", lambda: 0)
         if phase in ("serialization", "transfer"):
@@ -196,7 +221,9 @@ def test_peer_rejection_releases_undelivered_packet_storage(
             patch.setattr(executor, "members", [0, 1])
             patch.setattr(executor, "_broadcast", lambda command: command)
         message = (
-            "output snapshot"
+            "required rank 4"
+            if phase == "copy"
+            else "output snapshot"
             if phase == "peer"
             else "status exchange"
             if phase == "exchange"
@@ -204,6 +231,8 @@ def test_peer_rejection_releases_undelivered_packet_storage(
         )
         with pytest.raises((MemoryError, RuntimeError), match=message) as failure:
             executor.invoke(operation, argument)
+    if phase == "copy":
+        assert failure.value is copy_error and copy_calls == 2 and len(storages) == 3
     if phase == "exchange":
         assert failure.value is exchange_error
         # A failed status collective has no recovery contract; release only this
@@ -213,7 +242,7 @@ def test_peer_rejection_releases_undelivered_packet_storage(
         executor.invoke("release", tuple(pending))
     if operation != "forward":
         executor.invoke("close" if operation == "next" else "batches_close", argument)
-    assert (exchanges[0] is None) is (phase != "snapshot")
+    assert (exchanges[0] is None) is (phase not in ("snapshot", "copy"))
     assert len(exchanges) == (2 if phase == "transfer" else 1)
     assert failure.value.__traceback__ is not None
     assert rejected.value.__traceback__ is not None

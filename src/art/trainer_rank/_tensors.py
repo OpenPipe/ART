@@ -178,16 +178,21 @@ def detach_tree(
     handle: str, tree: Any, *, device: torch.device | str | None = None
 ) -> TensorPacket:
     """Snapshot supported output containers; reject opaque tensor-bearing objects."""
-    tensors, spec = flatten_tensors(tree)
-    _validate_output_spec(spec)
-    return TensorPacket(
-        handle,
-        spec,
-        tuple(
-            _plain(tensor).detach().to(device=device, copy=True) for tensor in tensors
-        ),
-        tuple(tensor.requires_grad for tensor in tensors),
-    )
+    copies: list[torch.Tensor] = []
+    try:
+        tensors, spec = flatten_tensors(tree)
+        _validate_output_spec(spec)
+        for tensor in tensors:
+            copies.append(_plain(tensor).detach().to(device=device, copy=True))
+        return TensorPacket(
+            handle,
+            spec,
+            tuple(copies),
+            tuple(tensor.requires_grad for tensor in tensors),
+        )
+    finally:
+        tree = tensors = tensor = None
+        del copies
 
 
 class _OutputBridge(torch.autograd.Function):
