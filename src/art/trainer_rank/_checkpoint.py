@@ -1510,8 +1510,18 @@ def _finalize_checkpoint_save(
             if finalized is None and outcome is None:
                 try:
                     assert prepared is not None
+                    # Abort discards the snapshot: acknowledge its joined cleanup,
+                    # even if writing failed. Finish still reports that failure.
                     _phase(
-                        lambda: prepared.writer.result() if prepared.writer else None,
+                        lambda: (
+                            (
+                                prepared.writer.result()
+                                if action == "finish"
+                                else prepared.writer.exception()
+                            )
+                            if prepared.writer
+                            else None
+                        ),
                         "write checkpoint snapshot",
                         group,
                     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
 import threading
@@ -142,7 +143,7 @@ def test_finish_abort_wait_for_owned_write_before_cleanup(
         release.set()
         thread.join(3)
     assert not thread.is_alive()
-    assert errors == ([error] if fails else [])
+    assert errors == ([error] if fails and action == "finish" else [])
     assert not prepared.snapshot.exists() and not prepared.reservation.exists()
     assert not trainer._prepared_checkpoint_saves
     assert trainer._checkpoint_save_next == 1
@@ -279,9 +280,12 @@ def test_start_failure_is_owned_until_collective_finalization(
     assert prepared.writer.exception() is error
     assert all(ref() is None for ref in refs)
     assert prepared.snapshot.exists() and prepared.reservation.exists()
-    with pytest.raises(RuntimeError) as caught:
-        getattr(trainer, f"{action}_checkpoint_save")(output)
-    assert caught.value is error
+    if action == "finish":
+        with pytest.raises(RuntimeError) as caught:
+            trainer.finish_checkpoint_save(output)
+        assert caught.value is error
+    else:
+        trainer.abort_checkpoint_save(output)
     assert not prepared.snapshot.exists() and not prepared.reservation.exists()
     assert not trainer._prepared_checkpoint_saves
     assert trainer._checkpoint_save_next == 1
@@ -289,6 +293,25 @@ def test_start_failure_is_owned_until_collective_finalization(
     trainer.prepare_checkpoint_save(following, "a")
     trainer.abort_checkpoint_save(following)
     assert trainer._checkpoint_save_next == 2
+
+
+def test_abort_writer_failure_does_not_hide_failed_cleanup(tmp_path, monkeypatch):
+    trainer = _save_state_trainer()
+    writer = Future()
+    writer.set_exception(OSError("discarded snapshot failed"))
+    prepared = replace(_prepared_save(tmp_path, 0), writer=writer)
+    trainer._prepared_checkpoint_saves["save"] = prepared
+    cleanup = OSError("cannot remove owned snapshot")
+    with monkeypatch.context() as patch:
+        patch.setattr(cp, "_cleanup_paths", lambda _paths: cleanup)
+        with pytest.raises(OSError) as caught:
+            trainer.abort_checkpoint_save("save")
+    assert caught.value is cleanup
+    assert trainer._prepared_checkpoint_saves["save"] is prepared
+    assert prepared.snapshot.exists()
+    trainer.abort_checkpoint_save("save")
+    assert not trainer._prepared_checkpoint_saves
+    assert not prepared.snapshot.exists() and not prepared.reservation.exists()
 
 
 def test_custom_digest_failure_is_reported_before_next_collective(
