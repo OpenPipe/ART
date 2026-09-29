@@ -27,6 +27,7 @@ def _scalar_multiply(tensors, scale, *, inplace=False):
 def _scalar_copy(models, masters):
     for model, master in zip(models, masters, strict=True):
         model.copy_(master)
+        model.grad = None
 
 
 @pytest.mark.parametrize("scale", [0.0, -0.3, 1.0, 1e30, float("inf"), float("nan")])
@@ -162,6 +163,29 @@ def test_copy_back_matches_scalar_casts_and_preserves_sources(layout):
         torch.testing.assert_close(master, original, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32, torch.float64])
+def test_uniform_copy_back_batches_casts_and_clears_gradients(monkeypatch, dtype):
+    models = [torch.nn.Parameter(torch.zeros(size, dtype=dtype)) for size in (3, 7)]
+    masters = [torch.linspace(-0.7, 0.9, model.numel()) for model in models]
+    for model in models:
+        model.grad = torch.ones_like(model)
+    versions = [model._version for model in models]
+    copied = []
+    original = torch._foreach_copy_
+
+    def record(destination, source):
+        copied.append(len(destination))
+        original(destination, source)
+
+    monkeypatch.setattr(torch, "_foreach_copy_", record)
+    with torch.no_grad():
+        _optimizer._copy_back(models, masters)
+    assert copied == [2]
+    for model, master, version in zip(models, masters, versions, strict=True):
+        torch.testing.assert_close(model, master.to(dtype), atol=0, rtol=0)
+        assert model.grad is None and model._version == version + 1
+
+
 @pytest.mark.parametrize(
     "alias", ["destination", "cross-pair", "source", "same-pair", "separate-storage"]
 )
@@ -220,6 +244,39 @@ def test_copy_back_device_and_subclass_fallback(monkeypatch):
     )
     _optimizer._copy_back(models, masters)
     torch.testing.assert_close(models[0], torch.ones(2), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("failure", ["shape", "length"])
+def test_copy_failure_keeps_prior_gradient_cleanup(failure):
+    first, second = (torch.nn.Parameter(torch.zeros(size)) for size in (2, 3))
+    for param in (first, second):
+        param.grad = torch.ones_like(param)
+    masters = [torch.ones(2)] if failure == "length" else [torch.ones(2), torch.ones(2)]
+    with (
+        torch.no_grad(),
+        pytest.raises(ValueError if failure == "length" else RuntimeError),
+    ):
+        _optimizer._copy_back([first, second], masters)
+    torch.testing.assert_close(first, torch.ones(2), atol=0, rtol=0)
+    assert first.grad is None
+    torch.testing.assert_close(second.grad, torch.ones(3), atol=0, rtol=0)
+
+
+def test_subclass_copy_observes_prior_gradient_cleanup():
+    first = torch.nn.Parameter(torch.zeros(2))
+    first.grad = torch.ones_like(first)
+
+    class CheckingTensor(torch.Tensor):
+        def copy_(self, source):
+            assert first.grad is None
+            return super().copy_(source)
+
+    second = torch.zeros(2).as_subclass(CheckingTensor)
+    second.grad = torch.ones(2)
+    with torch.no_grad():
+        _optimizer._copy_back([first, second], [torch.ones(2), torch.ones(2)])
+    assert second.grad is None
+    torch.testing.assert_close(second, torch.ones(2), atol=0, rtol=0)
 
 
 def test_empty_pointwise_lists():

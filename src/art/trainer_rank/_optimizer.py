@@ -87,9 +87,30 @@ def _scaled_grads(
 def _copy_back(models: Sequence[torch.Tensor], masters: Sequence[torch.Tensor]) -> None:
     if not models and not masters:
         return
-    pairs = tuple(zip(models, masters, strict=True))
+    pairs = tuple(zip(models, masters, strict=False))
     tensors = (*models, *masters)
-    if all(_foreach_compatible(tensor) for tensor in tensors):
+    if (
+        len(models) == len(masters)
+        and all(
+            _foreach_compatible(tensor)
+            and tensor.is_contiguous()
+            and tensor.dtype
+            in (
+                _impl.torch.float16,
+                _impl.torch.bfloat16,
+                _impl.torch.float32,
+                _impl.torch.float64,
+            )
+            for tensor in tensors
+        )
+        and all(
+            model.shape == master.shape
+            and model.device == master.device == models[0].device
+            and model.dtype == models[0].dtype
+            and master.dtype == masters[0].dtype
+            for model, master in pairs
+        )
+    ):
         # A foreach CUDA kernel may write pairs concurrently. Shared storage,
         # including cross-pair source/destination aliases, needs ordered copies.
         storage = sorted(
@@ -102,9 +123,12 @@ def _copy_back(models: Sequence[torch.Tensor], masters: Sequence[torch.Tensor]) 
             for left, right in zip(storage, storage[1:])
         ):
             _impl.torch._foreach_copy_(tuple(models), tuple(masters))
+            for model in models:
+                model.grad = None
             return
-    for model, master in pairs:
+    for model, master in zip(models, masters, strict=True):
         model.copy_(master)
+        model.grad = None
 
 
 def _extend_dynamic_optimizer(
@@ -401,8 +425,6 @@ def _dynamic_optim_step(
         dynamic.optimizer.zero_grad(set_to_none=True)
         with _impl.torch.no_grad():
             _copy_back(model_params, dynamic.master_params)
-            for model in model_params:
-                model.grad = None
         self._prune_slot_graphs(self._slot_ref(name))
         self._checkpoint_slots[name].revision += 1
     return metrics
