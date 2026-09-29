@@ -3,12 +3,14 @@
 from collections.abc import Generator
 from dataclasses import replace
 from functools import partial
+import gc
 from typing import Any
 import weakref
 
 import pytest
 from test_trainer_rank_commands import _input, _Rank
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from art.trainer_rank import (
     ForwardInput,
@@ -122,6 +124,70 @@ def test_failed_delivery_releases_registered_graph_and_native_cache(
     view.backward(view.forward(_input(7)).hidden_states.sum())
     assert rank.weight.grad.item() == 7
     assert not executor.state.graphs and not rank.cache.handles()
+
+
+@pytest.mark.parametrize("operation", ["forward", "next", "batches_next"])
+def test_peer_rejection_releases_undelivered_packet_storage(
+    monkeypatch, request, operation
+):
+    if gc.isenabled():
+        request.addfinalizer(gc.enable)
+    gc.disable()
+    rank: Any = _CachedRank()
+    executor = _Executor(rank, "zero")
+    view = _view(executor)
+    previous = view.forward(_input(7))
+    graphs, handles = set(executor.state.graphs), rank.cache.handles()
+    borrowed = StorageWeakRef(rank.weight.untyped_storage())
+    peer_rank: Any = _Rank(1, 2)
+    peer = _Executor(peer_rank, "zero")
+    monkeypatch.setattr(peer, "_available_host_memory", lambda: 0)
+    with pytest.raises(MemoryError, match="output snapshot") as rejected:
+        peer.invoke("forward", _input(5))
+    assert not peer.state.graphs
+    argument = (
+        _input(3)
+        if operation == "forward"
+        else executor.invoke(
+            "batches" if operation == "next" else "batches_open", [_input(3)]
+        )
+    )
+    storages, packets, exchanges = [], [], []
+    packet = executor._packet
+
+    def observe(*args):
+        value = packet(*args)
+        packets.append(weakref.ref(value))
+        storages.extend(
+            StorageWeakRef(t.untyped_storage()) for t in value.packet.tensors
+        )
+        return value
+
+    def gather(error):
+        exchanges.append(error)
+        return [error, f"MemoryError: {rejected.value}"]
+
+    monkeypatch.setattr(executor, "_packet", observe)
+    with monkeypatch.context() as patch:
+        patch.setattr(executor, "_gather", gather)
+        with pytest.raises(RuntimeError, match="output snapshot") as failure:
+            executor.invoke(operation, argument)
+    if operation != "forward":
+        executor.invoke("close" if operation == "next" else "batches_close", argument)
+    assert exchanges == [None]  # This leader completed its real forward and packet.
+    assert failure.value.__traceback__ is not None
+    assert rejected.value.__traceback__ is not None
+    assert set(executor.state.graphs) == graphs and rank.cache.handles() == handles
+    assert storages and all(storage.expired() for storage in storages)
+    assert all(packet() is None for packet in packets)
+    assert not borrowed.expired() and rank.weight.item() == 2
+    view.backward(previous.hidden_states.sum())
+    assert rank.weight.grad.item() == 7
+    result = executor.invoke("forward", _input(11))
+    assert result[0] is packets[-1]()
+    executor.invoke("release", (result[0].packet.handle,))
+    assert not executor.state.graphs and not rank.cache.handles()
+    assert not storages[-1].expired() and result[0].packet.tensors[0].item() == 22
 
 
 @pytest.mark.parametrize("delivery", ["forward", "iterator", "persistent"])

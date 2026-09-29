@@ -403,6 +403,7 @@ class _Executor:
             None if error is None else f"{type(error).__name__}: {error}"
         )
         if any(errors):
+            result = None
             self.state.graphs.pop(
                 f"{self.mode}:{command.sequence}:dp:{self.dp_rank}", None
             )
