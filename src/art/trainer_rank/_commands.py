@@ -395,84 +395,93 @@ class _Executor:
     def _execute(self, command: _Command) -> Any:
         result, error = None, None
         try:
-            with torch.set_grad_enabled(command.grad_enabled):
-                result = self._dispatch(command)
-        except BaseException as exc:
-            error = exc
-        errors = self._gather(
-            None if error is None else f"{type(error).__name__}: {error}"
-        )
-        if any(errors):
-            result = None
-            self.state.graphs.pop(
-                f"{self.mode}:{command.sequence}:dp:{self.dp_rank}", None
-            )
-            if error is not None:
-                raise error
-            raise RuntimeError(
-                f"Physical trainer command {command.operation!r} failed: {errors}"
-            )
-        if command.operation in ("forward", "next", "batches_next"):
-            value = (
-                result if get_rank_callback_metadata(self.rank) is not None else None
-            )
             try:
-                return self._gather_outputs(value)
-            except BaseException:
+                with torch.set_grad_enabled(command.grad_enabled):
+                    result = self._dispatch(command)
+            except BaseException as exc:
+                error = exc
+            errors = self._gather(
+                None if error is None else f"{type(error).__name__}: {error}"
+            )
+            if any(errors):
                 self.state.graphs.pop(
                     f"{self.mode}:{command.sequence}:dp:{self.dp_rank}", None
                 )
-                raise
-        return result
+                if error is not None:
+                    raise error
+                raise RuntimeError(
+                    f"Physical trainer command {command.operation!r} failed: {errors}"
+                )
+            if command.operation in ("forward", "next", "batches_next"):
+                try:
+                    return self._gather_outputs(
+                        result
+                        if get_rank_callback_metadata(self.rank) is not None
+                        else None
+                    )
+                except BaseException:
+                    self.state.graphs.pop(
+                        f"{self.mode}:{command.sequence}:dp:{self.dp_rank}", None
+                    )
+                    raise
+            return result
+        finally:
+            result = None
 
     def _gather_outputs(self, value: Any) -> list[Any] | None:
-        if not self.distributed or len(self.members) == 1:
-            return [value]
+        try:
+            if not self.distributed or len(self.members) == 1:
+                return [value]
 
-        def admit_serialization() -> None:
-            from ._tensors import flatten_tensors
+            def admit_serialization() -> None:
+                from ._tensors import flatten_tensors
 
-            tensors, _ = flatten_tensors(value)
-            # Pickling creates storage bytes before gather admission can sample
-            # their size. Reserve tensor storage, a copy, and per-leaf metadata.
-            required = 2 * sum(t.numel() * t.element_size() for t in tensors)
-            required += 4096 * (len(tensors) + 1)
-            if required > self._available_host_memory():
-                raise MemoryError(
-                    f"Trainer output serialization requires {required} CPU bytes"
-                )
+                tensors, _ = flatten_tensors(value)
+                # Pickling creates storage bytes before gather admission can sample
+                # their size. Reserve tensor storage, a copy, and per-leaf metadata.
+                try:
+                    required = 2 * sum(t.numel() * t.element_size() for t in tensors)
+                    required += 4096 * (len(tensors) + 1)
+                finally:
+                    del tensors, _
+                if required > self._available_host_memory():
+                    raise MemoryError(
+                        f"Trainer output serialization requires {required} CPU bytes"
+                    )
 
-        self._coordinated_preflight(admit_serialization)
-        payload = self._coordinated_preflight(lambda: cloudpickle.dumps(value))
-        sizes = self._gather(len(payload))
+            self._coordinated_preflight(admit_serialization)
+            payload = self._coordinated_preflight(lambda: cloudpickle.dumps(value))
+            sizes = self._gather(len(payload))
 
-        def admit() -> None:
-            available = self._available_host_memory()
-            # Gloo gather_object pads every sender to the largest serialized
-            # payload. Include receive storage and unpickling copies on leader.
-            padded = max(sizes) + 1024
-            required = 2 * padded
-            if self.is_leader:
-                required += 2 * len(sizes) * padded + sum(sizes)
-            if required > available:
-                raise MemoryError(
-                    f"Trainer output transfer requires {required} CPU bytes, "
-                    f"but the per-process shared-host budget has {available}"
-                )
+            def admit() -> None:
+                available = self._available_host_memory()
+                # Gloo gather_object pads every sender to the largest serialized
+                # payload. Include receive storage and unpickling copies on leader.
+                padded = max(sizes) + 1024
+                required = 2 * padded
+                if self.is_leader:
+                    required += 2 * len(sizes) * padded + sum(sizes)
+                if required > available:
+                    raise MemoryError(
+                        f"Trainer output transfer requires {required} CPU bytes, "
+                        f"but the per-process shared-host budget has {available}"
+                    )
 
-        self._coordinated_preflight(admit)
-        values: list[Any] | None = (
-            [None] * len(self.members) if self.is_leader else None
-        )
-        dist.gather_object(payload, values, dst=self.leader, group=self.group)
+            self._coordinated_preflight(admit)
+            values: list[Any] | None = (
+                [None] * len(self.members) if self.is_leader else None
+            )
+            dist.gather_object(payload, values, dst=self.leader, group=self.group)
 
-        def decode() -> list[Any] | None:
-            if values is None:
-                return None
-            decoded = [cloudpickle.loads(item) for item in values]
-            return [item for item in decoded if item is not None]
+            def decode() -> list[Any] | None:
+                if values is None:
+                    return None
+                decoded = [cloudpickle.loads(item) for item in values]
+                return [item for item in decoded if item is not None]
 
-        return self._coordinated_preflight(decode)
+            return self._coordinated_preflight(decode)
+        finally:
+            value = payload = values = None
 
     def _available_host_memory(self) -> int:
         from ._memory_policy import host_memory_budget, local_rank_count
@@ -488,20 +497,25 @@ class _Executor:
     def _packet(self, tree: Any, sequence: int) -> Any:
         from ._tensors import ManagedTensor, detach_tree, flatten_tensors
 
-        handle = f"{self.mode}:{sequence}:dp:{self.dp_rank}"
-        tensors, _ = flatten_tensors(tree)
-        if any(tensor.requires_grad for tensor in tensors):
-            self.state.graphs[handle] = tuple(tensors)
-        if get_rank_callback_metadata(self.rank) is None:
-            return None
-        required = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
-        if required > self._available_host_memory():
-            raise MemoryError(f"Trainer output snapshot requires {required} CPU bytes")
-        return _OutputPacket(
-            detach_tree(handle, tree, device="cpu"),
-            tuple(tensor.device.type == "cpu" for tensor in tensors),
-            any(isinstance(tensor, ManagedTensor) for tensor in tensors),
-        )
+        try:
+            handle = f"{self.mode}:{sequence}:dp:{self.dp_rank}"
+            tensors, _ = flatten_tensors(tree)
+            if any(tensor.requires_grad for tensor in tensors):
+                self.state.graphs[handle] = tuple(tensors)
+            if get_rank_callback_metadata(self.rank) is None:
+                return None
+            required = sum(tensor.numel() * tensor.element_size() for tensor in tensors)
+            if required > self._available_host_memory():
+                raise MemoryError(
+                    f"Trainer output snapshot requires {required} CPU bytes"
+                )
+            return _OutputPacket(
+                detach_tree(handle, tree, device="cpu"),
+                tuple(tensor.device.type == "cpu" for tensor in tensors),
+                any(isinstance(tensor, ManagedTensor) for tensor in tensors),
+            )
+        finally:
+            tree = tensors = _ = None
 
     def _dispatch(self, command: _Command) -> Any:
         op, args, kwargs = command.operation, command.args, command.kwargs
@@ -524,11 +538,14 @@ class _Executor:
             )
             if op in ("next", "batches_next"):
                 batch = next(iterators[args[0]], None)
-                if batch is None:
-                    return (None, None)
-                return replace(batch, inputs=[], outputs=[]), self._packet(
-                    batch.outputs, command.sequence
-                )
+                try:
+                    if batch is None:
+                        return (None, None)
+                    return replace(batch, inputs=[], outputs=[]), self._packet(
+                        batch.outputs, command.sequence
+                    )
+                finally:
+                    batch = None
             iterator = iterators.pop(args[0], None)
             if op == "batches_close":
                 self.state.batch_inputs.pop(args[0], None)

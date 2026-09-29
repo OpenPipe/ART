@@ -126,9 +126,12 @@ def test_failed_delivery_releases_registered_graph_and_native_cache(
     assert not executor.state.graphs and not rank.cache.handles()
 
 
+@pytest.mark.parametrize(
+    "phase", ["peer", "snapshot", "serialization", "transfer", "exchange"]
+)
 @pytest.mark.parametrize("operation", ["forward", "next", "batches_next"])
 def test_peer_rejection_releases_undelivered_packet_storage(
-    monkeypatch, request, operation
+    monkeypatch, request, operation, phase
 ):
     if gc.isenabled():
         request.addfinalizer(gc.enable)
@@ -156,29 +159,67 @@ def test_peer_rejection_releases_undelivered_packet_storage(
     packet = executor._packet
 
     def observe(*args):
-        value = packet(*args)
-        packets.append(weakref.ref(value))
-        storages.extend(
-            StorageWeakRef(t.untyped_storage()) for t in value.packet.tensors
-        )
-        return value
+        try:
+            if phase == "snapshot":
+                storages.extend(
+                    StorageWeakRef(t.untyped_storage())
+                    for t in _tensors.flatten_tensors(args[0])[0]
+                )
+            value = packet(*args)
+            packets.append(weakref.ref(value))
+            storages.extend(
+                StorageWeakRef(t.untyped_storage()) for t in value.packet.tensors
+            )
+            return value
+        finally:
+            args = ()  # Observation must not retain the failed call's input tree.
 
-    def gather(error):
-        exchanges.append(error)
-        return [error, f"MemoryError: {rejected.value}"]
+    exchange_error = RuntimeError("status exchange failed")
+
+    def gather(value):
+        exchanges.append(value)
+        if phase == "exchange":
+            raise exchange_error
+        return [value, f"MemoryError: {rejected.value}" if phase == "peer" else value]
 
     monkeypatch.setattr(executor, "_packet", observe)
     with monkeypatch.context() as patch:
         patch.setattr(executor, "_gather", gather)
-        with pytest.raises(RuntimeError, match="output snapshot") as failure:
+        if phase == "snapshot":
+            patch.setattr(executor, "_available_host_memory", lambda: 0)
+        if phase in ("serialization", "transfer"):
+            budgets = iter(
+                [2**20, 0] if phase == "serialization" else [2**20, 2**20, 0]
+            )
+            patch.setattr(executor, "_available_host_memory", lambda: next(budgets))
+            patch.setattr(executor, "distributed", True)
+            patch.setattr(executor, "members", [0, 1])
+            patch.setattr(executor, "_broadcast", lambda command: command)
+        message = (
+            "output snapshot"
+            if phase == "peer"
+            else "status exchange"
+            if phase == "exchange"
+            else f"output {phase}"
+        )
+        with pytest.raises((MemoryError, RuntimeError), match=message) as failure:
             executor.invoke(operation, argument)
+    if phase == "exchange":
+        assert failure.value is exchange_error
+        # A failed status collective has no recovery contract; release only this
+        # test's successful graph through the existing explicit release operation.
+        pending = set(executor.state.graphs) - graphs
+        assert len(pending) == 1
+        executor.invoke("release", tuple(pending))
     if operation != "forward":
         executor.invoke("close" if operation == "next" else "batches_close", argument)
-    assert exchanges == [None]  # This leader completed its real forward and packet.
+    assert (exchanges[0] is None) is (phase != "snapshot")
+    assert len(exchanges) == (2 if phase == "transfer" else 1)
     assert failure.value.__traceback__ is not None
     assert rejected.value.__traceback__ is not None
-    assert set(executor.state.graphs) == graphs and rank.cache.handles() == handles
+    assert set(executor.state.graphs) == graphs
     assert storages and all(storage.expired() for storage in storages)
+    assert rank.cache.handles() == handles
     assert all(packet() is None for packet in packets)
     assert not borrowed.expired() and rank.weight.item() == 2
     view.backward(previous.hidden_states.sum())
