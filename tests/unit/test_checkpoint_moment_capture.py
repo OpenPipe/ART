@@ -213,6 +213,39 @@ def test_capture_copies_physical_parameters_once(captured_state, monkeypatch):
     assert sum(copies) == 4 * sum(param.numel() for param in params)
 
 
+def test_adapter_only_capture_freezes_shard_metadata(captured_state, monkeypatch):
+    trainer, params, *_ = captured_state
+    if trainer._checkpoint_slots["a"].custom:
+        pytest.skip("custom state has no LoRA shard metadata")
+    from art.megatron import lora as lm
+    from art.megatron.weights.lora_publish import collect_local_lora_entries
+
+    monkeypatch.setattr(lm, "_get_shard_world_size", lambda _: 2)
+    monkeypatch.setattr(lm, "_get_shard_rank", lambda _: 0)
+    for index, param in enumerate(params):
+        param.lora_tp_sharded = True
+        param.lora_tp_shard_dim = param.ndim - 2 + index % 2
+        param.lora_tp_shard_strategy = "components"
+        param.lora_tp_component_sizes = [2, 2]
+    expected, metadata = collect_local_lora_entries(
+        trainer.runtime.model, {}, owner_rank=0
+    )
+    trainer._checkpoint_slots["a"].optimizer = None
+    files = {}
+    captured, optimizer, custom = cp._local_state(trainer, "a", files)
+    assert optimizer is None and not custom
+    for param in params:
+        param.lora_tp_component_sizes.append(99)
+        param.lora_tp_sharded = False
+    shards = cp._expand_local_state(captured, files)
+    assert [shard.metadata for shard in shards] == metadata
+    assert len(files) == 1
+    payload = next(iter(files.values()))
+    assert set(payload) == {f"lora/{key}" for key in expected}
+    for key, value in expected.items():
+        torch.testing.assert_close(payload[f"lora/{key}"], value, rtol=0, atol=0)
+
+
 def test_expert_expansion_releases_capture_and_preserves_snapshot(
     captured_state, tmp_path, monkeypatch
 ):
@@ -225,7 +258,12 @@ def test_expert_expansion_releases_capture_and_preserves_snapshot(
         trainer.runtime.model, {}, owner_rank=0
     )
     expected = {key: value.clone() for key, value in tensors.items()}
-    config = {"base_model_name_or_path": "test/model", "r": 2}
+    config = {
+        "base_model_name_or_path": "test/model",
+        "r": 2,
+        "lora_alpha": 2,
+        "target_modules": ["q_proj"],
+    }
     trainer._checkpoint_slots["a"].config = config
     monkeypatch.setattr(cp, "_validate_save_state", lambda *_: config)
     entered, release = threading.Event(), threading.Event()
@@ -256,13 +294,21 @@ def test_expert_expansion_releases_capture_and_preserves_snapshot(
     finally:
         release.set()
 
+    original_finish = cp._finish
+
     def finish(_trainer, owned):
         assert [shard.metadata for shard in owned.shards] == metadata
         saved = safetensors.torch.load_file(owned.snapshot / owned.shards[0].file)
         for key, value in expected.items():
             torch.testing.assert_close(saved[f"lora/{key}"], value, rtol=0, atol=0)
+        original_finish(_trainer, owned)
 
     monkeypatch.setattr(cp, "_finish", finish)
     trainer.finish_checkpoint_save(output)
     assert not trainer._prepared_checkpoint_saves
     assert not prepared.snapshot.exists()
+    artifact = cp.prepare_checkpoint(output)
+    assert artifact.config["r"] == 2
+    assert artifact.manifest is not None
+    assert set(artifact.manifest["parameters"]) == set(expected)
+    assert artifact.manifest["steps"] == dict.fromkeys(expected, 0.0)
