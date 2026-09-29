@@ -329,7 +329,7 @@ def test_recomputed_layer_fact_validation_rejects_forged_input(change, layer, tm
         facts["groups"][0]["moe_covered"] = True
         message = "invalid MoE recompute coverage"
     elif change == "triton_min_rows":
-        facts["triton_min_rows"] = 0
+        facts["triton_min_rows"] = 64.0
         message = "invalid runtime dimension"
     elif change == "routed_rows":
         item["arguments"]["group_routed_rows"][1] -= 1
@@ -341,9 +341,98 @@ def test_recomputed_layer_fact_validation_rejects_forged_input(change, layer, tm
         reports.replay(report)
 
 
+@pytest.mark.parametrize("value", [None, 1.5, -1])
+def test_replay_refuses_invalid_recorded_geometry(value, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    # The recomputed mixer multiplies these; refuse before any pricing.
+    report["replay"]["memory_replay"]["rank"]["geometry"]["kv_channels"] = value
+    with pytest.raises(ValueError, match="geometry"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("setting", ["0", "-3"])
+def test_non_positive_triton_threshold_is_captured_and_replayed(
+    setting, monkeypatch, tmp_path
+):
+    # Live pricing accepts it (the fallback chunk then prices no rows).
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", setting)
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, costs = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    assert facts["triton_min_rows"] == int(setting)
+    result = reports.replay(report)
+    assert result["aggregate"]["matches"]
+    assert result["estimates"][0]["required_bytes"] == costs[0].required
+
+
+def test_recompute_readers_are_unread_without_a_checkpointed_decoder(
+    monkeypatch, tmp_path
+):
+    from art.trainer_rank import _planner_replay
+
+    # Live pricing reads them only for a checkpointed decoder's recompute;
+    # capture must not refuse a plan over a setting live never reads.
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "not-a-number")
+    rank = _rank(monkeypatch)
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(rank, rank._plan_flat_forward([_request(1)]), tmp_path)
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    assert facts["checkpoint_layers"] == 0
+    assert all(facts[name] is None for name in _planner_replay._RECOMPUTE_READERS)
+    assert reports.replay(report)["aggregate"]["matches"]
+    forged = deepcopy(report)
+    forged["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "te_workspace_growth_bytes"
+    ] = 0
+    with pytest.raises(ValueError, match="invalid runtime dimension"):
+        reports.replay(forged)
+
+
+def test_staged_head_needs_recorded_cp2_target_backward(tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    # This CP1 plan cannot stage its head; a forged flag must not price it so.
+    report["replay"]["memory_replay"]["estimates"][0]["arguments"][
+        "head_backward_traced"
+    ] = True
+    with pytest.raises(ValueError, match="staging disagrees"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("hidden_size", "8"), ("gdn_layers", -1), ("sequence_parallel", 0)]
+)
+def test_replay_refuses_invalid_recorded_rank_dimensions(field, value, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    report["replay"]["memory_replay"]["rank"][field] = value
+    with pytest.raises(ValueError, match="rank dimensions"):
+        reports.replay(report)
+
+
 @pytest.mark.parametrize(
     "name",
-    ["_te_workspace_growth_bytes", "_moe_recompute_covered_for", "_triton_min_rows"],
+    [
+        "_te_workspace_growth_bytes",
+        "_moe_recompute_covered_for",
+        "_triton_min_rows",
+        "_plan_group_routed_rows",
+        "_plan_head_backward_traced",
+        "_head_backward_traced",
+    ],
 )
 def test_custom_recomputed_layer_reader_is_explicitly_incomplete(name, monkeypatch):
     from art.trainer_rank import _planner_replay

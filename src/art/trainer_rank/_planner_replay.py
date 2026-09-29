@@ -54,6 +54,15 @@ _REFUSALS = frozenset(
 )
 
 
+# Frozen per plan; None where no checkpointed decoder would read them.
+_RECOMPUTE_READERS = (
+    "moe_checkpoint_state_bytes_per_token",
+    "te_workspace_growth_bytes",
+    "backward_row_state_bytes",
+    "triton_min_rows",
+)
+
+
 def refusal_reason(error: Exception) -> str:
     # Never retain arbitrary reader exception text, model reprs or token values.
     if (
@@ -138,6 +147,10 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_layout_adapter_gradient_bytes",
         "_checkpoint_adapter_gradient_extra",
         "_recomputed_mixer_widths",
+        # Producers of recorded arguments replay checks against the facts.
+        "_plan_group_routed_rows",
+        "_plan_head_backward_traced",
+        "_head_backward_traced",
     ):
         method = getattr(rank, name)
         expected = getattr(_impl.TrainerRank, name)
@@ -333,14 +346,12 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "version": 4,
         "checkpoint_layers": layers,
         "checkpoint_moe_bytes_per_token": rank._checkpoint_moe_bytes_per_token(),
-        # Model and process readers of the recomputed layer and staged head.
-        "moe_checkpoint_state_bytes_per_token": (
-            rank._moe_checkpoint_state_bytes_per_token()
-        ),
-        "te_workspace_growth_bytes": rank._te_workspace_growth_bytes(),
-        # Only a checkpointed Megatron decoder stages the head and has this.
-        "backward_row_state_bytes": rank._backward_row_state_bytes() if layers else 0,
-        "triton_min_rows": rank._triton_min_rows(),
+        # Model and process readers of the recomputed layer and staged head,
+        # read (like live pricing) only with a checkpointed decoder.
+        **{
+            name: getattr(rank, "_" + name)() if layers else None
+            for name in _RECOMPUTE_READERS
+        },
         "layer_gdn_inputs": list(inputs),
         "head_vocabulary": vocabulary,
         "head_target_backward": target_backward,
@@ -384,13 +395,17 @@ def validate(facts: Any) -> None:
     for key in (
         "checkpoint_layers",
         "checkpoint_moe_bytes_per_token",
-        "moe_checkpoint_state_bytes_per_token",
-        "te_workspace_growth_bytes",
-        "backward_row_state_bytes",
         "head_vocabulary",
     ):
         integer(facts[key])
-    integer(facts["triton_min_rows"], minimum=1)
+    for key in _RECOMPUTE_READERS:
+        if not facts["checkpoint_layers"]:
+            if facts[key] is not None:
+                raise ValueError("invalid runtime dimension")
+            continue
+        # Any integer Triton setting is live-accepted (a non-positive one
+        # prices no fallback chunk rows).
+        integer(facts[key], minimum=-(2**63) if key == "triton_min_rows" else 0)
     if type(facts["head_target_backward"]) is not bool:
         raise ValueError("invalid head backward eligibility")
     groups = facts["groups"]
@@ -637,7 +652,8 @@ class ReplayRank(_impl.TrainerRank):
 
     def _head_workspace_bytes(self, rows: int) -> int:
         assert self._facts is not None
-        return _memory._dense_head_bytes(self._facts["head_vocabulary"], rows)
+        vocabulary = self._facts["head_vocabulary"]
+        return _memory._dense_head_bytes(vocabulary, rows) if rows > 0 else 0
 
     def verify_group(
         self, group: dict[str, Any], layout: Any, records: list[dict[str, Any]]
@@ -795,8 +811,16 @@ class ReplayRank(_impl.TrainerRank):
         recorded = arguments.get("group_routed_rows")
         if not isinstance(recorded, (list, tuple)) or tuple(recorded) != routed:
             raise ValueError("runtime facts disagree with selected routed rows")
-        if type(arguments.get("head_backward_traced")) is not bool:
+        traced = arguments.get("head_backward_traced")
+        if type(traced) is not bool:
             raise ValueError("head backward staging is not recorded")
+        # Live staging needs CP2 and a target backward through a priced head.
+        if traced and not (
+            self._topology_key()[2] == 2
+            and facts["head_target_backward"]
+            and facts["head_vocabulary"]
+        ):
+            raise ValueError("head backward staging disagrees with recorded facts")
         layouts = None
         if groups[0]["layout"] is not None:
             if len(groups[0]["layout"]["attention_rows"]) != self._topology_key()[2]:
