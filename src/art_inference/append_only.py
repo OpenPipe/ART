@@ -488,9 +488,15 @@ async def chat_response_prefixes(
 
     async def complete(message: Mapping[str, Any]) -> list[int] | None:
         message = openai_tool_arguments(message)
-        return await render(
-            type(request).model_validate({**payload, "messages": [*messages, message]})
-        )
+        try:
+            completed_request = type(request).model_validate(
+                {**payload, "messages": [*messages, message]}
+            )
+        except ValueError:
+            # Sparse or incomplete native tool deltas need not form a valid
+            # subsequent request. Preserve the response, without certifying it.
+            return None
+        return await render(completed_request)
 
     entries: list[PrefixObservation] = []
     for message, output, finished in choices:
