@@ -1,6 +1,7 @@
 """Tiny CPU captures through the real collector; no CUDA performance claim."""
 
 from importlib.util import find_spec
+from typing import Any, cast
 
 import pytest
 import safetensors.torch
@@ -53,7 +54,7 @@ def captured_state(request, monkeypatch):
             model.bind_expert_layout((8, None, 10), ())
         params = tuple(model.parameters())
         entries = model._export_items()
-        tensors, _ = collect_local_lora_entries([model], {}, owner_rank=0)
+        tensors, _ = collect_local_lora_entries(cast(Any, [model]), {}, owner_rank=0)
         optimizer_file = "block-000000.safetensors"
         expected[optimizer_file] = {
             f"lora/{key}": value.clone() for key, value in tensors.items()
@@ -65,7 +66,7 @@ def captured_state(request, monkeypatch):
         for param in params
     )
     optimizer = torch.optim.Adam(masters, lr=0.125)
-    trainer.runtime.model = [model]
+    trainer.runtime.model = cast(Any, [model])
     trainer._checkpoint_slots["a"] = _CheckpointSlot(
         params=params,
         optimizer=_DynamicOptimizer(optimizer, masters),
