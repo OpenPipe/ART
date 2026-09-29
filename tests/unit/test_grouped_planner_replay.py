@@ -496,7 +496,16 @@ def test_dense_stage_on_cp_layouts_is_replayed(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "change", ["length", "value", "half_zero", "below_base", "no_base", "topology"]
+    "change",
+    [
+        "length",
+        "value",
+        "half_zero",
+        "below_base",
+        "no_base",
+        "no_checkpoint",
+        "topology",
+    ],
 )
 def test_dense_fact_validation_rejects_forged_input(change, monkeypatch, tmp_path):
     from test_trainer_rank_dense_memory import _dense_rank
@@ -521,6 +530,10 @@ def test_dense_fact_validation_rejects_forged_input(change, monkeypatch, tmp_pat
         message = "invalid dense stage facts"
     elif change == "no_base":
         facts["dense_base_widths"] = [0, 0]
+        message = "invalid dense stage facts"
+    elif change == "no_checkpoint":
+        # Only a checkpointed decoder has dense widths.
+        facts["checkpoint_layers"] = 0
         message = "invalid dense stage facts"
     else:
         # Dense widths on a report whose recorded topology is not CP2.
