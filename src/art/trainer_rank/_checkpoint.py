@@ -959,8 +959,8 @@ def _local_state(
 def _admit_snapshot(trainer: TrainerRank, name: str) -> None:
     """Estimate registered copies without executing user serialization hooks.
 
-    Unregistered allocations, payload-expanding hooks and concurrent external
-    allocations are outside this estimate.
+    Unregistered allocations, unusually large serialization metadata,
+    payload-expanding hooks and concurrent allocations are outside this estimate.
     """
     from ._impl import _custom_named_parameters
 
@@ -973,20 +973,24 @@ def _admit_snapshot(trainer: TrainerRank, name: str) -> None:
     tensors: list[torch.Tensor] = [
         param for param in slot.params if id(param) not in custom_params
     ]
+    buffers: list[torch.Tensor] = []
     for custom in slot.custom.values():
         if custom.kind == "module":
             for _, child in cast(torch.nn.Module, custom.value).named_modules(
                 remove_duplicate=False
             ):
                 tensors.extend(p for p in child._parameters.values() if p is not None)
-                tensors.extend(
+                buffers.extend(
                     value
                     for key, value in child._buffers.items()
                     if value is not None
                     and key not in child._non_persistent_buffers_set
                 )
         else:
-            tensors.append(cast(torch.Tensor, custom.value))
+            (buffers if custom.kind == "buffer" else tensors).append(
+                cast(torch.Tensor, custom.value)
+            )
+    tensors.extend(buffers)
     cached = slot.custom_payload
     if cached is not None:
         tensors.extend(cached.tensors.values())
@@ -1016,6 +1020,12 @@ def _admit_snapshot(trainer: TrainerRank, name: str) -> None:
         with spill.lock:
             workspace = max(spill.workspace.values(), default=0)
     required = max(2 * size + workspace, 3 * size)
+    if buffers and _distributed():
+        # Buffer sync clones logical contents before pickling: no backing views.
+        # Allow one page per tensor for ordinary pickle metadata, the padded
+        # all-gather output, input, and cloning/serialization/deserialization copies.
+        sync = sum(value.numel() * value.element_size() + 4096 for value in buffers)
+        required = max(required, (dist.get_world_size() + 6) * sync + workspace)
     available = trainer._available_cpu_memory_bytes()
     if required > available:
         raise RuntimeError(

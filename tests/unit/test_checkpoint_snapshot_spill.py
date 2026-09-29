@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
+import pickle
 import sys
 import threading
 from types import SimpleNamespace
@@ -554,3 +555,33 @@ def test_module_snapshot_admission_reads_metadata_without_hooks(monkeypatch):
     assert not hooks
     cp._custom_snapshot(trainer, "a", {})
     assert hooks == [True]
+
+
+@pytest.mark.parametrize("world", (2, 8))
+@pytest.mark.parametrize("kind", ("buffer", "module"))
+def test_snapshot_admission_counts_buffer_gather(monkeypatch, world, kind):
+    from art.trainer_rank._heads import _plain
+
+    trainer = _snapshot_trainer(monkeypatch)
+    buffer = torch.ones(64)[1:3]
+    value: torch.Tensor | torch.nn.Module = buffer
+    if kind == "module":
+        value = torch.nn.Module()
+        value.register_buffer("saved", buffer)
+        value.register_buffer("scratch", torch.ones(64), persistent=False)
+    trainer._checkpoint_slots["a"].custom["b"] = _CustomObject(kind, value, object())
+    payload = _plain(buffer).cpu()
+    assert payload.untyped_storage().nbytes() == 8  # Not the 256-byte backing view.
+    assert 8 < len(pickle.dumps({("a", "b"): (0, {"saved": payload})})) <= 4104
+    trainer._checkpoint_snapshot_spill = SimpleNamespace(
+        lock=threading.Lock(), workspace={Future(): 512}
+    )
+    monkeypatch.setattr(cp, "_distributed", lambda: True)
+    monkeypatch.setattr(cp.dist, "get_world_size", lambda: world)
+    # Padded gather plus cloning/serialization/deserialization and an old writer.
+    available = (world + 6) * 4104 + 512 - 1
+    monkeypatch.setattr(trainer, "_available_cpu_memory_bytes", lambda: available)
+    with pytest.raises(RuntimeError, match="checkpoint.*host memory"):
+        cp._admit_snapshot(trainer, "a")
+    available += 1
+    cp._admit_snapshot(trainer, "a")
