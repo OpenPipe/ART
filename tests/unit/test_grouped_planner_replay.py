@@ -354,7 +354,41 @@ def test_named_slot_coverage_needs_its_gradient_coefficient(layer, tmp_path):
     uncovered = reports.replay(report)["estimates"][0]["required_bytes"]
     assert uncovered > 0
     group["moe_covered"] = True
-    with pytest.raises(ValueError, match="invalid MoE recompute coverage"):
+    with pytest.raises(ValueError, match="MoE coverage without a checkpoint"):
+        reports.replay(report)
+    # Relabelled unnamed, its terms must be the constructor's.
+    group["adapter"] = None
+    with pytest.raises(ValueError, match="invalid MoE terms"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("covered", [True, False])
+def test_unnamed_gradient_terms_are_the_constructor_coefficient(covered, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    group = facts["groups"][0]
+    assert group["adapter"] is None and group["moe_covered"]
+    assert group["gradient"][0] == facts["checkpoint_moe_bytes_per_token"] > 0
+    group["moe_covered"] = covered
+    group["gradient"] = [0, [], 0]
+    with pytest.raises(ValueError, match="invalid MoE terms"):
+        reports.replay(report)
+
+
+def test_moe_facts_need_the_recorded_tp1(tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    memory = report["replay"]["memory_replay"]
+    assert memory["estimates"][0]["runtime_facts"]["checkpoint_moe_bytes_per_token"]
+    memory["rank"]["topology"][1] = 2
+    with pytest.raises(ValueError, match="MoE facts disagree with the recorded"):
         reports.replay(report)
 
 

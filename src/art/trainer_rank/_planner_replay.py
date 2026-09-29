@@ -509,14 +509,17 @@ def validate(facts: Any) -> None:
             integer(terms[2])
             if terms[2] > terms[0]:
                 raise ValueError("invalid MoE terms")
-        # A named slot (only gradient groups record its adapter) is covered
-        # live only with its own checkpoint coefficient.
+        # Only gradient groups record a named slot's adapter. Live freezes an
+        # unnamed one's gradient terms from the constructor coefficient, and
+        # covers a group only with its own positive coefficient.
         if (
-            group["moe_covered"]
-            and group["adapter"] is not None
-            and not group["gradient"][0]
+            group["grad"]
+            and group["adapter"] is None
+            and group["gradient"][0] != facts["checkpoint_moe_bytes_per_token"]
         ):
-            raise ValueError("invalid MoE recompute coverage")
+            raise ValueError("invalid MoE terms")
+        if group["moe_covered"] and not group["gradient"][0]:
+            raise ValueError("MoE coverage without a checkpoint coefficient")
         layout = group["layout"]
         if layout is not None:
             fields(layout, {"attention_rows", "gdn_rows", "attention_retained"})
@@ -872,6 +875,12 @@ class ReplayRank(_impl.TrainerRank):
         # Live dense widths exist only at TP1/CP2/PP1 (_dense_mlp_widths).
         if any(facts["dense_base_widths"]) and self._topology_key()[1:] != (1, 2, 1):
             raise ValueError("dense stage facts disagree with the recorded topology")
+        # Live MoE coefficients are all 0 above TP1 (_moe_output_bytes_per_token).
+        if self._topology_key()[1] != 1 and (
+            facts["checkpoint_moe_bytes_per_token"]
+            or any(group[key][0] for group in groups for key in ("forward", "gradient"))
+        ):
+            raise ValueError("MoE facts disagree with the recorded topology")
         layouts = None
         if groups[0]["layout"] is not None:
             # Live layout pricing is CP2 at TP1/PP1 only (_layout_pricing_supported).
