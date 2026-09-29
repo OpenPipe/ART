@@ -267,9 +267,9 @@ def test_subclass_copy_observes_prior_gradient_cleanup():
     first.grad = torch.ones_like(first)
 
     class CheckingTensor(torch.Tensor):
-        def copy_(self, source):
+        def copy_(self, other, non_blocking=False):
             assert first.grad is None
-            return super().copy_(source)
+            return super().copy_(other, non_blocking=non_blocking)
 
     second = torch.zeros(2).as_subclass(CheckingTensor)
     second.grad = torch.ones(2)
