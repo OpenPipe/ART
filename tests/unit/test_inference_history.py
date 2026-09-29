@@ -494,7 +494,7 @@ def test_unrenderable_tool_observation_preserves_response(
     serving, monkeypatch, stream, incomplete
 ):
     server, modules = serving
-    calls = [
+    calls: list[dict] = [
         {
             "index": index,
             "id": f"call_{index}",
