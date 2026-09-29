@@ -265,3 +265,77 @@ def test_custom_tensor_conversion_can_append_history(monkeypatch):
     monkeypatch.setattr(torch, "stack", lambda values: Converted())
     masks = tensors.first_occurrence_masks(rows, where=tr.TokenFlag.SAMPLED)
     assert [mask.tolist() for mask in masks] == [[True], [False]]
+
+
+@pytest.mark.parametrize("where", [None, tr.TokenFlag.SAMPLED])
+@pytest.mark.parametrize("initial_flags", [[0, 2], [2, 2]])
+def test_late_tensor_device_callback_preserves_prior_claims(where, initial_flags):
+    rows = []
+    armed = False
+
+    class DeviceTensor(torch.Tensor):
+        @property
+        def device(self):
+            if armed and len(rows) == 1:
+                rows.append(rows[0])
+                rows[0].flags[:] = 2
+            return super().device
+
+    value = tensors.TensorizedHistory.model_construct(
+        history=tr.LegacyHistory(messages_and_choices=[]),
+        model="policy",
+        tokens=torch.tensor([7, 7]).as_subclass(DeviceTensor),
+        flags=torch.tensor(initial_flags),
+        logprobs=torch.zeros(2),
+    )
+    rows.append(value)
+    armed = True
+    masks = tensors.first_occurrence_masks(rows, where=where)
+    assert [mask.tolist() for mask in masks] == (
+        [[True, True], [False, False]]
+        if where is None
+        else [
+            [bool(v & 2) for v in initial_flags],
+            [not bool(v & 2) for v in initial_flags],
+        ]
+    )
+    assert rows[0] is rows[1]
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("change_tokens", [False, True])
+def test_output_callback_cannot_rewrite_deferred_prefix_or_claims(
+    monkeypatch, change_tokens
+):
+    value = history([7, 7], [3, 3]).tensorize()
+    rows = [value]
+    converted_tokens, converted_flags = [7, 7], [3, 3]
+    original_tensor = torch.tensor
+
+    class Converted:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def tolist(self):
+            return [converted_tokens, converted_flags]
+
+    def tensor(data, **kwargs):
+        if len(rows) == 1:
+            rows.append(value)
+            if change_tokens:
+                converted_tokens[:] = [8, 8]
+            converted_flags[:] = [0, 0]
+            data[:] = [False, False]
+        return original_tensor(data, **kwargs)
+
+    monkeypatch.setattr(torch, "stack", lambda values: Converted())
+    monkeypatch.setattr(torch, "tensor", tensor)
+    masks = tensors.first_occurrence_masks(rows)
+    # Constructor mutation changes its own output, but not the first prefix claims.
+    assert [mask.tolist() for mask in masks] == [
+        [False, False],
+        [change_tokens, change_tokens],
+    ]

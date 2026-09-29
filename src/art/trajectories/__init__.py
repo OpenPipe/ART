@@ -1821,7 +1821,7 @@ def first_occurrence_masks(
     if all(isinstance(history, TokenizedHistory) for history in values):
         trie = _FirstOccurrenceTrie()
         if len(values) == 1 and type(values[0]) is TokenizedHistory:
-            history = cast(TokenizedHistory, values[0])
+            history = values[0]
             model, tokens, flags = history.model, history.tokens, history.flags
             # Preserve the ordinary key protocol for customized model values.
             return [

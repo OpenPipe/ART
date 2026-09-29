@@ -241,13 +241,19 @@ def first_occurrence_masks(
 
     trie = _FirstOccurrenceTrie()
     result: list[torch.Tensor] = []
+    pending = None
     for history in histories:
+        if pending is not None:
+            # Output callbacks can append another history after the fast mask.
+            trie.mask(*pending, where=cast(TokenFlag, 1))
+            pending = None
         tokens, flags = (
             torch.stack((history.tokens, history.flags)).detach().cpu().tolist()
         )
         if (
             type(histories) is list
             and len(histories) == 1
+            and not result
             and type(history) is TensorizedHistory
             and (where is None or type(where) is TokenFlag)
         ):
@@ -262,11 +268,12 @@ def first_occurrence_masks(
                     for value in values
                 )
             )
-            mask = (
-                _single_history_mask(tokens, flags, where=where)
-                if type(model) is str and len(histories) == 1 and plain
-                else trie.mask(model, tokens, flags, where=where)
-            )
+            if type(model) is str and len(histories) == 1 and plain:
+                mask = _single_history_mask(tokens, flags, where=where)
+                # Save passive values and the actual claims before output callbacks.
+                pending = (model, tuple(tokens), tuple(mask))
+            else:
+                mask = trie.mask(model, tokens, flags, where=where)
         else:
             mask = trie.mask(history.model, tokens, flags, where=where)
         result.append(
