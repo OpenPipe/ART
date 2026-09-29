@@ -17,6 +17,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
+import json
 import logging
 import math
 import os
@@ -124,6 +125,34 @@ _MEMORY_PROFILE_TRUST_GROWTH = 8
 _MEMORY_SAFETY_FACTOR = 1.10
 _MEMORY_RESERVE_FRACTION = 0.03
 _HEAD_CHUNK_TOKENS = 512
+# An unprofiled full-recompute gradient wave's first execution keeps two fixed
+# 32 MiB transients live at its peak (Qwen3.6-35B-A3B CP2: the RoPE frequencies
+# and a frozen linear's output, at 2k to 20k tokens); warm waves do not.
+_COLD_RECOMPUTE_TRANSIENT_BYTES = 64 * 2**20
+
+# Per local row, index state the backward keeps beside the RoPE embedding and
+# hidden-width tensors: int64 positions and row maps, CP block masks and GDN
+# exchange plans. Qwen3.6-35B-A3B CP2 traces at the head's backward peak:
+# 106-181 bytes per row at 3.5k-8.7k rows.
+_BACKWARD_ROW_STATE_BYTES = 256
+
+# A head chunk below the fused statistics' row minimum takes the FP32 fallback
+# (_vocab_parallel_log_z): the BF16 logits, their FP32 copy, the shifted copy
+# and its saved exponent in the recompute, then the exponent's gradient, its
+# BF16 cast and the target gather's gradient in backward. At most this many
+# BF16 logits-sized buffers of that chunk (about 18 bytes per logit); derived
+# from the code, not traced.
+_HEAD_FALLBACK_BUFFERS = 9
+
+# Which fused head statistics kernels have run in this process, and whether any
+# call fell back to FP32 after an error: staging trusts only a proven path.
+_TRITON_STATS_STATE: dict[str, Any] = {"succeeded": set(), "failed": False}
+
+# Set while a gradient group of a plan priced with a staged head projects it;
+# per thread, and captured into each chunk's checkpoint for its recompute.
+_HEAD_STATISTICS_STRICT: ContextVar[bool] = ContextVar(
+    "trainer_rank_head_statistics_strict", default=False
+)
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -1060,6 +1089,13 @@ class _SubforwardCost:
     # HybridEP buffer growth before the safety factor. It is in required, not
     # retained, and persists across a split, which charges the largest once.
     hybridep_growth: int = 0
+    # Adapter gradients the recompute backward holds beyond the boundaries it
+    # has released (``_checkpoint_adapter_gradient_bytes``), before the safety
+    # factor. Split children training the same slots share them, so a split
+    # charges the largest once; ``..._slots`` names those slots (sorted JSON
+    # of kind/name pairs, "" when none), keeping the cost JSON-serializable.
+    checkpoint_adapter_gradient: int = 0
+    checkpoint_adapter_gradient_slots: str = ""
 
     @property
     def ephemeral(self) -> int:
@@ -1541,8 +1577,30 @@ def _expert_lora_weight_storage(
     return (transposes if a.shape[2] < 8 else 0, transposes, effective)
 
 
-# Routed rows per rank at EP>1, relative to balanced routing (see below).
-_EP_ROUTED_ROW_ALLOWANCE = 1.5
+# Routed rows on the most loaded rank at EP>1, relative to its balanced share.
+# Expert-shard load is uneven per layer, from the router's expert preferences,
+# and larger batches do not average it away. Qwen3.6-35B-A3B on 3.5M tokens of
+# retail agent trajectories, worst layer in 200k-token batches at EP2 / EP4 /
+# EP8: pretrained up to 1.22 / 1.40 / 1.62, a trained policy up to 1.24 / 1.41 /
+# 1.61; a small rollout sample reached 1.95 at EP8. One production EP2 run was
+# inferred at 1.35. These samples bound what was measured, not all routing.
+# Unmeasured EP sizes use the next measured one; above EP8 the allowance grows
+# with log2(EP) up to EP itself (every pair on one rank).
+_EP_ROUTED_ROW_ALLOWANCE = {2: 1.4, 4: 1.6, 8: 2.0}
+
+
+def _ep_routed_row_allowance(ep: int) -> float:
+    if ep <= 1:
+        return 1.0
+    for size, allowance in sorted(_EP_ROUTED_ROW_ALLOWANCE.items()):
+        if ep <= size:
+            return allowance
+    return min(float(ep), 2.0 + 0.4 * math.log2(ep / 8))
+
+
+# Transformer Engine's Hopper cuBLAS workspaces: one per grouped-GEMM stream
+# (four) plus the plain GEMM's, each 32 MiB + 1 KiB.
+_TE_CUBLAS_WORKSPACE_BYTES = 5 * (32 * 2**20 + 1024)
 
 
 def _moe_dispatcher_supported(
@@ -1556,6 +1614,29 @@ def _moe_dispatcher_supported(
         and type(getattr(dispatcher, "_comm_manager", None)) is hybridep
         and getattr(dispatcher, "ep_size", None) == ep
         and getattr(dispatcher, "tp_size", None) == 1
+    )
+
+
+def _ep_group_is_cp_group(shape: ParallelShape) -> bool:
+    """Whether this rank's expert-parallel group is exactly its CP group.
+
+    HybridEP then dispatches that CP group's rows across it: at balanced
+    routing each rank receives the group's rows over EP, however CP split them.
+    """
+    if shape.ep <= 1 or shape.ep != shape.cp or (shape.tp, shape.etp) != (1, 1):
+        return False
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    try:
+        from megatron.core import parallel_state as ps
+    except ModuleNotFoundError:
+        return False
+    expert = ps.get_expert_model_parallel_group(check_initialized=False)
+    context = ps.get_context_parallel_group(check_initialized=False)
+    if expert is None or context is None:
+        return False
+    return sorted(dist.get_process_group_ranks(expert)) == sorted(
+        dist.get_process_group_ranks(context)
     )
 
 
@@ -1590,8 +1671,15 @@ def _moe_output_bytes_per_token(
     checkpoint_grad: bool = False,
     converted_stages: list[tuple[int, int]] | None = None,
     slot_ref: "LoRASlotRef | None" = None,
+    shared_bytes: list[int] | None = None,
+    enclosed: list[bool] | None = None,
 ) -> int:
-    """Known routed-expert working set, not a complete model/compiled bound."""
+    """Known routed-expert working set, not a complete model/compiled bound.
+
+    ``shared_bytes`` collects each layer's shared-expert part of the per-token
+    coefficient and stages; that part follows local rows, not routed rows.
+    ``enclosed`` records, per MoE layer, whether its FC1 stage is priced too.
+    """
     # CP shards rows, not the per-token working set. At EP>1 only ART's
     # HybridEP flex dispatcher is modeled; TP and ETP are not.
     if (shape.tp, shape.etp) != (1, 1):
@@ -1612,9 +1700,12 @@ def _moe_output_bytes_per_token(
     from art.megatron.lora import LoRA, MLPExpertsLinearFC1LoRA, MLPExpertsLinearFC2LoRA
 
     # HybridEP hands each rank the pairs routed to its local experts, already
-    # permuted. Balanced routing gives local tokens x top-k, as at EP1; a
-    # pretrained CP2/EP2 run put about 1.35x that on one rank.
-    routed_allowance = _EP_ROUTED_ROW_ALLOWANCE if shape.ep > 1 else 1
+    # permuted. Balanced routing gives local tokens x top-k, as at EP1.
+    routed_allowance = _ep_routed_row_allowance(shape.ep)
+    # Routed H-wide inputs held at the expert stage. The EP1 all-to-all path
+    # keeps its permuted rows and their expert-sorted copy; HybridEP permutes
+    # while it dispatches and returns one tensor.
+    dispatched = 1 if shape.ep > 1 else 2
     coefficient = 0
     for chunk in model:
         for layer in chunk.modules():
@@ -1708,8 +1799,6 @@ def _moe_output_bytes_per_token(
                     and fc1.fused_gate_up
                     and not fc1.non_gated
                     and fc1.out_features == 2 * inputs.shape[-2]
-                    # HybridEP keeps one dispatched H-wide input where the
-                    # EP1 all-to-all keeps two; charging two is conservative.
                     and getattr(dispatcher, "ep_size", None) == shape.ep
                     and getattr(dispatcher, "tp_size", None) == 1
                     and getattr(dispatcher, "num_local_experts", 0) > 1
@@ -1718,10 +1807,10 @@ def _moe_output_bytes_per_token(
                     and getattr(experts, "offload_moe_act", None) is False
                     and getattr(experts, "activation_recompute", None) is False
                 ):
-                    # The two dispatched H-wide inputs and FC1 gate/up sum
-                    # remain live at the FC2 sum, including in the observed
-                    # compiled path. This is one stage, not a backward bound.
-                    features += 2 * fc2.out_features + fc1.out_features
+                    # The dispatched H-wide inputs and FC1 gate/up sum remain
+                    # live at the FC2 sum, including in the observed compiled
+                    # path. This is one stage, not a backward bound.
+                    features += dispatched * fc2.out_features + fc1.out_features
                     enclosing_fc1 = fc1
             shared = _shared_expert_output_bytes_per_token(layer)
             if (
@@ -1733,10 +1822,15 @@ def _moe_output_bytes_per_token(
                 # Gate-score backward saves a distinct pre-gate X. Charge it
                 # beside this layer's returned X, not another layer's maximum.
                 shared += shared
-            routed_rows = math.ceil(config.moe_router_topk * routed_allowance)
-            row_bytes = routed_rows * features * weights.element_size() + shared
+            if shared_bytes is not None:
+                shared_bytes.append(shared)
+            routed_rows = config.moe_router_topk * routed_allowance
+            row_bytes = (
+                math.ceil(routed_rows * features * weights.element_size()) + shared
+            )
             coefficient = max(coefficient, row_bytes)
             storage = _expert_lora_weight_storage(lora, slot_ref)
+            fc1_stages = False
             if converted_stages is not None and storage is not None:
                 padded, transposes, effective = storage
                 saved_fc1, rank_fc1 = 0, 0
@@ -1765,13 +1859,14 @@ def _moe_output_bytes_per_token(
                         and first_tensors[1].shape[2] == enclosing_fc1.out_features
                     ):
                         first_padding, first_transposes, first_rank = first
-                        # FC1 retains both routed H inputs and its base O1
+                        fc1_stages = True
+                        # FC1 retains the routed H inputs and its base O1
                         # while producing adapter O1. Its sum is not live yet.
                         converted_stages.append(
                             (
                                 routed_size
                                 * (
-                                    2 * fc2.out_features
+                                    dispatched * fc2.out_features
                                     + 2 * enclosing_fc1.out_features
                                     + first_rank
                                 )
@@ -1785,7 +1880,7 @@ def _moe_output_bytes_per_token(
                             (
                                 routed_size
                                 * (
-                                    2 * fc2.out_features
+                                    dispatched * fc2.out_features
                                     + 3 * enclosing_fc1.out_features
                                     + (first_rank if checkpoint_grad else 0)
                                 )
@@ -1839,6 +1934,23 @@ def _moe_output_bytes_per_token(
                                 + 2 * (experts_count + 1) * 4,
                             )
                         )
+            if enclosed is not None:
+                # FC1 is covered when priced beside FC2 and its converted
+                # stages are priced too, unless it has no adapter or the
+                # selected slot has no FC1 tensors to convert.
+                adapter = getattr(enclosing_fc1, "lora", None)
+                inactive = adapter is None or (
+                    slot_ref is not None
+                    and type(adapter) is LoRA
+                    and "_slot" not in vars(adapter)
+                    and _slot_lora_tensors(adapter, slot_ref) is None
+                )
+                enclosed.append(enclosing_fc1 is not None and (fc1_stages or inactive))
+    if converted_stages is not None:
+        # The EP allowance gives fractional routed rows; round each stage up.
+        converted_stages[:] = [
+            (math.ceil(per_row), fixed) for per_row, fixed in converted_stages
+        ]
     return coefficient
 
 
@@ -1964,9 +2076,15 @@ class TrainerRank:
         )
         forward_stages: list[tuple[int, int]] = []
         gradient_stages: list[tuple[int, int]] = []
+        forward_shared: list[int] = []
+        gradient_shared: list[int] = []
+        gradient_enclosed: list[bool] = []
         self._moe_output_bytes_per_token = (
             _moe_output_bytes_per_token(
-                runtime.model, self._parallel_shape, converted_stages=forward_stages
+                runtime.model,
+                self._parallel_shape,
+                converted_stages=forward_stages,
+                shared_bytes=forward_shared,
             )
             if self._moe_layers
             else 0
@@ -1980,6 +2098,8 @@ class TrainerRank:
                 self._parallel_shape,
                 checkpoint_grad=True,
                 converted_stages=gradient_stages,
+                shared_bytes=gradient_shared,
+                enclosed=gradient_enclosed,
             )
             if self._moe_layers
             else 0
@@ -1991,6 +2111,26 @@ class TrainerRank:
         self._moe_gradient_stages = (
             tuple(gradient_stages) if self._moe_checkpoint_grad_bytes_per_token else ()
         )
+        self._moe_forward_shared_bytes = (
+            max(forward_shared, default=0) if self._moe_output_bytes_per_token else 0
+        )
+        self._moe_gradient_shared_bytes = (
+            max(gradient_shared, default=0)
+            if self._moe_checkpoint_grad_bytes_per_token
+            else 0
+        )
+        # Recompute is covered only if every decoder layer is a priced MoE
+        # layer whose FC1 stage is enclosed; otherwise dense MLP or FC1 work
+        # the floor does not price keeps the per-boundary gradient allowance.
+        self._moe_gradient_enclosed = (
+            tuple(gradient_enclosed)
+            if self._moe_checkpoint_grad_bytes_per_token
+            else ()
+        )
+        self._moe_recompute_covered = len(
+            self._moe_gradient_enclosed
+        ) == self._num_layers and all(self._moe_gradient_enclosed)
+        self._ep_group_is_cp_group = _ep_group_is_cp_group(self._parallel_shape)
         selection = select_scoring(
             device_capability=capability,
             device_memory_bytes=device_memory,
@@ -2900,14 +3040,16 @@ class TrainerRank:
         logical_tokens: int,
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
+        group_routed_rows: tuple[int, ...] | None = None,
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
+        head_backward_traced: bool = False,
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
     ) -> _SubforwardCost:
         checkpoint_memory = self._checkpoint_memory_floor(
-            group_rows, slot_refs, gdn_segments
+            group_rows, slot_refs, gdn_segments, routed_rows=group_routed_rows
         )
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
@@ -2916,6 +3058,7 @@ class TrainerRank:
             logical_tokens=logical_tokens,
             gdn_segments=gdn_segments,
             group_rows=group_rows,
+            group_routed_rows=group_routed_rows,
             slot_refs=slot_refs,
             head_workspace_bytes=head_workspace_bytes,
             checkpoint_floor=checkpoint_floor,
@@ -2935,25 +3078,45 @@ class TrainerRank:
                 checkpoint_floor[0],
             ),
         )
-        # One logical BF16 input gradient per eligible full/uniform/1 boundary.
-        # This partial peak allowance is not evidence of simultaneous distinct
-        # backing stores, nor a bound for compiler saves or other backward work.
-        # Keep it out of forward retention, including the cold fallback above.
-        gradient = checkpoint_retained
+        # Input gradients live at the recomputed layer's peak; kept out of
+        # forward retention, including the cold fallback above.
+        gradient = self._checkpoint_input_gradient_bytes(
+            group_rows, slot_refs, retained=checkpoint_retained
+        )
+        gradient_slots = self._gradient_slots(group_rows, slot_refs)
+        adapter_gradient = (
+            self._checkpoint_adapter_gradient_bytes(
+                self._checkpoint_gradient_groups(group_rows, slot_refs)
+            )
+            if gradient
+            else 0
+        )
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
-        checkpoint_workspace = max(
-            checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
-        )
+        decoder_workspace = max(checkpoint_workspace, checkpoint_floor[1])
+        checkpoint_workspace = max(decoder_workspace, head_workspace_bytes)
         forward_required = required
         if gradient:
+            head_stage = self._checkpoint_head_stage_bytes(
+                head_workspace_bytes, gradient, group_rows, slot_refs
+            )
+            peak = checkpoint_workspace + adapter_gradient
+            if head_stage is not None:
+                # A split adds its children's adapter gradients to the largest
+                # workspace, and one child's head can follow another's decoder
+                # backward: keep the whole head stage there.
+                checkpoint_workspace = max(decoder_workspace, head_stage)
+                # An untraced head's buffers can exceed head_workspace_bytes:
+                # it keeps the unstaged price as a floor.
+                staged = max(decoder_workspace + adapter_gradient, head_stage)
+                peak = staged if head_backward_traced else max(peak, staged)
+            if self._memory_profiles.get(signature) is None:
+                checkpoint_workspace += _COLD_RECOMPUTE_TRANSIENT_BYTES
+                peak += _COLD_RECOMPUTE_TRANSIENT_BYTES
             required = max(
                 required,
-                int(
-                    (checkpoint_retained + checkpoint_workspace + gradient)
-                    * _MEMORY_SAFETY_FACTOR
-                ),
+                int((checkpoint_retained + gradient + peak) * _MEMORY_SAFETY_FACTOR),
             )
         # HybridEP buffer growth stays allocated through the forward and
         # backward peaks, but is not forward retention.
@@ -2965,6 +3128,22 @@ class TrainerRank:
             checkpoint_input_gradient=gradient,
             checkpoint_peak_increment=required - forward_required,
             hybridep_growth=hybridep_growth_bytes,
+            checkpoint_adapter_gradient=adapter_gradient,
+            checkpoint_adapter_gradient_slots=json.dumps(
+                [
+                    [ref.kind, ref.name]
+                    for ref in sorted(
+                        gradient_slots,
+                        key=lambda ref: (
+                            ref.kind,
+                            ref.name is not None,
+                            ref.name or "",
+                        ),
+                    )
+                ]
+            )
+            if adapter_gradient
+            else "",
         )
 
     def last_forward_telemetry(self) -> dict[str, Any]:
@@ -3378,6 +3557,8 @@ class TrainerRank:
         }
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
+        # A head priced as staged must not silently widen (_head_backward_traced).
+        staged = bool(getattr(plan, "_head_staged", False))
         outputs = [
             ForwardOutput(None, None, None, None, checkpoint, no_grad)
             for checkpoint, no_grad in plan.output_metadata
@@ -3399,7 +3580,13 @@ class TrainerRank:
                 with torch.set_grad_enabled(group.grad_enabled):
                     with use_lora_slot(group.slot_ref):
                         prepared = self._prepare_packed_forward(group.packed)
-                        item_outputs = self._forward_packed(group.items, prepared)
+                        strict = _HEAD_STATISTICS_STRICT.set(
+                            staged and group.grad_enabled
+                        )
+                        try:
+                            item_outputs = self._forward_packed(group.items, prepared)
+                        finally:
+                            _HEAD_STATISTICS_STRICT.reset(strict)
                     item_outputs = [
                         replace(
                             output,
@@ -4243,6 +4430,7 @@ class TrainerRank:
         from torch.utils.checkpoint import checkpoint
 
         model = _language_model(self.runtime.model[0])
+        strict_statistics = _HEAD_STATISTICS_STRICT.get()
         max_top_k = max((int(item.request.top_k or 0) for item in items), default=0)
         need_log_z = any(
             item.labels is not None or item.request.top_k is not None for item in items
@@ -4260,6 +4448,8 @@ class TrainerRank:
                 output_weight=output_weight,
                 need_log_z=need_log_z,
                 max_top_k=max_top_k,
+                # Captured now: the backward recompute keeps this plan's mode.
+                strict_statistics=strict_statistics,
                 use_reentrant=False,
             )
             logit_start, logit_end = logit_bounds[chunk_index : chunk_index + 2]
@@ -4340,6 +4530,7 @@ class TrainerRank:
         output_weight: torch.Tensor | None,
         need_log_z: bool,
         max_top_k: int,
+        strict_statistics: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -4353,11 +4544,17 @@ class TrainerRank:
         log_z: torch.Tensor | None = None
         local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
         if need_log_z:
-            topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
+            topk_stats = _try_triton_local_topk_stats(
+                local_logits, k=max_top_k, strict=strict_statistics
+            )
             logsumexp_stats = (
                 cast(
                     tuple[torch.Tensor, torch.Tensor] | None,
-                    _try_triton_stats("local_logsumexp_stats", local_logits),
+                    _try_triton_stats(
+                        "local_logsumexp_stats",
+                        local_logits,
+                        strict=strict_statistics,
+                    ),
                 )
                 if topk_stats is None
                 else None
@@ -4698,12 +4895,66 @@ class TrainerRank:
     _record_split_memory_floor = _memory._record_split_memory_floor
     _split_plan_memory_check = _memory._split_plan_memory_check
     _head_workspace_bytes = _memory._head_workspace_bytes
+
+    def _cp_group_model_tokens(
+        self,
+        batch: PrefixTreePack,
+        *,
+        topology: "ParallelTopology",
+    ) -> int:
+        """The CP group's model rows in its larger physical layout."""
+        from art.megatron.context_parallel.runtime import (
+            context_parallel_model_token_total,
+        )
+        from art.megatron.training.microbatches import (
+            _context_parallel_config_for_provider,
+            _gdn_planner_config_for_provider,
+        )
+
+        handler = self.runtime.model_support_handler
+        return context_parallel_model_token_total(
+            group_ids=batch.group_ids,
+            parent_ids=batch.parent_ids,
+            topology=topology,
+            config=_context_parallel_config_for_provider(
+                self.runtime.provider,
+                self.device,
+                handler,
+            ),
+            original_seq_len=int(batch.tokens.shape[1]),
+            build_gdn_execution_spec=handler.build_gdn_execution_spec,
+            gdn_planner_config=_gdn_planner_config_for_provider(
+                self.runtime.provider, handler
+            ),
+        )
+
     _group_head_workspace_bytes = _memory._group_head_workspace_bytes
+    _triton_min_rows = _memory._triton_min_rows
+    _head_backward_traced = _memory._head_backward_traced
+    _te_workspace_growth_bytes = _memory._te_workspace_growth_bytes
+    _moe_checkpoint_state_bytes_per_token = (
+        _memory._moe_checkpoint_state_bytes_per_token
+    )
+    _moe_recompute_covered_for = _memory._moe_recompute_covered_for
+    _checkpoint_input_gradient_bytes = _memory._checkpoint_input_gradient_bytes
+    _checkpoint_gradient_covered = _memory._checkpoint_gradient_covered
+    _checkpoint_head_stage_bytes = _memory._checkpoint_head_stage_bytes
+    _backward_row_state_bytes = _memory._backward_row_state_bytes
+    _mixer_activation_widths = _memory._mixer_activation_widths
+    _recomputed_mixer_bytes_per_token = _memory._recomputed_mixer_bytes_per_token
+    _adapter_gradient_head = staticmethod(_memory._adapter_gradient_head)
+    _plan_head_backward_traced = _micro_batch_planner._plan_head_backward_traced
+    _plan_group_routed_rows = _micro_batch_planner._plan_group_routed_rows
     _plan_head_workspace_bytes = _memory._plan_head_workspace_bytes
     _plan_hybridep_growth_bytes = _memory._plan_hybridep_growth_bytes
     _checkpoint_moe_bytes_per_token = _memory._checkpoint_moe_bytes_per_token
     _moe_workspace_bytes = _memory._moe_workspace_bytes
     _checkpoint_memory_floor = _memory._checkpoint_memory_floor
+    _gradient_slots = staticmethod(_memory._gradient_slots)
+    _pending_adapter_gradient_bytes = _memory._pending_adapter_gradient_bytes
+    _checkpoint_gradient_groups = _memory._checkpoint_gradient_groups
+    _checkpoint_adapter_gradient_bytes = _memory._checkpoint_adapter_gradient_bytes
+    _adapter_gradient_walk = staticmethod(_memory._adapter_gradient_walk)
     _retained_memory_bytes = _memory._retained_memory_bytes
     _estimate_flat_forward = _memory._estimate_flat_forward
     _update_peak_memory_profile = _memory._update_peak_memory_profile
@@ -4844,6 +5095,18 @@ _PACKED_PRICED_LOGICAL_ROW_BYTES = 12 * 512
 # Shorter single-target requests keep the logical extrapolation, so each
 # packed-priced request brings at least 384 KiB for per-request constants.
 _PACKED_PRICED_MIN_REQUEST_TOKENS = 64
+
+
+def _traced_states(traced: Sequence[bool | None]) -> tuple[bool, ...]:
+    """Head stagings a plan's gradient groups allow (``_head_backward_traced``).
+
+    Staged only when every group is traced; both when any is undecided.
+    """
+    if not traced or any(state is False for state in traced):
+        return (False,)
+    if all(state is True for state in traced):
+        return (True,)
+    return (True, False)
 
 
 def _packed_priced(signature: "_MemorySignature", one_layer_recompute: bool) -> bool:
@@ -5380,6 +5643,7 @@ def _try_triton_local_topk_stats(
     local_logits: torch.Tensor,
     *,
     k: int,
+    strict: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     if k <= 0 or k > int(
         os.environ.get("ART_TRAINER_RANK_TRITON_FUSED_TOPK_MAX", "10")
@@ -5390,6 +5654,7 @@ def _try_triton_local_topk_stats(
         _try_triton_stats(
             "local_topk_stats",
             local_logits,
+            strict=strict,
             k=min(k, int(local_logits.shape[1])),
         ),
     )
@@ -5398,8 +5663,16 @@ def _try_triton_local_topk_stats(
 def _try_triton_stats(
     name: str,
     local_logits: torch.Tensor,
+    *,
+    strict: bool = False,
     **kwargs: object,
 ) -> object | None:
+    """The fused statistics, or None for the FP32 fallback.
+
+    ``strict``: a plan whose price relied on them raises instead of falling
+    back after an error (``_head_backward_traced``). Too few rows still fall
+    back: the head stage prices that (``_HEAD_FALLBACK_BUFFERS``).
+    """
     if not local_logits.is_cuda:
         return None
     if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() in {
@@ -5412,11 +5685,19 @@ def _try_triton_stats(
     try:
         from art.trainer_rank import topk
 
-        return getattr(topk, name)(local_logits, **kwargs)
-    except Exception:
+        result = getattr(topk, name)(local_logits, **kwargs)
+    except Exception as error:
+        _TRITON_STATS_STATE["failed"] = True
+        if strict:
+            raise RuntimeError(
+                "Fused head statistics failed in a plan admitted on their "
+                "memory; the FP32 fallback would exceed its price"
+            ) from error
         if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict":
             raise
         return None
+    _TRITON_STATS_STATE["succeeded"].add(name)
+    return result
 
 
 def _vocab_parallel_topk_from_local(

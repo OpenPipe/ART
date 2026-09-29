@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import MISSING, asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
 from itertools import islice
@@ -600,6 +600,18 @@ def replay(
         raise ValueError(
             "incomplete replay: immutable rank fields differ (including MoE stages)"
         )
+    layers = values["num_layers"]
+    if type(layers) is not int or not 0 < layers <= _planner_replay.MAX_LAYERS:
+        raise ValueError("incomplete replay: recorded layer count out of bounds")
+    # Recomputed-layer pricing reads these alongside the geometry below.
+    if any(
+        type(values[name]) is not int or not 0 <= values[name] < 2**63
+        for name in ("hidden_size", "param_dtype_size", "gdn_layers")
+    ) or any(
+        type(values[name]) is not bool
+        for name in ("sequence_parallel", "attention_output_gate")
+    ):
+        raise ValueError("incomplete replay: recorded rank dimensions are invalid")
     rank = _planner_replay.ReplayRank.__new__(_planner_replay.ReplayRank)
     for name in _RANK_FIELDS - {"one_layer_recompute"}:
         setattr(rank, "_" + name, values[name])
@@ -607,7 +619,19 @@ def replay(
         raise ValueError("incomplete replay: recompute mode is not recorded")
     rank._recorded_one_layer_recompute = values["one_layer_recompute"]
     rank._moe_forward_stages = tuple(tuple(row) for row in values["moe_forward_stages"])
-    rank._geometry = ModelGeometry(**values["geometry"])
+    # Recomputed-layer pricing multiplies these; accept only what live
+    # construction (ModelGeometry.from_config) records. Reports may omit
+    # fields that default to zero.
+    geometry = values["geometry"]
+    fields = ModelGeometry.__dataclass_fields__
+    required = {name for name, field in fields.items() if field.default is MISSING}
+    if (
+        type(geometry) is not dict
+        or not required <= set(geometry) <= set(fields)
+        or any(type(v) is not int or not 0 <= v < 2**63 for v in geometry.values())
+    ):
+        raise ValueError("incomplete replay: recorded model geometry is invalid")
+    rank._geometry = ModelGeometry(**geometry)
     dp, tp, cp, pp = values["topology"]
     rank._topology_key = lambda: (dp, tp, cp, pp)
     # Check the same shared subforward inventories as capture, including the

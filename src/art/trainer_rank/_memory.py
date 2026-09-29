@@ -13,7 +13,7 @@ also lets the circular import resolve lazily.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import nullcontext
 import hashlib
 import math
@@ -45,12 +45,32 @@ def _split_required_memory(costs: Sequence[_impl._SubforwardCost]) -> int:
     if any(cost.checkpoint_input_gradient for cost in costs):
         # The caller owns all returned graphs. A calibrated forward-retained
         # discount cannot replace the sum of their input-gradient extents.
+        # Children training the same slots share their adapter gradients,
+        # allocated once by whichever child's backward reaches a layer
+        # first; the largest child's extra covers any order. Different
+        # slots have disjoint gradients, charged per child.
+        adapter = [
+            cost.checkpoint_adapter_gradient
+            for cost in costs
+            if cost.checkpoint_adapter_gradient
+        ]
+        shared = (
+            len(
+                {
+                    cost.checkpoint_adapter_gradient_slots
+                    for cost in costs
+                    if cost.checkpoint_adapter_gradient
+                }
+            )
+            <= 1
+        )
         checkpoint = (
             sum(
                 cost.checkpoint_retained + cost.checkpoint_input_gradient
                 for cost in costs
             )
             + max(cost.checkpoint_workspace for cost in costs)
+            + ((max(adapter) if shared else sum(adapter)) if adapter else 0)
             + growth
         )
         required = max(required, int(checkpoint * _impl._MEMORY_SAFETY_FACTOR))
@@ -418,13 +438,14 @@ def _moe_workspace_terms(
     *,
     checkpoint_grad: bool = False,
     slot_ref: "LoRASlotRef | None" = None,
-) -> tuple[int, tuple[tuple[int, int], ...]]:
+) -> tuple[int, tuple[tuple[int, int], ...], int]:
     """Maximum of same-layer affine stages, not a retained multi-layer bank.
 
     The constructor cache covers original tensors. Explicit slots are
     repriced from their tensor metadata and original owners, including
     this rank's exact dispatcher wrapper. Ordinary non-checkpoint gradients
-    retain only forward-stage coverage.
+    retain only forward-stage coverage. The third term is the shared
+    expert's part of the coefficient, which stays on the local rows.
     """
     coefficient = (
         self._checkpoint_moe_bytes_per_token()
@@ -436,8 +457,16 @@ def _moe_workspace_terms(
         "_moe_gradient_stages" if checkpoint_grad else "_moe_forward_stages",
         (),
     )
+    shared = getattr(
+        self,
+        "_moe_gradient_shared_bytes"
+        if checkpoint_grad
+        else "_moe_forward_shared_bytes",
+        0,
+    )
     if slot_ref is not None and slot_ref.name is not None:
         selected: list[tuple[int, int]] = []
+        slot_shared: list[int] = []
         coefficient = (
             _impl._moe_output_bytes_per_token(
                 self.runtime.model,
@@ -445,11 +474,13 @@ def _moe_workspace_terms(
                 checkpoint_grad=checkpoint_grad,
                 converted_stages=selected,
                 slot_ref=slot_ref,
+                shared_bytes=slot_shared,
             )
             if self._moe_layers
             else 0
         )
         stages = tuple(selected) if coefficient else ()
+        shared = max(slot_shared, default=0) if coefficient else 0
     if type(stages) is not tuple or any(
         type(stage) is not tuple
         or len(stage) != 2
@@ -457,20 +488,27 @@ def _moe_workspace_terms(
         for stage in stages
     ):
         raise ValueError("Invalid constructor converted-weight stages")
-    return coefficient, stages
+    if type(shared) is not int or not 0 <= shared <= coefficient:
+        raise ValueError("Invalid constructor shared-expert coefficient")
+    return coefficient, stages, shared
 
 
 def _moe_workspace_from_terms(
-    rows: int, terms: tuple[int, tuple[tuple[int, int], ...]]
+    rows: int,
+    terms: tuple[int, tuple[tuple[int, int], ...], int],
+    routed_rows: int | None = None,
 ) -> int:
-    coefficient, stages = terms
-    return (
+    """``routed_rows`` is what this rank's experts receive at balanced routing
+    (``rows`` by default); the shared expert's part stays on the local rows."""
+    coefficient, stages, shared = terms
+    routed = rows if routed_rows is None else max(0, min(rows, routed_rows))
+    return (rows - routed) * shared + (
         max(
-            rows * coefficient,
-            *(rows * per_row + fixed for per_row, fixed in stages),
+            routed * coefficient,
+            *(routed * per_row + fixed for per_row, fixed in stages),
         )
         if stages and rows > 0
-        else rows * coefficient
+        else routed * coefficient
     )
 
 
@@ -478,12 +516,14 @@ def _moe_workspace_bytes(
     self: TrainerRank,
     rows: int,
     *,
+    routed_rows: int | None = None,
     checkpoint_grad: bool = False,
     slot_ref: "LoRASlotRef | None" = None,
 ) -> int:
     return _moe_workspace_from_terms(
         rows,
         _moe_workspace_terms(self, checkpoint_grad=checkpoint_grad, slot_ref=slot_ref),
+        routed_rows,
     )
 
 
@@ -567,26 +607,41 @@ def _checkpoint_memory_floor(
     group_rows: tuple[tuple[int, bool], ...],
     slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
     gdn_segments: int = 0,
+    routed_rows: tuple[int, ...] | None = None,
 ) -> tuple[int, int]:
+    """Conservative saved-boundary charge and one recomputed layer's workspace.
+
+    ``routed_rows`` are each group's balanced dispatched rows per rank
+    (``_plan_group_routed_rows``); by default, its local rows. Eligibility is
+    ``_checkpoint_layers``; the arithmetic, shared with grouped CPU replay, is
+    ``_checkpoint_floor_from_facts``.
+    """
     layers = _checkpoint_layers(self, group_rows)
     if not layers:
         return 0, 0
     retained, workspace = _checkpoint_floor_from_facts(
-        self, group_rows, slot_refs, gdn_segments, layers
+        self, group_rows, slot_refs, gdn_segments, layers, routed_rows
     )
-    # HybridEP runtime state is intentionally outside grouped CPU replay v1.
-    hybrid_rows = None
+    # HybridEP runtime state is intentionally outside grouped CPU replay.
     if (
         any(grad for _, grad in group_rows)
         and self._topology_key() == (1, 1, 2, 1)
         and self._parallel_shape == _impl.ParallelShape(tp=1, cp=2, ep=2, etp=1)
         and self._moe_memory_supported
     ):
-        hybrid_rows = max(rows for rows, _ in group_rows)
+        # Recompute runs after _execute_flat_plan restores the communication
+        # high-water. Combine allocates a fresh BF16 [P, H] before cropping;
+        # this is separate from already-held native buffer capacity. Do not
+        # prune graph references or reset execution state while estimating.
+        rows = max(rows for rows, _ in group_rows)
         if any(ref() is not None for ref in self._pending_hybridep_graphs):
-            hybrid_rows = max(hybrid_rows, self._hybridep_rows_high_water)
-    if hybrid_rows is not None:
-        workspace = max(workspace, -(-hybrid_rows // 4) * 4 * self._hidden_size * 2)
+            rows = max(rows, self._hybridep_rows_high_water)
+        # The combine output and the TE workspaces are live together.
+        workspace = max(
+            workspace,
+            -(-rows // 4) * 4 * self._hidden_size * 2
+            + self._te_workspace_growth_bytes(),
+        )
     return retained, workspace
 
 
@@ -596,33 +651,589 @@ def _checkpoint_floor_from_facts(
     slot_refs: tuple["LoRASlotRef | None", ...] | None,
     gdn_segments: int,
     layers: int,
+    routed_rows: tuple[int, ...] | None = None,
 ) -> tuple[int, int]:
+    """Count actual local full/uniform/1 boundaries, including aliases, rather
+    than claiming measured distinct storage. Only this call's new groups
+    enter the term; already-live graphs remain in the availability baseline.
+    The workspace is one MoE stage plus what else is live beside it.
+    Gradient groups recompute the layer, so its attention or GDN mixer
+    keeps its saved activations across the MoE stage. No-grad groups keep
+    decoder input, current layer input, its MLP residual and norm output.
+    Count these four row tensors separately from returned outputs, allowing
+    storage aliases. This is not a bound for custom preprocessing or all of
+    backward. With sequence parallelism a rank saves only its shard of each
+    boundary; that is priced only where ``_sequence_parallel_floor_covered``
+    holds, and there, for gradient waves, the recomputed GDN layer's
+    recurrent states for ``gdn_segments`` (gradient groups' segments) plus
+    padding, as traced (the recomputed mixer is not added at TP > 1).
+    """
     if not layers:
         return 0, 0
     gradient_rows = sum(rows for rows, grad in group_rows if grad)
     _, tp, _, _ = self._topology_key()
-    # Physical rows are padded to a multiple of TP; each rank saves its shard.
-    retained = (
-        sum(-(-rows // tp) for rows, grad in group_rows if grad)
-        * layers
-        * self._hidden_size
-        * 2
-    )
-    if gradient_rows:
-        self._checkpoint_moe_bytes_per_token()
     refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
-    workspace = max(
-        self._moe_workspace_bytes(rows, checkpoint_grad=grad, slot_ref=ref)
-        + (0 if grad else 4 * rows * self._hidden_size * 2)
-        for (rows, grad), ref in zip(group_rows, refs, strict=True)
+    if tp > 1:
+        # The traced TP x SP floor. Physical rows are padded to a multiple of
+        # TP; each rank saves its shard.
+        retained = (
+            sum(-(-rows // tp) for rows, grad in group_rows if grad)
+            * layers
+            * self._hidden_size
+            * 2
+        )
+        if gradient_rows:
+            self._checkpoint_moe_bytes_per_token()
+        workspace = max(
+            self._moe_workspace_bytes(rows, checkpoint_grad=grad, slot_ref=ref)
+            + (0 if grad else 4 * rows * self._hidden_size * 2)
+            for (rows, grad), ref in zip(group_rows, refs, strict=True)
+        )
+        if self._gdn_layers and gradient_rows:
+            # Recurrent states grow with segments, not rows; backward recomputes
+            # one layer at a time. Padding to TP adds up to TP - 1 one-token
+            # roots per group. Kernel-internal chunk states are not bounded here.
+            roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
+            workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
+        return retained, workspace
+    # Boundaries on the busiest rank's rows and one recomputed layer.
+    routed = (None,) * len(group_rows) if routed_rows is None else routed_rows
+    retained = gradient_rows * layers * self._hidden_size * 2
+    moe = self._checkpoint_moe_bytes_per_token() if gradient_rows else 0
+    # Beside the mixer, the recomputed layer keeps its post-mixer residual
+    # and pre-MLP norm output, and its MoE stage its routing state.
+    mixer = (
+        self._recomputed_mixer_bytes_per_token()
+        + (
+            2 * self._hidden_size * 2 + self._moe_checkpoint_state_bytes_per_token()
+            if moe
+            else 0
+        )
+        if gradient_rows
+        else 0
     )
-    if tp > 1 and self._gdn_layers and gradient_rows:
-        # Recurrent states grow with segments, not rows; backward recomputes
-        # one layer at a time. Padding to TP adds up to TP - 1 one-token
-        # roots per group. Kernel-internal chunk states are not bounded here.
-        roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
-        workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
+    workspace = max(
+        self._moe_workspace_bytes(
+            rows, routed_rows=dispatched, checkpoint_grad=grad, slot_ref=ref
+        )
+        + (mixer * rows if grad else 4 * rows * self._hidden_size * 2)
+        for (rows, grad), ref, dispatched in zip(group_rows, refs, routed, strict=True)
+    )
+    if moe:
+        workspace += self._te_workspace_growth_bytes()
     return retained, workspace
+
+
+def _gradient_slots(
+    group_rows: Sequence[tuple[int, bool]],
+    slot_refs: Sequence[LoRASlotRef | None] | None,
+) -> frozenset[LoRASlotRef]:
+    """Gradient groups' adapter slots; the base model (no name) has none."""
+    return frozenset(
+        ref
+        for (_, grad), ref in zip(
+            group_rows, slot_refs or (None,) * len(group_rows), strict=True
+        )
+        if grad and ref is not None and ref.name is not None
+    )
+
+
+def _pending_adapter_gradient_bytes(
+    self: TrainerRank, refs: Iterable[LoRASlotRef]
+) -> tuple[int, ...]:
+    """Local adapter gradient bytes the next backward allocates, per decoder layer.
+
+    One entry per decoder layer, then one for parameters outside the
+    decoder. Backward reaches a parameter's highest decoder layer first, so
+    a parameter shared across layers counts there once; those outside the
+    decoder count as live throughout. Only unallocated gradients count:
+    within a step, later waves find the rest in the availability baseline.
+    Empty when none is pending.
+    """
+    refs = tuple(dict.fromkeys(refs))
+    if not refs or len(self.runtime.model) != 1:
+        return ()
+    try:
+        from art.megatron.lora import LoRA
+    except ModuleNotFoundError as error:
+        if error.name != "megatron":
+            raise
+        return ()
+    chunk = self.runtime.model[0]
+    try:
+        layers = _impl._language_model(chunk).decoder.layers
+    except (AttributeError, RuntimeError):
+        return ()
+    layer_of: dict[int, int] = {}
+    params: dict[int, torch.nn.Parameter] = {}
+
+    def slot_params(
+        modules: Iterable[torch.nn.Module],
+    ) -> Iterator[torch.nn.Parameter]:
+        for module in modules:
+            # A LoRA without slot tables holds no slot parameters.
+            if isinstance(module, LoRA) and "_slot_keys" in vars(module):
+                for ref in refs:
+                    yield from module.lora_slot_params(ref)
+
+    for index, layer in enumerate(layers):
+        for param in slot_params(layer.modules()):
+            params[id(param)] = param
+            layer_of[id(param)] = max(layer_of.get(id(param), -1), index)
+    # Outside the decoder (a head runs its backward first) is live
+    # throughout, even for a parameter or module a decoder layer also uses:
+    # walk every path except through the layers themselves.
+    outside: list[torch.nn.Module] = []
+    visited: set[int] = set()
+    pending_modules: list[torch.nn.Module] = [chunk]
+    while pending_modules:
+        module = pending_modules.pop()
+        if module is layers or id(module) in visited:
+            continue
+        visited.add(id(module))
+        outside.append(module)
+        pending_modules.extend(module.children())
+    for param in slot_params(outside):
+        params[id(param)] = param
+        layer_of[id(param)] = len(layers)
+    # A checkpoint's other trainable parameters (custom objects) have no
+    # decoder position; count them as live throughout.
+    for ref in refs:
+        slot = (
+            None
+            if ref.name is None
+            else getattr(self, "_checkpoint_slots", {}).get(ref.name)
+        )
+        for param in () if slot is None else slot.params:
+            if id(param) not in params:
+                params[id(param)] = param
+                layer_of[id(param)] = len(layers)
+    sizes = [0] * (len(layers) + 1)
+    for param_id, param in params.items():
+        if (
+            param.requires_grad
+            and param.grad is None
+            and getattr(param, "main_grad", None) is None
+        ):
+            sizes[layer_of[param_id]] += param.numel() * param.element_size()
+    return tuple(sizes) if any(sizes) else ()
+
+
+def _checkpoint_gradient_groups(
+    self: TrainerRank,
+    group_rows: Sequence[tuple[int, bool]],
+    slot_refs: Sequence[LoRASlotRef | None] | None,
+) -> tuple[tuple[LoRASlotRef | None, tuple[int, ...]], ...]:
+    """Each gradient group's adapter slot and per-layer saved boundaries.
+
+    In execution order, as ``_checkpoint_memory_floor`` prices them: every
+    decoder layer saves the group's rows (this rank's TP shard). The base
+    model (no name) has no adapter slot.
+    """
+    tp = self._topology_key()[1]
+    return tuple(
+        (
+            ref if ref is not None and ref.name is not None else None,
+            (-(-rows // tp) * self._hidden_size * 2,) * self._num_layers,
+        )
+        for (rows, grad), ref in zip(
+            group_rows, slot_refs or (None,) * len(group_rows), strict=True
+        )
+        if grad
+    )
+
+
+def _checkpoint_adapter_gradient_bytes(
+    self: TrainerRank,
+    groups: Sequence[tuple[LoRASlotRef | None, Sequence[int]]],
+    *,
+    head: bool = False,
+) -> int:
+    """The recompute backward's adapter-gradient peak beyond released boundaries.
+
+    ``groups`` gives each gradient group's adapter slot (None for the base
+    model) and each decoder layer's saved-boundary bytes
+    (``_adapter_gradient_walk``). With ``head``, those live while a group's
+    head runs its backward instead (``_adapter_gradient_head``).
+    """
+    chains = []
+    for slot, boundaries in groups:
+        pending = () if slot is None else self._pending_adapter_gradient_bytes((slot,))
+        if pending and len(pending) != len(boundaries) + 1:
+            return 0
+        chains.append((pending or (0,) * (len(boundaries) + 1), boundaries))
+    if head:
+        return self._adapter_gradient_head(chains)
+    return self._adapter_gradient_walk(chains)
+
+
+def _adapter_gradient_walk(
+    chains: Sequence[tuple[Sequence[int], Sequence[int]]],
+) -> int:
+    """The adapter-gradient peak beyond the floor over gradient groups' backward.
+
+    Each chain is a gradient group's pending gradient bytes (per decoder
+    layer, then outside the decoder) and saved-boundary bytes per layer.
+    Backward recomputes the last layer first. While it recomputes layer i it
+    still holds the saved boundaries of layers 0..i and every adapter
+    gradient allocated so far: those of layers i..L-1 (a layer allocates its
+    own during its backward) and any outside the decoder. The floor already
+    prices all L boundaries at once, so one group's extra peak is
+    max(0, max over i of gradients(i..) - boundaries(i+1..)), taken at every
+    layer over the real per-layer gradient sizes and the caller's per-layer
+    boundaries, not along a uniform-layer line. A short
+    first wave peaks at layer 0 (Qwen3.6-35B-A3B CP2: 830-900 MB of expert
+    LoRA gradients live at its peak), a long one at the last layer.
+    Groups run their backward one after another, not layer by layer
+    together: autograd drains the last-forwarded group's chain first, and
+    separate backward calls can come in either order. While one group runs,
+    each group already run holds all its gradients and none of its
+    boundaries, and each group yet to run all its boundaries. Any set of the
+    other groups can have run first, so the worst adds every other group
+    whose gradients outweigh its boundaries.
+    """
+    nets = [sum(pending) - sum(boundaries) for pending, boundaries in chains]
+    others = sum(max(0, net) for net in nets)
+    worst = 0
+    for (pending, boundaries), net in zip(chains, nets, strict=True):
+        extra = gradients = pending[-1]
+        released = 0
+        for index in range(len(boundaries) - 1, -1, -1):
+            gradients += pending[index]
+            extra = max(extra, gradients - released)
+            released += boundaries[index]
+        worst = max(worst, extra + others - max(0, net))
+    return worst
+
+
+def _triton_min_rows(self: TrainerRank) -> int:
+    """Rows the fused head statistics need in a chunk (process-wide setting)."""
+    return int(_impl.os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64"))
+
+
+def _head_backward_traced(
+    self: TrainerRank,
+    requests: Sequence[AnyForwardInput],
+    rows: int,
+    upper_rows: int | None = None,
+) -> bool | None:
+    """Whether a gradient group's head backward is the traced one.
+
+    The head stage (``_checkpoint_head_stage_bytes``) relies on
+    ``_group_head_workspace_bytes`` bounding the head's backward buffers.
+    Qwen3.6-35B-A3B CP2 traces establish that for target-only requests on
+    the standard logit scale through the fused Triton statistics, which
+    need at least ``ART_TRAINER_RANK_TRITON_MIN_ROWS`` rows in the first
+    projected chunk. Top-k, logits and hidden-state outputs keep further
+    dense gradients, and the FP32 fallback wider copies; other CP sizes
+    are untraced. The fused statistics must have run in this process and
+    never fallen back after an error; a plan priced on them then runs them
+    strictly (``_plan_head_backward_traced``), so a later failure raises
+    rather than taking the wider FP32 path. ``rows`` bounds the first chunk's rows from below,
+    ``upper_rows`` from above: None when they straddle the threshold.
+    A CP rank projecting fewer rows falls back on its own; the head stage
+    prices that (``_HEAD_FALLBACK_BUFFERS``). ``ART_TRAINER_RANK_TRITON_*``
+    settings are process-wide: changing them while a plan is in flight is
+    unsupported (a staged chunk could then fall back unpriced).
+    """
+    if (
+        not requests
+        or any(
+            request.target_tokens is None
+            # Several labels per row save gather indices and masks per label;
+            # one label per input token, in either accepted layout, does not.
+            or request.target_tokens.numel() != request.input_tokens.numel()
+            or request.top_k is not None
+            or request.logits
+            or request.hidden_states
+            for request in requests
+        )
+        or _impl.os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower()
+        in {"0", "false"}
+        # Target-only heads run the logsumexp kernel; another kernel's
+        # success does not prove it.
+        or "local_logsumexp_stats" not in _impl._TRITON_STATS_STATE["succeeded"]
+        or _impl._TRITON_STATS_STATE["failed"]
+        or self._topology_key()[2] != 2
+        or not self._head_workspace_bytes(1)
+        or not _head_target_backward(self)
+    ):
+        return False
+    minimum = self._triton_min_rows()
+    if rows >= minimum:
+        return True
+    if upper_rows is None or upper_rows < minimum:
+        return False
+    return None
+
+
+def _te_workspace_growth_bytes(self: TrainerRank) -> int:
+    """Transformer Engine's cuBLAS workspaces, until its GEMMs allocate them.
+
+    The first plain and grouped GEMMs allocate them during a call, and TE
+    keeps them for the process; later calls see them as used memory.
+    """
+    try:
+        from transformer_engine.pytorch.cpp_extensions import gemm
+    except ImportError:
+        return _impl._TE_CUBLAS_WORKSPACE_BYTES
+    info = getattr(gemm.get_cublas_workspace, "cache_info", None)
+    if callable(info) and info().currsize >= 2:
+        return 0
+    return _impl._TE_CUBLAS_WORKSPACE_BYTES
+
+
+def _moe_checkpoint_state_bytes_per_token(self: TrainerRank) -> int:
+    """Per local token beside the recomputed MoE stage's routed rows.
+
+    FP32 router scores and the boolean routing map; the dispatcher's state
+    (the EP1 permutation's int32 row-id map of 2E + 1, or HybridEP's FP32
+    probability copy and handle metadata of about 5E); and the shared
+    expert's saved FC1 gate/up and GLU outputs. Qwen3.6-35B-A3B traces:
+    3,332 and 3,593 bytes of routing state at EP1 and EP2, 3 KB shared.
+    """
+    geometry = self._geometry
+    experts = geometry.moe_experts
+    if not experts:
+        return 0
+    routing = experts * (4 + 1) + (
+        4 * (2 * experts + 1) if self._parallel_shape.ep == 1 else 9 * experts + 16
+    )
+    return routing + 3 * geometry.moe_shared_expert_ffn * self._param_dtype_size
+
+
+def _moe_recompute_covered_for(
+    self: TrainerRank, slot_ref: "LoRASlotRef | None"
+) -> bool:
+    """Whether an explicit slot keeps the constructor's full MoE coverage."""
+    if not getattr(self, "_moe_recompute_covered", False):
+        return False
+    if slot_ref is None or slot_ref.name is None:
+        return True
+    enclosed: list[bool] = []
+    coefficient = _impl._moe_output_bytes_per_token(
+        self.runtime.model,
+        self._parallel_shape,
+        checkpoint_grad=True,
+        converted_stages=[],
+        slot_ref=slot_ref,
+        enclosed=enclosed,
+    )
+    # The constructor's walk already matched every decoder layer.
+    return (
+        coefficient > 0
+        and len(enclosed) == len(getattr(self, "_moe_gradient_enclosed", ()))
+        and all(enclosed)
+    )
+
+
+def _checkpoint_input_gradient_bytes(
+    self: TrainerRank,
+    group_rows: tuple[tuple[int, bool], ...],
+    slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+    *,
+    retained: int | None = None,
+) -> int:
+    """Gradient rows live at the recomputed layer's peak.
+
+    Backward recomputes the last layer first, so its peak meets every saved
+    boundary but only the one incoming gradient. Where the MoE stage covers
+    every layer's recompute, FC1 included (Qwen3.6-35B-A3B traces at CP1,
+    CP2/EP1 and EP2/CP2), charge that gradient. Elsewhere, including above
+    CP2 (more remote attention stages than the mixer's CP2 allowance), keep
+    one gradient per boundary: that allowance also covers dense MLP and
+    other recompute work the floor does not price. ``retained`` is the
+    floor's boundary charge where the caller already has it.
+    """
+    if retained is None:
+        retained, _ = self._checkpoint_memory_floor(group_rows)
+    if not retained:
+        return 0
+    if self._checkpoint_gradient_covered(group_rows, slot_refs):
+        return sum(rows for rows, grad in group_rows if grad) * self._hidden_size * 2
+    return retained
+
+
+def _checkpoint_gradient_covered(
+    self: TrainerRank,
+    group_rows: tuple[tuple[int, bool], ...],
+    slot_refs: tuple["LoRASlotRef | None", ...] | None,
+) -> bool:
+    """Whether the traced MoE stage covers every gradient group's recompute."""
+    refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
+    return bool(
+        self._topology_key()[2] <= 2
+        and self._checkpoint_moe_bytes_per_token()
+        and all(
+            self._moe_recompute_covered_for(ref)
+            for (_, grad), ref in zip(group_rows, refs, strict=True)
+            if grad
+        )
+    )
+
+
+def _checkpoint_head_stage_bytes(
+    self: TrainerRank,
+    head_workspace_bytes: int,
+    gradient: int,
+    group_rows: tuple[tuple[int, bool], ...],
+    slot_refs: tuple["LoRASlotRef | None", ...] | None,
+) -> int | None:
+    """The head backward's peak beyond the boundaries and ``gradient``.
+
+    The head finishes its backward before the decoder's recompute starts,
+    so its buffers never meet a recomputed layer's workspace or the adapter
+    gradients that recompute allocates. Where the MoE stage covers the
+    recompute, ``gradient`` is the gradient groups' rows x 2H, and each of
+    these is at most that: the final decoder outputs, the hidden rows each
+    checkpointed head chunk saved (this rank's rows), and the hidden-row
+    gradient. Beside them are each row's RoPE embedding and index state,
+    the head's own buffers, TE's cuBLAS workspaces from the forward's first
+    GEMMs, and the adapter gradients of groups whose backward ran first.
+    Qwen3.6-35B-A3B CP2 traces (EP1 and EP2, single and multi-request
+    waves) show these terms at the head's peak. Elsewhere None: the head
+    shares the decoder stage. That bounds heads whose backward is the
+    traced one (``_head_backward_traced``); callers keep the unstaged price
+    beside any other, whose buffers can exceed ``head_workspace_bytes``.
+    """
+    if not head_workspace_bytes or not self._checkpoint_gradient_covered(
+        group_rows, slot_refs
+    ):
+        return None
+    rows = sum(rows for rows, grad in group_rows if grad)
+    # A rank's chunk below the fused minimum (CP splits the projected rows
+    # unevenly) takes the FP32 fallback.
+    fallback = _impl._HEAD_FALLBACK_BUFFERS * self._head_workspace_bytes(
+        min(
+            self._triton_min_rows() - 1,
+            _impl._HEAD_CHUNK_TOKENS,
+        )
+    )
+    return (
+        max(head_workspace_bytes, fallback)
+        + 2 * gradient
+        + rows * self._backward_row_state_bytes()
+        + self._te_workspace_growth_bytes()
+        + self._checkpoint_adapter_gradient_bytes(
+            self._checkpoint_gradient_groups(group_rows, slot_refs), head=True
+        )
+    )
+
+
+def _backward_row_state_bytes(self: TrainerRank) -> int:
+    """Per local row, what the backward keeps beside hidden-width tensors.
+
+    The FP32 RoPE embedding at the rotary width (256 bytes for
+    Qwen3.6-35B-A3B) and ``_BACKWARD_ROW_STATE_BYTES`` of index state.
+    """
+    rope = getattr(_impl._language_model(self.runtime.model[0]), "rotary_pos_emb", None)
+    frequencies = getattr(rope, "inv_freq", None)
+    width = (
+        2 * frequencies.numel() if isinstance(frequencies, _impl.torch.Tensor) else 0
+    )
+    return width * 4 + _impl._BACKWARD_ROW_STATE_BYTES
+
+
+def _mixer_activation_widths(self: TrainerRank) -> tuple[float, float]:
+    """Saved activations per token of one attention and one GDN layer.
+
+    Elements, not bytes: what a layer's attention or GDN mixer keeps for
+    its backward, including the input norm output (and gathered LoRA
+    inputs under sequence parallelism).
+    """
+    geometry = self._geometry
+    hidden = self._hidden_size
+    tp = max(1, self._topology_key()[1])
+    sp = tp if self._sequence_parallel else 1
+    # Gathered LoRA inputs alias norm output without sequence sharding.
+    gathered = hidden if sp > 1 else 0
+    common = 2 * hidden / sp + gathered
+    attention_width = geometry.num_attention_heads * geometry.kv_channels or hidden
+    kv_width = geometry.num_query_groups * geometry.kv_channels or hidden
+    gated = self._attention_output_gate
+    attention = common + ((7 if gated else 5) * attention_width + 3 * kv_width) / tp
+    if 0 < geometry.num_query_groups < tp:
+        # SelfAttentionLinearQKVLoRA constructs global QKV before
+        # slicing it when KV groups cannot be partitioned across TP.
+        attention += ((2 if gated else 1) * attention_width + 2 * kv_width) * (
+            1 - 1 / tp
+        )
+    gdn = (
+        common
+        + (
+            4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+            + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+        )
+        / tp
+    )
+    return attention, gdn
+
+
+def _recomputed_mixer_bytes_per_token(self: TrainerRank) -> int:
+    """Saved mixer activations of the layer being recomputed, per row.
+
+    Full recompute replays one layer with gradients, and its attention or
+    GDN mixer keeps what its backward needs across that layer's MoE stage.
+    Price the larger mixer the model has. Sites and sizes come from
+    Qwen3.6-35B-A3B allocator traces on H200, per local token at the
+    layer's recompute peak:
+
+    - attention: the retained attention width above (66 KB measured at
+      CP1, 69 KB priced). A context-parallel rank also keeps its
+      stage-padded Q/K/V, the stage output and a core-attention copy
+      (94 KB measured at CP2, 95 KB priced). CP above 2 uses the CP2
+      allowance; ranks with several remote stages may keep more.
+    - GDN: norm output, the projected q/k/v, their l2norm outputs
+      expanded to the value heads, five more value-width tensors (z, two
+      segment-layout tensors, the gated-norm output and its gated
+      product) and the chunk decay matrix: 80 KB measured at CP1, 82 KB
+      priced. A context-parallel rank's exchanged layout holds about 7%
+      more rows; its hidden-width input exchange and value-width output
+      allowance price that (88 KB measured at CP2, 94 KB priced).
+    """
+    geometry = self._geometry
+    hidden = self._hidden_size
+    tp = max(1, self._topology_key()[1])
+    cp = self._topology_key()[2] > 1
+    widths = []
+    if self._gdn_layers < self._num_layers:
+        attention, _gdn = self._mixer_activation_widths()
+        if cp:
+            q = geometry.num_attention_heads * geometry.kv_channels or hidden
+            kv = geometry.num_query_groups * geometry.kv_channels or hidden
+            attention += (3 * q + 2 * kv) / tp
+        widths.append(attention)
+    if self._gdn_layers:
+        key = geometry.gdn_key_heads * geometry.gdn_key_head_dim
+        value = geometry.gdn_value_heads * geometry.gdn_value_head_dim
+        normalized = 2 * geometry.gdn_value_heads * geometry.gdn_key_head_dim
+        chunk = 64 * geometry.gdn_value_heads
+        gdn = hidden + (2 * key + normalized + 6 * value + chunk) / tp
+        if cp:
+            gdn += hidden + value / tp
+        widths.append(gdn)
+    return int(max(widths, default=0) * self._param_dtype_size)
+
+
+def _adapter_gradient_head(
+    chains: Sequence[tuple[Sequence[int], Sequence[int]]],
+) -> int:
+    """Adapter gradients live while one group's head runs its backward.
+
+    Chains as ``_adapter_gradient_walk``. None of the group's decoder layers
+    has run yet; its gradients outside the decoder are live, and so is every
+    other group whose gradients outweigh its boundaries, as any may have run
+    first.
+    """
+    nets = [max(0, sum(pending) - sum(boundaries)) for pending, boundaries in chains]
+    others = sum(nets)
+    return max(
+        (
+            pending[-1] + others - net
+            for (pending, _), net in zip(chains, nets, strict=True)
+        ),
+        default=0,
+    )
 
 
 def _retained_memory_bytes(
@@ -674,6 +1285,7 @@ def _estimate_flat_forward(
     memory_minimal: bool = False,
     sync_planning_errors: bool = False,
     gdn_segments: list[int] | None = None,
+    head_traced: list[bool | None] | None = None,
 ) -> tuple[int, int, _impl._MemorySignature, tuple[tuple[int, bool], ...], int] | None:
     """Estimate packed tokens for width probing.
 
@@ -689,6 +1301,8 @@ def _estimate_flat_forward(
     ``gdn_segments`` receives each gradient group's segment count: exact
     layouts' actual counts; in cheap mode, the same kind of bound as the
     token count (twice the requests, as a radix tree has fewer, or one).
+    ``head_traced`` receives each gradient group's ``_head_backward_traced``
+    over its projected-row bounds.
     """
 
     if sync_planning_errors:
@@ -704,6 +1318,19 @@ def _estimate_flat_forward(
         ):
             # This cheap return type has no slot metadata. Materialize the
             # exact plan instead of admitting with the constructor rank.
+            return None
+        gradient_slots = [
+            ref
+            for (ref, grad), _ in groups
+            if grad and ref is not None and ref.name is not None
+        ]
+        if (
+            gradient_slots
+            and getattr(self, "_recompute_granularity", None) == "full"
+            and self._pending_adapter_gradient_bytes(gradient_slots)
+        ):
+            # The step's first backward allocates adapter gradients that
+            # only slot metadata can price; the exact plan carries it.
             return None
         if (
             any(mode for (_, mode), _ in groups)
@@ -724,6 +1351,10 @@ def _estimate_flat_forward(
             head_requests = tuple(requests[index] for index in group_indices)
             lower = self._head_projection_rows(head_requests, lower_bound=True)
             upper = self._head_projection_rows(head_requests)
+            if grad_enabled and head_traced is not None:
+                head_traced.append(
+                    self._head_backward_traced(head_requests, lower, upper)
+                )
             if exact:
                 tree, layout = self._select_group_layout(
                     tuple(
@@ -952,8 +1583,10 @@ def _memory_check(
             logical_tokens=forward.active_logical_tokens,
             gdn_segments=forward.grad_segment_count,
             group_rows=self._plan_group_rows(forward),
+            group_routed_rows=self._plan_group_routed_rows(forward),
             slot_refs=tuple(g.slot_ref for g in forward.groups),
             head_workspace_bytes=self._plan_head_workspace_bytes(forward),
+            head_backward_traced=self._plan_head_backward_traced(forward),
             checkpoint_floor=_impl._gdn_memory.plan_floor(self, forward),
             retained_tokens=self._plan_retained_tokens(forward),
         ) + int(self._plan_hybridep_growth_bytes(forward) * _impl._MEMORY_SAFETY_FACTOR)
@@ -1064,8 +1697,10 @@ def _estimate_required_memory_bytes_from_values(
     logical_tokens: int | None = None,
     gdn_segments: int = 0,
     group_rows: tuple[tuple[int, bool], ...] = (),
+    group_routed_rows: tuple[int, ...] | None = None,
     slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
     head_workspace_bytes: int = 0,
+    head_backward_traced: bool = False,
     checkpoint_floor: tuple[int, int] = (0, 0),
     retained_tokens: int | None = None,
     include_checkpoint_input_gradient: bool = True,
@@ -1086,24 +1721,7 @@ def _estimate_required_memory_bytes_from_values(
         # Gathered LoRA inputs alias norm output without sequence sharding.
         gathered = hidden if sp > 1 else 0
         common = 2 * hidden / sp + gathered
-        attention_width = geometry.num_attention_heads * geometry.kv_channels or hidden
-        kv_width = geometry.num_query_groups * geometry.kv_channels or hidden
-        gated = self._attention_output_gate
-        attention = common + ((7 if gated else 5) * attention_width + 3 * kv_width) / tp
-        if 0 < geometry.num_query_groups < tp:
-            # SelfAttentionLinearQKVLoRA constructs global QKV before
-            # slicing it when KV groups cannot be partitioned across TP.
-            attention += ((2 if gated else 1) * attention_width + 2 * kv_width) * (
-                1 - 1 / tp
-            )
-        gdn = (
-            common
-            + (
-                4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
-                + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
-            )
-            / tp
-        )
+        attention, gdn = self._mixer_activation_widths()
         ffn_width = geometry.ffn_hidden_size or 4 * hidden
         mlp = common + self._mlp_activation_factor * ffn_width / tp
         if geometry.moe_experts:
@@ -1152,29 +1770,48 @@ def _estimate_required_memory_bytes_from_values(
         )
     # Groups execute sequentially: summed packed rows conservatively bound
     # this FC2 component, not all workspace or retained graphs.
+    grouped = signature.topology[2] > 1 and bool(group_rows)
     static_compute = max(
         static_compute,
         *(
             self._moe_workspace_bytes(
-                sum(rows for rows, _ in group_rows)
-                if signature.topology[2] > 1 and group_rows
-                else packed_tokens,
+                sum(rows for rows, _ in group_rows) if grouped else packed_tokens,
+                routed_rows=sum(group_routed_rows)
+                if grouped and group_routed_rows is not None
+                else None,
                 slot_ref=ref,
             )
             for ref in (slot_refs or (None,))
         ),
     )
     retained, workspace = (
-        self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments)
+        self._checkpoint_memory_floor(
+            group_rows, slot_refs, gdn_segments, routed_rows=group_routed_rows
+        )
         if checkpoint_memory is None
         else checkpoint_memory
     )
-    static_compute = max(
-        static_compute,
-        max(retained, checkpoint_floor[0])
-        + max(workspace, head_workspace_bytes, checkpoint_floor[1])
-        + (retained if include_checkpoint_input_gradient else 0),
-    )
+    decoder_workspace = max(workspace, checkpoint_floor[1])
+    peak = max(decoder_workspace, head_workspace_bytes)
+    if include_checkpoint_input_gradient and retained:
+        # The input gradient, the backward's other end and cold transients,
+        # staged as _subforward_cost.
+        gradient = self._checkpoint_input_gradient_bytes(group_rows, slot_refs)
+        adapter_gradient = self._checkpoint_adapter_gradient_bytes(
+            self._checkpoint_gradient_groups(group_rows, slot_refs)
+        )
+        head_stage = self._checkpoint_head_stage_bytes(
+            head_workspace_bytes, gradient, group_rows, slot_refs
+        )
+        peak += adapter_gradient
+        if head_stage is not None:
+            # An untraced head keeps the unstaged price as a floor.
+            staged = max(decoder_workspace + adapter_gradient, head_stage)
+            peak = staged if head_backward_traced else max(peak, staged)
+        peak += gradient
+        if profiled is None and any(grad for _, grad in group_rows):
+            peak += _impl._COLD_RECOMPUTE_TRANSIENT_BYTES
+    static_compute = max(static_compute, max(retained, checkpoint_floor[0]) + peak)
     if signature.topology[2] > 1:
         # Local head results coexist with full CP outputs during gathering.
         # Uneven rank plans can assign all of an item's rows to one rank.

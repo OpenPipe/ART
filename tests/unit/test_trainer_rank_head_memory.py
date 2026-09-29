@@ -9,6 +9,9 @@ import torch
 
 from art.trainer_rank import ForwardInput
 from art.trainer_rank._impl import (
+    _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD,
+)
+from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
     Unset,
     _MemoryProfile,
@@ -143,11 +146,19 @@ def test_outputs_retention_and_empirical_peak_are_counted_once():
     r = rank()
     plan = r._plan_flat_forward([request(grad=True)])
     retained = 512 * 40 * 2048 * 2
-    gradient = 512 * 40 * 2048 * 2
+    gradient = 512 * 2048 * 2  # The incoming gradient beside the MoE stage.
     head = 3 * 512 * 248320 * 2
     cost = r._plan_cost(plan)
     assert cost.retained == int((plan.output_bytes + retained + head) * 1.1)
-    assert cost.required == int((plan.output_bytes + retained + gradient + head) * 1.1)
+    # Unprofiled head stage: the head workspace, the final output, saved
+    # selected rows and hidden-row gradient beside the incoming one, each
+    # row's RoPE and index state, TE's first-GEMM workspaces and the first
+    # execution's transients.
+    state = 512 * r._backward_row_state_bytes()
+    te = r._te_workspace_growth_bytes()
+    assert cost.required == int(
+        (plan.output_bytes + retained + 3 * gradient + state + head + te + COLD) * 1.1
+    )
     r._memory_profiles[plan.signature] = _MemoryProfile(
         bytes_per_token=2_000_000,
         packed_tokens=512,
@@ -306,14 +317,21 @@ def test_tied_standard_head_weight_uses_the_same_capacity():
 
 
 @pytest.mark.parametrize("rows", [128, 512])
-def test_target_backward_refuses_budget_below_logits_and_both_gradients(rows):
+def test_target_backward_refuses_budget_below_logits_and_both_gradients(
+    monkeypatch, rows
+):
     r = rank()
+    # Isolate the head term from TE's one-time cuBLAS workspace growth, and
+    # the three target-backward buffers from the small-chunk fallback cover.
+    r._te_workspace_growth_bytes = lambda: 0
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "1")
     plan = r._plan_flat_forward([request(rows, grad=True)])
     retained, _ = r._checkpoint_memory_floor(r._plan_group_rows(plan))
-    gradient = rows * 40 * 2048 * 2
+    gradient = rows * 2048 * 2
+    stage = 3 * gradient + rows * r._backward_row_state_bytes()
     dense = min(rows, 512) * 248320 * 2
-    before = int((plan.output_bytes + retained + gradient + 2 * dense) * 1.1)
-    expected = int((plan.output_bytes + retained + gradient + 3 * dense) * 1.1)
+    before = int((plan.output_bytes + retained + stage + 2 * dense + COLD) * 1.1)
+    expected = int((plan.output_bytes + retained + stage + 3 * dense + COLD) * 1.1)
     r._available_memory_bytes = lambda: (before + expected) // 2
     check = r._memory_check(plan)
     assert check.estimated_required_bytes == expected

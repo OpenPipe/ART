@@ -11,14 +11,27 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict
 import json
 from types import MethodType, SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import _gdn_memory, _impl, _memory
 
 _MAX_BYTES = 262144
 _MAX_GROUPS = 1024
+# Replay sizes per-layer tuples from this recorded rank field; bound it as capture does.
+MAX_LAYERS = 1024
 _MAX_SEGMENTS = 4096
 _MAX_INPUT_VALUES = 1_000_000
+
+
+# Estimators bound on TrainerRank as plain functions, not methods.
+_STATIC_ESTIMATORS = frozenset(
+    {
+        "_split_required_memory",
+        "_gradient_slots",
+        "_adapter_gradient_walk",
+        "_adapter_gradient_head",
+    }
+)
 
 
 _REFUSALS = frozenset(
@@ -38,6 +51,15 @@ _REFUSALS = frozenset(
         "selected_request_input_mismatch",
         "runtime_request_inputs_unavailable",
     }
+)
+
+
+# Frozen per plan; None where no checkpointed decoder would read them.
+_RECOMPUTE_READERS = (
+    "moe_checkpoint_state_bytes_per_token",
+    "te_workspace_growth_bytes",
+    "backward_row_state_bytes",
+    "triton_min_rows",
 )
 
 
@@ -68,7 +90,10 @@ def _fact_budget() -> Callable[[int], None]:
 
 
 def capture(rank: Any, plan: Any) -> dict[str, Any]:
-    if rank._num_layers > 1024 or not 0 < len(plan.groups) <= _MAX_GROUPS:
+    if (
+        not 0 < rank._num_layers <= MAX_LAYERS
+        or not 0 < len(plan.groups) <= _MAX_GROUPS
+    ):
         raise ValueError("runtime_group_inventory_over_limit")
     if (
         getattr(rank.runtime.provider, "expert_model_parallel_size", 1) > 1
@@ -96,12 +121,32 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_physical_tokens",
         "_plan_group_rows",
         "_plan_retained_tokens",
+        "_gradient_slots",
+        "_pending_adapter_gradient_bytes",
+        "_checkpoint_gradient_groups",
+        "_checkpoint_adapter_gradient_bytes",
+        "_adapter_gradient_walk",
+        "_adapter_gradient_head",
+        "_checkpoint_input_gradient_bytes",
+        "_checkpoint_gradient_covered",
+        "_moe_recompute_covered_for",
+        "_checkpoint_head_stage_bytes",
+        "_backward_row_state_bytes",
+        "_te_workspace_growth_bytes",
+        "_moe_checkpoint_state_bytes_per_token",
+        "_recomputed_mixer_bytes_per_token",
+        "_mixer_activation_widths",
+        "_triton_min_rows",
+        # Producers of recorded arguments replay checks against the facts.
+        "_plan_group_routed_rows",
+        "_plan_head_backward_traced",
+        "_head_backward_traced",
     ):
         method = getattr(rank, name)
         expected = getattr(_impl.TrainerRank, name)
         supported = (
             method is expected
-            if name == "_split_required_memory"  # The sole static estimator.
+            if name in _STATIC_ESTIMATORS
             else type(method) is MethodType
             and method.__self__ is rank
             and method.__func__ is expected
@@ -131,19 +176,19 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     head_values = _MAX_INPUT_VALUES
 
     def terms(checkpoint_grad: bool, ref: Any) -> list[Any]:
-        coefficient, stages = _memory._moe_workspace_terms(
+        coefficient, stages, shared = _memory._moe_workspace_terms(
             rank, checkpoint_grad=checkpoint_grad, slot_ref=ref
         )
         if len(stages) > 4096:
             raise ValueError("runtime_stage_inventory_over_limit")
-        reserve(64 + 72 * len(stages))
+        reserve(96 + 72 * len(stages))
         if (
             type(coefficient) is not int
             or not 0 <= coefficient < 2**63
             or any(v >= 2**63 for stage in stages for v in stage)
         ):
             raise ValueError("runtime_dimension_unsupported")
-        return [coefficient, [list(stage) for stage in stages]]
+        return [coefficient, [list(stage) for stage in stages], shared]
 
     has_grad = any(g.grad_enabled for g in plan.groups)
     for group, (physical_rows, _) in zip(
@@ -214,6 +259,18 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             if backwards
             else 0
         )
+        adapter = None
+        if group.grad_enabled and name is not None:
+            # The live estimator reads this slot's unallocated gradient bytes
+            # per decoder layer; freeze them with the selection.
+            kind = getattr(group.slot_ref, "kind", None)
+            if kind is not None and (type(kind) is not str or len(kind) > 64):
+                raise ValueError("runtime_slot_identity_unsupported")
+            pending = rank._pending_adapter_gradient_bytes((group.slot_ref,))
+            if len(pending) > 1025:
+                raise ValueError("runtime_shape_inventory_over_limit")
+            reserve(128 + 12 * len(name) + 24 * len(pending))
+            adapter = {"kind": kind, "name": name, "pending": [int(v) for v in pending]}
         model = _gdn_memory.model_shapes(rank, group.slot_ref) if has_grad else None
         if model is not None:
             if len(model[1]) > 1024:
@@ -231,6 +288,9 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 "gradient": terms(True, group.slot_ref),
                 "head_rows": projected,
                 "head_target_rows": target_rows,
+                "adapter": adapter,
+                "moe_covered": group.grad_enabled
+                and rank._moe_recompute_covered_for(group.slot_ref),
                 "gdn": None
                 if model is None
                 else {
@@ -252,12 +312,17 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 },
             }
         )
+    layers = _memory._checkpoint_layers(rank, rank._plan_group_rows(plan))
     facts = {
-        "version": 1,
-        "checkpoint_layers": _memory._checkpoint_layers(
-            rank, rank._plan_group_rows(plan)
-        ),
+        "version": 3,
+        "checkpoint_layers": layers,
         "checkpoint_moe_bytes_per_token": rank._checkpoint_moe_bytes_per_token(),
+        # Model and process readers of the recomputed layer and staged head,
+        # read (like live pricing) only with a checkpointed decoder.
+        **{
+            name: getattr(rank, "_" + name)() if layers else None
+            for name in _RECOMPUTE_READERS
+        },
         "head_vocabulary": vocabulary,
         "head_target_backward": target_backward,
         "groups": groups,
@@ -285,12 +350,16 @@ def validate(facts: Any) -> None:
             "version",
             "checkpoint_layers",
             "checkpoint_moe_bytes_per_token",
+            "moe_checkpoint_state_bytes_per_token",
+            "te_workspace_growth_bytes",
+            "backward_row_state_bytes",
+            "triton_min_rows",
             "head_vocabulary",
             "head_target_backward",
             "groups",
         },
     )
-    if type(facts["version"]) is not int or facts["version"] != 1:
+    if type(facts["version"]) is not int or facts["version"] != 3:
         raise ValueError("unsupported runtime facts version")
     for key in (
         "checkpoint_layers",
@@ -298,6 +367,14 @@ def validate(facts: Any) -> None:
         "head_vocabulary",
     ):
         integer(facts[key])
+    for key in _RECOMPUTE_READERS:
+        if not facts["checkpoint_layers"]:
+            if facts[key] is not None:
+                raise ValueError("invalid runtime dimension")
+            continue
+        # Any integer Triton setting is live-accepted (a non-positive one
+        # prices no fallback chunk rows).
+        integer(facts[key], minimum=-(2**63) if key == "triton_min_rows" else 0)
     if type(facts["head_target_backward"]) is not bool:
         raise ValueError("invalid head backward eligibility")
     groups = facts["groups"]
@@ -319,6 +396,8 @@ def validate(facts: Any) -> None:
                 "gradient",
                 "head_rows",
                 "head_target_rows",
+                "adapter",
+                "moe_covered",
                 "gdn",
             },
         )
@@ -330,6 +409,11 @@ def validate(facts: Any) -> None:
             or len(group["slot"]) > 4096
         ):
             raise ValueError("invalid runtime group identity")
+        # Only gradient groups recompute; the live reader is not asked otherwise.
+        if type(group["moe_covered"]) is not bool or (
+            group["moe_covered"] and not group["grad"]
+        ):
+            raise ValueError("invalid MoE recompute coverage")
         if (
             type(group["request_indices"]) is not list
             or len(group["request_indices"]) > 4096
@@ -351,18 +435,41 @@ def validate(facts: Any) -> None:
             terms = group[key]
             if (
                 type(terms) is not list
-                or len(terms) != 2
+                or len(terms) != 3
                 or type(terms[1]) is not list
                 or len(terms[1]) > 4096
             ):
                 raise ValueError("invalid MoE terms")
-            reserve(64 + 72 * len(terms[1]))
+            reserve(96 + 72 * len(terms[1]))
             integer(terms[0])
             for stage in terms[1]:
                 if type(stage) is not list or len(stage) != 2:
                     raise ValueError("invalid MoE stage")
                 for value in stage:
                     integer(value)
+            # The shared expert's part of the coefficient (live invariant).
+            integer(terms[2])
+            if terms[2] > terms[0]:
+                raise ValueError("invalid MoE terms")
+        adapter = group["adapter"]
+        if adapter is not None:
+            fields(adapter, {"kind", "name", "pending"})
+            if (
+                not group["grad"]
+                or (adapter["kind"] is not None and type(adapter["kind"]) is not str)
+                or len(adapter["kind"] or "") > 64
+                or type(adapter["name"]) is not str
+                or len(adapter["name"]) > 4096
+                or type(adapter["pending"]) is not list
+                or len(adapter["pending"]) > 1025
+            ):
+                raise ValueError("invalid adapter gradient facts")
+            reserve(128 + 12 * len(adapter["name"]) + 24 * len(adapter["pending"]))
+            for value in adapter["pending"]:
+                integer(value)
+            # A slot without a kind (megatron-less reference) has none pending.
+            if adapter["kind"] is None and any(adapter["pending"]):
+                raise ValueError("invalid adapter gradient facts")
         gdn = group["gdn"]
         if gdn is not None:
             fields(gdn, {"layers", "shapes", "segments"})
@@ -390,6 +497,14 @@ def validate(facts: Any) -> None:
                 )
                 for value in segment.values():
                     integer(value)
+    # Live slot references all have a kind, or (without megatron) none do.
+    kinds = {
+        group["adapter"]["kind"] is None
+        for group in groups
+        if group["adapter"] is not None
+    }
+    if len(kinds) > 1:
+        raise ValueError("invalid adapter gradient facts")
     if len(json.dumps(facts, separators=(",", ":"))) > _MAX_BYTES:
         raise ValueError("runtime_facts_over_limit")
 
@@ -420,14 +535,58 @@ def validate_tokens(inventories: Iterable[Any]) -> None:
         count(value)
 
 
+class _ReplaySlot(NamedTuple):
+    """A frozen adapter slot identity (the live LoRASlotRef's kind and name)."""
+
+    kind: str | None
+    name: str
+
+
 class ReplayRank(_impl.TrainerRank):
     """The real estimator with runtime metadata readers replaced by frozen facts."""
 
     _facts: dict[str, Any] | None = None
 
+    def _replay_slots(self, slot_refs: Any) -> Any:
+        # Replay passes each group's index; map it to that group's frozen slot.
+        if self._facts is None or slot_refs is None:
+            return slot_refs
+        groups = self._facts["groups"]
+        return tuple(
+            None
+            if (adapter := groups[index]["adapter"]) is None
+            else _ReplaySlot(adapter["kind"], adapter["name"])
+            for index in slot_refs
+        )
+
+    def _gradient_slots(self, group_rows: Any, slot_refs: Any) -> Any:
+        return _memory._gradient_slots(group_rows, self._replay_slots(slot_refs))
+
+    def _checkpoint_gradient_groups(self, group_rows: Any, slot_refs: Any) -> Any:
+        return _memory._checkpoint_gradient_groups(
+            self, group_rows, self._replay_slots(slot_refs)
+        )
+
+    def _pending_adapter_gradient_bytes(self, refs: Any) -> tuple[int, ...]:
+        if self._facts is None:
+            return _memory._pending_adapter_gradient_bytes(self, refs)
+        refs = tuple(dict.fromkeys(refs))
+        if not refs:
+            return ()
+        if len(refs) != 1:
+            raise ValueError("replayed adapter gradients are frozen per slot")
+        for group in self._facts["groups"]:
+            adapter = group["adapter"]
+            if adapter is not None and (adapter["kind"], adapter["name"]) == tuple(
+                refs[0]
+            ):
+                return tuple(adapter["pending"])
+        return ()
+
     def _head_workspace_bytes(self, rows: int) -> int:
         assert self._facts is not None
-        return _memory._dense_head_bytes(self._facts["head_vocabulary"], rows)
+        vocabulary = self._facts["head_vocabulary"]
+        return _memory._dense_head_bytes(vocabulary, rows) if rows > 0 else 0
 
     def verify_group(
         self, group: dict[str, Any], layout: Any, records: list[dict[str, Any]]
@@ -492,28 +651,71 @@ class ReplayRank(_impl.TrainerRank):
             raise ValueError("head row facts disagree with selected requests/layout")
 
     def _moe_workspace_bytes(
-        self, rows: int, *, checkpoint_grad: bool = False, slot_ref: Any = None
+        self,
+        rows: int,
+        *,
+        routed_rows: int | None = None,
+        checkpoint_grad: bool = False,
+        slot_ref: Any = None,
     ) -> int:
         if self._facts is None:
             return _memory._moe_workspace_bytes(
-                self, rows, checkpoint_grad=checkpoint_grad, slot_ref=slot_ref
+                self,
+                rows,
+                routed_rows=routed_rows,
+                checkpoint_grad=checkpoint_grad,
+                slot_ref=slot_ref,
             )
         group = self._facts["groups"][0 if slot_ref is None else slot_ref]
-        coefficient, stages = group["gradient" if checkpoint_grad else "forward"]
+        coefficient, stages, shared = group[
+            "gradient" if checkpoint_grad else "forward"
+        ]
         return _memory._moe_workspace_from_terms(
-            rows, (coefficient, tuple(map(tuple, stages)))
+            rows, (coefficient, tuple(map(tuple, stages)), shared), routed_rows
         )
 
     def _checkpoint_memory_floor(
-        self, group_rows: Any, slot_refs: Any = None, gdn_segments: int = 0
+        self,
+        group_rows: Any,
+        slot_refs: Any = None,
+        gdn_segments: int = 0,
+        routed_rows: Any = None,
     ) -> tuple[int, int]:
         if self._facts is None:
             return _memory._checkpoint_memory_floor(
-                self, group_rows, slot_refs, gdn_segments
+                self, group_rows, slot_refs, gdn_segments, routed_rows
             )
         return _memory._checkpoint_floor_from_facts(
-            self, group_rows, slot_refs, gdn_segments, self._facts["checkpoint_layers"]
+            self,
+            group_rows,
+            slot_refs,
+            gdn_segments,
+            self._facts["checkpoint_layers"],
+            routed_rows,
         )
+
+    def _moe_recompute_covered_for(self, slot_ref: Any) -> bool:
+        if self._facts is None:
+            return _memory._moe_recompute_covered_for(self, slot_ref)
+        if slot_ref is None:
+            raise ValueError("replayed MoE coverage is frozen per group")
+        return self._facts["groups"][slot_ref]["moe_covered"]
+
+    def _frozen(self, name: str) -> int:
+        assert self._facts is not None
+        return self._facts[name]
+
+    def _moe_checkpoint_state_bytes_per_token(self) -> int:
+        return self._frozen("moe_checkpoint_state_bytes_per_token")
+
+    def _te_workspace_growth_bytes(self) -> int:
+        return self._frozen("te_workspace_growth_bytes")
+
+    def _backward_row_state_bytes(self) -> int:
+        return self._frozen("backward_row_state_bytes")
+
+    def _triton_min_rows(self) -> int:
+        return self._frozen("triton_min_rows")
 
     def runtime_arguments(
         self, facts: Any, arguments: dict[str, Any]
@@ -529,6 +731,22 @@ class ReplayRank(_impl.TrainerRank):
             raise ValueError("runtime facts disagree with selected group rows")
         if arguments.get("hybridep_growth_bytes", 0):
             raise ValueError("hybridep_runtime_facts_unsupported")
+        # Capture refuses expert parallelism, where each group's experts see
+        # its local rows (_plan_group_routed_rows).
+        routed = tuple(g["rows"] for g in groups)
+        recorded = arguments.get("group_routed_rows")
+        if not isinstance(recorded, (list, tuple)) or tuple(recorded) != routed:
+            raise ValueError("runtime facts disagree with selected routed rows")
+        traced = arguments.get("head_backward_traced")
+        if type(traced) is not bool:
+            raise ValueError("head backward staging is not recorded")
+        # Live staging needs CP2 and a target backward through a priced head.
+        if traced and not (
+            self._topology_key()[2] == 2
+            and facts["head_target_backward"]
+            and facts["head_vocabulary"]
+        ):
+            raise ValueError("head backward staging disagrees with recorded facts")
         head = max(
             max(
                 _memory._dense_head_bytes(facts["head_vocabulary"], g["head_rows"]),
@@ -560,6 +778,7 @@ class ReplayRank(_impl.TrainerRank):
         return {
             **arguments,
             "group_rows": rows,
+            "group_routed_rows": routed,
             "slot_refs": tuple(range(len(groups))),
             "head_workspace_bytes": head,
             "checkpoint_floor": (retained, workspace),

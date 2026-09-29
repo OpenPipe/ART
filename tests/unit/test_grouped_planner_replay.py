@@ -171,6 +171,366 @@ def test_selected_slot_terms_are_replayed_and_frozen(layer, tmp_path):
     )
 
 
+def adapter_report(layer, tmp_path):
+    """A grouped report whose gradient slot has pending adapter gradients."""
+    from test_trainer_rank_adapter_gradient_memory import lora, parameter
+    from test_trainer_rank_converted_memory import weights
+    from test_trainer_rank_pending_memory import rank_with_moe
+    from test_trainer_rank_slot_memory import load_slot
+    from test_trainer_rank_slot_memory import request as slot_request
+
+    rank, _ = rank_with_moe(weights(layer, 8))
+    load_slot(rank, "small", 1)
+    load_slot(rank, "large", 64)
+    # Unallocated slot gradients the recompute backward will allocate: small,
+    # distinct per-layer sizes (the fixture has 40 layers; keep this bounded).
+    layers = tr._language_model(rank.runtime.model[0]).decoder.layers
+    assert len(layers) <= 64
+    sizes = [16 * (index + 1) for index in range(len(layers))]
+    assert sum(sizes) * 2 <= 66_560  # BF16 bytes, checked before allocating.
+    params = []
+    for size, block in zip(sizes, layers, strict=True):
+        params.append(parameter(size))
+        block.add_module("adapter", lora(large=[params[-1]]))
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward(
+        [slot_request("small", rows=2), slot_request("large", rows=65, grad=True)],
+        ensure_slots=False,
+    )
+    original, costs = emitted(rank, plan, tmp_path)
+    return original, costs, params
+
+
+def test_selected_adapter_gradients_are_replayed_and_frozen(layer, tmp_path):
+    original, costs, params = adapter_report(layer, tmp_path)
+    assert costs[0].checkpoint_adapter_gradient > 0
+    groups = original["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ]
+    assert groups[0]["adapter"] is None
+    assert groups[1]["adapter"]["name"] == "large" and any(
+        groups[1]["adapter"]["pending"]
+    )
+    actual = reports.replay(original)
+    assert actual["aggregate"]["matches"]
+    assert all(item["matches"] for item in actual["estimates"])
+    # Gradients allocated after selection cannot change the replayed answer.
+    for param in params:
+        param.grad = torch.zeros_like(param)
+    assert reports.replay(original) == actual
+    changed = deepcopy(original)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["groups"][1][
+        "adapter"
+    ]["pending"][0] += 10**12
+    result = reports.replay(changed)
+    assert not result["estimates"][0]["matches"]
+    assert (
+        result["estimates"][0]["required_bytes"]
+        > actual["estimates"][0]["required_bytes"]
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["gradient", "length", "value", "kind_length", "kindless_pending", "mixed_kinds"],
+)
+def test_adapter_fact_validation_rejects_forged_input(change, layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    group = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ][1]
+    adapter = group["adapter"]
+    if change == "gradient":
+        group["grad"] = False
+        group["moe_covered"] = False
+    elif change == "length":
+        adapter["pending"] = [0] * 1026
+    elif change == "value":
+        adapter["pending"][0] = 1.5
+    elif change == "kind_length":
+        adapter["kind"] = "k" * 65
+    elif change == "kindless_pending":
+        adapter["kind"] = None
+    else:
+        groups = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+            "groups"
+        ]
+        groups[0]["grad"] = True
+        groups[0]["adapter"] = {"kind": None, "name": "base", "pending": []}
+    # Name the refusal: a forged fact must fail validation, not a later check.
+    message = (
+        "invalid runtime dimension"
+        if change == "value"
+        else "invalid adapter gradient facts"
+    )
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+def test_recomputed_layer_and_head_stage_facts_are_replayed_and_frozen(
+    monkeypatch, tmp_path
+):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    original, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    item = original["replay"]["memory_replay"]["estimates"][0]
+    assert item["runtime_facts"]["groups"][0]["moe_covered"] is True
+    assert item["arguments"]["head_backward_traced"] is False
+    actual = reports.replay(original)
+    assert actual["aggregate"]["matches"]
+    # The replaying process's settings and TE state do not enter the answer.
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "1")
+    monkeypatch.setattr(tr, "_TE_CUBLAS_WORKSPACE_BYTES", 0)
+    assert reports.replay(original) == actual
+    for field in (
+        "moe_checkpoint_state_bytes_per_token",
+        "te_workspace_growth_bytes",
+        "backward_row_state_bytes",
+        "triton_min_rows",
+    ):
+        changed = deepcopy(original)
+        changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][field] += (
+            10**9
+        )
+        result = reports.replay(changed)
+        assert not result["estimates"][0]["matches"], field
+        assert (
+            result["estimates"][0]["required_bytes"]
+            > actual["estimates"][0]["required_bytes"]
+        ), field
+    # Coverage selects the input-gradient charge and whether the head stages.
+    changed = deepcopy(original)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["groups"][0][
+        "moe_covered"
+    ] = False
+    result = reports.replay(changed)
+    assert not result["estimates"][0]["matches"]
+    assert (
+        result["estimates"][0]["required_bytes"]
+        != actual["estimates"][0]["required_bytes"]
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["shared", "covered_no_grad", "triton_min_rows", "routed_rows", "head_staging"],
+)
+def test_recomputed_layer_fact_validation_rejects_forged_input(change, layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    item = report["replay"]["memory_replay"]["estimates"][0]
+    facts = item["runtime_facts"]
+    if change == "shared":
+        terms = facts["groups"][1]["gradient"]
+        terms[2] = terms[0] + 1
+        message = "invalid MoE terms"
+    elif change == "covered_no_grad":
+        facts["groups"][0]["moe_covered"] = True
+        message = "invalid MoE recompute coverage"
+    elif change == "triton_min_rows":
+        facts["triton_min_rows"] = 64.0
+        message = "invalid runtime dimension"
+    elif change == "routed_rows":
+        item["arguments"]["group_routed_rows"][1] -= 1
+        message = "routed rows"
+    else:
+        del item["arguments"]["head_backward_traced"]
+        message = "head backward staging"
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("value", [None, 1.5, -1])
+def test_replay_refuses_invalid_recorded_geometry(value, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    # The recomputed mixer multiplies these; refuse before any pricing.
+    report["replay"]["memory_replay"]["rank"]["geometry"]["kv_channels"] = value
+    with pytest.raises(ValueError, match="geometry"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("setting", ["0", "-3"])
+def test_non_positive_triton_threshold_is_captured_and_replayed(
+    setting, monkeypatch, tmp_path
+):
+    # Live pricing accepts it (the fallback chunk then prices no rows).
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", setting)
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, costs = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    assert facts["triton_min_rows"] == int(setting)
+    result = reports.replay(report)
+    assert result["aggregate"]["matches"]
+    assert result["estimates"][0]["required_bytes"] == costs[0].required
+
+
+def test_recompute_readers_are_unread_without_a_checkpointed_decoder(
+    monkeypatch, tmp_path
+):
+    from art.trainer_rank import _planner_replay
+
+    # Live pricing reads them only for a checkpointed decoder's recompute;
+    # capture must not refuse a plan over a setting live never reads.
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "not-a-number")
+    rank = _rank(monkeypatch)
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(rank, rank._plan_flat_forward([_request(1)]), tmp_path)
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    assert facts["checkpoint_layers"] == 0
+    assert all(facts[name] is None for name in _planner_replay._RECOMPUTE_READERS)
+    assert reports.replay(report)["aggregate"]["matches"]
+    forged = deepcopy(report)
+    forged["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "te_workspace_growth_bytes"
+    ] = 0
+    with pytest.raises(ValueError, match="invalid runtime dimension"):
+        reports.replay(forged)
+
+
+def test_staged_head_needs_recorded_cp2_target_backward(tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    # This CP1 plan cannot stage its head; a forged flag must not price it so.
+    report["replay"]["memory_replay"]["estimates"][0]["arguments"][
+        "head_backward_traced"
+    ] = True
+    with pytest.raises(ValueError, match="staging disagrees"):
+        reports.replay(report)
+
+
+def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        tr,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
+    )
+    from types import SimpleNamespace
+
+    from art.megatron.context_parallel.types import ParallelTopology
+
+    # CP2 through the stock topology reader (as capture requires), over a CPU
+    # CP2 topology and planning config.
+    monkeypatch.setattr(tr.TrainerRank, "_topology_key", lambda self: (1, 1, 2, 1))
+    rank = head_rank()
+    rank._topology = lambda: ParallelTopology(tp=1, cp=2)
+    for name, value in {
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "params_dtype": torch.bfloat16,
+    }.items():
+        setattr(rank.runtime.provider, name, value)
+    rank.runtime.model_support_handler = SimpleNamespace(
+        build_gdn_execution_spec=True,
+        context_parallel_workload_profile=lambda provider: None,
+    )
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward([request(512, grad=True)])
+    assert plan.signature.topology[2] == 2
+    report, costs = emitted(rank, plan, tmp_path)
+    item = report["replay"]["memory_replay"]["estimates"][0]
+    assert item["arguments"]["head_backward_traced"] is True
+    result = reports.replay(report)
+    assert result["aggregate"]["matches"]
+    assert result["estimates"][0]["required_bytes"] == costs[0].required
+
+
+@pytest.mark.parametrize("change", ["omit_default", "omit_required", "extra"])
+def test_recorded_geometry_fields_follow_its_schema(change, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    geometry = report["replay"]["memory_replay"]["rank"]["geometry"]
+    if change == "omit_default":
+        # Older reports may omit fields that default to zero.
+        (name,) = [n for n, v in geometry.items() if n == "gdn_conv_kernel" and v == 0]
+        del geometry[name]
+        assert reports.replay(report)["aggregate"]["matches"]
+        return
+    if change == "omit_required":
+        del geometry["kv_channels"]
+    else:
+        geometry["unknown_width"] = 1
+    with pytest.raises(ValueError, match="geometry"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize(
+    "field,value", [("hidden_size", "8"), ("gdn_layers", -1), ("sequence_parallel", 0)]
+)
+def test_replay_refuses_invalid_recorded_rank_dimensions(field, value, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    report["replay"]["memory_replay"]["rank"][field] = value
+    with pytest.raises(ValueError, match="rank dimensions"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "_te_workspace_growth_bytes",
+        "_moe_recompute_covered_for",
+        "_triton_min_rows",
+        "_plan_group_routed_rows",
+        "_plan_head_backward_traced",
+        "_head_backward_traced",
+    ],
+)
+def test_custom_recomputed_layer_reader_is_explicitly_incomplete(name, monkeypatch):
+    from art.trainer_rank import _planner_replay
+
+    rank = _rank(monkeypatch)
+    plan = rank._plan_flat_forward([_request(1)])
+    original = getattr(rank, name)
+    monkeypatch.setattr(rank, name, lambda *args: original(*args))
+    with pytest.raises(ValueError, match="custom_runtime_estimator"):
+        _planner_replay.capture(rank, plan)
+
+
+@pytest.mark.parametrize("layers", [2**10 + 1, 0, 40.0])
+def test_replay_bounds_the_recorded_layer_count(layers, pending_rank, tmp_path):
+    rank = pending_rank
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    # Replay sizes per-layer tuples from this field; refuse it before costing.
+    report["replay"]["memory_replay"]["rank"]["num_layers"] = layers
+    with pytest.raises(ValueError, match="layer count"):
+        reports.replay(report)
+
+
+def test_custom_adapter_gradient_reader_is_explicitly_incomplete(monkeypatch):
+    from art.trainer_rank import _planner_replay
+
+    rank = _rank(monkeypatch)
+    plan = rank._plan_flat_forward([_request(1)])
+    original = rank._pending_adapter_gradient_bytes
+    monkeypatch.setattr(
+        rank, "_pending_adapter_gradient_bytes", lambda refs: original(refs)
+    )
+    with pytest.raises(ValueError, match="custom_runtime_estimator"):
+        _planner_replay.capture(rank, plan)
+
+
 @pytest.mark.parametrize(
     "change", ["version", "group", "layout", "gdn_segment", "budget"]
 )
@@ -184,7 +544,7 @@ def test_fact_validation_rejects_inconsistent_or_unbounded_input(
     )
     facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
     if change == "version":
-        facts["version"] = 2
+        facts["version"] += 1
     elif change == "group":
         facts["groups"][0]["rows"] += 1
     elif change == "layout":
