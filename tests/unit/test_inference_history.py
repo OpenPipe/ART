@@ -3,7 +3,10 @@ import copy
 import json
 from types import SimpleNamespace
 
-from openai.types.chat import ChatCompletionMessageToolCallParam
+from openai.types.chat import (
+    ChatCompletionMessageToolCallParam,
+    ChatCompletionMessageToolCallUnionParam,
+)
 from pydantic import BaseModel, TypeAdapter, model_validator
 import pytest
 
@@ -37,6 +40,7 @@ class Message(BaseModel):
     role: str = "assistant"
     reasoning_content: str
     content: str
+    tool_calls: list[dict] = []
 
 
 @pytest.fixture
@@ -90,6 +94,7 @@ def serving(monkeypatch):
             self.chat_template = None
             self.chat_template_content_format = "string"
             self.parser = None
+            self.message = Message(reasoning_content="\nthought\n", content="action")
 
         async def preprocess_chat(self, request, messages, **kwargs):
             return await self.render_chat_request(request)
@@ -119,7 +124,7 @@ def serving(monkeypatch):
 
         async def create_chat_completion(self, request, raw_request=None):
             _, inputs = await self.render_chat_request(request)
-            message = Message(reasoning_content="\nthought\n", content="action")
+            message = self.message
 
             async def stream():
                 params = SimpleNamespace(output_kind=SimpleNamespace(name="DELTA"))
@@ -468,5 +473,106 @@ def test_responses_observe_rendered_tool_history_without_rejecting_result(
         assert (
             request.messages[1]["tool_calls"][0]["function"]["arguments"] == arguments
         )
+
+    asyncio.run(run())
+
+
+class ToolValidatedRequest(Request):
+    @model_validator(mode="after")
+    def validate_tool_calls(self):
+        for message in self.messages:
+            for call in message.get("tool_calls") or []:
+                TypeAdapter(ChatCompletionMessageToolCallUnionParam).validate_python(
+                    call
+                )
+        return self
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("incomplete", ["sparse", "missing_id", "missing_name"])
+def test_unrenderable_tool_observation_preserves_response(
+    serving, monkeypatch, stream, incomplete
+):
+    server, modules = serving
+    calls = [
+        {
+            "index": index,
+            "id": f"call_{index}",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        for index in (0, 2)
+    ]
+    if incomplete == "sparse":
+        if not stream:
+            calls.insert(1, {})
+    else:
+        calls = calls[:1]
+        if incomplete == "missing_id":
+            del calls[0]["id"]
+        else:
+            del calls[0]["function"]["name"]
+    server.message = Message(
+        reasoning_content="\nthought\n", content="", tool_calls=calls
+    )
+    original = copy.deepcopy(server.message.model_dump())
+    observed, completed_observations = [], []
+    original_observer = vllm.chat_response_prefixes
+
+    async def observe_choices(*args, **kwargs):
+        result = await original_observer(*args, **kwargs)
+        completed_observations.append(result)
+        return result
+
+    monkeypatch.setattr(vllm, "chat_response_prefixes", observe_choices)
+
+    async def observe(request, entries):
+        observed.extend(entries)
+
+    vllm.set_external_history_observer(observe, modules.__getitem__)
+
+    async def run():
+        response = await server.create_chat_completion(
+            ToolValidatedRequest(
+                messages=[{"role": "user", "content": "question"}], stream=stream
+            ),
+            SimpleNamespace(headers={"x-caladan-prefix-scope": "scope"}),
+        )
+        if stream:
+            chunks = [chunk async for chunk in response]
+            assert chunks[-1] == "data: [DONE]\n\n"
+            value = json.loads(chunks[0][6:])
+            assert value["choices"][0]["delta"] == original
+        else:
+            assert response.choices[0].message.model_dump() == original
+        # No invalid completed assistant is repaired or certified. The engine
+        # output observer remains unchanged and independent of this path.
+        assert observed == [] and completed_observations == [[]]
+        assert server.message.model_dump() == original
+
+    asyncio.run(run())
+
+
+def test_completed_observation_renderer_error_is_not_hidden(serving):
+    server, _ = serving
+    original = server.render_chat_request
+    failure = ValueError("renderer failed after valid request construction")
+
+    async def render(request):
+        if not request.add_generation_prompt:
+            raise failure
+        return await original(request)
+
+    server.render_chat_request = render
+
+    async def run():
+        response = await server.create_chat_completion(
+            ToolValidatedRequest(
+                messages=[{"role": "user", "content": "question"}], stream=True
+            )
+        )
+        with pytest.raises(ValueError) as caught:
+            _ = [chunk async for chunk in response]
+        assert caught.value is failure
 
     asyncio.run(run())
