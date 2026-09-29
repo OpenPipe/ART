@@ -390,23 +390,22 @@ def load_unique_hf_keys_once(
         else:
             materialized_source_by_key[key] = (source, selected_option)
 
-    physical_direct_keys = sorted(set(direct_physical_by_logical.values()))
-    if physical_direct_keys and hasattr(hf_state_dict, "__getitem__"):
-        hf_state_dict_getter = cast(Any, hf_state_dict)
-        loaded = (
-            hf_state_dict_getter[physical_direct_keys]
-            if not isinstance(hf_state_dict, dict)
-            else {key: hf_state_dict[key] for key in physical_direct_keys}
-        )
-    else:
-        loaded = {key: hf_state_dict[key] for key in physical_direct_keys}
-    loaded_direct = cast(Mapping[str, torch.Tensor], loaded)
-    cache.update(
-        {
-            logical_key: _pin_cpu_tensor(loaded_direct[physical_key])
-            for logical_key, physical_key in direct_physical_by_logical.items()
-        }
-    )
+    last_logical_by_physical = {
+        physical_key: logical_key
+        for logical_key, physical_key in direct_physical_by_logical.items()
+    }
+    loaded_direct: dict[str, torch.Tensor] = {}
+    for logical_key, physical_key in direct_physical_by_logical.items():
+        if physical_key not in loaded_direct:
+            loaded_direct[physical_key] = (
+                hf_state_dict[physical_key]
+                if isinstance(hf_state_dict, dict)
+                else cast(Any, hf_state_dict)[[physical_key]][physical_key]
+            )
+        cache[logical_key] = _pin_cpu_tensor(loaded_direct[physical_key])
+        # Preserve per-logical pinning and aliases without retaining dead sources.
+        if last_logical_by_physical[physical_key] == logical_key:
+            del loaded_direct[physical_key]
     for key, (source, selected_option) in materialized_source_by_key.items():
         cache[key] = _pin_cpu_tensor(
             _materialize_hf_weight_source(
