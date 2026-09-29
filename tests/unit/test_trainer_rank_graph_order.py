@@ -9,6 +9,7 @@ import torch.multiprocessing as mp
 from trainer_rank_test_support import gloo_group
 
 from art.trainer_rank import TrainerRank, _graphs
+from art.trainer_rank._commands import _coordinate_call
 from art.trainer_rank._impl import _CheckpointSlot
 
 
@@ -64,16 +65,7 @@ def _worker(rank, rendezvous, fail_replay):
             packets.append((handle, (torch.tensor(1.0),)))
 
         def coordinate(function):
-            result, error = None, None
-            try:
-                result = function()
-            except Exception as exc:
-                error = str(exc)
-            errors = [None, None]
-            dist.all_gather_object(errors, error)
-            if any(errors):
-                raise RuntimeError(str(errors))
-            return result
+            return _coordinate_call(function, group=None)
 
         for parameter in parameters:
             parameter.grad = torch.tensor(7.0)

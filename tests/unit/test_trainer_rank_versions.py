@@ -13,6 +13,7 @@ from torch.utils.checkpoint import checkpoint
 from trainer_rank_test_support import gloo_group, spawn_and_join
 
 from art.trainer_rank import TrainerRank, TrainerRankSlotStateError
+from art.trainer_rank._commands import _coordinate_call
 from art.trainer_rank._impl import _CheckpointSlot
 
 
@@ -425,17 +426,7 @@ def _transaction_exit_failure_worker(rank: int, rendezvous: str, nested: bool) -
 
         def coordinate(validate) -> None:
             calls.append(True)
-            error = None
-            try:
-                validate()
-            except BaseException as exc:
-                error = exc
-            errors = [None, None]
-            dist.all_gather_object(errors, None if error is None else str(error))
-            if error is not None:
-                raise error
-            if any(errors):
-                raise RuntimeError(f"another rank failed: {errors}")
+            _coordinate_call(validate, group=None)
 
         saved_error = None
         reference = None

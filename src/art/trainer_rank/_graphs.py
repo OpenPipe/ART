@@ -572,71 +572,61 @@ class GraphCache:
     ) -> None:
         self.validate_many(packets)
         try:
-            self._backward_validated(
-                packets,
-                retain_graph=retain_graph,
-                coordinate=coordinate or (lambda function: function()),
-            )
+            coordinate = coordinate or (lambda function: function())
+            # Random wire handles differ across physical ranks. Creation order is
+            # shared by TP/CP peers and therefore fixes backward collective order.
+            ordinals = {handle: index for index, handle in enumerate(self._records)}
+            ordered_packets = sorted(packets, key=lambda packet: ordinals[packet[0]])
+            prepared = {}
+            stale = {
+                handle: record.is_stale is not None and record.is_stale()
+                for handle, _ in ordered_packets
+                for record in (self._records[handle],)
+            }
+            # The coordinator uses this logical rank's TP/CP group, never all DP
+            # ranks: different DP owners may have different numbers of graphs.
+            try:
+                for handle, gradients in ordered_packets:
+                    record = self._records[handle]
+                    prepared[handle] = coordinate(
+                        lambda: self._prepare_correction(
+                            record, gradients, stale[handle]
+                        )
+                    )
+                for handle, gradients in ordered_packets:
+                    record = self._records[handle]
+                    pairs = coordinate(
+                        lambda: self._prepare_backward(
+                            record, gradients, stale[handle], prepared[handle]
+                        )
+                    )
+                    try:
+                        coordinate(
+                            lambda: (
+                                torch.autograd.backward(
+                                    [output for output, _ in pairs],
+                                    [gradient for _, gradient in pairs],
+                                    retain_graph=retain_graph,
+                                )
+                                if pairs
+                                else None
+                            )
+                        )
+                    finally:
+                        record.restored.clear()
+                        pairs.clear()
+                    if not retain_graph:
+                        self.release(handle)
+                    elif record.retention == "replay":
+                        self.evict(handle)
+            finally:
+                prepared.clear()
         except BaseException:
             # A replay/backward failure consumes the operation. The enclosing
             # checkpoint transaction discards unpublished optimizer gradients.
             for handle, _ in packets:
                 self.release(handle)
             raise
-
-    def _backward_validated(
-        self,
-        packets: Sequence[tuple[ForwardHandle, Sequence[torch.Tensor | None]]],
-        *,
-        retain_graph: bool,
-        coordinate: Callable[[Callable[[], Any]], Any],
-    ) -> None:
-        # Random wire handles differ across physical ranks. Creation order is
-        # shared by TP/CP peers and therefore fixes backward collective order.
-        ordinals = {handle: index for index, handle in enumerate(self._records)}
-        packets = sorted(packets, key=lambda packet: ordinals[packet[0]])
-        prepared = {}
-        stale = {
-            handle: record.is_stale is not None and record.is_stale()
-            for handle, _ in packets
-            for record in (self._records[handle],)
-        }
-        # The coordinator uses this logical rank's TP/CP group, never all DP
-        # ranks: different DP owners may have different numbers of graphs.
-        try:
-            for handle, gradients in packets:
-                record = self._records[handle]
-                prepared[handle] = coordinate(
-                    lambda: self._prepare_correction(record, gradients, stale[handle])
-                )
-            for handle, gradients in packets:
-                record = self._records[handle]
-                pairs = coordinate(
-                    lambda: self._prepare_backward(
-                        record, gradients, stale[handle], prepared[handle]
-                    )
-                )
-                try:
-                    coordinate(
-                        lambda: (
-                            torch.autograd.backward(
-                                [output for output, _ in pairs],
-                                [gradient for _, gradient in pairs],
-                                retain_graph=retain_graph,
-                            )
-                            if pairs
-                            else None
-                        )
-                    )
-                finally:
-                    record.restored.clear()
-                    pairs.clear()
-                if not retain_graph:
-                    self.release(handle)
-                elif record.retention == "replay":
-                    self.evict(handle)
-        finally:
-            prepared.clear()
 
     @staticmethod
     def _prepare_correction(record, gradients, stale):
