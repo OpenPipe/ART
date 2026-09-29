@@ -231,7 +231,8 @@ def test_selected_adapter_gradients_are_replayed_and_frozen(layer, tmp_path):
 
 
 @pytest.mark.parametrize(
-    "change", ["gradient", "length", "value", "kind_length", "kindless_pending"]
+    "change",
+    ["gradient", "length", "value", "kind_length", "kindless_pending", "mixed_kinds"],
 )
 def test_adapter_fact_validation_rejects_forged_input(change, layer, tmp_path):
     report, _, _ = adapter_report(layer, tmp_path)
@@ -247,8 +248,14 @@ def test_adapter_fact_validation_rejects_forged_input(change, layer, tmp_path):
         adapter["pending"][0] = 1.5
     elif change == "kind_length":
         adapter["kind"] = "k" * 65
-    else:
+    elif change == "kindless_pending":
         adapter["kind"] = None
+    else:
+        groups = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+            "groups"
+        ]
+        groups[0]["grad"] = True
+        groups[0]["adapter"] = {"kind": None, "name": "base", "pending": []}
     with pytest.raises(ValueError):
         reports.replay(report)
 

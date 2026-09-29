@@ -76,7 +76,10 @@ def _fact_budget() -> Callable[[int], None]:
 
 
 def capture(rank: Any, plan: Any) -> dict[str, Any]:
-    if rank._num_layers > MAX_LAYERS or not 0 < len(plan.groups) <= _MAX_GROUPS:
+    if (
+        not 0 < rank._num_layers <= MAX_LAYERS
+        or not 0 < len(plan.groups) <= _MAX_GROUPS
+    ):
         raise ValueError("runtime_group_inventory_over_limit")
     if (
         getattr(rank.runtime.provider, "expert_model_parallel_size", 1) > 1
@@ -436,6 +439,14 @@ def validate(facts: Any) -> None:
                 )
                 for value in segment.values():
                     integer(value)
+    # Live slot references all have a kind, or (without megatron) none do.
+    kinds = {
+        group["adapter"]["kind"] is None
+        for group in groups
+        if group["adapter"] is not None
+    }
+    if len(kinds) > 1:
+        raise ValueError("invalid adapter gradient facts")
     if len(json.dumps(facts, separators=(",", ":"))) > _MAX_BYTES:
         raise ValueError("runtime_facts_over_limit")
 
