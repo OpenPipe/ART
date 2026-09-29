@@ -129,22 +129,36 @@ class _SnapshotSpill:
             tuple[Path, dict[str, dict[str, torch.Tensor]], Future[None]]
         ] = deque()
         self.thread: threading.Thread | None = None
+        self.workspace: dict[Future[None], int] = {}
 
     def submit(
         self, snapshot: Path, payloads: dict[str, dict[str, torch.Tensor]]
     ) -> Future[None]:
         result: Future[None] = Future()
         with self.lock:
+            self.workspace[result] = max(
+                (
+                    sum(
+                        value.numel()
+                        * value.element_size()
+                        * (1 if value.is_contiguous() else 2)
+                        for value in tensors.values()
+                    )
+                    for tensors in payloads.values()
+                ),
+                default=0,
+            )
             self.pending.append((snapshot, payloads, result))
             if self.thread is None:
-                self.thread = threading.Thread(
-                    target=self._run, name="checkpoint-snapshot"
-                )
                 try:
+                    self.thread = threading.Thread(
+                        target=self._run, name="checkpoint-snapshot"
+                    )
                     self.thread.start()
                 except BaseException:
                     self.thread = None
                     self.pending.pop()
+                    self.workspace.pop(result)
                     raise
         return result
 
@@ -188,6 +202,8 @@ class _SnapshotSpill:
             finally:
                 payloads.clear()
                 tensors = None
+                with self.lock:
+                    self.workspace.pop(result)
             if error is None:
                 result.set_result(None)
             else:
@@ -940,6 +956,74 @@ def _local_state(
     return tuple(records), optimizer, _custom_snapshot(trainer, name, files)
 
 
+def _admit_snapshot(trainer: TrainerRank, name: str) -> None:
+    """Estimate registered copies without executing user serialization hooks.
+
+    Unregistered allocations, payload-expanding hooks and concurrent external
+    allocations are outside this estimate.
+    """
+    from ._impl import _custom_named_parameters
+
+    slot = trainer._checkpoint_slots[name]
+    custom_params = {
+        id(param)
+        for key, custom in slot.custom.items()
+        for _, param in _custom_named_parameters(key, custom)
+    }
+    tensors: list[torch.Tensor] = [
+        param for param in slot.params if id(param) not in custom_params
+    ]
+    for custom in slot.custom.values():
+        if custom.kind == "module":
+            for _, child in cast(torch.nn.Module, custom.value).named_modules(
+                remove_duplicate=False
+            ):
+                tensors.extend(p for p in child._parameters.values() if p is not None)
+                tensors.extend(
+                    value
+                    for key, value in child._buffers.items()
+                    if value is not None
+                    and key not in child._non_persistent_buffers_set
+                )
+        else:
+            tensors.append(cast(torch.Tensor, custom.value))
+    cached = slot.custom_payload
+    if cached is not None:
+        tensors.extend(cached.tensors.values())
+        tensors.extend(cached.optimizer.values())
+    size = sum(value.numel() * value.element_size() for value in tensors)
+    if slot.optimizer is not None:
+        step_bytes = torch.finfo(torch.get_default_dtype()).bits // 8
+        # Three FP32 optimizer components and at most one step per expert element.
+        size += sum(
+            3 * master.numel() * max(4, master.element_size())
+            + max(1, master.numel()) * step_bytes
+            for master in slot.optimizer.master_params
+        )
+        if cached is not None:
+            size += sum(
+                12 * cached.tensors[key].numel() + step_bytes
+                for record in cached.records.values()
+                for key in record["trainable_keys"]
+                if f"master/{key}" not in cached.optimizer
+            )
+    # Capture may overlap source copies/zeros and an older writer. Writing holds
+    # captured tensors, contiguous packing, and one file's serialized byte strings.
+    # Fresh headroom already excludes resident captures; do not charge them again.
+    workspace = 0
+    spill = getattr(trainer, "_checkpoint_snapshot_spill", None)
+    if spill is not None:
+        with spill.lock:
+            workspace = max(spill.workspace.values(), default=0)
+    required = max(2 * size + workspace, 3 * size)
+    available = trainer._available_cpu_memory_bytes()
+    if required > available:
+        raise RuntimeError(
+            f"Cannot capture checkpoint: estimated host memory needs {required} additional "
+            f"bytes, {available} available; finish pending saves and retry"
+        )
+
+
 def prepare_checkpoint_save(
     trainer: TrainerRank, output_dir: str, checkpoint_name: str
 ) -> None:
@@ -972,6 +1056,11 @@ def prepare_checkpoint_save(
                 )
             from ._heads import synchronize_head_buffers
 
+            _phase(
+                lambda: _admit_snapshot(trainer, checkpoint_name),
+                "admit checkpoint host memory",
+                group,
+            )
             synchronize_head_buffers(trainer, (checkpoint_name,))
             config = deepcopy(_validate_save_state(trainer, checkpoint_name))
             if any(value != config for value in _gather(config, group)):

@@ -2,19 +2,17 @@
 
 from datetime import timedelta
 from pathlib import Path
-import sys
 import threading
 import time
-from types import SimpleNamespace
 
 import pytest
 import safetensors.torch
-from test_trainer_rank_validation import _save_state_trainer
+from test_checkpoint_snapshot_spill import _snapshot_trainer
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from art.trainer_rank._impl import _CheckpointSlot, _CustomObject
+from art.trainer_rank import _checkpoint as cp
 
 
 def _worker(rank, directory, failure, action, prepared, released, finalized):
@@ -24,18 +22,6 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
         world_size=2,
         init_method=f"file://{directory}/gloo",
         timeout=timedelta(seconds=15),
-    )
-    trainer = _save_state_trainer()
-    parameter = torch.nn.Parameter(torch.tensor([1.0]))
-    trainer._checkpoint_slots["a"] = _CheckpointSlot(
-        params=(parameter,),
-        config={
-            "base_model_name_or_path": "test/model",
-            "r": 1,
-            "lora_alpha": 1,
-            "target_modules": ["q_proj"],
-        },
-        custom={"p": _CustomObject("parameter", parameter, object())},
     )
     output = str(Path(directory) / "failed")
     original_write, original_start = safetensors.torch.save_file, threading.Thread.start
@@ -55,17 +41,34 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
 
     try:
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(trainer, "_slot_ref", lambda _: None)
-            patch.setitem(
-                sys.modules,
-                "art.megatron.lora",
-                SimpleNamespace(LoRA=type("UnusedLoRA", (), {})),
-            )
-            patch.setitem(
-                sys.modules,
-                "art.megatron.weights.lora_publish",
-                SimpleNamespace(collect_local_lora_entries=lambda *a, **kw: ({}, [])),
-            )
+            trainer = _snapshot_trainer(patch)
+            parameter = trainer._checkpoint_slots["a"].params[0]
+            if failure == "admission":
+                with pytest.MonkeyPatch.context() as admission:
+                    admission.setattr(
+                        trainer,
+                        "_available_cpu_memory_bytes",
+                        lambda: 0 if rank == 0 else 12,
+                    )
+                    admission.setattr(
+                        cp,
+                        "_local_state",
+                        lambda *_: pytest.fail(
+                            "capture ran before collective admission"
+                        ),
+                    )
+                    admission.setattr(
+                        "art.trainer_rank._heads.synchronize_head_buffers",
+                        lambda *_: pytest.fail("buffer copies ran before admission"),
+                    )
+                    with pytest.raises(RuntimeError, match="checkpoint.*host memory"):
+                        trainer.prepare_checkpoint_save(output, "a")
+                assert not trainer._checkpoint_preparing_saves
+                assert not trainer._prepared_checkpoint_saves
+                assert trainer._checkpoint_snapshot_spill is None
+                assert not list(Path(directory).glob(".failed.*"))
+                assert trainer._checkpoint_save_sequence == 0
+                failure = "write"
             patch.setattr(safetensors.torch, "save_file", write)
             patch.setattr(threading.Thread, "start", start)
             trainer.prepare_checkpoint_save(output, "a")
@@ -105,8 +108,16 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("action", ["finish", "abort"])
-@pytest.mark.parametrize("failure", ["start", "write"])
+@pytest.mark.parametrize(
+    "failure,action",
+    [
+        ("start", "finish"),
+        ("start", "abort"),
+        ("write", "finish"),
+        ("write", "abort"),
+        ("admission", "finish"),
+    ],
+)
 def test_asymmetric_snapshot_failure_does_not_block_capture(tmp_path, action, failure):
     context = mp.get_context("spawn")
     prepared = [context.Event() for _ in range(2)]
@@ -119,7 +130,7 @@ def test_asymmetric_snapshot_failure_does_not_block_capture(tmp_path, action, fa
         )
         for rank in range(2)
     ]
-    deadline = time.monotonic() + 40
+    deadline = time.monotonic() + 60
     try:
         for process in processes:
             process.start()
