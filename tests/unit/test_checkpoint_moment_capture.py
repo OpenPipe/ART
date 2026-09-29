@@ -110,9 +110,7 @@ def test_moment_capture(captured_state, monkeypatch, present, allocation_guard):
             )
         expected_optimizer[f"step/{key}"] = torch.tensor(7.0)
 
-    live_storage = {
-        value.untyped_storage().data_ptr() for value in (*params, *masters)
-    }
+    live_storage = {value.untyped_storage().data_ptr() for value in (*params, *masters)}
     zeros = []
     original = torch.zeros_like
 
