@@ -956,6 +956,9 @@ def _local_state(
     return tuple(records), optimizer, _custom_snapshot(trainer, name, files)
 
 
+_CAPTURE_FRAME_CODES = (_local_state.__code__, _custom_snapshot.__code__)
+
+
 def _admit_snapshot(trainer: TrainerRank, name: str) -> None:
     """Estimate registered copies without executing user serialization hooks.
 
@@ -1112,6 +1115,13 @@ def prepare_checkpoint_save(
             )
         except BaseException as exc:
             error = exc
+            # Only our completed capture frames own these partial snapshots;
+            # preserve active callers and foreign copy/hook traceback locals.
+            capture_tb = exc.__traceback__
+            while capture_tb is not None:
+                if capture_tb.tb_frame.f_code in _CAPTURE_FRAME_CODES:
+                    capture_tb.tb_frame.clear()
+                capture_tb = capture_tb.tb_next
         try:
             raise_distributed(error, "prepare checkpoint", group)
             if any(value != optimizer for value in _gather(optimizer, group)):

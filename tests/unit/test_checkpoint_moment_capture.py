@@ -1,12 +1,15 @@
 """Tiny CPU captures through the real collector; no CUDA performance claim."""
 
+import gc
 from importlib.util import find_spec
+import traceback
 from typing import Any, cast
 
 import pytest
 import safetensors.torch
 from test_trainer_rank_validation import _save_state_trainer
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 
 from art.trainer_rank import _checkpoint as cp
 from art.trainer_rank._impl import _CheckpointSlot, _CustomObject, _DynamicOptimizer
@@ -164,3 +167,73 @@ def test_moment_capture(captured_state, monkeypatch, present, allocation_guard):
         before = saved[f"exp_avg_sq/{key}"].clone()
         saved[f"exp_avg/{key}"].add_(100)
         torch.testing.assert_close(saved[f"exp_avg_sq/{key}"], before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("captured_state", ("custom", "dense"), indirect=True)
+def test_failed_capture_releases_partial_copies(captured_state, tmp_path, monkeypatch):
+    trainer, params, masters, _, _, expected, _ = captured_state
+    trainer._checkpoint_slots["a"].config = {
+        "base_model_name_or_path": "test/model",
+        "r": 2,
+        "lora_alpha": 2,
+        "target_modules": ["q_proj"],
+    }
+    borrowed = [
+        StorageWeakRef(value.untyped_storage()) for value in (*params, *masters)
+    ]
+    sentinel = torch.tensor([13.0])
+    copies = []
+    calls = 0
+    error, cause = OSError("CPU capture copy failed"), RuntimeError("copy cause")
+    original = torch.Tensor.to
+
+    def copy(value, *args, **kwargs):
+        nonlocal calls
+        foreign_marker = sentinel
+        if kwargs.get("copy"):
+            calls += 1
+            if calls == 2:
+                try:
+                    raise cause
+                except RuntimeError:
+                    raise error from cause
+        result = original(value, *args, **kwargs)
+        if kwargs.get("copy"):
+            copies.append(StorageWeakRef(result.untyped_storage()))
+        assert foreign_marker is sentinel
+        return result
+
+    output = str(tmp_path / "reusable")
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.Tensor, "to", copy)
+            with pytest.raises(OSError) as caught:
+                trainer.prepare_checkpoint_save(output, "a")
+        assert caught.value is error and error.__cause__ is cause
+        for failure in (error, cause):
+            frame = next(
+                frame
+                for frame, _ in traceback.walk_tb(failure.__traceback__)
+                if frame.f_code is copy.__code__
+            )
+            assert frame.f_locals["foreign_marker"] is sentinel
+        assert calls == 2 and len(copies) == 1 and copies[0].expired()
+        assert all(not storage.expired() for storage in borrowed)
+        assert not trainer._checkpoint_preparing_saves
+        assert not trainer._prepared_checkpoint_saves
+        assert not list(tmp_path.glob(".reusable.*"))
+        trainer.prepare_checkpoint_save(output, "a")
+        prepared = trainer._prepared_checkpoint_saves[output]
+        assert prepared.writer is not None
+        prepared.writer.result(3)
+        for filename, tensors in expected.items():
+            actual = safetensors.torch.load_file(prepared.snapshot / filename)
+            for key, reference in tensors.items():
+                torch.testing.assert_close(actual[key], reference, rtol=0, atol=0)
+    finally:
+        if enabled:
+            gc.enable()
+        for pending in list(trainer._prepared_checkpoint_saves):
+            trainer.abort_checkpoint_save(pending)
