@@ -28,19 +28,22 @@ T = TypeVar("T")
 def _coordinate_call(call: Callable[[], T], *, group: dist.ProcessGroup | None) -> T:
     result, error = None, None
     try:
-        result = call()
-    except BaseException as exc:
-        error = exc
-    failures = [None if error is None else f"{type(error).__name__}: {error}"]
-    if dist.is_initialized():
-        local = failures[0]
-        failures = [None] * dist.get_world_size(group)
-        dist.all_gather_object(failures, local, group=group)
-    if any(failures):
-        if error is not None:
-            raise error
-        raise RuntimeError(f"Physical trainer preflight failed: {failures}")
-    return cast(T, result)
+        try:
+            result = call()
+        except BaseException as exc:
+            error = exc
+        failures = [None if error is None else f"{type(error).__name__}: {error}"]
+        if dist.is_initialized():
+            local = failures[0]
+            failures = [None] * dist.get_world_size(group)
+            dist.all_gather_object(failures, local, group=group)
+        if any(failures):
+            if error is not None:
+                raise error
+            raise RuntimeError(f"Physical trainer preflight failed: {failures}")
+        return cast(T, result)
+    finally:
+        result = None
 
 
 @dataclass(frozen=True)
