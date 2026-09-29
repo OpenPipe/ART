@@ -1600,6 +1600,12 @@ def _load_adapter(
 
 
 def _slot_snapshot(trainer: TrainerRank) -> _SlotSnapshot:
+    modules = (
+        module
+        for chunk in trainer.runtime.model
+        for module in chunk.modules()
+        if hasattr(module, "_slot_keys") and hasattr(module, "_slot_modules")
+    )
     return tuple(
         (
             module,
@@ -1607,9 +1613,7 @@ def _slot_snapshot(trainer: TrainerRank) -> _SlotSnapshot:
             dict(module._slot_modules.items()),
             {key: getattr(slot, "ref") for key, slot in module._slot_modules.items()},
         )
-        for chunk in trainer.runtime.model
-        for module in chunk.modules()
-        if hasattr(module, "_slot_keys") and hasattr(module, "_slot_modules")
+        for module in cast("Iterable[LoRA]", modules)
     )
 
 
