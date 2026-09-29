@@ -98,6 +98,18 @@ def test_one_spill_writer_drains_payloads_without_finalization(tmp_path, monkeyp
     assert all(ref() is None for ref in refs)
 
 
+def test_spill_creates_empty_snapshot_and_rejects_existing_directory(tmp_path):
+    spill = cp._SnapshotSpill()
+    snapshot = tmp_path / "empty"
+    spill.submit(snapshot, {}).result(3)
+    assert snapshot.is_dir()
+    retained = snapshot / "retained"
+    retained.write_bytes(b"existing state")
+    with pytest.raises(FileExistsError):
+        spill.submit(snapshot, {"retained": {"v": torch.ones(1)}}).result(3)
+    assert retained.read_bytes() == b"existing state"
+
+
 @pytest.mark.parametrize("action", ("finish", "abort"))
 @pytest.mark.parametrize("fails", (False, True))
 def test_finish_abort_wait_for_owned_write_before_cleanup(
@@ -119,6 +131,7 @@ def test_finish_abort_wait_for_owned_write_before_cleanup(
 
     monkeypatch.setattr(safetensors.torch, "save_file", write)
     spill = cp._SnapshotSpill()
+    prepared.snapshot.rmdir()
     writer = spill.submit(prepared.snapshot, {"v.safetensors": {"v": torch.ones(1)}})
     prepared = replace(prepared, writer=writer)
     trainer._prepared_checkpoint_saves["save"] = prepared
