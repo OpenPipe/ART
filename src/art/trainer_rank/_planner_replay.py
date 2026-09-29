@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict
 import json
 from types import MethodType, SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import _gdn_memory, _impl, _memory
 
@@ -19,6 +19,12 @@ _MAX_BYTES = 262144
 _MAX_GROUPS = 1024
 _MAX_SEGMENTS = 4096
 _MAX_INPUT_VALUES = 1_000_000
+
+
+# Estimators bound on TrainerRank as plain functions, not methods.
+_STATIC_ESTIMATORS = frozenset(
+    {"_split_required_memory", "_gradient_slots", "_adapter_gradient_walk"}
+)
 
 
 _REFUSALS = frozenset(
@@ -96,12 +102,17 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_physical_tokens",
         "_plan_group_rows",
         "_plan_retained_tokens",
+        "_gradient_slots",
+        "_pending_adapter_gradient_bytes",
+        "_checkpoint_gradient_groups",
+        "_checkpoint_adapter_gradient_bytes",
+        "_adapter_gradient_walk",
     ):
         method = getattr(rank, name)
         expected = getattr(_impl.TrainerRank, name)
         supported = (
             method is expected
-            if name == "_split_required_memory"  # The sole static estimator.
+            if name in _STATIC_ESTIMATORS
             else type(method) is MethodType
             and method.__self__ is rank
             and method.__func__ is expected
@@ -214,6 +225,18 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             if backwards
             else 0
         )
+        adapter = None
+        if group.grad_enabled and getattr(group.slot_ref, "name", None) is not None:
+            # The live estimator reads this slot's unallocated gradient bytes
+            # per decoder layer; freeze them with the selection.
+            kind = getattr(group.slot_ref, "kind", None)
+            if kind is not None and (type(kind) is not str or len(kind) > 64):
+                raise ValueError("runtime_slot_identity_unsupported")
+            pending = rank._pending_adapter_gradient_bytes((group.slot_ref,))
+            if len(pending) > 1025:
+                raise ValueError("runtime_shape_inventory_over_limit")
+            reserve(128 + 12 * len(name) + 24 * len(pending))
+            adapter = {"kind": kind, "name": name, "pending": [int(v) for v in pending]}
         model = _gdn_memory.model_shapes(rank, group.slot_ref) if has_grad else None
         if model is not None:
             if len(model[1]) > 1024:
@@ -231,6 +254,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 "gradient": terms(True, group.slot_ref),
                 "head_rows": projected,
                 "head_target_rows": target_rows,
+                "adapter": adapter,
                 "gdn": None
                 if model is None
                 else {
@@ -253,7 +277,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             }
         )
     facts = {
-        "version": 1,
+        "version": 2,
         "checkpoint_layers": _memory._checkpoint_layers(
             rank, rank._plan_group_rows(plan)
         ),
@@ -290,7 +314,7 @@ def validate(facts: Any) -> None:
             "groups",
         },
     )
-    if type(facts["version"]) is not int or facts["version"] != 1:
+    if type(facts["version"]) is not int or facts["version"] != 2:
         raise ValueError("unsupported runtime facts version")
     for key in (
         "checkpoint_layers",
@@ -319,6 +343,7 @@ def validate(facts: Any) -> None:
                 "gradient",
                 "head_rows",
                 "head_target_rows",
+                "adapter",
                 "gdn",
             },
         )
@@ -363,6 +388,22 @@ def validate(facts: Any) -> None:
                     raise ValueError("invalid MoE stage")
                 for value in stage:
                     integer(value)
+        adapter = group["adapter"]
+        if adapter is not None:
+            fields(adapter, {"kind", "name", "pending"})
+            if (
+                not group["grad"]
+                or (adapter["kind"] is not None and type(adapter["kind"]) is not str)
+                or len(adapter["kind"] or "") > 64
+                or type(adapter["name"]) is not str
+                or len(adapter["name"]) > 4096
+                or type(adapter["pending"]) is not list
+                or len(adapter["pending"]) > 1025
+            ):
+                raise ValueError("invalid adapter gradient facts")
+            reserve(128 + 12 * len(adapter["name"]) + 24 * len(adapter["pending"]))
+            for value in adapter["pending"]:
+                integer(value)
         gdn = group["gdn"]
         if gdn is not None:
             fields(gdn, {"layers", "shapes", "segments"})
@@ -420,10 +461,53 @@ def validate_tokens(inventories: Iterable[Any]) -> None:
         count(value)
 
 
+class _ReplaySlot(NamedTuple):
+    """A frozen adapter slot identity (the live LoRASlotRef's kind and name)."""
+
+    kind: str | None
+    name: str
+
+
 class ReplayRank(_impl.TrainerRank):
     """The real estimator with runtime metadata readers replaced by frozen facts."""
 
     _facts: dict[str, Any] | None = None
+
+    def _replay_slots(self, slot_refs: Any) -> Any:
+        # Replay passes each group's index; map it to that group's frozen slot.
+        if self._facts is None or slot_refs is None:
+            return slot_refs
+        groups = self._facts["groups"]
+        return tuple(
+            None
+            if (adapter := groups[index]["adapter"]) is None
+            else _ReplaySlot(adapter["kind"], adapter["name"])
+            for index in slot_refs
+        )
+
+    def _gradient_slots(self, group_rows: Any, slot_refs: Any) -> Any:
+        return _memory._gradient_slots(group_rows, self._replay_slots(slot_refs))
+
+    def _checkpoint_gradient_groups(self, group_rows: Any, slot_refs: Any) -> Any:
+        return _memory._checkpoint_gradient_groups(
+            self, group_rows, self._replay_slots(slot_refs)
+        )
+
+    def _pending_adapter_gradient_bytes(self, refs: Any) -> tuple[int, ...]:
+        if self._facts is None:
+            return _memory._pending_adapter_gradient_bytes(self, refs)
+        refs = tuple(dict.fromkeys(refs))
+        if not refs:
+            return ()
+        if len(refs) != 1:
+            raise ValueError("replayed adapter gradients are frozen per slot")
+        for group in self._facts["groups"]:
+            adapter = group["adapter"]
+            if adapter is not None and (adapter["kind"], adapter["name"]) == tuple(
+                refs[0]
+            ):
+                return tuple(adapter["pending"])
+        return ()
 
     def _head_workspace_bytes(self, rows: int) -> int:
         assert self._facts is not None

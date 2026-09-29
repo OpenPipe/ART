@@ -171,6 +171,59 @@ def test_selected_slot_terms_are_replayed_and_frozen(layer, tmp_path):
     )
 
 
+def test_selected_adapter_gradients_are_replayed_and_frozen(layer, tmp_path):
+    from test_trainer_rank_adapter_gradient_memory import lora, parameter
+    from test_trainer_rank_converted_memory import weights
+    from test_trainer_rank_pending_memory import rank_with_moe
+    from test_trainer_rank_slot_memory import load_slot
+    from test_trainer_rank_slot_memory import request as slot_request
+
+    rank, _ = rank_with_moe(weights(layer, 8))
+    load_slot(rank, "small", 1)
+    load_slot(rank, "large", 64)
+    # Unallocated slot gradients the recompute backward will allocate: small,
+    # distinct per-layer sizes (the fixture has 40 layers; keep this bounded).
+    layers = tr._language_model(rank.runtime.model[0]).decoder.layers
+    assert len(layers) <= 64
+    sizes = [16 * (index + 1) for index in range(len(layers))]
+    assert sum(sizes) * 2 <= 66_560  # BF16 bytes, checked before allocating.
+    params = []
+    for size, block in zip(sizes, layers, strict=True):
+        params.append(parameter(size))
+        block.add_module("adapter", lora(large=[params[-1]]))
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward(
+        [slot_request("small", rows=2), slot_request("large", rows=65, grad=True)],
+        ensure_slots=False,
+    )
+    original, costs = emitted(rank, plan, tmp_path)
+    assert costs[0].checkpoint_adapter_gradient > 0
+    groups = original["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ]
+    assert groups[0]["adapter"] is None
+    assert groups[1]["adapter"]["name"] == "large" and any(
+        groups[1]["adapter"]["pending"]
+    )
+    actual = reports.replay(original)
+    assert actual["aggregate"]["matches"]
+    assert all(item["matches"] for item in actual["estimates"])
+    # Gradients allocated after selection cannot change the replayed answer.
+    for param in params:
+        param.grad = torch.zeros_like(param)
+    assert reports.replay(original) == actual
+    changed = deepcopy(original)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["groups"][1][
+        "adapter"
+    ]["pending"][0] += 10**12
+    result = reports.replay(changed)
+    assert not result["estimates"][0]["matches"]
+    assert (
+        result["estimates"][0]["required_bytes"]
+        > actual["estimates"][0]["required_bytes"]
+    )
+
+
 @pytest.mark.parametrize(
     "change", ["version", "group", "layout", "gdn_segment", "budget"]
 )
@@ -184,7 +237,7 @@ def test_fact_validation_rejects_inconsistent_or_unbounded_input(
     )
     facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
     if change == "version":
-        facts["version"] = 2
+        facts["version"] += 1
     elif change == "group":
         facts["groups"][0]["rows"] += 1
     elif change == "layout":
