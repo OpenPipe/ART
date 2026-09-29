@@ -168,14 +168,14 @@ def begin(
 ) -> tuple[CaptureState | None, contextvars.Token[bool] | None]:
     scope = _get_current_scope()
     endpoint = endpoint_for_url(url)
-    request = _json_body(body)
     if (
         scope is None
         or method.upper() != "POST"
         or endpoint is None
-        or request is None
         or _adapter_active.get()
     ):
+        return None, None
+    if (request := _json_body(body)) is None:
         return None, None
     return (
         CaptureState(
