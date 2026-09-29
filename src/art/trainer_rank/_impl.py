@@ -90,6 +90,7 @@ if TYPE_CHECKING:
         PreparedCustomPayload,
         _FinalizedSave,
         _PreparedSave,
+        _SnapshotSpill,
     )
     from art.trainer_rank._lora_export import _PreparedLoraExport
 
@@ -2026,6 +2027,7 @@ class TrainerRank:
         self._checkpoint_process_group: dist.ProcessGroup | None = None
         self._checkpoint_finalize_process_group: dist.ProcessGroup | None = None
         self._checkpoint_group_lock = threading.Lock()
+        self._checkpoint_snapshot_spill: _SnapshotSpill | None = None
         self._checkpoint_prepare_lock = threading.Lock()
         self._checkpoint_finalize_lock = threading.Lock()
         self._checkpoint_save_condition = threading.Condition()
