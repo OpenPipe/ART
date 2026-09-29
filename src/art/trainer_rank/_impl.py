@@ -598,6 +598,11 @@ class _MemoryCheck:
     decision: dict[str, Any] | None = dataclass_field(
         default=None, compare=False, repr=False
     )
+    # Extrema above are diagnostics; fits is the conjunction of local fits.
+    # Keep each local producer through refreshes of different DP items.
+    local_required_bytes: int | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
 
 
 @dataclass(frozen=True)
