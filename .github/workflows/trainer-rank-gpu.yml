@@ -4,6 +4,14 @@ on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
+    inputs:
+      context:
+        description: Free Kubernetes context for this validation
+        type: choice
+        default: cks-wb3
+        options:
+          - cks-wb3
+          - ext-collab2
 
 permissions:
   contents: read
@@ -138,7 +146,7 @@ jobs:
     timeout-minutes: 45
     environment: trainer-rank-gpu-validation
     env:
-      SKY_INFRA: k8s/cks-wb3
+      SKY_INFRA: k8s/${{ inputs.context || 'cks-wb3' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -164,9 +172,13 @@ jobs:
 
       - name: Configure Kubernetes
         env:
-          KUBECONFIG_VALUE: ${{ secrets.CKS_WB3_KUBECONFIG }}
+          KUBECONFIG_VALUE: ${{ secrets[inputs.context == 'ext-collab2' && 'GPU_IMAGE_KUBECONFIG' || 'CKS_WB3_KUBECONFIG'] }}
         run: |
           set -euo pipefail
+          case "${SKY_INFRA}" in
+            k8s/cks-wb3|k8s/ext-collab2) ;;
+            *) echo "Unsupported GPU CI context" >&2; exit 1 ;;
+          esac
           test -n "${KUBECONFIG_VALUE}"
           mkdir -p "${HOME}/.kube"
           KUBECONFIG_PATH="${HOME}/.kube/config" python3 - <<'PY'
@@ -184,21 +196,22 @@ jobs:
           Path(os.environ["KUBECONFIG_PATH"]).write_bytes(data)
           PY
           chmod 600 "${HOME}/.kube/config"
-          kubectl --context cks-wb3 get nodes >/dev/null
+          kubectl --context "${SKY_INFRA#k8s/}" get nodes >/dev/null
 
       - name: Configure SkyPilot workload identity
         run: |
           mkdir -p "${HOME}/.sky"
-          cat > "${HOME}/.sky/config.yaml" <<'YAML'
+          context="${SKY_INFRA#k8s/}"
+          cat > "${HOME}/.sky/config.yaml" <<YAML
           # Use the pre-provisioned least-privilege service account instead of
           # allowing SkyPilot to create its broadly privileged legacy RBAC.
           allowed_clouds:
             - kubernetes
           kubernetes:
             allowed_contexts:
-              - cks-wb3
+              - ${context}
             remote_identity:
-              cks-wb3: skypilot-workload
+              ${context}: skypilot-workload
           YAML
 
       - name: Run TrainerRank GPU validation

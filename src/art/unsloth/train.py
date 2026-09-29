@@ -36,8 +36,6 @@ from ..preprocessing.pack import (
 from ..preprocessing.tokenize import SFTBatch
 from ..types import TrainConfig
 
-nest_asyncio.apply()
-
 __all__ = [
     "CausalLM",
     "StopTrainingLoop",
@@ -348,6 +346,10 @@ async def train(
     trainer: "GRPOTrainer",
     results_queue: asyncio.Queue[dict[str, float]],
 ) -> None:
+    nest_asyncio.apply()
+    # Let any active, unpatched loop iteration finish before entering a nested
+    # queue read: it still owns a fixed count of ready callbacks.
+    await asyncio.sleep(0)
     _compute_loss = trainer.compute_loss
     _log = trainer.log
     trainer.compute_loss = get_compute_loss_fn(trainer)

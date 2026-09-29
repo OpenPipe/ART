@@ -1382,14 +1382,26 @@ def _fill_planner_snapshot(
 ) -> None:
     """Freeze the selected estimator without opening a measurement window."""
     try:
+        if not _impl._planner_misses._planner_retention.capture_enabled():
+            return
         children = (
             plan.subforwards if isinstance(plan, _impl._SplitForwardPlan) else (plan,)
         )
-        # Freeze scalar calibration before forward updates it. Keep owned
-        # request references, not new token copies or autograd outputs.
+        # Freeze calibration before forward updates it. Versioned CPU inputs
+        # remain references; versionless CPU inputs need an owned bounded copy.
         costs = [self._plan_cost(child) for child in children]
+        from . import _planner_replay
+
         estimates: list[dict[str, Any]] = []
         for child, cost in zip(children, costs, strict=True):
+            facts, missing = None, []
+            if child.groups:
+                try:
+                    facts = _planner_replay.capture(self, child)
+                except (AttributeError, TypeError, ValueError, RuntimeError) as error:
+                    missing = [
+                        f"runtime_facts_unavailable:{_planner_replay.refusal_reason(error)}"
+                    ]
             estimates.append(
                 {
                     "signature": asdict(child.signature),
@@ -1410,13 +1422,8 @@ def _fill_planner_snapshot(
                     "expected_required_bytes": cost.required,
                     "retained_bytes": cost.retained,
                     "cost_components": asdict(cost),
-                    # Observed costs do not reconstruct model/slot eligibility
-                    # or the head/GDN/checkpoint inputs used to derive them.
-                    "missing_inputs": [
-                        "immutable runtime group/slot, head, checkpoint and GDN facts"
-                    ]
-                    if child.groups
-                    else [],
+                    "runtime_facts": facts,
+                    "missing_inputs": missing,
                 }
             )
         floor = 0
@@ -1454,11 +1461,37 @@ def _fill_planner_snapshot(
             except RuntimeError:
                 return None
 
+        type InputSnapshot = tuple[
+            torch.Tensor | None, int | None, torch.Tensor | None, str | None
+        ]
+        input_limit = 1_000_000
+        snapshot_remaining = input_limit
+
+        def capture(tensor: torch.Tensor | None) -> InputSnapshot:
+            nonlocal snapshot_remaining
+            original_version = version(tensor)
+            frozen = None
+            reason = None
+            if tensor is not None and tensor.device.type != "cpu":
+                reason = "device_input"
+            elif tensor is not None and original_version is None:
+                if tensor.numel() > snapshot_remaining:
+                    reason = "token_inventory_over_limit"
+                else:
+                    try:
+                        # No D2H or autograd retention, even if the caller has
+                        # inference mode enabled. Bind this plan's actual input.
+                        with _impl.torch.inference_mode(False):
+                            frozen = tensor.detach().clone()
+                        snapshot_remaining -= tensor.numel()
+                    except Exception:
+                        reason = "input_snapshot_unavailable"
+            return tensor, original_version, frozen, reason
+
         tensors = [
             (
-                item,
-                version(item.input_ids),
-                version(item.labels),
+                capture(item.input_ids),
+                capture(item.labels),
                 {
                     "top_k": item.request.top_k,
                     "logits": item.request.logits,
@@ -1491,56 +1524,94 @@ def _fill_planner_snapshot(
         }
 
         def replay() -> dict[str, Any]:
-            remaining = 1_000_000
+            remaining = input_limit
+            structure_remaining = 4096
             incomplete = {
                 reason for item in estimates for reason in item["missing_inputs"]
             }
 
-            def tensor_data(
-                tensor: torch.Tensor | None, original_version: int | None
-            ) -> Any:
-                nonlocal remaining
+            def tensor_data(snapshot: InputSnapshot) -> Any:
+                nonlocal remaining, structure_remaining
+                tensor, original_version, frozen, reason = snapshot
                 if tensor is None:
                     return None
-                reason = None
-                if (
-                    tensor.device.type != "cpu"
-                    or original_version is None
-                    or version(tensor) != original_version
+                # Storage can be replaced without incrementing the version.
+                # Recheck before equality or materialization; never read D2H.
+                if tensor.device.type != "cpu":
+                    reason = "device_input"
+                if reason is None and (
+                    not _impl.torch.equal(tensor, frozen)
+                    if frozen is not None
+                    else version(tensor) != original_version
                 ):
-                    reason = "device_or_modified_input"
-                elif tensor.numel() > remaining:
+                    reason = "modified_input"
+                if reason is None and tensor.numel() > remaining:
                     reason = "token_inventory_over_limit"
+                # Count every list produced by tolist(), including empty lists:
+                # numel() alone cannot bound shapes such as (large, 0).
+                containers, width = 0, 1
+                if reason is None:
+                    for size in tensor.shape:
+                        containers += width
+                        if containers > structure_remaining:
+                            reason = "token_structure_over_limit"
+                            break
+                        width *= size
+                # Leave room for report wrappers in the recursive JSON encoder.
+                # A zero extent ends list nesting, even if more dimensions follow.
+                if reason is None:
+                    for depth, size in enumerate(tensor.shape, 1):
+                        if depth > 128:
+                            reason = "token_nesting_over_limit"
+                            break
+                        if size == 0:
+                            break
                 if reason is not None:
                     incomplete.add(reason)
                     return {
                         "unavailable": reason,
                         "shape": list(tensor.shape),
                         "dtype": str(tensor.dtype),
+                        "device": str(tensor.device),
                     }
                 remaining -= tensor.numel()
-                return tensor.tolist()
+                structure_remaining -= containers
+                return (frozen if frozen is not None else tensor).tolist()
 
             requests = [
                 {
                     **options,
-                    "input_tokens": tensor_data(item.input_ids, input_version),
-                    "target_tokens": tensor_data(item.labels, label_version),
+                    "input_tokens": tensor_data(input_snapshot),
+                    "target_tokens": tensor_data(label_snapshot),
                 }
-                for item, input_version, label_version, options in tensors
+                for input_snapshot, label_snapshot, options in tensors
             ]
             layouts = []
             cursor = 0
             for group in plan.groups:
-                rows = [
+                rows: list[Any] = [
                     item["input_tokens"]
                     for item in requests[cursor : cursor + len(group.items)]
                 ]
                 cursor += len(group.items)
+                reason = None
                 if group.layout is None:
                     incomplete.add("selected_layout_unavailable")
+                    reason = "selected_layout_input_unverified"
                 elif not all(isinstance(row, list) for row in rows):
                     incomplete.add("layout_inputs_unavailable")
+                    reason = "selected_layout_input_unverified"
+                elif any(not row for row in rows) or (
+                    build_canonical_prefix_tree(
+                        _impl.torch.tensor(row, dtype=_impl.torch.long, device="cpu")
+                        for row in rows
+                    ).fingerprint
+                    != group.layout.tree_fingerprint
+                ):
+                    # Inputs may have changed after the selected layout was
+                    # materialized but before observation started. Never pair
+                    # later rows with that layout's immutable fingerprint.
+                    reason = "selected_layout_input_mismatch"
                 else:
                     layouts.append(
                         {
@@ -1552,6 +1623,13 @@ def _fill_planner_snapshot(
                             "expected_packed_tokens": group.layout.packed_tokens,
                         }
                     )
+                if reason is not None:
+                    for item in requests[cursor - len(group.items) : cursor]:
+                        if isinstance(item["input_tokens"], list):
+                            # A group fingerprint cannot certify a partial row
+                            # inventory. Keep more precise sibling omissions.
+                            incomplete.add(reason)
+                            item["input_tokens"] = {"unavailable": reason}
             return {
                 "memory_replay": {"rank": rank_fields, "estimates": estimates},
                 "layouts": layouts,

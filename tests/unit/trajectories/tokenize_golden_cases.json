@@ -2468,55 +2468,51 @@
  "fake/exchange_length_stop_nonterminal": {
   "digest": {
    "fields": {
-    "flags": "509990adeecfde05",
-    "logprobs": "490db9e684d3cb58",
+    "flags": "c0cb3dde31baa48b",
+    "logprobs": "733451b8398a30f6",
     "model": "3c2b43fc9c77b112",
-    "tokens": "a807490d963e2768"
+    "tokens": "49a64717d5d4cb19"
    },
    "input": "8d452ac9e3fd3ff4",
    "kind": "ChatCompletionsHistory",
-   "n": 3,
-   "output": "052da7f5dd4e2afbf4a8cb46ac339ca187ce88651094f12338625fa505d89f2e"
+   "n": 2,
+   "output": "d2a9c1282d4760f5400058676983434909ee88a169dbd930e41393ff5ba048e0"
   },
   "values": {
    "flags": [
     1,
-    23,
-    8
+    23
    ],
    "logprobs": [
     "nan",
-    "-0x1.999999999999ap-3",
-    "nan"
+    "-0x1.999999999999ap-3"
    ],
    "model": "test/model",
    "tokens": [
     1,
-    2,
-    9
+    2
    ]
   }
  },
  "fake/exchange_mixed_stop_captured": {
   "digest": {
    "fields": {
-    "flags": "7ce17ec6bd1f0c6c",
-    "logprobs": "4194e7efd1591b26",
+    "flags": "cb609cb2285f225d",
+    "logprobs": "510d8863a84dcccf",
     "model": "3c2b43fc9c77b112",
-    "tokens": "afd52bf7787b8903"
+    "tokens": "042e922fcb24f75f"
    },
    "input": "919a7c8d65251dc0",
    "kind": "ChatCompletionsHistory",
-   "n": 7,
-   "output": "990c8adb7364e243153431d31ce8ea764aa8bb0d75780ca6f9169fcc87f51172"
+   "n": 6,
+   "output": "9377d5b128b001a28b574d1c24b23d9e07c15eef472aae97ee748b99a4c61fe0"
   },
   "values": {
    "flags": [
     1,
     23,
     23,
-    8,
-    0,
+    1,
     23,
     31
    ],
@@ -2525,7 +2521,6 @@
     "-0x1.999999999999ap-3",
     "-0x1.ccccccccccccdp-1",
     "nan",
-    "nan",
     "-0x1.999999999999ap-2",
     "-0x1.ccccccccccccdp-1"
    ],
@@ -2533,7 +2528,6 @@
    "tokens": [
     1,
     2,
-    9,
     9,
     3,
     4,
@@ -4208,15 +4202,15 @@
  "qwen3/chat_thinking_off_literal_think_markers": {
   "digest": {
    "fields": {
-    "flags": "1aa1162684026173",
-    "logprobs": "600e63592026968b",
+    "flags": "68d2dd3f4739bcf4",
+    "logprobs": "1df8344a08abceea",
     "model": "feaaa00aded5db1e",
-    "tokens": "6bb19bd02ec640aa"
+    "tokens": "5c8ff00d13b4790d"
    },
    "input": "29020837edc33231",
    "kind": "ChatCompletionsHistory",
-   "n": 24,
-   "output": "6642df6982ae8a2d05a731434f176fab84a4b0e6d7ca02d300d04591338586db"
+   "n": 30,
+   "output": "f6a15ede92e066181ff52b1eb0e2ac3ce2424988d225b55cc93d23c62711e8ff"
   },
   "values": {
    "flags": [
@@ -4234,6 +4228,12 @@
     0,
     0,
     0,
+    0,
+    0,
+    4,
+    4,
+    4,
+    4,
     4,
     4,
     4,
@@ -4246,6 +4246,12 @@
     0
    ],
    "logprobs": [
+    "nan",
+    "nan",
+    "nan",
+    "nan",
+    "nan",
+    "nan",
     "nan",
     "nan",
     "nan",
@@ -4286,14 +4292,20 @@
     77091,
     198,
     151667,
-    198,
+    271,
+    151668,
+    271,
+    785,
+    4772,
+    374,
+    220,
+    151667,
     323,
     432,
     33250,
     448,
-    715,
+    220,
     151668,
-    271,
     13,
     151645,
     198

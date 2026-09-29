@@ -232,11 +232,10 @@ def _split_plan_memory_check(
     return self._memory_check_required(max(required, empirical))
 
 
-def _head_workspace_bytes(self: TrainerRank, rows: int) -> int:
-    """One dense BF16 head tensor, not complete statistics/backward memory."""
+def _head_vocabulary(self: TrainerRank) -> int:
+    """Runtime eligibility and vocabulary, without reading parameter values."""
     if (
-        rows <= 0
-        or self._padded_vocab_size is None
+        self._padded_vocab_size is None
         or len(self.runtime.model) != 1
         or self._topology_key()[1::2] != (1, 1)
     ):
@@ -294,7 +293,31 @@ def _head_workspace_bytes(self: TrainerRank, rows: int) -> int:
         )
     ):
         return 0
-    return min(rows, _impl._HEAD_CHUNK_TOKENS) * int(self._padded_vocab_size) * 2
+    return int(self._padded_vocab_size)
+
+
+def _dense_head_bytes(vocabulary: int, rows: int) -> int:
+    return min(rows, _impl._HEAD_CHUNK_TOKENS) * vocabulary * 2
+
+
+def _head_workspace_bytes(self: TrainerRank, rows: int) -> int:
+    """One dense BF16 head tensor, not complete statistics/backward memory."""
+    return _dense_head_bytes(_head_vocabulary(self), rows) if rows > 0 else 0
+
+
+def _head_target_backward(self: TrainerRank) -> bool:
+    from megatron.core.models.common.language_module.language_module import (
+        LanguageModule,
+    )
+
+    model = _impl._language_model(self.runtime.model[0])
+    scale = getattr(model, "_scale_logits", None)
+    return (
+        type(scale) is MethodType
+        and scale.__self__ is model
+        and scale.__func__ is LanguageModule._scale_logits
+        and getattr(model.config, "use_mup", None) is False
+    )
 
 
 def _group_head_workspace_bytes(
@@ -319,18 +342,7 @@ def _group_head_workspace_bytes(
         or not any(request.target_tokens is not None for request in requests)
     ):
         return dense
-    from megatron.core.models.common.language_module.language_module import (
-        LanguageModule,
-    )
-
-    model = _impl._language_model(self.runtime.model[0])
-    scale = getattr(model, "_scale_logits", None)
-    if (
-        type(scale) is MethodType
-        and scale.__self__ is model
-        and scale.__func__ is LanguageModule._scale_logits
-        and getattr(model.config, "use_mup", None) is False
-    ):
+    if _head_target_backward(self):
         # IndexBackward's dense result overlaps saved logits and grad_logits.
         # The FP32 fallback already exceeds this three-buffer component.
         target_dense = (
@@ -421,13 +433,12 @@ def _checkpoint_moe_bytes_per_token(self: TrainerRank) -> int:
     return gradient
 
 
-def _moe_workspace_bytes(
+def _moe_workspace_terms(
     self: TrainerRank,
-    rows: int,
     *,
     checkpoint_grad: bool = False,
     slot_ref: "LoRASlotRef | None" = None,
-) -> int:
+) -> tuple[int, tuple[tuple[int, int], ...]]:
     """Maximum of same-layer affine stages, not a retained multi-layer bank.
 
     The constructor cache covers original tensors. Explicit slots are
@@ -466,6 +477,13 @@ def _moe_workspace_bytes(
         for stage in stages
     ):
         raise ValueError("Invalid constructor converted-weight stages")
+    return coefficient, stages
+
+
+def _moe_workspace_from_terms(
+    rows: int, terms: tuple[int, tuple[tuple[int, int], ...]]
+) -> int:
+    coefficient, stages = terms
     return (
         max(
             rows * coefficient,
@@ -476,12 +494,23 @@ def _moe_workspace_bytes(
     )
 
 
-def _checkpoint_memory_floor(
+def _moe_workspace_bytes(
+    self: TrainerRank,
+    rows: int,
+    *,
+    checkpoint_grad: bool = False,
+    slot_ref: "LoRASlotRef | None" = None,
+) -> int:
+    return _moe_workspace_from_terms(
+        rows,
+        _moe_workspace_terms(self, checkpoint_grad=checkpoint_grad, slot_ref=slot_ref),
+    )
+
+
+def _checkpoint_layers(
     self: TrainerRank,
     group_rows: tuple[tuple[int, bool], ...],
-    slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
-    gdn_segments: int = 0,
-) -> tuple[int, int]:
+) -> int:
     """Conservative saved-boundary charge and one disjoint MoE workspace.
 
     Count actual local full/uniform/1 boundaries, including aliases, rather
@@ -496,22 +525,21 @@ def _checkpoint_memory_floor(
     and there, for gradient waves, the recomputed GDN layer's recurrent
     states for ``gdn_segments`` (gradient groups' segments) plus padding.
     """
-    gradient_rows = sum(rows for rows, grad in group_rows if grad)
     if not group_rows or len(self.runtime.model) != 1:
-        return 0, 0
+        return 0
     try:
         decoder = _impl._language_model(self.runtime.model[0]).decoder
     except (AttributeError, RuntimeError):
-        return 0, 0
+        return 0
     try:
         from megatron.core.transformer.transformer_block import TransformerBlock
     except ModuleNotFoundError as error:
         if error.name != "megatron":
             raise
-        return 0, 0
+        return 0
 
     if type(decoder) is not TransformerBlock:
-        return 0, 0
+        return 0
     config = decoder.config
     layers = len(decoder.layers)
     _, tp, cp, pp = self._topology_key()
@@ -550,7 +578,49 @@ def _checkpoint_memory_floor(
         or getattr(decoder, "_forward_hooks", None)
         or getattr(decoder, "_forward_pre_hooks", None)
     ):
+        return 0
+    return layers
+
+
+def _checkpoint_memory_floor(
+    self: TrainerRank,
+    group_rows: tuple[tuple[int, bool], ...],
+    slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
+    gdn_segments: int = 0,
+) -> tuple[int, int]:
+    layers = _checkpoint_layers(self, group_rows)
+    if not layers:
         return 0, 0
+    retained, workspace = _checkpoint_floor_from_facts(
+        self, group_rows, slot_refs, gdn_segments, layers
+    )
+    # HybridEP runtime state is intentionally outside grouped CPU replay v1.
+    hybrid_rows = None
+    if (
+        any(grad for _, grad in group_rows)
+        and self._topology_key() == (1, 1, 2, 1)
+        and self._parallel_shape == _impl.ParallelShape(tp=1, cp=2, ep=2, etp=1)
+        and self._moe_memory_supported
+    ):
+        hybrid_rows = max(rows for rows, _ in group_rows)
+        if any(ref() is not None for ref in self._pending_hybridep_graphs):
+            hybrid_rows = max(hybrid_rows, self._hybridep_rows_high_water)
+    if hybrid_rows is not None:
+        workspace = max(workspace, -(-hybrid_rows // 4) * 4 * self._hidden_size * 2)
+    return retained, workspace
+
+
+def _checkpoint_floor_from_facts(
+    self: TrainerRank,
+    group_rows: tuple[tuple[int, bool], ...],
+    slot_refs: tuple["LoRASlotRef | None", ...] | None,
+    gdn_segments: int,
+    layers: int,
+) -> tuple[int, int]:
+    if not layers:
+        return 0, 0
+    gradient_rows = sum(rows for rows, grad in group_rows if grad)
+    _, tp, _, _ = self._topology_key()
     # Physical rows are padded to a multiple of TP; each rank saves its shard.
     retained = (
         sum(-(-rows // tp) for rows, grad in group_rows if grad)
@@ -572,20 +642,6 @@ def _checkpoint_memory_floor(
         # roots per group. Kernel-internal chunk states are not bounded here.
         roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
         workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
-    if (
-        gradient_rows
-        and self._topology_key() == (1, 1, 2, 1)
-        and self._parallel_shape == _impl.ParallelShape(tp=1, cp=2, ep=2, etp=1)
-        and self._moe_memory_supported
-    ):
-        # Recompute runs after _execute_flat_plan restores the communication
-        # high-water. Combine allocates a fresh BF16 [P, H] before cropping;
-        # this is separate from already-held native buffer capacity. Do not
-        # prune graph references or reset execution state while estimating.
-        rows = max(rows for rows, _ in group_rows)
-        if any(ref() is not None for ref in self._pending_hybridep_graphs):
-            rows = max(rows, self._hybridep_rows_high_water)
-        workspace = max(workspace, -(-rows // 4) * 4 * self._hidden_size * 2)
     return retained, workspace
 
 

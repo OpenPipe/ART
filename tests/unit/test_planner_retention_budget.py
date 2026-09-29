@@ -38,7 +38,7 @@ def ledger(bound):
     return json.loads((bound.spool_dir / ".retention.json").read_bytes())
 
 
-def test_reclamation_never_refunds_cumulative_budget(tmp_path):
+def test_reclamation_never_refunds_cumulative_budget(tmp_path, caplog):
     bound = limits(tmp_path, max_reports=1)
     reporter = reports.Reporter(5, spool_dir=tmp_path / "standalone")
     with reports.report_retention_scope(bound):
@@ -47,7 +47,11 @@ def test_reclamation_never_refunds_cumulative_budget(tmp_path):
         raw = path.read_bytes()
         original = ledger(bound)
         path.unlink()
+        caplog.clear()
         assert emit(reporter) is None
+    assert "report retention limit reached; report omitted" in caplog.text
+    assert "local persistence failed" not in caplog.text
+    assert reporter.failures == 1
     assert not reporter.spool_dir.exists()
     assert ledger(bound)["charges"] == original["charges"]
     assert ledger(bound)["omitted"] == 1
@@ -95,7 +99,7 @@ def test_enrollment_cannot_be_replaced_or_replenished(tmp_path, field, value):
     assert (bound.spool_dir / ".retention.json").read_bytes() == original
 
 
-def test_ambiguous_payload_write_keeps_charge(tmp_path, monkeypatch):
+def test_ambiguous_payload_write_keeps_charge(tmp_path, monkeypatch, caplog):
     bound = limits(tmp_path, max_reports=1)
     reporter = reports.Reporter(5)
 
@@ -106,6 +110,8 @@ def test_ambiguous_payload_write_keeps_charge(tmp_path, monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(reports.os, "link", fail)
             assert emit(reporter) is None
+        assert "local persistence failed (OSError)" in caplog.text
+        assert "retention limit reached" not in caplog.text
         assert len(ledger(bound)["charges"]) == 1
         assert emit(reporter) is None
     assert not list(bound.spool_dir.glob("[0-9a-f]*.json"))
@@ -139,18 +145,21 @@ def test_planning_flood_keeps_oom_headroom_after_reclaim(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "bound_values", [{"max_bytes": 0}, {"max_reports": 0}, {"max_bytes": 1}]
 )
-def test_exhausted_allowance_has_no_fallback(tmp_path, bound_values):
+def test_exhausted_allowance_has_no_fallback(tmp_path, bound_values, caplog):
     bound = limits(tmp_path, **bound_values)
     reporter = reports.Reporter(5, spool_dir=tmp_path / "standalone")
     with reports.report_retention_scope(bound):
         assert emit(reporter) is None
+    assert "report retention limit reached; report omitted" in caplog.text
+    assert "local persistence failed" not in caplog.text
+    assert reporter.failures == 1
     assert not reporter.spool_dir.exists()
     assert not list(bound.spool_dir.glob("[0-9a-f]*.json"))
     assert ledger(bound)["omitted"] == 1
     assert ledger(bound)["omitted_bytes"] > 0
 
 
-def test_unaccounted_spool_and_corrupt_ledger_refuse(tmp_path):
+def test_unaccounted_spool_and_corrupt_ledger_refuse(tmp_path, caplog):
     bound = limits(tmp_path)
     bound.spool_dir.mkdir(mode=0o700)
     foreign = bound.spool_dir / "foreign.json"
@@ -158,6 +167,8 @@ def test_unaccounted_spool_and_corrupt_ledger_refuse(tmp_path):
     reporter = reports.Reporter(5)
     with reports.report_retention_scope(bound):
         assert emit(reporter) is None
+        assert "local persistence failed (ValueError)" in caplog.text
+        assert "retention limit reached" not in caplog.text
         assert foreign.read_text() == "retained"
         foreign.unlink()
         assert emit(reporter) is not None
