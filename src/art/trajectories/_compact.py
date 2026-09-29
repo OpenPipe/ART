@@ -109,7 +109,11 @@ def dump_tokenized_trajectory_group(
 
 
 def validate(
-    payload: Mapping[str, object], *, type: object = None, device: object = None
+    payload: Mapping[str, object],
+    *,
+    type: object = None,
+    device: object = None,
+    _owned: bool = False,
 ) -> _CompactValidated:
     """Decode one compact value, inferring or checking its requested type."""
 
@@ -123,7 +127,7 @@ def validate(
             )
     if device is not None and not kind.startswith("tensorized_"):
         raise ValueError("device is only valid for tensorized compact payloads")
-    data = _decode(payload, kind)
+    data = _decode(payload, kind, owned=_owned)
     if kind in _PLURAL_KINDS:
         if not isinstance(data, list):
             raise ValueError("Compact collection payload data must be a list")
@@ -134,6 +138,17 @@ def validate(
         ]
         return cast(_CompactValidated, [_finish(value) for value in values])
     return _finish(_validate_value(data, kind, target_model, device=device))
+
+
+def validate_json(
+    payload: str | bytes | bytearray | memoryview,
+    *,
+    type: object = None,
+    device: object = None,
+) -> _CompactValidated:
+    import orjson
+
+    return validate(orjson.loads(payload), type=type, device=device, _owned=True)
 
 
 def _validate_value(
@@ -686,7 +701,10 @@ def _replace_strings(
 
 
 def _decode(
-    payload: Mapping[str, object], expected_kind: CompactTrajectoryKind
+    payload: Mapping[str, object],
+    expected_kind: CompactTrajectoryKind,
+    *,
+    owned: bool = False,
 ) -> pydantic.JsonValue:
     if set(payload) != _FIELDS:
         raise ValueError(
@@ -713,7 +731,44 @@ def _decode(
         if not isinstance(value, str):
             raise ValueError("Compact trajectory string table values must be strings")
         strings[key] = value
+    if owned:
+        return _decode_owned_value(cast(pydantic.JsonValue, payload["data"]), strings)
     return _decode_value(payload["data"], strings)
+
+
+def _decode_owned_value(
+    value: pydantic.JsonValue, strings: dict[str, str]
+) -> pydantic.JsonValue:
+    """Consume a private JSON tree without copying its list containers."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return strings.get(value, value)
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if type(item) is not int and type(item) is not float:
+                value[index] = _decode_owned_value(item, strings)
+        return value
+    if isinstance(value, dict):
+        # JSON guarantees string keys. Self-mapped references still need rekeying
+        # to retain the string table's canonical object, not merely equal text.
+        if all(key not in strings for key in value):
+            for key, item in value.items():
+                value[key] = _decode_owned_value(item, strings)
+            return value
+        decoded: dict[str, pydantic.JsonValue] = {}
+        for key, item in value.items():
+            decoded_key = strings.get(key, key)
+            if decoded_key in decoded:
+                raise ValueError(
+                    f"Compact trajectory decoding creates duplicate key {decoded_key!r}"
+                )
+            decoded[decoded_key] = _decode_owned_value(item, strings)
+            # Release consumed branches while decoding the remaining owned tree.
+            value[key] = None
+        value.clear()
+        return decoded
+    raise ValueError(f"Compact trajectory data is not JSON-compatible: {type(value)!r}")
 
 
 def _decode_value(value: object, strings: dict[str, str]) -> pydantic.JsonValue:
