@@ -833,16 +833,12 @@ def _custom_snapshot(
             assert dynamic is not None
             state = dynamic.optimizer.state.get(master, {})
             optimizer[f"master/{key}"] = master.detach().to("cpu", copy=True)
-            optimizer[f"exp_avg/{key}"] = (
-                cast(torch.Tensor, state.get("exp_avg", torch.zeros_like(master)))
-                .detach()
-                .to("cpu", copy=True)
-            )
-            optimizer[f"exp_avg_sq/{key}"] = (
-                cast(torch.Tensor, state.get("exp_avg_sq", torch.zeros_like(master)))
-                .detach()
-                .to("cpu", copy=True)
-            )
+            for component in ("exp_avg", "exp_avg_sq"):
+                optimizer[f"{component}/{key}"] = (
+                    cast(torch.Tensor, state[component]).detach().to("cpu", copy=True)
+                    if component in state
+                    else torch.zeros_like(optimizer[f"master/{key}"])
+                )
             optimizer[f"step/{key}"] = torch.tensor(float(state.get("step", 0.0)))
 
     if dynamic is not None:
@@ -921,13 +917,17 @@ def _local_state(
                     for component, value in zip(
                         ("master", "exp_avg", "exp_avg_sq"), values, strict=True
                     ):
-                        value = torch.zeros_like(master) if value is None else value
-                        local = value if expert is None else value[expert]
-                        payloads[item.block][f"{component}/{key}"] = (
-                            local.T.detach().to(
-                                device="cpu", dtype=torch.float32, copy=True
+                        if value is None:
+                            payloads[item.block][f"{component}/{key}"] = (
+                                torch.zeros_like(payloads[item.block][f"master/{key}"])
                             )
-                        )
+                        else:
+                            local = value if expert is None else value[expert]
+                            payloads[item.block][f"{component}/{key}"] = (
+                                local.T.detach().to(
+                                    device="cpu", dtype=torch.float32, copy=True
+                                )
+                            )
                     step = state.get("step", 0.0)
                     payloads[item.block][f"step/{key}"] = torch.tensor(float(step))
     records: list[_LocalShard] = []
