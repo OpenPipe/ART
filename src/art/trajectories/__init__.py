@@ -1770,6 +1770,21 @@ class _FirstOccurrenceTrie:
         return result
 
 
+def _single_history_mask(
+    tokens: Iterable[int],
+    flags: Iterable[int | TokenFlag],
+    *,
+    where: TokenFlag | None,
+) -> list[bool]:
+    # Complete prefixes within one history are distinct by their length.
+    sentinel = int(where) if where is not None else None
+    result = []
+    for token, flag in zip(tokens, flags, strict=True):
+        token = int(token)  # Preserve conversion errors and evaluation order.
+        result.append(sentinel is None or bool(int(flag) & sentinel))
+    return result
+
+
 @overload
 def first_occurrence_masks(
     histories: Iterable[TokenizedHistory],
@@ -1805,6 +1820,15 @@ def first_occurrence_masks(
         return []
     if all(isinstance(history, TokenizedHistory) for history in values):
         trie = _FirstOccurrenceTrie()
+        if len(values) == 1 and type(values[0]) is TokenizedHistory:
+            history = cast(TokenizedHistory, values[0])
+            model, tokens, flags = history.model, history.tokens, history.flags
+            # Preserve the ordinary key protocol for customized model values.
+            return [
+                _single_history_mask(tokens, flags, where=where)
+                if type(model) is str
+                else trie.mask(model, tokens, flags, where=where)
+            ]
         return [
             trie.mask(
                 history.model,
