@@ -384,6 +384,13 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
         ] = rows
         with pytest.raises(ValueError, match="immutable runtime"):
             reports.replay(changed)
+    # CP layouts are grouped runtime facts; no estimate records them itself.
+    changed = json.loads(path.read_bytes())
+    changed["replay"]["memory_replay"]["estimates"][0]["arguments"]["group_layouts"] = [
+        {"attention_rows": [1, 1]}
+    ]
+    with pytest.raises(ValueError, match="immutable runtime"):
+        reports.replay(changed)
     for field in (
         "checkpoint_input_gradient",
         "checkpoint_workspace",
