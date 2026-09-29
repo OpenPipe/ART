@@ -1078,6 +1078,28 @@ def _estimate_required_memory_bytes_from_values(
     static_compute = (
         packed_tokens * self._hidden_size * self._param_dtype_size * activation_factor
     )
+    if (
+        not signature.grad_enabled
+        and not self._geometry.moe_experts
+        and self._geometry.ffn_hidden_size
+        and signature.topology[1:3] == (1, 1)
+    ):
+        # A dense no-grad layer peaks at its FC1 stage (the base GEMM output,
+        # the adapter output and their sum: 6F, or the SwiGLU live set if
+        # wider) beside the residual pair, embedding and norm output (4H), per
+        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. At CP1 every packed
+        # row is local, which the per-packed-token floor above does not
+        # cover. Groups run one after another, so the largest bounds it.
+        rows = max((n for n, _ in group_rows), default=packed_tokens)
+        static_compute = max(
+            static_compute,
+            rows
+            * self._param_dtype_size
+            * (
+                max(6, self._mlp_activation_factor) * self._geometry.ffn_hidden_size
+                + 4 * self._hidden_size
+            ),
+        )
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry
         hidden = self._hidden_size

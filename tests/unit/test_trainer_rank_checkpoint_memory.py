@@ -497,3 +497,115 @@ def test_no_grad_enclosure_config_guard(field, value):
     r = rank()
     setattr(r.runtime.model[0].decoder.config, field, value)
     assert r._checkpoint_memory_floor(((11, False),)) == (0, 0)
+
+
+def dense_rank():
+    """Qwen3.8-27B's dense shape: H 5120, F 17408, 64 layers, fused SwiGLU."""
+    r = rank()
+    config = r.runtime.model[0].config
+    config.hidden_size, config.num_layers = 5120, 64
+    config.ffn_hidden_size, config.bias_activation_fusion = 17408, True
+    decoder = r.runtime.model[0].decoder
+    decoder.layers = torch.nn.ModuleList(
+        [torch.nn.Linear(1, 1).bfloat16() for _ in range(64)]
+    )
+    decoder.num_layers_per_pipeline_rank = 64
+    r.runtime.provider = SimpleNamespace(
+        hidden_size=5120, num_layers=64, ffn_hidden_size=17408
+    )
+    dense = TrainerRank(r.runtime)
+    assert dense._geometry.ffn_hidden_size == 17408
+    assert not dense._geometry.moe_experts and dense._mlp_activation_factor == 3
+    return dense
+
+
+# Qwen3.8-27B TP1/CP1 no-grad target-only waves (random init, ART a68fa500,
+# 2026-09-29): a cold first wave peaked at 260,789 B per row, warm waves at
+# 250,181-250,507; the floor they share is (6F + 4H) x 2 = 249,856.
+_DENSE_NO_GRAD_ROW = (6 * 17408 + 4 * 5120) * 2
+_COLD_NO_GRAD_ROW = 260_789
+
+
+def no_grad_wave(r, n):
+    return r._estimate_flat_forward(
+        [
+            ForwardInput(
+                input_tokens=torch.arange(n),
+                target_tokens=torch.arange(n),
+                no_grad=True,
+            )
+        ],
+        checkpoint=None,
+    )
+
+
+def estimate(r, signature, groups, packed, logical=None):
+    return r._estimate_required_memory_bytes_from_values(
+        packed_tokens=packed,
+        output_bytes=0,
+        signature=signature,
+        logical_tokens=logical,
+        group_rows=groups,
+    )
+
+
+@pytest.mark.parametrize("n", [7268, 144228])
+def test_cp1_dense_no_grad_floor_covers_each_row(n):
+    r = dense_rank()
+    values = no_grad_wave(r, n)
+    _, _, signature, groups, _ = values
+    assert not signature.grad_enabled and signature.topology == (1, 1, 1, 1)
+    assert groups == ((n, False),)
+    assert _DENSE_NO_GRAD_ROW <= 250_181
+    # The 16H per packed token floor admitted 180 KB per row, below the cold
+    # peak; the per-row floor admits it with the usual 1.1 factor.
+    assert int(n * 5120 * 2 * 16 * 1.1) < n * _COLD_NO_GRAD_ROW
+    assert estimate(r, signature, groups, n) == int(n * _DENSE_NO_GRAD_ROW * 1.1)
+    assert price(r, values).required >= n * _COLD_NO_GRAD_ROW
+
+
+def test_cp1_dense_no_grad_floor_bounds_profiles():
+    r = dense_rank()
+    _, _, signature, groups, _ = no_grad_wave(r, 7268)
+    floor = estimate(r, signature, groups, 7268)
+    r._memory_profiles[signature] = _MemoryProfile(100_000, 7268)
+    assert estimate(r, signature, groups, 7268) == floor
+    r._memory_profiles[signature] = _MemoryProfile(480_869, 7268)
+    assert estimate(r, signature, groups, 7268) > floor
+
+
+def test_cp1_dense_no_grad_floor_prices_physical_rows_of_the_largest_group():
+    r = dense_rank()
+    _, _, signature, _, _ = no_grad_wave(r, 64)
+    # Shared prefixes add logical rows, not physical ones.
+    single = estimate(r, signature, ((144228, False),), 144228)
+    assert estimate(r, signature, ((144228, False),), 144228, 149832) == single
+    # Groups run one after another: the largest group's rows bound the stage,
+    # and the per-packed-token floor still applies to their sum.
+    groups = ((100_000, False), (44_228, False))
+    assert estimate(r, signature, groups, 144228) == int(
+        max(144228 * 5120 * 2 * 16, 100_000 * _DENSE_NO_GRAD_ROW) * 1.1
+    )
+
+
+@pytest.mark.parametrize("case", ["cp2", "tp2", "gradient", "moe"])
+def test_dense_no_grad_floor_leaves_other_pricing(case):
+    r = dense_rank()
+    _, _, signature, _, _ = no_grad_wave(r, 64)
+    groups = ((144228, False),)
+    if case == "cp2":
+        signature = replace(signature, topology=(1, 1, 2, 1))
+    elif case == "tp2":
+        signature = replace(signature, topology=(1, 2, 1, 1))
+    elif case == "gradient":
+        signature = replace(signature, grad_enabled=True, grad_modes=(True,))
+        groups = ((144228, True),)
+    else:
+        r._geometry = replace(r._geometry, moe_experts=8)
+    priced = estimate(r, signature, groups, 144228)
+    r._geometry = replace(r._geometry, ffn_hidden_size=0)
+    assert estimate(r, signature, groups, 144228) == priced
+    if case == "cp2":
+        # At CP2 each rank holds part of the packed rows; left to the
+        # existing floors (and #986's traced CP2 stage).
+        assert priced == int(144228 * 5120 * 2 * 16 * 1.1)
