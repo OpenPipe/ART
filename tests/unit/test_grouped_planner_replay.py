@@ -409,6 +409,66 @@ def test_staged_head_needs_recorded_cp2_target_backward(tmp_path):
         reports.replay(report)
 
 
+def test_staged_cp2_head_is_replayed(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        tr,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
+    )
+    from types import SimpleNamespace
+
+    from art.megatron.context_parallel.types import ParallelTopology
+
+    # CP2 through the stock topology reader (as capture requires), over a CPU
+    # CP2 topology and planning config.
+    monkeypatch.setattr(tr.TrainerRank, "_topology_key", lambda self: (1, 1, 2, 1))
+    rank = head_rank()
+    rank._topology = lambda: ParallelTopology(tp=1, cp=2)
+    for name, value in {
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 32,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "params_dtype": torch.bfloat16,
+    }.items():
+        setattr(rank.runtime.provider, name, value)
+    rank.runtime.model_support_handler = SimpleNamespace(
+        build_gdn_execution_spec=True,
+        context_parallel_workload_profile=lambda provider: None,
+    )
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward([request(512, grad=True)])
+    assert plan.signature.topology[2] == 2
+    report, costs = emitted(rank, plan, tmp_path)
+    item = report["replay"]["memory_replay"]["estimates"][0]
+    assert item["arguments"]["head_backward_traced"] is True
+    result = reports.replay(report)
+    assert result["aggregate"]["matches"]
+    assert result["estimates"][0]["required_bytes"] == costs[0].required
+
+
+@pytest.mark.parametrize("change", ["omit_default", "omit_required", "extra"])
+def test_recorded_geometry_fields_follow_its_schema(change, tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    geometry = report["replay"]["memory_replay"]["rank"]["geometry"]
+    if change == "omit_default":
+        # Older reports may omit fields that default to zero.
+        (name,) = [n for n, v in geometry.items() if n == "gdn_conv_kernel" and v == 0]
+        del geometry[name]
+        assert reports.replay(report)["aggregate"]["matches"]
+        return
+    if change == "omit_required":
+        del geometry["kv_channels"]
+    else:
+        geometry["unknown_width"] = 1
+    with pytest.raises(ValueError, match="geometry"):
+        reports.replay(report)
+
+
 @pytest.mark.parametrize(
     "field,value", [("hidden_size", "8"), ("gdn_layers", -1), ("sequence_parallel", 0)]
 )
