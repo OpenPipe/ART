@@ -742,19 +742,21 @@ def _decode_owned_value(value: object, strings: dict[str, str]) -> pydantic.Json
     if isinstance(value, str):
         return strings.get(value, value)
     if isinstance(value, list):
-        for index, item in enumerate(value):
+        items = cast(list[pydantic.JsonValue], value)
+        for index, item in enumerate(items):
             if type(item) is not int and type(item) is not float:
-                value[index] = _decode_owned_value(item, strings)
-        return value
+                items[index] = _decode_owned_value(item, strings)
+        return items
     if isinstance(value, dict):
+        fields = cast(dict[str, pydantic.JsonValue], value)
         # JSON guarantees string keys. Self-mapped references still need rekeying
         # to retain the string table's canonical object, not merely equal text.
-        if all(key not in strings for key in value):
-            for key, item in value.items():
-                value[key] = _decode_owned_value(item, strings)
-            return value
+        if all(key not in strings for key in fields):
+            for key, item in fields.items():
+                fields[key] = _decode_owned_value(item, strings)
+            return fields
         decoded: dict[str, pydantic.JsonValue] = {}
-        for key, item in value.items():
+        for key, item in fields.items():
             decoded_key = strings.get(key, key)
             if decoded_key in decoded:
                 raise ValueError(
@@ -762,8 +764,8 @@ def _decode_owned_value(value: object, strings: dict[str, str]) -> pydantic.Json
                 )
             decoded[decoded_key] = _decode_owned_value(item, strings)
             # Release consumed branches while decoding the remaining owned tree.
-            value[key] = None
-        value.clear()
+            fields[key] = None
+        fields.clear()
         return decoded
     raise ValueError(f"Compact trajectory data is not JSON-compatible: {type(value)!r}")
 

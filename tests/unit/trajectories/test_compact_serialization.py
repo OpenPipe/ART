@@ -885,6 +885,10 @@ def test_compact_json_round_trips_all_kinds_and_protocol_source_joins() -> None:
                     elif isinstance(source_history, tr.ResponsesHistory):
                         assert source_history.instructions_source is owner
                     else:
+                        assert isinstance(
+                            source_history,
+                            (tr.CompletionsTokenHistory, tr.CompletionsStringHistory),
+                        )
                         assert (
                             next(
                                 s.source
