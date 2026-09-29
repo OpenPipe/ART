@@ -1,5 +1,6 @@
 import math
 import pickle
+import random
 from typing import Any, cast
 
 import pytest
@@ -135,6 +136,66 @@ def test_first_occurrence_preview_does_not_mutate_trie() -> None:
     root = trie._roots["model"]
     assert trie.mask("model", [1, 2, 3], [0, 0, 0], claim=False) == [False, True, True]
     assert 2 not in root.children[1].children
+
+
+def test_first_occurrence_allocates_only_unseen_prefixes(monkeypatch) -> None:
+    original = tr._TokenPrefixNode
+    created = []
+
+    def create_node():
+        node = original()
+        created.append(node)
+        return node
+
+    monkeypatch.setattr(tr, "_TokenPrefixNode", create_node)
+    trie = tr._FirstOccurrenceTrie()
+    output = tr.TokenFlag.OUTPUT
+    assert trie.mask("one", [1, 2, 3], [output] * 3, claim=False) == [True] * 3
+    assert not created
+    assert trie.mask("one", [1, 2, 3], [0] * 3, where=output) == [False] * 3
+    assert len(created) == 4
+    assert trie.mask("one", [1, 2, 3], [output] * 3, where=output) == [True] * 3
+    assert trie.mask("one", [1, 2, 3], [output] * 3, where=output) == [False] * 3
+    assert len(created) == 4
+    assert trie.mask("one", [1, 2, 4], [output] * 3, where=output) == [
+        False,
+        False,
+        True,
+    ]
+    assert len(created) == 5
+    assert trie.mask("two", [1, 2, 3], [output] * 3, where=output) == [True] * 3
+    assert len(created) == 9
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        None,
+        tr.TokenFlag(0),
+        tr.TokenFlag.SAMPLED,
+        tr.TokenFlag.OUTPUT | tr.TokenFlag.STOP,
+    ],
+)
+def test_first_occurrence_matches_prefix_set(where) -> None:
+    rng = random.Random(6219)
+    trie = tr._FirstOccurrenceTrie()
+    claimed = set()
+    for _ in range(200):
+        model = rng.choice(["one", "two"])
+        tokens = [rng.randrange(3) for _ in range(rng.randrange(20))]
+        flags = [rng.randrange(32) for _ in tokens]
+        claim = bool(rng.randrange(2))
+        expected = []
+        for index, flag in enumerate(flags):
+            key = (model, tuple(tokens[: index + 1]))
+            first = (where is None or bool(flag & int(where))) and key not in claimed
+            expected.append(first)
+            if first and claim:
+                claimed.add(key)
+        assert (
+            trie.mask(model, iter(tokens), iter(flags), where=where, claim=claim)
+            == expected
+        )
 
 
 def test_tensorized_first_occurrence_masks_match_tokenized() -> None:

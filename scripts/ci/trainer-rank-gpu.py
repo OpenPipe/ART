@@ -14,6 +14,7 @@ import sys
 import time
 
 NONTERMINAL = {"INIT", "PENDING", "SETTING_UP", "RUNNING"}
+INFRAS = {"k8s/cks-wb3", "k8s/ext-collab2"}
 EXIT_CODES = {
     "SUCCEEDED": 0,
     "FAILED": 100,
@@ -48,7 +49,7 @@ def worker(root, operation):
     cluster = owner["cluster"]
     if operation == "launch":
         task = sky.Task.from_yaml("scripts/ci/trainer-rank-gpu.sky.yaml")
-        task.set_resources_override({"infra": "k8s/cks-wb3"})
+        task.set_resources_override({"infra": owner["infra"]})
         request_id = sky.launch(task, cluster_name=cluster, retry_until_up=False)
         try:
             write_json(root / "request.json", {**owner, "request_id": request_id})
@@ -263,8 +264,9 @@ def main(root):
     run_id, attempt = os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"]
     if not run_id.isdecimal() or not attempt.isdecimal():
         raise ValueError("Expected numeric GitHub run ID and attempt")
-    if os.environ["SKY_INFRA"] != "k8s/cks-wb3":
-        raise ValueError("TrainerRank CI requires free cks-wb3")
+    infra = os.environ["SKY_INFRA"]
+    if infra not in INFRAS:
+        raise ValueError("TrainerRank CI requires free cks-wb3 or ext-collab2")
     owner = {
         "run_id": run_id,
         "attempt": attempt,
@@ -274,6 +276,7 @@ def main(root):
         "cluster": f"trainer-rank-gpu-{run_id}-{attempt}",
         "repository": os.environ["GITHUB_REPOSITORY"],
         "event": os.environ["GITHUB_EVENT_NAME"],
+        "infra": infra,
     }
     if owner["head"] != os.environ["EXPECTED_HEAD_SHA"]:
         raise ValueError("Checkout differs from classified CI head")
