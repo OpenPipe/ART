@@ -13,7 +13,7 @@ also lets the circular import resolve lazily.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import nullcontext
 import hashlib
 import math
@@ -27,7 +27,12 @@ if TYPE_CHECKING:
     import torch.distributed as dist
 
     from art.megatron.lora import LoRASlotRef
-    from art.trainer_rank._impl import AdapterSelection, AnyForwardInput, TrainerRank
+    from art.trainer_rank._impl import (
+        AdapterSelection,
+        AnyForwardInput,
+        TrainerRank,
+        _GroupLayout,
+    )
 
 
 def _split_required_memory(costs: Sequence[_impl._SubforwardCost]) -> int:
@@ -501,8 +506,10 @@ def _moe_workspace_from_terms(
     """``routed_rows`` is what this rank's experts receive at balanced routing
     (``rows`` by default); the shared expert's part stays on the local rows."""
     coefficient, stages, shared = terms
-    routed = rows if routed_rows is None else max(0, min(rows, routed_rows))
-    return (rows - routed) * shared + (
+    # A rank can receive more routed rows than it holds (an uneven CP
+    # split); the shared part then stays on the routed rows' count.
+    routed = rows if routed_rows is None else max(0, routed_rows)
+    return max(0, rows - routed) * shared + (
         max(
             routed * coefficient,
             *(routed * per_row + fixed for per_row, fixed in stages),
@@ -608,19 +615,22 @@ def _checkpoint_memory_floor(
     slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
     gdn_segments: int = 0,
     routed_rows: tuple[int, ...] | None = None,
+    layouts: tuple[_GroupLayout, ...] | None = None,
 ) -> tuple[int, int]:
     """Conservative saved-boundary charge and one recomputed layer's workspace.
 
     ``routed_rows`` are each group's balanced dispatched rows per rank
-    (``_plan_group_routed_rows``); by default, its local rows. Eligibility is
-    ``_checkpoint_layers``; the arithmetic, shared with grouped CPU replay, is
-    ``_checkpoint_floor_from_facts``.
+    (``_plan_group_routed_rows``); by default, its local rows. With
+    ``layouts`` (``_plan_group_layouts``), price every rank on its own CP
+    layouts instead of the busiest rank's rows (``_layout_checkpoint_floor``).
+    Eligibility is ``_checkpoint_layers``; the arithmetic, shared with grouped
+    CPU replay, is ``_checkpoint_floor_from_facts``.
     """
     layers = _checkpoint_layers(self, group_rows)
     if not layers:
         return 0, 0
     retained, workspace = _checkpoint_floor_from_facts(
-        self, group_rows, slot_refs, gdn_segments, layers, routed_rows
+        self, group_rows, slot_refs, gdn_segments, layers, routed_rows, layouts
     )
     # HybridEP runtime state is intentionally outside grouped CPU replay.
     if (
@@ -652,6 +662,7 @@ def _checkpoint_floor_from_facts(
     gdn_segments: int,
     layers: int,
     routed_rows: tuple[int, ...] | None = None,
+    layouts: tuple[_GroupLayout, ...] | None = None,
 ) -> tuple[int, int]:
     """Count actual local full/uniform/1 boundaries, including aliases, rather
     than claiming measured distinct storage. Only this call's new groups
@@ -696,8 +707,10 @@ def _checkpoint_floor_from_facts(
             roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
             workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
         return retained, workspace
-    # Boundaries on the busiest rank's rows and one recomputed layer.
     routed = (None,) * len(group_rows) if routed_rows is None else routed_rows
+    if layouts is not None and all(grad for _, grad in group_rows):
+        return self._layout_checkpoint_floor(refs, routed, layouts)
+    # Boundaries on the busiest rank's rows and one recomputed layer.
     retained = gradient_rows * layers * self._hidden_size * 2
     moe = self._checkpoint_moe_bytes_per_token() if gradient_rows else 0
     # Beside the mixer, the recomputed layer keeps its post-mixer residual
@@ -846,6 +859,7 @@ def _checkpoint_gradient_groups(
 def _checkpoint_adapter_gradient_bytes(
     self: TrainerRank,
     groups: Sequence[tuple[LoRASlotRef | None, Sequence[int]]],
+    pending_by_slot: Mapping[LoRASlotRef, tuple[int, ...]] | None = None,
     *,
     head: bool = False,
 ) -> int:
@@ -853,12 +867,20 @@ def _checkpoint_adapter_gradient_bytes(
 
     ``groups`` gives each gradient group's adapter slot (None for the base
     model) and each decoder layer's saved-boundary bytes
-    (``_adapter_gradient_walk``). With ``head``, those live while a group's
-    head runs its backward instead (``_adapter_gradient_head``).
+    (``_adapter_gradient_walk``). ``pending_by_slot`` reuses slots' pending
+    gradients already resolved (``_pending_adapter_gradient_bytes``). With
+    ``head``, those live while a group's head runs its backward instead
+    (``_adapter_gradient_head``).
     """
     chains = []
     for slot, boundaries in groups:
-        pending = () if slot is None else self._pending_adapter_gradient_bytes((slot,))
+        pending = (
+            ()
+            if slot is None
+            else pending_by_slot[slot]
+            if pending_by_slot is not None
+            else self._pending_adapter_gradient_bytes((slot,))
+        )
         if pending and len(pending) != len(boundaries) + 1:
             return 0
         chains.append((pending or (0,) * (len(boundaries) + 1), boundaries))
@@ -1078,6 +1100,7 @@ def _checkpoint_head_stage_bytes(
     gradient: int,
     group_rows: tuple[tuple[int, bool], ...],
     slot_refs: tuple["LoRASlotRef | None", ...] | None,
+    layouts: tuple[_GroupLayout, ...] | None = None,
 ) -> int | None:
     """The head backward's peak beyond the boundaries and ``gradient``.
 
@@ -1095,12 +1118,17 @@ def _checkpoint_head_stage_bytes(
     shares the decoder stage. That bounds heads whose backward is the
     traced one (``_head_backward_traced``); callers keep the unstaged price
     beside any other, whose buffers can exceed ``head_workspace_bytes``.
+    On per-rank CP layouts, each rank's boundaries are within the floor's,
+    so the largest rank's adapter term bounds each.
     """
     if not head_workspace_bytes or not self._checkpoint_gradient_covered(
         group_rows, slot_refs
     ):
         return None
     rows = sum(rows for rows, grad in group_rows if grad)
+    adapters = self._layout_adapter_gradient_bytes(
+        group_rows, slot_refs, layouts, head=True
+    )
     # A rank's chunk below the fused minimum (CP splits the projected rows
     # unevenly) takes the FP32 fallback.
     fallback = _impl._HEAD_FALLBACK_BUFFERS * self._head_workspace_bytes(
@@ -1114,8 +1142,12 @@ def _checkpoint_head_stage_bytes(
         + 2 * gradient
         + rows * self._backward_row_state_bytes()
         + self._te_workspace_growth_bytes()
-        + self._checkpoint_adapter_gradient_bytes(
-            self._checkpoint_gradient_groups(group_rows, slot_refs), head=True
+        + (
+            self._checkpoint_adapter_gradient_bytes(
+                self._checkpoint_gradient_groups(group_rows, slot_refs), head=True
+            )
+            if adapters is None
+            else max(adapters, default=0)
         )
     )
 
@@ -1191,18 +1223,296 @@ def _recomputed_mixer_bytes_per_token(self: TrainerRank) -> int:
       more rows; its hidden-width input exchange and value-width output
       allowance price that (88 KB measured at CP2, 94 KB priced).
     """
+    return max(self._recomputed_mixer_widths().values(), default=0)
+
+
+def _layer_gdn_inputs(self: TrainerRank) -> tuple[bool, ...]:
+    """Per decoder layer, whether its saved input arrives in the GDN layout.
+
+    It does when the layer follows a GDN layer in its island
+    (``_art_gdn_island_boundary``); otherwise it is in the attention layout.
+    """
+    decoder = _impl._language_model(self.runtime.model[0]).decoder
+    return tuple(
+        getattr(getattr(layer, "_art_gdn_island_boundary", None), "input_layout", "")
+        == "gdn"
+        for layer in decoder.layers
+    )
+
+
+def _layout_checkpoint_floor(
+    self: TrainerRank,
+    refs: tuple["LoRASlotRef | None", ...],
+    routed: tuple[int | None, ...],
+    layouts: tuple[_GroupLayout, ...],
+) -> tuple[int, int]:
+    """The largest rank's boundaries and the rest of the largest rank total.
+
+    The two sum to the largest of ``_layout_checkpoint_rank_floors``' totals.
+    """
+    floors = self._layout_checkpoint_rank_floors(refs, routed, layouts)
+    retained = max(retained for retained, _ in floors)
+    return retained, max(map(sum, floors)) - retained
+
+
+def _layout_checkpoint_rank_floors(
+    self: TrainerRank,
+    refs: tuple["LoRASlotRef | None", ...],
+    routed: tuple[int | None, ...],
+    layouts: tuple[_GroupLayout, ...],
+) -> tuple[tuple[int, int], ...]:
+    """Each CP rank's boundaries and recomputed layer on its own layouts.
+
+    A saved layer input arrives in the GDN layout when the layer follows a
+    GDN layer in its island (``_art_gdn_island_boundary``), and in the
+    attention layout otherwise. A recomputed attention layer keeps its
+    activations on its attention rows plus what the CP executor keeps for
+    backward; a GDN layer keeps the GDN width on its GDN rows. Either one's
+    residual, norm, routing state and MoE stage use that layer's rows, and
+    routed rows the EP share. Traced CP2 ranks: boundaries match exactly and
+    attention within 0.3%. Returns each rank's (boundaries, workspace).
+    """
+    hidden = self._hidden_size * 2
+    inputs = self._layer_gdn_inputs()
+    gdn_inputs = sum(inputs)
+    attention_inputs = len(inputs) - gdn_inputs
+    widths = self._recomputed_mixer_widths(stage_buffers=False)
+    moe = self._checkpoint_moe_bytes_per_token()
+    beside = 2 * hidden + self._moe_checkpoint_state_bytes_per_token() if moe else 0
+    floors: list[tuple[int, int]] = []
+    for rank in range(len(layouts[0].attention_rows)):
+        retained = workspace = 0
+        for ref, dispatched, layout in zip(refs, routed, layouts, strict=True):
+            attention = max(1, layout.attention_rows[rank])
+            gdn = (
+                attention if layout.gdn_rows is None else max(1, layout.gdn_rows[rank])
+            )
+            retained += hidden * (attention_inputs * attention + gdn_inputs * gdn)
+            for kind, rows, extra in (
+                ("attention", attention, layout.attention_retained[rank]),
+                ("gdn", gdn, 0),
+            ):
+                if kind not in widths:
+                    continue
+                stage = (
+                    rows * (widths[kind] + beside)
+                    + extra
+                    + self._moe_workspace_bytes(
+                        rows,
+                        routed_rows=dispatched,
+                        checkpoint_grad=True,
+                        slot_ref=ref,
+                    )
+                )
+                workspace = max(workspace, stage)
+        floors.append((retained, workspace))
+    growth = self._te_workspace_growth_bytes() if moe else 0
+    return tuple((retained, workspace + growth) for retained, workspace in floors)
+
+
+def _layout_pricing_supported(
+    self: TrainerRank, topology: tuple[int, int, int, int], *, gradient_groups: bool
+) -> bool:
+    """Whether layout-aware pricing models this runtime and plan shape."""
+    _dp, tp, cp, pp = topology
+    if (tp, cp, pp) != (1, 2, 1) or not gradient_groups:
+        return False
+    geometry = self._geometry
+    if not geometry.num_attention_heads or not geometry.kv_channels:
+        return False
+    if len(self.runtime.model) != 1:
+        return False
+    try:
+        decoder = _impl._language_model(self.runtime.model[0]).decoder
+        from art.megatron.context_parallel.core_attention import (
+            ArtContextParallelCoreAttention,
+        )
+    except (AttributeError, RuntimeError, ModuleNotFoundError):
+        return False
+    layers = getattr(decoder, "layers", None)
+    if layers is None:
+        return False
+    for layer in layers:
+        boundary = getattr(layer, "_art_gdn_island_boundary", None)
+        if boundary is not None and boundary.is_gdn:
+            continue
+        if self._gdn_layers and boundary is None:
+            return False
+        core = getattr(getattr(layer, "self_attention", None), "core_attention", None)
+        if (
+            type(core) is not ArtContextParallelCoreAttention
+            or getattr(core, "softmax_offset", None) is not None
+        ):
+            return False
+    return True
+
+
+def _minimum_layouts(
+    self: TrainerRank, physical_rows: Sequence[int], cp: int
+) -> tuple[_GroupLayout, ...]:
+    """Even-share layouts keeping the least attention state: a lower bound.
+
+    Every rank's total grows with its own rows, and every rank keeps at
+    least an aligned local stage's state per row (each row attends to
+    itself), so the largest rank's total is at least the total at the mean
+    rows. The mean is at least the floor of an even share, which is why
+    this rounds down; rounding up can exceed a split's exact cost.
+    """
+    from art.megatron.context_parallel.executor import (
+        minimum_retained_bytes_per_row,
+    )
+
+    geometry = self._geometry
+    per_row = minimum_retained_bytes_per_row(
+        q_heads=int(geometry.num_attention_heads),
+        kv_heads=int(geometry.num_query_groups),
+        head_dim=int(geometry.kv_channels),
+        value_head_dim=int(geometry.kv_channels),
+        element_size=self._param_dtype_size,
+    )
+    return tuple(
+        _impl._GroupLayout(
+            attention_rows=(rows // cp,) * cp,
+            gdn_rows=(rows // cp,) * cp if self._gdn_layers else None,
+            attention_retained=(rows // cp * per_row,) * cp,
+        )
+        for rows in physical_rows
+    )
+
+
+def _layout_layer_boundaries(
+    self: TrainerRank, layouts: tuple[_GroupLayout, ...]
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """Each CP rank's saved-boundary bytes per group and decoder layer.
+
+    As ``_layout_checkpoint_rank_floors`` prices them: a layer saves its
+    input in the GDN layout when it follows a GDN layer in its island and in
+    the attention layout otherwise, on that rank's rows of the group.
+    """
+    gdn_inputs = self._layer_gdn_inputs()
+    hidden = self._hidden_size * 2
+    ranks = []
+    for rank in range(len(layouts[0].attention_rows)):
+        groups = []
+        for layout in layouts:
+            attention = max(1, layout.attention_rows[rank])
+            gdn = (
+                attention if layout.gdn_rows is None else max(1, layout.gdn_rows[rank])
+            )
+            groups.append(
+                tuple(hidden * (gdn if is_gdn else attention) for is_gdn in gdn_inputs)
+            )
+        ranks.append(tuple(groups))
+    return tuple(ranks)
+
+
+def _layout_adapter_gradient_bytes(
+    self: TrainerRank,
+    group_rows: tuple[tuple[int, bool], ...],
+    slot_refs: tuple["LoRASlotRef | None", ...] | None,
+    layouts: tuple[_GroupLayout, ...] | None,
+    *,
+    head: bool = False,
+) -> list[int] | None:
+    """Each CP rank's ``_checkpoint_adapter_gradient_bytes`` on its own rows.
+
+    Over that rank's boundaries (``_layout_layer_boundaries``). None
+    without per-rank layouts: every layer then saves each gradient group's
+    rows (``_checkpoint_gradient_groups``).
+    """
+    if (
+        layouts is None
+        or self._topology_key()[1] > 1
+        or not all(grad for _, grad in group_rows)
+    ):
+        return None
+    slots = [
+        slot for slot, _ in self._checkpoint_gradient_groups(group_rows, slot_refs)
+    ]
+    # Every rank walks the same slots' gradients: resolve them once.
+    pending = {
+        slot: self._pending_adapter_gradient_bytes((slot,))
+        for slot in slots
+        if slot is not None
+    }
+    return [
+        self._checkpoint_adapter_gradient_bytes(
+            tuple(zip(slots, boundaries, strict=True)), pending, head=head
+        )
+        for boundaries in self._layout_layer_boundaries(layouts)
+    ]
+
+
+def _checkpoint_adapter_gradient_extra(
+    self: TrainerRank,
+    floor: tuple[int, int],
+    group_rows: tuple[tuple[int, bool], ...],
+    slot_refs: tuple["LoRASlotRef | None", ...] | None,
+    routed_rows: tuple[int, ...] | None,
+    layouts: tuple[_GroupLayout, ...] | None,
+) -> int:
+    """Adapter gradients at the recompute backward's peak beyond ``floor``.
+
+    ``floor`` is ``_checkpoint_memory_floor``'s (boundaries, workspace).
+    Every layer saves each gradient group's rows
+    (``_checkpoint_gradient_groups``), except on per-rank CP layouts
+    (``_layout_checkpoint_floor``), where each rank releases its own
+    (``_layout_layer_boundaries``). A rank with fewer rows releases less
+    as backward proceeds, so its extra is larger, but its own floor is
+    smaller by what it never saved. Pair each rank's extra with its own
+    boundaries plus the larger of its workspace and the floor's, which
+    bounds that rank's floor, so a short CP2 sequence (all GDN rows on one
+    rank) does not add one rank's extra to the other's floor.
+    """
+    retained, workspace = floor
+    extras = self._layout_adapter_gradient_bytes(group_rows, slot_refs, layouts)
+    if extras is None:
+        return self._checkpoint_adapter_gradient_bytes(
+            self._checkpoint_gradient_groups(group_rows, slot_refs)
+        )
+    if not any(extras):
+        return 0
+    assert layouts is not None  # extras come only from per-rank layouts
+    floors = self._layout_checkpoint_rank_floors(
+        (None,) * len(group_rows) if slot_refs is None else slot_refs,
+        (None,) * len(group_rows) if routed_rows is None else routed_rows,
+        layouts,
+    )
+    # No rank's pairing exceeds the floor, so every rank's own floor plus
+    # its extra fits within the floor plus this.
+    return max(
+        0,
+        max(
+            rank_retained + max(rank_workspace, workspace) + extra
+            for (rank_retained, rank_workspace), extra in zip(
+                floors, extras, strict=True
+            )
+        )
+        - retained
+        - workspace,
+    )
+
+
+def _recomputed_mixer_widths(
+    self: TrainerRank, *, stage_buffers: bool = True
+) -> dict[str, int]:
+    """Recomputed attention and GDN mixer bytes per row, by layer type.
+
+    ``stage_buffers=False`` leaves out the CP attention stage allowance, for
+    callers that price the executor's stage buffers from its stage plan.
+    """
     geometry = self._geometry
     hidden = self._hidden_size
     tp = max(1, self._topology_key()[1])
     cp = self._topology_key()[2] > 1
-    widths = []
+    widths: dict[str, float] = {}
     if self._gdn_layers < self._num_layers:
         attention, _gdn = self._mixer_activation_widths()
-        if cp:
+        if cp and stage_buffers:
             q = geometry.num_attention_heads * geometry.kv_channels or hidden
             kv = geometry.num_query_groups * geometry.kv_channels or hidden
             attention += (3 * q + 2 * kv) / tp
-        widths.append(attention)
+        widths["attention"] = attention
     if self._gdn_layers:
         key = geometry.gdn_key_heads * geometry.gdn_key_head_dim
         value = geometry.gdn_value_heads * geometry.gdn_value_head_dim
@@ -1211,8 +1521,8 @@ def _recomputed_mixer_bytes_per_token(self: TrainerRank) -> int:
         gdn = hidden + (2 * key + normalized + 6 * value + chunk) / tp
         if cp:
             gdn += hidden + value / tp
-        widths.append(gdn)
-    return int(max(widths, default=0) * self._param_dtype_size)
+        widths["gdn"] = gdn
+    return {kind: int(width * self._param_dtype_size) for kind, width in widths.items()}
 
 
 def _adapter_gradient_head(
@@ -1584,6 +1894,7 @@ def _memory_check(
             gdn_segments=forward.grad_segment_count,
             group_rows=self._plan_group_rows(forward),
             group_routed_rows=self._plan_group_routed_rows(forward),
+            group_layouts=self._plan_group_layouts(forward),
             slot_refs=tuple(g.slot_ref for g in forward.groups),
             head_workspace_bytes=self._plan_head_workspace_bytes(forward),
             head_backward_traced=self._plan_head_backward_traced(forward),
@@ -1698,6 +2009,7 @@ def _estimate_required_memory_bytes_from_values(
     gdn_segments: int = 0,
     group_rows: tuple[tuple[int, bool], ...] = (),
     group_routed_rows: tuple[int, ...] | None = None,
+    group_layouts: tuple[_GroupLayout, ...] | None = None,
     slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
     head_workspace_bytes: int = 0,
     head_backward_traced: bool = False,
@@ -1786,7 +2098,11 @@ def _estimate_required_memory_bytes_from_values(
     )
     retained, workspace = (
         self._checkpoint_memory_floor(
-            group_rows, slot_refs, gdn_segments, routed_rows=group_routed_rows
+            group_rows,
+            slot_refs,
+            gdn_segments,
+            routed_rows=group_routed_rows,
+            layouts=group_layouts,
         )
         if checkpoint_memory is None
         else checkpoint_memory
@@ -1797,11 +2113,15 @@ def _estimate_required_memory_bytes_from_values(
         # The input gradient, the backward's other end and cold transients,
         # staged as _subforward_cost.
         gradient = self._checkpoint_input_gradient_bytes(group_rows, slot_refs)
-        adapter_gradient = self._checkpoint_adapter_gradient_bytes(
-            self._checkpoint_gradient_groups(group_rows, slot_refs)
+        adapter_gradient = self._checkpoint_adapter_gradient_extra(
+            (retained, workspace),
+            group_rows,
+            slot_refs,
+            group_routed_rows,
+            group_layouts,
         )
         head_stage = self._checkpoint_head_stage_bytes(
-            head_workspace_bytes, gradient, group_rows, slot_refs
+            head_workspace_bytes, gradient, group_rows, slot_refs, group_layouts
         )
         peak += adapter_gradient
         if head_stage is not None:

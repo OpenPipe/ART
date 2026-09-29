@@ -716,12 +716,14 @@ def replay(
                     name in arguments
                     for name in (
                         "slot_refs",
+                        "group_layouts",
                         "head_workspace_bytes",
                         "checkpoint_floor",
                     )
                 )
             )
             or arguments.get("slot_refs")
+            or arguments.get("group_layouts")
             or arguments.get("head_workspace_bytes", 0)
             or any(arguments.get("checkpoint_floor", (0, 0)))
         ):

@@ -1070,6 +1070,17 @@ _AnyForwardPlan = _FlatForwardPlan | _SplitForwardPlan
 
 
 @dataclass(frozen=True)
+class _GroupLayout:
+    """One packed group's CP layouts on every rank, for layout-aware pricing."""
+
+    attention_rows: tuple[int, ...]
+    gdn_rows: tuple[int, ...] | None
+    # What each rank's recomputed CP attention keeps for backward beyond its
+    # own-row activations (``retained_stage_record_bytes``).
+    attention_retained: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class _SubforwardCost:
     """Memory terms of one candidate subforward while all graphs stay live.
 
@@ -3041,6 +3052,7 @@ class TrainerRank:
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
         group_routed_rows: tuple[int, ...] | None = None,
+        group_layouts: tuple[_GroupLayout, ...] | None = None,
         slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
         head_workspace_bytes: int = 0,
         head_backward_traced: bool = False,
@@ -3049,7 +3061,11 @@ class TrainerRank:
         hybridep_growth_bytes: int = 0,
     ) -> _SubforwardCost:
         checkpoint_memory = self._checkpoint_memory_floor(
-            group_rows, slot_refs, gdn_segments, routed_rows=group_routed_rows
+            group_rows,
+            slot_refs,
+            gdn_segments,
+            routed_rows=group_routed_rows,
+            layouts=group_layouts,
         )
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
@@ -3059,6 +3075,7 @@ class TrainerRank:
             gdn_segments=gdn_segments,
             group_rows=group_rows,
             group_routed_rows=group_routed_rows,
+            group_layouts=group_layouts,
             slot_refs=slot_refs,
             head_workspace_bytes=head_workspace_bytes,
             checkpoint_floor=checkpoint_floor,
@@ -3080,13 +3097,21 @@ class TrainerRank:
         )
         # Input gradients live at the recomputed layer's peak; kept out of
         # forward retention, including the cold fallback above.
+        # Per-rank layouts price each rank's own boundaries; the input-gradient
+        # allowance keeps the busiest rank's (``_checkpoint_input_gradient_bytes``).
         gradient = self._checkpoint_input_gradient_bytes(
-            group_rows, slot_refs, retained=checkpoint_retained
+            group_rows,
+            slot_refs,
+            retained=checkpoint_retained if group_layouts is None else None,
         )
         gradient_slots = self._gradient_slots(group_rows, slot_refs)
         adapter_gradient = (
-            self._checkpoint_adapter_gradient_bytes(
-                self._checkpoint_gradient_groups(group_rows, slot_refs)
+            self._checkpoint_adapter_gradient_extra(
+                (checkpoint_retained, checkpoint_workspace),
+                group_rows,
+                slot_refs,
+                group_routed_rows,
+                group_layouts,
             )
             if gradient
             else 0
@@ -3099,7 +3124,7 @@ class TrainerRank:
         forward_required = required
         if gradient:
             head_stage = self._checkpoint_head_stage_bytes(
-                head_workspace_bytes, gradient, group_rows, slot_refs
+                head_workspace_bytes, gradient, group_rows, slot_refs, group_layouts
             )
             peak = checkpoint_workspace + adapter_gradient
             if head_stage is not None:
@@ -4929,6 +4954,17 @@ class TrainerRank:
         )
 
     _group_head_workspace_bytes = _memory._group_head_workspace_bytes
+    _layer_gdn_inputs = _memory._layer_gdn_inputs
+    _layout_checkpoint_floor = _memory._layout_checkpoint_floor
+    _layout_checkpoint_rank_floors = _memory._layout_checkpoint_rank_floors
+    _layout_pricing_supported = _memory._layout_pricing_supported
+    _minimum_layouts = _memory._minimum_layouts
+    _layout_layer_boundaries = _memory._layout_layer_boundaries
+    _layout_adapter_gradient_bytes = _memory._layout_adapter_gradient_bytes
+    _checkpoint_adapter_gradient_extra = _memory._checkpoint_adapter_gradient_extra
+    _recomputed_mixer_widths = _memory._recomputed_mixer_widths
+    _plan_group_layouts = _micro_batch_planner._plan_group_layouts
+    _compute_group_layouts = _micro_batch_planner._compute_group_layouts
     _triton_min_rows = _memory._triton_min_rows
     _head_backward_traced = _memory._head_backward_traced
     _te_workspace_growth_bytes = _memory._te_workspace_growth_bytes

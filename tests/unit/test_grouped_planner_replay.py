@@ -720,3 +720,128 @@ def test_grouped_replay_refuses_unconsumed_metadata(field, monkeypatch, tmp_path
     report["replay"][field].append(deepcopy(report["replay"][field][0]))
     with pytest.raises(ValueError, match="unused"):
         reports.replay(report)
+
+
+def layout_report(monkeypatch, tmp_path):
+    """A grouped CP2 report priced on every rank's own layouts."""
+    from test_trainer_rank_checkpoint_memory import rank as checkpoint_rank
+    from test_trainer_rank_layout_memory import _requests, art_cp
+
+    rank = art_cp(checkpoint_rank(), monkeypatch)
+    del rank._topology_key  # the stock reader, over the fixture's CP2 topology
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward(_requests())
+    assert rank._plan_group_layouts(plan) is not None
+    report, costs = emitted(rank, plan, tmp_path)
+    return report, costs, rank
+
+
+def test_cp_layouts_are_replayed_and_frozen(monkeypatch, tmp_path):
+    original, costs, rank = layout_report(monkeypatch, tmp_path)
+    facts = original["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    (group,) = facts["groups"]
+    assert len(group["layout"]["attention_rows"]) == 2
+    assert len(facts["layer_gdn_inputs"]) == facts["checkpoint_layers"] == 40
+    assert any(facts["layer_gdn_inputs"]) and not all(facts["layer_gdn_inputs"])
+    actual = reports.replay(original)
+    assert actual["aggregate"]["matches"]
+    assert actual["estimates"][0]["required_bytes"] == costs[0].required
+    # The live model's layers cannot change the replayed answer.
+    for layer in rank.runtime.model[0].decoder.layers:
+        layer._art_gdn_island_boundary = None
+    assert reports.replay(original) == actual
+
+    def changed(edit):
+        report = deepcopy(original)
+        edit(report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"])
+        return reports.replay(report)["estimates"][0]
+
+    # Each frozen layout fact reaches the per-rank pricing.
+    for edit in (
+        lambda f: f["groups"][0]["layout"]["attention_rows"].__setitem__(1, 10**5),
+        lambda f: f["groups"][0]["layout"]["attention_retained"].__setitem__(0, 10**12),
+        lambda f: f.__setitem__("layer_gdn_inputs", [True] * 40),
+    ):
+        result = changed(edit)
+        assert not result["matches"]
+        assert result["required_bytes"] != actual["estimates"][0]["required_bytes"]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "no_grad",
+        "gdn_length",
+        "value",
+        "inputs_length",
+        "inputs_type",
+        "ranks",
+        "argument",
+        "empty_gdn",
+    ],
+)
+def test_cp_layout_fact_validation_rejects_forged_input(change, monkeypatch, tmp_path):
+    report, _, _ = layout_report(monkeypatch, tmp_path)
+    item = report["replay"]["memory_replay"]["estimates"][0]
+    facts = item["runtime_facts"]
+    layout = facts["groups"][0]["layout"]
+    if change == "no_grad":
+        facts["groups"][0]["grad"] = False
+        facts["groups"][0]["moe_covered"] = False
+        facts["groups"][0]["adapter"] = None
+        message = "invalid CP layout facts"
+    elif change == "gdn_length":
+        layout["gdn_rows"].append(1)
+        message = "invalid CP layout facts"
+    elif change == "value":
+        layout["attention_retained"][0] = 1.5
+        message = "invalid runtime dimension"
+    elif change == "inputs_length":
+        facts["layer_gdn_inputs"].pop()
+        message = "invalid layer input layout facts"
+    elif change == "inputs_type":
+        facts["layer_gdn_inputs"][0] = 1
+        message = "invalid layer input layout facts"
+    elif change == "ranks":
+        for key in ("attention_rows", "gdn_rows", "attention_retained"):
+            layout[key].append(1)
+        message = "recorded topology"
+    elif change == "argument":
+        item["arguments"]["group_layouts"] = [dict(layout)]
+        message = "immutable runtime"
+    else:
+        layout["gdn_rows"] = []
+        message = "invalid CP layout facts"
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+def test_cp_layouts_need_the_live_cp2_topology(tmp_path):
+    # Layout pricing is CP2-only: layouts forged onto a CP1 report are refused.
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    (group,) = facts["groups"]
+    group["layout"] = {
+        "attention_rows": [group["rows"]],
+        "gdn_rows": None,
+        "attention_retained": [0],
+    }
+    facts["layer_gdn_inputs"] = [False] * facts["checkpoint_layers"]
+    with pytest.raises(ValueError, match="recorded topology"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("name", ["_plan_group_layouts", "_layer_gdn_inputs"])
+def test_custom_layout_reader_is_explicitly_incomplete(name, monkeypatch):
+    from art.trainer_rank import _planner_replay
+
+    rank = _rank(monkeypatch)
+    plan = rank._plan_flat_forward([_request(1)])
+    original = getattr(rank, name)
+    monkeypatch.setattr(rank, name, lambda *args: original(*args))
+    with pytest.raises(ValueError, match="custom_runtime_estimator"):
+        _planner_replay.capture(rank, plan)
