@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -277,6 +278,32 @@ def test_subclass_copy_observes_prior_gradient_cleanup():
         _optimizer._copy_back([first, second], [torch.ones(2), torch.ones(2)])
     assert second.grad is None
     torch.testing.assert_close(second, torch.ones(2), atol=0, rtol=0)
+
+
+def test_subclass_clipping_failure_keeps_prior_master_gradient(monkeypatch):
+    class FailingGradient(torch.Tensor):
+        def mul(self, other, *, out=None):
+            raise RuntimeError("clip failed")
+
+    trainer = TrainerRank(_runtime())
+    params = tuple(torch.nn.Parameter(torch.ones(2)) for _ in range(2))
+    for param in params:
+        param.grad = torch.ones_like(param)
+    trainer._checkpoint_slots["test"] = _CheckpointSlot(params=params)
+    masters = tuple(torch.nn.Parameter(torch.ones(2)) for _ in params)
+    grads = (torch.ones(2), torch.ones(2).as_subclass(FailingGradient))
+    monkeypatch.setattr(
+        trainer, "_reduce_dynamic_grads", lambda *_args, **_kwargs: grads
+    )
+    monkeypatch.setattr(
+        trainer,
+        "_dynamic_optimizer",
+        lambda *_: SimpleNamespace(master_params=masters, optimizer=None),
+    )
+    with pytest.raises(RuntimeError, match="clip failed"):
+        trainer.optim_step(params=AdamParams(learning_rate=0.01, grad_clip_norm=0.0))
+    torch.testing.assert_close(masters[0].grad, torch.ones(2), atol=0, rtol=0)
+    assert masters[1].grad is None
 
 
 def test_empty_pointwise_lists():

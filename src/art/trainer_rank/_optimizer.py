@@ -58,6 +58,16 @@ def _multiply(
 def _scaled_grads(
     params: Sequence[torch.nn.Parameter], scale: float
 ) -> tuple[torch.Tensor, ...]:
+    if any(
+        param.grad is not None and not _foreach_compatible(param.grad)
+        for param in params
+    ):
+        return tuple(
+            _impl.torch.zeros_like(param, dtype=_impl.torch.float32)
+            if param.grad is None
+            else param.grad.detach().float().mul(scale)
+            for param in params
+        )
     grads = []
     owned, borrowed = [], []
     for param in params:
@@ -413,11 +423,13 @@ def _dynamic_optim_step(
             else 1.0
         )
         dynamic = dynamics[name]
-        clipped = iter(
-            _multiply(
-                [grad for grad, step in zip(grads, step_flags, strict=True) if step],
-                clip,
-            )
+        active_grads = [
+            grad for grad, step in zip(grads, step_flags, strict=True) if step
+        ]
+        clipped = (
+            iter(_multiply(active_grads, clip))
+            if all(_foreach_compatible(grad) for grad in active_grads)
+            else (grad.mul(clip) for grad in active_grads)
         )
         for master, should_step in zip(dynamic.master_params, step_flags, strict=True):
             master.grad = next(clipped) if should_step else None
