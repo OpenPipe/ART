@@ -1082,6 +1082,7 @@ def _estimate_required_memory_bytes_from_values(
         not signature.grad_enabled
         and not self._geometry.moe_experts
         and self._geometry.ffn_hidden_size
+        and self._dense_fc1_adapted
         and signature.topology[1:3] == (1, 1)
     ):
         # A dense no-grad layer peaks at its FC1 stage (the base GEMM output,

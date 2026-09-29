@@ -516,6 +516,9 @@ def dense_rank():
     dense = TrainerRank(r.runtime)
     assert dense._geometry.ffn_hidden_size == 17408
     assert not dense._geometry.moe_experts and dense._mlp_activation_factor == 3
+    # These stand-in layers have no MLP; the traced model wraps every FC1.
+    assert dense._dense_fc1_adapted is False
+    dense._dense_fc1_adapted = True
     return dense
 
 
@@ -588,7 +591,7 @@ def test_cp1_dense_no_grad_floor_prices_physical_rows_of_the_largest_group():
     )
 
 
-@pytest.mark.parametrize("case", ["cp2", "tp2", "gradient", "moe"])
+@pytest.mark.parametrize("case", ["cp2", "tp2", "gradient", "moe", "unwrapped_fc1"])
 def test_dense_no_grad_floor_leaves_other_pricing(case):
     r = dense_rank()
     _, _, signature, _, _ = no_grad_wave(r, 64)
@@ -600,12 +603,33 @@ def test_dense_no_grad_floor_leaves_other_pricing(case):
     elif case == "gradient":
         signature = replace(signature, grad_enabled=True, grad_modes=(True,))
         groups = ((144228, True),)
-    else:
+    elif case == "moe":
         r._geometry = replace(r._geometry, moe_experts=8)
+    else:
+        # Attention-only adapters leave FC1 unwrapped: no adapter output or sum.
+        r._dense_fc1_adapted = False
     priced = estimate(r, signature, groups, 144228)
     r._geometry = replace(r._geometry, ffn_hidden_size=0)
     assert estimate(r, signature, groups, 144228) == priced
-    if case == "cp2":
-        # At CP2 each rank holds part of the packed rows; left to the
-        # existing floors (and #986's traced CP2 stage).
+    if case in ("cp2", "unwrapped_fc1"):
+        # CP2 ranks hold part of the packed rows and are left to the existing
+        # floors (and #986's traced CP2 stage), as is an unwrapped FC1.
         assert priced == int(144228 * 5120 * 2 * 16 * 1.1)
+
+
+def test_dense_fc1_adapted_needs_every_layer_wrapped():
+    from art.megatron.lora import SharedExpertsLinearFC1LoRA
+    from art.trainer_rank._impl import _dense_fc1_adapted
+
+    wrapped = SharedExpertsLinearFC1LoRA.__new__(SharedExpertsLinearFC1LoRA)
+
+    def model(*fc1s: object) -> Any:
+        layers = [SimpleNamespace(mlp=SimpleNamespace(linear_fc1=f)) for f in fc1s]
+        return SimpleNamespace(
+            _preprocess=lambda: None, decoder=SimpleNamespace(layers=layers)
+        )
+
+    assert _dense_fc1_adapted(model(wrapped, wrapped)) is True
+    assert _dense_fc1_adapted(model(wrapped, torch.nn.Linear(1, 1))) is False
+    assert _dense_fc1_adapted(model()) is False
+    assert _dense_fc1_adapted(cast(Any, SimpleNamespace())) is False
