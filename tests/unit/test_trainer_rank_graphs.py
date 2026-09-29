@@ -283,10 +283,12 @@ def test_backward_uses_creation_order_not_wire_handle_order():
     assert seen == [0, 1, 2]
 
 
-def _corrected_cache(*, retention="gpu", policy="when_available", stale=True):
+def _corrected_cache(
+    *, retention="gpu", policy="when_available", stale=True, cache=None
+):
     from art.trainer_rank._corrections import capture_forward_corrections
 
-    cache = GraphCache()
+    cache = cache or GraphCache()
     original = torch.nn.Parameter(torch.tensor(-1.0))
     current = torch.nn.Parameter(torch.tensor(-0.5))
     selected = [original]
@@ -344,6 +346,141 @@ def test_always_correction_uses_no_grad_current_evaluation_and_old_jacobian():
     assert executions == [(False, True), (True, False)]
 
 
+@pytest.mark.parametrize("phase", ["always", "coordinator", "metadata"])
+def test_correction_and_coordinator_failures_release_owned_storage(
+    monkeypatch, request, phase
+):
+    from art.trainer_rank import _corrections as corrections
+    from art.trainer_rank import _graphs as graphs
+
+    if gc.isenabled():
+        request.addfinalizer(gc.enable)
+    gc.disable()
+    cache = GraphCache()
+    older_weight = torch.nn.Parameter(torch.tensor(3.0))
+    older, (older_output,) = cache.run(lambda _: (older_weight.square(),), ())
+    storages, errors = [], []
+
+    def observe(function, *, inputs=False):
+        def call(*args, **kwargs):
+            try:
+                if inputs:
+                    storages.extend(
+                        StorageWeakRef(value.untyped_storage()) for value in args[:2]
+                    )
+                result = function(*args, **kwargs)
+                for value in result if isinstance(result, tuple) else (result,):
+                    if isinstance(value, torch.Tensor):
+                        storages.append(StorageWeakRef(value.untyped_storage()))
+                return result
+            except BaseException as error:
+                errors.append(error)
+                raise
+            finally:
+                args = kwargs = result = value = None
+
+        return call
+
+    monkeypatch.setattr(
+        graphs._ForwardRecord, "run", observe(graphs._ForwardRecord.run)
+    )
+    monkeypatch.setattr(
+        GraphCache,
+        "_prepare_correction",
+        staticmethod(observe(GraphCache._prepare_correction)),
+    )
+    monkeypatch.setattr(
+        GraphCache,
+        "_prepare_backward",
+        staticmethod(observe(GraphCache._prepare_backward)),
+    )
+    monkeypatch.setattr(
+        corrections,
+        "importance_weights",
+        observe(corrections.importance_weights, inputs=True),
+    )
+    packets = []
+    transaction = nullcontext()
+    if phase == "metadata":
+        trainer = TrainerRank.__new__(TrainerRank)
+        parameter = torch.nn.Parameter(torch.tensor(2.0))
+        trainer._checkpoint_slots = {"student": _CheckpointSlot(params=(parameter,))}
+        trainer.runtime = SimpleNamespace(model=[], optimizer=None)
+        snapshot = trainer._snapshot_parameter(
+            parameter, trainer._capture_checkpoint_version("student")
+        )
+        first, _ = cache.run(
+            lambda x: (snapshot * x,), torch.tensor(3.0), retention="replay"
+        )
+        packets.append((first, (torch.tensor(1.0),)))
+        parameter.grad = prior_gradient = torch.tensor(7.0)
+        transaction = trainer._gradient_transaction()
+    cache, handle, original, current, executions, _ = _corrected_cache(
+        policy="always",
+        retention="replay" if phase == "metadata" else "gpu",
+        cache=cache,
+    )
+    if phase == "metadata":
+        execute = cache._records[handle].execute
+        cache._records[handle].execute = lambda x: tuple(
+            value.expand(2) if torch.is_grad_enabled() else value
+            for value in execute(x)
+        )
+    gradient = torch.tensor(1.0)
+    borrowed = [
+        StorageWeakRef(value.untyped_storage())
+        for value in (original, current, gradient)
+    ]
+    primary, cause = RuntimeError("peer backward failed"), ValueError("peer cause")
+    calls = 0
+
+    def coordinate(function):
+        nonlocal calls
+        calls += 1
+        result = function()
+        if phase == "coordinator" and calls == 3:
+            raise primary from cause
+        return result
+
+    if phase == "always":
+        with torch.no_grad():
+            current.fill_(float("nan"))
+    packets.append((handle, (gradient,)))
+    with pytest.raises(ValueError if phase == "always" else RuntimeError) as failure:
+        with transaction:
+            cache.backward_many(packets, coordinate=coordinate)
+    if phase != "coordinator":
+        assert errors and all(error is failure.value for error in errors)
+        assert (
+            "metadata differs" if phase == "metadata" else "current logprobs"
+        ) in str(failure.value)
+        assert original.grad is None
+        if phase == "metadata":
+            assert parameter.grad is prior_gradient and parameter.grad.item() == 7
+            assert snapshot.grad is None and not trainer._version_state()._origins
+    else:
+        assert failure.value is primary and primary.__cause__ is cause and calls == 3
+        torch.testing.assert_close(
+            original.grad, torch.tensor(2.0) * torch.tensor(0.75).exp()
+        )
+    assert failure.value.__traceback__ is not None
+    assert len(storages) >= 4 and all(storage.expired() for storage in storages)
+    assert all(not storage.expired() for storage in borrowed)
+    assert gradient.item() == 1 and original.item() == -1 and current.grad is None
+    assert executions == [(False, True), (True, False)] + (
+        [(False, True)] if phase == "metadata" else []
+    )
+    assert cache.handles() == (older,)
+    cache.backward(older, (torch.ones_like(older_output),))
+    torch.testing.assert_close(older_weight.grad, torch.tensor(6.0))
+    cache, retry, retry_weight, _, _, _ = _corrected_cache(policy="always", cache=cache)
+    cache.backward(retry, (gradient,))
+    torch.testing.assert_close(
+        retry_weight.grad, torch.tensor(2.0) * torch.tensor(0.75).exp()
+    )
+    assert all(storage.expired() for storage in storages) and not cache.handles()
+
+
 def test_newer_replay_opportunistically_corrects_current_jacobian():
     cache, handle, original, current, executions, _ = _corrected_cache()
     cache.evict(handle, replay_with_current=True)
@@ -354,15 +491,24 @@ def test_newer_replay_opportunistically_corrects_current_jacobian():
 
 
 @pytest.mark.parametrize("corrections", [False, True])
-def test_current_replay_rejects_changed_selected_token_events(corrections):
+def test_current_replay_rejects_changed_selected_token_events(corrections, request):
     from art.trainer_rank._corrections import capture_forward_corrections
 
+    if gc.isenabled():
+        request.addfinalizer(gc.enable)
+    gc.disable()
     cache = GraphCache()
     parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
     tokens = [torch.tensor([0, 1])]
+    storages = []
 
     def execute(_):
-        return parameter.log_softmax(-1)[tokens[0]], tokens[0]
+        logprobs = parameter.log_softmax(-1)
+        output = logprobs[tokens[0]]
+        storages.extend(
+            StorageWeakRef(value.untyped_storage()) for value in (logprobs, output)
+        )
+        return output, tokens[0]
 
     handle, outputs = cache.run(execute, None)
     context = capture_forward_corrections(
@@ -379,8 +525,14 @@ def test_current_replay_rejects_changed_selected_token_events(corrections):
     )
     cache.evict(handle, replay_with_current=True)
     tokens[0] = torch.tensor([1, 0])
-    with pytest.raises(RuntimeError, match="token identit"):
-        cache.backward(handle, (torch.ones(2), None))
+    gradient = torch.ones(2)
+    with pytest.raises(RuntimeError, match="token identit") as failure:
+        cache.backward(handle, (gradient, None))
+    assert failure.value.__traceback__ is not None and failure.value.__cause__ is None
+    assert len(storages) == 4 and all(storage.expired() for storage in storages)
+    torch.testing.assert_close(parameter, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(gradient, torch.ones(2))
+    torch.testing.assert_close(tokens[0], torch.tensor([1, 0]))
     assert parameter.grad is None
     assert not cache.handles()
 

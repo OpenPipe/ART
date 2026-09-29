@@ -25,40 +25,48 @@ def importance_weights(
     silently replaced. Computation uses at least float32 and promotes to float64
     for float64 inputs or clipping bounds outside the float32 normal range.
     """
-    if original_logprobs.shape != current_logprobs.shape:
-        raise ValueError("correction logprob shapes must match exactly")
-    if original_logprobs.device != current_logprobs.device:
-        raise ValueError("correction logprobs must be on the same device")
-    if (
-        not original_logprobs.is_floating_point()
-        or not current_logprobs.is_floating_point()
-    ):
-        raise TypeError("correction logprobs must be floating-point tensors")
-    if not bool(torch.isfinite(original_logprobs).all()):
-        raise ValueError("original logprobs must be finite (positive sampling support)")
-    if bool((torch.isnan(current_logprobs) | torch.isposinf(current_logprobs)).any()):
-        raise ValueError("current logprobs must be finite or negative infinity")
-    dtype = (
-        torch.float64
-        if torch.float64 in (original_logprobs.dtype, current_logprobs.dtype)
-        or correction.clip_high > torch.finfo(torch.float32).max
-        or any(
-            0 < bound < torch.finfo(torch.float32).tiny
-            for bound in (correction.clip_low, correction.clip_high)
+    try:
+        if original_logprobs.shape != current_logprobs.shape:
+            raise ValueError("correction logprob shapes must match exactly")
+        if original_logprobs.device != current_logprobs.device:
+            raise ValueError("correction logprobs must be on the same device")
+        if (
+            not original_logprobs.is_floating_point()
+            or not current_logprobs.is_floating_point()
+        ):
+            raise TypeError("correction logprobs must be floating-point tensors")
+        if not bool(torch.isfinite(original_logprobs).all()):
+            raise ValueError(
+                "original logprobs must be finite (positive sampling support)"
+            )
+        if bool(
+            (torch.isnan(current_logprobs) | torch.isposinf(current_logprobs)).any()
+        ):
+            raise ValueError("current logprobs must be finite or negative infinity")
+        dtype = (
+            torch.float64
+            if torch.float64 in (original_logprobs.dtype, current_logprobs.dtype)
+            or correction.clip_high > torch.finfo(torch.float32).max
+            or any(
+                0 < bound < torch.finfo(torch.float32).tiny
+                for bound in (correction.clip_low, correction.clip_high)
+            )
+            else torch.float32
         )
-        else torch.float32
-    )
-    log_ratio = current_logprobs.detach().to(dtype) - original_logprobs.detach().to(
-        dtype
-    )
-    if correction.clip_high == 0:
-        return torch.zeros_like(log_ratio)
-    log_low = math.log(correction.clip_low) if correction.clip_low else -math.inf
-    return (
-        log_ratio.clamp(log_low, math.log(correction.clip_high))
-        .exp()
-        .clamp(correction.clip_low, correction.clip_high)
-    )
+        log_ratio = current_logprobs.detach().to(dtype) - original_logprobs.detach().to(
+            dtype
+        )
+        if correction.clip_high == 0:
+            return torch.zeros_like(log_ratio)
+        log_low = math.log(correction.clip_low) if correction.clip_low else -math.inf
+        return (
+            log_ratio.clamp(log_low, math.log(correction.clip_high))
+            .exp()
+            .clamp(correction.clip_low, correction.clip_high)
+        )
+    finally:
+        del original_logprobs, current_logprobs
+        log_ratio = None
 
 
 def correct_logprob_cotangent(
@@ -77,42 +85,49 @@ def correct_logprob_cotangent(
     their identity/order. Values are full-vocabulary logprobs, not probabilities
     renormalized over top-k. No forward is performed here.
     """
-    if cotangent.shape != original_logprobs.shape:
-        raise ValueError("cotangent and correction logprob shapes must match exactly")
-    active = cotangent != 0
-    if not bool(active.any()):
-        return cotangent
-    if current_logprobs is None:
-        if correction.policy == "always":
-            raise RuntimeError(
-                "importance sampling correction requires current logprobs"
-            )
-        return cotangent
-    if (original_tokens is None) != (current_tokens is None):
-        raise ValueError("correction requires both original and current token IDs")
-    if original_tokens is not None and current_tokens is not None:
-        if (
-            original_tokens.shape != original_logprobs.shape
-            or current_tokens.shape != current_logprobs.shape
-        ):
-            raise ValueError("correction token IDs must match logprob shapes")
-        if not torch.equal(original_tokens, current_tokens):
+    try:
+        if cotangent.shape != original_logprobs.shape:
             raise ValueError(
-                "correction must compare the same token IDs in the same order"
+                "cotangent and correction logprob shapes must match exactly"
             )
-    if current_logprobs.shape != original_logprobs.shape:
-        raise ValueError("correction logprob shapes must match exactly")
-    if current_logprobs.device != original_logprobs.device:
-        raise ValueError("correction logprobs must be on the same device")
-    selected = active.to(original_logprobs.device)
-    weights = importance_weights(
-        original_logprobs[selected], current_logprobs[selected], correction
-    )
-    corrected = cotangent.clone()
-    corrected[active] = (cotangent[active] * weights.to(cotangent.device)).to(
-        cotangent.dtype
-    )
-    return corrected
+        active = cotangent != 0
+        if not bool(active.any()):
+            return cotangent
+        if current_logprobs is None:
+            if correction.policy == "always":
+                raise RuntimeError(
+                    "importance sampling correction requires current logprobs"
+                )
+            return cotangent
+        if (original_tokens is None) != (current_tokens is None):
+            raise ValueError("correction requires both original and current token IDs")
+        if original_tokens is not None and current_tokens is not None:
+            if (
+                original_tokens.shape != original_logprobs.shape
+                or current_tokens.shape != current_logprobs.shape
+            ):
+                raise ValueError("correction token IDs must match logprob shapes")
+            if not torch.equal(original_tokens, current_tokens):
+                raise ValueError(
+                    "correction must compare the same token IDs in the same order"
+                )
+        if current_logprobs.shape != original_logprobs.shape:
+            raise ValueError("correction logprob shapes must match exactly")
+        if current_logprobs.device != original_logprobs.device:
+            raise ValueError("correction logprobs must be on the same device")
+        selected = active.to(original_logprobs.device)
+        weights = importance_weights(
+            original_logprobs[selected], current_logprobs[selected], correction
+        )
+        corrected = cotangent.clone()
+        corrected[active] = (cotangent[active] * weights.to(cotangent.device)).to(
+            cotangent.dtype
+        )
+        return corrected
+    finally:
+        del cotangent, original_logprobs, current_logprobs
+        del original_tokens, current_tokens
+        active = selected = weights = corrected = None
 
 
 @dataclass(frozen=True)
@@ -178,62 +193,72 @@ class ForwardCorrectionContext:
         current_tensors: Sequence[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, ...]:
         """Stage corrected cotangents without mutating gradients or model state."""
-        self.requires_current(gradients)
-        if current_tensors is not None and len(current_tensors) != self.output_count:
-            raise ValueError("current tensors must match the captured output count")
-        corrected = list(gradients)
-        if self.correction is None:
-            return tuple(corrected)
-        for output in self.outputs:
-            gradient = gradients[output.index]
-            original = output.original_logprobs
-            if gradient is None or not bool((gradient != 0).any()):
-                continue
-            current = (
-                None
-                if current_tensors is None
-                else current_tensors[output.index].detach()
-            )
-            if current is not None and output.original_tokens is not None:
-                assert current_tensors is not None and output.token_index is not None
-                tokens = current_tensors[output.token_index]
-                original_tokens = output.original_tokens.to(tokens.device)
-                if tokens.shape != original_tokens.shape:
-                    raise ValueError(
-                        "current top-k token shape must match original top-k"
+        try:
+            self.requires_current(gradients)
+            if (
+                current_tensors is not None
+                and len(current_tensors) != self.output_count
+            ):
+                raise ValueError("current tensors must match the captured output count")
+            corrected = list(gradients)
+            if self.correction is None:
+                return tuple(corrected)
+            for output in self.outputs:
+                gradient = gradients[output.index]
+                original = output.original_logprobs
+                if gradient is None or not bool((gradient != 0).any()):
+                    continue
+                current = (
+                    None
+                    if current_tensors is None
+                    else current_tensors[output.index].detach()
+                )
+                if current is not None and output.original_tokens is not None:
+                    assert (
+                        current_tensors is not None and output.token_index is not None
                     )
-                if not torch.equal(tokens, original_tokens):
-                    # A changed top-k ordering can still contain every old ID.
-                    sorted_tokens, order = tokens.sort(dim=-1)
-                    positions = torch.searchsorted(
-                        sorted_tokens.contiguous(), original_tokens.contiguous()
-                    ).clamp_max(tokens.shape[-1] - 1)
-                    matched = sorted_tokens.gather(-1, positions) == original_tokens
-                    if bool((matched | (gradient == 0).to(matched.device)).all()):
-                        current = current.gather(-1, order.gather(-1, positions))
-                    elif output.logits_index is not None:
-                        logits = current_tensors[output.logits_index].detach()
-                        dtype = (
-                            torch.float64
-                            if logits.dtype == torch.float64
-                            else torch.float32
+                    tokens = current_tensors[output.token_index]
+                    original_tokens = output.original_tokens.to(tokens.device)
+                    if tokens.shape != original_tokens.shape:
+                        raise ValueError(
+                            "current top-k token shape must match original top-k"
                         )
-                        logits = logits.to(dtype)
-                        current = logits.gather(
-                            -1, output.original_tokens.to(logits.device)
-                        ) - logits.logsumexp(-1, keepdim=True)
-                    else:
-                        # The new top-k lacks original events: no ratio is available.
-                        current = None
-            corrected[output.index] = correct_logprob_cotangent(
-                gradient,
-                original_logprobs=original
-                if current is None
-                else original.to(current.device),
-                current_logprobs=current,
-                correction=self.correction,
-            )
-        return tuple(corrected)
+                    if not torch.equal(tokens, original_tokens):
+                        # A changed top-k ordering can still contain every old ID.
+                        sorted_tokens, order = tokens.sort(dim=-1)
+                        positions = torch.searchsorted(
+                            sorted_tokens.contiguous(), original_tokens.contiguous()
+                        ).clamp_max(tokens.shape[-1] - 1)
+                        matched = sorted_tokens.gather(-1, positions) == original_tokens
+                        if bool((matched | (gradient == 0).to(matched.device)).all()):
+                            current = current.gather(-1, order.gather(-1, positions))
+                        elif output.logits_index is not None:
+                            logits = current_tensors[output.logits_index].detach()
+                            dtype = (
+                                torch.float64
+                                if logits.dtype == torch.float64
+                                else torch.float32
+                            )
+                            logits = logits.to(dtype)
+                            current = logits.gather(
+                                -1, output.original_tokens.to(logits.device)
+                            ) - logits.logsumexp(-1, keepdim=True)
+                        else:
+                            # The new top-k lacks original events: no ratio is available.
+                            current = None
+                corrected[output.index] = correct_logprob_cotangent(
+                    gradient,
+                    original_logprobs=original
+                    if current is None
+                    else original.to(current.device),
+                    current_logprobs=current,
+                    correction=self.correction,
+                )
+            return tuple(corrected)
+        finally:
+            del self, gradients, current_tensors
+            output = gradient = original = current = tokens = original_tokens = None
+            sorted_tokens = order = positions = matched = logits = corrected = None
 
     def validate_replay(
         self,
@@ -246,26 +271,30 @@ class ForwardCorrectionContext:
         Physical current-weight replay cannot feed original-position cotangents
         to a Jacobian whose selected token at that position has changed.
         """
-        self.requires_current(gradients)
-        if len(current_tensors) != self.output_count:
-            raise ValueError("current tensors must match the captured output count")
-        for output in self.outputs:
-            gradient = gradients[output.index]
-            if output.original_tokens is None or gradient is None:
-                continue
-            active = gradient != 0
-            if not bool(active.any()):
-                continue
-            assert output.token_index is not None
-            tokens = current_tensors[output.token_index]
-            original = output.original_tokens.to(tokens.device)
-            if tokens.shape != original.shape or bool(
-                ((tokens != original) & active.to(tokens.device)).any()
-            ):
-                raise RuntimeError(
-                    "current replay changed active top-k token identities; "
-                    "replay the original weights instead"
-                )
+        try:
+            self.requires_current(gradients)
+            if len(current_tensors) != self.output_count:
+                raise ValueError("current tensors must match the captured output count")
+            for output in self.outputs:
+                gradient = gradients[output.index]
+                if output.original_tokens is None or gradient is None:
+                    continue
+                active = gradient != 0
+                if not bool(active.any()):
+                    continue
+                assert output.token_index is not None
+                tokens = current_tensors[output.token_index]
+                original = output.original_tokens.to(tokens.device)
+                if tokens.shape != original.shape or bool(
+                    ((tokens != original) & active.to(tokens.device)).any()
+                ):
+                    raise RuntimeError(
+                        "current replay changed active top-k token identities; "
+                        "replay the original weights instead"
+                    )
+        finally:
+            del self, gradients, current_tensors
+            output = gradient = active = tokens = original = None
 
 
 def capture_forward_corrections(

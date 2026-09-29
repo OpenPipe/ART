@@ -603,37 +603,40 @@ class GraphCache:
         }
         # The coordinator uses this logical rank's TP/CP group, never all DP
         # ranks: different DP owners may have different numbers of graphs.
-        for handle, gradients in packets:
-            record = self._records[handle]
-            prepared[handle] = coordinate(
-                lambda: self._prepare_correction(record, gradients, stale[handle])
-            )
-        for handle, gradients in packets:
-            record = self._records[handle]
-            pairs = coordinate(
-                lambda: self._prepare_backward(
-                    record, gradients, stale[handle], prepared[handle]
+        try:
+            for handle, gradients in packets:
+                record = self._records[handle]
+                prepared[handle] = coordinate(
+                    lambda: self._prepare_correction(record, gradients, stale[handle])
                 )
-            )
-            try:
-                coordinate(
-                    lambda: (
-                        torch.autograd.backward(
-                            [output for output, _ in pairs],
-                            [gradient for _, gradient in pairs],
-                            retain_graph=retain_graph,
-                        )
-                        if pairs
-                        else None
+            for handle, gradients in packets:
+                record = self._records[handle]
+                pairs = coordinate(
+                    lambda: self._prepare_backward(
+                        record, gradients, stale[handle], prepared[handle]
                     )
                 )
-            finally:
-                record.restored.clear()
-            del pairs
-            if not retain_graph:
-                self.release(handle)
-            elif record.retention == "replay":
-                self.evict(handle)
+                try:
+                    coordinate(
+                        lambda: (
+                            torch.autograd.backward(
+                                [output for output, _ in pairs],
+                                [gradient for _, gradient in pairs],
+                                retain_graph=retain_graph,
+                            )
+                            if pairs
+                            else None
+                        )
+                    )
+                finally:
+                    record.restored.clear()
+                    pairs.clear()
+                if not retain_graph:
+                    self.release(handle)
+                elif record.retention == "replay":
+                    self.evict(handle)
+        finally:
+            prepared.clear()
 
     @staticmethod
     def _prepare_correction(record, gradients, stale):
@@ -646,50 +649,57 @@ class GraphCache:
             return None
         # Explicit always may add a no-grad forward. Stage every correction
         # before physical backward; changed cotangents wait on CPU.
-        with record.rng.replay(record.rng_tracker):
-            current = record.run(
-                context_factory=record.current_context_factory,
-                store=False,
-                grad_enabled=False,
+        try:
+            with record.rng.replay(record.rng_tracker):
+                current = record.run(
+                    context_factory=record.current_context_factory,
+                    store=False,
+                    grad_enabled=False,
+                )
+            corrected = record.corrections.correct(gradients, current)
+            return tuple(
+                value if value is None or value is original else value.to("cpu")
+                for value, original in zip(corrected, gradients, strict=True)
             )
-        corrected = record.corrections.correct(gradients, current)
-        return tuple(
-            value.to("cpu") if value is not None and value is not original else value
-            for value, original in zip(corrected, gradients, strict=True)
-        )
+        finally:
+            current = corrected = None
 
     @staticmethod
     def _prepare_backward(record, gradients, stale, prepared):
-        gradients = gradients if prepared is None else prepared
-        if not any(gradient is not None for gradient in gradients):
-            return []
-        current_replay = stale and record.replay_with_current
-        if record.outputs is None:
-            with record.rng.replay(record.rng_tracker):
-                physical = record.run(
-                    context_factory=record.current_context_factory
-                    if current_replay
-                    else None
+        try:
+            gradients = gradients if prepared is None else prepared
+            if not any(gradient is not None for gradient in gradients):
+                return []
+            current_replay = stale and record.replay_with_current
+            if record.outputs is None:
+                with record.rng.replay(record.rng_tracker):
+                    physical = record.run(
+                        context_factory=record.current_context_factory
+                        if current_replay
+                        else None
+                    )
+                metadata = tuple(
+                    (value.shape, value.dtype, value.device, value.requires_grad)
+                    for value in physical
                 )
-            metadata = tuple(
-                (value.shape, value.dtype, value.device, value.requires_grad)
-                for value in physical
-            )
-            del physical
-            if metadata != record.metadata:
-                raise RuntimeError(
-                    "Replayed output metadata differs from original forward"
+                del physical
+                if metadata != record.metadata:
+                    raise RuntimeError(
+                        "Replayed output metadata differs from original forward"
+                    )
+                record.replay_count += 1
+            if prepared is None and stale and record.corrections is not None:
+                if current_replay:
+                    record.corrections.validate_replay(gradients, record.outputs)
+                gradients = record.corrections.correct(
+                    gradients, record.outputs if current_replay else None
                 )
-            record.replay_count += 1
-        if prepared is None and stale and record.corrections is not None:
-            if current_replay:
-                record.corrections.validate_replay(gradients, record.outputs)
-            gradients = record.corrections.correct(
-                gradients, record.outputs if current_replay else None
-            )
-        assert record.outputs is not None
-        return [
-            (output, gradient.to(output.device))
-            for output, gradient in zip(record.outputs, gradients, strict=True)
-            if gradient is not None
-        ]
+            assert record.outputs is not None
+            return [
+                (output, gradient.to(output.device))
+                for output, gradient in zip(record.outputs, gradients, strict=True)
+                if gradient is not None
+            ]
+        finally:
+            del gradients, prepared
+            physical = None
