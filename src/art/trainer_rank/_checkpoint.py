@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future
 from copy import deepcopy
 from dataclasses import dataclass, field
 import hashlib
@@ -13,6 +15,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import shutil
 import struct
 import threading
+import traceback
 from typing import TYPE_CHECKING, Literal, NotRequired, TypedDict, cast
 import uuid
 import weakref
@@ -114,6 +117,83 @@ class _PreparedSave:
     shards: tuple[_LocalShard, ...]
     optimizer: OptimizerConfig | None
     custom_tensors: dict[str, CustomTensorRecord] = field(default_factory=dict)
+    writer: Future[None] | None = None
+
+
+class _SnapshotSpill:
+    """One CPU writer per rank, exiting when its owned pending writes drain."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pending: deque[
+            tuple[Path, dict[str, dict[str, torch.Tensor]], Future[None]]
+        ] = deque()
+        self.thread: threading.Thread | None = None
+
+    def submit(
+        self, snapshot: Path, payloads: dict[str, dict[str, torch.Tensor]]
+    ) -> Future[None]:
+        result: Future[None] = Future()
+        with self.lock:
+            self.pending.append((snapshot, payloads, result))
+            if self.thread is None:
+                self.thread = threading.Thread(
+                    target=self._run, name="checkpoint-snapshot"
+                )
+                try:
+                    self.thread.start()
+                except BaseException:
+                    self.thread = None
+                    self.pending.pop()
+                    raise
+        return result
+
+    def _run(self) -> None:
+        while True:
+            with self.lock:
+                if not self.pending:
+                    self.thread = None
+                    return
+                snapshot, payloads, result = self.pending.popleft()
+            error: BaseException | None = None
+            tensors: dict[str, torch.Tensor] | None = None
+            try:
+                save = importlib.import_module("safetensors.torch").save_file
+                for relative, tensors in payloads.items():
+                    path = snapshot / relative
+                    path.parent.mkdir(exist_ok=True)
+                    save(
+                        {key: value.contiguous() for key, value in tensors.items()},
+                        path,
+                    )
+            except BaseException as failure:
+                error = failure
+                # Keep exception identity/causes/stack, not completed serializer
+                # frame locals that would retain CPU tensors until finalization.
+                pending = [failure]
+                seen: set[int] = set()
+                while pending:
+                    failure = pending.pop()
+                    if id(failure) in seen:
+                        continue
+                    seen.add(id(failure))
+                    traceback.clear_frames(failure.__traceback__)
+                    pending.extend(
+                        e
+                        for e in (failure.__cause__, failure.__context__)
+                        if e is not None
+                    )
+                    if isinstance(failure, BaseExceptionGroup):
+                        pending.extend(failure.exceptions)
+            finally:
+                payloads.clear()
+                tensors = None
+            if error is None:
+                result.set_result(None)
+            else:
+                result.set_exception(error)
+            # Do not retain the previous save while the next one writes.
+            del snapshot, payloads, result, error
 
 
 @dataclass(frozen=True)
@@ -679,7 +759,7 @@ def _validate_save_state(trainer: TrainerRank, name: str) -> _AdapterConfig:
 def _custom_snapshot(
     trainer: TrainerRank,
     name: str,
-    snapshot: Path,
+    payloads: dict[str, dict[str, torch.Tensor]],
 ) -> dict[str, CustomTensorRecord]:
     from art.trainer_rank._impl import (
         _custom_layout,
@@ -696,10 +776,12 @@ def _custom_snapshot(
     if records:
         assert slot.custom_payload is not None
         tensors.update(
-            (key, value.clone()) for key, value in slot.custom_payload.tensors.items()
+            (key, value.detach().to("cpu", copy=True))
+            for key, value in slot.custom_payload.tensors.items()
         )
         optimizer.update(
-            (key, value.clone()) for key, value in slot.custom_payload.optimizer.items()
+            (key, value.detach().to("cpu", copy=True))
+            for key, value in slot.custom_payload.optimizer.items()
         )
 
     dynamic = slot.optimizer
@@ -741,7 +823,7 @@ def _custom_snapshot(
             "persistent_buffer_keys": list(persistent_buffer_keys),
         }
         tensors.update(
-            (key, value.detach().cpu().contiguous().clone())
+            (key, value.detach().to("cpu", copy=True))
             for key, value in flattened.items()
         )
         for key, param in trainable.items():
@@ -750,16 +832,16 @@ def _custom_snapshot(
                 continue
             assert dynamic is not None
             state = dynamic.optimizer.state.get(master, {})
-            optimizer[f"master/{key}"] = master.detach().cpu().contiguous()
+            optimizer[f"master/{key}"] = master.detach().to("cpu", copy=True)
             optimizer[f"exp_avg/{key}"] = (
                 cast(torch.Tensor, state.get("exp_avg", torch.zeros_like(master)))
-                .cpu()
-                .contiguous()
+                .detach()
+                .to("cpu", copy=True)
             )
             optimizer[f"exp_avg_sq/{key}"] = (
                 cast(torch.Tensor, state.get("exp_avg_sq", torch.zeros_like(master)))
-                .cpu()
-                .contiguous()
+                .detach()
+                .to("cpu", copy=True)
             )
             optimizer[f"step/{key}"] = torch.tensor(float(state.get("step", 0.0)))
 
@@ -776,18 +858,16 @@ def _custom_snapshot(
 
     if not records:
         return {}
-    save = importlib.import_module("safetensors.torch").save_file
-    save(tensors, snapshot / "custom_tensors.safetensors")
+    payloads["custom_tensors.safetensors"] = tensors
     if optimizer:
-        (snapshot / "optimizer").mkdir(exist_ok=True)
-        save(optimizer, snapshot / "optimizer/custom.safetensors")
+        payloads["optimizer/custom.safetensors"] = optimizer
     return records
 
 
 def _local_state(
     trainer: TrainerRank,
     name: str,
-    snapshot: Path,
+    files: dict[str, dict[str, torch.Tensor]],
 ) -> tuple[
     tuple[_LocalShard, ...],
     OptimizerConfig | None,
@@ -819,7 +899,7 @@ def _local_state(
     metadata_by_block: dict[str, list[LoraShardMeta]] = {}
     for item in metadata:
         payloads.setdefault(item.block, {})[f"lora/{item.key}"] = (
-            tensors[item.key].cpu().contiguous()
+            tensors[item.key].detach().to("cpu", copy=True)
         )
         metadata_by_block.setdefault(item.block, []).append(item)
     if dynamic is not None:
@@ -844,18 +924,20 @@ def _local_state(
                         value = torch.zeros_like(master) if value is None else value
                         local = value if expert is None else value[expert]
                         payloads[item.block][f"{component}/{key}"] = (
-                            local.T.float().cpu().contiguous()
+                            local.T.detach().to(
+                                device="cpu", dtype=torch.float32, copy=True
+                            )
                         )
                     step = state.get("step", 0.0)
                     payloads[item.block][f"step/{key}"] = torch.tensor(float(step))
     records: list[_LocalShard] = []
     for index, block in enumerate(sorted(payloads)):
         relative = f"block-{index:06d}.safetensors"
-        importlib.import_module("safetensors.torch").save_file(
-            payloads[block], snapshot / relative
+        files[relative] = payloads[block]
+        records.extend(
+            _LocalShard(deepcopy(item), relative) for item in metadata_by_block[block]
         )
-        records.extend(_LocalShard(item, relative) for item in metadata_by_block[block])
-    return tuple(records), optimizer, _custom_snapshot(trainer, name, snapshot)
+    return tuple(records), optimizer, _custom_snapshot(trainer, name, files)
 
 
 def prepare_checkpoint_save(
@@ -903,10 +985,10 @@ def prepare_checkpoint_save(
             f".{destination.name}.snapshot-r{_rank()}-{uuid.uuid4().hex}"
         )
         error: BaseException | None = None
-        prepared: _PreparedSave | None = None
         shards: tuple[_LocalShard, ...] | None = None
         optimizer: OptimizerConfig | None = None
         custom_tensors: dict[str, CustomTensorRecord] = {}
+        payloads: dict[str, dict[str, torch.Tensor]] = {}
         reservation_created = False
         with trainer._checkpoint_save_condition:
             sequence = trainer._checkpoint_save_sequence
@@ -924,7 +1006,7 @@ def prepare_checkpoint_save(
                 reservation_created = True
             snapshot.mkdir(parents=True)
             shards, optimizer, custom_tensors = _local_state(
-                trainer, checkpoint_name, snapshot
+                trainer, checkpoint_name, payloads
             )
         except BaseException as exc:
             error = exc
@@ -934,33 +1016,9 @@ def prepare_checkpoint_save(
                 raise trainer._slot_state_error(
                     f"Checkpoint {checkpoint_name!r} optimizer differs across ranks"
                 )
-            custom_signature = (
-                custom_tensors,
-                _file_digest(snapshot / "custom_tensors.safetensors")
-                if custom_tensors
-                else None,
-                _file_digest(snapshot / "optimizer/custom.safetensors")
-                if (snapshot / "optimizer/custom.safetensors").is_file()
-                else None,
-            )
-            if any(
-                value != custom_signature for value in _gather(custom_signature, group)
-            ):
-                raise trainer._slot_state_error(
-                    f"Checkpoint {checkpoint_name!r} custom tensors differ across ranks"
-                )
-            assert shards is not None
-            prepared = _PreparedSave(
-                sequence,
-                snapshot,
-                reservation,
-                destination,
-                dict(config),
-                shards,
-                optimizer,
-                custom_tensors,
-            )
+
         except BaseException as failure:
+            payloads.clear()
             cleanup = _cleanup_paths(
                 [snapshot, *([reservation] if reservation_created else [])]
             )
@@ -979,7 +1037,41 @@ def prepare_checkpoint_save(
                     [failure, cleanup_failure],
                 ) from None
             raise failure
-        assert prepared is not None
+
+        # Starting the CPU writer is part of persistence, not capture. Retain a
+        # local start failure for collective finish/abort rather than waiting on
+        # another rank's disk while still in the ordered capture call.
+        def start_writer() -> Future[None] | BaseException:
+            try:
+                spill = getattr(trainer, "_checkpoint_snapshot_spill", None)
+                if spill is None:
+                    spill = _SnapshotSpill()
+                    trainer._checkpoint_snapshot_spill = spill
+                return spill.submit(snapshot, payloads)
+            except BaseException as failure:
+                payloads.clear()
+                return failure
+
+        started = start_writer()
+        if isinstance(started, BaseException):
+            # The completed start frames no longer own captured tensors.
+            traceback.clear_frames(started.__traceback__)
+            writer: Future[None] = Future()
+            writer.set_exception(started)
+        else:
+            writer = started
+        assert shards is not None
+        prepared = _PreparedSave(
+            sequence,
+            snapshot,
+            reservation,
+            destination,
+            dict(config),
+            shards,
+            optimizer,
+            custom_tensors,
+            writer,
+        )
         with trainer._checkpoint_save_condition:
             trainer._prepared_checkpoint_saves[output_dir] = prepared
             trainer._finalized_checkpoint_saves.pop(output_dir, None)
@@ -1131,6 +1223,22 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
     from art.megatron.model_support.lora_disk import save_adapter_config
 
     group = _ensure_finalize_group(trainer)
+
+    custom_signature = _phase(
+        lambda: (
+            prepared.custom_tensors,
+            _file_digest(prepared.snapshot / "custom_tensors.safetensors")
+            if prepared.custom_tensors
+            else None,
+            _file_digest(prepared.snapshot / "optimizer/custom.safetensors")
+            if (prepared.snapshot / "optimizer/custom.safetensors").is_file()
+            else None,
+        ),
+        "read checkpoint custom snapshot",
+        group,
+    )
+    if any(value != custom_signature for value in _gather(custom_signature, group)):
+        raise trainer._slot_state_error("Checkpoint custom tensors differ across ranks")
     metadata = [item for values in _gather(prepared.shards, group) for item in values]
     identities: set[tuple[str, int]] = set()
     selected: list[LoraShardMeta] = []
@@ -1399,10 +1507,26 @@ def _finalize_checkpoint_save(
         error: BaseException | None = None
         cleanup_failed = True
         try:
-            if finalized is None and outcome is None and action == "finish":
+            if finalized is None and outcome is None:
                 try:
                     assert prepared is not None
-                    _finish(trainer, prepared)
+                    # Abort discards the snapshot: acknowledge its joined cleanup,
+                    # even if writing failed. Finish still reports that failure.
+                    _phase(
+                        lambda: (
+                            (
+                                prepared.writer.result()
+                                if action == "finish"
+                                else prepared.writer.exception()
+                            )
+                            if prepared.writer
+                            else None
+                        ),
+                        "write checkpoint snapshot",
+                        group,
+                    )
+                    if action == "finish":
+                        _finish(trainer, prepared)
                 except BaseException as exc:
                     error = exc
             if finalized is None and outcome is None:
