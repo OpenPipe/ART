@@ -170,7 +170,7 @@ def test_direct_load_releases_sources_after_last_alias(
     aliases = {"a": "shared", "b": "other", "c": "shared", "d": "tail"}
     bridge = SimpleNamespace(
         _art_hf_weight_source=lambda key, **kwargs: HfWeightSource(
-            key, ((aliases[key],),)
+            logical_key=key, physical_key_options=((aliases[key],),)
         )
     )
     pin_calls = []
