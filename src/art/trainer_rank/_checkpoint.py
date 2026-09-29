@@ -985,12 +985,10 @@ def prepare_checkpoint_save(
             f".{destination.name}.snapshot-r{_rank()}-{uuid.uuid4().hex}"
         )
         error: BaseException | None = None
-        prepared: _PreparedSave | None = None
         shards: tuple[_LocalShard, ...] | None = None
         optimizer: OptimizerConfig | None = None
         custom_tensors: dict[str, CustomTensorRecord] = {}
         payloads: dict[str, dict[str, torch.Tensor]] = {}
-        writer: Future[None] | None = None
         reservation_created = False
         with trainer._checkpoint_save_condition:
             sequence = trainer._checkpoint_save_sequence
@@ -1019,36 +1017,7 @@ def prepare_checkpoint_save(
                     f"Checkpoint {checkpoint_name!r} optimizer differs across ranks"
                 )
 
-            # Start spilling immediately, independently of older saves' uploads.
-            # Only capture above touches live model/optimizer or device tensors.
-            def start_writer() -> None:
-                nonlocal writer
-                spill = getattr(trainer, "_checkpoint_snapshot_spill", None)
-                if spill is None:
-                    spill = _SnapshotSpill()
-                    trainer._checkpoint_snapshot_spill = spill
-                writer = spill.submit(snapshot, payloads)
-
-            _phase(start_writer, "start checkpoint snapshot", group)
-            assert shards is not None
-            prepared = _PreparedSave(
-                sequence,
-                snapshot,
-                reservation,
-                destination,
-                dict(config),
-                shards,
-                optimizer,
-                custom_tensors,
-                writer,
-            )
         except BaseException as failure:
-            if writer is not None:
-                # A different rank may have failed to start its own writer.
-                try:
-                    writer.result()
-                except BaseException:
-                    pass
             payloads.clear()
             cleanup = _cleanup_paths(
                 [snapshot, *([reservation] if reservation_created else [])]
@@ -1068,7 +1037,41 @@ def prepare_checkpoint_save(
                     [failure, cleanup_failure],
                 ) from None
             raise failure
-        assert prepared is not None
+
+        # Starting the CPU writer is part of persistence, not capture. Retain a
+        # local start failure for collective finish/abort rather than waiting on
+        # another rank's disk while still in the ordered capture call.
+        def start_writer() -> Future[None] | BaseException:
+            try:
+                spill = getattr(trainer, "_checkpoint_snapshot_spill", None)
+                if spill is None:
+                    spill = _SnapshotSpill()
+                    trainer._checkpoint_snapshot_spill = spill
+                return spill.submit(snapshot, payloads)
+            except BaseException as failure:
+                payloads.clear()
+                return failure
+
+        started = start_writer()
+        if isinstance(started, BaseException):
+            # The completed start frames no longer own captured tensors.
+            traceback.clear_frames(started.__traceback__)
+            writer: Future[None] = Future()
+            writer.set_exception(started)
+        else:
+            writer = started
+        assert shards is not None
+        prepared = _PreparedSave(
+            sequence,
+            snapshot,
+            reservation,
+            destination,
+            dict(config),
+            shards,
+            optimizer,
+            custom_tensors,
+            writer,
+        )
         with trainer._checkpoint_save_condition:
             trainer._prepared_checkpoint_saves[output_dir] = prepared
             trainer._finalized_checkpoint_saves.pop(output_dir, None)

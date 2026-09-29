@@ -242,6 +242,55 @@ def test_writer_start_failure_has_no_orphaned_backlog(tmp_path, monkeypatch):
     assert (tmp_path / "next/v.safetensors").is_file()
 
 
+@pytest.mark.parametrize("action", ("finish", "abort"))
+def test_start_failure_is_owned_until_collective_finalization(
+    tmp_path, monkeypatch, action
+):
+    trainer = _save_state_trainer()
+    trainer._checkpoint_slots["a"] = _CheckpointSlot(
+        config={
+            "base_model_name_or_path": "test/model",
+            "r": 1,
+            "lora_alpha": 1,
+            "target_modules": ["q_proj"],
+        }
+    )
+    monkeypatch.setattr(cp, "_validate_save_state", lambda *_: {})
+    refs = []
+
+    def capture(_trainer, _name, files):
+        value = torch.ones(1)
+        refs.append(weakref.ref(value))
+        files["v.safetensors"] = {"v": value}
+        return (), None, {}
+
+    monkeypatch.setattr(cp, "_local_state", capture)
+    error = RuntimeError("cannot start writer")
+
+    def fail(_self):
+        raise error
+
+    output = str(tmp_path / "failed")
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", fail)
+        trainer.prepare_checkpoint_save(output, "a")
+    prepared = trainer._prepared_checkpoint_saves[output]
+    assert prepared.writer is not None
+    assert prepared.writer.exception() is error
+    assert all(ref() is None for ref in refs)
+    assert prepared.snapshot.exists() and prepared.reservation.exists()
+    with pytest.raises(RuntimeError) as caught:
+        getattr(trainer, f"{action}_checkpoint_save")(output)
+    assert caught.value is error
+    assert not prepared.snapshot.exists() and not prepared.reservation.exists()
+    assert not trainer._prepared_checkpoint_saves
+    assert trainer._checkpoint_save_next == 1
+    following = str(tmp_path / "next")
+    trainer.prepare_checkpoint_save(following, "a")
+    trainer.abort_checkpoint_save(following)
+    assert trainer._checkpoint_save_next == 2
+
+
 def test_custom_digest_failure_is_reported_before_next_collective(
     tmp_path, monkeypatch
 ):
