@@ -14,7 +14,7 @@ targets, never replacements for missing estimator inputs.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -439,6 +439,31 @@ class Reporter:
                 observed_peak_bytes is not None and observed_peak_bytes < 0
             ):
                 raise ValueError("negative memory measurement")
+            retention = _planner_retention.current_limits()
+            planning_budget = planning and not (
+                failure is not None and failure["type"] == "OutOfMemoryError"
+            )
+            report_limit = MAX_PLANNING_REPORT_BYTES if planning else MAX_REPORT_BYTES
+            if retention is not None:
+                # This is not a reservation. Final persistence rechecks under the
+                # shared lock; a large refusal never disables later smaller/OOM
+                # reports. Keep the existing partial-report fallback if possible.
+                available = _planner_retention.remaining(
+                    retention,
+                    count_limit=MAX_PLANNING_REPORTS
+                    if planning_budget
+                    else MAX_SPOOL_REPORTS,
+                    byte_limit=MAX_PLANNING_SPOOL_BYTES
+                    if planning_budget
+                    else MAX_SPOOL_BYTES,
+                )
+                if not available:
+                    with suppress(Exception):
+                        _planner_retention.omit_unmeasured(retention)
+                    raise _planner_retention.RetentionLimitReached(
+                        "assigned planner retention exhausted before construction"
+                    )
+                report_limit = min(report_limit, available)
             record: dict[str, Any] = {
                 "format": 2,
                 "kind": "art-planner-miss",
@@ -483,30 +508,28 @@ class Reporter:
                 if not record["replay_complete"] and not record["incomplete_reasons"]:
                     record["incomplete_reasons"] = ["memory replay inputs unavailable"]
                 try:
-                    raw = _encode(
-                        record,
-                        limit=MAX_PLANNING_REPORT_BYTES
-                        if planning
-                        else MAX_REPORT_BYTES,
-                    )
+                    raw = _encode(record, limit=report_limit)
                 except _ReportTooLarge:
                     if not planning:
                         raise
                     record = _compact_planning_record(record)
-                    raw = _encode(record, limit=MAX_PLANNING_REPORT_BYTES)
+                    raw = _encode(record, limit=report_limit)
             except Exception as exc:
                 record["replay"] = None
                 record["replay_complete"] = False
                 record["incomplete_reasons"] = [
-                    f"replay unavailable: {'ValueError' if isinstance(exc, _ReportTooLarge) else type(exc).__name__}"
+                    "replay exceeds remaining retention allowance"
+                    if isinstance(exc, _ReportTooLarge)
+                    and retention is not None
+                    and report_limit
+                    < (MAX_PLANNING_REPORT_BYTES if planning else MAX_REPORT_BYTES)
+                    else f"replay unavailable: {'ValueError' if isinstance(exc, _ReportTooLarge) else type(exc).__name__}"
                 ]
                 raw = _encode(record)
-            retention = _planner_retention.current_limits()
             path = persist_report(
                 raw,
                 self.spool_dir if retention is None else retention.spool_dir,
-                planning_budget=planning
-                and not (failure is not None and failure["type"] == "OutOfMemoryError"),
+                planning_budget=planning_budget,
                 retention=retention,
             )
         except Exception as exc:
