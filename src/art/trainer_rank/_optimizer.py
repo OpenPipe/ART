@@ -29,6 +29,84 @@ if TYPE_CHECKING:
     from art.trainer_rank._impl import AdamParams, TrainerRank, _DynamicOptimizer
 
 
+def _foreach_compatible(tensor: torch.Tensor) -> bool:
+    return (
+        type(tensor) in (_impl.torch.Tensor, _impl.torch.nn.Parameter)
+        and tensor.layout == _impl.torch.strided
+        and tensor.device.type in ("cpu", "cuda")
+        and not tensor.is_conj()
+        and not tensor.is_neg()
+    )
+
+
+def _multiply(
+    tensors: Sequence[torch.Tensor], scale: float, *, inplace: bool = False
+) -> tuple[torch.Tensor, ...]:
+    tensors = tuple(tensors)
+    if not tensors:
+        return ()
+    if all(_foreach_compatible(tensor) for tensor in tensors):
+        if inplace:
+            _impl.torch._foreach_mul_(tensors, scale)
+            return tuple(tensors)
+        return tuple(_impl.torch._foreach_mul(tensors, scale))
+    return tuple(
+        tensor.mul_(scale) if inplace else tensor.mul(scale) for tensor in tensors
+    )
+
+
+def _scaled_grads(
+    params: Sequence[torch.nn.Parameter], scale: float
+) -> tuple[torch.Tensor, ...]:
+    grads = []
+    owned, borrowed = [], []
+    for param in params:
+        if param.grad is None:
+            # Missing gradients stay zero even when scale is nonfinite.
+            grads.append(_impl.torch.zeros_like(param, dtype=_impl.torch.float32))
+            continue
+        value = param.grad.detach().float()
+        # A dtype conversion owns its result. Scale it in place to avoid
+        # retaining a second FP32 copy of every low-precision gradient.
+        indices = (
+            owned
+            if type(param.grad) in (_impl.torch.Tensor, _impl.torch.nn.Parameter)
+            and type(value) is _impl.torch.Tensor
+            and param.grad.dtype != _impl.torch.float32
+            else borrowed
+        )
+        indices.append(len(grads))
+        grads.append(value)
+    for indices, inplace in ((owned, True), (borrowed, False)):
+        values = _multiply([grads[index] for index in indices], scale, inplace=inplace)
+        for index, value in zip(indices, values, strict=True):
+            grads[index] = value
+    return tuple(grads)
+
+
+def _copy_back(models: Sequence[torch.Tensor], masters: Sequence[torch.Tensor]) -> None:
+    if not models and not masters:
+        return
+    pairs = tuple(zip(models, masters, strict=True))
+    tensors = (*models, *masters)
+    if all(_foreach_compatible(tensor) for tensor in tensors):
+        # A foreach CUDA kernel may write pairs concurrently. Shared storage,
+        # including cross-pair source/destination aliases, needs ordered copies.
+        storage = sorted(
+            (str(tensor.device), value.data_ptr(), value.data_ptr() + value.nbytes())
+            for tensor in tensors
+            for value in (tensor.untyped_storage(),)
+        )
+        if not any(
+            left[0] == right[0] and left[2] > right[1]
+            for left, right in zip(storage, storage[1:])
+        ):
+            _impl.torch._foreach_copy_(tuple(models), tuple(masters))
+            return
+    for model, master in pairs:
+        model.copy_(master)
+
+
 def _extend_dynamic_optimizer(
     self: TrainerRank,
     name: str,
@@ -311,15 +389,19 @@ def _dynamic_optim_step(
             else 1.0
         )
         dynamic = dynamics[name]
-        for master, grad, should_step in zip(
-            dynamic.master_params, grads, step_flags, strict=True
-        ):
-            master.grad = grad.mul(clip) if should_step else None
+        clipped = iter(
+            _multiply(
+                [grad for grad, step in zip(grads, step_flags, strict=True) if step],
+                clip,
+            )
+        )
+        for master, should_step in zip(dynamic.master_params, step_flags, strict=True):
+            master.grad = next(clipped) if should_step else None
         dynamic.optimizer.step()
         dynamic.optimizer.zero_grad(set_to_none=True)
         with _impl.torch.no_grad():
-            for model, master in zip(model_params, dynamic.master_params, strict=True):
-                model.copy_(master)
+            _copy_back(model_params, dynamic.master_params)
+            for model in model_params:
                 model.grad = None
         self._prune_slot_graphs(self._slot_ref(name))
         self._checkpoint_slots[name].revision += 1

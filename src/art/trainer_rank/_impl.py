@@ -3134,14 +3134,7 @@ class TrainerRank:
             key = (id(group), str(op), grad.dtype, grad.device)
             buckets.setdefault(key, (group, op, []))[2].append(grad)
 
-        grads = tuple(
-            (
-                torch.zeros_like(param, dtype=torch.float32)
-                if param.grad is None
-                else param.grad.detach().float().mul(scale_grads)
-            )
-            for param in params
-        )
+        grads = _optimizer._scaled_grads(params, scale_grads)
         for param, grad in zip(params, grads, strict=True):
             if bool(getattr(param, "allreduce", True)):
                 group = ps.get_data_parallel_group(with_context_parallel=True)
