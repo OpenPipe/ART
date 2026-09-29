@@ -1119,7 +1119,8 @@ def prepare_checkpoint_save(
             # preserve active callers and foreign copy/hook traceback locals.
             capture_tb = exc.__traceback__
             while capture_tb is not None:
-                if capture_tb.tb_frame.f_code in _CAPTURE_FRAME_CODES:
+                frame_code = capture_tb.tb_frame.f_code
+                if any(frame_code is code for code in _CAPTURE_FRAME_CODES):
                     capture_tb.tb_frame.clear()
                 capture_tb = capture_tb.tb_next
         try:
