@@ -21,6 +21,7 @@ from dataclasses import (
     replace,
 )
 import hashlib
+import math
 from typing import TYPE_CHECKING
 
 from art.trainer_rank import _impl
@@ -611,6 +612,28 @@ def _plan_head_backward_traced(self: TrainerRank, plan: _FlatForwardPlan) -> boo
 def _plan_group_routed_rows(
     self: TrainerRank, plan: _FlatForwardPlan
 ) -> tuple[int, ...]:
+    """Balanced rows per group, raised to each slot's observed routing.
+
+    The cold allowance prices top-k x allowance pairs per balanced row. A
+    checkpoint whose worst observed share plus a margin exceeds that is
+    priced at the higher share instead; nothing is ever priced lower.
+    """
+    balanced = self._plan_group_balanced_rows(plan)
+    shares = [self._observed_routed_share(group.slot_ref) for group in plan.groups]
+    if all(share is None for share in shares):
+        return balanced
+    cold = _impl._ep_routed_row_allowance(self._parallel_shape.ep)
+    return tuple(
+        rows
+        if share is None or share + _impl._ROUTED_SHARE_MARGIN <= cold
+        else math.ceil(rows * (share + _impl._ROUTED_SHARE_MARGIN) / cold)
+        for rows, share in zip(balanced, shares, strict=True)
+    )
+
+
+def _plan_group_balanced_rows(
+    self: TrainerRank, plan: _FlatForwardPlan
+) -> tuple[int, ...]:
     """Rows one rank's experts receive per group at balanced routing.
 
     HybridEP dispatches the whole EP group's rows. When that group is this
@@ -771,6 +794,7 @@ def _split_request_order(
 
 def _reset_planning_telemetry(self: TrainerRank) -> None:
     self._planning_seconds_accum = 0.0
+    self._last_routed_share = None
     with self._layout_cache_lock:
         self._speculative_planning_seconds = 0.0
 
@@ -785,6 +809,9 @@ def _snapshot_planning_telemetry(
         if isinstance(plan, _impl._SplitForwardPlan)
         else (tuple(range(plan.request_count)),)
     )
+    # Consume the share so a later forward without a handoff reports none.
+    routed_share = getattr(self, "_last_routed_share", None)
+    self._last_routed_share = None
     self._last_forward_telemetry_snapshot = {
         "planning_ms": self._planning_seconds_accum * 1_000.0,
         "speculative_planning_ms": speculative_seconds * 1_000.0,
@@ -795,6 +822,7 @@ def _snapshot_planning_telemetry(
         "subforward_request_indices": partition,
         "predicted_peak_bytes": check.estimated_required_bytes,
         "usable_limit_bytes": check.available_bytes,
+        "routed_share": routed_share,
     }
 
 
@@ -1631,6 +1659,12 @@ def _fill_planner_snapshot(
                             self._plan_hybridep_growth_bytes(child)
                         ),
                     },
+                    # Each group's observed share behind its routed rows;
+                    # None prices the cold allowance.
+                    "routed_share_max": [
+                        self._observed_routed_share(group.slot_ref)
+                        for group in child.groups
+                    ],
                     "expected_required_bytes": cost.required,
                     "retained_bytes": cost.retained,
                     "cost_components": asdict(cost),

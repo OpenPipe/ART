@@ -149,6 +149,9 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_recomputed_mixer_widths",
         # Producers of recorded arguments replay checks against the facts.
         "_plan_group_routed_rows",
+        "_plan_group_balanced_rows",
+        "_observed_routed_share",
+        "_route_epoch",
         "_plan_head_backward_traced",
         "_head_backward_traced",
     ):
