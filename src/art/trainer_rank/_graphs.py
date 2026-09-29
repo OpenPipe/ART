@@ -113,18 +113,30 @@ class _TransferStats:
     restore_max_bytes: int = 0
 
     @torch.compiler.disable
-    def copy(self, tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
-        start = perf_counter()
-        if tensor.device.type == "cuda" and torch.device(device).type == "cpu":
-            # Pin the only host copy of each storage. Keep copies blocking so
-            # offload releases GPU ownership before returning, even on user
-            # streams, and unpack never exposes an unfinished restore.
-            result = torch.empty_like(tensor, device="cpu", pin_memory=True)
-            result.copy_(tensor)
-        else:
-            result = tensor.to(device, copy=True)
+    def copy(self, cell: _SavedTensor, device: torch.device | str) -> torch.Tensor:
+        tensor = cell.tensor
+        storage = tensor.untyped_storage()
+        raw = result = None
+        try:
+            raw = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
+                storage, 0, (storage.nbytes(),), (1,)
+            )
+            start = perf_counter()
+            if tensor.device.type == "cuda" and torch.device(device).type == "cpu":
+                # Pin the only host copy of each storage. Keep copies blocking so
+                # offload releases GPU ownership before returning, even on user
+                # streams, and unpack never exposes an unfinished restore.
+                result = torch.empty_like(raw, device="cpu", pin_memory=True)
+                result.copy_(raw)
+            else:
+                result = raw.to(device, copy=True)
+        except BaseException:
+            # The disabled wrapper retains its arguments on failure: pass a cell
+            # that failed-forward cleanup can empty, never a borrowed raw tensor.
+            del tensor, storage, raw, result
+            raise
         elapsed = perf_counter() - start
-        size = tensor.numel() * tensor.element_size()
+        size = storage.nbytes()
         if result.device.type == "cpu":
             self.offload_bytes += size
             self.offload_seconds += elapsed
@@ -160,16 +172,11 @@ class _SavedTensor:
 
     def offload(self, copies: dict[StorageWeakRef, torch.Tensor]) -> None:
         if self.managed and self.tensor.device.type != "cpu":
-            tensor = self.tensor
-            storage = tensor.untyped_storage()
             # Weak storage identity prevents allocator address reuse from
             # confusing distinct activations without pinning CUDA storage.
             key = self.source
             if key not in copies:
-                raw = torch.empty(0, dtype=torch.uint8, device=tensor.device).set_(
-                    storage, 0, (storage.nbytes(),), (1,)
-                )
-                copies[key] = self.transfer_stats.copy(raw, "cpu")
+                copies[key] = self.transfer_stats.copy(self, "cpu")
             self.tensor = self.view(copies[key].untyped_storage(), "cpu")
 
     def unpack(self) -> torch.Tensor:
@@ -181,11 +188,7 @@ class _SavedTensor:
             return self.tensor
         key = (self.device, self.source)
         if key not in self.restored:
-            storage = self.tensor.untyped_storage()
-            raw = torch.empty(0, dtype=torch.uint8).set_(
-                storage, 0, (storage.nbytes(),), (1,)
-            )
-            self.restored[key] = self.transfer_stats.copy(raw, self.device)
+            self.restored[key] = self.transfer_stats.copy(self, self.device)
         return self.view(self.restored[key].untyped_storage(), self.device)
 
 
@@ -235,6 +238,9 @@ class _ForwardRecord:
     def release(self) -> None:
         # Saved-variable hooks can outlive their Python outputs. Break all
         # ownership edges even when a caller retains a failure traceback.
+        for reference in self.saved or ():
+            if (cell := reference()) is not None:
+                cell.tensor = torch.empty(0)
         self.outputs = self.saved = self.resident = None
         self.restored.clear()
         self.inputs = self.corrections = None
@@ -275,9 +281,10 @@ class _ForwardRecord:
                 restored,
                 transfer_stats,
             )
+            saved.append(weakref.ref(cell))
+            del tensor
             if retention == "cpu":
                 cell.offload(copies)
-            saved.append(weakref.ref(cell))
             return cell
 
         with (
