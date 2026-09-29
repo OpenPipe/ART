@@ -110,21 +110,32 @@ def test_moment_capture(captured_state, monkeypatch, present, allocation_guard):
             )
         expected_optimizer[f"step/{key}"] = torch.tensor(7.0)
 
-    live_storage = {value.data_ptr() for value in (*params, *masters)}
+    live_storage = {
+        value.untyped_storage().data_ptr() for value in (*params, *masters)
+    }
     zeros = []
     original = torch.zeros_like
 
     def owned_cpu_zero(value, *args, **kwargs):
         assert value.device.type == "cpu"
-        assert value.data_ptr() not in live_storage, (
+        assert value.untyped_storage().data_ptr() not in live_storage, (
             "zero fallback allocated from live optimizer storage"
         )
         zeros.append(value)
         return original(value, *args, **kwargs)
 
+    contiguous = torch.Tensor.contiguous
+
+    def pack_owned(value, *args, **kwargs):
+        assert value.untyped_storage().data_ptr() not in live_storage, (
+            "capture packed live LoRA storage before its immutable CPU copy"
+        )
+        return contiguous(value, *args, **kwargs)
+
     payloads = {}
     if allocation_guard:
         monkeypatch.setattr(torch, "zeros_like", owned_cpu_zero)
+        monkeypatch.setattr(torch.Tensor, "contiguous", pack_owned)
     shards, config, records = cp._local_state(trainer, "a", payloads)
     if allocation_guard:
         assert len(zeros) == len(entries) * (2 - len(present))
