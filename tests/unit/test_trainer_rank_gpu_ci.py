@@ -324,10 +324,14 @@ def test_cancel_request_requires_own_receipt(tmp_path, owner, sky):
     sky.api_cancel.assert_not_called()
 
 
-@pytest.mark.parametrize("known_request", [False, True])
+@pytest.mark.parametrize(
+    "attempted,known_request", [(False, False), (True, False), (True, True)]
+)
 def test_launch_timeout_cancels_only_recorded_request(
-    tmp_path, owner, monkeypatch, known_request
+    tmp_path, owner, monkeypatch, attempted, known_request
 ):
+    if attempted:
+        ci.write_json(tmp_path / "launch-attempt.json", owner)
     if known_request:
         ci.write_json(tmp_path / "request.json", {**owner, "request_id": "request-17"})
     error = TimeoutError("launch wait")
@@ -337,7 +341,9 @@ def test_launch_timeout_cancels_only_recorded_request(
     assert raised.value is error
     assert calls == (["launch", "cancel_request"] if known_request else ["launch"])
     # A lost launch reply does not prove the remote test never started.
-    assert ci.read_bound(tmp_path, "result.json", owner)["status"] == "UNCONFIRMED"
+    assert ci.read_bound(tmp_path, "result.json", owner)["status"] == (
+        "UNCONFIRMED" if attempted else "NOT_RUN"
+    )
 
 
 def test_capacity_wait_uses_original_admission_expiry(tmp_path, owner, monkeypatch):
@@ -720,6 +726,20 @@ def test_api_cleanup_is_limited_to_its_ephemeral_runner(
     sky.api_status.return_value = []
     ci.worker(tmp_path, "stop_api")
     sky.api_stop.assert_called_once_with()
+
+
+def test_api_cleanup_detects_surviving_server_with_only_terminal_requests(
+    tmp_path, owner, sky, monkeypatch
+):
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
+    sky.api_status.side_effect = lambda **options: (
+        [NS(request_id="request-17", status="CANCELLED")]
+        if options.get("all_status")
+        else []
+    )
+    with pytest.raises(RuntimeError, match="still reports requests"):
+        ci.worker(tmp_path, "stop_api")
 
 
 @pytest.mark.parametrize("foreign", [False, True])

@@ -188,7 +188,7 @@ def worker(root, operation):
         ):
             raise ValueError("API cleanup requires an isolated GitHub-hosted runner")
         sky.api_stop()  # The maintained SDK rejects remote API endpoints.
-        if sky.api_status():
+        if sky.api_status(all_status=True, limit=1):
             raise RuntimeError("The CI API still reports requests after stopping")
         return
     if operation in {"resources", "remove_resources"}:
@@ -354,12 +354,15 @@ def supervise(root, owner, timeout=35 * 60, poll_seconds=10):
                 {**owner, "remote_status": remote_status, "error": repr(error)},
             )
             if job is None:
+                attempted = (root / "launch-attempt.json").exists()
                 write_json(
                     root / "result.json",
                     {
                         **owner,
-                        "status": "UNCONFIRMED",
-                        "reason": "launch_result_unavailable",
+                        "status": "UNCONFIRMED" if attempted else "NOT_RUN",
+                        "reason": "launch_result_unavailable"
+                        if attempted
+                        else "not_submitted",
                     },
                 )
         except Exception as receipt_error:

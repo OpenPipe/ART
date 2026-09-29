@@ -237,7 +237,7 @@ jobs:
           uv venv --python 3.10 "${sky_venv}"
           # Preserve cancelled requests before retry callbacks can reschedule them.
           uv pip install --python "${sky_venv}/bin/python" \
-            'skypilot[kubernetes,remote] @ git+https://github.com/OpenPipe/skypilot-modal.git@9792e52a66dbe8c1c2636476103ec90654ac71e3' \
+            'skypilot[kubernetes,remote] @ git+https://github.com/OpenPipe/skypilot-modal.git@924100745348cb0d880ba9e1f64b4e54cb1c0898' \
             'kubernetes==34.1.0'
           sky="${sky_venv}/bin/sky"
           "${sky}" check kubernetes
