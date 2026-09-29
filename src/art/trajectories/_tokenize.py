@@ -1085,6 +1085,11 @@ def _sampled_evidence_fingerprint(
             evidence["routed_experts"] = routing
         if "compact_top_logprobs" in choice_extra:
             evidence["compact_top_logprobs"] = choice_extra["compact_top_logprobs"]
+        mode = choice_extra.get(
+            "logprobs_mode", (exchange.response.model_extra or {}).get("logprobs_mode")
+        )
+        if mode is not None:
+            evidence["logprobs_mode"] = mode
     return _fingerprint(evidence)
 
 
@@ -8118,10 +8123,11 @@ def tokenize_history(
     ):
         raise TypeError(f"Unsupported history type: {type(history).__name__}")
     tokenized.history = history
-    from ._routed_experts import history_routes, history_top_k
+    from ._routed_experts import history_logprob_flags, history_routes, history_top_k
 
     tokenized.routed_experts = history_routes(history, tokenized.tokens)
     tokenized.top_k = history_top_k(history, tokenized.tokens)
+    history_logprob_flags(history, tokenized.tokens, tokenized.flags)
     return tokenized
 
 

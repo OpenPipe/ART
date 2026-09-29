@@ -76,6 +76,33 @@ def test_compact_logprobs_and_routes_survive_tokenize_tensorize_and_serializatio
         assert restored.routed_experts is not None
 
 
+@pytest.mark.parametrize(
+    "mode,flag",
+    [
+        ("raw_logprobs", tr.TokenFlag.RAW_LOGPROBS),
+        ("processed_logprobs", tr.TokenFlag.PROCESSED_LOGPROBS),
+    ],
+)
+def test_logprob_modes_survive_tokenization_tensorization_and_compact(mode, flag):
+    response = _response()
+    response.model_extra["logprobs_mode"] = mode
+    tokenized = _trajectory(response).tokenize()
+    assert [bool(value & flag) for value in tokenized.flags] == [
+        False,
+        False,
+        True,
+        True,
+    ]
+    for value in (tokenized, tokenized.tensorize()):
+        restored = tr.compact_validate(value.compact_dump())
+        assert [bool(int(item) & flag) for item in restored.flags] == [
+            False,
+            False,
+            True,
+            True,
+        ]
+
+
 def test_legacy_binary_routes_align_and_leave_last_token_missing():
     response = _response()
     extra = response.choices[0].model_extra

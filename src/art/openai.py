@@ -208,7 +208,7 @@ def _init_choice(chunk_choice: ChatCompletionChunkChoice) -> Choice:
 
 def finalize_chat_completion(chat_completion: ChatCompletion) -> ChatCompletion:
     attach_dynamo_token_metadata(chat_completion)
-    for key in ("prompt_token_ids", "prompt_routed_experts"):
+    for key in ("prompt_token_ids", "prompt_routed_experts", "logprobs_mode"):
         value = (chat_completion.model_extra or {}).get(key)
         if value is not None:
             for choice in chat_completion.choices:
@@ -222,6 +222,11 @@ def update_chat_completion(
     chat_completion: ChatCompletion, chunk: ChatCompletionChunk
 ) -> None:
     chat_completion_extra = cast(dict[str, Any], chat_completion.model_extra)
+    mode = getattr(chunk, "logprobs_mode", None)
+    if mode is not None:
+        if chat_completion_extra.get("logprobs_mode", mode) != mode:
+            raise ValueError("logprobs_mode changed within a completion stream")
+        chat_completion_extra["logprobs_mode"] = mode
     nvext = (chunk.model_extra or {}).get("nvext")
     if isinstance(nvext, dict) and "engine_data" in nvext:
         # Dynamo sends a complete snapshot in the final (possibly choice-less)
@@ -250,6 +255,11 @@ def update_chat_completion(
             choices[choice.index] = choice
             chat_completion.choices.append(choice)
         choice_extra = cast(dict[str, Any], choice.model_extra)
+        mode = getattr(chunk_choice, "logprobs_mode", None)
+        if mode is not None:
+            if choice_extra.get("logprobs_mode", mode) != mode:
+                raise ValueError("logprobs_mode changed within a choice stream")
+            choice_extra["logprobs_mode"] = mode
         if completion_prompt_token_ids is not None:
             choice_extra["prompt_token_ids"] = completion_prompt_token_ids
         prompt_routes = getattr(chunk_choice, "prompt_routed_experts", None)

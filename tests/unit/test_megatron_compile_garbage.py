@@ -8,6 +8,30 @@ import torch.utils.checkpoint
 lora = pytest.importorskip("art.megatron.lora")
 
 
+def test_checkpoint_hooks_capture_routing_automatically():
+    from art.megatron.routed_experts import CURRENT_ROUTES, RoutingContext, use_routes
+
+    value = torch.tensor([2.0], requires_grad=True)
+    outputs = []
+    seen = []
+
+    def forward(x):
+        context = CURRENT_ROUTES.get()
+        factor = context.targets[0]["attention"]
+        seen.append(float(factor))
+        return (x * factor).square()
+
+    for factor in (3.0, 5.0):
+        with use_routes(RoutingContext({0: {"attention": torch.tensor(factor)}})):
+            outputs.append(
+                torch.utils.checkpoint.checkpoint(forward, value, use_reentrant=True)
+            )
+    sum(outputs).sum().backward()
+    assert value.grad.item() == 2 * 2 * (3**2 + 5**2)
+    assert seen == [3.0, 5.0, 5.0, 3.0]
+    assert CURRENT_ROUTES.get() is None
+
+
 class _Cycle:
     other: "_Cycle"
     tensor: torch.Tensor

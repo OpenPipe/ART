@@ -169,6 +169,9 @@ class TokenFlag(IntFlag):
     STOP = 1 << 3
     # Best-effort provenance that the token came from a concrete response.
     OUTPUT = 1 << 4
+    # Explicit server provenance for sampled/top-k logprobs. Neither means unknown.
+    RAW_LOGPROBS = 1 << 5
+    PROCESSED_LOGPROBS = 1 << 6
 
 
 class ChatCompletionsRequest(TypedDict, total=False, extra_items=Any):

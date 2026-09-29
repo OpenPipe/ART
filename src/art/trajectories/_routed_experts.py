@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from . import TokenFlag
 
 
 def validate_routes(routes: list, length: int) -> tuple[int, int] | None:
@@ -181,6 +184,38 @@ def history_routes(history: Any, tokens: list[int]) -> list[list[list[int]]] | N
                     if aligned[index][layer_index][slot] == -1:
                         aligned[index][layer_index][slot] = expert
     return aligned
+
+
+def history_logprob_flags(
+    history: Any, tokens: list[int], flags: list[TokenFlag]
+) -> None:
+    from . import TokenFlag
+
+    modes = {
+        "raw_logprobs": TokenFlag.RAW_LOGPROBS,
+        "processed_logprobs": TokenFlag.PROCESSED_LOGPROBS,
+    }
+    mask = TokenFlag.RAW_LOGPROBS | TokenFlag.PROCESSED_LOGPROBS
+    for choice, response in history_choices(history):
+        extra = choice.model_extra or {}
+        response_extra = getattr(response, "model_extra", None) or {}
+        mode = extra.get("logprobs_mode", response_extra.get("logprobs_mode"))
+        if mode is None:
+            continue
+        if mode not in modes:
+            raise ValueError(f"Unsupported logprobs_mode: {mode!r}")
+        prompt = extra.get("prompt_token_ids", response_extra.get("prompt_token_ids"))
+        completion = extra.get("token_ids")
+        if not isinstance(prompt, list) or not isinstance(completion, list):
+            continue
+        for index, (actual, captured) in enumerate(zip(tokens, prompt + completion)):
+            if actual != captured:
+                break
+            if index < len(prompt) or not flags[index] & TokenFlag.SAMPLED:
+                continue
+            if flags[index] & mask and flags[index] & mask != modes[mode]:
+                raise ValueError("Captured logprobs modes disagree for sampled tokens")
+            flags[index] |= modes[mode]
 
 
 def history_top_k(history: Any, tokens: list[int]) -> Any:
