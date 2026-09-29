@@ -302,6 +302,10 @@ class _ForwardRecord:
                     for reference in saved:
                         if (cell := reference()) is not None:
                             cell.tensor = torch.empty(0)
+                    # These frame aliases otherwise outlive record.release().
+                    del self
+                    context_factory = keep_on_device = None
+                    cell = None
                     raise
                 finally:
                     copies.clear()
@@ -375,15 +379,16 @@ class GraphCache:
             for device in ("cpu", "cuda")
         )
         record.execution_peak_bytes = execution_peak_bytes
-        physical = record.run()
-        record.metadata = tuple(
-            (value.shape, value.dtype, value.device, value.requires_grad)
-            for value in physical
-        )
-        # clone: a detached view may still pin a much larger model activation.
         copied: list[torch.Tensor] = []
+        physical: tuple[torch.Tensor, ...] = ()
         value = None
         try:
+            physical = record.run()
+            record.metadata = tuple(
+                (value.shape, value.dtype, value.device, value.requires_grad)
+                for value in physical
+            )
+            # clone: a detached view may still pin a much larger model activation.
             for value in physical:
                 copied.append(
                     value.detach()
