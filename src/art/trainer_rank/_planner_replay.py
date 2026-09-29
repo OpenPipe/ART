@@ -523,11 +523,14 @@ def validate(facts: Any) -> None:
             group["gradient"][0] and facts["checkpoint_moe_bytes_per_token"]
         ):
             raise ValueError("MoE coverage without a checkpoint coefficient")
-        # One walk prices both modes: the checkpoint coefficient is at least
-        # the forward one, and the same storage gates both modes' stages.
+        # One walk prices both modes under the same gates: its checkpoint
+        # pass only raises the coefficient and adds a stage per converted FC2.
         forward, gradient = group["forward"], group["gradient"]
-        if gradient[0] < forward[0] or (
-            forward[0] and bool(forward[1]) != bool(gradient[1])
+        if (
+            gradient[0] < forward[0]
+            or bool(gradient[0]) != bool(forward[0])
+            or bool(gradient[1]) != bool(forward[1])
+            or (forward[1] and len(gradient[1]) <= len(forward[1]))
         ):
             raise ValueError("invalid MoE terms")
         layout = group["layout"]

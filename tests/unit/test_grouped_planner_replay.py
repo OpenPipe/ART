@@ -402,7 +402,17 @@ def test_zero_moe_coefficients_carry_no_stage_or_coverage(change, layer, tmp_pat
         reports.replay(report)
 
 
-@pytest.mark.parametrize("change", ["below_forward", "stages", "coverage"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        "below_forward",
+        "stages",
+        "zero_forward",
+        "stage_count",
+        "coverage",
+        "unnamed_coverage",
+    ],
+)
 def test_moe_terms_agree_across_modes_and_groups(change, layer, tmp_path):
     report, _, _ = adapter_report(layer, tmp_path)
     groups = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
@@ -410,22 +420,35 @@ def test_moe_terms_agree_across_modes_and_groups(change, layer, tmp_path):
     ]
     named = groups[1]
     assert named["adapter"] is not None and named["moe_covered"]
-    assert named["forward"][0] <= named["gradient"][0] and named["gradient"][1]
+    assert named["forward"][0] <= named["gradient"][0]
+    assert 0 < len(named["forward"][1]) < len(named["gradient"][1])
     if change == "below_forward":
-        named["gradient"] = [1, [], 0]
+        # Stages kept, so only the coefficient order is wrong.
+        named["gradient"][0] = named["forward"][0] - 1
         message = "invalid MoE terms"
     elif change == "stages":
         named["forward"][1] = []
         message = "invalid MoE terms"
+    elif change == "zero_forward":
+        named["forward"] = [0, [], 0]
+        message = "invalid MoE terms"
+    elif change == "stage_count":
+        named["gradient"][1] = named["gradient"][1][: len(named["forward"][1])]
+        message = "invalid MoE terms"
     else:
         from art.trainer_rank import _planner_replay
 
-        # An uncovered unnamed gradient group beside a covered named slot;
-        # validation refuses it before the recorded arguments are compared.
+        # Validation refuses these before the recorded arguments are compared:
+        # an uncovered unnamed gradient group beside a covered named slot, or
+        # two unnamed gradient groups that disagree.
         facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
         groups[0]["grad"] = True
         groups[0]["gradient"] = deepcopy(named["gradient"])
         groups[0]["gradient"][0] = facts["checkpoint_moe_bytes_per_token"]
+        if change == "unnamed_coverage":
+            named["moe_covered"] = False
+            groups.append(deepcopy(groups[0]))
+            groups[-1]["moe_covered"] = True
         with pytest.raises(ValueError, match="inconsistent MoE recompute coverage"):
             _planner_replay.validate(facts)
         return
@@ -461,8 +484,10 @@ def test_dense_ranks_record_no_moe_facts(fact, monkeypatch, tmp_path):
     if fact == "rank":
         memory["rank"]["moe_forward_stages"] = [[0, 1]]
     else:
-        # Consistent with itself (unnamed terms equal the coefficient).
+        # Consistent with itself (unnamed terms equal the coefficient in
+        # both modes).
         facts["checkpoint_moe_bytes_per_token"] = 1
+        facts["groups"][0]["forward"] = [1, [], 0]
         facts["groups"][0]["gradient"] = [1, [], 0]
     with pytest.raises(ValueError, match="MoE facts disagree with the recorded"):
         reports.replay(report)
