@@ -56,8 +56,7 @@ def test_cumulative_fact_budget_precedes_json_encoding(inventory, monkeypatch):
     group = facts["groups"][0]
     group["gdn"] = None
     if inventory == "stages":
-        coefficient = facts["checkpoint_moe_bytes_per_token"]
-        group["forward"] = [coefficient, [[0, 0]] * 4096, 0]
+        group["forward"] = [0, [[0, 0]] * 4096, 0]
         group["gradient"] = deepcopy(group["forward"])
         facts["groups"] = [deepcopy(group) for _ in range(8)]
     elif inventory == "slots":

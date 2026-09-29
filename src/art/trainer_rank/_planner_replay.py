@@ -507,7 +507,8 @@ def validate(facts: Any) -> None:
                     integer(value)
             # The shared expert's part of the coefficient (live invariant).
             integer(terms[2])
-            if terms[2] > terms[0]:
+            # Live keeps no stage or shared part beside a zero coefficient.
+            if terms[2] > terms[0] or (terms[1] and not terms[0]):
                 raise ValueError("invalid MoE terms")
         # Only gradient groups record a named slot's adapter. Live freezes an
         # unnamed one's gradient terms from the constructor coefficient, and
@@ -518,7 +519,9 @@ def validate(facts: Any) -> None:
             and group["gradient"][0] != facts["checkpoint_moe_bytes_per_token"]
         ):
             raise ValueError("invalid MoE terms")
-        if group["moe_covered"] and not group["gradient"][0]:
+        if group["moe_covered"] and not (
+            group["gradient"][0] and facts["checkpoint_moe_bytes_per_token"]
+        ):
             raise ValueError("MoE coverage without a checkpoint coefficient")
         layout = group["layout"]
         if layout is not None:
@@ -875,12 +878,27 @@ class ReplayRank(_impl.TrainerRank):
         # Live dense widths exist only at TP1/CP2/PP1 (_dense_mlp_widths).
         if any(facts["dense_base_widths"]) and self._topology_key()[1:] != (1, 2, 1):
             raise ValueError("dense stage facts disagree with the recorded topology")
-        # Live MoE coefficients are all 0 above TP1 (_moe_output_bytes_per_token).
-        if self._topology_key()[1] != 1 and (
-            facts["checkpoint_moe_bytes_per_token"]
+        # Live MoE coefficients are all 0 above TP1 (_moe_output_bytes_per_token)
+        # and on a dense rank, which has no MoE layers (_dense_mlp_widths).
+        if (self._topology_key()[1] != 1 or any(facts["dense_base_widths"])) and (
+            self._moe_output_bytes_per_token
+            or self._moe_forward_stages
+            or facts["checkpoint_moe_bytes_per_token"]
             or any(group[key][0] for group in groups for key in ("forward", "gradient"))
         ):
-            raise ValueError("MoE facts disagree with the recorded topology")
+            raise ValueError("MoE facts disagree with the recorded rank")
+        # An unnamed gradient group's forward terms are the constructor's.
+        for group in groups:
+            if (
+                group["grad"]
+                and group["adapter"] is None
+                and (
+                    group["forward"][0] != self._moe_output_bytes_per_token
+                    or tuple(map(tuple, group["forward"][1]))
+                    != self._moe_forward_stages
+                )
+            ):
+                raise ValueError("invalid MoE terms")
         layouts = None
         if groups[0]["layout"] is not None:
             # Live layout pricing is CP2 at TP1/PP1 only (_layout_pricing_supported).

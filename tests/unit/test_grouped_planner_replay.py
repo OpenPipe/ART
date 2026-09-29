@@ -379,6 +379,24 @@ def test_unnamed_gradient_terms_are_the_constructor_coefficient(covered, tmp_pat
         reports.replay(report)
 
 
+@pytest.mark.parametrize("change", ["forward_stage", "gradient_stage", "constructor"])
+def test_zero_moe_coefficients_carry_no_stage_or_coverage(change, layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    named = facts["groups"][1]
+    assert named["adapter"] is not None and named["moe_covered"]
+    if change == "constructor":
+        # Live coverage needs the constructor's coefficient too.
+        facts["checkpoint_moe_bytes_per_token"] = 0
+        message = "MoE coverage without a checkpoint"
+    else:
+        named["moe_covered"] = False
+        named[change.split("_")[0]] = [0, [[0, 2**40]], 0]
+        message = "invalid MoE terms"
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
 def test_moe_facts_need_the_recorded_tp1(tmp_path):
     rank = head_rank()
     rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
@@ -389,6 +407,43 @@ def test_moe_facts_need_the_recorded_tp1(tmp_path):
     assert memory["estimates"][0]["runtime_facts"]["checkpoint_moe_bytes_per_token"]
     memory["rank"]["topology"][1] = 2
     with pytest.raises(ValueError, match="MoE facts disagree with the recorded"):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("fact", ["rank", "checkpoint"])
+def test_dense_ranks_record_no_moe_facts(fact, monkeypatch, tmp_path):
+    from test_trainer_rank_dense_memory import _dense_rank
+
+    rank = cp2(monkeypatch, _dense_rank())
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(512, grad=True)]), tmp_path
+    )
+    memory = report["replay"]["memory_replay"]
+    facts = memory["estimates"][0]["runtime_facts"]
+    assert any(facts["dense_base_widths"])
+    if fact == "rank":
+        memory["rank"]["moe_output_bytes_per_token"] = 1
+    else:
+        # Consistent with itself (unnamed terms equal the coefficient).
+        facts["checkpoint_moe_bytes_per_token"] = 1
+        facts["groups"][0]["gradient"] = [1, [], 0]
+    with pytest.raises(ValueError, match="MoE facts disagree with the recorded"):
+        reports.replay(report)
+
+
+def test_unnamed_forward_terms_are_the_constructor_coefficient(tmp_path):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    group = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ][0]
+    assert group["adapter"] is None and group["forward"][0]
+    group["forward"] = [0, [], 0]
+    with pytest.raises(ValueError, match="invalid MoE terms"):
         reports.replay(report)
 
 
