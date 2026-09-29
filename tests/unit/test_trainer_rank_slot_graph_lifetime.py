@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import nullcontext
 import gc
-import traceback
 from typing import Literal
 import weakref
 
@@ -13,7 +12,7 @@ import torch
 
 from art.megatron.context_parallel.types import ParallelTopology
 from art.megatron.prefix_tree_packing import prefix_tree_pack
-from art.trainer_rank import ForwardInput, ForwardOptions, ForwardOutput
+from art.trainer_rank import ForwardInput, ForwardOptions, ForwardOutput, TopK
 from art.trainer_rank._impl import (
     TrainerRankSlotStateError,
     _ForwardGroupPlan,
@@ -97,17 +96,31 @@ def test_failed_correction_capture_releases_unattached_graph(monkeypatch, failur
     monkeypatch.setattr(
         trainer,
         "_forward_packed",
-        lambda items, prepared: [ForwardOutput(weight.square(), None, None, None)],
+        lambda items, prepared: [
+            ForwardOutput(
+                weight.square(),
+                TopK(weight.pow(3).reshape(1), torch.tensor([0])),
+                None,
+                None,
+            )
+        ],
     )
     cache = trainer._forward_graph_cache()
+    older = torch.nn.Parameter(torch.tensor(3.0))
+    old_handle, (old_output,) = cache.run(lambda _: (older.square(),), None)
+    old_record = weakref.ref(cache._records[old_handle])
     primary = failure_type("correction CPU snapshot failed")
     primary.__cause__ = cause = RuntimeError("original cause")
-    saved, outputs, versions = [], [], []
+    saved, outputs, versions, detached, copies = [], [], [], [], []
     to = torch.Tensor.to
 
     def fail_snapshot(value, *args, **kwargs):
-        if args == ("cpu",) and kwargs.get("copy") and cache.handles():
-            (handle,) = cache.handles()
+        if args == ("cpu",) and kwargs.get("copy") and len(cache.handles()) == 2:
+            if len(copies) < 2:
+                copied = to(value, *args, **kwargs)
+                copies.append(weakref.ref(copied))
+                return copied
+            handle = next(handle for handle in cache.handles() if handle != old_handle)
             record = cache._records[handle]
             saved.extend(record.saved or ())
             outputs.extend(weakref.ref(output) for output in record.outputs or ())
@@ -118,25 +131,33 @@ def test_failed_correction_capture_releases_unattached_graph(monkeypatch, failur
             assert record.checkpoint_versions == (
                 trainer._capture_checkpoint_version("student"),
             )
+            del value
             raise primary
-        return to(value, *args, **kwargs)
+        copied = to(value, *args, **kwargs)
+        if kwargs.get("copy") and "device" in kwargs:
+            detached.append(weakref.ref(copied))
+        return copied
 
     with monkeypatch.context() as allocation:
         allocation.setattr(torch.Tensor, "to", fail_snapshot)
         with pytest.raises(failure_type) as caught:
             trainer._execute_graph_group(group)
     assert caught.value is primary and primary.__cause__ is cause
-    assert not cache.handles()
+    assert primary.__traceback__ is not None
+    assert cache.handles() == (old_handle,)
+    assert cache._records[old_handle] is old_record()
+    assert len(detached) == 3 and len(copies) == 2
     assert all(reference() is None for reference in (*saved, *outputs))
+    assert all(reference() is None for reference in (*detached, *copies))
     assert not trainer._has_live_slot_graph(ref)
-    # The original traceback owns function locals; the cache must not keep the
-    # checkpoint capture alive once those independent references are released.
-    traceback.clear_frames(primary.__traceback__)
-    gc.collect()
     assert all(reference() is None for reference in versions)
     assert not trainer._version_state().lora
     trainer._guard_slot_can_load(ref)
     assert weight.grad is None
+    assert old_output.item() == 9
+    cache.backward(old_handle, (torch.tensor(1.0),))
+    torch.testing.assert_close(older.grad, torch.tensor(6.0))
+    assert not cache.handles()
     output = trainer._execute_graph_group(group)[0].target_logprobs
     assert output is not None and output.item() == 4
     assert len(cache.handles()) == 1

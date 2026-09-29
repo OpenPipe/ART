@@ -294,34 +294,42 @@ def capture_forward_corrections(
     if len(indices) != len(tensors):
         raise ValueError("correction capture requires deduplicated flat tensors")
     entries: dict[int, _OutputCorrection] = {}
-    for output in leaves(outputs):
-        for kind, tensor in (
-            ("target_logprobs", output.target_logprobs),
-            ("top_k", None if output.top_k is None else output.top_k.logprobs),
-        ):
-            if (
-                tensor is None
-                or not tensor.requires_grad
-                or (correction is None and kind != "top_k")
+    try:
+        for output in leaves(outputs):
+            for kind, tensor in (
+                ("target_logprobs", output.target_logprobs),
+                ("top_k", None if output.top_k is None else output.top_k.logprobs),
             ):
-                continue
-            index = indices[id(tensor)]
-            entry = _OutputCorrection(
-                index=index,
-                original_logprobs=tensor.detach().to("cpu", copy=True),
-                token_index=indices[id(output.top_k.tokens)]
-                if kind == "top_k"
-                else None,
-                original_tokens=output.top_k.tokens.detach().to("cpu", copy=True)
-                if kind == "top_k"
-                else None,
-                logits_index=indices[id(output.logits)]
-                if kind == "top_k" and output.logits is not None
-                else None,
-            )
-            if index in entries and entries[index].token_index != entry.token_index:
-                raise ValueError(
-                    "an aliased output tensor has ambiguous correction semantics"
+                if (
+                    tensor is None
+                    or not tensor.requires_grad
+                    or (correction is None and kind != "top_k")
+                ):
+                    continue
+                index = indices[id(tensor)]
+                entry = _OutputCorrection(
+                    index=index,
+                    original_logprobs=tensor.detach().to("cpu", copy=True),
+                    token_index=indices[id(output.top_k.tokens)]
+                    if kind == "top_k"
+                    else None,
+                    original_tokens=output.top_k.tokens.detach().to("cpu", copy=True)
+                    if kind == "top_k"
+                    else None,
+                    logits_index=indices[id(output.logits)]
+                    if kind == "top_k" and output.logits is not None
+                    else None,
                 )
-            entries.setdefault(index, entry)
-    return ForwardCorrectionContext(len(tensors), correction, tuple(entries.values()))
+                if index in entries and entries[index].token_index != entry.token_index:
+                    raise ValueError(
+                        "an aliased output tensor has ambiguous correction semantics"
+                    )
+                entries.setdefault(index, entry)
+        return ForwardCorrectionContext(
+            len(tensors), correction, tuple(entries.values())
+        )
+    except BaseException:
+        entries.clear()
+        del outputs, tensors
+        output = tensor = entry = None
+        raise
