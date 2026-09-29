@@ -1753,9 +1753,15 @@ class _FirstOccurrenceTrie:
                     result.append(eligible and not node.claimed)
             return result
 
-        node = self._roots.setdefault(model, _TokenPrefixNode())
+        node = self._roots.get(model)
+        if node is None:
+            node = self._roots[model] = _TokenPrefixNode()
         for token, flag in zip(tokens, flags, strict=True):
-            node = node.children.setdefault(int(token), _TokenPrefixNode())
+            token = int(token)
+            child = node.children.get(token)
+            if child is None:
+                child = node.children[token] = _TokenPrefixNode()
+            node = child
             eligible = sentinel is None or bool(int(flag) & sentinel)
             first = eligible and not node.claimed
             result.append(first)
