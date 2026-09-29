@@ -439,6 +439,25 @@ class Reporter:
                 observed_peak_bytes is not None and observed_peak_bytes < 0
             ):
                 raise ValueError("negative memory measurement")
+            retention = _planner_retention.current_limits()
+            planning_budget = planning and not (
+                failure is not None and failure["type"] == "OutOfMemoryError"
+            )
+            if retention is not None and not _planner_retention.remaining(
+                retention,
+                count_limit=MAX_PLANNING_REPORTS
+                if planning_budget
+                else MAX_SPOOL_REPORTS,
+                byte_limit=MAX_PLANNING_SPOOL_BYTES
+                if planning_budget
+                else MAX_SPOOL_BYTES,
+            ):
+                # Only definitive exhaustion can skip construction without changing
+                # which smaller reports or static-cap fallbacks remain retainable.
+                _planner_retention.omit_unmeasured(retention)
+                raise _planner_retention.RetentionLimitReached(
+                    "assigned planner retention exhausted before construction"
+                )
             record: dict[str, Any] = {
                 "format": 2,
                 "kind": "art-planner-miss",
@@ -501,12 +520,10 @@ class Reporter:
                     f"replay unavailable: {'ValueError' if isinstance(exc, _ReportTooLarge) else type(exc).__name__}"
                 ]
                 raw = _encode(record)
-            retention = _planner_retention.current_limits()
             path = persist_report(
                 raw,
                 self.spool_dir if retention is None else retention.spool_dir,
-                planning_budget=planning
-                and not (failure is not None and failure["type"] == "OutOfMemoryError"),
+                planning_budget=planning_budget,
                 retention=retention,
             )
         except Exception as exc:

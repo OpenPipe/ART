@@ -1,4 +1,9 @@
-"""Execution-assigned cumulative report allowances; no transport or quota refund."""
+"""Execution-assigned cumulative report allowances; no transport or quota refund.
+
+``omitted_bytes`` counts serialized failed attempts only. ``omitted_unmeasured``
+counts omissions before construction; their unknown sizes are never fabricated.
+Both contribute to ``omitted``. Existing ledgers need not contain the new counter.
+"""
 
 from __future__ import annotations
 
@@ -116,21 +121,7 @@ def _write(path: Path, value: dict[str, Any]) -> None:
 
 
 @contextmanager
-def charge(
-    limits: RetentionLimits,
-    event_id: str,
-    raw: bytes,
-    *,
-    count_limit: int,
-    byte_limit: int,
-) -> Iterator[None]:
-    """Commit a charge before the payload write; ambiguous writes never refund it.
-
-    Payload reclamation does not change this ledger. The caller reserves bounded
-    ledger/lock metadata separately from cumulative captured payload bytes.
-    """
-    if not _UUID.fullmatch(event_id):
-        raise ValueError("invalid planner charge identity")
+def _ledger(limits: RetentionLimits) -> Iterator[tuple[Path, dict[str, Any], int]]:
     root = limits.spool_dir
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = root.lstat()
@@ -163,13 +154,16 @@ def charge(
             ledger = json.loads(saved)
             if (
                 _encode(ledger) != saved
-                or set(ledger) != {"allowance", "charges", "omitted", "omitted_bytes"}
+                or set(ledger) - {"omitted_unmeasured"}
+                != {"allowance", "charges", "omitted", "omitted_bytes"}
                 or _encode(ledger["allowance"]) != _encode(limits.identity())
                 or not isinstance(ledger["charges"], dict)
                 or type(ledger["omitted"]) is not int
                 or not 0 <= ledger["omitted"] <= 2**63 - 1
                 or type(ledger["omitted_bytes"]) is not int
                 or not 0 <= ledger["omitted_bytes"] <= 2**63 - 1
+                or type(ledger.get("omitted_unmeasured", 0)) is not int
+                or not 0 <= ledger.get("omitted_unmeasured", 0) <= ledger["omitted"]
             ):
                 raise ValueError("planner charge ledger differs from enrollment")
         charges = ledger["charges"]
@@ -188,6 +182,49 @@ def charge(
             total += item[1]
         if len(charges) > limits.max_reports or total > limits.max_bytes:
             raise ValueError("planner charge ledger exceeds enrollment")
+        yield path, ledger, total
+    finally:
+        os.close(lock)
+
+
+def remaining(limits: RetentionLimits, *, count_limit: int, byte_limit: int) -> int:
+    """Snapshot only; concurrent producers must still charge their final bytes."""
+    with _ledger(limits) as (_, ledger, total):
+        return (
+            0
+            if len(ledger["charges"]) >= min(limits.max_reports, count_limit)
+            else max(0, min(limits.max_bytes, byte_limit) - total)
+        )
+
+
+def omit_unmeasured(limits: RetentionLimits) -> None:
+    """Count a skipped construction without inventing its serialized size."""
+    with _ledger(limits) as (path, ledger, _):
+        ledger["omitted"] = min(ledger["omitted"] + 1, 2**63 - 1)
+        ledger["omitted_unmeasured"] = min(
+            ledger.get("omitted_unmeasured", 0) + 1, 2**63 - 1
+        )
+        _write(path, ledger)
+
+
+@contextmanager
+def charge(
+    limits: RetentionLimits,
+    event_id: str,
+    raw: bytes,
+    *,
+    count_limit: int,
+    byte_limit: int,
+) -> Iterator[None]:
+    """Commit a charge before the payload write; ambiguous writes never refund it.
+
+    Payload reclamation does not change this ledger. The caller reserves bounded
+    ledger/lock metadata separately from cumulative captured payload bytes.
+    """
+    if not _UUID.fullmatch(event_id):
+        raise ValueError("invalid planner charge identity")
+    with _ledger(limits) as (path, ledger, total):
+        charges = ledger["charges"]
         identity = [hashlib.sha256(raw).hexdigest(), len(raw)]
         if event_id in charges and charges[event_id] != identity:
             raise ValueError("planner report ID has conflicting charged bytes")
@@ -208,5 +245,3 @@ def charge(
             with suppress(Exception):
                 _write(path, ledger)
             raise
-    finally:
-        os.close(lock)
