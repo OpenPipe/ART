@@ -169,7 +169,10 @@ def test_failed_spill_does_not_strand_following_save(tmp_path, monkeypatch):
     assert (tmp_path / "second/v.safetensors").is_file()
 
 
-def test_rank_prepare_returns_before_disk_and_owns_capture(tmp_path, monkeypatch):
+@pytest.mark.parametrize("blocked", ("write", "mkdir"))
+def test_rank_prepare_returns_before_disk_and_owns_capture(
+    tmp_path, monkeypatch, blocked
+):
     import sys
     from types import SimpleNamespace
 
@@ -199,18 +202,41 @@ def test_rank_prepare_returns_before_disk_and_owns_capture(tmp_path, monkeypatch
     entered, release = threading.Event(), threading.Event()
     saved = {}
     original = safetensors.torch.save_file
+    original_mkdir = Path.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        if blocked == "mkdir" and ".snapshot-r" in path.name:
+            entered.set()
+            assert release.wait(3)
+        return original_mkdir(path, *args, **kwargs)
 
     def write(tensors, path):
-        entered.set()
-        assert release.wait(3)
+        if blocked == "write":
+            entered.set()
+            assert release.wait(3)
         saved.update({key: value.clone() for key, value in tensors.items()})
         original(tensors, path)
 
     monkeypatch.setattr(safetensors.torch, "save_file", write)
+    monkeypatch.setattr(Path, "mkdir", mkdir)
     output = str(tmp_path / "checkpoint")
+    captured = threading.Event()
+    errors = []
+
+    def capture():
+        try:
+            trainer.prepare_checkpoint_save(output, "a")
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            captured.set()
+
+    capture_thread = threading.Thread(target=capture)
+    capture_thread.start()
     try:
-        trainer.prepare_checkpoint_save(output, "a")
         assert entered.wait(3)
+        assert captured.wait(1), "snapshot filesystem work held the capture queue"
+        assert not errors
         prepared = trainer._prepared_checkpoint_saves[output]
         assert prepared.writer is not None and not prepared.writer.done()
         with torch.no_grad():
@@ -221,6 +247,8 @@ def test_rank_prepare_returns_before_disk_and_owns_capture(tmp_path, monkeypatch
         assert prepared.config["r"] == 1
     finally:
         release.set()
+        capture_thread.join(3)
+        assert not capture_thread.is_alive()
         trainer.abort_checkpoint_save(output)
     torch.testing.assert_close(saved["p"], torch.tensor([1.0]))
     assert not trainer._prepared_checkpoint_saves
@@ -279,7 +307,7 @@ def test_start_failure_is_owned_until_collective_finalization(
     assert prepared.writer is not None
     assert prepared.writer.exception() is error
     assert all(ref() is None for ref in refs)
-    assert prepared.snapshot.exists() and prepared.reservation.exists()
+    assert not prepared.snapshot.exists() and prepared.reservation.exists()
     if action == "finish":
         with pytest.raises(RuntimeError) as caught:
             trainer.finish_checkpoint_save(output)

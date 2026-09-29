@@ -39,6 +39,12 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
     )
     output = str(Path(directory) / "failed")
     original_write, original_start = safetensors.torch.save_file, threading.Thread.start
+    original_mkdir = Path.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        if rank == 0 and failure == "mkdir" and ".snapshot-r" in path.name:
+            raise OSError("rank zero writer directory failed")
+        return original_mkdir(path, *args, **kwargs)
 
     def write(tensors, path):
         if rank == 0 and failure == "write":
@@ -68,6 +74,7 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
             )
             patch.setattr(safetensors.torch, "save_file", write)
             patch.setattr(threading.Thread, "start", start)
+            patch.setattr(Path, "mkdir", mkdir)
             trainer.prepare_checkpoint_save(output, "a")
             owned = trainer._prepared_checkpoint_saves[output]
             assert owned.writer is not None
@@ -88,6 +95,7 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
             # Restore successful persistence, then reuse both collective groups.
             patch.setattr(safetensors.torch, "save_file", original_write)
             patch.setattr(threading.Thread, "start", original_start)
+            patch.setattr(Path, "mkdir", original_mkdir)
             following = str(Path(directory) / "following")
             trainer.prepare_checkpoint_save(following, "a")
             trainer.abort_checkpoint_save(following)
@@ -106,7 +114,7 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
 
 
 @pytest.mark.parametrize("action", ["finish", "abort"])
-@pytest.mark.parametrize("failure", ["start", "write"])
+@pytest.mark.parametrize("failure", ["start", "write", "mkdir"])
 def test_asymmetric_snapshot_failure_does_not_block_capture(tmp_path, action, failure):
     context = mp.get_context("spawn")
     prepared = [context.Event() for _ in range(2)]

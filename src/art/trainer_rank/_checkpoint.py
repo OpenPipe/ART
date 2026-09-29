@@ -158,6 +158,7 @@ class _SnapshotSpill:
             error: BaseException | None = None
             tensors: dict[str, torch.Tensor] | None = None
             try:
+                snapshot.mkdir(parents=True, exist_ok=True)
                 save = importlib.import_module("safetensors.torch").save_file
                 for relative, tensors in payloads.items():
                     path = snapshot / relative
@@ -1004,7 +1005,6 @@ def prepare_checkpoint_save(
             if _rank() == 0:
                 reservation.mkdir(parents=True)
                 reservation_created = True
-            snapshot.mkdir(parents=True)
             shards, optimizer, custom_tensors = _local_state(
                 trainer, checkpoint_name, payloads
             )
