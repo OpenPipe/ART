@@ -431,6 +431,7 @@ def _split_chunk_lower_cost(
     packed_tokens = 0
     unshared_packed_tokens = 0
     head_workspace_bytes = 0
+    head_traced: list[bool | None] = []
     group_rows: list[tuple[int, bool]] = []
     for (_slot, grad_enabled), group_indices in groups:
         estimated = _impl.estimate_prefix_tree_packed_tokens(
@@ -444,15 +445,24 @@ def _split_chunk_lower_cost(
         cp = max(1, self._topology_key()[2])
         group_rows.append((-(-physical_rows // cp), grad_enabled))
         head_requests = tuple(requests[index] for index in group_indices)
+        lower = self._head_projection_rows(head_requests, lower_bound=True)
         head_workspace_bytes = max(
             head_workspace_bytes,
             self._group_head_workspace_bytes(
-                self._head_projection_rows(head_requests, lower_bound=True),
+                lower,
                 head_requests,
                 grad_enabled=grad_enabled,
                 lower_bound=True,
             ),
         )
+        if grad_enabled:
+            head_traced.append(
+                self._head_backward_traced(
+                    head_requests,
+                    lower,
+                    self._head_projection_rows(head_requests),
+                )
+            )
         unshared_packed_tokens += self._physical_tokens(
             sum(int(rows[index].numel()) for index in group_indices)
         )
@@ -464,17 +474,27 @@ def _split_chunk_lower_cost(
         slot_groups=tuple(key for key, _ in groups),
     )
     logical_tokens = _impl._active_logical_tokens(requests)
-    cost = self._subforward_cost(
-        packed_tokens=packed_tokens,
-        output_bytes=output_bytes,
-        signature=signature,
-        logical_tokens=logical_tokens,
-        group_rows=tuple(group_rows),
-        slot_refs=tuple(ref for (ref, _), _ in groups),
-        head_workspace_bytes=head_workspace_bytes,
-        # The average CP load is an optimistic bound, not an admission cost.
-        retained_tokens=(packed_tokens + signature.topology[2] - 1)
-        // signature.topology[2],
+    # Whether the exact plan stages its head can depend on projected rows
+    # these bounds leave open; the lower of both prices bounds either.
+    cost = min(
+        (
+            self._subforward_cost(
+                packed_tokens=packed_tokens,
+                output_bytes=output_bytes,
+                signature=signature,
+                logical_tokens=logical_tokens,
+                group_rows=tuple(group_rows),
+                slot_refs=tuple(ref for (ref, _), _ in groups),
+                head_workspace_bytes=head_workspace_bytes,
+                head_backward_traced=traced,
+                # The average CP load is an optimistic bound, not an
+                # admission cost.
+                retained_tokens=(packed_tokens + signature.topology[2] - 1)
+                // signature.topology[2],
+            )
+            for traced in _impl._traced_states(head_traced)
+        ),
+        key=lambda cost: cost.required,
     )
     profile = self._memory_profiles.get(signature)
     if (
@@ -535,6 +555,76 @@ def _plan_group_rows(
     )
 
 
+def _plan_head_backward_traced(self: TrainerRank, plan: _FlatForwardPlan) -> bool:
+    """Every gradient group's head backward is traced (``_head_backward_traced``).
+
+    When that stages the plan's head price (``_checkpoint_head_stage_bytes``
+    applies), marks the plan: its gradient groups then run the fused
+    statistics strictly (``_execute_flat_plan``). The mark stays once set:
+    a later re-pricing cannot weaken the admission that relied on it.
+    Every plan admitted on a staged price has been priced here: staging
+    needs CP2, where the cheap width estimate declines and admission
+    prices the materialized plan (``_estimate_flat_forward``). Strictness
+    trades the FP32 fallback's availability for memory safety: a fused
+    kernel error then fails the wave, and a CP peer waits in its next
+    collective like after a rank-local OOM.
+    """
+    traced = [
+        self._head_backward_traced(
+            requests,
+            self._head_projection_rows(
+                requests,
+                positions=group.packed.positions_by_sequence,
+                lower_bound=True,
+            ),
+        )
+        for group in plan.groups
+        if group.grad_enabled
+        for requests in (tuple(item.request for item in group.items),)
+    ]
+    eligible = bool(traced) and all(state is True for state in traced)
+    if (
+        eligible
+        and self._plan_head_workspace_bytes(plan)
+        and self._checkpoint_gradient_covered(
+            self._plan_group_rows(plan), tuple(g.slot_ref for g in plan.groups)
+        )
+    ):
+        object.__setattr__(plan, "_head_staged", True)
+    return eligible
+
+
+def _plan_group_routed_rows(
+    self: TrainerRank, plan: _FlatForwardPlan
+) -> tuple[int, ...]:
+    """Rows one rank's experts receive per group at balanced routing.
+
+    HybridEP dispatches the whole EP group's rows. When that group is this
+    rank's CP group, a balanced rank receives the group's rows over EP,
+    however unevenly CP split them; otherwise keep the local rows.
+    """
+    rows = self._plan_group_rows(plan)
+    if (
+        not getattr(self, "_ep_group_is_cp_group", False)
+        or plan.signature.topology[2] <= 1
+    ):
+        return tuple(local for local, _ in rows)
+    topology = self._topology()
+    return tuple(
+        min(
+            local,
+            -(
+                -self._cp_group_model_tokens(
+                    _impl._pad_packed_batch(group.packed, multiple=int(topology.tp)),
+                    topology=topology,
+                )
+                // int(topology.cp)
+            ),
+        )
+        for (local, _), group in zip(rows, plan.groups, strict=True)
+    )
+
+
 def _plan_cost(self: TrainerRank, plan: _FlatForwardPlan) -> _SubforwardCost:
     return self._subforward_cost(
         packed_tokens=plan.packed_tokens,
@@ -543,8 +633,10 @@ def _plan_cost(self: TrainerRank, plan: _FlatForwardPlan) -> _SubforwardCost:
         logical_tokens=plan.active_logical_tokens,
         gdn_segments=plan.grad_segment_count,
         group_rows=self._plan_group_rows(plan),
+        group_routed_rows=self._plan_group_routed_rows(plan),
         slot_refs=tuple(g.slot_ref for g in plan.groups),
         head_workspace_bytes=self._plan_head_workspace_bytes(plan),
+        head_backward_traced=self._plan_head_backward_traced(plan),
         checkpoint_floor=_impl._gdn_memory.plan_floor(self, plan),
         retained_tokens=self._plan_retained_tokens(plan),
         hybridep_growth_bytes=self._plan_hybridep_growth_bytes(plan),
@@ -679,11 +771,13 @@ def _search_next_micro_batch(
         indices, local_inputs = local_slice(width)
         local_requests = list(_impl._flatten(local_inputs))
         cheap_segments: list[int] = []
+        cheap_traced: list[bool | None] = []
         values = self._estimate_flat_forward(
             local_requests,
             checkpoint=checkpoint,
             sync_planning_errors=True,
             gdn_segments=cheap_segments,
+            head_traced=cheap_traced,
         )
         if not self._all_ranks_true(values is not None):
             estimates[width] = None
@@ -699,18 +793,27 @@ def _search_next_micro_batch(
             head_workspace_bytes: int,
             *,
             gdn_segments: int,
+            head_traced: Sequence[bool | None],
+            lower: bool,
         ) -> tuple[_MemoryCheck, int, int, _MemorySignature]:
             with self._planning_status(True):
-                required = self._estimate_required_memory_bytes_from_values(
-                    packed_tokens=packed_tokens,
-                    output_bytes=output_bytes,
-                    signature=signature,
-                    logical_tokens=logical_tokens,
-                    # Gradient groups' segments: exact layouts' counts, else
-                    # a bound matching the estimate's (_estimate_flat_forward).
-                    gdn_segments=gdn_segments,
-                    group_rows=group_rows,
-                    head_workspace_bytes=head_workspace_bytes,
+                # A bound over layouts whose head may or may not stage:
+                # the higher price to accept, the lower to reject.
+                required = (min if lower else max)(
+                    self._estimate_required_memory_bytes_from_values(
+                        packed_tokens=packed_tokens,
+                        output_bytes=output_bytes,
+                        signature=signature,
+                        logical_tokens=logical_tokens,
+                        # Gradient groups' segments: exact layouts' counts,
+                        # else a bound matching the estimate's
+                        # (_estimate_flat_forward).
+                        gdn_segments=gdn_segments,
+                        group_rows=group_rows,
+                        head_workspace_bytes=head_workspace_bytes,
+                        head_backward_traced=traced,
+                    )
+                    for traced in _impl._traced_states(head_traced)
                 )
             return (
                 self._memory_check_required(required, sync_across_dp=True),
@@ -723,6 +826,7 @@ def _search_next_micro_batch(
             *, exact: bool, memory_minimal: bool
         ) -> tuple[_MemoryCheck, int, int, _MemorySignature] | None:
             segments: list[int] = []
+            traced: list[bool | None] = []
             estimated = self._estimate_flat_forward(
                 local_requests,
                 checkpoint=checkpoint,
@@ -730,11 +834,18 @@ def _search_next_micro_batch(
                 memory_minimal=memory_minimal,
                 sync_planning_errors=True,
                 gdn_segments=segments,
+                head_traced=traced,
             )
             return (
                 None
                 if estimated is None
-                else priced(*estimated, gdn_segments=sum(segments))
+                else priced(
+                    *estimated,
+                    gdn_segments=sum(segments),
+                    head_traced=traced,
+                    # Only the cheap full-sharing count rejects.
+                    lower=memory_minimal and not exact,
+                )
             )
 
         def trusted(packed_tokens: int, signature: _MemorySignature) -> bool:
@@ -748,7 +859,12 @@ def _search_next_micro_batch(
         # reject on memory, or when it would reject on profile trust while
         # a profile exists — the selected layout may be far smaller than
         # the bound and squarely inside the profiled regime.
-        selected = priced(*values, gdn_segments=sum(cheap_segments))
+        selected = priced(
+            *values,
+            gdn_segments=sum(cheap_segments),
+            head_traced=cheap_traced,
+            lower=False,
+        )
         profiled = self._all_ranks_true(selected[3] in self._memory_profiles)
         needs_exact = not selected[0].fits or (
             profiled and not trusted(selected[1], selected[3])
@@ -1415,6 +1531,8 @@ def _fill_planner_snapshot(
                         "gdn_segments": child.grad_segment_count,
                         "retained_tokens": self._plan_retained_tokens(child),
                         "group_rows": self._plan_group_rows(child),
+                        "group_routed_rows": self._plan_group_routed_rows(child),
+                        "head_backward_traced": self._plan_head_backward_traced(child),
                         "hybridep_growth_bytes": (
                             self._plan_hybridep_growth_bytes(child)
                         ),

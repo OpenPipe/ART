@@ -242,6 +242,7 @@ def test_adapter_fact_validation_rejects_forged_input(change, layer, tmp_path):
     adapter = group["adapter"]
     if change == "gradient":
         group["grad"] = False
+        group["moe_covered"] = False
     elif change == "length":
         adapter["pending"] = [0] * 1026
     elif change == "value":
@@ -264,6 +265,95 @@ def test_adapter_fact_validation_rejects_forged_input(change, layer, tmp_path):
     )
     with pytest.raises(ValueError, match=message):
         reports.replay(report)
+
+
+def test_recomputed_layer_and_head_stage_facts_are_replayed_and_frozen(
+    monkeypatch, tmp_path
+):
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    original, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    item = original["replay"]["memory_replay"]["estimates"][0]
+    assert item["runtime_facts"]["groups"][0]["moe_covered"] is True
+    assert item["arguments"]["head_backward_traced"] is False
+    actual = reports.replay(original)
+    assert actual["aggregate"]["matches"]
+    # The replaying process's settings and TE state do not enter the answer.
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "1")
+    monkeypatch.setattr(tr, "_TE_CUBLAS_WORKSPACE_BYTES", 0)
+    assert reports.replay(original) == actual
+    for field in (
+        "moe_checkpoint_state_bytes_per_token",
+        "te_workspace_growth_bytes",
+        "backward_row_state_bytes",
+        "triton_min_rows",
+    ):
+        changed = deepcopy(original)
+        changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][field] += (
+            10**9
+        )
+        result = reports.replay(changed)
+        assert not result["estimates"][0]["matches"], field
+        assert (
+            result["estimates"][0]["required_bytes"]
+            > actual["estimates"][0]["required_bytes"]
+        ), field
+    # Coverage selects the input-gradient charge and whether the head stages.
+    changed = deepcopy(original)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["groups"][0][
+        "moe_covered"
+    ] = False
+    result = reports.replay(changed)
+    assert not result["estimates"][0]["matches"]
+    assert (
+        result["estimates"][0]["required_bytes"]
+        != actual["estimates"][0]["required_bytes"]
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["shared", "covered_no_grad", "triton_min_rows", "routed_rows", "head_staging"],
+)
+def test_recomputed_layer_fact_validation_rejects_forged_input(change, layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    item = report["replay"]["memory_replay"]["estimates"][0]
+    facts = item["runtime_facts"]
+    if change == "shared":
+        terms = facts["groups"][1]["gradient"]
+        terms[2] = terms[0] + 1
+        message = "invalid MoE terms"
+    elif change == "covered_no_grad":
+        facts["groups"][0]["moe_covered"] = True
+        message = "invalid MoE recompute coverage"
+    elif change == "triton_min_rows":
+        facts["triton_min_rows"] = 0
+        message = "invalid runtime dimension"
+    elif change == "routed_rows":
+        item["arguments"]["group_routed_rows"][1] -= 1
+        message = "routed rows"
+    else:
+        del item["arguments"]["head_backward_traced"]
+        message = "head backward staging"
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["_te_workspace_growth_bytes", "_moe_recompute_covered_for", "_triton_min_rows"],
+)
+def test_custom_recomputed_layer_reader_is_explicitly_incomplete(name, monkeypatch):
+    from art.trainer_rank import _planner_replay
+
+    rank = _rank(monkeypatch)
+    plan = rank._plan_flat_forward([_request(1)])
+    original = getattr(rank, name)
+    monkeypatch.setattr(rank, name, lambda *args: original(*args))
+    with pytest.raises(ValueError, match="custom_runtime_estimator"):
+        _planner_replay.capture(rank, plan)
 
 
 @pytest.mark.parametrize("layers", [2**10 + 1, 0, 40.0])
