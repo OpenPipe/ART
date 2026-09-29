@@ -87,6 +87,7 @@ def test_prefix_routes_use_reference_sequence_and_cp_padding_is_explicit():
         ),
     )
     context = prepare_routes(items, packed, prepared, [(binding, 0)], "cpu")
+    assert context is not None
     assert context.targets[id(binding)]["attention"].flatten().tolist() == [
         2,
         0,

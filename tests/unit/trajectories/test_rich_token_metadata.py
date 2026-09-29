@@ -95,6 +95,7 @@ def test_logprob_modes_survive_tokenization_tensorization_and_compact(mode, flag
     ]
     for value in (tokenized, tokenized.tensorize()):
         restored = tr.compact_validate(value.compact_dump())
+        assert isinstance(restored, (tr.TokenizedTrajectory, tr.TensorizedTrajectory))
         assert [bool(int(item) & flag) for item in restored.flags] == [
             False,
             False,

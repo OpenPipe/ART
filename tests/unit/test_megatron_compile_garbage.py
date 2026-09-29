@@ -17,6 +17,7 @@ def test_checkpoint_hooks_capture_routing_automatically():
 
     def forward(x):
         context = CURRENT_ROUTES.get()
+        assert context is not None
         factor = context.targets[0]["attention"]
         seen.append(float(factor))
         return (x * factor).square()
@@ -27,6 +28,7 @@ def test_checkpoint_hooks_capture_routing_automatically():
                 torch.utils.checkpoint.checkpoint(forward, value, use_reentrant=True)
             )
     sum(outputs).sum().backward()
+    assert value.grad is not None
     assert value.grad.item() == 2 * 2 * (3**2 + 5**2)
     assert seen == [3.0, 5.0, 5.0, 3.0]
     assert CURRENT_ROUTES.get() is None
