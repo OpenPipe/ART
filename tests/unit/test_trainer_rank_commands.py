@@ -9,7 +9,7 @@ import gc
 import sys
 import threading
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 import weakref
 
@@ -300,7 +300,7 @@ class _FailPhysicalBackward(torch.autograd.Function):
         return value
 
     @staticmethod
-    def backward(ctx, gradient):
+    def backward(ctx, gradient):  # ty: ignore[invalid-method-override]
         if dist.get_rank() == 1:
             raise RuntimeError("intentional physical backward failure")
         return gradient
@@ -513,7 +513,13 @@ def _distributed_worker(physical, rendezvous, output):
             view.backward(head(torch.tensor(3.0)))
 
         asyncio.run(run_rank_callback(native, head_callback, mode="zero"))
-        weight = native._checkpoint_slots["student"].custom["head"].value.weight
+        weight = cast(
+            torch.nn.Parameter,
+            cast(
+                torch.nn.Module,
+                native._checkpoint_slots["student"].custom["head"].value,
+            ).weight,
+        )
         gradient = (
             torch.zeros_like(weight) if weight.grad is None else weight.grad.clone()
         )
@@ -644,6 +650,8 @@ def test_logical_native_head_backward_commits_after_local_autograd():
     trainer, _ = _trainer("student")
 
     class LocalHead(torch.nn.Module):
+        count: torch.Tensor
+
         def __init__(self):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.tensor(2.0))
@@ -658,7 +666,7 @@ def test_logical_native_head_backward_commits_after_local_autograd():
         view.backward(head(torch.tensor(3.0)))
 
     asyncio.run(run_rank_callback(trainer, callback, mode="zero"))
-    native = trainer._checkpoint_slots["student"].custom["head"].value
+    native = cast(LocalHead, trainer._checkpoint_slots["student"].custom["head"].value)
     torch.testing.assert_close(native.weight.grad, torch.tensor(12.0))
     assert native.count.item() == 1
 
