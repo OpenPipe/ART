@@ -509,8 +509,10 @@ def validate(facts: Any) -> None:
                 not group["grad"]
                 or type(ranks) is not list
                 or not 0 < len(ranks) <= 64
-                or (gdn_rows is not None and type(gdn_rows) is not list)
-                or len(gdn_rows or ranks) != len(ranks)
+                or (
+                    gdn_rows is not None
+                    and (type(gdn_rows) is not list or len(gdn_rows) != len(ranks))
+                )
                 or type(layout["attention_retained"]) is not list
                 or len(layout["attention_retained"]) != len(ranks)
             ):
@@ -852,7 +854,11 @@ class ReplayRank(_impl.TrainerRank):
             raise ValueError("head backward staging disagrees with recorded facts")
         layouts = None
         if groups[0]["layout"] is not None:
-            if len(groups[0]["layout"]["attention_rows"]) != self._topology_key()[2]:
+            # Live layout pricing is CP2 at TP1/PP1 only (_layout_pricing_supported).
+            _, tp, cp, pp = self._topology_key()
+            if (tp, cp, pp) != (1, 2, 1) or len(
+                groups[0]["layout"]["attention_rows"]
+            ) != 2:
                 raise ValueError("CP layout facts disagree with the recorded topology")
             layouts = tuple(
                 _impl._GroupLayout(
