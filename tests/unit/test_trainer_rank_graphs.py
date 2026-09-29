@@ -9,6 +9,7 @@ import weakref
 
 import pytest
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils.checkpoint import checkpoint
 
 from art.trainer_rank import ForwardOutput, TopK, TrainerRank
@@ -478,7 +479,12 @@ def test_replay_restores_original_autocast_context():
     torch.testing.assert_close(parameter.grad, torch.full_like(parameter, 2.0))
 
 
-def test_replay_failure_discards_transaction_and_releases_participating_records():
+def test_replay_failure_discards_transaction_and_releases_participating_records(
+    request,
+):
+    if gc.isenabled():
+        request.addfinalizer(gc.enable)
+    gc.disable()
     trainer = TrainerRank.__new__(TrainerRank)
     parameter = torch.nn.Parameter(torch.tensor(2.0))
     trainer._checkpoint_slots = {"student": _CheckpointSlot(params=(parameter,))}
@@ -487,26 +493,50 @@ def test_replay_failure_discards_transaction_and_releases_participating_records(
         parameter, trainer._capture_checkpoint_version("student")
     )
     cache = GraphCache()
+    older_weight = torch.nn.Parameter(torch.tensor(3.0))
+    older, (older_output,) = cache.run(lambda _: (older_weight.square(),), ())
+    borrowed = StorageWeakRef(parameter.untyped_storage())
+    storages = []
     executions = [0]
 
     def failing(x):
         executions[0] += 1
-        result = snapshot * x
+        activation = snapshot * x + 1
+        result = activation.square()
+        storages.extend(
+            StorageWeakRef(value.untyped_storage()) for value in (activation, result)
+        )
         return (result if executions[0] == 1 else result.expand(2),)
 
     first, _ = cache.run(
         lambda x: (snapshot * x,), torch.tensor(3.0), retention="replay"
     )
     second, _ = cache.run(failing, torch.tensor(4.0), retention="replay")
-    parameter.grad = torch.tensor(7.0)
-    with pytest.raises(RuntimeError, match="metadata differs"):
+    parameter.grad = prior_gradient = torch.tensor(7.0)
+    with pytest.raises(RuntimeError, match="metadata differs") as failure:
         with trainer._gradient_transaction():
             cache.backward_many(
                 [(first, (torch.tensor(1.0),)), (second, (torch.tensor(1.0),))]
             )
-    assert parameter.grad.item() == 7
+    assert parameter.grad is prior_gradient and parameter.grad.item() == 7
     assert snapshot.grad is None
     assert not trainer._version_state()._origins
+    assert failure.value.__traceback__ is not None and failure.value.__cause__ is None
+    assert len(storages) == 4 and all(storage.expired() for storage in storages)
+    assert not borrowed.expired() and parameter.item() == snapshot.item() == 2
+    assert cache.handles() == (older,)
+    torch.testing.assert_close(older_output, torch.tensor(9.0))
+    cache.backward(older, (torch.ones_like(older_output),))
+    torch.testing.assert_close(older_weight.grad, torch.tensor(6.0))
+    retry, (output,) = cache.run(
+        lambda x: ((snapshot * x + 1).square(),),
+        torch.arange(1.0, 4.0),
+        retention="replay",
+    )
+    torch.testing.assert_close(output, torch.tensor([9.0, 25.0, 49.0]))
+    with trainer._gradient_transaction():
+        cache.backward(retry, (torch.ones_like(output),))
+    assert parameter.grad.item() == 75 and snapshot.grad is None
     assert cache.handles() == ()
 
 

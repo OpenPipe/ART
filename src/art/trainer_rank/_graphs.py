@@ -235,7 +235,7 @@ class _ForwardRecord:
     )
     execution_peak_bytes: int = 0
 
-    def release(self) -> None:
+    def release_physical(self) -> None:
         # Saved-variable hooks can outlive their Python outputs. Break all
         # ownership edges even when a caller retains a failure traceback.
         for reference in self.saved or ():
@@ -243,6 +243,9 @@ class _ForwardRecord:
                 cell.tensor = torch.empty(0)
         self.outputs = self.saved = self.resident = None
         self.restored.clear()
+
+    def release(self) -> None:
+        self.release_physical()
         self.inputs = self.corrections = None
         self.execute = lambda _: ()
         self.context_factory = nullcontext
@@ -506,8 +509,7 @@ class GraphCache:
             if replay_with_current and record.current_context_factory is None:
                 raise ValueError("Current-weight replay requires a version context")
             record.replay_with_current = replay_with_current
-        record.outputs = record.saved = record.resident = None
-        record.restored.clear()
+        record.release_physical()
         record.retention = "replay"
 
     def release(self, handle: ForwardHandle) -> None:
@@ -673,8 +675,8 @@ class GraphCache:
                 (value.shape, value.dtype, value.device, value.requires_grad)
                 for value in physical
             )
+            del physical
             if metadata != record.metadata:
-                record.outputs = record.saved = None
                 raise RuntimeError(
                     "Replayed output metadata differs from original forward"
                 )

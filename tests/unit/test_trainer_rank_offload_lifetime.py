@@ -13,7 +13,9 @@ from art.trainer_rank import _graphs as graphs
 
 @pytest.mark.parametrize("failure_type", [MemoryError, asyncio.CancelledError])
 @pytest.mark.parametrize("stage", ["allocation", "copy"])
-@pytest.mark.parametrize("late", [False, True], ids=["initial", "later"])
+@pytest.mark.parametrize(
+    "late", [False, True, "evicted"], ids=["initial", "later", "evicted"]
+)
 def test_offload_failure_storage_lifetime(monkeypatch, failure_type, stage, late):
     class SyntheticCuda(torch.Tensor):
         __torch_function__ = cast(Any, torch._C._disabled_torch_function_impl)
@@ -103,7 +105,7 @@ def test_offload_failure_storage_lifetime(monkeypatch, failure_type, stage, late
                 cache.offload(handle)
         assert failure.value is error and error.__cause__ is cause
         assert error.__traceback__ is not None
-        assert cache.transfer_stats.offload_count == int(late)
+        assert cache.transfer_stats.offload_count == int(bool(late))
         assert cache.transfer_stats.restore_count == 0
         assert not borrowed.expired() and weight.item() == 2
         if late:
@@ -113,6 +115,10 @@ def test_offload_failure_storage_lifetime(monkeypatch, failure_type, stage, late
             assert not destinations[0].expired()
             assert not sources[-1].expired()
             failing = False
+            if late == "evicted":
+                cache.evict(handle)
+                assert all(storage.expired() for storage in sources + destinations)
+                assert cache.state(handle).retention == "replay"
             cache.backward(handle, (torch.ones_like(output),))
             torch.testing.assert_close(weight.grad, torch.tensor(68.0))
             weight.grad = None
