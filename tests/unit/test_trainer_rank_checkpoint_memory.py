@@ -559,10 +559,9 @@ def test_cp1_dense_no_grad_floor_covers_each_row(n):
     _, _, signature, groups, _ = values
     assert not signature.grad_enabled and signature.topology == (1, 1, 1, 1)
     assert groups == ((n, False),)
-    assert _DENSE_NO_GRAD_ROW <= 250_181
     # The 16H per packed token floor admitted 180 KB per row, below the cold
-    # peak; the per-row floor admits it with the usual 1.1 factor.
-    assert int(n * 5120 * 2 * 16 * 1.1) < n * _COLD_NO_GRAD_ROW
+    # peak; the per-row floor, itself below the warm peaks, admits it with the
+    # usual 1.1 factor.
     assert estimate(r, signature, groups, n) == int(n * _DENSE_NO_GRAD_ROW * 1.1)
     assert price(r, values).required >= n * _COLD_NO_GRAD_ROW
 
@@ -580,9 +579,13 @@ def test_cp1_dense_no_grad_floor_bounds_profiles():
 def test_cp1_dense_no_grad_floor_prices_physical_rows_of_the_largest_group():
     r = dense_rank()
     _, _, signature, _, _ = no_grad_wave(r, 64)
-    # Shared prefixes add logical rows, not physical ones.
+    # Shared prefixes add logical rows, not physical ones: beside a low
+    # profile, which does grow with logical rows, the floor stays put.
+    r._memory_profiles[signature] = _MemoryProfile(1_000, 144228)
     single = estimate(r, signature, ((144228, False),), 144228)
-    assert estimate(r, signature, ((144228, False),), 144228, 149832) == single
+    assert single == int(144228 * _DENSE_NO_GRAD_ROW * 1.1)
+    assert estimate(r, signature, ((144228, False),), 144228, 1_500_000) == single
+    del r._memory_profiles[signature]
     # Groups run one after another: the largest group's rows bound the stage,
     # and the per-packed-token floor still applies to their sum.
     groups = ((100_000, False), (44_228, False))
@@ -617,11 +620,44 @@ def test_dense_no_grad_floor_leaves_other_pricing(case):
         assert priced == int(144228 * 5120 * 2 * 16 * 1.1)
 
 
+@pytest.mark.parametrize("factor,stage", [(3, 6), (5, 6), (7, 7)])
+def test_cp1_dense_no_grad_stage_takes_the_wider_swiglu_live_set(factor, stage):
+    r = dense_rank()
+    r._mlp_activation_factor = factor
+    _, _, signature, groups, _ = no_grad_wave(r, 4096)
+    assert estimate(r, signature, groups, 4096) == int(
+        4096 * (stage * 17408 + 4 * 5120) * 2 * 1.1
+    )
+
+
+@pytest.mark.parametrize("gradient_first", [False, True])
+def test_dense_mixed_plan_keeps_the_no_grad_stage(gradient_first):
+    r = dense_rank()
+    gradient, reference = requests(1, 10_000)
+    req = [gradient, reference] if gradient_first else [reference, gradient]
+    reference_cost = r._plan_cost(r._plan_flat_forward([reference])).required
+    assert reference_cost >= int(10_000 * _DENSE_NO_GRAD_ROW * 1.1)
+    mixed = r._plan_flat_forward(req)
+    mixed_cost = r._plan_cost(mixed).required
+    # One gradient row cannot make the no-grad group's stage cheaper.
+    assert mixed_cost >= reference_cost
+    assert r._memory_check(mixed).estimated_required_bytes == mixed_cost
+    assert (
+        r._split_chunk_lower_cost(
+            req, tuple(x.input_tokens for x in req), checkpoint=Unset
+        ).required
+        == mixed_cost
+    )
+
+
 def test_dense_fc1_adapted_needs_every_layer_wrapped():
     from art.megatron.lora import SharedExpertsLinearFC1LoRA
     from art.trainer_rank._impl import _dense_fc1_adapted
 
     wrapped = SharedExpertsLinearFC1LoRA.__new__(SharedExpertsLinearFC1LoRA)
+    wrapped.__dict__["non_gated"] = False
+    non_gated = SharedExpertsLinearFC1LoRA.__new__(SharedExpertsLinearFC1LoRA)
+    non_gated.__dict__["non_gated"] = True
 
     def model(*fc1s: object) -> Any:
         layers = [SimpleNamespace(mlp=SimpleNamespace(linear_fc1=f)) for f in fc1s]
@@ -631,5 +667,7 @@ def test_dense_fc1_adapted_needs_every_layer_wrapped():
 
     assert _dense_fc1_adapted(model(wrapped, wrapped)) is True
     assert _dense_fc1_adapted(model(wrapped, torch.nn.Linear(1, 1))) is False
+    # A non-gated FC1 outputs F, not 2F: not the traced stage.
+    assert _dense_fc1_adapted(model(non_gated, non_gated)) is False
     assert _dense_fc1_adapted(model()) is False
     assert _dense_fc1_adapted(cast(Any, SimpleNamespace())) is False

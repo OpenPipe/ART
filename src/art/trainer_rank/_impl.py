@@ -1191,8 +1191,9 @@ def _moe_layer_count(model: torch.nn.Module) -> int:
 
 
 def _dense_fc1_adapted(model: torch.nn.Module) -> bool:
-    """Whether every decoder layer's MLP FC1 is ART's LoRA wrapper, which keeps
-    an adapter output and the sum beside the base output even for inactive slots."""
+    """Whether every decoder layer's MLP FC1 is ART's gated LoRA wrapper, which
+    keeps a 2F adapter output and the sum beside the 2F base output, even for
+    inactive slots."""
 
     try:
         from art.megatron.lora import SharedExpertsLinearFC1LoRA
@@ -1200,10 +1201,13 @@ def _dense_fc1_adapted(model: torch.nn.Module) -> bool:
         layers = _language_model(model).decoder.layers
     except (AttributeError, ImportError, RuntimeError):
         return False
-    return len(layers) > 0 and all(
-        type(getattr(getattr(layer, "mlp", None), "linear_fc1", None))
-        is SharedExpertsLinearFC1LoRA
-        for layer in layers
+    fc1s = [
+        getattr(getattr(layer, "mlp", None), "linear_fc1", None) for layer in layers
+    ]
+    return len(fc1s) > 0 and all(
+        type(fc1) is SharedExpertsLinearFC1LoRA
+        and getattr(fc1, "non_gated", True) is False
+        for fc1 in fc1s
     )
 
 
