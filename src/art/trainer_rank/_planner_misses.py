@@ -14,7 +14,7 @@ targets, never replacements for missing estimator inputs.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -443,27 +443,21 @@ class Reporter:
             planning_budget = planning and not (
                 failure is not None and failure["type"] == "OutOfMemoryError"
             )
-            report_limit = MAX_PLANNING_REPORT_BYTES if planning else MAX_REPORT_BYTES
-            if retention is not None:
-                # This is not a reservation. Final persistence rechecks under the
-                # shared lock; a large refusal never disables later smaller/OOM
-                # reports. Keep the existing partial-report fallback if possible.
-                available = _planner_retention.remaining(
-                    retention,
-                    count_limit=MAX_PLANNING_REPORTS
-                    if planning_budget
-                    else MAX_SPOOL_REPORTS,
-                    byte_limit=MAX_PLANNING_SPOOL_BYTES
-                    if planning_budget
-                    else MAX_SPOOL_BYTES,
+            if retention is not None and not _planner_retention.remaining(
+                retention,
+                count_limit=MAX_PLANNING_REPORTS
+                if planning_budget
+                else MAX_SPOOL_REPORTS,
+                byte_limit=MAX_PLANNING_SPOOL_BYTES
+                if planning_budget
+                else MAX_SPOOL_BYTES,
+            ):
+                # Only definitive exhaustion can skip construction without changing
+                # which smaller reports or static-cap fallbacks remain retainable.
+                _planner_retention.omit_unmeasured(retention)
+                raise _planner_retention.RetentionLimitReached(
+                    "assigned planner retention exhausted before construction"
                 )
-                if not available:
-                    with suppress(Exception):
-                        _planner_retention.omit_unmeasured(retention)
-                    raise _planner_retention.RetentionLimitReached(
-                        "assigned planner retention exhausted before construction"
-                    )
-                report_limit = min(report_limit, available)
             record: dict[str, Any] = {
                 "format": 2,
                 "kind": "art-planner-miss",
@@ -508,22 +502,22 @@ class Reporter:
                 if not record["replay_complete"] and not record["incomplete_reasons"]:
                     record["incomplete_reasons"] = ["memory replay inputs unavailable"]
                 try:
-                    raw = _encode(record, limit=report_limit)
+                    raw = _encode(
+                        record,
+                        limit=MAX_PLANNING_REPORT_BYTES
+                        if planning
+                        else MAX_REPORT_BYTES,
+                    )
                 except _ReportTooLarge:
                     if not planning:
                         raise
                     record = _compact_planning_record(record)
-                    raw = _encode(record, limit=report_limit)
+                    raw = _encode(record, limit=MAX_PLANNING_REPORT_BYTES)
             except Exception as exc:
                 record["replay"] = None
                 record["replay_complete"] = False
                 record["incomplete_reasons"] = [
-                    "replay exceeds remaining retention allowance"
-                    if isinstance(exc, _ReportTooLarge)
-                    and retention is not None
-                    and report_limit
-                    < (MAX_PLANNING_REPORT_BYTES if planning else MAX_REPORT_BYTES)
-                    else f"replay unavailable: {'ValueError' if isinstance(exc, _ReportTooLarge) else type(exc).__name__}"
+                    f"replay unavailable: {'ValueError' if isinstance(exc, _ReportTooLarge) else type(exc).__name__}"
                 ]
                 raw = _encode(record)
             path = persist_report(

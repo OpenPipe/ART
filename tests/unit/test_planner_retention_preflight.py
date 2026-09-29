@@ -75,9 +75,7 @@ def test_healthy_bytes_and_accounting_are_unchanged(tmp_path, monkeypatch):
     assert "omitted_unmeasured" not in ledger(bound)
 
 
-def test_nearly_full_budget_bounds_encoding_and_preserves_small_oom(
-    tmp_path, monkeypatch
-):
+def test_nearly_full_budget_keeps_original_refusal_and_small_oom(tmp_path, monkeypatch):
     bound = limits(tmp_path, max_bytes=4096)
     reporter = reports.Reporter(5)
     visited = []
@@ -91,24 +89,22 @@ def test_nearly_full_budget_bounds_encoding_and_preserves_small_oom(
     monkeypatch.setattr(reports, "_source_files", lambda: {})
     with reports.report_retention_scope(bound):
         path = emit(reporter, replay_factory=lambda: {"rows": Rows([12345] * 100000)})
-        assert path is not None
-        record = reports.validate_report(path.read_bytes())
-        assert record["replay"] is None and not record["replay_complete"]
-        assert record["incomplete_reasons"] == [
-            "replay exceeds remaining retention allowance"
-        ]
-        assert len(visited) < 1000  # Parent traverses all 100,000 rows.
+        assert path is None
+        assert len(visited) == 100000  # Positive allowance keeps the original path.
+        assert ledger(bound)["charges"] == {}
         small = emit(reporter)
         oom = emit(reporter, oom=True, observed_peak_bytes=None, partial_peak_bytes=99)
         assert small is not None and oom is not None
         saved = reports.validate_report(oom.read_bytes())
         assert saved["oom"] and saved["observed_peak_bytes"] is None
         assert saved["partial_peak_bytes"] == 99
-    sizes = sum(p.stat().st_size for p in (path, small, oom))
+    sizes = sum(p.stat().st_size for p in (small, oom))
     assert (
         sum(x[1] for x in ledger(bound)["charges"].values()) == sizes <= bound.max_bytes
     )
-    assert ledger(bound)["omitted"] == reporter.failures == 0
+    assert ledger(bound)["omitted"] == reporter.failures == 1
+    assert ledger(bound)["omitted_bytes"] > bound.max_bytes
+    assert "omitted_unmeasured" not in ledger(bound)
 
 
 def test_concurrent_preflights_do_not_reserve_or_overspend(tmp_path):
@@ -168,3 +164,67 @@ def test_unknown_byte_counter_is_validated(tmp_path, bad):
     with reports.report_retention_scope(bound):
         assert emit(reports.Reporter(5)) is None
     assert (bound.spool_dir / ".retention.json").read_bytes() == original
+
+
+@pytest.mark.parametrize("capacity", [{"max_reports": 1}, {"max_bytes": 1200}])
+def test_oversized_miss_does_not_displace_later_oom(tmp_path, monkeypatch, capacity):
+    bound = limits(tmp_path, **capacity)
+    reporter = reports.Reporter(5)
+    monkeypatch.setattr(reports, "_source_files", lambda: {})
+    with reports.report_retention_scope(bound):
+        assert emit(reporter, replay_factory=lambda: {"rows": [12345] * 200000}) is None
+        assert ledger(bound)["charges"] == {}
+        path = emit(reporter, oom=True, observed_peak_bytes=None, partial_peak_bytes=99)
+    assert path is not None
+    saved = reports.validate_report(path.read_bytes())
+    assert saved["oom"] and saved["partial_peak_bytes"] == 99
+    assert len(ledger(bound)["charges"]) == 1
+    assert ledger(bound)["omitted_bytes"] > bound.max_bytes
+
+
+@pytest.mark.parametrize("kind", ["miss", "oom", "planning_oom"])
+def test_near_full_allowance_preserves_original_static_fallback(
+    tmp_path, monkeypatch, kind
+):
+    bound = limits(tmp_path, max_bytes=1500)
+    monkeypatch.setattr(reports, "_source_files", lambda: {})
+    monkeypatch.setattr(reports, "MAX_REPORT_BYTES", 2048)
+    monkeypatch.setattr(reports, "MAX_PLANNING_REPORT_BYTES", 2048)
+    values = {"replay_factory": lambda: {"bulk": "x" * 5000}}
+    if kind == "oom":
+        values.update(oom=True, observed_peak_bytes=None, partial_peak_bytes=99)
+    elif kind == "planning_oom":
+        values.update(
+            event="planning_error",
+            phase="planning",
+            observed_peak_bytes=None,
+            failure={
+                "type": "OutOfMemoryError",
+                "phase": "planning",
+                "frames": [],
+                "omitted_frames": 0,
+            },
+        )
+    monkeypatch.setattr(reports.uuid, "uuid4", lambda: SimpleNamespace(hex="d" * 32))
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(reports, "datetime", Clock)
+    original = emit(reports.Reporter(5, spool_dir=tmp_path / "unassigned"), **values)
+    assert original is not None
+    with reports.report_retention_scope(bound):
+        path = emit(reports.Reporter(5), **values)
+    assert path is not None
+    assert path.read_bytes() == original.read_bytes()
+    record = reports.validate_report(path.read_bytes())
+    assert not record["replay_complete"]
+    assert record["incomplete_reasons"]
+    assert len(ledger(bound)["charges"]) == 1
+    assert ledger(bound)["omitted"] == 0
+    if kind == "oom":
+        assert record["oom"] and record["partial_peak_bytes"] == 99
+    elif kind == "planning_oom":
+        assert record["failure"]["type"] == "OutOfMemoryError"
