@@ -23,7 +23,12 @@ spec.loader.exec_module(ci)
 
 @pytest.fixture
 def owner(tmp_path):
-    value = {"cluster": "trainer-rank-gpu-42-2", "head": "a" * 40, "attempt": "2"}
+    value = {
+        "cluster": "trainer-rank-gpu-42-2",
+        "head": "a" * 40,
+        "attempt": "2",
+        "infra": "k8s/cks-wb3",
+    }
     ci.write_json(tmp_path / "owner.json", value)
     return value
 
@@ -44,7 +49,14 @@ def sky(monkeypatch):
     return api
 
 
-def test_submit_once_records_request_before_wait_and_actual_job(tmp_path, owner, sky):
+@pytest.mark.parametrize("infra", ["k8s/cks-wb3", "k8s/ext-collab2"])
+def test_submit_once_records_request_before_wait_and_actual_job(
+    tmp_path, owner, sky, monkeypatch, infra
+):
+    owner["infra"] = infra
+    ci.write_json(tmp_path / "owner.json", owner)
+    monkeypatch.setenv("SKY_INFRA", "k8s/unapproved")  # Use recorded ownership.
+
     def get(request):
         assert request == "request-17"
         assert ci.read_bound(tmp_path, "request.json", owner)["request_id"] == request
@@ -53,7 +65,7 @@ def test_submit_once_records_request_before_wait_and_actual_job(tmp_path, owner,
     sky.get.side_effect = get
     ci.worker(tmp_path, "launch")
     task = sky.Task.from_yaml.return_value
-    task.set_resources_override.assert_called_once_with({"infra": "k8s/cks-wb3"})
+    task.set_resources_override.assert_called_once_with({"infra": infra})
     sky.launch.assert_called_once_with(
         task, cluster_name=owner["cluster"], retry_until_up=False
     )
@@ -303,8 +315,17 @@ def test_launch_timeout_cancels_only_recorded_request(
     assert calls == (["launch", "cancel_request"] if known_request else ["launch"])
 
 
-@pytest.mark.parametrize("bad", ["head", "infra", "run_id"])
-def test_main_rejects_invalid_scope_before_launch(tmp_path, monkeypatch, bad):
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("EXPECTED_HEAD_SHA", "invalid"),
+        ("GITHUB_RUN_ID", "invalid"),
+        ("SKY_INFRA", "invalid"),
+        ("SKY_INFRA", "k8s/unapproved"),
+        ("SKY_INFRA", "aws/us-east-1"),
+    ],
+)
+def test_main_rejects_invalid_scope_before_launch(tmp_path, monkeypatch, key, value):
     environment = {
         "GITHUB_RUN_ID": "42",
         "GITHUB_RUN_ATTEMPT": "2",
@@ -313,11 +334,7 @@ def test_main_rejects_invalid_scope_before_launch(tmp_path, monkeypatch, bad):
         "EXPECTED_HEAD_SHA": "a" * 40,
         "SKY_INFRA": "k8s/cks-wb3",
     }
-    environment[
-        {"head": "EXPECTED_HEAD_SHA", "infra": "SKY_INFRA", "run_id": "GITHUB_RUN_ID"}[
-            bad
-        ]
-    ] = "invalid"
+    environment[key] = value
     for key, value in environment.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(ci.subprocess, "check_output", lambda *args, **kwargs: "a" * 40)
@@ -328,7 +345,8 @@ def test_main_rejects_invalid_scope_before_launch(tmp_path, monkeypatch, bad):
     run.assert_not_called()
 
 
-def test_real_worker_round_trip_with_fake_sdk(tmp_path):
+@pytest.mark.parametrize("infra", ["k8s/cks-wb3", "k8s/ext-collab2"])
+def test_real_worker_round_trip_with_fake_sdk(tmp_path, infra):
     """Exercise the actual direct Python parent/worker JSON transport, without Sky."""
     (tmp_path / "sky.py").write_text("""
 import os
@@ -337,7 +355,7 @@ from types import SimpleNamespace as NS
 class Task:
     @classmethod
     def from_yaml(cls, path): return cls()
-    def set_resources_override(self, options): assert options == {"infra":"k8s/cks-wb3"}
+    def set_resources_override(self, options): assert options == {"infra":os.environ["SKY_INFRA"]}
 def launch(task, *, cluster_name, retry_until_up):
     assert retry_until_up is False
     Path(os.environ["FAKE_CLUSTER"]).write_text(cluster_name)
@@ -366,7 +384,7 @@ def tail_logs(cluster, *, job_id, follow):
         "GITHUB_RUN_ATTEMPT": "2",
         "GITHUB_REPOSITORY": "OpenPipe/ART",
         "GITHUB_EVENT_NAME": "pull_request",
-        "SKY_INFRA": "k8s/cks-wb3",
+        "SKY_INFRA": infra,
         "EXPECTED_HEAD_SHA": head,
     }
     root = tmp_path / "evidence"
@@ -380,6 +398,7 @@ def tail_logs(cluster, *, job_id, follow):
     )
     assert result.returncode == 0, result.stderr
     assert json.loads((root / "result.json").read_text())["job_id"] == 17
+    assert json.loads((root / "result.json").read_text())["infra"] == infra
     assert "fake complete log" in (root / "logs.log").read_text()
 
 
