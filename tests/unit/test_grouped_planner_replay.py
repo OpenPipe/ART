@@ -256,7 +256,13 @@ def test_adapter_fact_validation_rejects_forged_input(change, layer, tmp_path):
         ]
         groups[0]["grad"] = True
         groups[0]["adapter"] = {"kind": None, "name": "base", "pending": []}
-    with pytest.raises(ValueError):
+    # Name the refusal: a forged fact must fail validation, not a later check.
+    message = (
+        "invalid runtime dimension"
+        if change == "value"
+        else "invalid adapter gradient facts"
+    )
+    with pytest.raises(ValueError, match=message):
         reports.replay(report)
 
 
