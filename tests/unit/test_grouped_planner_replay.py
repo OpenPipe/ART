@@ -341,6 +341,23 @@ def test_recomputed_layer_fact_validation_rejects_forged_input(change, layer, tm
         reports.replay(report)
 
 
+def test_named_slot_coverage_needs_its_gradient_coefficient(layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    group = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ][1]
+    assert group["adapter"] is not None and group["moe_covered"]
+    # A named slot without a checkpoint coefficient (an unsupported owner)
+    # keeps the per-boundary gradient live; coverage there would discount it.
+    group["gradient"] = [0, [], 0]
+    group["moe_covered"] = False
+    uncovered = reports.replay(report)["estimates"][0]["required_bytes"]
+    assert uncovered > 0
+    group["moe_covered"] = True
+    with pytest.raises(ValueError, match="invalid MoE recompute coverage"):
+        reports.replay(report)
+
+
 @pytest.mark.parametrize("value", [None, 1.5, -1])
 def test_replay_refuses_invalid_recorded_geometry(value, tmp_path):
     rank = head_rank()

@@ -509,6 +509,14 @@ def validate(facts: Any) -> None:
             integer(terms[2])
             if terms[2] > terms[0]:
                 raise ValueError("invalid MoE terms")
+        # A named slot (only gradient groups record its adapter) is covered
+        # live only with its own checkpoint coefficient.
+        if (
+            group["moe_covered"]
+            and group["adapter"] is not None
+            and not group["gradient"][0]
+        ):
+            raise ValueError("invalid MoE recompute coverage")
         layout = group["layout"]
         if layout is not None:
             fields(layout, {"attention_rows", "gdn_rows", "attention_retained"})
