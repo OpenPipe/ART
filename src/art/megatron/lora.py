@@ -1694,6 +1694,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         )
         alpha = beta.clone()
         adapter_output = torch.cat([qkv, z, beta, alpha], dim=-1)
+        del qkv, z, beta, alpha
         return linear_output + adapter_output, bias
 
 
