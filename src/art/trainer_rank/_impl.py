@@ -2877,22 +2877,13 @@ class TrainerRank:
         # lazy. Own the submitted tensor storage before returning an iterator.
         materialized = _snapshot(_materialize(inputs))
         constructor = getattr(self, "_forward_options", None)
-        from dataclasses import fields
 
         def capture(value: ForwardInputs) -> ForwardInputs:
             if isinstance(value, ForwardInput):
                 if constructor is None and options is None:
                     return replace(value)
                 resolved = resolve_forward_options(constructor, options, value.options)
-                return replace(
-                    value,
-                    options=ForwardOptions(
-                        **{
-                            field.name: getattr(resolved, field.name)
-                            for field in fields(resolved)
-                        }
-                    ),
-                )
+                return replace(value, options=ForwardOptions(**vars(resolved)))
             return _rebuild_forward_tree(value, [capture(child) for child in value])
 
         return capture(materialized)

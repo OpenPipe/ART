@@ -1295,8 +1295,6 @@ def logical_register_head(
     *,
     checkpoint: Any = ...,
 ) -> Any:
-    from ._options import resolve_forward_options
-
     if checkpoint is ...:
         from ._impl import Unset
 
@@ -1345,9 +1343,7 @@ def logical_register_head(
         if isinstance(value, torch.nn.Module)
         else value.to(view.device)
     )
-    maximum = resolve_forward_options(
-        getattr(view._rank, "_forward_options", None)
-    ).max_gradient_staleness
+    maximum = head_staleness(view._rank)
     head = LiveHead(
         state, value, view._executor.state.collector, max_gradient_staleness=maximum
     )
