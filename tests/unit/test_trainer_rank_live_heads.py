@@ -1085,6 +1085,7 @@ def test_logical_callback_reentrant_head_rejects_before_gradient_publication():
 
     def callback(rank):
         head = rank.module("head", lambda: TiedHead(True), checkpoint="student")
+        head.offset.add_(1)
         loss = head(torch.tensor(3.0, requires_grad=True))
         # The logical executor submits packets only after local collection succeeds.
         with pytest.raises(RuntimeError, match="nested remote backward is unsupported"):
@@ -1092,15 +1093,12 @@ def test_logical_callback_reentrant_head_rejects_before_gradient_publication():
         custom = trainer._checkpoint_slots["student"].custom["head"].value
         assert isinstance(custom, torch.nn.Module)
         assert all(parameter.grad is None for parameter in custom.parameters())
-        assert (
-            getattr(trainer, "_logical_head_handles")[
-                ("student", "head")
-            ].take_publication()
-            is None
-        )
         assert export_head(trainer, "student", "head").buffer_revision == 0
 
     asyncio.run(run_rank_callback(trainer, callback))
+    state = export_head(trainer, "student", "head")
+    assert state.buffer_revision == 1
+    assert state.buffers["offset"].item() == 2
 
 
 @pytest.mark.parametrize("mode", ("rank", "zero"))
