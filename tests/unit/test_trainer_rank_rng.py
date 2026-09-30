@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import nullcontext
-from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -11,7 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.checkpoint import checkpoint
-from trainer_rank_test_support import gloo_group, megatron_topology, spawn_and_join
+from trainer_rank_test_support import megatron_topology, process_group, spawn_and_join
 
 from art.trainer_rank import (
     AdamParams,
@@ -223,7 +222,7 @@ def test_failed_forward_keeps_command_collectives_aligned(tmp_path):
 
 def _failed_forward_worker(physical, rendezvous):
     with (
-        gloo_group(physical, rendezvous, timeout=10),
+        process_group(physical, rendezvous, timeout=10),
         megatron_topology(physical, dp_size=1, tp_size=2),
     ):
         for primary_type, sync_failure, preflight in (
@@ -416,14 +415,9 @@ def _distributed_worker(rank, dp_size, parallelism, backend, init_method):
     device = torch.device("cpu" if backend == "gloo" else f"cuda:{rank}")
     if device.type == "cuda":
         torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend,
-        init_method=init_method,
-        rank=rank,
-        world_size=2 * dp_size,
-        timeout=timedelta(seconds=90),
-    )
-    try:
+    with process_group(
+        rank, init_method, world_size=2 * dp_size, timeout=90, backend=backend
+    ):
         replica_groups = [dist.new_group([2 * dp, 2 * dp + 1]) for dp in range(dp_size)]
         dp_groups = [
             dist.new_group(list(range(replica, 2 * dp_size, 2))) for replica in range(2)
@@ -467,8 +461,6 @@ def _distributed_worker(rank, dp_size, parallelism, backend, init_method):
                 dp_group,
                 parallelism,
             )
-    finally:
-        dist.destroy_process_group()
 
 
 def _gradient_oracle(
