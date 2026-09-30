@@ -1171,7 +1171,7 @@ class TrajectoryGroup(_CompactModel):
 class TokenizedTopK(_StringInterningModel):
     """Parallel [token positions, k] arrays, matching TrainerRank's TopK layout.
 
-    Rows align with sampled tokens; TrainerRank forward rows predict the next
+    Rows align with scored tokens; TrainerRank forward rows predict the next
     token instead. Missing entries use token ID -1 and a NaN logprob.
     """
 
