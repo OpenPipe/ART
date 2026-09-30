@@ -1356,15 +1356,7 @@ def test_forward_snapshot_is_independent_and_forward_only(
     )
     trainer._checkpoint_slots["student"] = _CheckpointSlot(
         tuple(lora.lora_slot_params(source)),
-        cast(
-            Any,
-            {
-                "base_model_name_or_path": "test/model",
-                "r": 2,
-                "lora_alpha": 2,
-                "target_modules": ["q_proj"],
-            },
-        ),
+        _adapter_config(rank=2, alpha=2, target_modules=("q_proj",)),
     )
 
     assert trainer.snapshot_checkpoint("student", "saved")

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from datetime import timedelta
-from types import SimpleNamespace
 
 import pytest
 from test_trainer_rank_custom_tensors import _trainer, _use_local_gradients
@@ -25,7 +24,6 @@ from art.trainer_rank._heads import (
     execute_head_operation,
     export_head,
     head_gradient_targets,
-    logical_register_head,
 )
 from art.trainer_rank._options import ForwardOptions
 from art.trainer_rank._tensors import CotangentCollector, detach_tree
@@ -1084,38 +1082,15 @@ def test_inplace_operation_snapshots_readonly_client_tensor(kind):
 
 def test_logical_callback_reentrant_head_rejects_before_gradient_publication():
     trainer, _ = _trainer("student")
-    collector = CotangentCollector()
-
-    def invoke(operation, kind, payload):
-        assert operation == "head"
-        return execute_head_operation(trainer, kind, payload)
-
-    view = SimpleNamespace(
-        _rank=trainer,
-        _invoke=invoke,
-        _executor=SimpleNamespace(
-            state=SimpleNamespace(collector=collector), invoke=invoke
-        ),
-        device=torch.device("cpu"),
-    )
 
     def callback(rank):
-        head = logical_register_head(
-            rank, "module", "head", lambda: TiedHead(True), checkpoint="student"
-        )
+        head = rank.module("head", lambda: TiedHead(True), checkpoint="student")
         loss = head(torch.tensor(3.0, requires_grad=True))
         # The logical executor submits packets only after local collection succeeds.
-        packets = collector.backward(loss)
-        trainer._commit_versioned_gradients(
-            [
-                target
-                for packet in packets
-                for target in head_gradient_targets(trainer, packet)
-            ]
-        )
+        rank.backward(loss)
 
     with pytest.raises(RuntimeError, match="nested remote backward is unsupported"):
-        callback(view)
+        asyncio.run(run_rank_callback(trainer, callback))
     custom = trainer._checkpoint_slots["student"].custom["head"].value
     assert isinstance(custom, torch.nn.Module)
     assert all(parameter.grad is None for parameter in custom.parameters())
@@ -1213,20 +1188,39 @@ def test_live_buffer_view_mutation_rejects_without_silent_write(
 
 
 @pytest.mark.parametrize("client", (False, True))
-def test_functional_batchnorm_no_grad_publishes_buffer_changes(client):
-    trainer, native = _native_head("buffer", "mean", lambda: torch.zeros(2))
-    live = _live_head(trainer, "mean", torch.zeros(2)) if client else None
+@pytest.mark.parametrize("device", ("cpu", "cuda"))
+def test_functional_batchnorm_no_grad_publishes_buffer_changes(client, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    trainer, rank = _trainer("student")
+    if device == "cuda":
+        trainer.device = torch.device("cuda", 0)
+    native = rank.buffer("mean", lambda: torch.zeros(2), checkpoint="student")
+    live = (
+        _live_head(trainer, "mean", torch.zeros(2, device=device)) if client else None
+    )
     mean = native if live is None else _tensor(live)
     before = export_head(trainer, "student", "mean").buffer_revision
+    assert before == 0
+    if device == "cuda":
+        with pytest.raises(
+            RuntimeError, match="Views of live checkpoint buffers are read-only"
+        ):
+            mean[:].fill_(7)
     with torch.no_grad():
         torch.nn.functional.batch_norm(
-            torch.ones(4, 2), mean, torch.ones(2), training=True
+            torch.ones(4, 2, device=device),
+            mean,
+            torch.ones(2, device=device),
+            training=True,
         )
-    torch.testing.assert_close(mean, torch.full((2,), 0.1))
+    expected = torch.full((2,), 0.1, device=device)
+    torch.testing.assert_close(mean, expected)
     if live is not None:
         update = live.take_publication()
         assert update is not None
         execute_head_operation(trainer, "head_publish", (update,))
+    torch.testing.assert_close(native, expected)
     assert export_head(trainer, "student", "mean").buffer_revision == before + 1
 
 
@@ -1357,35 +1351,6 @@ def test_stateful_function_on_buffer_snapshot_view_rejects(client):
     torch.testing.assert_close(mean, torch.zeros(2))
     if live is not None:
         assert live.take_publication() is None
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("client", (False, True))
-def test_cuda_live_buffer_views_and_functional_publication(client):
-    trainer, rank = _trainer("student")
-    trainer.device = torch.device("cuda", 0)
-    native = rank.buffer("mean", lambda: torch.zeros(2), checkpoint="student")
-    live = (
-        _live_head(trainer, "mean", torch.zeros(2, device="cuda")) if client else None
-    )
-    mean = native if live is None else _tensor(live)
-    with pytest.raises(
-        RuntimeError, match="Views of live checkpoint buffers are read-only"
-    ):
-        mean[:].fill_(7)
-    with torch.no_grad():
-        torch.nn.functional.batch_norm(
-            torch.ones(4, 2, device="cuda"),
-            mean,
-            torch.ones(2, device="cuda"),
-            training=True,
-        )
-    if live is not None:
-        update = live.take_publication()
-        assert update is not None
-        execute_head_operation(trainer, "head_publish", (update,))
-    torch.testing.assert_close(native, torch.full((2,), 0.1, device="cuda"))
-    assert export_head(trainer, "student", "mean").buffer_revision == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
