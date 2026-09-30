@@ -47,10 +47,12 @@ def test_terminal_state_releases_only_its_owners():
     state.finish()
     (exchange,) = trajectory.exchanges.chat_completions
     assert exchange.request == request
-    assert exchange.response.choices[0].logprobs.content[0].logprob == -0.2
-    assert exchange.response.choices[0].model_extra["token_ids"] == [7]
+    choice = exchange.response.choices[0]
+    assert choice.logprobs is not None and choice.logprobs.content is not None
+    assert choice.logprobs.content[0].logprob == -0.2
+    assert choice.model_extra is not None and choice.model_extra["token_ids"] == [7]
     # Rebinding the private owner must not clear an aliased original request.
-    assert request["messages"][0]["content"] == "fixture"
+    assert request["messages"] == [{"role": "user", "content": "fixture"}]
     state.add(b"ignored after terminal capture")
     state.finish()
     assert len(trajectory.exchanges.chat_completions) == 1
@@ -183,5 +185,5 @@ async def test_stream_terminal_cleanup_preserves_delivery_and_failures(failure):
         del trajectory
         # Failure tracebacks are preserved, so clear only the test-owned sentinel.
         sentinel.__traceback__ = None
-        assert response._art_trajectory_capture.trajectory is None
+        assert getattr(response, "_art_trajectory_capture").trajectory is None
         assert ref() is None
