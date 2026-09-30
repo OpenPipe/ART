@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import replace
 from enum import Enum
 import sys
@@ -77,13 +78,16 @@ def test_forward_routes_align_with_inputs_without_shift_and_group_separately():
 def test_cached_forward_and_replay_preserve_owned_routes(monkeypatch, retention):
     from trainer_rank_test_support import checkpoint_runtime
 
-    from art.megatron.context_parallel.types import ParallelTopology
-
     model = torch.nn.Linear(1, 1, bias=False)
     rank = TrainerRank(checkpoint_runtime(model))
     binding, seen = router(), []
     rank._routing_bindings = [(binding, 0)]
-    monkeypatch.setattr(rank, "_topology", lambda: ParallelTopology())
+    monkeypatch.setattr(rank, "_resolve_slot_ref", lambda *_a, **_kw: None)
+    lora = SimpleNamespace(use_lora_slot=lambda _slot, **_kwargs: nullcontext())
+    monkeypatch.setitem(sys.modules, "art.megatron.lora", lora)
+    monkeypatch.setattr(
+        rank, "_topology", lambda: SimpleNamespace(dp=1, tp=1, cp=1, pp=1)
+    )
     monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_configure_hybridep", lambda *a, **kw: None)
     monkeypatch.setattr(
