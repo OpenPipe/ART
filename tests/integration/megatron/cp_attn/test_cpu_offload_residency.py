@@ -1,11 +1,9 @@
 """Actual CP2 graph residency and constrained complete-root placement."""
 
 from dataclasses import asdict, replace
-from datetime import timedelta
 import gc
 import json
 import os
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -15,14 +13,12 @@ import torch.multiprocessing as mp
 pytest.importorskip("megatron.core")
 
 from art.megatron.context_parallel import executor  # noqa: E402
-from art.megatron.flex_attn import compiled  # noqa: E402
-from art.megatron.runtime.compile_cache import configure_reusable_backward  # noqa: E402
 from art.trainer_rank._graphs import GraphCache  # noqa: E402
 from art.trainer_rank._memory_policy import (  # noqa: E402
     ForwardMemoryCost,
     placement_cost,
 )
-from tests.support.cp_attention import prepare_cp2_attention  # noqa: E402
+from tests.support.cp_attention import cp2_runtime, prepare_cp2_attention  # noqa: E402
 
 
 @pytest.mark.skipif(
@@ -37,29 +33,9 @@ def test_cp_cpu_residency_constrains_complete_root(tmp_path):
 
 def _worker(rank, rendezvous):
     torch.set_num_threads(2)
-    torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    configure_reusable_backward()
-    dist.init_process_group(
-        "nccl",
-        init_method=rendezvous,
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=120),
-        device_id=device,
-    )
-    try:
-        with (
-            patch.object(compiled, "_FORCED_FLEX_BACKEND", "TRITON"),
-            patch.object(
-                compiled,
-                "sparse_compiled_flex_attention",
-                compiled.triton_sparse_compiled_flex_attention,
-            ),
-        ):
-            _check(rank, device)
-    finally:
-        dist.destroy_process_group()
+    with cp2_runtime(rank, rendezvous, device, backend="TRITON", timeout=120):
+        _check(rank, device)
 
 
 def _check(rank, device):

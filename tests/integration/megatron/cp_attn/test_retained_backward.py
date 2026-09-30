@@ -1,6 +1,5 @@
 """Actual CP collectives and compiled attention against a dense manual oracle."""
 
-from datetime import timedelta
 import os
 from pathlib import Path
 from unittest.mock import patch
@@ -8,16 +7,13 @@ import weakref
 
 import pytest
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 pytest.importorskip("megatron.core")
 
 from art.megatron.context_parallel import executor  # noqa: E402
-from art.megatron.flex_attn import compiled  # noqa: E402
-from art.megatron.runtime.compile_cache import configure_reusable_backward  # noqa: E402
 from art.trainer_rank._graphs import GraphCache  # noqa: E402
-from tests.support.cp_attention import prepare_cp2_attention  # noqa: E402
+from tests.support.cp_attention import cp2_runtime, prepare_cp2_attention  # noqa: E402
 
 
 def test_cp_retained_failure_releases_original_records(monkeypatch):
@@ -74,31 +70,8 @@ def test_cp_retained_backward_matches_dense_attention(
 def _worker(rank: int, init_method: str, backend: str, dim: int) -> None:
     # Exercise group ranks independently from CUDA device numbering.
     device = torch.device("cuda", 1 - rank)
-    torch.cuda.set_device(device)
-    configure_reusable_backward()
-    dist.init_process_group(
-        "nccl",
-        init_method=init_method,
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=90),
-        device_id=device,
-    )
-    try:
-        if backend == "TRITON":
-            with (
-                patch.object(compiled, "_FORCED_FLEX_BACKEND", "TRITON"),
-                patch.object(
-                    compiled,
-                    "sparse_compiled_flex_attention",
-                    compiled.triton_sparse_compiled_flex_attention,
-                ),
-            ):
-                _check_repeated_backward(rank, device, backend, dim)
-        else:
-            _check_repeated_backward(rank, device, backend, dim)
-    finally:
-        dist.destroy_process_group()
+    with cp2_runtime(rank, init_method, device, backend=backend, timeout=90):
+        _check_repeated_backward(rank, device, backend, dim)
 
 
 def _check_repeated_backward(
