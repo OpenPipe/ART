@@ -93,7 +93,7 @@ def test_recovery_keeps_profile_demand_above_cold_head_floor(monkeypatch):
     )
 
 
-def test_real_head_split_fits_before_cache_recovery(monkeypatch):
+def test_real_head_split_survives_denied_cache_upgrade(monkeypatch):
     from test_trainer_rank_split import _recording_executor
 
     from art.trainer_rank import TrainerRank, _impl
@@ -124,8 +124,9 @@ def test_real_head_split_fits_before_cache_recovery(monkeypatch):
     monkeypatch.setattr(
         r, "_available_memory_bytes", lambda: TrainerRank._available_memory_bytes(probe)
     )
+    probes = []
     monkeypatch.setattr(
-        r, "_try_cache_recovery", lambda *a, **kw: pytest.fail("Split already fits")
+        r, "_try_cache_recovery", lambda check, **kw: probes.append(check) or False
     )
     executed = _recording_executor(monkeypatch, r)
     batches = list(r.forward_micro_batches([requests]))
@@ -136,6 +137,7 @@ def test_real_head_split_fits_before_cache_recovery(monkeypatch):
         for group in batches[0].outputs
     ] == [[7, 107, 207, 307]]
     assert r.last_forward_telemetry()["subforward_request_indices"] == ((0, 1), (2, 3))
+    assert len(probes) == 1 and probes[0].estimated_required_bytes > budget
     assert not torch.cuda.is_initialized()
 
 

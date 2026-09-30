@@ -933,6 +933,8 @@ def _search_next_micro_batch(
                     else 1
                     if isinstance(found, _impl._ForwardRefusal)
                     else 2
+                    if found[0].subforward_count > 1
+                    else 3
                 )
             except BaseException:
                 if admission_error is not None:
@@ -961,6 +963,9 @@ def _search_next_micro_batch(
                 stats_global_count=min_width,
                 rejected_candidates=len(rejected_widths),
                 cold_start=True,
+                # The existing WORLD vote makes this uniform even on peers
+                # with a flat or empty share. Retain demand, not a second plan.
+                recovery_probe=first.check if outcome == 2 else None,
             )
         if first.cold_start:
             return first
@@ -1828,7 +1833,7 @@ def discard_planner_observation(self: TrainerRank) -> None:
 
 
 def _admission_outcome(self: TrainerRank, local: int) -> int:
-    """Existing world fallback MIN: error=0, refusal=1, fit=2."""
+    """Existing world fallback MIN: error=0, refusal=1, split=2, flat=3."""
     if not (_impl.dist.is_available() and _impl.dist.is_initialized()):
         return local
     value = _impl.torch.tensor(
@@ -1968,7 +1973,7 @@ def _recover_admission_impl(
     sync_across_dp: bool,
     admit_refusal: Callable[[_ForwardRefusal], Any] | None = None,
 ) -> Any:
-    """Pure search, at most one smaller-plan refresh, then one recovery."""
+    """Pure search, one budgeted recovery, and freshly checked fallback."""
     original: TrainerRankMemoryError | None = None
     refused: _ForwardRefusal | None = None
     best: _ForwardRefusal | None = None
@@ -2067,12 +2072,18 @@ def _recover_admission_impl(
 
     value = search()
     result = finish(value)
-    if result is not None:
+    probe = (
+        result.recovery_probe
+        if isinstance(result, _impl._CandidateMicroBatch)
+        else None
+    )
+    if result is not None and probe is None:
         return result
-    assert refused is not None
-    original = refused.error(context)
+    incumbent = result
+    if refused is not None:
+        original = refused.error(context)
     with self._cache_recovery_episode() as (owner, started):
-        if not isinstance(value, _impl._ForwardRefusal):
+        if incumbent is None and not isinstance(value, _impl._ForwardRefusal):
             # A formerly fitting width is not proof that the minimum cannot fit.
             value = search()
             result = finish(value)
@@ -2083,15 +2094,23 @@ def _recover_admission_impl(
                 assert refused is not None
                 self._snapshot_planning_telemetry(refused.plan, refused.check)
                 return reject()
-        assert refused is not None
+        if probe is None:
+            assert refused is not None
+            probe = refused.check
         if self._try_cache_recovery(
-            refused.check,
+            probe,
             sync_across_dp=sync_across_dp,
             owner=owner,
             started=started,
         ):
             value = search()
             result = finish(value)
+            if result is not None:
+                return result
+        if incumbent is not None:
+            # Denial or ineffective release is harmless only while the saved
+            # split still fits fresh WORLD counters. Never attempt release twice.
+            result = finish(incumbent)
             if result is not None:
                 return result
         assert refused is not None
