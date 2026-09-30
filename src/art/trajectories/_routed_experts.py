@@ -246,11 +246,12 @@ def history_logprob_flags(
 
 def history_prompt_scores(
     history: Any, tokens: list[int], logprobs: list[float], flags: list[TokenFlag]
-) -> None:
+) -> list[int | None]:
     from ..preprocessing.dynamo_tokens import compact_prompt_logprobs
     from . import TokenFlag
 
-    for choice, response in history_choices(history):
+    owners: list[int | None] = [None] * len(tokens)
+    for source_index, (choice, response) in enumerate(history_choices(history)):
         extra = {
             **(getattr(response, "model_extra", None) or {}),
             **(choice.model_extra or {}),
@@ -280,9 +281,16 @@ def history_prompt_scores(
             ):
                 logprobs[i] = value
                 flags[i] |= flag
+                owners[i] = source_index
+    return owners
 
 
-def history_top_k(history: Any, tokens: list[int], flags: list[TokenFlag]) -> Any:
+def history_top_k(
+    history: Any,
+    tokens: list[int],
+    flags: list[TokenFlag],
+    prompt_owners: list[int | None],
+) -> Any:
     from . import TokenFlag, TokenizedTopK
 
     captured = []
@@ -291,8 +299,10 @@ def history_top_k(history: Any, tokens: list[int], flags: list[TokenFlag]) -> An
         {**(getattr(response, "model_extra", None) or {}), **(choice.model_extra or {})}
         for choice, response in history_choices(history)
     ]
-    for extra, is_prompt in [
-        (extra, prompt) for prompt in (False, True) for extra in sources
+    for source_index, extra, is_prompt in [
+        (index, extra, prompt)
+        for prompt in (False, True)
+        for index, extra in enumerate(sources)
     ]:
         field = "compact_prompt_top_logprobs" if is_prompt else "compact_top_logprobs"
         top = extra.get(field)
@@ -342,20 +352,29 @@ def history_top_k(history: Any, tokens: list[int], flags: list[TokenFlag]) -> An
                 raise ValueError("compact_top_logprobs requires finite logprobs")
             width = max(width, len(row_ids))
         captured.append(
-            ([] if is_prompt else prompt, completion, ids, values, is_prompt)
+            (
+                [] if is_prompt else prompt,
+                completion,
+                ids,
+                values,
+                is_prompt,
+                source_index,
+            )
         )
     if not captured or not width:
         return None
     ids = [[-1] * width for _ in tokens]
     values = [[math.nan] * width for _ in tokens]
-    for prompt, completion, row_ids, row_values, is_prompt in captured:
+    for prompt, completion, row_ids, row_values, is_prompt, source_index in captured:
         if tokens[: len(prompt)] != prompt:
             continue
         for j, (actual, token) in enumerate(zip(tokens[len(prompt) :], completion)):
             if actual != token:
                 break
             index = len(prompt) + j
-            if is_prompt and flags[index] & TokenFlag.SAMPLED:
+            if is_prompt and (
+                flags[index] & TokenFlag.SAMPLED or prompt_owners[index] != source_index
+            ):
                 continue
             if all(token_id == -1 for token_id in ids[index]):
                 ids[index][: len(row_ids[j])] = row_ids[j]

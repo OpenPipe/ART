@@ -8190,10 +8190,12 @@ def tokenize_history(
     )
 
     tokenized.routed_experts = history_routes(history, tokenized.tokens)
-    tokenized.top_k = history_top_k(history, tokenized.tokens, tokenized.flags)
     history_logprob_flags(history, tokenized.tokens, tokenized.flags)
-    history_prompt_scores(
+    prompt_owners = history_prompt_scores(
         history, tokenized.tokens, tokenized.logprobs, tokenized.flags
+    )
+    tokenized.top_k = history_top_k(
+        history, tokenized.tokens, tokenized.flags, prompt_owners
     )
     return tokenized
 

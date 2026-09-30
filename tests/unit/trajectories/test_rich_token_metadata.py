@@ -99,7 +99,7 @@ def test_prompt_rescoring_never_replaces_sampled_probabilities():
         assert scores[1] == behavior_score or math.isnan(scores[1])
         assert flags[1] & tr.TokenFlag.RAW_LOGPROBS
         assert not flags[1] & tr.TokenFlag.PROCESSED_LOGPROBS
-    top = history_top_k(history, [10, 11], flags)
+    top = history_top_k(history, [10, 11], flags, [None, None])
     assert top.tokens == [[-1], [-1]]
 
 
@@ -183,6 +183,31 @@ def test_other_protocols_preserve_the_same_compact_metadata(protocol):
     assert tokenized.top_k is not None
     assert tokenized.top_k.tokens == [[-1], [-1], [20]]
     assert tokenized.flags[-1] & tr.TokenFlag.PROCESSED_LOGPROBS
+
+
+def test_prompt_topk_cannot_mix_distributions_from_different_requests():
+    from art.trajectories._routed_experts import history_prompt_scores, history_top_k
+
+    choices = []
+    for score in (-0.5, -1.0):
+        choice = _response().choices[0]
+        choice.model_extra.update(
+            prompt_token_ids=[10, 11],
+            compact_prompt_logprobs=[None, score],
+            logprobs_mode="processed_logprobs",
+        )
+        choices.append(choice)
+    choices[1].model_extra["compact_prompt_top_logprobs"] = {
+        "token_ids": [[], [11]],
+        "logprobs": [[], [-1.0]],
+    }
+    history = tr.LegacyHistory(messages_and_choices=choices)
+    flags = [tr.TokenFlag.EXACT] * 2
+    scores = [math.nan] * 2
+    owners = history_prompt_scores(history, [10, 11], scores, flags)
+    assert scores[1] == -0.5
+    top = history_top_k(history, [10, 11], flags, owners)
+    assert top.tokens == [[-1], [-1]]
 
 
 def test_compact_logprobs_and_routes_survive_tokenize_tensorize_and_serialization():
