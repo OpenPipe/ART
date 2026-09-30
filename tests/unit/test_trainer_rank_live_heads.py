@@ -1098,6 +1098,7 @@ def test_logical_callback_reentrant_head_rejects_before_gradient_publication():
             ].take_publication()
             is None
         )
+        assert export_head(trainer, "student", "head").buffer_revision == 0
 
     asyncio.run(run_rank_callback(trainer, callback))
 
