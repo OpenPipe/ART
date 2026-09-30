@@ -63,7 +63,7 @@ def _terminal_sse_event(endpoint: Endpoint, block: bytes) -> bool:
 
 @dataclass
 class CaptureState:
-    trajectory: Trajectory
+    trajectory: Trajectory | None
     endpoint: Endpoint
     request: dict[str, Any]
     start_time: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -98,26 +98,33 @@ class CaptureState:
 
     def discard(self) -> None:
         self.body.clear()
+        self.request = {}
+        self.trajectory = None
         self.captured = True
 
     def finish(self) -> None:
         if self.captured:
             return
         self.captured = True
-        if self.status_code is None or not 200 <= self.status_code < 300:
-            return
         try:
-            exchange = build_exchange(
-                self.endpoint,
-                self.request,
-                bytes(self.body),
-                start_time=self.start_time,
-                end_time=datetime.now(UTC),
-            )
-        except Exception as exc:
-            logger.debug("Ignoring incomplete trajectory exchange: %s", exc)
-            return
-        _append_exchange(self.trajectory, exchange)
+            if self.status_code is None or not 200 <= self.status_code < 300:
+                return
+            try:
+                exchange = build_exchange(
+                    self.endpoint,
+                    self.request,
+                    bytes(self.body),
+                    start_time=self.start_time,
+                    end_time=datetime.now(UTC),
+                )
+            except Exception as exc:
+                logger.debug("Ignoring incomplete trajectory exchange: %s", exc)
+                return
+            assert self.trajectory is not None
+            _append_exchange(self.trajectory, exchange)
+        finally:
+            # Responses may outlive capture in transport cycles or user code.
+            self.discard()
 
 
 def _append_exchange(trajectory: Trajectory, exchange: Exchange) -> None:
