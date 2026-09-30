@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -122,11 +122,7 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
 def test_trainer_rank_custom_objects_train_and_become_stale_on_cuda() -> None:
-    with _single_rank_model_parallel():
-        device = torch.device("cuda")
-        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
-        trainer = _trainer_for(lora, device)
-        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=1))
+    with _lora_checkpoint() as (device, _lora, trainer):
         head = trainer.module(
             "value_head", lambda: _CudaValueHead(4).to(device), checkpoint="A"
         )
@@ -638,8 +634,10 @@ class _IdentityModelSupportHandler:
 
 
 @contextmanager
-def _lora_checkpoint(seed=1, *, rng_seed=None):
-    """Construct the shared single-rank dense checkpoint used by version tests."""
+def _lora_checkpoint(
+    seed: int = 1, *, rng_seed: int | None = None
+) -> Iterator[tuple[torch.device, LoRA, TrainerRank]]:
+    """Construct a dense LoRA checkpoint in a fresh single-rank context."""
     with _single_rank_model_parallel():
         if rng_seed is not None:
             torch.manual_seed(rng_seed)
