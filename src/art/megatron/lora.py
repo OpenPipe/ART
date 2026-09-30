@@ -46,6 +46,7 @@ from .lora_config import (
     MEGATRON_LORA_TARGET_MODULES_ENV,
     default_lora_rank_for_handler,
 )
+from .routed_experts import capture_routes
 
 _LAYER_BLOCK_RE = re.compile(r"^(?P<block>.*\.layers\.\d+)\.")
 
@@ -159,6 +160,7 @@ def _collect_compile_garbage() -> None:
 def _with_captured_lora_slot(function: _F) -> _F:
     context = _CURRENT_LORA_SLOT.get()
     version = _CURRENT_LORA_VERSION.get()
+    function = capture_routes(function)
 
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -1721,6 +1723,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         )
         alpha = beta.clone()
         adapter_output = torch.cat([qkv, z, beta, alpha], dim=-1)
+        del qkv, z, beta, alpha
         return linear_output + adapter_output, bias
 
 

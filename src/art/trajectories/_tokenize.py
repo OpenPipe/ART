@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from ..preprocessing.dynamo_tokens import (
     COMPLETION_LOGPROBS_KEY,
     choice_completion_logprobs,
+    has_completion_logprobs,
 )
 from ..utils.chat_template import (
     chat_template_with_preserved_thinking,
@@ -1016,7 +1017,7 @@ def _sampled_evidence_fingerprint(
             "logprobs": _chat_logprob_fingerprint_evidence(choice),
             **(
                 {COMPLETION_LOGPROBS_KEY: choice_completion_logprobs(choice)}
-                if COMPLETION_LOGPROBS_KEY in choice_extra
+                if has_completion_logprobs(choice)
                 else {}
             ),
             "finish_reason": choice.finish_reason,
@@ -1043,6 +1044,8 @@ def _sampled_evidence_fingerprint(
             },
             "finish_reason": choice.finish_reason,
         }
+        if has_completion_logprobs(choice):
+            evidence[COMPLETION_LOGPROBS_KEY] = choice_completion_logprobs(choice)
     elif protocol == "responses":
         if not isinstance(exchange, ResponsesExchange):
             raise TypeError("Responses source has the wrong exchange type")
@@ -1073,6 +1076,20 @@ def _sampled_evidence_fingerprint(
             "logprobs": response_extra.get("logprobs"),
             "stop_reason": exchange.response.stop_reason,
         }
+    if protocol in {"chat_completions", "completions"}:
+        from ._routed_experts import choice_routes
+
+        assert isinstance(evidence, dict)
+        routing = choice_routes(choice, exchange.response)
+        if routing is not None:
+            evidence["routed_experts"] = routing
+        if "compact_top_logprobs" in choice_extra:
+            evidence["compact_top_logprobs"] = choice_extra["compact_top_logprobs"]
+        mode = choice_extra.get(
+            "logprobs_mode", (exchange.response.model_extra or {}).get("logprobs_mode")
+        )
+        if mode is not None:
+            evidence["logprobs_mode"] = mode
     return _fingerprint(evidence)
 
 
@@ -1301,7 +1318,7 @@ def _chat_choice_output_tokens(
         field="Chat Completions token_ids",
     )
     exact_logprobs = choice_completion_logprobs(choice)
-    if COMPLETION_LOGPROBS_KEY in (choice.model_extra or {}):
+    if has_completion_logprobs(choice):
         return token_ids, exact_logprobs if exact_logprobs is not None else [
             math.nan
         ] * len(token_ids or [])
@@ -1381,6 +1398,14 @@ def _completion_evidence(
     token_ids = _exact_token_ids(
         choice_data.get("token_ids"), field="Completions token_ids"
     )
+    if has_completion_logprobs(choice):
+        values = choice_completion_logprobs(choice)
+        return (
+            prompt_ids,
+            token_ids,
+            [],
+            values if values is not None else [math.nan] * len(token_ids or []),
+        )
     logprobs = _dump(choice.logprobs)
     tokens = logprobs.get("tokens") or []
     if token_ids == [] and (choice.text or tokens):
@@ -8045,6 +8070,11 @@ def tokenize_history(
     ):
         raise TypeError(f"Unsupported history type: {type(history).__name__}")
     tokenized.history = history
+    from ._routed_experts import history_logprob_flags, history_routes, history_top_k
+
+    tokenized.routed_experts = history_routes(history, tokenized.tokens)
+    tokenized.top_k = history_top_k(history, tokenized.tokens)
+    history_logprob_flags(history, tokenized.tokens, tokenized.flags)
     return tokenized
 
 
@@ -8057,6 +8087,8 @@ def _materialize_trajectory(
         tokens=tokenized.tokens,
         logprobs=tokenized.logprobs,
         flags=tokenized.flags,
+        routed_experts=tokenized.routed_experts,
+        top_k=tokenized.top_k,
         trajectory=trajectory,
     )
 

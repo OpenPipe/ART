@@ -2,6 +2,7 @@
 
 import gc
 from importlib.util import find_spec
+import threading
 import traceback
 from typing import Any, cast
 
@@ -137,15 +138,30 @@ def test_moment_capture(captured_state, monkeypatch, present, allocation_guard):
     if allocation_guard:
         monkeypatch.setattr(torch, "zeros_like", owned_cpu_zero)
         monkeypatch.setattr(torch.Tensor, "contiguous", pack_owned)
-    shards, config, records = cp._local_state(trainer, "a", payloads)
+    captured, config, records = cp._local_state(trainer, "a", payloads)
+    # Expansion must not consult live model, optimizer, or expert-layout state.
+    with torch.no_grad():
+        for value in (*params, *masters):
+            value.add_(100)
+        for state in optimizer.state.values():
+            for value in state.values():
+                value.add_(100)
+    for model in trainer.runtime.model:
+        if hasattr(model, "expert_ids"):
+            if model.is_expert:
+                model.bind_expert_layout((99, 98, 97), ())
+            model.adapter_model_prefix = "changed"
+    shards = cp._expand_local_state(captured, payloads)
     if allocation_guard:
-        assert len(zeros) == len(entries) * (2 - len(present))
-        captured_masters = {
-            id(value)
+        assert len(zeros) == len(params) * (2 - len(present))
+        captured_storage = {
+            value.untyped_storage().data_ptr()
             for key, value in payloads[optimizer_file].items()
             if key.startswith("master/")
         }
-        assert all(id(value) in captured_masters for value in zeros)
+        assert all(
+            value.untyped_storage().data_ptr() in captured_storage for value in zeros
+        )
     assert bool(records) is is_custom
     assert len(shards) == (0 if is_custom else len(entries))
     assert config == cp._optimizer_config(trainer._checkpoint_slots["a"].optimizer)
@@ -243,3 +259,136 @@ def test_failed_capture_releases_partial_copies(captured_state, tmp_path, monkey
             gc.enable()
         for pending in list(trainer._prepared_checkpoint_saves):
             trainer.abort_checkpoint_save(pending)
+
+
+def test_capture_copies_physical_parameters_once(captured_state, monkeypatch):
+    trainer, params, masters, optimizer, *_ = captured_state
+    for master in masters:
+        optimizer.state[master] = {
+            "step": torch.tensor(7.0),
+            "exp_avg": torch.ones_like(master),
+            "exp_avg_sq": torch.ones_like(master),
+        }
+    copies = []
+    original = torch.Tensor.to
+
+    def copy(value, *args, **kwargs):
+        if kwargs.get("copy"):
+            copies.append(value.numel())
+        return original(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", copy)
+    cp._local_state(trainer, "a", {})
+    assert len(copies) == 4 * len(params)
+    assert sum(copies) == 4 * sum(param.numel() for param in params)
+
+
+def test_adapter_only_capture_freezes_shard_metadata(captured_state, monkeypatch):
+    trainer, params, *_ = captured_state
+    if trainer._checkpoint_slots["a"].custom:
+        pytest.skip("custom state has no LoRA shard metadata")
+    from art.megatron import lora as lm
+    from art.megatron.weights.lora_publish import collect_local_lora_entries
+
+    monkeypatch.setattr(lm, "_get_shard_world_size", lambda _: 2)
+    monkeypatch.setattr(lm, "_get_shard_rank", lambda _: 0)
+    for index, param in enumerate(params):
+        param.lora_tp_sharded = True
+        param.lora_tp_shard_dim = param.ndim - 2 + index % 2
+        param.lora_tp_shard_strategy = "components"
+        param.lora_tp_component_sizes = [2, 2]
+    expected, metadata = collect_local_lora_entries(
+        trainer.runtime.model, {}, owner_rank=0
+    )
+    trainer._checkpoint_slots["a"].optimizer = None
+    files = {}
+    captured, optimizer, custom = cp._local_state(trainer, "a", files)
+    assert optimizer is None and not custom
+    for param in params:
+        param.lora_tp_component_sizes.append(99)
+        param.lora_tp_sharded = False
+    shards = cp._expand_local_state(captured, files)
+    assert [shard.metadata for shard in shards] == metadata
+    assert len(files) == 1
+    payload = next(iter(files.values()))
+    assert set(payload) == {f"lora/{key}" for key in expected}
+    for key, value in expected.items():
+        torch.testing.assert_close(payload[f"lora/{key}"], value, rtol=0, atol=0)
+
+
+def test_expert_expansion_releases_capture_and_preserves_snapshot(
+    captured_state, tmp_path, monkeypatch
+):
+    trainer, params, masters, optimizer, *_ = captured_state
+    if trainer._checkpoint_slots["a"].custom:
+        pytest.skip("custom state does not expand expert keys")
+    from art.megatron.weights.lora_publish import collect_local_lora_entries
+
+    tensors, metadata = collect_local_lora_entries(
+        trainer.runtime.model, {}, owner_rank=0
+    )
+    expected = {key: value.clone() for key, value in tensors.items()}
+    config = {
+        "base_model_name_or_path": "test/model",
+        "r": 2,
+        "lora_alpha": 2,
+        "target_modules": ["q_proj"],
+    }
+    trainer._checkpoint_slots["a"].config = config
+    monkeypatch.setattr(cp, "_validate_save_state", lambda *_: config)
+    entered, release = threading.Event(), threading.Event()
+    expand = cp._expand_local_state
+
+    def blocked(captured, files):
+        assert threading.current_thread().name == "checkpoint-snapshot"
+        entered.set()
+        assert release.wait(5), "capture did not release expert expansion"
+        return expand(captured, files)
+
+    monkeypatch.setattr(cp, "_expand_local_state", blocked)
+    output = str(tmp_path / "checkpoint")
+    try:
+        trainer.prepare_checkpoint_save(output, "a")
+        assert entered.wait(5)
+        prepared = trainer._prepared_checkpoint_saves[output]
+        assert prepared.writer is not None and not prepared.writer.done()
+        # Deferred expansion still reserves its packing/serialization workspace.
+        spill = trainer._checkpoint_snapshot_spill
+        assert spill is not None
+        with spill.lock:
+            workspace = spill.workspace[prepared.writer]
+        exported_bytes = sum(
+            value.numel() * value.element_size() for value in expected.values()
+        )
+        assert workspace >= 2 * exported_bytes
+        with torch.no_grad():
+            for value in (*params, *masters):
+                value.add_(100)
+        for model in trainer.runtime.model:
+            if model.is_expert:
+                model.bind_expert_layout((90, 91, 92), ())
+            model.adapter_model_prefix = "changed"
+        config["r"] = 99
+        assert prepared.config["r"] == 2
+    finally:
+        release.set()
+
+    original_finish = cp._finish
+
+    def finish(_trainer, owned):
+        assert [shard.metadata for shard in owned.shards] == metadata
+        saved = safetensors.torch.load_file(owned.snapshot / owned.shards[0].file)
+        for key, value in expected.items():
+            torch.testing.assert_close(saved[f"lora/{key}"], value, rtol=0, atol=0)
+        original_finish(_trainer, owned)
+
+    monkeypatch.setattr(cp, "_finish", finish)
+    trainer.finish_checkpoint_save(output)
+    assert not spill.workspace
+    assert not trainer._prepared_checkpoint_saves
+    assert not prepared.snapshot.exists()
+    artifact = cp.prepare_checkpoint(output)
+    assert artifact.config["r"] == 2
+    assert artifact.manifest is not None
+    assert set(artifact.manifest["parameters"]) == set(expected)
+    assert artifact.manifest["steps"] == dict.fromkeys(expected, 0.0)

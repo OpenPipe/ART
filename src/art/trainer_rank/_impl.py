@@ -213,7 +213,15 @@ class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
 
 @dataclass(slots=True)
 class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
+    """Flattened inputs with optional [tokens, model layers, top-k] expert IDs.
+
+    Routes align with input tokens without a shift and must contain no missing
+    (-1) IDs. Shared token prefixes use the first sequence's routes. Omit routes
+    for normal model routing. Forward logprobs always describe raw model scores.
+    """
+
     input_tokens: torch.Tensor
+    routed_experts: torch.Tensor | None = None
     target_tokens: torch.Tensor | None = None
     top_k: int | None = None
     logits: bool = False
@@ -227,6 +235,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: None = None,
         logits: Literal[False] = False,
@@ -241,6 +250,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: None = None,
         logits: Literal[False] = False,
@@ -255,6 +265,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: int,
         logits: Literal[False] = False,
@@ -269,6 +280,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: None = None,
         logits: Literal[True],
@@ -283,6 +295,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: None = None,
         logits: Literal[False] = False,
@@ -297,6 +310,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: int,
         logits: Literal[False] = False,
@@ -311,6 +325,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: None = None,
         logits: Literal[True],
@@ -325,6 +340,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: None = None,
         logits: Literal[False] = False,
@@ -339,6 +355,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: int,
         logits: Literal[True],
@@ -353,6 +370,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: int,
         logits: Literal[False] = False,
@@ -367,6 +385,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: None = None,
         logits: Literal[True],
@@ -381,6 +400,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: int,
         logits: Literal[True],
@@ -395,6 +415,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: int,
         logits: Literal[False] = False,
@@ -409,6 +430,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: None = None,
         logits: Literal[True],
@@ -423,6 +445,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: int,
         logits: Literal[True],
@@ -437,6 +460,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: int,
         logits: Literal[True],
@@ -451,6 +475,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor | None = None,
         top_k: int | None = None,
         logits: bool = False,
@@ -464,6 +489,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor | None = None,
         top_k: int | None = None,
         logits: bool = False,
@@ -478,6 +504,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         self,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor | None = None,
         top_k: int | None = None,
         logits: bool = False,
@@ -486,6 +513,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         checkpoint: AdapterSelection = Unset,
         options: ForwardOptions | None = None,
     ) -> None:
+        self.routed_experts = routed_experts
         self.input_tokens = input_tokens
         self.target_tokens = target_tokens
         self.top_k = top_k
@@ -974,6 +1002,7 @@ class _ForwardItem:
     request: AnyForwardInput
     input_ids: torch.Tensor
     labels: torch.Tensor | None
+    routed_experts: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -985,6 +1014,7 @@ class _PreparedPackedForward:
     positions_by_item: tuple[torch.Tensor, ...]
     source_positions_by_item: tuple[torch.Tensor, ...]
     context_parallel_group: dist.ProcessGroup | None = None
+    token_uids: torch.Tensor | None = None
 
 
 type _RowMatch = tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]
@@ -1729,7 +1759,10 @@ def _moe_output_bytes_per_token(
                         and not dispatcher.dispatch_preprocess.keywords
                     )
                 )
-                or "routing" in vars(layer.router)
+                or (
+                    "routing" in vars(layer.router)
+                    and not hasattr(layer.router, "_art_rank_original_routing")
+                )
             ):
                 return 0
             tensors = _slot_lora_tensors(lora, slot_ref)
@@ -3676,7 +3709,7 @@ class TrainerRank:
         if ensure_slots:
             self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
         groups: dict[
-            tuple[LoRASlotRef | None, bool, ResolvedForwardOptions], list[int]
+            tuple[LoRASlotRef | None, bool, ResolvedForwardOptions, bool], list[int]
         ] = {}
         for index, request in enumerate(requests):
             if (
@@ -3694,12 +3727,13 @@ class TrainerRank:
                             else not request.no_grad
                         ),
                         _resolved_request_policy(request.options),
+                        request.routed_experts is not None,
                     ),
                     [],
                 ).append(index)
         return tuple(
             ((slot_ref, grad), tuple(indices))
-            for (slot_ref, grad, _options), indices in groups.items()
+            for (slot_ref, grad, _options, _routed), indices in groups.items()
         )
 
     @_backward_region
@@ -3946,7 +3980,17 @@ class TrainerRank:
                 if hybrid is not None:
                     self._set_hybridep_rows(hybrid[0][0])
                 prepared = self._prepare_packed_forward(captured.packed)
-                outputs = self._forward_packed(captured.items, prepared)
+                from art.megatron.routed_experts import prepare_routes, use_routes
+
+                routes = prepare_routes(
+                    captured.items,
+                    captured.packed,
+                    prepared,
+                    getattr(self, "_routing_bindings", ()),
+                    self.device,
+                )
+                with use_routes(routes):
+                    outputs = self._forward_packed(captured.items, prepared)
                 outputs = [
                     replace(
                         output,
@@ -5118,7 +5162,21 @@ class TrainerRank:
                     f"dimensions: input_tokens={input_shape} "
                     f"target_tokens={tuple(labels.shape)}"
                 )
-        return _ForwardItem(request=request, input_ids=input_ids, labels=labels)
+        routes = request.routed_experts
+        if routes is not None:
+            from art.megatron.routed_experts import router_bindings, validate_routes
+
+            if not hasattr(self, "_routing_bindings"):
+                self._routing_bindings = router_bindings(self.runtime.model)
+            routes = validate_routes(
+                routes,
+                int(input_ids.numel()),
+                self.runtime.provider.num_layers,
+                self._routing_bindings,
+            )
+        return _ForwardItem(
+            request=request, input_ids=input_ids, labels=labels, routed_experts=routes
+        )
 
     def _forward_packed(
         self,
@@ -5575,6 +5633,9 @@ class TrainerRank:
         provider = self.runtime.provider
         return _PreparedPackedForward(
             tokens=batch.tokens.to(self.device),
+            token_uids=torch.arange(batch.tokens.numel(), dtype=torch.int64).unsqueeze(
+                0
+            ),
             position_ids=batch.position_ids.to(self.device),
             attention_state=create_prefix_tree_state(
                 group_ids=batch.group_ids,
@@ -5800,6 +5861,7 @@ class TrainerRank:
         )
         return _PreparedPackedForward(
             tokens=prepared.tensors.tokens,
+            token_uids=local_positions,
             position_ids=prepared.tensors.input_pos,
             attention_state=cast("ArtContextParallelState", prepared.attention_state),
             packed_seq_params=prepared.packed_seq_params,
@@ -5998,6 +6060,8 @@ def _request_mix_key(request: AnyForwardInput) -> str:
         parts.append("logits")
     if request.hidden_states:
         parts.append("hidden")
+    if request.routed_experts is not None:
+        parts.append("routes")
     return "+".join(parts) if parts else "inactive"
 
 
