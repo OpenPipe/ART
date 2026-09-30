@@ -36,7 +36,7 @@ from ..utils.chat_template import (
     merge_chat_template_kwargs,
     normalize_tool_call_arguments_for_chat_template,
 )
-from .dynamo_tokens import COMPLETION_LOGPROBS_KEY, choice_completion_logprobs
+from .dynamo_tokens import choice_completion_logprobs, has_completion_logprobs
 from .moe_routing import (
     MoeRouteArray,
     MoeRouteSegments,
@@ -555,7 +555,7 @@ def _choice_logprobs(
     allow_training_without_logprobs: bool,
 ) -> tuple[list[float], list[Any]]:
     exact_logprobs = choice_completion_logprobs(choice)
-    if COMPLETION_LOGPROBS_KEY in (choice.model_extra or {}):
+    if has_completion_logprobs(choice):
         if exact_logprobs is None:
             if allow_training_without_logprobs:
                 return [float("nan")] * token_count, []
@@ -696,7 +696,7 @@ def assemble_vllm_training_sequences(
             if isinstance(item, Choice)
             and (
                 item.logprobs is not None
-                or COMPLETION_LOGPROBS_KEY in (item.model_extra or {})
+                or has_completion_logprobs(item)
                 or allow_training_without_logprobs
             )
         ):

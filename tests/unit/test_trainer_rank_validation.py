@@ -408,7 +408,7 @@ def test_forward_groups_execute_in_their_selected_grad_modes(
             slot_ref=_slot_ref(checkpoint),
             grad_enabled=enabled,
             packed=None,
-            items=(None,),
+            items=(SimpleNamespace(routed_experts=None),),
             request_indices=(index,),
         )
         for index, (checkpoint, enabled) in enumerate(

@@ -63,6 +63,57 @@ def _json_tensor(value: torch.Tensor) -> list[int] | list[float | str]:
     return [int(item) for item in items]
 
 
+class TensorizedTopK(_StringInterningModel):
+    model_config = pydantic.ConfigDict(arbitrary_types_allowed=True)
+    tokens: torch.Tensor
+    logprobs: torch.Tensor
+
+    @pydantic.field_validator("tokens", "logprobs", mode="before")
+    @classmethod
+    def validate_tensor(
+        cls, value: object, info: pydantic.ValidationInfo
+    ) -> torch.Tensor:
+        if info.field_name == "logprobs" and isinstance(value, list):
+            rows = []
+            for row in value:
+                if not isinstance(row, list):
+                    raise ValueError("top_k fields must have shape [tokens, k]")
+                rows.append([math.nan if item == "NaN" else item for item in row])
+            value = rows
+        result = value if isinstance(value, torch.Tensor) else torch.tensor(value)
+        if result.ndim != 2:
+            raise ValueError("top_k fields must have shape [tokens, k]")
+        if info.field_name == "tokens" and (
+            result.dtype == torch.bool
+            or result.dtype.is_floating_point
+            or result.dtype.is_complex
+        ):
+            raise ValueError("top_k token IDs must be integers")
+        return result.to(
+            dtype=torch.int64 if info.field_name == "tokens" else torch.float32
+        ).contiguous()
+
+    @pydantic.model_validator(mode="after")
+    def validate_shape(self) -> Self:
+        if self.tokens.shape != self.logprobs.shape or bool(
+            (self.tokens < -1).any().item()
+        ):
+            raise ValueError("top_k requires matching shapes and token IDs >= -1")
+        return self
+
+    @pydantic.field_serializer("tokens", "logprobs", when_used="json")
+    def serialize_tensor(self, value: torch.Tensor) -> list:
+        return [_json_tensor(row) for row in value]
+
+    def to(self, device: torch.device | str, *, copy: bool = True) -> Self:
+        return self.model_copy(
+            update={
+                "tokens": self.tokens.to(device=device, copy=copy),
+                "logprobs": self.logprobs.to(device=device, copy=copy),
+            }
+        )
+
+
 class TensorizedHistory(_StringInterningModel):
     """One tokenizable history represented by canonical one-dimensional tensors."""
 
@@ -73,6 +124,12 @@ class TensorizedHistory(_StringInterningModel):
     tokens: torch.Tensor
     logprobs: torch.Tensor
     flags: torch.Tensor
+    routed_experts: torch.Tensor | None = pydantic.Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    top_k: TensorizedTopK | None = pydantic.Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @pydantic.field_serializer("history")
     def serialize_source_history(
@@ -100,6 +157,29 @@ class TensorizedHistory(_StringInterningModel):
     def validate_flags(cls, value: object) -> torch.Tensor:
         return _tensor(value, dtype=torch.int32, label="flags")
 
+    @pydantic.field_validator("routed_experts", mode="before")
+    @classmethod
+    def validate_routed_experts(cls, value: object) -> torch.Tensor | None:
+        if value is None:
+            return None
+        result = value if isinstance(value, torch.Tensor) else torch.tensor(value)
+        if (
+            result.dtype == torch.bool
+            or result.dtype.is_floating_point
+            or result.dtype.is_complex
+        ):
+            raise ValueError("routed_experts must contain integer expert IDs")
+        if result.ndim != 3 or min(result.shape[1:]) <= 0:
+            raise ValueError("routed_experts must have shape [tokens, layers, top-k]")
+        result = result.to(dtype=torch.int64)
+        if bool(((result < -1) | (result > 65535)).any().item()):
+            raise ValueError("routed_experts IDs must be in [-1, 65535]")
+        return result.to(dtype=torch.int32).contiguous()
+
+    @pydantic.field_serializer("routed_experts", when_used="json")
+    def serialize_routed_experts(self, value: torch.Tensor | None) -> object:
+        return value.detach().cpu().tolist() if value is not None else None
+
     @pydantic.field_serializer("tokens", "logprobs", "flags", when_used="json")
     def serialize_tensor(self, value: torch.Tensor) -> list[int] | list[float | str]:
         return _json_tensor(value)
@@ -108,6 +188,12 @@ class TensorizedHistory(_StringInterningModel):
     def validate_tokenwise_lengths(self) -> Self:
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tensorized history fields differ in length")
+        if self.top_k is not None and len(self.top_k.tokens) != len(self.tokens):
+            raise ValueError("Tensorized top_k differs in length from tokens")
+        if self.routed_experts is not None and len(self.routed_experts) != len(
+            self.tokens
+        ):
+            raise ValueError("Tensorized routed_experts differs in length from tokens")
         sampled = self.flags.bitwise_and(int(TokenFlag.SAMPLED)).bool()
         self.flags = self.flags.bitwise_or(
             sampled.to(self.flags.dtype) * int(TokenFlag.OUTPUT)
@@ -126,6 +212,10 @@ class TensorizedHistory(_StringInterningModel):
         result.tokens = self.tokens.to(device=device, copy=True)
         result.logprobs = self.logprobs.to(device=device, copy=True)
         result.flags = self.flags.to(device=device, copy=True)
+        if self.top_k is not None:
+            result.top_k = self.top_k.to(device)
+        if self.routed_experts is not None:
+            result.routed_experts = self.routed_experts.to(device=device, copy=True)
         return result
 
     def to_(self, device: torch.device | str) -> None:
@@ -134,6 +224,10 @@ class TensorizedHistory(_StringInterningModel):
         self.tokens = self.tokens.to(device=device)
         self.logprobs = self.logprobs.to(device=device)
         self.flags = self.flags.to(device=device)
+        if self.top_k is not None:
+            self.top_k = self.top_k.to(device, copy=False)
+        if self.routed_experts is not None:
+            self.routed_experts = self.routed_experts.to(device=device)
 
     def compact_dump(self) -> CompactTrajectoryPayload:
         from ._compact import dump
@@ -366,6 +460,25 @@ def tensorize_history(
             value.logprobs, dtype=torch.float32, device=device or "cpu"
         ),
         flags=torch.tensor(value.flags, dtype=torch.int32, device=device or "cpu"),
+        top_k=(
+            TensorizedTopK(
+                tokens=torch.tensor(
+                    value.top_k.tokens, dtype=torch.int64, device=device or "cpu"
+                ),
+                logprobs=torch.tensor(
+                    value.top_k.logprobs, dtype=torch.float32, device=device or "cpu"
+                ),
+            )
+            if value.top_k is not None
+            else None
+        ),
+        routed_experts=(
+            torch.tensor(
+                value.routed_experts, dtype=torch.int32, device=device or "cpu"
+            )
+            if value.routed_experts is not None
+            else None
+        ),
     )
 
 
@@ -380,6 +493,8 @@ def tensorize_trajectory(
         tokens=history.tokens,
         logprobs=history.logprobs,
         flags=history.flags,
+        routed_experts=history.routed_experts,
+        top_k=history.top_k,
     )
 
 
@@ -441,6 +556,7 @@ def tensorize_group(
 
 __all__ = [
     "TensorizedHistory",
+    "TensorizedTopK",
     "TensorizedMultiHistoryTrajectory",
     "TensorizedTrajectory",
     "TensorizedTrajectoryGroup",
