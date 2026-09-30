@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from test_trainer_rank_handoff_budget import plan as handoff_plan
@@ -15,7 +16,10 @@ def candidate(required=5, *, probe=True):
     return _impl._CandidateMicroBatch(
         inputs=[],
         indices=(0,),
-        plan=SimpleNamespace(packed_tokens=required, logical_tokens=required),
+        plan=cast(
+            _impl._AnyForwardPlan,
+            SimpleNamespace(packed_tokens=required, logical_tokens=required),
+        ),
         check=_impl._MemoryCheck(required, 10, required <= 10),
         stats_global_count=1,
         rejected_candidates=1,

@@ -929,7 +929,7 @@ def _search_next_micro_batch(
             try:
                 outcome = self._admission_outcome(
                     0
-                    if admission_error is not None
+                    if found is None
                     else 1
                     if isinstance(found, _impl._ForwardRefusal)
                     else 2
