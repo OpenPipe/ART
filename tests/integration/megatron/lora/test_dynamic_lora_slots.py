@@ -638,6 +638,19 @@ class _IdentityModelSupportHandler:
 
 
 @contextmanager
+def _lora_checkpoint(seed=1, *, rng_seed=None):
+    """Construct the shared single-rank dense checkpoint used by version tests."""
+    with _single_rank_model_parallel():
+        if rng_seed is not None:
+            torch.manual_seed(rng_seed)
+        device = torch.device("cuda")
+        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
+        trainer = _trainer_for(lora, device)
+        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=seed))
+        yield device, lora, trainer
+
+
+@contextmanager
 def _single_rank_model_parallel():
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ["MASTER_PORT"] = str(_free_port())

@@ -14,15 +14,10 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("megatron.core")
 
-from art.megatron.lora import LoRA, LoRASlotRef, use_lora_slot  # noqa: E402
+from art.megatron.lora import LoRASlotRef, use_lora_slot  # noqa: E402
 from art.trainer_rank import AdamParams  # noqa: E402
 
-from .test_dynamic_lora_slots import (  # noqa: E402
-    _adapter,
-    _install_checkpoint,
-    _single_rank_model_parallel,
-    _trainer_for,
-)
+from .test_dynamic_lora_slots import _lora_checkpoint  # noqa: E402
 
 
 def _coupled_loss(first, second):
@@ -49,12 +44,7 @@ def _adam(parameters, gradients, moments, step, params):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("recompute", ["none", "torch", "reentrant", "megatron"])
 def test_native_old_lora_graph_matches_matrix_and_adam_oracle(recompute, artifact_dir):
-    with _single_rank_model_parallel():
-        torch.manual_seed(1709)
-        device = torch.device("cuda")
-        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
-        trainer = _trainer_for(lora, device)
-        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=91))
+    with _lora_checkpoint(seed=91, rng_seed=1709) as (device, lora, trainer):
         ref = LoRASlotRef("checkpoint", "A")
         originals = tuple(trainer._checkpoint_slots["A"].params)
         reference = [p.detach().double().requires_grad_() for p in originals]

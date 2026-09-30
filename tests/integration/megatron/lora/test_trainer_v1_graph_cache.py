@@ -22,6 +22,7 @@ from art.trainer_rank._impl import _ForwardGroupPlan  # noqa: E402
 from .test_dynamic_lora_slots import (  # noqa: E402
     _adapter,
     _install_checkpoint,
+    _lora_checkpoint,
     _single_rank_model_parallel,
     _trainer_for,
 )
@@ -141,12 +142,7 @@ def test_native_stale_logprob_correction_keeps_original_gradient_age(mode, monke
         TrainerRankSlotStateError,
     )
 
-    with _single_rank_model_parallel():
-        torch.manual_seed(19)
-        device = torch.device("cuda")
-        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
-        trainer = _trainer_for(lora, device)
-        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=91))
+    with _lora_checkpoint(seed=91, rng_seed=19) as (device, lora, trainer):
         ref = LoRASlotRef("checkpoint", "A")
         origin = trainer._capture_checkpoint_version("A")
         parameters = trainer._checkpoint_slots["A"].params

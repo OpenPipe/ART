@@ -8,19 +8,14 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("megatron.core")
 
-from art.megatron.lora import LoRA, LoRASlotRef, use_lora_slot  # noqa: E402
+from art.megatron.lora import LoRASlotRef, use_lora_slot  # noqa: E402
 from art.trainer_rank import TrainerRankSlotStateError  # noqa: E402
 from art.trainer_rank._checkpoint import (  # noqa: E402
     discard_snapshot_checkpoint,
     snapshot_checkpoint,
 )
 
-from .test_dynamic_lora_slots import (  # noqa: E402
-    _adapter,
-    _install_checkpoint,
-    _single_rank_model_parallel,
-    _trainer_for,
-)
+from .test_dynamic_lora_slots import _lora_checkpoint  # noqa: E402
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -28,11 +23,7 @@ from .test_dynamic_lora_slots import (  # noqa: E402
 def test_native_capture_preserves_independent_parameter_trainability(
     train_a: bool,
 ) -> None:
-    with _single_rank_model_parallel():
-        device = torch.device("cuda")
-        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
-        trainer = _trainer_for(lora, device)
-        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=1))
+    with _lora_checkpoint() as (device, lora, trainer):
         ref = LoRASlotRef("checkpoint", "A")
         current = lora._slot(ref)
         assert current is not None
@@ -68,11 +59,7 @@ def test_native_capture_preserves_independent_parameter_trainability(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_native_version_storage_reuse_accounting_and_checkpoint_lifetime() -> None:
-    with _single_rank_model_parallel():
-        device = torch.device("cuda")
-        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
-        trainer = _trainer_for(lora, device)
-        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=1))
+    with _lora_checkpoint() as (device, lora, trainer):
         ref = LoRASlotRef("checkpoint", "A")
         expected_bytes = (4 * 2 + 2 * 5) * 4
         custom = torch.nn.Parameter(torch.ones(100, device=device))
@@ -117,11 +104,7 @@ def test_native_version_storage_reuse_accounting_and_checkpoint_lifetime() -> No
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_native_capture_rejects_staleness_and_checkpoint_replacement() -> None:
-    with _single_rank_model_parallel():
-        device = torch.device("cuda")
-        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
-        trainer = _trainer_for(lora, device)
-        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=1))
+    with _lora_checkpoint() as (device, lora, trainer):
         ref = LoRASlotRef("checkpoint", "A")
         capture = trainer._capture_lora_version(ref, max_gradient_staleness=0)
         with use_lora_slot(ref, version=capture):
@@ -141,11 +124,7 @@ def test_native_capture_rejects_staleness_and_checkpoint_replacement() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_newer_weight_replay_keeps_original_gradient_age() -> None:
-    with _single_rank_model_parallel():
-        device = torch.device("cuda")
-        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
-        trainer = _trainer_for(lora, device)
-        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=1))
+    with _lora_checkpoint() as (device, lora, trainer):
         ref = LoRASlotRef("checkpoint", "A")
         origin = trainer._capture_checkpoint_version("A")
         trainer._checkpoint_slots["A"].revision = origin.revision + 2
@@ -173,11 +152,7 @@ def test_newer_weight_replay_keeps_original_gradient_age() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_discarded_snapshot_name_cannot_reuse_old_capture() -> None:
-    with _single_rank_model_parallel():
-        device = torch.device("cuda")
-        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
-        trainer = _trainer_for(lora, device)
-        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=1))
+    with _lora_checkpoint() as (device, lora, trainer):
         trainer._checkpoint_slots["A"].config = {
             "base_model_name_or_path": "test/model",
             "r": 2,
