@@ -48,6 +48,19 @@ def _activation_grad(x, ACTIVATION: tl.constexpr):
     return _gelu_grad(x)
 
 
+@triton.jit
+def _boundary_silu_fwd(x):
+    x = x.to(tl.bfloat16).to(tl.float32)
+    return _apply_activation(x, 1)
+
+
+@triton.jit
+def _boundary_silu_bwd(x, go):
+    x = x.to(tl.bfloat16).to(tl.float32)
+    gz = go * _activation_grad(x, 1)
+    return gz.to(tl.bfloat16).to(tl.float32)
+
+
 @triton.jit(do_not_specialize=["SEGMENTS"])
 def _segment_for_token(
     cu_seqlens,
@@ -136,7 +149,11 @@ def _packed_conv_fwd_kernel(
         x_in = tl.load(conv_in + in_idx, mask=mask & ~from_initial, other=0.0)
         w = tl.load(weight + offs_c * K + j, mask=offs_c < C, other=0.0).to(tl.float32)
         acc += (x_init + x_in).to(tl.float32) * w[None, :]
-    tl.store(out + n * C + c, _apply_activation(acc, ACTIVATION), mask=mask)
+    if ACTIVATION == 1 and conv_in.dtype.element_ty == tl.bfloat16:
+        activated = _boundary_silu_fwd(acc)
+    else:
+        activated = _apply_activation(acc, ACTIVATION)
+    tl.store(out + n * C + c, activated, mask=mask)
 
 
 @triton.jit
@@ -228,7 +245,10 @@ def _packed_conv_grad_preact_weight_partial_kernel(
         w = tl.load(weight + offs_c * K + j, mask=offs_c < C, other=0.0).to(tl.float32)
         acc += (x_init + x_in).to(tl.float32) * w[None, :]
     go = tl.load(grad_out + n * C + c, mask=mask, other=0.0).to(tl.float32)
-    gz = go * _activation_grad(acc, ACTIVATION)
+    if ACTIVATION == 1 and conv_in.dtype.element_ty == tl.bfloat16:
+        gz = _boundary_silu_bwd(acc, go)
+    else:
+        gz = go * _activation_grad(acc, ACTIVATION)
     tl.store(
         grad_preact + n * C + c,
         gz,
