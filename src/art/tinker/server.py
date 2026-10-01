@@ -155,12 +155,12 @@ class OpenAICompatibleTinkerServer:
             raise RuntimeError("Tinker server is already started")
         host = self.host or "0.0.0.0"
         try:
-            self._socket = socket.socket(
-                socket.AF_INET6 if ":" in host else socket.AF_INET,
-                socket.SOCK_STREAM,
-            )
+            family, kind, protocol, _, address = socket.getaddrinfo(
+                host, self.port if self.port is not None else 0, type=socket.SOCK_STREAM
+            )[0]
+            self._socket = socket.socket(family, kind, protocol)
             self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._socket.bind((host, self.port if self.port is not None else 0))
+            self._socket.bind(address)
             self._socket.listen()
             port = self._socket.getsockname()[1]
             self._workers = []
@@ -467,10 +467,16 @@ class OpenAICompatibleTinkerServer:
             log_level="error",
             timeout_graceful_shutdown=5,
         )
-        self._server = uvicorn.Server(server_config)
+        server = self._server = uvicorn.Server(server_config)
         try:
-            await self._server.serve(sockets=[sock])
+            await server.serve(sockets=[sock])
+        except BaseException:
+            if server.started:
+                await server.shutdown(sockets=[sock])
+            raise
         finally:
+            for listener in getattr(server, "servers", []):
+                listener.close()
             sock.close()
 
     def _default_num_workers(self) -> int:

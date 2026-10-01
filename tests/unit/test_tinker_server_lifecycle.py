@@ -77,6 +77,54 @@ async def test_explicit_worker_override_and_restart(workers):
         worker.close.assert_called_once()
 
 
+async def test_ipv6_only_hostname_with_explicit_port(workers, monkeypatch):
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+            port = probe.getsockname()[1]
+    except OSError:
+        pytest.skip("IPv6 loopback is unavailable")
+    resolve = socket.getaddrinfo
+
+    def resolve_test_host(host, *args, **kwargs):
+        return resolve("::1" if host == "tinker.test" else host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve_test_host)
+    server = OpenAICompatibleTinkerServer(host="tinker.test", port=port, num_workers=1)
+    try:
+        assert await server.start() == ("tinker.test", port)
+        async with httpx.AsyncClient(trust_env=False) as client:
+            response = await client.get(f"http://[::1]:{port}/health")
+            assert response.status_code == 200
+    finally:
+        await server.stop()
+
+
+async def test_cancel_serving_then_restart_same_port(workers, caplog):
+    server = OpenAICompatibleTinkerServer(host="127.0.0.1", num_workers=1)
+    try:
+        host, port = await server.start()
+        assert server._task is not None
+        server._task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await server._task
+    finally:
+        await server.stop()
+    server.port = port
+    try:
+        assert await server.start() == (host, port)
+        async with httpx.AsyncClient(trust_env=False) as client:
+            response = await asyncio.wait_for(
+                client.get(f"http://{host}:{port}/health"), 5
+            )
+            assert response.json() == {"status": "ok"}
+    finally:
+        await server.stop()
+    assert not caplog.records
+    for worker in workers:
+        worker.close.assert_called_once()
+
+
 async def test_port_reserved_before_workers_and_explicit_port_collision(
     workers, monkeypatch
 ):
