@@ -12,7 +12,7 @@ import torch
 from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils.checkpoint import checkpoint
 
-from art.trainer_rank import ForwardOutput, TopK, TrainerRank
+from art.trainer_rank import ForwardOutput, TrainerRank
 from art.trainer_rank._graphs import GraphCache
 from art.trainer_rank._impl import _CheckpointSlot
 from art.trainer_rank._options import (
@@ -340,14 +340,19 @@ def test_opportunistic_exact_replay_never_adds_correction_forward(retention):
     assert current.grad is None
 
 
-def test_always_correction_uses_no_grad_current_evaluation_and_old_jacobian():
+@pytest.mark.parametrize("evicted", [False, True], ids=["resident", "evicted"])
+def test_always_correction_uses_no_grad_current_evaluation_and_old_jacobian(evicted):
     cache, handle, original, current, executions, _ = _corrected_cache(policy="always")
+    expected_executions = [(False, True), (True, False)]
+    if evicted:
+        cache.evict(handle)
+        expected_executions.append((False, True))
     cache.backward(handle, (torch.tensor(1.0),))
     torch.testing.assert_close(
         original.grad, torch.tensor(2.0) * torch.tensor(0.75).exp()
     )
     assert current.grad is None
-    assert executions == [(False, True), (True, False)]
+    assert executions == expected_executions
 
 
 def _observe_backward_storage(monkeypatch, request):
@@ -488,17 +493,6 @@ def test_correction_and_coordinator_failures_release_owned_storage(
         retry_weight.grad, torch.tensor(2.0) * torch.tensor(0.75).exp()
     )
     assert all(storage.expired() for storage in storages) and not cache.handles()
-
-
-def test_always_correction_after_eviction_uses_original_jacobian():
-    cache, handle, original, current, executions, _ = _corrected_cache(policy="always")
-    cache.evict(handle)
-    cache.backward(handle, (torch.tensor(1.0),))
-    assert current.grad is None
-    torch.testing.assert_close(
-        original.grad, torch.tensor(2.0) * torch.tensor(0.75).exp()
-    )
-    assert executions == [(False, True), (True, False), (False, True)]
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])
