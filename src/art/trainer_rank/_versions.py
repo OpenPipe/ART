@@ -107,20 +107,6 @@ class CheckpointVersions:
                 f"{version.revision}, current revision {slot.revision})"
             )
 
-    def snapshot(
-        self,
-        parameter: torch.nn.Parameter,
-        version: CheckpointVersion,
-        maximum: int = 2,
-    ) -> torch.nn.Parameter:
-        self.validate(version, maximum)
-        with torch._C.DisableTorchFunctionSubclass():
-            result = torch.nn.Parameter(
-                parameter.detach().clone(), requires_grad=parameter.requires_grad
-            )
-        self.track(result, parameter, version, maximum)
-        return result
-
     def track(
         self,
         snapshot: torch.nn.Parameter,

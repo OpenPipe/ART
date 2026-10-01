@@ -2204,9 +2204,14 @@ class TrainerRank:
         version: CheckpointVersion,
         max_gradient_staleness: int = 2,
     ) -> torch.nn.Parameter:
-        return self._version_state().snapshot(
-            parameter, version, max_gradient_staleness
-        )
+        state = self._version_state()
+        state.validate(version, max_gradient_staleness)
+        with torch._C.DisableTorchFunctionSubclass():
+            result = torch.nn.Parameter(
+                parameter.detach().clone(), requires_grad=parameter.requires_grad
+            )
+        state.track(result, parameter, version, max_gradient_staleness)
+        return result
 
     def _commit_versioned_gradients(
         self, gradients: Sequence[VersionedGradient]
