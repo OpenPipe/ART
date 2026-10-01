@@ -247,27 +247,14 @@ def main():
         # BF16 packed and split matmuls can differ numerically. Compare replay
         # against the identical admitted physical partition, with CPU reduction
         # on both arms; retain the packed reference as a separate diagnostic.
-        run(
-            "gpu",
-            "cpu",
-            "same_split_gpu",
+        split_comparison = dict(
             chunks=accepted["telemetry"]["subforward_request_indices"],
             compare="constrained_replay",
         )
-        run(
-            "cpu",
-            "cpu",
-            "same_split_cpu_offload",
-            chunks=accepted["telemetry"]["subforward_request_indices"],
-            compare="constrained_replay",
-        )
+        run("gpu", "cpu", "same_split_gpu", **split_comparison)
+        run("cpu", "cpu", "same_split_cpu_offload", **split_comparison)
         adaptive = run(
-            "auto",
-            "cpu",
-            "constrained_measured_auto",
-            cap=cap,
-            chunks=accepted["telemetry"]["subforward_request_indices"],
-            compare="constrained_replay",
+            "auto", "cpu", "constrained_measured_auto", cap=cap, **split_comparison
         )
         evidence = adaptive["telemetry"]["fallback_costs"]
         if evidence["source"] != "measured_forward_and_transfers":
