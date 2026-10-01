@@ -103,6 +103,7 @@ def _canonical_gradients(rank, checkpoint):
         return None
     groups = defaultdict(list)
     for shard in gathered:
+        assert shard is not None
         for key, entry in shard.items():
             groups[key].append(entry)
     return merge_sharded_adapter_entries(groups)
