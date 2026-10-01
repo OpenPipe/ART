@@ -315,14 +315,19 @@ class ModuleHandle(torch.nn.Module):
         publish: Callable[[Mapping[str, torch.Tensor]], None],
     ) -> None:
         super().__init__()
-        object.__setattr__(self, "_source", module)
         object.__setattr__(self, "_capture", capture)
         object.__setattr__(self, "_publish", publish)
-        self._parameters = module._parameters
-        self._buffers = module._buffers
-        self._modules = module._modules
+        self._bind_source(module)
         self._non_persistent_buffers_set = module._non_persistent_buffers_set
         self.training = module.training
+
+    def _bind_source(self, module: torch.nn.Module) -> None:
+        object.__setattr__(self, "_source", module)
+        self._parameters, self._buffers, self._modules = (
+            module._parameters,
+            module._buffers,
+            module._modules,
+        )
 
     def __getattr__(self, name: str) -> Any:
         try:
@@ -358,11 +363,7 @@ class ModuleHandle(torch.nn.Module):
             )
         finally:
             _parameter_transform.reset(token)
-        self._parameters, self._buffers, self._modules = (
-            self._source._parameters,
-            self._source._buffers,
-            self._source._modules,
-        )
+        self._bind_source(self._source)
         return self
 
     def requires_grad_(self, requires_grad: bool = True) -> ModuleHandle:
@@ -409,12 +410,7 @@ class ModuleHandle(torch.nn.Module):
             )
         )
         try:
-            object.__setattr__(self, "_source", captured)
-            self._parameters, self._buffers, self._modules = (
-                captured._parameters,
-                captured._buffers,
-                captured._modules,
-            )
+            self._bind_source(captured)
             result = call()
             current_parameters = dict(captured.named_parameters())
             if current_parameters.keys() != parameters.keys() or any(
@@ -427,12 +423,7 @@ class ModuleHandle(torch.nn.Module):
                 )
             updated_buffers = dict(captured.named_buffers())
         finally:
-            object.__setattr__(self, "_source", original)
-            self._parameters, self._buffers, self._modules = (
-                original._parameters,
-                original._buffers,
-                original._modules,
-            )
+            self._bind_source(original)
             _head_call.reset(token)
         self._publish(updated_buffers)
         return result
