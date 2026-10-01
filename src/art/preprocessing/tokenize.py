@@ -948,17 +948,17 @@ def tokenize_trajectory_groups(
                 )
             )
         )
-        first_non_nan_index = min(
+        first_trainable_index = min(
             (
                 next(
-                    (i for i, lp in enumerate(r.logprobs) if not math.isnan(lp)),
-                    len(r.logprobs),
+                    (i for i, selected in enumerate(r.assistant_mask) if selected),
+                    len(r.assistant_mask),
                 )
                 for r in results
             ),
             default=0,
         )
-        prompt_length = max(min(prompt_length, first_non_nan_index) - 1, 0)
+        prompt_length = max(min(prompt_length, first_trainable_index) - 1, 0)
         # Set the prompt id and length
         for result in results:
             result.prompt_id = prompt_id

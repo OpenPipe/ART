@@ -282,6 +282,48 @@ def test_preprocessing_requires_model_selection() -> None:
     assert all(result.token_ids == [1, 2] for result in results)
 
 
+def test_prompt_scores_preserve_training_mask_and_shared_prefix_packing() -> None:
+    from art.preprocessing.pack import prefix_tree_pack, prefix_tree_shareable_length
+
+    trajectories = []
+    for token, reward in ((7, 1.0), (8, 0.0)):
+        exchange = _exchange("policy", token)
+        assert exchange.response.model_extra is not None
+        exchange.response.model_extra.update(
+            prompt_token_ids=[1, 2, 3],
+            compact_prompt_logprobs=[None, "-inf", -0.3],
+            logprobs_mode="processed_logprobs",
+        )
+        assert exchange.response.choices[0].model_extra is not None
+        exchange.response.choices[0].model_extra.pop("prompt_token_ids")
+        trajectories.append(
+            art.Trajectory(
+                exchanges=tr.TrajectoryExchanges(chat_completions=[exchange]),
+                reward=reward,
+            )
+        )
+    results = list(
+        tokenize_trajectory_groups(
+            cast(PreTrainedTokenizerBase, _Tokenizer()),
+            [art.TrajectoryGroup(trajectories)],
+            allow_training_without_logprobs=False,
+            scale_rewards=False,
+        )
+    )
+    assert all(result.assistant_mask == [0, 0, 0, 1] for result in results)
+    assert all(result.logprobs[1:3] == [-math.inf, -0.3] for result in results)
+    assert all(result.prompt_length == 2 for result in results)
+    assert all(prefix_tree_shareable_length(result) == 2 for result in results)
+    packed = prefix_tree_pack(
+        tokenized_results=results, seq_len=8, min_prefix_tree_shared_segment_length=1
+    )
+    assert packed["prefix_tree_packing_stats"] == {
+        "logical_tokens": 8,
+        "physical_tokens": 6,
+    }
+    assert packed["assistant_mask"].sum().item() == 2
+
+
 def test_tinker_requires_model_selection() -> None:
     with pytest.raises(ValueError, match="exactly one concrete model"):
         trajectory_groups_to_datums([_group()], renderer=None, tokenizer=None)
