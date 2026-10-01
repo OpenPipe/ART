@@ -354,44 +354,24 @@ def test_empty_output_does_not_pin_hidden_storage_and_keeps_autograd():
     assert hidden.grad is not None and hidden.grad.count_nonzero() == 0
 
 
-def test_correction_metadata_and_explicit_prepass_are_budgeted(rank):
-    request = ForwardInput(
-        input_tokens=torch.arange(3),
-        target_tokens=torch.arange(3),
-        top_k=2,
-    )
-    group = rank._plan_flat_forward([request]).groups[0]
-    default = _impl._resolved_request_policy(None)
-    always = _impl._resolved_request_policy(
-        ForwardOptions(
-            stale_gradient_corrections=(
-                ImportanceSamplingGradientCorrection(policy="always"),
-            )
-        )
-    )
-    assert _impl._correction_state_bytes(group, default) == 3 * 4 + 6 * 12
-    assert _impl._correction_state_bytes(group, always) == 3 * 8 + 6 * 16
-    assert (
-        _impl._correction_state_bytes(
-            group,
-            _impl._resolved_request_policy(
-                ForwardOptions(stale_gradient_corrections=())
-            ),
-        )
-        == 0
-    )
-
-
 @pytest.mark.parametrize("grad_enabled", [False, True])
-@pytest.mark.parametrize("top_k", [0, 4])
+@pytest.mark.parametrize(
+    "top_k, hidden_states",
+    [(0, True), (4, True), (2, False)],
+    ids=["0", "4", "2-no-hidden"],
+)
 @pytest.mark.parametrize("label_columns", [0, 1, 2])
 @pytest.mark.parametrize(
-    "corrections",
-    [None, (), (ImportanceSamplingGradientCorrection(policy="always"),)],
+    "corrections, expected",
+    [
+        (None, 3 * 4 + 6 * 12),
+        ((), 0),
+        ((ImportanceSamplingGradientCorrection(policy="always"),), 3 * 8 + 6 * 16),
+    ],
     ids=["default", "disabled", "always"],
 )
 def test_correction_budget_covers_captured_storage_and_aliases(
-    rank, grad_enabled, top_k, label_columns, corrections
+    rank, grad_enabled, top_k, hidden_states, label_columns, corrections, expected
 ):
     from art.trainer_rank._corrections import capture_forward_corrections
     from art.trainer_rank._tensors import flatten_tensors
@@ -404,18 +384,16 @@ def test_correction_budget_covers_captured_storage_and_aliases(
         else None
     )
     options = _impl._resolved_request_policy(
-        ForwardOptions(
-            stale_gradient_corrections=_impl.Unset
-            if corrections is None
-            else corrections
-        )
+        None
+        if corrections is None
+        else ForwardOptions(stale_gradient_corrections=corrections)
     )
     request = ForwardInput(
         input_tokens=torch.arange(3),
         target_tokens=labels,
         top_k=top_k or None,
-        hidden_states=True,
-        no_grad=not grad_enabled,
+        hidden_states=hidden_states,
+        no_grad=None if top_k == 2 and grad_enabled else not grad_enabled,
     )
     plan = rank._plan_flat_forward([request])
     group = plan.groups[0]
@@ -430,7 +408,9 @@ def test_correction_budget_covers_captured_storage_and_aliases(
         if top_k
         else None,
         logits=None,
-        hidden_states=torch.zeros(3, 1, requires_grad=grad_enabled),
+        hidden_states=torch.zeros(3, 1, requires_grad=grad_enabled)
+        if hidden_states
+        else None,
     )
     tree = {"output": output, "alias": [output]}
     tensors, _ = flatten_tensors(tree)
@@ -454,6 +434,8 @@ def test_correction_budget_covers_captured_storage_and_aliases(
             if after is not None and after is not before
         )
     assert _impl._correction_state_bytes(group, options) == retained + staged
+    if top_k == 2 and label_columns == 1 and grad_enabled:
+        assert _impl._correction_state_bytes(group, options) == expected
     if not grad_enabled:
         assert next(rank._graph_memory_units(plan))[2].replay_bytes == 0
 
