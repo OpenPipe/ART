@@ -1,7 +1,5 @@
 """Driver CPU transport stays separate from native output placement."""
 
-from __future__ import annotations
-
 import asyncio
 from dataclasses import replace
 import gc

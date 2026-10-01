@@ -101,8 +101,7 @@ def test_hook_removal_applies_to_retained_graph(client):
 @pytest.mark.parametrize("bad_result", (False, True))
 def test_hook_failure_leaves_all_authoritative_gradients_unchanged(client, bad_result):
     trainer, native, parameter, _, collector, backward = setup(client)
-    rank = trainer
-    other = rank.parameter("q", lambda: torch.tensor(3.0), checkpoint="student")
+    other = trainer.parameter("q", lambda: torch.tensor(3.0), checkpoint="student")
     qlive = _live_head(trainer, "q", torch.tensor(3.0), collector)
     q = qlive.value if client else other
     native.grad, other.grad = torch.tensor(5.0), torch.tensor(6.0)

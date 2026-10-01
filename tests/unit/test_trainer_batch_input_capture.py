@@ -1,7 +1,5 @@
 """Batch iterators own submitted inputs while executing one wave at a time."""
 
-from __future__ import annotations
-
 import asyncio
 from typing import Any, cast
 
