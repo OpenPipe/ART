@@ -73,7 +73,7 @@ async def test_concurrent_servers_reserve_distinct_ports(workers, port):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((host, actual_port))
             sock.listen()
-    assert all(server._socket is None and not server._workers for server in servers)
+    assert all(not server._sockets and not server._workers for server in servers)
 
 
 async def test_explicit_worker_override_and_restart(workers):
@@ -115,6 +115,54 @@ async def test_ipv6_only_hostname_with_explicit_port(workers, monkeypatch):
             assert response.status_code == 200
     finally:
         await server.stop()
+
+
+@pytest.mark.parametrize("occupied_second_address", [False, True])
+async def test_hostname_reserves_all_addresses_on_one_port(
+    workers, monkeypatch, occupied_second_address
+):
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        pytest.skip("IPv6 loopback is unavailable")
+    resolve = socket.getaddrinfo
+
+    def resolve_test_host(host, *args, **kwargs):
+        if host == "tinker.test":
+            v6 = resolve("::1", *args, **kwargs)
+            return v6 + resolve("127.0.0.1", *args, **kwargs) + v6
+        return resolve(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve_test_host)
+    with socket.socket() as competitor:
+        port = 0
+        if occupied_second_address:
+            competitor.bind(("127.0.0.1", 0))
+            competitor.listen()
+            port = competitor.getsockname()[1]
+        server = OpenAICompatibleTinkerServer(
+            host="tinker.test", port=port, num_workers=1
+        )
+        try:
+            if occupied_second_address:
+                with pytest.raises(OSError) as caught:
+                    await server.start()
+                assert caught.value.errno == errno.EADDRINUSE
+                assert not workers and not server._sockets
+                with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+                    probe.bind(("::1", port))
+                    probe.listen()
+            else:
+                _, port = await server.start()
+                assert len(server._sockets) == 2
+                assert {sock.getsockname()[1] for sock in server._sockets} == {port}
+                async with httpx.AsyncClient(trust_env=False) as client:
+                    for address in ("[::1]", "127.0.0.1"):
+                        response = await client.get(f"http://{address}:{port}/health")
+                        assert response.status_code == 200
+        finally:
+            await server.stop()
 
 
 async def test_cancel_serving_then_restart_same_port(workers):
@@ -163,9 +211,9 @@ async def test_interrupted_real_startup_closes_listener_and_lifespan(
     stop = None
     try:
         await asyncio.wait_for(entered.wait(), 5)
-        assert server._server is not None and server._socket is not None
+        assert server._server is not None and server._sockets
         uv_server = server._server
-        port = server._socket.getsockname()[1]
+        port = server._sockets[0].getsockname()[1]
         if action == "cancel":
             start.cancel()
         else:
@@ -209,7 +257,7 @@ async def test_stop_before_readiness_poll_does_not_return_address(workers, monke
     finally:
         await asyncio.gather(*stops)
         await server.stop()
-    assert server._socket is None and not server._workers
+    assert not server._sockets and not server._workers
 
 
 @pytest.mark.parametrize(
@@ -265,11 +313,11 @@ async def test_port_reserved_before_workers_and_explicit_port_collision(
     create = module.move_to_child_process
 
     def verify_reservation(*args, **kwargs):
-        assert first._socket is not None
+        assert first._sockets
         with socket.socket() as competitor:
             competitor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             with pytest.raises(OSError):
-                competitor.bind(first._socket.getsockname())
+                competitor.bind(first._sockets[0].getsockname())
         return create(*args, **kwargs)
 
     monkeypatch.setattr(module, "move_to_child_process", verify_reservation)
@@ -278,7 +326,7 @@ async def test_port_reserved_before_workers_and_explicit_port_collision(
         second = OpenAICompatibleTinkerServer(host=host, port=port)
         with pytest.raises(OSError):
             await second.start()
-        assert second._socket is None
+        assert not second._sockets
         assert not second._workers
         assert len(workers) == 1
     finally:
@@ -298,8 +346,8 @@ async def test_partial_worker_failure_releases_socket_and_workers(workers, monke
 
     def fail_second(*args, **kwargs):
         nonlocal address
-        assert server._socket is not None
-        address = server._socket.getsockname()
+        assert server._sockets
+        address = server._sockets[0].getsockname()
         if workers:
             raise RuntimeError("worker failed")
         return create(*args, **kwargs)
@@ -307,7 +355,7 @@ async def test_partial_worker_failure_releases_socket_and_workers(workers, monke
     monkeypatch.setattr(module, "move_to_child_process", fail_second)
     with pytest.raises(RuntimeError, match="worker failed"):
         await server.start()
-    assert server._socket is None and not server._workers
+    assert not server._sockets and not server._workers
     workers[0].close.assert_called_once()
     with socket.socket() as sock:
         assert address is not None
@@ -320,9 +368,9 @@ async def test_failed_start_closes_owned_resources(workers, monkeypatch, failure
     entered = asyncio.Event()
     address = None
 
-    async def run(host, port, sock):
+    async def run(host, port, sockets):
         nonlocal address
-        address = sock.getsockname()
+        address = sockets[0].getsockname()
         entered.set()
         if failure == "error":
             raise ValueError("serve failed")
@@ -347,7 +395,7 @@ async def test_failed_start_closes_owned_resources(workers, monkeypatch, failure
     }
     with pytest.raises(expected[failure]):
         await asyncio.wait_for(task, 5)
-    assert server._task is None and server._socket is None and not server._workers
+    assert server._task is None and not server._sockets and not server._workers
     workers[0].close.assert_called_once()
     with socket.socket() as sock:
         assert address is not None

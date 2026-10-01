@@ -154,7 +154,7 @@ class OpenAICompatibleTinkerServer:
         default_factory=dict
     )
     _workers: list["OpenAICompatibleTinkerServerWorker"] = field(default_factory=list)
-    _socket: socket.socket | None = None
+    _sockets: list[socket.socket] = field(default_factory=list)
     _server: uvicorn.Server | None = None
 
     @property
@@ -170,33 +170,37 @@ class OpenAICompatibleTinkerServer:
         self._get_tenant(os.environ["TINKER_API_KEY"]).models = models
 
     async def start(self) -> tuple[str, int]:
-        if self._socket is not None:
+        if self._sockets:
             raise RuntimeError("Tinker server is already started")
         host = self.host or "0.0.0.0"
         try:
-            addresses = socket.getaddrinfo(
-                host, self.port if self.port is not None else 0, type=socket.SOCK_STREAM
-            )
-            for family, kind, protocol, _, address in addresses:
+            port = self.port if self.port is not None else 0
+            addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+            last_error = None
+            for family, kind, protocol, _, address in dict.fromkeys(addresses):
+                sock = None
                 try:
-                    self._socket = socket.socket(family, kind, protocol)
-                    self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    self._socket.bind(address)
-                    self._socket.listen()
-                    break
+                    sock = socket.socket(family, kind, protocol)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    if family == socket.AF_INET6:
+                        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                    # Reserve one port across all addresses of a hostname.
+                    sock.bind((address[0], port, *address[2:]))
+                    sock.listen()
+                    self._sockets.append(sock)
+                    port = sock.getsockname()[1]
                 except OSError as exc:
-                    if self._socket is not None:
-                        self._socket.close()
-                        self._socket = None
+                    if sock is not None:
+                        sock.close()
                     if exc.errno not in (
                         errno.EADDRNOTAVAIL,
                         errno.EAFNOSUPPORT,
                         errno.EPROTONOSUPPORT,
                     ):
                         raise
-            if self._socket is None:
-                raise OSError(f"No usable listen address for {host}")
-            port = self._socket.getsockname()[1]
+                    last_error = exc
+            if not self._sockets:
+                raise last_error or OSError(f"No usable listen address for {host}")
             self._workers = []
             for i in range(self.num_workers or self._default_num_workers()):
                 self._workers.append(
@@ -205,7 +209,7 @@ class OpenAICompatibleTinkerServer:
                         process_name=f"openai-compatible-tinker-server-worker-{i}",
                     )
                 )
-            task = asyncio.create_task(self._run(host, port, self._socket))
+            task = asyncio.create_task(self._run(host, port, self._sockets))
             self._task = task
             timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 300.0))
             deadline = time.monotonic() + timeout
@@ -244,9 +248,9 @@ class OpenAICompatibleTinkerServer:
                 self._task = None
         finally:
             self._server = None
-            if self._socket is not None:
-                self._socket.close()
-                self._socket = None
+            for sock in self._sockets:
+                sock.close()
+            self._sockets.clear()
             for worker in self._workers:
                 close_proxy(worker)
             self._workers.clear()
@@ -265,7 +269,7 @@ class OpenAICompatibleTinkerServer:
             )
         return self._get_tenant(api_key)
 
-    async def _run(self, host: str, port: int, sock: socket.socket) -> None:
+    async def _run(self, host: str, port: int, sockets: list[socket.socket]) -> None:
         workers = cycle(self._workers)
         app = FastAPI()
 
@@ -511,15 +515,16 @@ class OpenAICompatibleTinkerServer:
         server = self._server = _UvicornServer(server_config)
         server.servers = []
         try:
-            await server.serve(sockets=[sock])
+            await server.serve(sockets=sockets)
         finally:
             try:
                 if hasattr(server, "lifespan") and not server._shutdown_complete:
-                    await server.shutdown(sockets=[sock])
+                    await server.shutdown(sockets=sockets)
             finally:
                 for listener in server.servers:
                     listener.close()
-                sock.close()
+                for sock in sockets:
+                    sock.close()
 
     def _default_num_workers(self) -> int:
         try:
