@@ -666,7 +666,7 @@ class GraphCache:
                     )
                 record.replay_count += 1
             if prepared is None and stale and record.corrections is not None:
-                gradients = record.corrections.correct(gradients)
+                gradients = record.corrections.correct(gradients, None)
             assert record.outputs is not None
             return [
                 (output, gradient.to(output.device))
