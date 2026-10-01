@@ -5,8 +5,6 @@ uses explicit float64 matrix products and Adam equations for expected values.
 Full-model and distributed acceptance are additional gates, not implied here.
 """
 
-from __future__ import annotations
-
 import json
 
 import pytest

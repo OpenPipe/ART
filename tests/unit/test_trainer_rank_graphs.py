@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 from contextlib import contextmanager, nullcontext
 from functools import partial
