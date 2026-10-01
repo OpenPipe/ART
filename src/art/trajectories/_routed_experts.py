@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -115,7 +116,13 @@ def choice_routes(choice: Any, response: Any) -> tuple[list[int], list] | None:
 def history_choices(history: Any) -> list[tuple[Any, Any]]:
     from openai.types.chat.chat_completion import Choice
 
-    from . import ChatCompletionsExchange, CompletionsExchange, LegacyHistory
+    from . import (
+        ChatCompletionsExchange,
+        CompletionsExchange,
+        LegacyHistory,
+        MessagesExchange,
+        ResponsesExchange,
+    )
 
     records = []
     if isinstance(history, LegacyHistory):
@@ -127,16 +134,35 @@ def history_choices(history: Any) -> list[tuple[Any, Any]]:
     else:
         sources = getattr(history, "message_sources", None)
         if sources is None:
+            sources = getattr(history, "input_sources", None)
+        if sources is None:
             sources = [span.source for span in getattr(history, "prompt_sources", ())]
         seen = set()
         for source in sources:
             exchange = getattr(source, "exchange", None)
             index = getattr(source, "choice_index", None)
-            if (
-                not isinstance(exchange, (ChatCompletionsExchange, CompletionsExchange))
-                or index is None
-            ):
+            if isinstance(exchange, (MessagesExchange, ResponsesExchange)):
+                if id(exchange) in seen:
+                    continue
+                seen.add(id(exchange))
+                extra = exchange.response.model_extra or {}
+                if isinstance(exchange, MessagesExchange):
+                    records.append((exchange.response, None))
+                else:
+                    for generation in extra.get("token_generations") or ():
+                        records.append((SimpleNamespace(model_extra=generation), None))
                 continue
+            if not isinstance(exchange, (ChatCompletionsExchange, CompletionsExchange)):
+                continue
+            if index is None:
+                if isinstance(exchange, CompletionsExchange):
+                    from ._history import _completion_choice_groups
+
+                    index = _completion_choice_groups(exchange)[source.prompt_index][
+                        0
+                    ].index
+                else:
+                    index = exchange.response.choices[0].index
             key = (id(exchange), index)
             if key in seen:
                 continue
@@ -218,21 +244,72 @@ def history_logprob_flags(
             flags[index] |= modes[mode]
 
 
-def history_top_k(history: Any, tokens: list[int]) -> Any:
-    from . import TokenizedTopK
+def history_prompt_scores(
+    history: Any, tokens: list[int], logprobs: list[float], flags: list[TokenFlag]
+) -> list[int | None]:
+    from ..preprocessing.dynamo_tokens import compact_prompt_logprobs
+    from . import TokenFlag
+
+    owners: list[int | None] = [None] * len(tokens)
+    for source_index, (choice, response) in enumerate(history_choices(history)):
+        extra = {
+            **(getattr(response, "model_extra", None) or {}),
+            **(choice.model_extra or {}),
+        }
+        prompt = extra.get("prompt_token_ids")
+        values = compact_prompt_logprobs(extra, prompt)
+        if values is None:
+            continue
+        assert isinstance(prompt, list)
+        mode = extra.get("logprobs_mode")
+        flag = {
+            None: TokenFlag(0),
+            "raw_logprobs": TokenFlag.RAW_LOGPROBS,
+            "processed_logprobs": TokenFlag.PROCESSED_LOGPROBS,
+        }.get(mode)
+        if flag is None:
+            raise ValueError(f"Unsupported logprobs_mode: {mode!r}")
+        for i, (actual, captured, value) in enumerate(zip(tokens, prompt, values)):
+            if actual != captured:
+                break
+            # A rescore under this request's settings is not the behavior policy
+            # of an earlier generated token, even if that token has no score.
+            if (
+                not flags[i] & TokenFlag.SAMPLED
+                and math.isnan(logprobs[i])
+                and not math.isnan(value)
+            ):
+                logprobs[i] = value
+                flags[i] |= flag
+                owners[i] = source_index
+    return owners
+
+
+def history_top_k(
+    history: Any,
+    tokens: list[int],
+    flags: list[TokenFlag],
+    prompt_owners: list[int | None],
+) -> Any:
+    from . import TokenFlag, TokenizedTopK
 
     captured = []
     width = 0
-    for choice, response in history_choices(history):
-        extra = choice.model_extra or {}
-        top = extra.get("compact_top_logprobs")
+    sources = [
+        {**(getattr(response, "model_extra", None) or {}), **(choice.model_extra or {})}
+        for choice, response in history_choices(history)
+    ]
+    for source_index, extra, is_prompt in [
+        (index, extra, prompt)
+        for prompt in (False, True)
+        for index, extra in enumerate(sources)
+    ]:
+        field = "compact_prompt_top_logprobs" if is_prompt else "compact_top_logprobs"
+        top = extra.get(field)
         if top is None:
             continue
-        prompt = extra.get(
-            "prompt_token_ids",
-            (getattr(response, "model_extra", None) or {}).get("prompt_token_ids"),
-        )
-        completion = extra.get("token_ids")
+        prompt = extra.get("prompt_token_ids")
+        completion = prompt if is_prompt else extra.get("token_ids")
         if (
             not isinstance(top, dict)
             or not isinstance(prompt, list)
@@ -274,18 +351,31 @@ def history_top_k(history: Any, tokens: list[int]) -> Any:
             ):
                 raise ValueError("compact_top_logprobs requires finite logprobs")
             width = max(width, len(row_ids))
-        captured.append((prompt, completion, ids, values))
+        captured.append(
+            (
+                [] if is_prompt else prompt,
+                completion,
+                ids,
+                values,
+                is_prompt,
+                source_index,
+            )
+        )
     if not captured or not width:
         return None
     ids = [[-1] * width for _ in tokens]
     values = [[math.nan] * width for _ in tokens]
-    for prompt, completion, row_ids, row_values in captured:
+    for prompt, completion, row_ids, row_values, is_prompt, source_index in captured:
         if tokens[: len(prompt)] != prompt:
             continue
         for j, (actual, token) in enumerate(zip(tokens[len(prompt) :], completion)):
             if actual != token:
                 break
             index = len(prompt) + j
+            if is_prompt and (
+                flags[index] & TokenFlag.SAMPLED or prompt_owners[index] != source_index
+            ):
+                continue
             if all(token_id == -1 for token_id in ids[index]):
                 ids[index][: len(row_ids[j])] = row_ids[j]
                 values[index][: len(row_values[j])] = row_values[j]

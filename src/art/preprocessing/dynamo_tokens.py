@@ -47,6 +47,32 @@ def has_completion_logprobs(choice: Choice | CompletionChoice) -> bool:
     return any(key in (choice.model_extra or {}) for key in COMPLETION_LOGPROBS_KEYS)
 
 
+def compact_prompt_logprobs(extra: dict[str, Any], tokens: Any) -> list[float] | None:
+    """Decode unavailable (null) and impossible (\"-inf\") prompt scores."""
+    values = extra.get("compact_prompt_logprobs")
+    if values is None:
+        return None
+    if (
+        not isinstance(values, list)
+        or not isinstance(tokens, list)
+        or len(values) != len(tokens)
+    ):
+        raise ValueError("compact_prompt_logprobs must match prompt token IDs")
+    result = []
+    for value in values:
+        if value is None:
+            result.append(math.nan)
+        elif value == "-inf":
+            result.append(-math.inf)
+        elif type(value) in (float, int) and math.isfinite(value):
+            result.append(float(value))
+        else:
+            raise ValueError(
+                "compact_prompt_logprobs requires finite numbers, null, or '-inf'"
+            )
+    return result
+
+
 def attach_dynamo_token_metadata(response: ChatCompletion) -> None:
     """Attach single-choice engine metadata to ART's per-choice training fields.
 

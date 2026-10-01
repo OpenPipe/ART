@@ -43,7 +43,7 @@ def _tensor(value: object, *, dtype: torch.dtype, label: str) -> torch.Tensor:
         result = value.to(dtype=dtype)
     else:
         if label == "logprobs" and isinstance(value, (list, tuple)):
-            value = [math.nan if item == "NaN" else item for item in value]
+            value = [float(item) if isinstance(item, str) else item for item in value]
         try:
             result = torch.tensor(value, dtype=dtype)
         except (TypeError, ValueError, RuntimeError) as exc:
@@ -78,7 +78,9 @@ class TensorizedTopK(_StringInterningModel):
             for row in value:
                 if not isinstance(row, list):
                     raise ValueError("top_k fields must have shape [tokens, k]")
-                rows.append([math.nan if item == "NaN" else item for item in row])
+                rows.append(
+                    [float(item) if isinstance(item, str) else item for item in row]
+                )
             value = rows
         result = value if isinstance(value, torch.Tensor) else torch.tensor(value)
         if result.ndim != 2:

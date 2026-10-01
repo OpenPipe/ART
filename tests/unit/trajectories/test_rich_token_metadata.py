@@ -50,6 +50,166 @@ def _trajectory(response=None):
     )
 
 
+def test_compact_prompt_scores_keep_impossible_and_unavailable_distinct():
+    response = _response()
+    response.model_extra.update(
+        compact_prompt_logprobs=[None, "-inf"],
+        compact_prompt_top_logprobs={"token_ids": [[], [99]], "logprobs": [[], [0.0]]},
+        logprobs_mode="processed_logprobs",
+    )
+    tokenized = _trajectory(response).tokenize()
+    assert math.isnan(tokenized.logprobs[0])
+    assert tokenized.logprobs[1:] == [-math.inf, -0.1, -0.2]
+    assert tokenized.flags[1] & tr.TokenFlag.PROCESSED_LOGPROBS
+    assert not tokenized.flags[1] & tr.TokenFlag.SAMPLED
+    assert tokenized.top_k.tokens == [[-1], [99], [-1], [-1]]
+    for value in (tokenized, tokenized.tensorize()):
+        restored = type(value).model_validate_json(value.model_dump_json())
+        assert math.isnan(restored.logprobs[0])
+        assert restored.logprobs[1] == -math.inf
+        compact = tr.compact_validate(value.compact_dump())
+        assert isinstance(compact, (tr.TokenizedTrajectory, tr.TensorizedTrajectory))
+        assert compact.logprobs[1] == -math.inf
+
+
+@pytest.mark.parametrize(
+    "values", [[None], [None, "NaN"], [None, math.inf], [None, True]]
+)
+def test_invalid_compact_prompt_scores_are_rejected(values):
+    response = _response()
+    response.model_extra["compact_prompt_logprobs"] = values
+    with pytest.raises(ValueError, match="compact_prompt_logprobs"):
+        _trajectory(response).tokenize()
+
+
+def test_prompt_rescoring_never_replaces_sampled_probabilities():
+    from art.trajectories._routed_experts import history_prompt_scores, history_top_k
+
+    response = _response()
+    response.model_extra.update(
+        compact_prompt_logprobs=[None, "-inf"],
+        compact_prompt_top_logprobs={"token_ids": [[], [99]], "logprobs": [[], [0.0]]},
+        logprobs_mode="processed_logprobs",
+    )
+    history = _trajectory(response).histories()[0]
+    flags = [tr.TokenFlag.EXACT, tr.TokenFlag.SAMPLED | tr.TokenFlag.RAW_LOGPROBS]
+    for behavior_score in (-0.5, math.nan):
+        scores = [math.nan, behavior_score]
+        history_prompt_scores(history, [10, 11], scores, flags)
+        assert scores[1] == behavior_score or math.isnan(scores[1])
+        assert flags[1] & tr.TokenFlag.RAW_LOGPROBS
+        assert not flags[1] & tr.TokenFlag.PROCESSED_LOGPROBS
+    top = history_top_k(history, [10, 11], flags, [None, None])
+    assert top.tokens == [[-1], [-1]]
+
+
+@pytest.mark.parametrize("protocol", ["messages", "responses"])
+def test_other_protocols_preserve_the_same_compact_metadata(protocol):
+    from anthropic.types import Message
+    from openai.types.responses import Response
+
+    now = datetime.now(timezone.utc)
+    metadata = {
+        "prompt_token_ids": [10, 11],
+        "token_ids": [20],
+        "compact_logprobs": [-0.3],
+        "compact_prompt_logprobs": [None, "-inf"],
+        "compact_top_logprobs": {"token_ids": [[20]], "logprobs": [[-0.3]]},
+        "prompt_routed_experts": [[[0]], [[1]]],
+        "routed_experts": [[[-1]]],
+        "logprobs_mode": "processed_logprobs",
+    }
+    if protocol == "messages":
+        response = Message.model_validate(
+            {
+                "id": "message",
+                "type": "message",
+                "role": "assistant",
+                "model": "policy",
+                "content": [{"type": "text", "text": "yes"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 2, "output_tokens": 1},
+                **metadata,
+            }
+        )
+        exchange = tr.MessagesExchange(
+            request={
+                "model": "policy",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+            },
+            response=response,
+            start_time=now,
+            end_time=now,
+        )
+    else:
+        response = Response.model_validate(
+            {
+                "id": "response",
+                "object": "response",
+                "created_at": 0,
+                "model": "policy",
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+                "output": [
+                    {
+                        "id": "msg",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {"type": "output_text", "text": "yes", "annotations": []}
+                        ],
+                    }
+                ],
+                "token_generations": [{**metadata, "output_indices": [0]}],
+            }
+        )
+        exchange = tr.ResponsesExchange(
+            request={"model": "policy", "input": "hi"},
+            response=response,
+            start_time=now,
+            end_time=now,
+        )
+    trajectory = tr.Trajectory(
+        exchanges=tr.TrajectoryExchanges(**{protocol: [exchange]}), reward=0
+    )
+    tokenized = trajectory.tokenize()
+    assert tokenized.tokens == [10, 11, 20]
+    assert math.isnan(tokenized.logprobs[0])
+    assert tokenized.logprobs[1:] == [-math.inf, -0.3]
+    assert tokenized.routed_experts == [[[0]], [[1]], [[-1]]]
+    assert tokenized.top_k is not None
+    assert tokenized.top_k.tokens == [[-1], [-1], [20]]
+    assert tokenized.flags[-1] & tr.TokenFlag.PROCESSED_LOGPROBS
+
+
+def test_prompt_topk_cannot_mix_distributions_from_different_requests():
+    from art.trajectories._routed_experts import history_prompt_scores, history_top_k
+
+    choices = []
+    for score in (-0.5, -1.0):
+        choice = _response().choices[0]
+        choice.model_extra.update(
+            prompt_token_ids=[10, 11],
+            compact_prompt_logprobs=[None, score],
+            logprobs_mode="processed_logprobs",
+        )
+        choices.append(choice)
+    choices[1].model_extra["compact_prompt_top_logprobs"] = {
+        "token_ids": [[], [11]],
+        "logprobs": [[], [-1.0]],
+    }
+    history = tr.LegacyHistory(messages_and_choices=choices)
+    flags = [tr.TokenFlag.EXACT] * 2
+    scores = [math.nan] * 2
+    owners = history_prompt_scores(history, [10, 11], scores, flags)
+    assert scores[1] == -0.5
+    top = history_top_k(history, [10, 11], flags, owners)
+    assert top.tokens == [[-1], [-1]]
+
+
 def test_compact_logprobs_and_routes_survive_tokenize_tensorize_and_serialization():
     trajectory = _trajectory()
     expected = [[[0, 1]], [[1, 2]], [[2, 3]], [[-1, -1]]]

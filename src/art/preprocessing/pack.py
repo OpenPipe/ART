@@ -681,7 +681,8 @@ def _first_trainable_token_index(
     assistant_mask: np.ndarray,
     logprobs: np.ndarray,
 ) -> int:
-    trainable = assistant_mask | ~np.isnan(logprobs)
+    # Prompt scores are metadata; only the mask identifies training targets.
+    trainable = assistant_mask
     indices = np.flatnonzero(trainable)
     return int(indices[0]) if int(indices.size) > 0 else int(assistant_mask.shape[0])
 
