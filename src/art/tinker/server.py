@@ -11,7 +11,6 @@ from typing import Annotated, Any, AsyncGenerator, Literal, cast
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
-from openai import AsyncOpenAI
 from openai.types import Model, ModelDeleted
 from openai.types.chat.chat_completion import ChatCompletion, Choice, ChoiceLogprobs
 from openai.types.chat.chat_completion_message import ChatCompletionMessage
@@ -136,6 +135,8 @@ class OpenAICompatibleTinkerServer:
         default_factory=dict
     )
     _workers: list["OpenAICompatibleTinkerServerWorker"] = field(default_factory=list)
+    _socket: socket.socket | None = None
+    _server: uvicorn.Server | None = None
 
     @property
     def models(self) -> dict[str, str]:
@@ -150,9 +151,18 @@ class OpenAICompatibleTinkerServer:
         self._get_tenant(os.environ["TINKER_API_KEY"]).models = models
 
     async def start(self) -> tuple[str, int]:
+        if self._socket is not None:
+            raise RuntimeError("Tinker server is already started")
         host = self.host or "0.0.0.0"
-        port = self.port or get_free_port(host)
         try:
+            self._socket = socket.socket(
+                socket.AF_INET6 if ":" in host else socket.AF_INET,
+                socket.SOCK_STREAM,
+            )
+            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._socket.bind((host, self.port if self.port is not None else 0))
+            self._socket.listen()
+            port = self._socket.getsockname()[1]
             self._workers = []
             for i in range(self.num_workers or self._default_num_workers()):
                 self._workers.append(
@@ -161,20 +171,19 @@ class OpenAICompatibleTinkerServer:
                         process_name=f"openai-compatible-tinker-server-worker-{i}",
                     )
                 )
-            self._task = asyncio.create_task(self._run(host, port))
-            client = AsyncOpenAI(api_key="default", base_url=f"http://{host}:{port}/v1")
-            start = time.time()
-            while True:
-                timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 300.0))
-                if time.time() - start > timeout:
+            task = asyncio.create_task(self._run(host, port, self._socket))
+            self._task = task
+            timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 300.0))
+            deadline = time.monotonic() + timeout
+            while self._server is None or not self._server.started:
+                if task.done():
+                    await task
+                    raise RuntimeError("Tinker server exited before startup")
+                if time.monotonic() > deadline:
                     raise TimeoutError(
                         f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
                     )
-                try:
-                    await client.completions.create(model="", prompt="")
-                    break  # Server is ready
-                except Exception:
-                    await asyncio.sleep(0.1)
+                await asyncio.sleep(0.01)
             return host, port
         except BaseException:
             await self.stop()
@@ -183,13 +192,20 @@ class OpenAICompatibleTinkerServer:
     async def stop(self) -> None:
         try:
             if self._task is not None:
-                self._task.cancel()
+                if self._server is not None and self._server.started:
+                    self._server.should_exit = True
+                else:
+                    self._task.cancel()
                 try:
-                    await self._task
+                    await asyncio.wait_for(self._task, timeout=10)
                 except (asyncio.CancelledError, Exception):
                     pass
                 self._task = None
         finally:
+            self._server = None
+            if self._socket is not None:
+                self._socket.close()
+                self._socket = None
             for worker in self._workers:
                 close_proxy(worker)
             self._workers.clear()
@@ -208,7 +224,7 @@ class OpenAICompatibleTinkerServer:
             )
         return self._get_tenant(api_key)
 
-    async def _run(self, host: str, port: int) -> None:
+    async def _run(self, host: str, port: int, sock: socket.socket) -> None:
         workers = cycle(self._workers)
         app = FastAPI()
 
@@ -449,15 +465,20 @@ class OpenAICompatibleTinkerServer:
             host=host,
             port=port,
             log_level="error",
+            timeout_graceful_shutdown=5,
         )
-        server = uvicorn.Server(server_config)
-        await server.serve()
+        self._server = uvicorn.Server(server_config)
+        try:
+            await self._server.serve(sockets=[sock])
+        finally:
+            sock.close()
 
     def _default_num_workers(self) -> int:
         try:
-            return max(1, len(os.sched_getaffinity(0)))  # ty:ignore[unresolved-attribute]
+            cpus = len(os.sched_getaffinity(0))  # ty:ignore[unresolved-attribute]
         except (AttributeError, OSError):
-            return os.cpu_count() or 1
+            cpus = os.cpu_count() or 1
+        return max(1, min(cpus, 8))
 
     def _get_tenant(self, api_key: str) -> "OpenAICompatibleTinkerServerTenant":
         if api_key not in self._tenants:
