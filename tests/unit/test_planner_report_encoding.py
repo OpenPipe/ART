@@ -43,9 +43,11 @@ def test_shared_containers_are_not_cycles():
 
 @pytest.mark.parametrize("kind", ["list", "dict", "indirect"])
 def test_cycles_refuse(kind):
-    value = [] if kind == "list" else {}
+    value = {}
     if kind == "list":
-        value.append(value)
+        sequence = []
+        sequence.append(sequence)
+        value["cycle"] = sequence
     else:
         value["cycle"] = value if kind == "dict" else ([], value)
     with pytest.raises(ValueError, match="Circular reference"):
