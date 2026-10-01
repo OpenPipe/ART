@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 from test_trainer_rank_custom_tensors import _trainer, _use_local_gradients
@@ -376,6 +377,36 @@ def test_constructor_staleness_applies_to_heads_before_mutating_gradients():
         with trainer._gradient_transaction():
             old.backward()
     assert head.left.grad is None
+
+
+def _empty_buffer_sync_worker(process_rank, init_method):
+    from art.trainer_rank import _checkpoint, _heads
+
+    with gloo_group(process_rank, init_method, timeout=10):
+        trainer, rank = _trainer("student")
+        for parameter in (False, True):
+            if parameter:
+                rank.parameter(
+                    "weight", lambda: torch.tensor(1.0), checkpoint="student"
+                )
+            with patch.object(
+                _checkpoint, "_gather", wraps=_checkpoint._gather
+            ) as gather:
+                _heads.synchronize_head_buffers(trainer)
+            assert gather.call_count == 1
+            assert gather.call_args.args[0] == {}
+            completed = torch.tensor(1)
+            dist.all_reduce(completed, group=trainer._checkpoint_group())
+            assert completed.item() == 2
+
+
+def test_distributed_empty_buffer_sync_keeps_registration_agreement(tmp_path):
+    spawn_and_join(
+        _empty_buffer_sync_worker,
+        (f"file://{tmp_path / 'empty-buffer-sync'}",),
+        timeout=60,
+        failure="Empty buffer synchronization stranded a collective peer",
+    )
 
 
 def _buffer_authority_worker(process_rank, init_method):

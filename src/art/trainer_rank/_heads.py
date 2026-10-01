@@ -1239,6 +1239,8 @@ def synchronize_head_buffers(trainer: TrainerRank, checkpoints: Any = None) -> N
         raise trainer._slot_state_error(
             "Custom buffer registrations differ across ranks"
         )
+    if not targets:
+        return
     payload = _checkpoint._phase(
         lambda: (
             {
