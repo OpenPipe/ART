@@ -430,8 +430,8 @@ class _Executor:
 
     def _gather_outputs(self, value: Any) -> list[Any] | None:
         try:
-            if not self.distributed or len(self.members) == 1:
-                return [value]
+            if self.mode == "rank" or not self.distributed or len(self.members) == 1:
+                return [value] if self.is_leader else None
 
             def admit_serialization() -> None:
                 from ._tensors import flatten_tensors

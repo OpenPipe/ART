@@ -306,13 +306,16 @@ class _FailPhysicalBackward(torch.autograd.Function):
         return gradient
 
 
-def _distributed_worker(physical, rendezvous, output):
+def _distributed_worker(physical, rendezvous, output, parallel_axis):
     with (
         gloo_group(physical, f"file://{rendezvous}", world_size=4),
         megatron_topology(physical, dp_size=2, tp_size=2) as ps,
     ):
         dp_groups = [dist.new_group([0, 2]), dist.new_group([1, 3])]
         dp, tp = divmod(physical, 2)
+        if parallel_axis == "cp":
+            ps.get_context_parallel_rank = ps.get_tensor_model_parallel_rank
+            ps.get_tensor_model_parallel_rank = lambda: 0
         rank: Any = _Rank(dp, 2)
         counts = [0, 0]
 
@@ -353,9 +356,26 @@ def _distributed_worker(physical, rendezvous, output):
             if out:
                 view.backward(_loss_tree(out))
             view.optim_step()
+            batches = list(view.forward_batches([_input(3), _input(5)], no_grad=True))
+            assert [batch.indices for batch in batches] == [
+                [0] if dp == 0 else [],
+                [1] if dp == 1 else [],
+            ]
+            assert all(
+                not output.hidden_states.requires_grad
+                for batch in batches
+                for output in batch.outputs
+            )
+            handle = view.open_forward_batches([_input(7)], no_grad=True)
+            batch = view.next_forward_batch(handle)
+            assert batch is not None and batch.indices == ([0] if dp == 0 else [])
+            assert view.next_forward_batch(handle) is None
             return dp
 
-        per_dp = asyncio.run(run_rank_callback(rank, logical))
+        with patch.object(
+            dist, "gather_object", side_effect=AssertionError("rank output gather")
+        ):
+            per_dp = asyncio.run(run_rank_callback(rank, logical))
 
         # Persistent streams release the command scope between waves. Every
         # physical participant must retain its iterator while serving other jobs.
@@ -537,11 +557,12 @@ def _distributed_worker(physical, rendezvous, output):
             torch.save(gathered, output)
 
 
-def test_gloo_dp2_tp2_participation_and_gradients(tmp_path):
+@pytest.mark.parametrize("parallel_axis", ["tp", "cp"])
+def test_gloo_dp2_parallel_participation_and_gradients(tmp_path, parallel_axis):
     output = tmp_path / "result.pt"
     mp.spawn(
         _distributed_worker,
-        args=(str(tmp_path / "init"), str(output)),
+        args=(str(tmp_path / "init"), str(output), parallel_axis),
         nprocs=4,
         join=True,
     )
