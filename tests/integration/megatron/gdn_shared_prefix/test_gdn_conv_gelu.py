@@ -59,13 +59,17 @@ def test_bf16_silu_matches_materialized_activation(
         for value in inputs
         if value is not None
     )
-    # Exact BF16 operands accumulate to 1 + 1/256, a preactivation rounding tie.
-    conv_in.fill_(1)
-    initial.fill_(1)
-    weight[:] = weight.new_tensor([1, 1 / 256, -1, 1])
-    bias.zero_()
-    out_grad.fill_(0 if final_only else 0.3)
-    final_grad.fill_(0.5)
+    if final_only:
+        # Distinct raw inputs and cotangents make tail routing observable.
+        out_grad.zero_()
+    else:
+        # Exact BF16 operands accumulate to 1 + 1/256, a rounding tie.
+        conv_in.fill_(1)
+        initial.fill_(1)
+        weight[:] = weight.new_tensor([1, 1 / 256, -1, 1])
+        bias.zero_()
+        out_grad.fill_(0.3)
+        final_grad.fill_(0.5)
     args = conv_in, cu, initial, weight, bias, out_grad, final_grad
     reference = _run_packed_fused(*args, activation=activation, split_silu=True)
     candidate = _run_packed_fused(*args, activation=activation)
