@@ -135,8 +135,10 @@ def test_group_cache_routes_old_gradients_after_optimizer_update(
         assert trainer._forward_graph_cache().handles() == ()
 
 
-@pytest.mark.parametrize("mode", ["always", "current_replay"])
-def test_native_stale_logprob_correction_keeps_original_gradient_age(mode, monkeypatch):
+@pytest.mark.parametrize("retention", ["gpu", "replay"])
+def test_native_stale_logprob_correction_keeps_original_gradient_age(
+    retention, monkeypatch
+):
     from art.trainer_rank import (
         ImportanceSamplingGradientCorrection,
         TrainerRankSlotStateError,
@@ -166,11 +168,10 @@ def test_native_stale_logprob_correction_keeps_original_gradient_age(mode, monke
             input_tokens=tokens,
             target_tokens=torch.zeros_like(tokens),
             options=ForwardOptions(
+                backward_state=retention,
                 stale_gradient_corrections=(
-                    ImportanceSamplingGradientCorrection(
-                        policy="always" if mode == "always" else "when_available"
-                    ),
-                )
+                    ImportanceSamplingGradientCorrection(policy="always"),
+                ),
             ),
         )
         group = _ForwardGroupPlan(
@@ -195,13 +196,8 @@ def test_native_stale_logprob_correction_keeps_original_gradient_age(mode, monke
         current = [value.detach().clone().requires_grad_() for value in parameters]
         new_logprobs = (((x @ current[0]) @ current[1]) * 16).log_softmax(-1)[:, 0]
         weights = (new_logprobs.detach() - old_logprobs.detach()).exp().clamp(0, 5)
-        expected = torch.autograd.grad(
-            ((old_logprobs if mode == "always" else new_logprobs) * weights).sum(),
-            historical if mode == "always" else current,
-        )
+        expected = torch.autograd.grad((old_logprobs * weights).sum(), historical)
         cache = trainer._forward_graph_cache()
-        if mode == "current_replay":
-            cache.evict(cache.handles()[0], replay_with_current=True)
         with trainer._gradient_transaction():
             packets = trainer._forward_cotangent_collector().backward(output.sum())
             cache.backward_many(
@@ -209,7 +205,7 @@ def test_native_stale_logprob_correction_keeps_original_gradient_age(mode, monke
             )
         for parameter, gradient in zip(parameters, expected, strict=True):
             torch.testing.assert_close(parameter.grad, gradient, atol=2e-4, rtol=5e-5)
-        assert executions == [True, mode == "current_replay"]
+        assert executions == [True, False] + ([True] if retention == "replay" else [])
         assert trainer._version_state()._origins["A"] == {(origin, 2)}
         trainer._checkpoint_slots["A"].revision += 2
         with pytest.raises(TrainerRankSlotStateError, match="staleness 3"):

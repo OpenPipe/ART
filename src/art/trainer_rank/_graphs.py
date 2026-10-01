@@ -229,7 +229,6 @@ class _ForwardRecord:
     corrections: Any = None
     is_stale: Callable[[], bool] | None = None
     current_context_factory: Callable[[], AbstractContextManager[Any]] | None = None
-    replay_with_current: bool = False
     restored: dict[tuple[torch.device, StorageWeakRef], torch.Tensor] = field(
         default_factory=dict
     )
@@ -499,16 +498,10 @@ class GraphCache:
             copies.clear()
         record.retention = "cpu"
 
-    def evict(
-        self, handle: ForwardHandle, *, replay_with_current: bool | None = None
-    ) -> None:
+    def evict(self, handle: ForwardHandle) -> None:
         record = self._records[handle]
         if not getattr(record.options, "allow_replay", True):
             raise RuntimeError("Graph replay is disabled for this forward")
-        if replay_with_current is not None:
-            if replay_with_current and record.current_context_factory is None:
-                raise ValueError("Current-weight replay requires a version context")
-            record.replay_with_current = replay_with_current
         record.release_physical()
         record.retention = "replay"
 
@@ -634,7 +627,6 @@ class GraphCache:
             stale
             and record.corrections is not None
             and record.corrections.requires_current(gradients)
-            and not (record.outputs is None and record.replay_with_current)
         ):
             return None
         # Explicit always may add a no-grad forward. Stage every correction
@@ -660,14 +652,9 @@ class GraphCache:
             gradients = gradients if prepared is None else prepared
             if not any(gradient is not None for gradient in gradients):
                 return []
-            current_replay = stale and record.replay_with_current
             if record.outputs is None:
                 with record.rng.replay(record.rng_tracker):
-                    physical = record.run(
-                        context_factory=record.current_context_factory
-                        if current_replay
-                        else None
-                    )
+                    physical = record.run()
                 metadata = tuple(
                     (value.shape, value.dtype, value.device, value.requires_grad)
                     for value in physical
@@ -679,11 +666,7 @@ class GraphCache:
                     )
                 record.replay_count += 1
             if prepared is None and stale and record.corrections is not None:
-                if current_replay:
-                    record.corrections.validate_replay(gradients, record.outputs)
-                gradients = record.corrections.correct(
-                    gradients, record.outputs if current_replay else None
-                )
+                gradients = record.corrections.correct(gradients)
             assert record.outputs is not None
             return [
                 (output, gradient.to(output.device))

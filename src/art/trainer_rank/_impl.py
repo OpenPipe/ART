@@ -6820,8 +6820,8 @@ def _correction_state_bytes(
             else 0
         )
     )
-    # Top-k probabilities and identities persist for replay validation even
-    # without corrections; explicit always also stages corrected cotangents.
+    # Captured top-k probabilities and identities persist even without
+    # corrections; explicit always also stages corrected cotangents.
     return topk * 8 + logprobs * (
         2
         if any(c.policy == "always" for c in options.stale_gradient_corrections)

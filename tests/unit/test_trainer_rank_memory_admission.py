@@ -450,14 +450,6 @@ def test_correction_budget_covers_captured_storage_and_aliases(
     assert _impl._correction_state_bytes(group, options) == retained + staged
     if not grad_enabled:
         assert next(rank._graph_memory_units(plan))[2].replay_bytes == 0
-    elif output.top_k is not None:
-        current = list(tensors)
-        index = next(
-            i for i, tensor in enumerate(tensors) if tensor is output.top_k.tokens
-        )
-        current[index] = current[index].flip(-1)
-        with pytest.raises(RuntimeError, match="changed active top-k token identities"):
-            context.validate_replay(gradients, current)
 
 
 @pytest.mark.parametrize(

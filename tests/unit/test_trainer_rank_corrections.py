@@ -184,35 +184,7 @@ def test_bad_cotangent_shape_is_rejected_before_requesting_replay() -> None:
         context.requires_current((None, torch.ones(1), None, None))
 
 
-@pytest.mark.parametrize("corrections", [(), (ImportanceSamplingGradientCorrection(),)])
-def test_current_replay_rejects_changed_active_top_k_events_even_without_correction(
-    corrections,
-) -> None:
-    values = torch.tensor([[-0.5, -1.0]], requires_grad=True)
-    tokens = torch.tensor([[2, 0]])
-    output = ForwardOutput(None, TopK(values, tokens), None, None)
-    context = capture_forward_corrections(
-        output,
-        (values, tokens),
-        ResolvedForwardOptions(stale_gradient_corrections=corrections),
-    )
-    gradients = (torch.ones_like(values), None)
-    context.validate_replay(gradients, (values - 1, tokens))
-    for changed in (tokens.flip(-1), torch.tensor([[2, 3]])):
-        with pytest.raises(RuntimeError, match="changed active top-k token identities"):
-            context.validate_replay(gradients, (values - 1, changed))
-    torch.testing.assert_close(gradients[0], torch.ones_like(values))
-
-
-def test_current_replay_ignores_inactive_top_k_event_changes() -> None:
-    context, tensors = _fixture("always")
-    current = (tensors[0], tensors[1], torch.tensor([[2, 3]]), tensors[3] - 1)
-    context.validate_replay((None, None, None, torch.tensor([[1.0, 0.0]])), current)
-    context.validate_replay((None, None, None, torch.zeros_like(tensors[3])), current)
-    context.validate_replay((None, None, None, None), current)
-
-
-def test_current_ratio_evaluation_can_reorder_but_physical_replay_cannot() -> None:
+def test_current_ratio_evaluation_can_reorder_top_k_events() -> None:
     context, tensors = _fixture("always", logits=True)
     gradients = (None, None, None, torch.ones_like(tensors[3]), None)
     current = (
@@ -226,5 +198,3 @@ def test_current_ratio_evaluation_can_reorder_but_physical_replay_cannot() -> No
         context.correct(gradients, current)[3],
         torch.exp(torch.full_like(tensors[3], -1)),
     )
-    with pytest.raises(RuntimeError, match="changed active top-k token identities"):
-        context.validate_replay(gradients, current)

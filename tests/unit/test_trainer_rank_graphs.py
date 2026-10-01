@@ -490,60 +490,15 @@ def test_correction_and_coordinator_failures_release_owned_storage(
     assert all(storage.expired() for storage in storages) and not cache.handles()
 
 
-def test_newer_replay_opportunistically_corrects_current_jacobian():
-    cache, handle, original, current, executions, _ = _corrected_cache()
-    cache.evict(handle, replay_with_current=True)
+def test_always_correction_after_eviction_uses_original_jacobian():
+    cache, handle, original, current, executions, _ = _corrected_cache(policy="always")
+    cache.evict(handle)
     cache.backward(handle, (torch.tensor(1.0),))
-    assert original.grad is None
-    torch.testing.assert_close(current.grad, torch.tensor(0.75).exp())
-    assert executions == [(False, True), (True, True)]
-
-
-@pytest.mark.parametrize("corrections", [False, True])
-def test_current_replay_rejects_changed_selected_token_events(corrections, request):
-    from art.trainer_rank._corrections import capture_forward_corrections
-
-    if gc.isenabled():
-        request.addfinalizer(gc.enable)
-    gc.disable()
-    cache = GraphCache()
-    parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
-    tokens = [torch.tensor([0, 1])]
-    storages = []
-
-    def execute(_):
-        logprobs = parameter.log_softmax(-1)
-        output = logprobs[tokens[0]]
-        storages.extend(
-            StorageWeakRef(value.untyped_storage()) for value in (logprobs, output)
-        )
-        return output, tokens[0]
-
-    handle, outputs = cache.run(execute, None)
-    context = capture_forward_corrections(
-        ForwardOutput(None, TopK(outputs[0], outputs[1]), None, None),
-        outputs,
-        ResolvedForwardOptions(
-            stale_gradient_corrections=(ImportanceSamplingGradientCorrection(),)
-            if corrections
-            else (),
-        ),
+    assert current.grad is None
+    torch.testing.assert_close(
+        original.grad, torch.tensor(2.0) * torch.tensor(0.75).exp()
     )
-    cache.set_corrections(
-        handle, context, is_stale=lambda: True, current_context_factory=nullcontext
-    )
-    cache.evict(handle, replay_with_current=True)
-    tokens[0] = torch.tensor([1, 0])
-    gradient = torch.ones(2)
-    with pytest.raises(RuntimeError, match="token identit") as failure:
-        cache.backward(handle, (gradient, None))
-    assert failure.value.__traceback__ is not None and failure.value.__cause__ is None
-    assert len(storages) == 4 and all(storage.expired() for storage in storages)
-    torch.testing.assert_close(parameter, torch.tensor([1.0, 2.0]))
-    torch.testing.assert_close(gradient, torch.ones(2))
-    torch.testing.assert_close(tokens[0], torch.tensor([1, 0]))
-    assert parameter.grad is None
-    assert not cache.handles()
+    assert executions == [(False, True), (True, False), (False, True)]
 
 
 @pytest.mark.parametrize("checkpointing", [False, True])

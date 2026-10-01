@@ -145,8 +145,7 @@ class ForwardCorrectionContext:
 
     Current tensors must come from the original inputs/contexts, with the same
     flattened output layout. Correct only stale forwards; exact original-weight
-    replay itself does not produce current probabilities. Validate physical
-    current-weight replay even when corrections are disabled.
+    replay itself does not produce current probabilities.
     """
 
     output_count: int
@@ -259,42 +258,6 @@ class ForwardCorrectionContext:
             del self, gradients, current_tensors
             output = gradient = original = current = tokens = original_tokens = None
             sorted_tokens = order = positions = matched = logits = corrected = None
-
-    def validate_replay(
-        self,
-        gradients: Sequence[torch.Tensor | None],
-        current_tensors: Sequence[torch.Tensor],
-    ) -> None:
-        """Require active top-k cotangents to address the same replayed events.
-
-        Ratio evaluation on a separate current forward can realign top-k IDs.
-        Physical current-weight replay cannot feed original-position cotangents
-        to a Jacobian whose selected token at that position has changed.
-        """
-        try:
-            self.requires_current(gradients)
-            if len(current_tensors) != self.output_count:
-                raise ValueError("current tensors must match the captured output count")
-            for output in self.outputs:
-                gradient = gradients[output.index]
-                if output.original_tokens is None or gradient is None:
-                    continue
-                active = gradient != 0
-                if not bool(active.any()):
-                    continue
-                assert output.token_index is not None
-                tokens = current_tensors[output.token_index]
-                original = output.original_tokens.to(tokens.device)
-                if tokens.shape != original.shape or bool(
-                    ((tokens != original) & active.to(tokens.device)).any()
-                ):
-                    raise RuntimeError(
-                        "current replay changed active top-k token identities; "
-                        "replay the original weights instead"
-                    )
-        finally:
-            del self, gradients, current_tensors
-            output = gradient = active = tokens = original = None
 
 
 def capture_forward_corrections(
