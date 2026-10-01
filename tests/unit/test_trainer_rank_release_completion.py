@@ -31,7 +31,7 @@ async def test_completed_release_is_finalized_before_queued_done_callback(
     )
     completed.set_result(None)
     completed.add_done_callback(lambda _: executor._finish_release(release))
-    await executor._join_release()
+    await join_rank_callback_release(rank)
     assert not state.graphs and not state.released
     assert state.pending_release is None
     # The already queued callback cannot alter the next release's ownership.
@@ -58,7 +58,7 @@ async def test_background_cleanup_failure_is_reported_and_blocks_next_entry(canc
     else:
         completed.set_exception(RuntimeError("injected release transport error"))
     with pytest.raises(RuntimeError, match="Callback release reconciliation failed"):
-        await asyncio.wait_for(executor._join_release(), 1)
+        await asyncio.wait_for(join_rank_callback_release(rank), 1)
     assert len(reports) == 1
     with pytest.raises(RuntimeError, match="Callback release reconciliation failed"):
         await executor.reconcile_releases()

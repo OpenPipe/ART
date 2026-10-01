@@ -11,8 +11,8 @@ import pytest
 import torch
 from trainer_rank_test_support import gloo_group, megatron_topology, spawn_and_join
 
-from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank
-from art.trainer_rank._commands import _Command, _encode_command, _Executor
+from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank, _transport
+from art.trainer_rank._commands import _Command, _Executor
 from art.trainer_rank._heads import HeadRegistration
 from art.trainer_rank._impl import _CheckpointSlot
 from art.trainer_rank._tensors import managed_tensor
@@ -97,7 +97,9 @@ def test_command_codec_preserves_nested_types_aliases_and_closure_storage() -> N
 
     executor = _Executor(cast(Any, _Rank()), "zero")
     source = _payload("cpu")
-    result = executor._decode(_encode_command(_Command(1, "test", (source,), {}, True)))
+    result = executor._decode(
+        _transport.encode(_Command(1, "test", (source,), {}, True))
+    )
     assert result.operation == "test" and result.grad_enabled
     _check_payload(result.args[0])
     assert result.args[0].base.untyped_storage() is not source.base.untyped_storage()

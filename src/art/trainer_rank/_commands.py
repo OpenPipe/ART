@@ -61,10 +61,6 @@ class _Command:
     grad_enabled: bool
 
 
-def _encode_command(command: _Command) -> bytes:
-    return _transport.encode(command)
-
-
 @dataclass(frozen=True)
 class _OutputPacket:
     packet: Any
@@ -254,16 +250,13 @@ class _Executor:
                 {"message": self.state.release_error, "exception": error}
             )
 
-    async def _join_release(self) -> asyncio.CancelledError | None:
-        return await join_rank_callback_release(self.rank)
-
     async def reconcile_releases(
         self, *, defer_cancellation: bool = False
     ) -> asyncio.CancelledError | None:
         """Join prior cleanup before entering another all-rank boundary."""
-        cancelled = await self._join_release()
+        cancelled = await join_rank_callback_release(self.rank)
         self._start_release()
-        cancelled = await self._join_release() or cancelled
+        cancelled = await join_rank_callback_release(self.rank) or cancelled
         if cancelled is not None and not defer_cancellation:
             raise cancelled
         return cancelled
@@ -290,7 +283,7 @@ class _Executor:
         payload = None
         if command is not None:
             try:
-                payload = _encode_command(command)
+                payload = _transport.encode(command)
             except Exception as exc:
                 command = _Command(
                     command.sequence,
@@ -299,7 +292,7 @@ class _Executor:
                     {},
                     False,
                 )
-                payload = _encode_command(command)
+                payload = _transport.encode(command)
         objects: list[Any] = [payload]
         dist.broadcast_object_list(objects, src=self.leader, group=self.group)
         return self._decode(objects[0])
