@@ -574,6 +574,46 @@ def test_released_client_graph_releases_physical_bridge():
     assert not rank._rank_command_state.graphs
 
 
+@pytest.mark.parametrize("mode", ["rank", "zero"])
+def test_concurrent_output_release_is_deferred_to_next_command(mode):
+    rank: Any = _Rank()
+    executor = _Executor(rank, mode)
+    view, state = _view(executor), executor.state
+    first, later = view.forward(_input(2)), [view.forward(_input(3))]
+    old, new = state.graphs
+    entered, finished = threading.Event(), threading.Event()
+
+    class PausingHandle(str):
+        def startswith(self, *args):
+            entered.set()
+            assert finished.wait(5)
+            return super().startswith(*args)
+
+    del first
+    state.released = {PausingHandle(old)}
+    observed = []
+    rank.zero_grad = lambda: observed.append(set(state.graphs))
+
+    def drop_later():
+        if entered.wait(5):
+            later.clear()  # Run the real autograd finalizer on this thread.
+        finished.set()
+
+    thread = threading.Thread(target=drop_later, name="deferred-output-release")
+    thread.start()
+    try:
+        view.zero_grad()
+        assert state.released == {new}
+        assert set(state.graphs) == {new}
+        view.zero_grad()
+        assert not state.released and not state.graphs
+        assert observed == [{new}, set()]
+    finally:
+        entered.set()
+        thread.join(5)
+        assert not thread.is_alive()
+
+
 def test_forward_batches_captures_policy_before_iteration():
     from art.trainer_rank._rng import TrainerRNG
 

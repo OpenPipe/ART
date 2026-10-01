@@ -751,7 +751,7 @@ class _RankView:
         released = self._executor.state.released
         handles = tuple(
             handle
-            for handle in released
+            for handle in tuple(released)
             if handle.startswith(f"{self._executor.mode}:")
         )
         if handles:
