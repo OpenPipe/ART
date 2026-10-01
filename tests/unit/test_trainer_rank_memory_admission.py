@@ -378,7 +378,7 @@ def test_correction_metadata_and_explicit_prepass_are_budgeted(rank):
                 ForwardOptions(stale_gradient_corrections=())
             ),
         )
-        == 6 * 12
+        == 0
     )
 
 
@@ -439,6 +439,12 @@ def test_correction_budget_covers_captured_storage_and_aliases(
     gradients = tuple(
         torch.ones_like(tensor) if tensor.requires_grad else None for tensor in tensors
     )
+    if corrections == ():
+        assert context.tensors == ()
+        assert all(
+            after is before
+            for before, after in zip(gradients, context.correct(gradients), strict=True)
+        )
     staged = 0
     if corrections and corrections[0].policy == "always":
         corrected = context.correct(gradients, tensors)
@@ -455,7 +461,7 @@ def test_correction_budget_covers_captured_storage_and_aliases(
 @pytest.mark.parametrize(
     "corrections,expected",
     [
-        ((), 144),
+        ((), 0),
         (None, 144),
         ((ImportanceSamplingGradientCorrection(policy="always"),), 192),
     ],

@@ -216,14 +216,28 @@ def test_disabled_policy_rejects_before_execute(retention, options):
         )
 
 
-def test_bad_cotangent_rejects_before_replay():
+@pytest.mark.parametrize("disabled_corrections", [False, True])
+@pytest.mark.parametrize(
+    "gradients,match",
+    [
+        ((), "count"),
+        ((torch.ones(2),), "mismatch"),
+        ((torch.ones((), dtype=torch.float64),), "mismatch"),
+    ],
+    ids=["count", "shape", "dtype"],
+)
+def test_bad_cotangent_rejects_before_replay(disabled_corrections, gradients, match):
     cache = GraphCache()
     parameter = torch.nn.Parameter(torch.tensor(2.0))
-    handle, _ = cache.run(
+    handle, outputs = cache.run(
         lambda x: (x * parameter,), torch.tensor(3.0), retention="replay"
     )
-    with pytest.raises(ValueError, match="mismatch"):
-        cache.backward(handle, (torch.ones(2),))
+    if disabled_corrections:
+        cache.set_corrections(
+            handle, _logprob_corrections(outputs, None), is_stale=lambda: True
+        )
+    with pytest.raises(ValueError, match=match):
+        cache.backward(handle, gradients)
     assert cache.state(handle).replay_count == 0
     assert parameter.grad is None
 
@@ -290,9 +304,9 @@ def _logprob_corrections(outputs, policy):
         ForwardOutput(outputs[0], None, None, None),
         outputs,
         ResolvedForwardOptions(
-            stale_gradient_corrections=(
-                ImportanceSamplingGradientCorrection(policy=policy),
-            )
+            stale_gradient_corrections=()
+            if policy is None
+            else (ImportanceSamplingGradientCorrection(policy=policy),)
         ),
     )
 

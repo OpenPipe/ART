@@ -6807,21 +6807,16 @@ def _resolved_request_policy(options: ForwardOptions | None) -> ResolvedForwardO
 def _correction_state_bytes(
     group: _ForwardGroupPlan, options: ResolvedForwardOptions
 ) -> int:
-    if not group.grad_enabled:
+    if not group.grad_enabled or not options.stale_gradient_corrections:
         return 0
     topk = sum(
         item.input_ids.numel() * (item.request.top_k or 0) for item in group.items
     )
     logprobs = 4 * (
         topk
-        + (
-            sum(item.labels.numel() for item in group.items if item.labels is not None)
-            if options.stale_gradient_corrections
-            else 0
-        )
+        + sum(item.labels.numel() for item in group.items if item.labels is not None)
     )
-    # Captured top-k probabilities and identities persist even without
-    # corrections; explicit always also stages corrected cotangents.
+    # Explicit always also stages corrected cotangents.
     return topk * 8 + logprobs * (
         2
         if any(c.policy == "always" for c in options.stale_gradient_corrections)

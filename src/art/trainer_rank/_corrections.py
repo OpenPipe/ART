@@ -265,7 +265,7 @@ def capture_forward_corrections(
     tensors: Sequence[torch.Tensor],
     options: ResolvedForwardOptions,
 ) -> ForwardCorrectionContext:
-    """Map a ForwardOutput tree to the caller's deduplicated flat tensor layout."""
+    """Capture enabled corrections; disabled policies skip output metadata entirely."""
     from ._impl import ForwardOutput
 
     def leaves(value: Any) -> Iterator[Any]:
@@ -281,7 +281,9 @@ def capture_forward_corrections(
             raise TypeError("correction capture requires a ForwardOutput tree")
 
     corrections = options.stale_gradient_corrections
-    correction = corrections[0] if corrections else None
+    if not corrections:
+        return ForwardCorrectionContext(len(tensors), None, ())
+    correction = corrections[0]
     indices = {id(tensor): index for index, tensor in enumerate(tensors)}
     if len(indices) != len(tensors):
         raise ValueError("correction capture requires deduplicated flat tensors")
@@ -292,11 +294,7 @@ def capture_forward_corrections(
                 ("target_logprobs", output.target_logprobs),
                 ("top_k", None if output.top_k is None else output.top_k.logprobs),
             ):
-                if (
-                    tensor is None
-                    or not tensor.requires_grad
-                    or (correction is None and kind != "top_k")
-                ):
+                if tensor is None or not tensor.requires_grad:
                     continue
                 index = indices[id(tensor)]
                 entry = _OutputCorrection(
