@@ -1009,16 +1009,10 @@ class LiveHead:
         state: HeadState,
         value: torch.nn.Module | torch.Tensor,
         collector: Any,
-        *,
-        max_gradient_staleness: int | None = None,
     ):
         self.state = state
         self.collector = collector
-        self.max_gradient_staleness = (
-            state.max_gradient_staleness
-            if max_gradient_staleness is None
-            else max_gradient_staleness
-        )
+        self.max_gradient_staleness = state.max_gradient_staleness
         self.pending = False
         self.invalid = False
         self.invalid_reason = "its checkpoint was replaced"
@@ -1336,10 +1330,7 @@ def logical_register_head(
         if isinstance(value, torch.nn.Module)
         else value.to(view.device)
     )
-    maximum = head_staleness(view._rank)
-    head = LiveHead(
-        state, value, view._executor.state.collector, max_gradient_staleness=maximum
-    )
+    head = LiveHead(state, value, view._executor.state.collector)
     registry[(checkpoint, name)] = head
     return head.value
 
