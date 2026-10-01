@@ -1,12 +1,12 @@
 """Allocator assertions; requires a validation-owned GPU reservation."""
 
-import json
 import os
 
 import pytest
 from test_trainer_rank_custom_tensors import _trainer
 import torch
 from torch.multiprocessing.reductions import StorageWeakRef
+from trainer_rank_test_support import report_measurement
 
 from art.trainer_rank import TrainerRankMemoryError
 from art.trainer_rank._commands import _Executor
@@ -57,16 +57,12 @@ def test_repeated_remote_head_cotangents_fit_original_gradient_reserve(
     torch.testing.assert_close(
         parameter.grad, torch.full_like(parameter, 73 if existing_gradient else 72)
     )
-    print(
-        "REMOTE_HEAD_RESERVATION="
-        + json.dumps(
-            dict(
-                existing_gradient=existing_gradient,
-                peak=peak,
-                reserve=reserve,
-                repeated_captures=8,
-            )
-        )
+    report_measurement(
+        "REMOTE_HEAD_RESERVATION",
+        existing_gradient=existing_gradient,
+        peak=peak,
+        reserve=reserve,
+        repeated_captures=8,
     )
 
 
@@ -119,11 +115,8 @@ def test_rejected_late_registration_releases_gpu_storage_with_live_traceback(
     assert torch.cuda.memory_allocated() <= baseline
     assert not trainer._checkpoint_slots["student"].custom
     cache.release(handle)
-    print(
-        "LATE_HEAD_RELEASE="
-        + json.dumps(
-            dict(
-                kind=kind, retained_extra_bytes=torch.cuda.memory_allocated() - baseline
-            )
-        )
+    report_measurement(
+        "LATE_HEAD_RELEASE",
+        kind=kind,
+        retained_extra_bytes=torch.cuda.memory_allocated() - baseline,
     )

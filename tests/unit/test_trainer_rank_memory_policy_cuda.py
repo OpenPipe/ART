@@ -2,13 +2,13 @@
 
 from dataclasses import asdict
 import gc
-import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from trainer_rank_test_support import report_measurement
 
 from art.trainer_rank import TrainerRank
 from art.trainer_rank._graphs import GraphCache
@@ -56,15 +56,11 @@ def test_sequential_gradient_publications_fit_original_admission_reserve(
     assert peak == parameter.numel() * parameter.element_size() * (
         2 if existing_gradient else 3
     )
-    print(
-        "GRADIENT_RESERVATION="
-        + json.dumps(
-            {
-                "existing_gradient": existing_gradient,
-                "reserved_bytes": reserved,
-                "peak_bytes": peak,
-            }
-        )
+    report_measurement(
+        "GRADIENT_RESERVATION",
+        existing_gradient=existing_gradient,
+        reserved_bytes=reserved,
+        peak_bytes=peak,
     )
     torch.testing.assert_close(parameter.grad, source * 2)
 
@@ -167,7 +163,7 @@ def _run_root(workload, state, device):
         "planned": asdict(planned),
         "host_budget_two_ranks": asdict(host_memory_budget(local_world_size=2)),
     }
-    print("MEMORY_MEASUREMENT=" + json.dumps(measurement, sort_keys=True))
+    report_measurement("MEMORY_MEASUREMENT", sort_keys=True, **measurement)
     assert peak <= planned.gpu_required_bytes + 8 * 1024**2
     if device == "cpu" and state == "replay":
         assert forward_retained < 1024**2

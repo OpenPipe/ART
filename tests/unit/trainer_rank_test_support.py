@@ -3,6 +3,7 @@
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import timedelta
+import json
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -211,3 +212,7 @@ def spawn_and_join(worker, args, *, timeout, failure, nprocs=2):
                 )
             except BaseException:
                 pass
+
+
+def report_measurement(label: str, *, sort_keys: bool = False, **values: Any) -> None:
+    print(label + "=" + json.dumps(values, sort_keys=sort_keys))

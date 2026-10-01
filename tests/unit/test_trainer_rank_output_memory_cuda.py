@@ -1,13 +1,13 @@
 """Reserved-GPU canary for logical copies beside an existing replay backward."""
 
 import gc
-import json
 import os
 
 import pytest
 from test_trainer_rank_custom_tensors import _trainer
 from test_trainer_rank_output_memory import _output
 import torch
+from trainer_rank_test_support import report_measurement
 
 from art.trainer_rank._commands import _Executor, _view
 from art.trainer_rank._tensors import detach_tree
@@ -69,15 +69,11 @@ def test_logical_outputs_leave_existing_replay_backward_admissible(monkeypatch):
         atol=0,
     )
     assert not cache.handles()
-    print(
-        "OUTPUT_BACKWARD_RESERVE="
-        + json.dumps(
-            dict(
-                available_bytes=capacity,
-                restore_bytes=workspace,
-                rejected_copy_bytes=large,
-                admitted_copy_bytes=8 * 1024**2,
-                peak_bytes=peak,
-            )
-        )
+    report_measurement(
+        "OUTPUT_BACKWARD_RESERVE",
+        available_bytes=capacity,
+        restore_bytes=workspace,
+        rejected_copy_bytes=large,
+        admitted_copy_bytes=8 * 1024**2,
+        peak_bytes=peak,
     )
