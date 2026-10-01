@@ -79,6 +79,49 @@ def test_subclasses_keep_standard_encoder_semantics():
     assert reports._encode(value) == canonical(value)
 
 
+def test_sorted_mapping_snapshots_values_before_nested_iterator_mutates_them():
+    def record():
+        root = {}
+
+        class MutatingList(list):
+            def __iter__(self):
+                root["z"] = 2
+                return super().__iter__()
+
+        root.update(a=MutatingList([3]), z=1)
+        return root
+
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
+    expected = ("".join(encoder.iterencode(record())) + "\n").encode()
+    assert reports._encode(record()) == expected
+
+
+@pytest.mark.parametrize("operation", ["replace", "append", "shrink"])
+@pytest.mark.parametrize("prefix", [0, 1024])
+def test_nested_iterator_mutations_preserve_native_sequence_iteration(
+    operation, prefix
+):
+    def record():
+        outer = [0] * prefix
+
+        class MutatingList(list):
+            def __iter__(self):
+                if operation == "replace":
+                    outer[prefix + 1] = 99
+                elif operation == "append":
+                    outer.append(99)
+                else:
+                    del outer[prefix + 1 :]
+                return super().__iter__()
+
+        outer.extend([MutatingList([0]), 1, 2])
+        return {"values": outer}
+
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
+    expected = ("".join(encoder.iterencode(record())) + "\n").encode()
+    assert reports._encode(record()) == expected
+
+
 def test_fast_chunks_are_bounded_and_oversize_stops_before_later_errors(monkeypatch):
     original = json.JSONEncoder.encode
     blocks = []

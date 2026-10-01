@@ -120,28 +120,33 @@ def _json_chunks(value: Any, encoder: json.JSONEncoder, active: set[int]):
     try:
         if mapping:
             yield "{"
-            for index, key in enumerate(sorted(value)):
+            for index, (key, item) in enumerate(sorted(value.items())):
                 if index:
                     yield ","
                 yield encoder.encode(key)
                 yield ":"
-                yield from _json_chunks(value[key], encoder, active)
+                yield from _json_chunks(item, encoder, active)
             yield "}"
         else:
             yield "["
-            for start in range(0, len(value), 1024):
-                if start:
-                    yield ","
+            start = 0
+            while start < len(value):
                 block = value[start : start + 1024]
                 if all(
                     type(item) is int and -(1 << 63) <= item < 1 << 63 for item in block
                 ):
+                    if start:
+                        yield ","
                     yield encoder.encode(block)[1:-1]
+                    start += len(block)
                 else:
-                    for index, item in enumerate(block):
-                        if index:
+                    # Subclass iterators can mutate later native-list entries.
+                    stop = start + len(block)
+                    while start < stop and start < len(value):
+                        if start:
                             yield ","
-                        yield from _json_chunks(item, encoder, active)
+                        yield from _json_chunks(value[start], encoder, active)
+                        start += 1
             yield "]"
     finally:
         active.remove(identity)
