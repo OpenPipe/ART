@@ -102,10 +102,55 @@ class _ReportTooLarge(ValueError):
     pass
 
 
+def _json_chunks(value: Any, encoder: json.JSONEncoder, active: set[int]):
+    # Token inventories dominate reports. Encode small native-int blocks in C,
+    # keeping bounded incremental rejection instead of allocating a whole report.
+    sequence = type(value) in (list, tuple)
+    mapping = type(value) is dict and all(type(key) is str for key in value)
+    if not sequence and not mapping:
+        if type(value) in (str, int, float, bool, type(None)):
+            yield encoder.encode(value)
+        else:
+            yield from encoder.iterencode(value)
+        return
+    identity = id(value)
+    if identity in active:
+        raise ValueError("Circular reference detected")
+    active.add(identity)
+    try:
+        if mapping:
+            yield "{"
+            for index, key in enumerate(sorted(value)):
+                if index:
+                    yield ","
+                yield encoder.encode(key)
+                yield ":"
+                yield from _json_chunks(value[key], encoder, active)
+            yield "}"
+        else:
+            yield "["
+            for start in range(0, len(value), 1024):
+                if start:
+                    yield ","
+                block = value[start : start + 1024]
+                if all(
+                    type(item) is int and -(1 << 63) <= item < 1 << 63 for item in block
+                ):
+                    yield encoder.encode(block)[1:-1]
+                else:
+                    for index, item in enumerate(block):
+                        if index:
+                            yield ","
+                        yield from _json_chunks(item, encoder, active)
+            yield "]"
+    finally:
+        active.remove(identity)
+
+
 def _encode(record: dict[str, Any], *, limit: int = MAX_REPORT_BYTES) -> bytes:
     chunks = bytearray()
     encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
-    for chunk in encoder.iterencode(record):
+    for chunk in _json_chunks(record, encoder, set()):
         encoded = chunk.encode("utf-8")
         if len(chunks) + len(encoded) + 1 > limit:
             raise _ReportTooLarge("report exceeds byte limit")
