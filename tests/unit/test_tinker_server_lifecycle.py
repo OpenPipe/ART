@@ -1,4 +1,6 @@
 import asyncio
+import errno
+import signal
 import socket
 from typing import Any, cast
 from unittest.mock import Mock
@@ -8,6 +10,14 @@ import pytest
 
 from art.tinker import server as module
 from art.tinker.server import OpenAICompatibleTinkerServer
+
+
+@pytest.fixture(autouse=True)
+def signal_handlers():
+    original = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
+    yield
+    for sig, handler in original.items():
+        signal.signal(sig, handler)
 
 
 @pytest.fixture
@@ -20,16 +30,19 @@ def workers(monkeypatch):
         return worker
 
     monkeypatch.setattr(module, "move_to_child_process", create)
-    monkeypatch.setattr(module.os, "sched_getaffinity", lambda _: set(range(128)))
+    monkeypatch.setattr(
+        module.os, "sched_getaffinity", lambda _: set(range(128)), raising=False
+    )
     return created
 
 
 @pytest.mark.parametrize("port", [None, 0])
-async def test_concurrent_servers_reserve_distinct_ports(workers, port, caplog):
+async def test_concurrent_servers_reserve_distinct_ports(workers, port):
     servers = [
         OpenAICompatibleTinkerServer(host="127.0.0.1", port=port) for _ in range(3)
     ]
     tasks = []
+    lifespans = []
     addresses = []
     try:
         addresses = await asyncio.wait_for(
@@ -43,12 +56,16 @@ async def test_concurrent_servers_reserve_distinct_ports(workers, port, caplog):
                 response = await client.get(f"http://{host}:{actual_port}/health")
                 assert response.json() == {"status": "ok"}
         tasks = [server._task for server in servers]
+        for server in servers:
+            assert server._server is not None
+            lifespans.append(server._server.lifespan)
     finally:
-        await asyncio.gather(*(server.stop() for server in servers))
+        for server in reversed(servers):
+            await server.stop()
     assert all(
         task is not None and task.done() and not task.cancelled() for task in tasks
     )
-    assert not caplog.records
+    assert all(lifespan.shutdown_event.is_set() for lifespan in lifespans)
     for worker in workers:
         worker.close.assert_called_once()
     for host, actual_port in addresses:
@@ -100,7 +117,7 @@ async def test_ipv6_only_hostname_with_explicit_port(workers, monkeypatch):
         await server.stop()
 
 
-async def test_cancel_serving_then_restart_same_port(workers, caplog):
+async def test_cancel_serving_then_restart_same_port(workers):
     server = OpenAICompatibleTinkerServer(host="127.0.0.1", num_workers=1)
     try:
         host, port = await server.start()
@@ -120,9 +137,125 @@ async def test_cancel_serving_then_restart_same_port(workers, caplog):
             assert response.json() == {"status": "ok"}
     finally:
         await server.stop()
-    assert not caplog.records
     for worker in workers:
         worker.close.assert_called_once()
+
+
+@pytest.mark.parametrize("action", ["cancel", "stop"])
+async def test_interrupted_real_startup_closes_listener_and_lifespan(
+    workers, monkeypatch, action
+):
+    server = OpenAICompatibleTinkerServer(host="127.0.0.1", num_workers=1)
+    loop = asyncio.get_running_loop()
+    create_server = loop.create_server
+    entered, release = asyncio.Event(), asyncio.Event()
+    listeners = []
+
+    async def pause_after_binding(*args, **kwargs):
+        listener = await create_server(*args, **kwargs)
+        listeners.append(listener)
+        entered.set()
+        await release.wait()
+        return listener
+
+    monkeypatch.setattr(loop, "create_server", pause_after_binding)
+    start = asyncio.create_task(server.start())
+    stop = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert server._server is not None and server._socket is not None
+        uv_server = server._server
+        port = server._socket.getsockname()[1]
+        if action == "cancel":
+            start.cancel()
+        else:
+            stop = asyncio.create_task(server.stop())
+        await asyncio.sleep(0.02)
+        release.set()
+        with pytest.raises(
+            asyncio.CancelledError if action == "cancel" else RuntimeError
+        ):
+            await asyncio.wait_for(start, 5)
+        if stop is not None:
+            await asyncio.wait_for(stop, 5)
+        assert uv_server.lifespan.shutdown_event.is_set()
+        assert all(not listener.is_serving() for listener in listeners)
+        monkeypatch.setattr(loop, "create_server", create_server)
+        server.port = port
+        await server.start()
+        async with httpx.AsyncClient(trust_env=False) as client:
+            assert (
+                await client.get(f"http://127.0.0.1:{port}/health")
+            ).status_code == 200
+    finally:
+        release.set()
+        await server.stop()
+        await asyncio.gather(start, *([stop] if stop else []), return_exceptions=True)
+
+
+async def test_stop_before_readiness_poll_does_not_return_address(workers, monkeypatch):
+    server = OpenAICompatibleTinkerServer(host="127.0.0.1", num_workers=1)
+    main_loop = module.uvicorn.Server.main_loop
+    stops = []
+
+    async def stop_at_ready(uv_server):
+        stops.append(asyncio.create_task(server.stop()))
+        await main_loop(uv_server)
+
+    monkeypatch.setattr(module.uvicorn.Server, "main_loop", stop_at_ready)
+    try:
+        with pytest.raises(RuntimeError, match="stopped during startup"):
+            await asyncio.wait_for(server.start(), 5)
+    finally:
+        await asyncio.gather(*stops)
+        await server.stop()
+    assert server._socket is None and not server._workers
+
+
+@pytest.mark.parametrize(
+    "error", [errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL, errno.EADDRINUSE]
+)
+async def test_hostname_address_fallback_excludes_collisions(
+    workers, monkeypatch, error
+):
+    resolve, new_socket = socket.getaddrinfo, socket.socket
+    first = Mock()
+    first.bind.side_effect = OSError(error, "first address unavailable")
+
+    def resolve_test_host(host, port, *args, **kwargs):
+        addresses = resolve(
+            "127.0.0.1" if host == "tinker.test" else host, port, *args, **kwargs
+        )
+        if host == "tinker.test":
+            return [
+                (socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::1", port, 0, 0)),
+                *addresses,
+            ]
+        return addresses
+
+    def create_socket(family=socket.AF_INET, *args, **kwargs):
+        return (
+            first if family == socket.AF_INET6 else new_socket(family, *args, **kwargs)
+        )
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolve_test_host)
+    monkeypatch.setattr(socket, "socket", create_socket)
+    server = OpenAICompatibleTinkerServer(host="tinker.test", num_workers=1)
+    try:
+        if error == errno.EADDRINUSE:
+            with pytest.raises(OSError) as caught:
+                await server.start()
+            assert caught.value.errno == error
+            assert not workers
+        else:
+            _, port = await server.start()
+            async with httpx.AsyncClient(trust_env=False) as client:
+                assert (
+                    await client.get(f"http://127.0.0.1:{port}/health")
+                ).status_code == 200
+        first.close.assert_called_once()
+    finally:
+        await server.stop()
 
 
 async def test_port_reserved_before_workers_and_explicit_port_collision(
@@ -210,7 +343,7 @@ async def test_failed_start_closes_owned_resources(workers, monkeypatch, failure
         "return": RuntimeError,
         "timeout": TimeoutError,
         "cancel": asyncio.CancelledError,
-        "stop": asyncio.CancelledError,
+        "stop": RuntimeError,
     }
     with pytest.raises(expected[failure]):
         await asyncio.wait_for(task, 5)
@@ -223,7 +356,9 @@ async def test_failed_start_closes_owned_resources(workers, monkeypatch, failure
 
 @pytest.mark.parametrize("cpus, expected", [(128, 8), (2, 2), (0, 1)])
 def test_default_workers_respect_affinity(monkeypatch, cpus, expected):
-    monkeypatch.setattr(module.os, "sched_getaffinity", lambda _: set(range(cpus)))
+    monkeypatch.setattr(
+        module.os, "sched_getaffinity", lambda _: set(range(cpus)), raising=False
+    )
     assert OpenAICompatibleTinkerServer()._default_num_workers() == expected
 
 

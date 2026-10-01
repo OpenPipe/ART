@@ -2,6 +2,7 @@ import asyncio
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+import errno
 from itertools import cycle
 import json
 import os
@@ -123,6 +124,24 @@ def _normalize_qwen3_dot_messages(
     return normalized_messages
 
 
+class _UvicornServer(uvicorn.Server):
+    _shutdown_complete = False
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        # create_server registers the listener before returning it. Let startup
+        # retain that listener before cancellation can enter our cleanup path.
+        startup = asyncio.create_task(super().startup(sockets))
+        try:
+            await asyncio.shield(startup)
+        except asyncio.CancelledError:
+            await startup
+            raise
+
+    async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
+        await super().shutdown(sockets)
+        self._shutdown_complete = True
+
+
 @dataclass
 class OpenAICompatibleTinkerServer:
     host: str | None = None
@@ -155,13 +174,28 @@ class OpenAICompatibleTinkerServer:
             raise RuntimeError("Tinker server is already started")
         host = self.host or "0.0.0.0"
         try:
-            family, kind, protocol, _, address = socket.getaddrinfo(
+            addresses = socket.getaddrinfo(
                 host, self.port if self.port is not None else 0, type=socket.SOCK_STREAM
-            )[0]
-            self._socket = socket.socket(family, kind, protocol)
-            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._socket.bind(address)
-            self._socket.listen()
+            )
+            for family, kind, protocol, _, address in addresses:
+                try:
+                    self._socket = socket.socket(family, kind, protocol)
+                    self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    self._socket.bind(address)
+                    self._socket.listen()
+                    break
+                except OSError as exc:
+                    if self._socket is not None:
+                        self._socket.close()
+                        self._socket = None
+                    if exc.errno not in (
+                        errno.EADDRNOTAVAIL,
+                        errno.EAFNOSUPPORT,
+                        errno.EPROTONOSUPPORT,
+                    ):
+                        raise
+            if self._socket is None:
+                raise OSError(f"No usable listen address for {host}")
             port = self._socket.getsockname()[1]
             self._workers = []
             for i in range(self.num_workers or self._default_num_workers()):
@@ -175,16 +209,21 @@ class OpenAICompatibleTinkerServer:
             self._task = task
             timeout = float(os.environ.get("ART_SERVER_TIMEOUT", 300.0))
             deadline = time.monotonic() + timeout
-            while self._server is None or not self._server.started:
+            while True:
+                if task.cancelling() or (
+                    self._server is not None and self._server.should_exit
+                ):
+                    raise RuntimeError("Tinker server stopped during startup")
                 if task.done():
                     await task
                     raise RuntimeError("Tinker server exited before startup")
+                if self._server is not None and self._server.started:
+                    return host, port
                 if time.monotonic() > deadline:
                     raise TimeoutError(
                         f"Unable to reach OpenAI-compatible server within {timeout} seconds. You can increase this timeout by setting the ART_SERVER_TIMEOUT environment variable."
                     )
                 await asyncio.sleep(0.01)
-            return host, port
         except BaseException:
             await self.stop()
             raise
@@ -192,9 +231,11 @@ class OpenAICompatibleTinkerServer:
     async def stop(self) -> None:
         try:
             if self._task is not None:
-                if self._server is not None and self._server.started:
+                if self._server is not None:
                     self._server.should_exit = True
-                else:
+                if (
+                    self._server is None or not self._server.started
+                ) and not self._task.cancelling():
                     self._task.cancel()
                 try:
                     await asyncio.wait_for(self._task, timeout=10)
@@ -467,17 +508,18 @@ class OpenAICompatibleTinkerServer:
             log_level="error",
             timeout_graceful_shutdown=5,
         )
-        server = self._server = uvicorn.Server(server_config)
+        server = self._server = _UvicornServer(server_config)
+        server.servers = []
         try:
             await server.serve(sockets=[sock])
-        except BaseException:
-            if server.started:
-                await server.shutdown(sockets=[sock])
-            raise
         finally:
-            for listener in getattr(server, "servers", []):
-                listener.close()
-            sock.close()
+            try:
+                if hasattr(server, "lifespan") and not server._shutdown_complete:
+                    await server.shutdown(sockets=[sock])
+            finally:
+                for listener in server.servers:
+                    listener.close()
+                sock.close()
 
     def _default_num_workers(self) -> int:
         try:
