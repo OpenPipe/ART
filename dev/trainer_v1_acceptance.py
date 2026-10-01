@@ -70,8 +70,10 @@ def _loss_and_cotangents(first, second):
 
 def _canonical_gradients(rank, checkpoint):
     """Reduce once, then gather canonical LoRA shards without altering weights."""
-    from art.megatron.lora import LoRA
-    from art.megatron.weights.lora_publish import _merge_manifest_entries
+    from art.megatron.weights.lora_publish import (
+        iter_lora_modules,
+        merge_sharded_adapter_entries,
+    )
 
     parameters = rank._checkpoint_slots[checkpoint].params
     reduced = rank._reduce_dynamic_grads(parameters, scale_grads=1.0)
@@ -80,19 +82,14 @@ def _canonical_gradients(rank, checkpoint):
         for parameter, gradient in zip(parameters, reduced, strict=True)
     }
     local = {}
-    for chunk in rank.runtime.model:
-        for module in chunk.modules():
-            if not isinstance(module, LoRA):
-                continue
-            for key, parameter, expert in module._export_items(
-                rank._slot_ref(checkpoint)
-            ):
-                value = by_id[id(parameter)]
-                value = value if expert is None else value[expert]
-                local[key] = (
-                    module._manifest_for_param(parameter),
-                    value.T.float().cpu(),
-                )
+    for module in iter_lora_modules(rank.runtime.model):
+        for key, parameter, expert in module._export_items(rank._slot_ref(checkpoint)):
+            value = by_id[id(parameter)]
+            value = value if expert is None else value[expert]
+            local[key] = (
+                module._manifest_for_param(parameter),
+                value.T.float().cpu(),
+            )
     if dist.get_rank() == 0:
         for name, custom in rank._checkpoint_slots[checkpoint].custom.items():
             for key, parameter in custom.value.named_parameters():
@@ -108,9 +105,7 @@ def _canonical_gradients(rank, checkpoint):
     for shard in gathered:
         for key, entry in shard.items():
             groups[key].append(entry)
-    return {
-        key: _merge_manifest_entries(key, entries) for key, entries in groups.items()
-    }
+    return merge_sharded_adapter_entries(groups)
 
 
 def _compare(actual, reference):
