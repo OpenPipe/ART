@@ -116,6 +116,7 @@ class ModelSupportHandler(Protocol):
     has_recurrent_layers: bool
     cp_supported: bool
     native_vllm_lora_status: NativeVllmLoraStatus
+    trust_remote_code: bool
 
     def identity_lora_model_config(self, base_config: Any) -> Any: ...
 
