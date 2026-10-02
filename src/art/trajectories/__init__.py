@@ -1454,8 +1454,9 @@ _CompactValidated: TypeAlias = Union[CompactDumpable, list[CompactDumpable]]
 def compact_memory[T](value: T) -> T:
     """Deduplicate writable string references without replacing container identities.
 
-    Strings directly held by immutable containers are left in place; their mutable
-    descendants are still compacted. Unsupported objects remain opaque.
+    Strings directly held by immutable containers, mixed-key mappings, or
+    sets stay in place; their supported mutable descendants are still compacted.
+    Container subclasses and other unsupported objects remain opaque.
     """
 
     _intern_string_graph(value)

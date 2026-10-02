@@ -81,7 +81,7 @@ def test_explicit_memory_compaction_interns_nested_models_keys_and_cycles() -> N
     assert trajectory.metadata["tuple_a"] is trajectory.metadata["tuple_b"]
     assert trajectory.metadata["tuple_a"] is shared_tuple
     assert trajectory.metadata["tuple_a"][0] == canonical
-    assert next(iter(trajectory.metadata["set"])) is canonical
+    assert next(iter(trajectory.metadata["set"])) == canonical
     assert next(iter(trajectory.metadata["frozenset"])) == canonical
 
 

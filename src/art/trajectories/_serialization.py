@@ -63,7 +63,7 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         value, (bytes, bytearray, memoryview, bool, int, float, complex)
     ):
         return value
-    if isinstance(value, list) and all(
+    if type(value) is list and all(
         item is None or type(item) is bool or type(item) is float or type(item) is int
         for item in value
     ):
@@ -84,29 +84,22 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         if isinstance(value, _StringInterningModel):
             value._mark_pickle_strings_interned()
         return value
-    if isinstance(value, dict):
+    if type(value) is dict:
         memo[value_id] = value
         _intern_mapping(cast(dict[object, object], value), pool, memo)
         return value
-    if isinstance(value, list):
+    if type(value) is list:
         memo[value_id] = value
         items = cast(list[object], value)
         for index, item in enumerate(items):
             items[index] = _intern_value(item, pool, memo)
         return value
-    if type(value) is tuple or type(value) is frozenset:
-        # Opaque objects and cycle backedges may still hold this exact container.
-        # Visit mutable descendants, but never replace immutable graph nodes.
+    if type(value) is tuple or type(value) is frozenset or type(value) is set:
+        # Preserve immutable aliases and cycles, and set hash-table order. Rebuilding
+        # a set can also rehash opaque members after clearing the original contents.
         memo[value_id] = value
         for item in value:
             _intern_value(item, pool, memo)
-        return value
-    if isinstance(value, set):
-        memo[value_id] = value
-        values = cast(set[object], value)
-        items = [_intern_value(item, pool, memo) for item in values]
-        values.clear()
-        values.update(items)
         return value
     if is_dataclass(value) and type(value).__module__.startswith("art.trajectories"):
         memo[value_id] = value
@@ -123,11 +116,17 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
 def _intern_mapping(
     value: dict[object, object], pool: _StringPool, memo: dict[int, object]
 ) -> None:
-    # Rebuilding arbitrary mappings can invoke custom methods or rehash opaque keys.
-    intern_keys = type(value) is dict and all(type(key) is str for key in value)
+    if type(value) is not dict:
+        return
+    # Opaque keys can reject even assigning an unchanged value. Visit descendants
+    # without rehashing keys or replacing direct values in these mappings.
+    if not all(type(key) is str for key in value):
+        for item in value.values():
+            _intern_value(item, pool, memo)
+        return
     replacements: dict[int, str] = {}
     for key, item in value.items():
-        if intern_keys and type(key) is str:
+        if type(key) is str:
             interned = pool.setdefault(key, key)
             if interned is not key:
                 replacements[id(key)] = interned

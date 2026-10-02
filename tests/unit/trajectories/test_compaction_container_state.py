@@ -93,7 +93,7 @@ def test_key_compaction_preserves_order_values_and_cycles(use_pickle):
         assert actual["later"] == 2
 
 
-def test_custom_mapping_is_not_rebuilt_and_keeps_state():
+def test_custom_mapping_is_opaque_and_keeps_state():
     canonical = "shared public dictionary key"
     key = canonical.encode().decode()
     mapping = NoRebuildDict({key: canonical.encode().decode(), "later": 2})
@@ -106,11 +106,12 @@ def test_custom_mapping_is_not_rebuilt_and_keeps_state():
     assert trajectory.metadata["mapping"] is mapping
     assert list(mapping) == before
     assert next(iter(mapping)) is key
-    assert mapping[key] is canonical
+    assert mapping[key] == canonical
+    assert mapping[key] is not canonical
     assert mapping.tag == ["retained state"]
 
 
-def test_mixed_mapping_avoids_extra_hash_callbacks_while_compacting_values():
+def test_mixed_mapping_avoids_hash_callbacks_and_preserves_direct_values():
     canonical = "shared public dictionary key"
     key = canonical.encode().decode()
     opaque = OpaqueKey()
@@ -123,8 +124,9 @@ def test_mixed_mapping_avoids_extra_hash_callbacks_while_compacting_values():
 
     assert list(mapping) == before
     assert next(iter(mapping)) is key
-    assert mapping[key] is canonical
-    assert opaque.calls == 1
+    assert mapping[key] == canonical
+    assert mapping[key] is not canonical
+    assert opaque.calls == 0
 
 
 def test_plain_immutable_containers_keep_identity():

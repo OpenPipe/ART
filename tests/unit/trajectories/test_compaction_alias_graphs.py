@@ -18,7 +18,7 @@ class Opaque:
 
 
 class TaggedTuple(tuple):
-    pass
+    value: object
 
 
 def fresh(s):
@@ -62,8 +62,10 @@ def test_tuple_backedge_keeps_exact_cycle(bridge, use_pickle):
     mutable = [] if bridge == "list" else {}
     inner = (fresh(canonical), mutable)
     if bridge == "list":
+        assert isinstance(mutable, list)
         mutable.append(inner)
     else:
+        assert isinstance(mutable, dict)
         mutable["back"] = inner
     trajectory = Trajectory(
         metadata={"seed": canonical, "inner": inner, "mutable": mutable}
