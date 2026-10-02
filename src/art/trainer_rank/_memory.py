@@ -1263,6 +1263,7 @@ def _memory_check_required(
         available_bytes=available,
         fits=fits,
         local_required_bytes=local_required,
+        local_available_bytes=local_available,
         sample=sample,
     )
 
