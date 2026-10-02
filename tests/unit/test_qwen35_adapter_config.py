@@ -253,3 +253,36 @@ def test_megatron_service_adapter_load_passes_the_running_model(monkeypatch):
     monkeypatch.setattr(train, "load_adapter_into_model", lambda *a, **k: None)
     train._load_adapter_into_model([], "adapter", 0, handler=None, provider=PROVIDER)
     assert seen[0]["provider"] is PROVIDER
+
+
+def test_base_config_lookup_does_not_run_checkpoint_code(tmp_path, monkeypatch):
+    import transformers.dynamic_module_utils
+
+    marker = tmp_path / "imported"
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "auto_map": {"AutoConfig": "custom_config.CustomConfig"},
+                "model_type": "llama",
+                "num_attention_heads": 16,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+            }
+        )
+    )
+    (tmp_path / "custom_config.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\n"
+        "from transformers import LlamaConfig as CustomConfig\n"
+    )
+    monkeypatch.setattr(
+        transformers.dynamic_module_utils,
+        "HF_MODULES_CACHE",
+        str(tmp_path / "modules"),
+    )
+    qwen35._qwen35_text_config.cache_clear()
+    try:
+        dims = qwen35._qwen35_attention_dims({"base_model_name_or_path": str(tmp_path)})
+    finally:
+        qwen35._qwen35_text_config.cache_clear()
+    assert dims == (16, 2, 256)
+    assert not marker.exists()
