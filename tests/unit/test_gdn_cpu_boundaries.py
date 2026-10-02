@@ -14,13 +14,17 @@ def test_bucket_passes_matching_cpu_boundaries_only_for_packed_fla(
 ):
     cpu_boundaries = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
     device_boundaries = cpu_boundaries.clone()
-    bucket = SimpleNamespace(
-        segment_count=len(lengths),
-        real_token_count=sum(lengths),
+    bucket = operator.GdnSegmentBucketPlan(
         length=max(lengths),
+        lengths=torch.tensor(lengths),
         lengths_cpu=torch.tensor(lengths),
         cu_seqlens=device_boundaries,
         cu_seqlens_cpu=cpu_boundaries,
+        real_mask=torch.ones(sum(lengths), dtype=torch.bool),
+        row_indices=torch.zeros(sum(lengths), dtype=torch.long),
+        position_indices=torch.cat([torch.arange(n) for n in lengths]),
+        family_indices=torch.arange(len(lengths)),
+        real_token_count_static=sum(lengths),
     )
     gdn = SimpleNamespace(
         num_key_heads=1,
