@@ -38,6 +38,7 @@ from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora,
     quack_grouped_lora_dual,
 )
+from .kernels.frozen_grouped_linear import FrozenGroupedBase
 from .lora_config import (
     LORA_ALPHA,
     MEGATRON_LORA_RANK_ENV,
@@ -1766,7 +1767,7 @@ class ComponentwiseColumnParallelLinearLoRA(torch.nn.Module):
         return base + adapter, bias
 
 
-class MLPExpertsLinearFC1LoRA(torch.nn.Module):
+class MLPExpertsLinearFC1LoRA(FrozenGroupedBase):
     def __init__(
         self,
         adapter_model_prefix: str,
@@ -1832,16 +1833,13 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
                 num_local_experts=num_local_experts,
             )
 
+    def _grouped_linear(self) -> torch.nn.Module:
+        return self.linear_fc1
+
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        base_out, bias_out = cast(
-            Callable[
-                [torch.Tensor, list[int] | torch.Tensor],
-                tuple[torch.Tensor, torch.Tensor | None],
-            ],
-            self.linear_fc1,
-        )(x, tokens_per_expert)
+        base_out, bias_out = self._base_forward(x, tokens_per_expert)
         adapter_out = (
             _expert_grouped_lora_forward(
                 self.up_lora if self.non_gated else self.lora,
@@ -1855,7 +1853,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         return base_out + adapter_out, bias_out
 
 
-class MLPExpertsLinearFC2LoRA(torch.nn.Module):
+class MLPExpertsLinearFC2LoRA(FrozenGroupedBase):
     def __init__(
         self,
         adapter_model_prefix: str,
@@ -1880,16 +1878,13 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
             num_local_experts=num_local_experts,
         )
 
+    def _grouped_linear(self) -> torch.nn.Module:
+        return self.linear_fc2
+
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        base_out, bias_out = cast(
-            Callable[
-                [torch.Tensor, list[int] | torch.Tensor],
-                tuple[torch.Tensor, torch.Tensor | None],
-            ],
-            self.linear_fc2,
-        )(x, tokens_per_expert)
+        base_out, bias_out = self._base_forward(x, tokens_per_expert)
         adapter_out = _expert_grouped_lora_forward(
             self.lora,
             x,

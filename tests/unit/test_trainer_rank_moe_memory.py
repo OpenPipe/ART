@@ -8,6 +8,7 @@ import weakref
 import pytest
 import torch
 
+from art.megatron.kernels.frozen_grouped_linear import FrozenGroupedBase
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
@@ -29,7 +30,12 @@ def layer() -> Any:
 
     def module(cls):
         value = cls.__new__(cls)
-        torch.nn.Module.__init__(value)
+        if isinstance(value, FrozenGroupedBase):
+            FrozenGroupedBase.__init__(value)
+            # Metadata-only CPU fixtures have no resident expert weight bank.
+            value._grouped_resident = False
+        else:
+            torch.nn.Module.__init__(value)
         return value
 
     # Actual supported types, without CUDA/process-group initialization. No
@@ -472,7 +478,8 @@ def _enclosing_moe(layer):
     from art.megatron.lora import MLPExpertsLinearFC1LoRA
 
     fc1 = MLPExpertsLinearFC1LoRA.__new__(MLPExpertsLinearFC1LoRA)
-    torch.nn.Module.__init__(fc1)
+    FrozenGroupedBase.__init__(fc1)
+    fc1._grouped_resident = False  # Metadata only, as with the FC2 fixture.
     fc1.fused_gate_up = True
     fc1.non_gated = False
     fc1.out_features = 1024
@@ -485,6 +492,18 @@ def _enclosing_moe(layer):
     layer.token_dispatcher.num_local_experts = 256
     layer.config.moe_permute_fusion = True
     return layer
+
+
+def test_metadata_only_grouped_wrappers_remain_unprepared(layer):
+    _rank(_enclosing_moe(layer))
+    for wrapper in (layer.experts.linear_fc1, layer.experts.linear_fc2):
+        assert not wrapper._grouped_resident
+        assert wrapper._grouped_shape is None
+        assert wrapper._grouped_weights == ()
+        assert wrapper._grouped_first is None
+        assert wrapper._grouped_preparations == 0
+        assert wrapper._grouped_load_hook is None
+        assert all(p.device.type == "cpu" for p in wrapper.parameters())
 
 
 def test_compiled_moe_retained_inputs_cold_floor(layer):

@@ -2104,6 +2104,11 @@ class TrainerRank:
         self._last_forward_telemetry_snapshot: dict[str, Any] | None = None
         _configure_moe_dispatcher_caches(runtime.model)
         self.zero_grad()
+        # TrainerRank owns resident weights; offload owners explicitly exclude
+        # their modules before any storage transition. No activation in forward.
+        from art.megatron.kernels.frozen_grouped_linear import prepare_grouped_bases
+
+        prepare_grouped_bases(runtime.model)
 
     def zero_grad(self) -> None:
         for chunk in self.runtime.model:
