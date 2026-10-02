@@ -325,6 +325,8 @@ def patch_history(
             protocol = importer("sglang.srt.entrypoints.openai.protocol")
             view = protocol.ChatCompletionRequest(
                 model=request.model,
+                parallel_tool_calls=getattr(request, "parallel_tool_calls", None)
+                is not False,
                 messages=self._construct_input_messages(request, previous),
                 tools=self._response_tools_to_chat_tools(request) or None,
                 chat_template=getattr(request, "chat_template", None),
