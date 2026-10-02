@@ -1,0 +1,44 @@
+name: Check Version Bump
+
+on:
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    if: ${{ !startsWith(github.head_ref, 'release/') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Check if version was changed
+        run: |
+          # Get the version from main branch
+          git checkout origin/main -- pyproject.toml
+          MAIN_VERSION=$(grep '^version = ' pyproject.toml | cut -d '"' -f 2)
+          
+          # Get the version from PR branch  
+          git checkout HEAD -- pyproject.toml
+          PR_VERSION=$(grep '^version = ' pyproject.toml | cut -d '"' -f 2)
+          
+          echo "Main branch version: $MAIN_VERSION"
+          echo "PR branch version: $PR_VERSION"
+          
+          if [ "$MAIN_VERSION" != "$PR_VERSION" ]; then
+            echo "❌ Version change detected in PR!"
+            echo ""
+            echo "Please do not manually bump the version in pull requests."
+            echo ""
+            echo "To create a release:"
+            echo "1. Use the GitHub workflow: gh workflow run create-draft-release.yml --field version_type=patch"
+            echo "2. Or go to: https://github.com/OpenPipe/ART/actions/workflows/create-draft-release.yml"
+            echo "3. Choose the version bump type (patch/minor/major)"
+            echo ""
+            echo "This will create a proper release PR with updated changelog."
+            exit 1
+          fi
+          
+          echo "✅ No version changes detected - check passed!"
