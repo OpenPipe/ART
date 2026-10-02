@@ -374,3 +374,28 @@ def test_response_observer_does_not_swallow_renderer_errors(error):
             )
         )
     assert raised.value is error
+
+
+def test_optional_validation_does_not_swallow_non_validation_value_error(monkeypatch):
+    request = StrictRequest(messages=[StrictMessage(role="user", content="question")])
+    failure = ValueError("request adapter failed outside pydantic validation")
+
+    def validate(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(StrictRequest, "model_validate", validate)
+
+    async def render(value):
+        return [1]
+
+    with pytest.raises(ValueError) as caught:
+        asyncio.run(
+            chat_response_prefixes(
+                Tokenizer(),
+                request,
+                [1],
+                [({"role": "assistant", "content": "answer"}, [2], True)],
+                render,
+            )
+        )
+    assert caught.value is failure
