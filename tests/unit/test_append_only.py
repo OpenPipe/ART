@@ -3,12 +3,13 @@ from copy import deepcopy
 import json
 from types import SimpleNamespace
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 import pytest
 
 from art.token_prefix import TokenPrefixCache, apply_prefix_edits
 from art.utils.append_only import chat_prefix_observations, chat_response_prefixes
 from art_inference.append_only import (
+    merge_chat_delta,
     output_prefix_observations,
     patch_deepseek_renderer,
 )
@@ -293,3 +294,108 @@ def test_history_edits_leave_multimodal_markers_outside_replacements():
     }
     updated = replace_prompt_tokens(original, raw, edits)
     assert updated["mm_placeholders"]["image"][0].offset == 3
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        {},
+        {"id": "partial", "type": "function"},
+        {"id": "partial", "type": "function", "function": {"arguments": "{}"}},
+    ],
+)
+def test_unrenderable_sampled_tool_call_declines_observation(call):
+    request = StrictRequest(messages=[StrictMessage(role="user", content="question")])
+    message = {"role": "assistant", "tool_calls": [call]}
+    before = deepcopy((request.model_dump(), message))
+    rendered = []
+
+    async def render(value):
+        rendered.append(value)
+        return [1]
+
+    assert (
+        asyncio.run(
+            chat_response_prefixes(
+                Tokenizer(), request, [1], [(message, [2], True)], render
+            )
+        )
+        == []
+    )
+    assert rendered == [request]
+    assert (request.model_dump(), message) == before
+
+
+def test_sparse_tool_indices_can_be_filled_by_later_deltas():
+    def part(index, name):
+        return {
+            "index": index,
+            "id": name,
+            "type": "function",
+            "function": {"name": name, "arguments": "{}"},
+        }
+
+    message = {"role": "assistant"}
+    merge_chat_delta(message, {"tool_calls": [part(0, "first"), part(2, "last")]})
+    assert message["tool_calls"][1] == {}
+    merge_chat_delta(message, {"tool_calls": [part(1, "middle")]})
+    request = StrictRequest.model_validate({"messages": [message]})
+    assert request.messages[0].tool_calls is not None
+    assert [call.id for call in request.messages[0].tool_calls] == [
+        "first",
+        "middle",
+        "last",
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("renderer failed"),
+        ValidationError.from_exception_data("Renderer", []),
+    ],
+)
+def test_response_observer_does_not_swallow_renderer_errors(error):
+    request = StrictRequest(messages=[StrictMessage(role="user", content="question")])
+
+    async def render(value):
+        if len(value.messages) > 1:
+            raise error
+        return [1]
+
+    with pytest.raises(type(error)) as raised:
+        asyncio.run(
+            chat_response_prefixes(
+                Tokenizer(),
+                request,
+                [1],
+                [({"role": "assistant", "content": "answer"}, [2], True)],
+                render,
+            )
+        )
+    assert raised.value is error
+
+
+def test_optional_validation_does_not_swallow_non_validation_value_error(monkeypatch):
+    request = StrictRequest(messages=[StrictMessage(role="user", content="question")])
+    failure = ValueError("request adapter failed outside pydantic validation")
+
+    def validate(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(StrictRequest, "model_validate", validate)
+
+    async def render(value):
+        return [1]
+
+    with pytest.raises(ValueError) as caught:
+        asyncio.run(
+            chat_response_prefixes(
+                Tokenizer(),
+                request,
+                [1],
+                [({"role": "assistant", "content": "answer"}, [2], True)],
+                render,
+            )
+        )
+    assert caught.value is failure
