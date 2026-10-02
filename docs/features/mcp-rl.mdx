@@ -42,6 +42,18 @@ scenario_collection = await generate_scenarios(
 )
 ```
 
+You can generate scenarios against [OrcaRouter](https://www.orcarouter.ai) the same way — point `generator_base_url` at `https://api.orcarouter.ai/v1` and use an OrcaRouter key (keys start with `sk-orca-`):
+
+```python
+scenario_collection = await generate_scenarios(
+    tools=tools_list,
+    num_scenarios=24,
+    show_preview=True,
+    generator_api_key="your_orcarouter_key",
+    generator_base_url="https://api.orcarouter.ai/v1",
+)
+```
+
 ART automatically generates diverse training scenarios that exercise different aspects of the MCP server: simple single-tool usage, complex multi-step workflows, edge cases and error handling, and creative combinations of available tools.
 
 ### 3. **RULER Evaluation**
