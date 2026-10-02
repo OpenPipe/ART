@@ -990,14 +990,27 @@ def test_gemma4_peft_target_parameter_moe_layout_is_transposed(tmp_path: Path):
         adapter_config=adapter_config,
     )
 
-    assert torch.equal(
-        normalized[f"{prefix}.base_layer.lora_A.weight"], peft_gate_up_b.T
-    )
-    assert torch.equal(
-        normalized[f"{prefix}.base_layer.lora_B.weight"], peft_gate_up_a.T
-    )
-    assert torch.equal(normalized[f"{prefix}.lora_A.weight"], peft_down_b.T)
-    assert torch.equal(normalized[f"{prefix}.lora_B.weight"], peft_down_a.T)
+    assert len(normalized) == 12
+    for expert in range(2):
+        for module, a, b in (
+            (
+                "gate_proj",
+                peft_gate_up_b[:, expert][None],
+                peft_gate_up_a[expert, :2, None],
+            ),
+            (
+                "up_proj",
+                peft_gate_up_b[:, expert][None],
+                peft_gate_up_a[expert, 2:, None],
+            ),
+            ("down_proj", peft_down_b[:, expert][None], peft_down_a[expert, :, None]),
+        ):
+            assert torch.equal(
+                normalized[f"{prefix}.{expert}.{module}.lora_A.weight"], a
+            )
+            assert torch.equal(
+                normalized[f"{prefix}.{expert}.{module}.lora_B.weight"], b
+            )
 
     internal = GEMMA4_MOE_HANDLER.from_vllm_lora_tensors(
         peft_tensors,
@@ -1010,11 +1023,98 @@ def test_gemma4_peft_target_parameter_moe_layout_is_transposed(tmp_path: Path):
         down_a = internal[f"{art_prefix}.{expert}.down_proj.lora_A.weight"]
         down_b = internal[f"{art_prefix}.{expert}.down_proj.lora_B.weight"]
         assert torch.equal(gate_up_a, peft_gate_up_b[:, expert].unsqueeze(0))
-        assert torch.equal(gate_up_b[:4], peft_gate_up_a[expert].unsqueeze(1))
-        assert torch.count_nonzero(gate_up_b[4:]) == 0
+        gate_b, up_b = gate_up_b.chunk(2, dim=0)
+        assert torch.equal(gate_b[:2], peft_gate_up_a[expert, :2].unsqueeze(1))
+        assert torch.equal(up_b[:2], peft_gate_up_a[expert, 2:].unsqueeze(1))
+        assert torch.count_nonzero(gate_b[2:]) == 0
+        assert torch.count_nonzero(up_b[2:]) == 0
         assert torch.equal(down_a[:, :2], peft_down_b[:, expert].unsqueeze(0))
         assert torch.count_nonzero(down_a[:, 2:]) == 0
         assert torch.equal(down_b, peft_down_a[expert].unsqueeze(1))
+
+
+@pytest.mark.parametrize("rank", [1, 3])
+@pytest.mark.parametrize("packed", [False, True])
+def test_gemma4_exports_all_experts_as_standard_projection_lora(
+    tmp_path: Path, rank: int, packed: bool
+) -> None:
+    from art.megatron.model_support.internal_padding import pack_vllm_3d_lora_b
+
+    model_dir = tmp_path / "base"
+    model_dir.mkdir()
+    hidden, intermediate, num_experts = 16, 7, 4
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "text_config": {
+                    "enable_moe_block": True,
+                    "hidden_size": hidden,
+                    "moe_intermediate_size": intermediate,
+                    "num_experts": num_experts,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _config(str(model_dir), rank=rank)
+    config["target_modules"].append("experts")
+    config["target_parameters"] = ["moe.experts.gate_up_proj", "moe.experts.down_proj"]
+    prefix = "base_model.model.model.layers.0.moe.experts"
+    art_prefix = prefix.replace(".moe.", ".mlp.")
+    generator = torch.Generator().manual_seed(17)
+    expected = {}
+    for expert in range(num_experts):
+        gate_a = torch.randn(rank, hidden, generator=generator)
+        for module, a, b in (
+            ("gate_proj", gate_a, torch.randn(intermediate, rank, generator=generator)),
+            (
+                "up_proj",
+                gate_a.clone(),
+                torch.randn(intermediate, rank, generator=generator),
+            ),
+            (
+                "down_proj",
+                torch.randn(rank, intermediate, generator=generator),
+                torch.randn(hidden, rank, generator=generator),
+            ),
+        ):
+            expected[f"{prefix}.{expert}.{module}.lora_A.weight"] = a
+            expected[f"{prefix}.{expert}.{module}.lora_B.weight"] = b
+    internal: dict[str, torch.Tensor] = GEMMA4_MOE_HANDLER.from_vllm_lora_tensors(
+        expected, adapter_config=config
+    )
+    original = internal
+    if packed:
+        internal = {}
+        for module, slot in (("gate_up_proj", "base_layer."), ("down_proj", "")):
+            for factor in ("A", "B"):
+                blocks = [
+                    original[f"{art_prefix}.{e}.{module}.lora_{factor}.weight"]
+                    for e in range(num_experts)
+                ]
+                internal[f"{art_prefix}.{slot}lora_{factor}.weight"] = (
+                    torch.cat(blocks) if factor == "A" else pack_vllm_3d_lora_b(blocks)
+                )
+    exported, exported_config = GEMMA4_MOE_HANDLER.to_vllm_lora_tensors(
+        internal, adapter_config=config
+    )
+    _assert_tensors_equal(exported, expected)
+    assert len(exported) == num_experts * 6
+    assert exported_config["r"] == rank
+    assert exported_config["lora_alpha"] == config["lora_alpha"]
+    assert "experts" not in exported_config["target_modules"]
+    assert exported_config["target_parameters"] is None
+    _assert_tensors_equal(
+        GEMMA4_MOE_HANDLER.from_vllm_lora_tensors(
+            exported, adapter_config=exported_config
+        ),
+        original,
+    )
+    adapter_dir = tmp_path / "adapter"
+    save_vllm_lora_tensors(adapter_dir, exported, exported_config)
+    _assert_tensors_equal(
+        load_file(adapter_dir / "adapter_model.safetensors"), expected
+    )
 
 
 def test_gpt_oss_vllm_canonical_roundtrip_and_stock_loader(tmp_path: Path):
