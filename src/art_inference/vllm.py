@@ -14,6 +14,8 @@ import json
 from types import MethodType
 from typing import Any
 
+from pydantic import ValidationError
+
 from .append_only import (
     aligned_values,
     chat_prefix_scope,
@@ -354,7 +356,7 @@ def patch_history(importer=importlib.import_module) -> None:
                 tools = responses_utils.construct_tool_dicts(
                     request.tools, request.tool_choice
                 )
-                view = protocol.ChatCompletionRequest(
+                view_payload = dict(
                     model=request.model,
                     parallel_tool_calls=getattr(request, "parallel_tool_calls", None)
                     is not False,
@@ -364,6 +366,11 @@ def patch_history(importer=importlib.import_module) -> None:
                     ],
                     chat_template_kwargs=self._effective_chat_template_kwargs(request),
                 )
+                try:
+                    view = protocol.ChatCompletionRequest(**view_payload)
+                except ValidationError:
+                    # Responses built-ins may have no valid Chat Completions view.
+                    return
 
                 async def render(value):
                     online = getattr(self, "online_renderer", None)

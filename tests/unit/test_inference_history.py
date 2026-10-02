@@ -5,10 +5,12 @@ import json
 from types import SimpleNamespace
 
 from openai.types.chat import (
+    ChatCompletionFunctionToolParam,
     ChatCompletionMessageToolCallParam,
     ChatCompletionMessageToolCallUnionParam,
 )
-from pydantic import BaseModel, TypeAdapter, model_validator
+from openai.types.responses.tool import Tool
+from pydantic import BaseModel, TypeAdapter, ValidationError, model_validator
 import pytest
 
 from art_inference import vllm
@@ -500,6 +502,116 @@ def test_previous_responses_keep_reasoning_and_tool_calls(serving):
     assert utils.construct_input_messages(
         prev_response_output=previous, request_input="next"
     )["request_input"] == [*previous, {"role": "user", "content": "next"}]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize(
+    "tool",
+    [
+        {
+            "type": "function",
+            "name": "lookup",
+            "description": "Lookup a value",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        {"type": "web_search_preview"},
+        {"type": "code_interpreter", "container": {"type": "auto"}},
+    ],
+)
+def test_responses_builtin_projection_keeps_completed_output(
+    serving, monkeypatch, stream, tool
+):
+    server, modules = serving
+    observed = []
+
+    class NativeChatRequest(Request):
+        tools: list[ChatCompletionFunctionToolParam] | None = None
+
+    modules[
+        "vllm.entrypoints.openai.chat_completion.protocol"
+    ].ChatCompletionRequest = NativeChatRequest
+    # vLLM 0.25.1 projects each non-Namespace Responses tool this way,
+    # including built-ins without the name required by the chat tool schema.
+    modules["vllm.entrypoints.openai.responses.utils"].construct_tool_dicts = (
+        lambda tools, choice: [
+            {"type": "function", "function": value.model_dump()} for value in tools
+        ]
+    )
+    original = vllm.chat_response_prefixes
+
+    async def observe(*args):
+        observed.append(args[1].tools)
+        return await original(*args)
+
+    monkeypatch.setattr(vllm, "chat_response_prefixes", observe)
+
+    async def run():
+        request = Request(
+            messages=[{"role": "user", "content": "question"}],
+            tools=[TypeAdapter(Tool).validate_python(tool)],
+            stream=stream,
+        )
+        before = copy.deepcopy(request.__dict__)
+        response = await server.create_responses(request)
+        if stream:
+            events = [event async for event in response]
+            assert len(events) == 1
+            assert events[0].type == "response.completed"
+            response = events[0].response
+        assert response.output == [
+            Message(reasoning_content="\nthought\n", content="action").model_dump()
+        ]
+        assert request.__dict__ == before
+
+    asyncio.run(run())
+    assert len(server.engine.prompts) == 1
+    assert len(observed) == (1 if tool["type"] == "function" else 0)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("boundary", ["constructor", "renderer", "normalization"])
+def test_responses_optional_view_keeps_other_errors(
+    serving, monkeypatch, stream, boundary
+):
+    server, modules = serving
+    error = ValueError("constructor failure")
+    if boundary != "constructor":
+        with pytest.raises(ValidationError) as caught:
+            TypeAdapter(int).validate_python("invalid")
+        error = caught.value
+
+        if boundary == "normalization":
+
+            def normalize(message):
+                raise error
+
+            monkeypatch.setattr(vllm, "openai_tool_arguments", normalize)
+        else:
+
+            async def render(*args, **kwargs):
+                raise error
+
+            server.online_renderer.preprocess_chat = render
+    else:
+
+        def construct(**kwargs):
+            raise error
+
+        modules[
+            "vllm.entrypoints.openai.chat_completion.protocol"
+        ].ChatCompletionRequest = construct
+
+    async def run():
+        response = await server.create_responses(
+            Request(messages=[{"role": "user", "content": "question"}], stream=stream)
+        )
+        if stream:
+            async for _ in response:
+                pass
+
+    with pytest.raises(type(error)) as caught:
+        asyncio.run(run())
+    assert caught.value is error
 
 
 def test_batched_generations_keep_separate_prompt_histories(serving):
