@@ -62,5 +62,6 @@ def test_compiled_child_move_retires_before_cached_view(monkeypatch, cpu_packing
     result = compiled(x, [1, 1])
     assert result.tolist() == [[8.0] * 8, [24.0] * 8]
     result.sum().backward()
+    assert x.grad is not None
     assert x.grad.tolist() == [[8.0] * 8, [24.0] * 8]
     assert module._grouped_shape is None

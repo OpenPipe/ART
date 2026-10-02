@@ -1,13 +1,42 @@
 """Packed frozen expert bases. Activation belongs to resident TrainerRank."""
 
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Iterator
+from typing import Any, Protocol, cast
 import weakref
 
 import torch
 
 
-def _pack_weights(linear: torch.nn.Module) -> tuple[int, int, int]:
+class _GroupedConfig(Protocol):
+    fp8: object
+    delay_wgrad_compute: bool
+
+
+class _GroupedLinear(Protocol):
+    num_gemms: int
+    weight0: torch.nn.Parameter
+    is_first_microbatch: bool
+    tp_size: int
+    sequence_parallel: bool
+    te_return_bias: bool
+
+    @property
+    def te_quant_params(self) -> object: ...
+    @property
+    def config(self) -> _GroupedConfig: ...
+
+    def named_parameters(
+        self, *, recurse: bool
+    ) -> Iterator[tuple[str, torch.nn.Parameter]]: ...
+    def register_load_state_dict_pre_hook(
+        self, hook: Callable[..., None]
+    ) -> torch.utils.hooks.RemovableHandle: ...
+    def __call__(
+        self, x: torch.Tensor, splits: list[int] | torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]: ...
+
+
+def _pack_weights(linear: _GroupedLinear) -> tuple[int, int, int]:
     weights = [getattr(linear, f"weight{i}") for i in range(linear.num_gemms)]
     # The registered Parameters remain the only persistent storage owners. A view
     # made in forward is an input to normal outer compile, not a cached GPU copy.
@@ -15,10 +44,10 @@ def _pack_weights(linear: torch.nn.Module) -> tuple[int, int, int]:
         packed = torch.stack(weights)
         for weight, view in zip(weights, packed, strict=True):
             weight.data = view
-    return tuple(packed.shape)
+    return cast(tuple[int, int, int], tuple(packed.shape))
 
 
-def _supported(linear: torch.nn.Module) -> bool:
+def _supported(linear: _GroupedLinear) -> bool:
     if not hasattr(torch, "_grouped_mm") or linear.num_gemms < 1:
         return False
     config = linear.config
@@ -78,7 +107,10 @@ def _offsets(
     # before constructing a view, without scanning expert storage or graph breaks
     # beyond this existing routing boundary. Nonuniform raw .data replacement is
     # outside the resident owner's contract.
-    if _first_layout(owner._grouped_linear().weight0) != owner._grouped_first:
+    if (
+        _first_layout(cast(_GroupedLinear, owner._grouped_linear()).weight0)
+        != owner._grouped_first
+    ):
         owner._retire_grouped_base()
         return None
     # Python routing lists otherwise become outer-Dynamo value guards, creating
@@ -131,7 +163,7 @@ class FrozenGroupedBase(torch.nn.Module):
             return
         if self._grouped_shape is not None:
             return
-        linear = self._grouped_linear()
+        linear = cast(_GroupedLinear, self._grouped_linear())
         if not _supported(linear):
             return
         if self._grouped_load_hook is None:
@@ -155,7 +187,7 @@ class FrozenGroupedBase(torch.nn.Module):
     def _base_forward(
         self, x: torch.Tensor, splits: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        linear = self._grouped_linear()
+        linear = cast(_GroupedLinear, self._grouped_linear())
         shape = self._grouped_shape
         if (
             shape is None

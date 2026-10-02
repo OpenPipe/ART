@@ -2,6 +2,7 @@
 
 import gc
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any, cast
 import weakref
 
 import pytest
@@ -9,8 +10,14 @@ import torch
 
 from art.megatron.kernels import frozen_grouped_linear as base
 
+if TYPE_CHECKING:
+    from art.megatron.train import TrainingRuntime
+
 
 class Linear(torch.nn.Module):
+    weight0: torch.nn.Parameter
+    weight1: torch.nn.Parameter
+
     def __init__(self):
         super().__init__()
         self.num_gemms = 2
@@ -24,7 +31,7 @@ class Linear(torch.nn.Module):
             weight = torch.nn.Parameter(
                 torch.full((8, 8), i + 1.0, dtype=torch.bfloat16), requires_grad=False
             )
-            weight.partition_dim = i
+            setattr(weight, "partition_dim", i)
             self.register_parameter(f"weight{i}", weight)
 
     def forward(self, x, splits):
@@ -85,7 +92,7 @@ def test_pack_once_preserves_schema_metadata_and_sole_backing(cpu_packing, monke
     assert calls == [1]
     assert tuple(module.state_dict()) == names
     assert all(a is b for a, b in zip(module.parameters(), parameters))
-    assert [p.partition_dim for p in parameters] == [0, 1]
+    assert [getattr(p, "partition_dim") for p in parameters] == [0, 1]
     assert not tuple(module.buffers())
     assert len({p.untyped_storage().data_ptr() for p in parameters}) == 1
     assert parameters[0].untyped_storage().nbytes() == 2 * 8 * 8 * 2
@@ -104,6 +111,7 @@ def test_inplace_copy_alias_and_overlapping_offset_lifetimes(cpu_packing):
     assert cpu_packing[0].tolist() == [0, 3]
     second.sum().backward(retain_graph=True)
     first.sum().backward()
+    assert x.grad is not None
     assert x.grad.tolist() == [[24.0] * 8, [24.0] * 8, [32.0] * 8]
     with torch.no_grad():
         module.linear.weight1.fill_(7)
@@ -214,7 +222,7 @@ def test_actual_manager_install_selects_before_streaming(
     )
     module = Wrapper()
     observed = []
-    namespace = {
+    namespace: dict[str, Any] = {
         "install_streaming_weight_offload": lambda **kwargs: observed.append(
             module._grouped_shape
         )
@@ -287,7 +295,8 @@ def test_actual_trainer_rank_constructor_activates_resident_base(cpu_packing):
         model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
     )
     assert model.fc._grouped_shape is None
-    rank = TrainerRank(runtime)
+    # The CPU constructor fixture supplies only the runtime fields it consumes.
+    rank = TrainerRank(cast("TrainingRuntime", runtime))
     assert rank.runtime is runtime
     assert model.fc._grouped_shape == (2, 8, 8)
     assert model.fc._grouped_preparations == 1
@@ -299,6 +308,7 @@ def test_nonfirst_base_trainability_keeps_te_gradient(cpu_packing):
     module.linear.weight1.requires_grad_(True)
     x = torch.ones((2, 8), dtype=torch.bfloat16, requires_grad=True)
     module(x, [1, 1]).sum().backward()
+    assert module.linear.weight1.grad is not None
     assert torch.equal(
         module.linear.weight1.grad, torch.ones_like(module.linear.weight1)
     )
