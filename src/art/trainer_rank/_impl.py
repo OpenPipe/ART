@@ -17,6 +17,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
+import json
 import logging
 import math
 import os
@@ -124,6 +125,10 @@ _MEMORY_PROFILE_TRUST_GROWTH = 8
 _MEMORY_SAFETY_FACTOR = 1.10
 _MEMORY_RESERVE_FRACTION = 0.03
 _HEAD_CHUNK_TOKENS = 512
+# An unprofiled full-recompute gradient wave's first execution keeps two fixed
+# 32 MiB transients live at its peak (Qwen3.6-35B-A3B CP2: the RoPE frequencies
+# and a frozen linear's output, at 2k to 20k tokens); warm waves do not.
+_COLD_RECOMPUTE_TRANSIENT_BYTES = 64 * 2**20
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -1090,6 +1095,13 @@ class _SubforwardCost:
     # HybridEP buffer growth before the safety factor. It is in required, not
     # retained, and persists across a split, which charges the largest once.
     hybridep_growth: int = 0
+    # Adapter gradients the recompute backward holds beyond the boundaries it
+    # has released (``_checkpoint_adapter_gradient_bytes``), before the safety
+    # factor. Split children training the same slots share them, so a split
+    # charges the largest once; ``..._slots`` names those slots (sorted JSON
+    # of kind/name pairs, "" when none), keeping the cost JSON-serializable.
+    checkpoint_adapter_gradient: int = 0
+    checkpoint_adapter_gradient_slots: str = ""
 
     @property
     def ephemeral(self) -> int:
@@ -2973,18 +2985,33 @@ class TrainerRank:
         # backing stores, nor a bound for compiler saves or other backward work.
         # Keep it out of forward retention, including the cold fallback above.
         gradient = checkpoint_retained
+        gradient_slots = self._gradient_slots(group_rows, slot_refs)
+        adapter_gradient = (
+            self._checkpoint_adapter_gradient_bytes(
+                self._checkpoint_gradient_groups(group_rows, slot_refs)
+            )
+            if gradient
+            else 0
+        )
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
         checkpoint_workspace = max(
             checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
+        if gradient and self._memory_profiles.get(signature) is None:
+            checkpoint_workspace += _COLD_RECOMPUTE_TRANSIENT_BYTES
         forward_required = required
         if gradient:
             required = max(
                 required,
                 int(
-                    (checkpoint_retained + checkpoint_workspace + gradient)
+                    (
+                        checkpoint_retained
+                        + checkpoint_workspace
+                        + gradient
+                        + adapter_gradient
+                    )
                     * _MEMORY_SAFETY_FACTOR
                 ),
             )
@@ -2998,6 +3025,22 @@ class TrainerRank:
             checkpoint_input_gradient=gradient,
             checkpoint_peak_increment=required - forward_required,
             hybridep_growth=hybridep_growth_bytes,
+            checkpoint_adapter_gradient=adapter_gradient,
+            checkpoint_adapter_gradient_slots=json.dumps(
+                [
+                    [ref.kind, ref.name]
+                    for ref in sorted(
+                        gradient_slots,
+                        key=lambda ref: (
+                            ref.kind,
+                            ref.name is not None,
+                            ref.name or "",
+                        ),
+                    )
+                ]
+            )
+            if adapter_gradient
+            else "",
         )
 
     def last_forward_telemetry(self) -> dict[str, Any]:
@@ -4772,6 +4815,11 @@ class TrainerRank:
     _checkpoint_moe_bytes_per_token = _memory._checkpoint_moe_bytes_per_token
     _moe_workspace_bytes = _memory._moe_workspace_bytes
     _checkpoint_memory_floor = _memory._checkpoint_memory_floor
+    _gradient_slots = staticmethod(_memory._gradient_slots)
+    _pending_adapter_gradient_bytes = _memory._pending_adapter_gradient_bytes
+    _checkpoint_gradient_groups = _memory._checkpoint_gradient_groups
+    _checkpoint_adapter_gradient_bytes = _memory._checkpoint_adapter_gradient_bytes
+    _adapter_gradient_walk = staticmethod(_memory._adapter_gradient_walk)
     _retained_memory_bytes = _memory._retained_memory_bytes
     _estimate_flat_forward = _memory._estimate_flat_forward
     _update_peak_memory_profile = _memory._update_peak_memory_profile

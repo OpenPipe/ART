@@ -710,6 +710,9 @@ def replay(
         raise ValueError(
             "incomplete replay: immutable rank fields differ (including MoE stages)"
         )
+    layers = values["num_layers"]
+    if type(layers) is not int or not 0 < layers <= _planner_replay.MAX_LAYERS:
+        raise ValueError("incomplete replay: recorded layer count out of bounds")
     rank = _planner_replay.ReplayRank.__new__(_planner_replay.ReplayRank)
     for name in _RANK_FIELDS - {"one_layer_recompute"}:
         setattr(rank, "_" + name, values[name])
