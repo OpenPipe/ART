@@ -8,6 +8,7 @@ import torch
 from torch._dynamo import config as dynamo_config
 
 from art.megatron.compile_workarounds import (
+    _isolate_moe_compile_cache,
     install_reusable_checkpoint_backward,
     install_te_reusable_backward,
     install_torch_compile_workarounds,
@@ -21,7 +22,10 @@ _DYNAMO_CONFIG = cast(Any, dynamo_config)
 
 def _configure_dynamo() -> None:
     """Set the process-wide Dynamo policy required by dynamic LoRA slots."""
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
     configure_reusable_backward()
+    _isolate_moe_compile_cache(MoELayer)
     # Dynamic checkpoint slots register differently shaped projection parameters
     # behind one LoRA.forward code object. Let automatic dynamic shapes generalize
     # those parameter dimensions instead of compiling once per projection site.

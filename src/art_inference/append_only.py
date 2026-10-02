@@ -12,6 +12,8 @@ import json
 import sys
 from typing import Any
 
+from pydantic import ValidationError
+
 from .token_prefix import PrefixEdit, prefix_edits
 
 PrefixObservation = tuple[list[int], list[int], tuple[PrefixEdit, ...]]
@@ -468,9 +470,15 @@ async def chat_response_prefixes(
 
     async def complete(message: Mapping[str, Any]) -> list[int] | None:
         message = openai_tool_arguments(message)
-        return await render(
-            type(request).model_validate({**payload, "messages": [*messages, message]})
-        )
+        try:
+            completed = type(request).model_validate(
+                {**payload, "messages": [*messages, message]}
+            )
+        except ValidationError:
+            # Sparse or incomplete sampled tool calls are not renderable history.
+            # Leave the response unchanged and decline this optional observation.
+            return None
+        return await render(completed)
 
     entries: list[PrefixObservation] = []
     for message, output, finished in choices:

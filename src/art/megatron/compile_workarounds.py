@@ -124,6 +124,18 @@ def install_reusable_checkpoint_backward() -> None:
     setattr(CheckpointWithoutOutput, "discard_output_and_register_recompute", discard)
 
 
+def _isolate_moe_compile_cache(moe_layer: Any) -> None:
+    # Megatron's three CUDA-graph decorators share one wrapped_func code object.
+    # Their different signatures and grad modes otherwise spend the same Dynamo
+    # recompile budget. Keep one cache per method, still shared across layers.
+    for name in ("route", "preprocess", "shared_experts_compute"):
+        function = getattr(moe_layer, name)
+        function = getattr(function, "_torchdynamo_orig_callable", function)
+        if not getattr(function, "__art_compile_cache_isolated__", False):
+            function.__code__ = function.__code__.replace()
+            function.__art_compile_cache_isolated__ = True
+
+
 def _require_attr(obj: Any, name: str) -> Any:
     value = getattr(obj, name, None)
     if value is None:
