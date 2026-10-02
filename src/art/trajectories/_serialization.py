@@ -94,11 +94,13 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         for index, item in enumerate(items):
             items[index] = _intern_value(item, pool, memo)
         return value
-    if isinstance(value, tuple):
+    if type(value) is tuple or type(value) is frozenset:
+        # Opaque objects and cycle backedges may still hold this exact container.
+        # Visit mutable descendants, but never replace immutable graph nodes.
         memo[value_id] = value
-        result = tuple(_intern_value(item, pool, memo) for item in value)
-        memo[value_id] = result
-        return result
+        for item in value:
+            _intern_value(item, pool, memo)
+        return value
     if isinstance(value, set):
         memo[value_id] = value
         values = cast(set[object], value)
@@ -106,11 +108,6 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         values.clear()
         values.update(items)
         return value
-    if isinstance(value, frozenset):
-        memo[value_id] = value
-        result = frozenset(_intern_value(item, pool, memo) for item in value)
-        memo[value_id] = result
-        return result
     if is_dataclass(value) and type(value).__module__.startswith("art.trajectories"):
         memo[value_id] = value
         for field in fields(value):
@@ -126,15 +123,19 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
 def _intern_mapping(
     value: dict[object, object], pool: _StringPool, memo: dict[int, object]
 ) -> None:
-    replacements: list[tuple[str, str]] = []
+    # Rebuilding arbitrary mappings can invoke custom methods or rehash opaque keys.
+    intern_keys = type(value) is dict and all(type(key) is str for key in value)
+    replacements: dict[int, str] = {}
     for key, item in value.items():
-        if type(key) is str:
+        if intern_keys and type(key) is str:
             interned = pool.setdefault(key, key)
             if interned is not key:
-                replacements.append((key, interned))
+                replacements[id(key)] = interned
         value[key] = _intern_value(item, pool, memo)
-    for key, interned in replacements:
-        value[interned] = value.pop(key)
+    if replacements:
+        items = [(replacements.get(id(key), key), item) for key, item in value.items()]
+        value.clear()
+        value.update(items)
 
 
 def serialize_messages_and_choices(items: list[Any]) -> list[dict[str, Any]]:

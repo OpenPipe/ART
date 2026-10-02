@@ -79,9 +79,10 @@ def test_explicit_memory_compaction_interns_nested_models_keys_and_cycles() -> N
     assert (provider.__pydantic_extra__ or {})[canonical] is canonical
     assert untouched.value is not canonical
     assert trajectory.metadata["tuple_a"] is trajectory.metadata["tuple_b"]
-    assert trajectory.metadata["tuple_a"][0] is canonical
+    assert trajectory.metadata["tuple_a"] is shared_tuple
+    assert trajectory.metadata["tuple_a"][0] == canonical
     assert next(iter(trajectory.metadata["set"])) is canonical
-    assert next(iter(trajectory.metadata["frozenset"])) is canonical
+    assert next(iter(trajectory.metadata["frozenset"])) == canonical
 
 
 def test_only_pickle_boundary_interns_validated_finished_and_grouped_values() -> None:

@@ -1452,7 +1452,11 @@ _CompactValidated: TypeAlias = Union[CompactDumpable, list[CompactDumpable]]
 
 
 def compact_memory[T](value: T) -> T:
-    """Deduplicate equal strings in a supported object graph in place."""
+    """Deduplicate writable string references without replacing container identities.
+
+    Strings directly held by immutable containers are left in place; their mutable
+    descendants are still compacted. Unsupported objects remain opaque.
+    """
 
     _intern_string_graph(value)
     return value
