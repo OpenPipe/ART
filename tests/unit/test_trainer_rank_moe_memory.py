@@ -746,15 +746,23 @@ def test_hybridep_high_water_needs_a_live_larger_graph(
     assert tuple(refs) == before and rank._pending_hybridep_graphs is refs
 
 
+@pytest.mark.parametrize("profiled", [False, True], ids=["cold", "profiled"])
 def test_hybridep_admission_ignores_consumed_graph_with_retained_sibling(
     hybrid_checkpoint_rank,
+    profiled,
 ):
     rank = hybrid_checkpoint_rank
+    signature = replace(_signature(), topology=(1, 1, 2, 1))
+    if profiled:
+        rank._memory_profiles[signature] = _MemoryProfile(
+            bytes_per_token=1, packed_tokens=2
+        )
+    cold = 0 if profiled else COLD
     values = dict(
         packed_tokens=2,
         logical_tokens=2,
         output_bytes=8,
-        signature=replace(_signature(), topology=(1, 1, 2, 1)),
+        signature=signature,
         group_rows=((2, True),),
     )
     baseline = rank._subforward_cost(**values)
@@ -770,7 +778,12 @@ def test_hybridep_admission_ignores_consumed_graph_with_retained_sibling(
     (marker_ref,) = refs
     assert marker_ref() is not None and not marker_ref().item()
     live = rank._subforward_cost(**values)
-    assert live.checkpoint_workspace == 218752 * 2048 * 2
+    retained, workspace = rank._checkpoint_memory_floor(values["group_rows"])
+    assert workspace == 218752 * 2048 * 2
+    assert live.checkpoint_adapter_gradient == 0
+    # The cold allowance is separate from the live graph's dense-output extent.
+    assert live.checkpoint_workspace == workspace + cold
+    assert live.required == int((8 + 2 * retained + workspace + cold) * 1.1)
     assert not rank._memory_check_required(live.required).fits
 
     assert output.hidden_states is not None
