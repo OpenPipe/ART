@@ -462,6 +462,9 @@ class Reporter:
             <= threshold * predicted_peak_bytes
         ):
             return None
+        retention = None
+        record = None
+        path = None
         try:
             if (predicted_peak_bytes is not None and predicted_peak_bytes < 0) or (
                 observed_peak_bytes is not None and observed_peak_bytes < 0
@@ -471,22 +474,7 @@ class Reporter:
             planning_budget = planning and not (
                 failure is not None and failure["type"] == "OutOfMemoryError"
             )
-            if retention is not None and not _planner_retention.remaining(
-                retention,
-                count_limit=MAX_PLANNING_REPORTS
-                if planning_budget
-                else MAX_SPOOL_REPORTS,
-                byte_limit=MAX_PLANNING_SPOOL_BYTES
-                if planning_budget
-                else MAX_SPOOL_BYTES,
-            ):
-                # Only definitive exhaustion can skip construction without changing
-                # which smaller reports or static-cap fallbacks remain retainable.
-                _planner_retention.omit_unmeasured(retention)
-                raise _planner_retention.RetentionLimitReached(
-                    "assigned planner retention exhausted before construction"
-                )
-            record: dict[str, Any] = {
+            record = {
                 "format": 2,
                 "kind": "art-planner-miss",
                 "event": event,
@@ -515,6 +503,21 @@ class Reporter:
                 "incomplete_reasons": [],
                 "replay_scope": "cpu-memory-estimator; GPU execution requires checkpoint/runtime",
             }
+            if retention is not None and not _planner_retention.remaining(
+                retention,
+                count_limit=MAX_PLANNING_REPORTS
+                if planning_budget
+                else MAX_SPOOL_REPORTS,
+                byte_limit=MAX_PLANNING_SPOOL_BYTES
+                if planning_budget
+                else MAX_SPOOL_BYTES,
+            ):
+                # Only definitive exhaustion can skip construction without changing
+                # which smaller reports or static-cap fallbacks remain retainable.
+                _planner_retention.omit_unmeasured(retention)
+                raise _planner_retention.RetentionLimitReached(
+                    "assigned planner retention exhausted before construction"
+                )
             try:
                 record["replay"] = dict(replay_factory())
                 record["replay"]["source_files"] = _source_files()
@@ -566,6 +569,14 @@ class Reporter:
                 else f"local persistence failed ({type(exc).__name__})"
             )
             return None
+        finally:
+            if retention is not None and record is not None:
+                try:
+                    _planner_retention.summarize(
+                        retention, record, retained=path is not None
+                    )
+                except Exception as exc:
+                    _warn(f"capture summary unavailable ({type(exc).__name__})")
         if not record["replay_complete"]:
             _warn(f"partial replay retained at {path}")
         if _sink is not None:
