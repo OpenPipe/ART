@@ -648,8 +648,10 @@ class FakeAsyncOpenAI:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("idle_timeout", [None, 7200.5])
 async def test_rollout_supports_string_model_args(
     monkeypatch: pytest.MonkeyPatch,
+    idle_timeout: float | None,
 ) -> None:
     rollout_module = importlib.import_module("art.tau_bench.rollout")
     rollout_module.openai_clients.clear()
@@ -675,6 +677,7 @@ async def test_rollout_supports_string_model_args(
         client=client,
         base_model="Qwen/Qwen3.6-35B-A3B",
         max_turns=1,
+        environment_idle_timeout_seconds=idle_timeout,
     )
 
     assert trajectory.reward == 1.0
@@ -688,7 +691,7 @@ async def test_rollout_supports_string_model_args(
     assert trajectory.metrics["tokens/completion"] == 5
     assert client.deleted == ["env-1"]
     assert client.create_kwargs["user_llm"] == "gpt-4.1-2025-04-14"
-    assert client.create_kwargs["idle_timeout_seconds"] == 30 * 60
+    assert client.create_kwargs["idle_timeout_seconds"] == (idle_timeout or 30 * 60)
     policy_client: Any = rollout_module.openai_clients[
         ("http://model.test/v1", "model-key")
     ]
@@ -716,7 +719,8 @@ async def test_rollout_supports_string_model_args(
 
 
 @pytest.mark.asyncio
-async def test_rollout_supports_art_model_like_args() -> None:
+@pytest.mark.parametrize("idle_timeout", [None, 7200.5])
+async def test_rollout_supports_art_model_like_args(idle_timeout: float | None) -> None:
     rollout_module = importlib.import_module("art.tau_bench.rollout")
     model = art.Model(
         name="registered-model",
@@ -733,11 +737,12 @@ async def test_rollout_supports_art_model_like_args() -> None:
         model,
         client=client,
         max_turns=1,
+        environment_idle_timeout_seconds=idle_timeout,
     )
 
     assert trajectory.metadata["scenario_id"] == "task_001"
     assert trajectory.metrics["num_turns"] == 1
-    assert client.create_kwargs["idle_timeout_seconds"] is None
+    assert client.create_kwargs["idle_timeout_seconds"] == idle_timeout
 
 
 @pytest.mark.asyncio
@@ -770,8 +775,10 @@ async def test_rollout_preserves_explicit_completion_limit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("idle_timeout", [None, 7200.5])
 async def test_rollout_preserves_server_lease_for_explicit_policy_timeout(
     monkeypatch: pytest.MonkeyPatch,
+    idle_timeout: float | None,
 ) -> None:
     rollout_module = importlib.import_module("art.tau_bench.rollout")
     rollout_module.openai_clients.clear()
@@ -796,9 +803,32 @@ async def test_rollout_preserves_server_lease_for_explicit_policy_timeout(
         client=client,
         max_turns=1,
         chat_completion_kwargs={"timeout": None},
+        environment_idle_timeout_seconds=idle_timeout,
     )
 
-    assert client.create_kwargs["idle_timeout_seconds"] is None
+    assert client.create_kwargs["idle_timeout_seconds"] == idle_timeout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("idle_timeout", [0, -1, 0.5, float("inf"), float("nan")])
+async def test_rollout_rejects_invalid_idle_timeout_before_client_creation(
+    monkeypatch: pytest.MonkeyPatch,
+    idle_timeout: float,
+) -> None:
+    rollout_module = importlib.import_module("art.tau_bench.rollout")
+
+    def unexpected_client(*args: Any) -> None:
+        raise AssertionError("Invalid timeout must fail before client creation")
+
+    monkeypatch.setattr(rollout_module, "_get_default_client", unexpected_client)
+    with pytest.raises(ValueError, match="finite and at least one second"):
+        await rollout_module.rollout(
+            Scenario(domain="banking_knowledge", task=Task(id="task_001")),
+            "http://model.test/v1",
+            "model-key",
+            "default",
+            environment_idle_timeout_seconds=idle_timeout,
+        )
 
 
 @pytest.mark.asyncio
