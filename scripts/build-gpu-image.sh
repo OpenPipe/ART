@@ -497,7 +497,11 @@ repo, tag = sys.argv[2], sys.argv[3]
 # abbreviated --image-repo must match its normalized form as well.
 candidates = {repo}
 parts = repo.split("/")
-if "." not in parts[0] and ":" not in parts[0] and parts[0] != "localhost":
+# A lone name is always a Docker Hub repository; only a component before a
+# slash can be a registry host (it contains a dot or a port, or is localhost).
+if len(parts) == 1 or (
+    "." not in parts[0] and ":" not in parts[0] and parts[0] != "localhost"
+):
     parts = ["docker.io", *parts]
 if parts[0] in {"docker.io", "index.docker.io"} and len(parts) == 2:
     parts = [parts[0], "library", parts[1]]

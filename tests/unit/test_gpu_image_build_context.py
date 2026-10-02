@@ -140,6 +140,8 @@ def _digest_resolver() -> str:
         ("docker.io/bradhiltonnw/art-gpu", "docker.io/bradhiltonnw/art-gpu"),
         ("bradhiltonnw/art-gpu", "docker.io/bradhiltonnw/art-gpu"),
         ("art-gpu", "docker.io/library/art-gpu"),
+        ("art.gpu", "docker.io/library/art.gpu"),
+        ("localhost", "docker.io/library/localhost"),
         ("index.docker.io/bradhiltonnw/art-gpu", "docker.io/bradhiltonnw/art-gpu"),
         ("ghcr.io/openpipe/art-gpu", "ghcr.io/openpipe/art-gpu"),
         ("localhost:5000/art-gpu", "localhost:5000/art-gpu"),
