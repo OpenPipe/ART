@@ -485,14 +485,27 @@ if [[ "${pull_image_repo}" != "${image_repo}" ]]; then
   echo "  ${pull_image_repo}:${image_tag}"
 fi
 image_digest="$(
-  uv run --no-project python - "${build_log_snapshot_path}" "${image_repo}:${image_tag}" <<'PY'
+  uv run --no-project python - "${build_log_snapshot_path}" "${image_repo}" "${image_tag}" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 log = Path(sys.argv[1]).read_text(errors="replace")
-image = re.escape(sys.argv[2])
-matches = re.findall(rf"pushing manifest for {image}@(sha256:[0-9a-f]+)", log)
+repo, tag = sys.argv[2], sys.argv[3]
+# BuildKit logs the canonical reference: Docker Hub repositories gain the
+# docker.io host and official images the library namespace, so an
+# abbreviated --image-repo must match its normalized form as well.
+candidates = {repo}
+parts = repo.split("/")
+if "." not in parts[0] and ":" not in parts[0] and parts[0] != "localhost":
+    parts = ["docker.io", *parts]
+if parts[0] in {"docker.io", "index.docker.io"} and len(parts) == 2:
+    parts = [parts[0], "library", parts[1]]
+candidates.add("/".join(parts))
+if parts[0] == "index.docker.io":
+    candidates.add("/".join(["docker.io", *parts[1:]]))
+images = "|".join(re.escape(f"{candidate}:{tag}") for candidate in sorted(candidates))
+matches = re.findall(rf"pushing manifest for (?:{images})@(sha256:[0-9a-f]+)", log)
 if matches:
     print(matches[-1])
 PY
