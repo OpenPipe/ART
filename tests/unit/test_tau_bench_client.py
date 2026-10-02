@@ -46,7 +46,8 @@ def test_client_reuses_connections_by_default(
     assert len(transport_kwargs) == 64
     limits = [kwargs["limits"] for kwargs in transport_kwargs]
     assert all(isinstance(limit, httpx.Limits) for limit in limits)
-    assert {limit.max_connections for limit in limits} == {100_000}
+    assert {limit.max_connections for limit in limits} == {None}
+    assert {limit.keepalive_expiry for limit in limits} == {60.0}
     assert sum(limit.max_keepalive_connections or 0 for limit in limits) == 100_000
     assert {kwargs["retries"] for kwargs in transport_kwargs} == {2}
     assert seen["timeout"] == httpx.Timeout(
@@ -58,20 +59,26 @@ def test_client_reuses_connections_by_default(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("max_connections", [None, 100_000])
 async def test_sharded_transport_routes_round_robin_and_closes(
     monkeypatch: pytest.MonkeyPatch,
+    max_connections: int | None,
 ) -> None:
     transports: list[Any] = []
 
     class FakeTransport:
         def __init__(self, **kwargs: Any) -> None:
             self.index = len(transports)
+            self.limits = kwargs["limits"]
             self.closed = False
             transports.append(self)
 
         async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
             return httpx.Response(
-                200, request=request, extensions={"shard": self.index}
+                200,
+                request=request,
+                stream=httpx.ByteStream(b""),
+                extensions={"shard": self.index},
             )
 
         async def aclose(self) -> None:
@@ -80,20 +87,25 @@ async def test_sharded_transport_routes_round_robin_and_closes(
     monkeypatch.setattr(client_module.httpx, "AsyncHTTPTransport", FakeTransport)
     transport = client_module._ShardedAsyncHTTPTransport(
         limits=httpx.Limits(
-            max_connections=100_000,
-            max_keepalive_connections=100_000,
+            max_connections=max_connections,
+            max_keepalive_connections=2,
         ),
         retries=2,
     )
     request = httpx.Request("GET", "http://tau.test")
 
-    shards = [
-        (await transport.handle_async_request(request)).extensions["shard"]
-        for _ in range(65)
-    ]
+    # Open responses may exceed the idle-retention limit without waiting for close.
+    async with asyncio.timeout(1):
+        responses = [await transport.handle_async_request(request) for _ in range(65)]
+    assert all(not response.is_closed for response in responses)
+    for response in responses:
+        await response.aclose()
+    assert all(response.is_closed for response in responses)
     await transport.aclose()
 
-    assert shards == [*range(64), 0]
+    assert [response.extensions["shard"] for response in responses] == [*range(64), 0]
+    assert {item.limits.max_connections for item in transports} == {max_connections}
+    assert sum(item.limits.max_keepalive_connections for item in transports) == 2
     assert all(item.closed for item in transports)
 
 
@@ -711,7 +723,8 @@ async def test_rollout_supports_string_model_args(
     transports = http_client.transport.transports
     assert len(transports) == 64
     assert {transport.retries for transport in transports} == {2}
-    assert {transport.limits.max_connections for transport in transports} == {100_000}
+    assert {transport.limits.max_connections for transport in transports} == {None}
+    assert {transport.limits.keepalive_expiry for transport in transports} == {5.0}
     assert (
         sum(transport.limits.max_keepalive_connections for transport in transports)
         == 100_000
