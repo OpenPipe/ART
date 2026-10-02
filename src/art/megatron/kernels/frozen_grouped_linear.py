@@ -56,8 +56,31 @@ def _supported(linear: torch.nn.Module) -> bool:
     )
 
 
+def _first_layout(weight: torch.nn.Parameter) -> tuple[Any, ...]:
+    storage = weight.untyped_storage()
+    return (
+        id(weight),
+        weight.device,
+        weight.dtype,
+        tuple(weight.shape),
+        weight.stride(),
+        weight.storage_offset(),
+        storage.data_ptr(),
+        storage.nbytes(),
+    )
+
+
 @torch.compiler.disable
-def _offsets(x: torch.Tensor, splits: list[int] | torch.Tensor) -> torch.Tensor:
+def _offsets(
+    owner: "FrozenGroupedBase", x: torch.Tensor, splits: list[int] | torch.Tensor
+) -> torch.Tensor | None:
+    # Standard child moves/views transform all Parameters. Check one layout here
+    # before constructing a view, without scanning expert storage or graph breaks
+    # beyond this existing routing boundary. Nonuniform raw .data replacement is
+    # outside the resident owner's contract.
+    if _first_layout(owner._grouped_linear().weight0) != owner._grouped_first:
+        owner._retire_grouped_base()
+        return None
     # Python routing lists otherwise become outer-Dynamo value guards, creating
     # a new graph for each routing pattern. Keep values in an invocation tensor.
     return torch.as_tensor(splits, device=x.device, dtype=torch.int32).cumsum(
@@ -84,6 +107,7 @@ class FrozenGroupedBase(torch.nn.Module):
         super().__init__()
         self._grouped_shape: tuple[int, int, int] | None = None
         self._grouped_weights: tuple[torch.nn.Parameter, ...] = ()
+        self._grouped_first: tuple[Any, ...] | None = None
         self._grouped_resident = True
         self._grouped_preparations = 0
         self._grouped_load_hook = None
@@ -91,6 +115,7 @@ class FrozenGroupedBase(torch.nn.Module):
     def _retire_grouped_base(self) -> None:
         self._grouped_shape = None
         self._grouped_weights = ()
+        self._grouped_first = None
 
     def _apply(self, fn: Callable, recurse: bool = True) -> Any:
         self._retire_grouped_base()
@@ -121,6 +146,7 @@ class FrozenGroupedBase(torch.nn.Module):
         self._grouped_weights = tuple(
             getattr(linear, f"weight{i}") for i in range(linear.num_gemms)
         )
+        self._grouped_first = _first_layout(linear.weight0)
         self._grouped_preparations += 1
 
     def _grouped_linear(self) -> torch.nn.Module:
@@ -139,7 +165,9 @@ class FrozenGroupedBase(torch.nn.Module):
             return linear(x, splits)
         _, n, k = shape
         # Invocation-owned offsets survive overlapping forwards and recompute.
-        offsets = _offsets(x, splits)
+        offsets = _offsets(self, x, splits)
+        if offsets is None:
+            return linear(x, splits)
         weight = linear.weight0.as_strided(shape, (n * k, k, 1))
         result = torch._grouped_mm(x, weight.transpose(1, 2), offs=offsets)
         linear.is_first_microbatch = False
