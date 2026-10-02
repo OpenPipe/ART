@@ -663,6 +663,7 @@ class _CandidateMicroBatch(Generic[ForwardInputsT]):
     rejected_candidates: int
     cold_start: bool
     fallback: _CandidateMicroBatch[ForwardInputsT] | None = None
+    recovery_probe: _MemoryCheck | None = None
 
 
 class _SlotGraphSentinel(torch.autograd.Function):

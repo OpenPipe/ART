@@ -272,10 +272,14 @@ def test_partial_forward_does_not_learn_split_peak(monkeypatch):
     assert rank._memory_profiles == counters["profiles_before_failure"]
 
 
-def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch):
-    # Real selection/find/rung methods with explicit scalar reductions. This is
-    # not native distributed convergence or a model-execution test.
+@pytest.mark.parametrize("request_count", [1, 2])
+def test_empty_dp_rank_retains_global_selection_collective_sequence(
+    monkeypatch, request_count
+):
+    # Real selection/find/rung/recovery methods with simulated peer operands.
+    # This is not native distributed convergence or a model-execution test.
     traces = []
+    split = request_count == 2
     for dp_rank in (0, 1):
         with monkeypatch.context() as patch:
             rank = _rank()
@@ -316,29 +320,91 @@ def test_empty_dp_rank_retains_global_selection_collective_sequence(monkeypatch)
             patch.setattr(rank, "_search_next_micro_batch", searched)
 
             def reduce(value, op, group=None):
-                trace.append(("global" if group is None else "local", str(op)))
-                if group is None:
-                    value.fill_(
-                        max(value.item(), 100 if search_finished else 200)
-                        if op == tr.dist.ReduceOp.MAX
-                        else min(value.item(), 100)
+                trace.append(
+                    (
+                        "global" if group is None else "local",
+                        str(op),
+                        tuple(value.shape),
+                        value.dtype,
                     )
+                )
+                if group is None:
+                    if value.dtype == torch.int32:
+                        # WORLD fallback MIN: split=2, flat/empty=3. The empty
+                        # peer must see the split vote and join recovery too.
+                        assert value.ndim == 0 and op == tr.dist.ReduceOp.MIN
+                        assert value.item() == (2 if split and dp_rank == 0 else 3)
+                        peer = value.new_tensor(2 if split else 3)
+                    elif value.ndim == 0:
+                        # Scalar admission checks exchange byte counters only.
+                        assert value.dtype == torch.float64
+                        assert op in (tr.dist.ReduceOp.MAX, tr.dist.ReduceOp.MIN)
+                        peer = value.new_tensor(
+                            (100 if search_finished else 200)
+                            if op == tr.dist.ReduceOp.MAX
+                            else 100
+                        )
+                    else:
+                        # Recovery vectors mix seconds, bytes and flags. Use
+                        # elementwise peer operands, never a scalar byte clamp.
+                        assert split and search_finished
+                        assert value.dtype == torch.float64
+                        peer = value.new_tensor(
+                            [0.0, 0.0]
+                            if op == tr.dist.ReduceOp.SUM
+                            else [200.0, 0.0, 0.0, 0.0]
+                            if op == tr.dist.ReduceOp.MAX
+                            else [100.0, 0.0, 1.0, 1.0]
+                        )
+                        assert value.shape == peer.shape
+                    if op == tr.dist.ReduceOp.SUM:
+                        value.add_(peer)
+                    elif op == tr.dist.ReduceOp.MAX:
+                        value.copy_(torch.maximum(value, peer))
+                    else:
+                        assert op == tr.dist.ReduceOp.MIN
+                        value.copy_(torch.minimum(value, peer))
 
             patch.setattr(tr.dist, "is_available", lambda: True)
             patch.setattr(tr.dist, "is_initialized", lambda: True)
             patch.setattr(tr.dist, "all_reduce", reduce)
-            candidate = rank._select_next_micro_batch([_requests()], 0)
+            candidate = rank._select_next_micro_batch([_requests(request_count)], 0)
             assert candidate.check.fits
+            assert candidate.check.estimated_required_bytes == 100
+            assert candidate.check.available_bytes == 100
             assert len(candidate.inputs) == (1 if dp_rank == 0 else 0)
+            assert candidate.indices == ((0,) if dp_rank == 0 else ())
+            assert candidate.stats_global_count == 1
             assert isinstance(
                 candidate.plan,
-                tr._SplitForwardPlan if dp_rank == 0 else tr._FlatForwardPlan,
+                tr._SplitForwardPlan if split and dp_rank == 0 else tr._FlatForwardPlan,
             )
+            assert candidate.plan.request_count == (
+                request_count if dp_rank == 0 else 0
+            )
+            assert len(search_finished) == 1
+            assert (candidate.recovery_probe is not None) == split
+            if split:
+                assert candidate.recovery_probe.estimated_required_bytes == 200
+            state = rank._recovery_state()
+            assert state.owner is None and not state.first_consumed
             traces.append([event for event in trace if event[0] == "global"])
             assert traces[-1][-2:] == [
-                ("global", str(tr.dist.ReduceOp.MAX)),
-                ("global", str(tr.dist.ReduceOp.MIN)),
+                ("global", str(tr.dist.ReduceOp.MAX), (), torch.float64),
+                ("global", str(tr.dist.ReduceOp.MIN), (), torch.float64),
             ]
+            vectors = [event for event in traces[-1] if len(event) == 4 and event[2]]
+            assert vectors == (
+                [
+                    ("global", str(tr.dist.ReduceOp.SUM), (2,), torch.float64),
+                    ("global", str(tr.dist.ReduceOp.MAX), (4,), torch.float64),
+                    ("global", str(tr.dist.ReduceOp.MIN), (4,), torch.float64),
+                ]
+                if split
+                else []
+            )
+            if split:
+                assert traces[-1][-5:-2] == vectors
     assert traces[0] == traces[1]
 
 
