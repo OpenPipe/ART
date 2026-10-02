@@ -64,7 +64,14 @@ def test_factory_outputs_keep_public_canonical_acceptance(
     else:
         with pytest.raises(ValueError):
             reports.validate_report(raw)
-        assert not list(bound.spool_dir.glob("*.json"))
+        assert list(bound.spool_dir.glob("*.json")) == [
+            bound.spool_dir / ".retention.json"
+        ]
+        metadata = ledger(bound)
+        assert metadata["charges"] == {} and metadata["omitted"] == 0
+        summary = metadata["event_summaries"]["estimate_miss"]
+        assert summary["retained"] == 0 and summary["omitted"] == 1
+        assert summary["latest"]["retained"] is False
         assert reporter.failures == 1
 
 
