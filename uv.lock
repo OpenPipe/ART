@@ -4564,7 +4564,7 @@ requires-dist = [
     { name = "setuptools", marker = "extra == 'backend'", specifier = ">=78.1.0" },
     { name = "setuptools", marker = "extra == 'backend-cu130'", specifier = ">=78.1.0" },
     { name = "tblib", specifier = ">=3.0.0" },
-    { name = "tinker", marker = "extra == 'tinker'", specifier = ">=0.23.4,<0.24" },
+    { name = "tinker", marker = "extra == 'tinker'", specifier = ">=0.31.0,<0.32" },
     { name = "tinker-cookbook", marker = "extra == 'tinker'", specifier = ">=0.5.2,<0.6" },
     { name = "torch", marker = "sys_platform == 'darwin' and extra == 'backend'", specifier = "==2.11.0" },
     { name = "torch", marker = "sys_platform == 'darwin' and extra == 'distributed'", specifier = "==2.11.0" },
@@ -7227,7 +7227,7 @@ wheels = [
 
 [[package]]
 name = "tinker"
-version = "0.23.4"
+version = "0.31.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -7245,9 +7245,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "zstandard" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3b/31/73f5231dc8956919533ea9ce0a7a0c2b6b858e61186e133ec78ecc159e0e/tinker-0.23.4.tar.gz", hash = "sha256:1829f5efb8d663d384c7f5bf53de9345850a80b2c9258d7c4ac7203bf4e93495", size = 255873, upload-time = "2026-07-25T01:39:52.001Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/bc/ca/938340f6fbbdb24bc028604258acb138640ba37d757410ced0983ad10935/tinker-0.31.0.tar.gz", hash = "sha256:df582ffe75b131477cc924dffb7383f6925b5d05ddd4d85be6315603afd58395", size = 293478, upload-time = "2026-09-30T00:24:45.535Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b1/65/4edc24cdec88c7c50d5daa7a87ed4558cffe2f6a1780a89773385b2c55aa/tinker-0.23.4-py3-none-any.whl", hash = "sha256:35ce7221f8cc827eef1b6083d880b3ed2babc2e2c865abb11247046e4bfa6837", size = 245304, upload-time = "2026-07-25T01:39:50.661Z" },
+    { url = "https://files.pythonhosted.org/packages/91/66/251dea0540d19f1a3bfe52749ec4bd81c32da1e2a70c68d63de32e080b9d/tinker-0.31.0-py3-none-any.whl", hash = "sha256:c5387d6d447f4aa0bba5d6f1303c6309242160f728d4f9031bb81fe02d554e4c", size = 279801, upload-time = "2026-09-30T00:24:43.709Z" },
 ]
 
 [[package]]

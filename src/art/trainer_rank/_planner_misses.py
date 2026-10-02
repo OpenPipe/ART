@@ -104,10 +104,60 @@ class _ReportTooLarge(ValueError):
     pass
 
 
+def _json_chunks(value: Any, encoder: json.JSONEncoder, active: set[int]):
+    # Token inventories dominate reports. Encode small native-int blocks in C,
+    # keeping bounded incremental rejection instead of allocating a whole report.
+    sequence = type(value) in (list, tuple)
+    mapping = type(value) is dict and all(type(key) is str for key in value)
+    if not sequence and not mapping:
+        if type(value) in (str, int, float, bool, type(None)):
+            yield encoder.encode(value)
+        else:
+            yield from encoder.iterencode(value)
+        return
+    identity = id(value)
+    if identity in active:
+        raise ValueError("Circular reference detected")
+    active.add(identity)
+    try:
+        if mapping:
+            yield "{"
+            for index, (key, item) in enumerate(sorted(value.items())):
+                if index:
+                    yield ","
+                yield encoder.encode(key)
+                yield ":"
+                yield from _json_chunks(item, encoder, active)
+            yield "}"
+        else:
+            yield "["
+            start = 0
+            while start < len(value):
+                block = value[start : start + 1024]
+                if all(
+                    type(item) is int and -(1 << 63) <= item < 1 << 63 for item in block
+                ):
+                    if start:
+                        yield ","
+                    yield encoder.encode(block)[1:-1]
+                    start += len(block)
+                else:
+                    # Subclass iterators can mutate later native-list entries.
+                    stop = start + len(block)
+                    while start < stop and start < len(value):
+                        if start:
+                            yield ","
+                        yield from _json_chunks(value[start], encoder, active)
+                        start += 1
+            yield "]"
+    finally:
+        active.remove(identity)
+
+
 def _encode(record: dict[str, Any], *, limit: int = MAX_REPORT_BYTES) -> bytes:
     chunks = bytearray()
     encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
-    for chunk in encoder.iterencode(record):
+    for chunk in _json_chunks(record, encoder, set()):
         encoded = chunk.encode("utf-8")
         if len(chunks) + len(encoded) + 1 > limit:
             raise _ReportTooLarge("report exceeds byte limit")
@@ -464,6 +514,9 @@ class Reporter:
             <= threshold * predicted_peak_bytes
         ):
             return None
+        retention = None
+        record = None
+        path = None
         try:
             if (predicted_peak_bytes is not None and predicted_peak_bytes < 0) or (
                 observed_peak_bytes is not None and observed_peak_bytes < 0
@@ -473,22 +526,7 @@ class Reporter:
             planning_budget = planning and not (
                 failure is not None and failure["type"] == "OutOfMemoryError"
             )
-            if retention is not None and not _planner_retention.remaining(
-                retention,
-                count_limit=MAX_PLANNING_REPORTS
-                if planning_budget
-                else MAX_SPOOL_REPORTS,
-                byte_limit=MAX_PLANNING_SPOOL_BYTES
-                if planning_budget
-                else MAX_SPOOL_BYTES,
-            ):
-                # Only definitive exhaustion can skip construction without changing
-                # which smaller reports or static-cap fallbacks remain retainable.
-                _planner_retention.omit_unmeasured(retention)
-                raise _planner_retention.RetentionLimitReached(
-                    "assigned planner retention exhausted before construction"
-                )
-            record: dict[str, Any] = {
+            record = {
                 "format": 2,
                 "kind": "art-planner-miss",
                 "event": event,
@@ -517,6 +555,21 @@ class Reporter:
                 "incomplete_reasons": [],
                 "replay_scope": "cpu-memory-estimator; GPU execution requires checkpoint/runtime",
             }
+            if retention is not None and not _planner_retention.remaining(
+                retention,
+                count_limit=MAX_PLANNING_REPORTS
+                if planning_budget
+                else MAX_SPOOL_REPORTS,
+                byte_limit=MAX_PLANNING_SPOOL_BYTES
+                if planning_budget
+                else MAX_SPOOL_BYTES,
+            ):
+                # Only definitive exhaustion can skip construction without changing
+                # which smaller reports or static-cap fallbacks remain retainable.
+                _planner_retention.omit_unmeasured(retention)
+                raise _planner_retention.RetentionLimitReached(
+                    "assigned planner retention exhausted before construction"
+                )
             try:
                 record["replay"] = dict(replay_factory())
                 record["replay"]["source_files"] = _source_files()
@@ -568,6 +621,14 @@ class Reporter:
                 else f"local persistence failed ({type(exc).__name__})"
             )
             return None
+        finally:
+            if retention is not None and record is not None:
+                try:
+                    _planner_retention.summarize(
+                        retention, record, retained=path is not None
+                    )
+                except Exception as exc:
+                    _warn(f"capture summary unavailable ({type(exc).__name__})")
         if not record["replay_complete"]:
             _warn(f"partial replay retained at {path}")
         if _sink is not None:
@@ -654,6 +715,9 @@ def replay(
         raise ValueError(
             "incomplete replay: immutable rank fields differ (including MoE stages)"
         )
+    layers = values["num_layers"]
+    if type(layers) is not int or not 0 < layers <= _planner_replay.MAX_LAYERS:
+        raise ValueError("incomplete replay: recorded layer count out of bounds")
     rank = _planner_replay.ReplayRank.__new__(_planner_replay.ReplayRank)
     for name in _RANK_FIELDS - {"one_layer_recompute"}:
         setattr(rank, "_" + name, values[name])

@@ -208,7 +208,13 @@ def _init_choice(chunk_choice: ChatCompletionChunkChoice) -> Choice:
 
 def finalize_chat_completion(chat_completion: ChatCompletion) -> ChatCompletion:
     attach_dynamo_token_metadata(chat_completion)
-    for key in ("prompt_token_ids", "prompt_routed_experts", "logprobs_mode"):
+    for key in (
+        "prompt_token_ids",
+        "prompt_routed_experts",
+        "logprobs_mode",
+        "compact_prompt_logprobs",
+        "compact_prompt_top_logprobs",
+    ):
         value = (chat_completion.model_extra or {}).get(key)
         if value is not None:
             for choice in chat_completion.choices:
@@ -241,6 +247,14 @@ def update_chat_completion(
     prompt_routes = getattr(chunk, "prompt_routed_experts", None)
     if prompt_routes is not None:
         chat_completion_extra["prompt_routed_experts"] = prompt_routes
+    for key in (
+        "prompt_logprobs",
+        "compact_prompt_logprobs",
+        "compact_prompt_top_logprobs",
+    ):
+        value = getattr(chunk, key, None)
+        if value is not None:
+            chat_completion_extra[key] = value
     completion_prompt_token_ids = chat_completion_extra.get("prompt_token_ids")
     choices = {choice.index: choice for choice in chat_completion.choices}
     if completion_prompt_token_ids is not None:

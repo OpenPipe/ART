@@ -13,7 +13,7 @@ also lets the circular import resolve lazily.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import nullcontext
 import hashlib
 import math
@@ -45,12 +45,32 @@ def _split_required_memory(costs: Sequence[_impl._SubforwardCost]) -> int:
     if any(cost.checkpoint_input_gradient for cost in costs):
         # The caller owns all returned graphs. A calibrated forward-retained
         # discount cannot replace the sum of their input-gradient extents.
+        # Children training the same slots share their adapter gradients,
+        # allocated once by whichever child's backward reaches a layer
+        # first; the largest child's extra covers any order. Different
+        # slots have disjoint gradients, charged per child.
+        adapter = [
+            cost.checkpoint_adapter_gradient
+            for cost in costs
+            if cost.checkpoint_adapter_gradient
+        ]
+        shared = (
+            len(
+                {
+                    cost.checkpoint_adapter_gradient_slots
+                    for cost in costs
+                    if cost.checkpoint_adapter_gradient
+                }
+            )
+            <= 1
+        )
         checkpoint = (
             sum(
                 cost.checkpoint_retained + cost.checkpoint_input_gradient
                 for cost in costs
             )
             + max(cost.checkpoint_workspace for cost in costs)
+            + ((max(adapter) if shared else sum(adapter)) if adapter else 0)
             + growth
         )
         required = max(required, int(checkpoint * _impl._MEMORY_SAFETY_FACTOR))
@@ -628,6 +648,182 @@ def _checkpoint_floor_from_facts(
     return retained, workspace
 
 
+def _gradient_slots(
+    group_rows: Sequence[tuple[int, bool]],
+    slot_refs: Sequence[LoRASlotRef | None] | None,
+) -> frozenset[LoRASlotRef]:
+    """Gradient groups' adapter slots; the base model (no name) has none."""
+    return frozenset(
+        ref
+        for (_, grad), ref in zip(
+            group_rows, slot_refs or (None,) * len(group_rows), strict=True
+        )
+        if grad and ref is not None and ref.name is not None
+    )
+
+
+def _pending_adapter_gradient_bytes(
+    self: TrainerRank, refs: Iterable[LoRASlotRef]
+) -> tuple[int, ...]:
+    """Local adapter gradient bytes the next backward allocates, per decoder layer.
+
+    One entry per decoder layer, then one for parameters outside the
+    decoder. Backward reaches a parameter's highest decoder layer first, so
+    a parameter shared across layers counts there once; those outside the
+    decoder count as live throughout. Only unallocated gradients count:
+    within a step, later waves find the rest in the availability baseline.
+    Empty when none is pending.
+    """
+    refs = tuple(dict.fromkeys(refs))
+    if not refs or len(self.runtime.model) != 1:
+        return ()
+    try:
+        from art.megatron.lora import LoRA
+    except ModuleNotFoundError as error:
+        if error.name != "megatron":
+            raise
+        return ()
+    chunk = self.runtime.model[0]
+    try:
+        layers = _impl._language_model(chunk).decoder.layers
+    except (AttributeError, RuntimeError):
+        return ()
+    layer_of: dict[int, int] = {}
+    params: dict[int, torch.nn.Parameter] = {}
+
+    def slot_params(
+        modules: Iterable[torch.nn.Module],
+    ) -> Iterator[torch.nn.Parameter]:
+        for module in modules:
+            # A LoRA without slot tables holds no slot parameters.
+            if isinstance(module, LoRA) and "_slot_keys" in vars(module):
+                for ref in refs:
+                    yield from module.lora_slot_params(ref)
+
+    for index, layer in enumerate(layers):
+        for param in slot_params(layer.modules()):
+            params[id(param)] = param
+            layer_of[id(param)] = max(layer_of.get(id(param), -1), index)
+    # Outside the decoder (a head runs its backward first) is live
+    # throughout, even for a parameter or module a decoder layer also uses:
+    # walk every path except through the layers themselves.
+    outside: list[torch.nn.Module] = []
+    visited: set[int] = set()
+    pending_modules: list[torch.nn.Module] = [chunk]
+    while pending_modules:
+        module = pending_modules.pop()
+        if module is layers or id(module) in visited:
+            continue
+        visited.add(id(module))
+        outside.append(module)
+        pending_modules.extend(module.children())
+    for param in slot_params(outside):
+        params[id(param)] = param
+        layer_of[id(param)] = len(layers)
+    # A checkpoint's other trainable parameters (custom objects) have no
+    # decoder position; count them as live throughout.
+    for ref in refs:
+        slot = (
+            None
+            if ref.name is None
+            else getattr(self, "_checkpoint_slots", {}).get(ref.name)
+        )
+        for param in () if slot is None else slot.params:
+            if id(param) not in params:
+                params[id(param)] = param
+                layer_of[id(param)] = len(layers)
+    sizes = [0] * (len(layers) + 1)
+    for param_id, param in params.items():
+        if (
+            param.requires_grad
+            and param.grad is None
+            and getattr(param, "main_grad", None) is None
+        ):
+            sizes[layer_of[param_id]] += param.numel() * param.element_size()
+    return tuple(sizes) if any(sizes) else ()
+
+
+def _checkpoint_gradient_groups(
+    self: TrainerRank,
+    group_rows: Sequence[tuple[int, bool]],
+    slot_refs: Sequence[LoRASlotRef | None] | None,
+) -> tuple[tuple[LoRASlotRef | None, tuple[int, ...]], ...]:
+    """Each gradient group's adapter slot and per-layer saved boundaries.
+
+    In execution order, as ``_checkpoint_memory_floor`` prices them: every
+    decoder layer saves the group's rows (this rank's TP shard). The base
+    model (no name) has no adapter slot.
+    """
+    tp = self._topology_key()[1]
+    return tuple(
+        (
+            ref if ref is not None and ref.name is not None else None,
+            (-(-rows // tp) * self._hidden_size * 2,) * self._num_layers,
+        )
+        for (rows, grad), ref in zip(
+            group_rows, slot_refs or (None,) * len(group_rows), strict=True
+        )
+        if grad
+    )
+
+
+def _checkpoint_adapter_gradient_bytes(
+    self: TrainerRank, groups: Sequence[tuple[LoRASlotRef | None, Sequence[int]]]
+) -> int:
+    """The recompute backward's adapter-gradient peak beyond released boundaries.
+
+    ``groups`` gives each gradient group's adapter slot (None for the base
+    model) and each decoder layer's saved-boundary bytes
+    (``_adapter_gradient_walk``).
+    """
+    chains = []
+    for slot, boundaries in groups:
+        pending = () if slot is None else self._pending_adapter_gradient_bytes((slot,))
+        if pending and len(pending) != len(boundaries) + 1:
+            return 0
+        chains.append((pending or (0,) * (len(boundaries) + 1), boundaries))
+    return self._adapter_gradient_walk(chains)
+
+
+def _adapter_gradient_walk(
+    chains: Sequence[tuple[Sequence[int], Sequence[int]]],
+) -> int:
+    """The adapter-gradient peak beyond the floor over gradient groups' backward.
+
+    Each chain is a gradient group's pending gradient bytes (per decoder
+    layer, then outside the decoder) and saved-boundary bytes per layer.
+    Backward recomputes the last layer first. While it recomputes layer i it
+    still holds the saved boundaries of layers 0..i and every adapter
+    gradient allocated so far: those of layers i..L-1 (a layer allocates its
+    own during its backward) and any outside the decoder. The floor already
+    prices all L boundaries at once, so one group's extra peak is
+    max(0, max over i of gradients(i..) - boundaries(i+1..)), taken at every
+    layer over the real per-layer gradient sizes and the caller's per-layer
+    boundaries, not along a uniform-layer line. A short
+    first wave peaks at layer 0 (Qwen3.6-35B-A3B CP2: 830-900 MB of expert
+    LoRA gradients live at its peak), a long one at the last layer.
+    Groups run their backward one after another, not layer by layer
+    together: autograd drains the last-forwarded group's chain first, and
+    separate backward calls can come in either order. While one group runs,
+    each group already run holds all its gradients and none of its
+    boundaries, and each group yet to run all its boundaries. Any set of the
+    other groups can have run first, so the worst adds every other group
+    whose gradients outweigh its boundaries.
+    """
+    nets = [sum(pending) - sum(boundaries) for pending, boundaries in chains]
+    others = sum(max(0, net) for net in nets)
+    worst = 0
+    for (pending, boundaries), net in zip(chains, nets, strict=True):
+        extra = gradients = pending[-1]
+        released = 0
+        for index in range(len(boundaries) - 1, -1, -1):
+            gradients += pending[index]
+            extra = max(extra, gradients - released)
+            released += boundaries[index]
+        worst = max(worst, extra + others - max(0, net))
+    return worst
+
+
 def _retained_memory_bytes(
     self: TrainerRank,
     signature: _impl._MemorySignature,
@@ -707,6 +903,19 @@ def _estimate_flat_forward(
         ):
             # This cheap return type has no slot metadata. Materialize the
             # exact plan instead of admitting with the constructor rank.
+            return None
+        gradient_slots = [
+            ref
+            for (ref, grad), _ in groups
+            if grad and ref is not None and ref.name is not None
+        ]
+        if (
+            gradient_slots
+            and getattr(self, "_recompute_granularity", None) == "full"
+            and self._pending_adapter_gradient_bytes(gradient_slots)
+        ):
+            # The step's first backward allocates adapter gradients that
+            # only slot metadata can price; the exact plan carries it.
             return None
         if (
             any(mode for (_, mode), _ in groups)
@@ -1182,11 +1391,19 @@ def _estimate_required_memory_bytes_from_values(
         if checkpoint_memory is None
         else checkpoint_memory
     )
+    backward = 0
+    if include_checkpoint_input_gradient and retained:
+        # The backward's other end and cold transients, as _subforward_cost.
+        backward = retained + self._checkpoint_adapter_gradient_bytes(
+            self._checkpoint_gradient_groups(group_rows, slot_refs)
+        )
+        if profiled is None and any(grad for _, grad in group_rows):
+            backward += _impl._COLD_RECOMPUTE_TRANSIENT_BYTES
     static_compute = max(
         static_compute,
         max(retained, checkpoint_floor[0])
         + max(workspace, head_workspace_bytes, checkpoint_floor[1])
-        + (retained if include_checkpoint_input_gradient else 0),
+        + backward,
     )
     if signature.topology[2] > 1:
         # Local head results coexist with full CP outputs during gathering.

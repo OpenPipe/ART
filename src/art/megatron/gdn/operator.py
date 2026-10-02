@@ -2342,6 +2342,7 @@ def run_gdn_bucket(
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=False,
             cu_seqlens=None if dense_local_bucket else bucket.cu_seqlens,
+            cu_seqlens_cpu=None if dense_local_bucket else bucket.cu_seqlens_cpu,
         )
         if dense_local_bucket:
             recurrent_out = recurrent_out.reshape(

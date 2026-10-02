@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,6 +24,49 @@ from typing import Any, Iterator
 _UUID = re.compile(r"[0-9a-f]{32}\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _LEDGER_LIMIT = 512 * 1024
+# Fixed event keys and one scalar observation per key, inside reserved metadata.
+_SUMMARY_LIMIT = 16 * 1024
+_EVENTS = frozenset({"estimate_miss", "oom", "admission_refused", "planning_error"})
+_SUMMARY_FIELDS = frozenset(
+    "id occurred_at phase oom threshold_pct predicted_peak_bytes "
+    "admission_peak_bytes observed_peak_bytes partial_peak_bytes error_pct".split()
+)
+
+
+def _validate_summaries(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) - _EVENTS:
+        raise ValueError("invalid planner event summaries")
+    for event in value.values():
+        if not isinstance(event, dict) or set(event) != {
+            "retained",
+            "omitted",
+            "latest",
+        }:
+            raise ValueError("invalid planner event summary")
+        if any(
+            type(event[k]) is not int or not 0 <= event[k] < 2**63
+            for k in ("retained", "omitted")
+        ):
+            raise ValueError("invalid planner summary counter")
+        latest = event["latest"]
+        if not isinstance(latest, dict) or set(latest) != _SUMMARY_FIELDS | {
+            "retained",
+            "failure_type",
+        }:
+            raise ValueError("invalid planner summary observation")
+        for key, item in latest.items():
+            if key in {"retained", "oom"}:
+                valid = type(item) is bool
+            elif key in {"id", "occurred_at", "phase", "failure_type"}:
+                valid = isinstance(item, str) and len(item) <= 80
+            else:
+                valid = item is None or (
+                    type(item) in (int, float) and math.isfinite(item) and item >= 0
+                )
+            if not valid:
+                raise ValueError("invalid planner summary scalar")
+    if len(_encode(value)) > _SUMMARY_LIMIT:
+        raise ValueError("planner event summaries exceed limit")
 
 
 class RetentionLimitReached(ValueError):
@@ -154,7 +198,7 @@ def _ledger(limits: RetentionLimits) -> Iterator[tuple[Path, dict[str, Any], int
             ledger = json.loads(saved)
             if (
                 _encode(ledger) != saved
-                or set(ledger) - {"omitted_unmeasured"}
+                or set(ledger) - {"omitted_unmeasured", "event_summaries"}
                 != {"allowance", "charges", "omitted", "omitted_bytes"}
                 or _encode(ledger["allowance"]) != _encode(limits.identity())
                 or not isinstance(ledger["charges"], dict)
@@ -166,6 +210,7 @@ def _ledger(limits: RetentionLimits) -> Iterator[tuple[Path, dict[str, Any], int
                 or not 0 <= ledger.get("omitted_unmeasured", 0) <= ledger["omitted"]
             ):
                 raise ValueError("planner charge ledger differs from enrollment")
+        _validate_summaries(ledger.get("event_summaries", {}))
         charges = ledger["charges"]
         total = 0
         for identifier, item in charges.items():
@@ -245,3 +290,80 @@ def charge(
             with suppress(Exception):
                 _write(path, ledger)
             raise
+
+
+def summarize(
+    limits: RetentionLimits, record: dict[str, Any], *, retained: bool
+) -> None:
+    """Keep counts and the latest scalar event, never replay inputs or tracebacks.
+
+    This is producer capture coverage, not delivery coverage. Historical attempts
+    and failed summary writes are not reconstructed. Counters saturate; storage
+    remains bounded even after the cumulative payload allowance is exhausted.
+    """
+    event = record["event"]
+    latest = {key: record[key] for key in _SUMMARY_FIELDS}
+    latest["retained"] = retained
+    latest["phase"] = latest["phase"][:80]
+    failure = record.get("failure")
+    latest["failure_type"] = str(failure.get("type", ""))[:80] if failure else ""
+    update = {"retained": int(retained), "omitted": int(not retained), "latest": latest}
+    _validate_summaries({event: update})
+    with _ledger(limits) as (path, ledger, _):
+        summaries = ledger.setdefault("event_summaries", {})
+        previous = summaries.get(event, {})
+        for key in ("retained", "omitted"):
+            update[key] = min(previous.get(key, 0) + update[key], 2**63 - 1)
+        summaries[event] = update
+        _write(path, ledger)
+
+
+def coverage(limits: RetentionLimits) -> dict[str, Any]:
+    """Bounded capture snapshot. Charges include uncertain writes, not ACKs.
+
+    Remaining bytes do not promise the next full report fits. Event summaries
+    cover supported Reporter calls only, not all training batches or historical
+    calls. Missing snapshots must never be interpreted as complete coverage.
+    """
+    with _ledger(limits) as (_, ledger, total):
+        summaries = ledger.get("event_summaries", {})
+        return {
+            "allowance": limits.identity(),
+            "charged_reports": len(ledger["charges"]),
+            "charged_bytes": total,
+            "remaining_reports": limits.max_reports - len(ledger["charges"]),
+            "remaining_bytes": limits.max_bytes - total,
+            "omitted": ledger["omitted"],
+            "omitted_bytes": ledger["omitted_bytes"],
+            "omitted_unmeasured": ledger.get("omitted_unmeasured", 0),
+            "event_summaries": summaries,
+        }
+
+
+def validate_coverage(value: dict[str, Any], *, allowance: dict[str, Any]) -> None:
+    """Validate the bounded producer snapshot separately from transport ledgers."""
+    counters = {
+        "charged_reports",
+        "charged_bytes",
+        "remaining_reports",
+        "remaining_bytes",
+        "omitted",
+        "omitted_bytes",
+        "omitted_unmeasured",
+    }
+    if (
+        not isinstance(value, dict)
+        or set(value) != counters | {"allowance", "event_summaries"}
+        or value["allowance"] != allowance
+        or any(
+            type(value[key]) is not int or not 0 <= value[key] < 2**63
+            for key in counters
+        )
+        or value["charged_reports"] + value["remaining_reports"]
+        != allowance["max_reports"]
+        or value["charged_bytes"] + value["remaining_bytes"] != allowance["max_bytes"]
+        or value["omitted_unmeasured"] > value["omitted"]
+        or len(_encode(value)) > _SUMMARY_LIMIT
+    ):
+        raise ValueError("invalid planner capture coverage")
+    _validate_summaries(value["event_summaries"])

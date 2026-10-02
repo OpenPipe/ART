@@ -9,6 +9,9 @@ from test_trainer_rank_pending_memory import full_requests, pending_rank  # noqa
 import torch
 
 from art.trainer_rank import ForwardInput
+from art.trainer_rank._impl import (
+    _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD,
+)
 from art.trainer_rank._impl import Unset, _MemoryProfile, _SplitForwardPlan
 
 
@@ -29,12 +32,15 @@ def test_pending_cold_peak_does_not_become_forward_retention(pending_rank):
     assert cost.checkpoint_input_gradient == gradient
     # Exact previous cold estimate, including outputs and its one safety factor.
     assert cost.retained == 23102959299
-    assert cost.required == int((plan.output_bytes + 2 * gradient + 12705630112) * 1.1)
+    # Unprofiled: the first execution's transients beside the workspace.
+    assert cost.required == int(
+        (plan.output_bytes + 2 * gradient + 12705630112 + COLD) * 1.1
+    )
     assert r._memory_check(plan).estimated_required_bytes == cost.required
     profile(r, plan)
     warm = r._plan_cost(plan)
     assert warm.retained == int((plan.output_bytes + gradient) * 1.1)
-    assert warm.required == cost.required
+    assert warm.required == int((plan.output_bytes + 2 * gradient + 12705630112) * 1.1)
 
 
 @pytest.mark.parametrize("rows", [1, 67, 1024])
@@ -60,8 +66,8 @@ def test_gradient_is_not_absorbed_by_larger_head_workspace():
     head = 10**10
     cost = price(r, (n, out, sig, groups, head))
     gradient = 67 * 40 * 2048 * 2
-    assert cost.checkpoint_workspace == head
-    assert cost.required == int((out + head + 2 * gradient) * 1.1)
+    assert cost.checkpoint_workspace == head + COLD
+    assert cost.required == int((out + head + COLD + 2 * gradient) * 1.1)
     assert cost.retained == int((out + head + gradient) * 1.1)
     r._memory_profiles[sig] = _MemoryProfile(
         bytes_per_token=10**9,
@@ -201,16 +207,18 @@ def test_split_priority_subtracts_only_uncovered_gradient_peak(fully_masked):
     r = rank()
     plan = r._plan_flat_forward(requests(17, 19))
     cold = r._plan_cost(plan)
+    # Once profiled, the static estimate has no first-execution transients.
+    profile(r, plan)
+    static = r._plan_cost(plan).required
+    assert static < cold.required
     # Place a real learned peak between the two static estimates, or above both.
-    measured = (
-        cold.required + 10**7 if fully_masked else (cold.retained + cold.required) / 2
-    )
+    measured = static + 10**7 if fully_masked else (cold.retained + static) / 2
     rate = (measured / 1.1 - plan.output_bytes) / plan.packed_tokens
     profile(r, plan, rate=rate)
     cost = r._plan_cost(plan)
     old_required = int((plan.output_bytes + int(plan.packed_tokens * rate)) * 1.1)
     assert cold.retained < old_required
-    assert cost.required == max(cold.required, old_required)
+    assert cost.required == max(static, old_required)
     assert (
         cost.ephemeral - cost.checkpoint_peak_increment == old_required - cost.retained
     )

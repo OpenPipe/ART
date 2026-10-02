@@ -29,6 +29,9 @@ from ..preprocessing.dynamo_tokens import (
     choice_completion_logprobs,
     has_completion_logprobs,
 )
+from ..preprocessing.dynamo_tokens import (
+    _logprobs as compact_completion_logprobs,
+)
 from ..utils.chat_template import (
     chat_template_with_preserved_thinking,
     default_chat_template_kwargs_for_template,
@@ -1054,7 +1057,19 @@ def _sampled_evidence_fingerprint(
             generation = _string_dict(generations[index]) or {}
             evidence = {
                 key: generation[key]
-                for key in ("prompt_token_ids", "output_tokens", "output_indices")
+                for key in (
+                    "prompt_token_ids",
+                    "output_tokens",
+                    "output_indices",
+                    "token_ids",
+                    "compact_logprobs",
+                    "compact_top_logprobs",
+                    "compact_prompt_logprobs",
+                    "compact_prompt_top_logprobs",
+                    "logprobs_mode",
+                    "routed_experts",
+                    "prompt_routed_experts",
+                )
                 if key in generation
             }
         else:
@@ -1075,6 +1090,19 @@ def _sampled_evidence_fingerprint(
             "token_ids": response_extra.get("token_ids"),
             "logprobs": response_extra.get("logprobs"),
             "stop_reason": exchange.response.stop_reason,
+            **{
+                key: response_extra[key]
+                for key in (
+                    "compact_logprobs",
+                    "compact_top_logprobs",
+                    "compact_prompt_logprobs",
+                    "compact_prompt_top_logprobs",
+                    "logprobs_mode",
+                    "routed_experts",
+                    "prompt_routed_experts",
+                )
+                if key in response_extra
+            },
         }
     if protocol in {"chat_completions", "completions"}:
         from ._routed_experts import choice_routes
@@ -1090,6 +1118,12 @@ def _sampled_evidence_fingerprint(
         )
         if mode is not None:
             evidence["logprobs_mode"] = mode
+        for key in ("compact_prompt_logprobs", "compact_prompt_top_logprobs"):
+            value = choice_extra.get(
+                key, (exchange.response.model_extra or {}).get(key)
+            )
+            if value is not None:
+                evidence[key] = value
     return _fingerprint(evidence)
 
 
@@ -1583,7 +1617,28 @@ def _response_generations(response: Response) -> list[_ResponseGeneration]:
         output = generation.get("output_tokens")
         output_ids: list[int] | None
         output_logprobs: list[float]
-        if output is None:
+        if "token_ids" in generation:
+            output_ids = _exact_token_ids(
+                generation["token_ids"], field="Responses generation token_ids"
+            )
+            compact_scores = compact_completion_logprobs(
+                generation.get("compact_logprobs"), generation["token_ids"]
+            )
+            if output is not None and compact_scores is None:
+                classic_ids, compact_scores = _pairs(
+                    output,
+                    require_token_ids=True,
+                    field="Responses generation output_tokens",
+                )
+                if classic_ids != output_ids:
+                    raise ValueError("Responses compact and classic token IDs disagree")
+            output_logprobs = (
+                compact_scores
+                if compact_scores is not None
+                else [math.nan] * len(output_ids or [])
+            )
+            output_text = None
+        elif output is None:
             output_ids, output_logprobs = None, []
             output_text = None
         else:
@@ -1693,12 +1748,16 @@ def _messages_tokens(
     token_ids = _exact_token_ids(data.get("token_ids"), field="Messages token_ids")
     if token_ids == [] and data.get("content"):
         token_ids = None
-    logprobs = [
-        float(value)
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
-        else math.nan
-        for value in data.get("logprobs") or []
-    ]
+    logprobs = (
+        compact_completion_logprobs(data["compact_logprobs"], token_ids) or []
+        if "compact_logprobs" in data
+        else [
+            float(value)
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            else math.nan
+            for value in data.get("logprobs") or []
+        ]
+    )
     if token_ids is not None and logprobs and len(logprobs) != len(token_ids):
         raise ValueError("Messages token IDs and logprobs differ in length")
     if token_ids is None or not logprobs:
@@ -8070,11 +8129,21 @@ def tokenize_history(
     ):
         raise TypeError(f"Unsupported history type: {type(history).__name__}")
     tokenized.history = history
-    from ._routed_experts import history_logprob_flags, history_routes, history_top_k
+    from ._routed_experts import (
+        history_logprob_flags,
+        history_prompt_scores,
+        history_routes,
+        history_top_k,
+    )
 
     tokenized.routed_experts = history_routes(history, tokenized.tokens)
-    tokenized.top_k = history_top_k(history, tokenized.tokens)
     history_logprob_flags(history, tokenized.tokens, tokenized.flags)
+    prompt_owners = history_prompt_scores(
+        history, tokenized.tokens, tokenized.logprobs, tokenized.flags
+    )
+    tokenized.top_k = history_top_k(
+        history, tokenized.tokens, tokenized.flags, prompt_owners
+    )
     return tokenized
 
 

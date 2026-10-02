@@ -39,11 +39,15 @@ def create_identity_lora(
     )
     if rank is None:
         rank = default_lora_rank_for_handler(handler)
-    base_config = AutoConfig.from_pretrained(base_model, trust_remote_code=True)
+    base_config = AutoConfig.from_pretrained(
+        base_model, trust_remote_code=handler.trust_remote_code
+    )
     model_config = handler.identity_lora_model_config(base_config)
     with handler.identity_lora_model_context(), init_empty_weights():
         model = AutoModelForCausalLM.from_config(
-            model_config, dtype=torch.bfloat16, trust_remote_code=True
+            model_config,
+            dtype=torch.bfloat16,
+            trust_remote_code=handler.trust_remote_code,
         )
     model.name_or_path = base_model
 

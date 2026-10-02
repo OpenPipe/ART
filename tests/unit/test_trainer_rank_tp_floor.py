@@ -14,6 +14,7 @@ import torch
 from trainer_rank_test_support import fake_rank, recompute_model
 
 from art.trainer_rank import TrainerRank
+from art.trainer_rank._impl import _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD
 from art.trainer_rank._impl import _MemorySignature
 
 H, F, LAYERS = 5120, 17408, 64
@@ -78,10 +79,11 @@ def test_the_traced_tp4_wave_prices_its_boundary_shards_and_their_repeat():
     assert workspace == 3 * SEGMENT
     cost = _required(r)
     assert cost.checkpoint_input_gradient == retained
-    # One segment plus up to three TP-padding roots, each with its states.
-    state = cost.checkpoint_workspace
+    # One segment plus up to three TP-padding roots, each with its states,
+    # beside the unprofiled first execution's transients.
+    state = cost.checkpoint_workspace - COLD
     assert state == 4 * SEGMENT
-    assert cost.required == int((OUTPUT + 2 * retained + state) * 1.1)
+    assert cost.required == int((OUTPUT + 2 * retained + state + COLD) * 1.1)
     # Measured cold on all four ranks: 7.130 GB (7.060 GB in production), all
     # but the boundaries a transient recompute workspace; this raw floor
     # (8.43 GB) covers it. Today's cold admission was 4.637 GB.
@@ -164,9 +166,9 @@ def test_gdn_segment_states_are_priced_with_the_segments():
     r = tp_rank()
     rows = 8192
     cost = _required(r, group_rows=((rows, True),), gdn_segments=4096)
-    assert cost.checkpoint_workspace == (4096 + 3) * SEGMENT
+    assert cost.checkpoint_workspace == (4096 + 3) * SEGMENT + COLD
     assert cost.required == int(
-        (OUTPUT + 2 * rows // 4 * LAYERS * H * 2 + (4096 + 3) * SEGMENT) * 1.1
+        (OUTPUT + 2 * rows // 4 * LAYERS * H * 2 + (4096 + 3) * SEGMENT + COLD) * 1.1
     )
 
 
@@ -175,7 +177,7 @@ def test_tp_padding_roots_carry_their_own_states():
     r = tp_rank()
     cost = _required(r, group_rows=((4, True),), gdn_segments=1)
     # Four roots' initial states alone: 4 x 12 value heads x 128 x 128 x fp32.
-    assert cost.checkpoint_workspace == 4 * SEGMENT > 4 * 12 * 128 * 128 * 4
+    assert cost.checkpoint_workspace - COLD == 4 * SEGMENT > 4 * 12 * 128 * 128 * 4
     assert cost.required > 4 * SEGMENT
 
 

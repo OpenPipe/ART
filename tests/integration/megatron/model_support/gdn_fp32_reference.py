@@ -18,6 +18,7 @@ def _torch_chunk_gated_delta_rule_reference(
     output_final_state: bool = False,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    cu_seqlens_cpu: torch.Tensor | None = None,
     scale: float | None = None,
     **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -25,6 +26,7 @@ def _torch_chunk_gated_delta_rule_reference(
         torch_chunk_gated_delta_rule,
     )
 
+    del cu_seqlens_cpu  # Metadata hint; the oracle independently reads device bounds.
     if kwargs:
         raise TypeError(
             f"Unsupported Qwen3.5 GDN fp32 reference kwargs: {sorted(kwargs)}"
