@@ -12,10 +12,11 @@ keep today's pricing.
 
 from dataclasses import replace
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
+from trainer_rank_test_support import fake_rank, recompute_model
 
 from art.trainer_rank import TrainerRank
 from art.trainer_rank._impl import _SEQUENCE_PARALLEL_COLD_TRANSIENT_BYTES as COLD
@@ -96,7 +97,9 @@ def workspace(
 def signature(topology, rank=0, grad=True):
     """A gradient signature whose slot carries LoRA modules of ``rank``."""
     shapes = ((True, ((2, H, rank, rank, H),)),) if rank else ()
-    return _MemorySignature(topology, (1, None), 1, (), grad, (grad,), shapes)
+    return _MemorySignature(
+        topology, (1, None), 1, (), grad, (grad,), slot_shapes=shapes
+    )
 
 
 def tp_rank(
@@ -110,46 +113,17 @@ def tp_rank(
 ):
     from megatron.core.transformer.transformer_block import TransformerBlock
 
-    block = TransformerBlock.__new__(TransformerBlock)
-    torch.nn.Module.__init__(block)
-    block.config = SimpleNamespace(
-        hidden_size=H,
-        num_layers=layers,
-        padded_vocab_size=32,
-        params_dtype=torch.bfloat16,
-        recompute_granularity="full",
-        recompute_method="uniform",
-        recompute_num_layers=1,
-        distribute_saved_activations=False,
-        sequence_parallel=sequence_parallel,
-        fp32_residual_connection=False,
-        cpu_offloading=False,
-        cuda_graph_impl="none",
-        fp8=None,
-        fp4=None,
+    model = recompute_model(
+        TransformerBlock,
+        H,
+        layers,
+        sequence_parallel,
+        layers=decoder_layers or (),
         **config,
     )
-    block.layers = torch.nn.ModuleList(
-        decoder_layers or [torch.nn.Linear(1, 1).bfloat16() for _ in range(layers)]
-    )
-    block.num_layers_per_pipeline_rank = layers
-    model: Any = torch.nn.Module()
-    model.config = block.config
-    model.decoder = block
-    model._preprocess = lambda: None
     if decoder_layers is not None:
         model.embedding = torch.nn.Linear(1, 1).bfloat16()  # a BF16 parameter
-    r: Any = TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[model],
-                optimizer=None,
-                provider=SimpleNamespace(hidden_size=H, num_layers=layers),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
-    )
+    r: Any = fake_rank(TrainerRank, [model], hidden_size=H, num_layers=layers)
     # Qwen3.8-27B: gated attention every fourth layer, GDN otherwise.
     r._geometry = replace(
         r._geometry,
@@ -243,7 +217,7 @@ def _required(
         (),
         any(grad for _, grad in group_rows),
         tuple(grad for _, grad in group_rows),
-        shapes,
+        slot_shapes=shapes,
     )
     return r._subforward_cost(
         packed_tokens=sum(rows for rows, _ in group_rows),
@@ -615,44 +589,27 @@ def test_rows_are_sharded_with_ceiling_and_only_gradient_groups_save_them():
 
 
 @pytest.mark.parametrize(
-    "case",
+    "case,kwargs",
     [
-        "tp8",
-        "cp2",
-        "tp2_cp2",
-        "pp2",
-        "no_sequence_parallel",
-        "sequence_parallel_at_tp1",
-        "selective_recompute",
-        "moe",
-        "tp2_moe",
-        "moe_geometry",
-        "replicated_qkv",
-        "tp2_replicated_qkv",
-        "missing_attention_geometry",
-        "missing_conv_kernel",
-        "tp2_no_sequence_parallel",
+        ("tp8", dict(topology=(1, 8, 1, 1))),
+        ("cp2", dict(topology=(1, 4, 2, 1))),
+        ("tp2_cp2", dict(topology=(1, 2, 2, 1))),
+        ("pp2", dict(topology=(1, 4, 1, 2))),
+        ("no_sequence_parallel", dict(sequence_parallel=False)),
+        ("sequence_parallel_at_tp1", dict(topology=(1, 1, 1, 1))),
+        ("selective_recompute", dict()),
+        ("moe", dict()),
+        ("tp2_moe", dict(topology=TP2)),
+        ("moe_geometry", dict()),
+        ("replicated_qkv", dict()),
+        ("tp2_replicated_qkv", dict(topology=TP2)),
+        ("missing_attention_geometry", dict()),
+        ("missing_conv_kernel", dict()),
+        ("tp2_no_sequence_parallel", dict(topology=TP2, sequence_parallel=False)),
     ],
 )
-def test_unproven_shapes_keep_todays_pricing(case):
-    shapes = {
-        "tp8": dict(topology=(1, 8, 1, 1)),
-        "cp2": dict(topology=(1, 4, 2, 1)),
-        "tp2_cp2": dict(topology=(1, 2, 2, 1)),
-        "pp2": dict(topology=(1, 4, 1, 2)),
-        "no_sequence_parallel": dict(sequence_parallel=False),
-        "sequence_parallel_at_tp1": dict(topology=(1, 1, 1, 1)),
-        "selective_recompute": dict(),
-        "moe": dict(),
-        "tp2_moe": dict(topology=TP2),
-        "moe_geometry": dict(),
-        "replicated_qkv": dict(),
-        "tp2_replicated_qkv": dict(topology=TP2),
-        "missing_attention_geometry": dict(),
-        "missing_conv_kernel": dict(),
-        "tp2_no_sequence_parallel": dict(topology=TP2, sequence_parallel=False),
-    }
-    r = tp_rank(**shapes[case])
+def test_unproven_shapes_keep_todays_pricing(case, kwargs):
+    r = tp_rank(**kwargs)
     if case == "selective_recompute":
         r.runtime.model[0].decoder.config.recompute_granularity = "selective"
     if case in ("moe", "tp2_moe"):

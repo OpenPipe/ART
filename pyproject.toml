@@ -5,6 +5,7 @@ description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "cloudpickle>=3.1.1",
     "aiohttp>=3.10.0",
     "anthropic>=0.77.0",
     "openai>=2.14.0,<3",

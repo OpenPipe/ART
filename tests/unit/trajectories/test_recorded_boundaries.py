@@ -829,6 +829,20 @@ def test_complete_messages_records_do_not_require_a_chat_projection(
     assert trajectory.model_dump_json() == before
 
 
+def _recorded_boundaries(
+    history: module.ChatCompletionsHistory,
+    tokenizer: Any,
+    render: module._ChatRender,
+) -> module.TokenizedHistory | None:
+    return module._tokenize_recorded_chat_boundaries(
+        history,
+        [dict(message) for message in history.messages],
+        tokenizer=tokenizer,
+        render=render,
+        _trace=None,
+    )
+
+
 def _boundary_render(tokenizer: Any) -> module._ChatRender:
     def render(
         selected_messages: list[dict[str, Any]], *, add_generation_prompt: bool
@@ -856,13 +870,7 @@ def test_optional_trailing_decode_valueerror_declines(monkeypatch):
         return decode(tokens, **kwargs)
 
     monkeypatch.setattr(tokenizer, "decode", limited)
-    result = module._tokenize_recorded_chat_boundaries(
-        history,
-        [dict(message) for message in history.messages],
-        tokenizer=tokenizer,
-        render=_boundary_render(tokenizer),
-        _trace=None,
-    )
+    result = _recorded_boundaries(history, tokenizer, _boundary_render(tokenizer))
     assert trailing and result is None
 
 
@@ -890,13 +898,7 @@ def test_other_errors_propagate_same_exception(monkeypatch, stage):
         monkeypatch.setattr(tokenizer, "decode", fail)
     render = fail if stage == "render" else _boundary_render(tokenizer)
     with pytest.raises(type(error)) as caught:
-        module._tokenize_recorded_chat_boundaries(
-            history,
-            [dict(message) for message in history.messages],
-            tokenizer=tokenizer,
-            render=render,
-            _trace=None,
-        )
+        _recorded_boundaries(history, tokenizer, render)
     assert calls == [True] and caught.value is error
 
 
@@ -916,11 +918,5 @@ def test_malformed_native_record_is_still_rejected(monkeypatch):
         raise AssertionError("should not reach rendering")
 
     with pytest.raises(ValueError, match="token_ids"):
-        module._tokenize_recorded_chat_boundaries(
-            history,
-            [dict(message) for message in history.messages],
-            tokenizer=tokenizer,
-            render=render,
-            _trace=None,
-        )
+        _recorded_boundaries(history, tokenizer, render)
     assert not called
