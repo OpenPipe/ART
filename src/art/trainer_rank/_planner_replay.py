@@ -2,7 +2,8 @@
 
 Eligibility is observed once, alongside the selected plan. Values are metadata,
 not model tensors, callable reconstructions, or recorded memory-cost answers.
-HybridEP growth and custom estimator overrides deliberately remain unsupported.
+HybridEP growth is recomputed from frozen buffer dimensions; custom estimator
+overrides deliberately remain unsupported.
 """
 
 from __future__ import annotations
@@ -82,8 +83,8 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     ):
         raise ValueError("runtime_group_inventory_over_limit")
     if (
-        getattr(rank.runtime.provider, "expert_model_parallel_size", 1) > 1
-        or rank._parallel_shape.ep > 1
+        int(getattr(rank.runtime.provider, "expert_model_parallel_size", 1) or 1)
+        != rank._parallel_shape.ep
     ):
         raise ValueError("hybridep_runtime_facts_unsupported")
     for name in (
@@ -144,6 +145,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     groups = []
     remaining = _MAX_SEGMENTS
     reserve = _fact_budget()
+    reserve(384)
     head_values = _MAX_INPUT_VALUES
 
     def terms(checkpoint_grad: bool, ref: Any) -> list[Any]:
@@ -284,8 +286,12 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 },
             }
         )
-    facts = {
-        "version": 3,
+    facts: dict[str, Any] = {
+        "version": 4,
+        "hybridep": _memory._plan_hybridep_dimensions(rank, plan),
+        "hybridep_recompute_rows": _memory._checkpoint_hybridep_rows(
+            rank, rank._plan_group_rows(plan)
+        ),
         "checkpoint_layers": _memory._checkpoint_layers(
             rank, rank._plan_group_rows(plan)
         ),
@@ -294,6 +300,8 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "head_target_backward": target_backward,
         "groups": groups,
     }
+    if facts["hybridep"] is not None:
+        facts["hybridep"] = list(facts["hybridep"])
     # All containers above are owned, including copied stage tuples. Validate
     # primitives before bounded JSON encoding; never retain model/slot objects.
     validate(facts)
@@ -311,6 +319,10 @@ def validate(facts: Any) -> None:
         if type(value) is not int or not minimum <= value < 2**63:
             raise ValueError("invalid runtime dimension")
 
+    if type(facts) is dict and (
+        type(facts.get("version")) is not int or facts["version"] not in (3, 4)
+    ):
+        raise ValueError("unsupported runtime facts version")
     fields(
         facts,
         {
@@ -320,10 +332,21 @@ def validate(facts: Any) -> None:
             "head_vocabulary",
             "head_target_backward",
             "groups",
-        },
+        }
+        | (
+            {"hybridep", "hybridep_recompute_rows"}
+            if type(facts) is dict and facts.get("version") == 4
+            else set()
+        ),
     )
-    if type(facts["version"]) is not int or facts["version"] != 3:
-        raise ValueError("unsupported runtime facts version")
+    dimensions = facts.get("hybridep")
+    if facts.get("hybridep_recompute_rows") is not None:
+        integer(facts["hybridep_recompute_rows"])
+    if dimensions is not None:
+        if type(dimensions) is not list or len(dimensions) != 5:
+            raise ValueError("invalid HybridEP dimensions")
+        for index, value in enumerate(dimensions):
+            integer(value, minimum=0 if index == 4 else 1)
     for key in (
         "checkpoint_layers",
         "checkpoint_moe_bytes_per_token",
@@ -337,6 +360,7 @@ def validate(facts: Any) -> None:
         raise ValueError("invalid runtime groups")
     remaining = _MAX_SEGMENTS
     reserve = _fact_budget()
+    reserve(384 if facts["version"] == 4 else 0)
     for group in groups:
         fields(
             group,
@@ -621,7 +645,12 @@ class ReplayRank(_impl.TrainerRank):
                 self, group_rows, slot_refs, gdn_segments
             )
         return _memory._checkpoint_floor_from_facts(
-            self, group_rows, slot_refs, gdn_segments, self._facts["checkpoint_layers"]
+            self,
+            group_rows,
+            slot_refs,
+            gdn_segments,
+            self._facts["checkpoint_layers"],
+            hybridep_rows=self._facts.get("hybridep_recompute_rows"),
         )
 
     def runtime_arguments(
@@ -636,8 +665,12 @@ class ReplayRank(_impl.TrainerRank):
         rows = tuple((g["rows"], g["grad"]) for g in groups)
         if rows != tuple(map(tuple, arguments["group_rows"])):
             raise ValueError("runtime facts disagree with selected group rows")
-        if arguments.get("hybridep_growth_bytes", 0):
+        if facts["version"] == 3 and arguments.get("hybridep_growth_bytes", 0):
             raise ValueError("hybridep_runtime_facts_unsupported")
+        dimensions = facts.get("hybridep")
+        growth = _memory._hybridep_growth_from_dimensions(
+            None if dimensions is None else tuple(dimensions)
+        )
         head = max(
             _memory._dense_head_bytes(facts["head_vocabulary"], g["head_rows"])
             * (
@@ -669,6 +702,7 @@ class ReplayRank(_impl.TrainerRank):
                 workspace = max(workspace, moe + pending)
         return {
             **arguments,
+            "hybridep_growth_bytes": growth,
             "group_rows": rows,
             "slot_refs": tuple(range(len(groups))),
             "head_workspace_bytes": head,
