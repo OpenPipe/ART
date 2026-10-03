@@ -66,6 +66,7 @@ def test_equal_subclasses_keep_distinct_state_while_plain_strings_share(
         metadata={"rich": [first, second, first], "plain": plain}
     )
 
+    compact_memory(trajectory)
     restored = (
         pickle.loads(pickle.dumps(trajectory))
         if use_pickle
