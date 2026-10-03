@@ -2163,43 +2163,41 @@ def _estimate_required_memory_bytes_from_values(
     static_compute = (
         packed_tokens * self._hidden_size * self._param_dtype_size * activation_factor
     )
-    _dense_stage, no_grad = (
+    no_grad_stage = 0
+    # A covered dense CP2 rank's no-grad width (_dense_mlp_widths).
+    _dense_stage, covered = (
         self._dense_mlp_widths(slot_refs)
         if not signature.grad_enabled and signature.topology[2] == 2 and group_rows
         else (0, 0)
     )
-    if no_grad:
-        # No-grad groups run one after another and keep only their outputs
-        # (charged below): price the largest group's own physical rows at
-        # the traced width, not the per-packed-token floor, which a CP2
-        # rank's rows stay well under (Qwen3.8-27B: +5.7% for one group).
-        static_compute = max(rows for rows, _ in group_rows) * no_grad
-    no_grad_stage = 0
-    if (
+    if covered or (
         not self._geometry.moe_experts
         and self._geometry.ffn_hidden_size
         and self._dense_fc1_adapted
         and signature.topology[1:3] == (1, 1)
     ):
-        # A dense no-grad layer peaks at its FC1 stage (the base GEMM output,
-        # the adapter output and their sum: 6F, or the SwiGLU live set if
-        # wider) beside the residual pair, embedding and norm output (4H), per
-        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. At CP1 every packed
-        # row is local, which the per-packed-token floor above prices at only
-        # 16H. Groups run one after another, so the largest no-grad group
-        # bounds it.
+        # A dense no-grad layer peaks at its FC1 stage beside the residual
+        # pair, embedding and norm output (_dense_no_grad_row_elements). At
+        # CP1 every packed row is local, which the per-packed-token floor
+        # above prices at only 16H. A covered CP2 rank holds only its share,
+        # which that floor over-prices (Qwen3.8-27B: +5.7% for one group), so
+        # there the stage, at its CP2 width, replaces it. Groups run one
+        # after another, so the largest no-grad group bounds it.
         rows = max(
             (n for n, grad in group_rows if not grad),
             default=0 if signature.grad_enabled else packed_tokens,
         )
-        no_grad_stage = (
-            rows
-            * self._param_dtype_size
-            * (
-                max(6, self._mlp_activation_factor) * self._geometry.ffn_hidden_size
-                + 4 * self._hidden_size
+        no_grad_stage = rows * (
+            covered
+            or self._param_dtype_size
+            * _impl._dense_no_grad_row_elements(
+                self._geometry.ffn_hidden_size,
+                self._hidden_size,
+                self._mlp_activation_factor,
             )
         )
+        if covered:
+            static_compute = no_grad_stage
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry
         hidden = self._hidden_size

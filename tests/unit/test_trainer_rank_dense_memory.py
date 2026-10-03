@@ -506,6 +506,16 @@ def _no_grad_required(r, group_rows, *, topology=CP2, packed=40_000):
     )
 
 
+def test_cp1_and_cp2_no_grad_stages_share_one_form():
+    from art.trainer_rank._impl import _dense_no_grad_row_elements
+
+    assert _dense_no_grad_row_elements(FFN, HIDDEN) == 6 * FFN + 4 * HIDDEN
+    assert _dense_no_grad_row_elements(FFN, HIDDEN, 8) == 8 * FFN + 4 * HIDDEN
+    # A covered CP2 rank adds H/4 and the adapters' rank intermediates.
+    stage = _dense_no_grad_row_elements(FFN, HIDDEN)
+    assert NO_GRAD == (stage + HIDDEN // 4 + 6 * RANK) * 2
+
+
 def test_no_grad_groups_price_the_largest_groups_own_rows():
     dense, plain = _at_cp2(_dense_rank()), _at_cp2(_dense_rank(0, 0))
     te = dense._te_workspace_growth_bytes()

@@ -1807,6 +1807,16 @@ def _hybridep_buffer_bytes(capacity: int, ranks: int, hidden: int, experts: int)
 _DENSE_LORA_RANK_LIMIT = 256
 
 
+def _dense_no_grad_row_elements(
+    ffn: int, hidden: int, activation_factor: int = 0
+) -> int:
+    """A dense no-grad layer's peak per row, in elements: its FC1 stage (the
+    base GEMM output, the adapter output and their sum: 6F, or the SwiGLU
+    live set if wider) beside the residual pair, embedding and norm output
+    (4H). Qwen3.8-27B TP1/CP1 traces at 7k-174k rows."""
+    return max(6, activation_factor) * ffn + 4 * hidden
+
+
 def _dense_mlp_recompute_bytes_per_token(
     model: Sequence[torch.nn.Module],
     slot_ref: "LoRASlotRef | None" = None,
@@ -1825,9 +1835,9 @@ def _dense_mlp_recompute_bytes_per_token(
       priced. Beside it the attention's q/k norm outputs and statistics
       (0.21H measured) are priced as H/4: with the residual, norm output and
       input gradient priced elsewhere, a layer's norms are 3.25H.
-    - A no-grad layer holds its three 2F FC1 tensors beside the residual
-      pair, embedding and norm output (4H, the CP1 no-grad floor's form):
-      6F + 4.04H measured, priced as 6F + 4.25H.
+    - A no-grad layer holds the CP1 no-grad stage
+      (``_dense_no_grad_row_elements``, 6F + 4H): a CP2 rank measured
+      6F + 4.04H, priced with H/4 more.
 
     Both add the rank intermediates of every adapter in the layer. Every
     decoder layer, all it runs and ``slot_ref``'s adapters must match the
@@ -2017,7 +2027,7 @@ def _dense_mlp_recompute_bytes_per_token(
     # product and gradient.
     adapters = 2 * rank
     return (7 * width + hidden // 4 + adapters) * 2, (
-        6 * width + 4 * hidden + hidden // 4 + adapters
+        _dense_no_grad_row_elements(width, hidden) + hidden // 4 + adapters
     ) * 2
 
 
