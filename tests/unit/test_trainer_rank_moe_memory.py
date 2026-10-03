@@ -10,6 +10,9 @@ import torch
 
 from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import (
+    _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD,
+)
+from art.trainer_rank._impl import (
     _PACKED_PRICED_LOGICAL_ROW_BYTES,
     _MemoryProfile,
     _MemorySignature,
@@ -452,7 +455,7 @@ def test_memory_check_preserves_collective_order(monkeypatch):
     calls = []
 
     def reduce(value, op, group):
-        calls.append((value.item(), op, group))
+        calls.append((value.tolist(), op, group))
 
     monkeypatch.setattr(impl.dist, "all_reduce", reduce)
     estimate = rank._estimate_required_memory_bytes_from_values(
@@ -464,7 +467,7 @@ def test_memory_check_preserves_collective_order(monkeypatch):
     assert not rank._memory_check_required(estimate).fits
     assert calls == [
         (float(estimate), impl.dist.ReduceOp.MAX, group),
-        (6_800_000_000.0, impl.dist.ReduceOp.MIN, group),
+        ([6_800_000_000.0, 0.0], impl.dist.ReduceOp.MIN, group),
     ]
 
 
@@ -741,15 +744,19 @@ def test_hybridep_recompute_prices_fresh_dense_output_without_buffer_growth(
     retained, workspace = rank._checkpoint_memory_floor(groups)
     assert workspace == 218752 * 2048 * 2 == 896008192
     cost = rank._subforward_cost(**values)
-    assert cost.required == int((8 + 2 * retained + workspace) * 1.1)
-    assert cost.checkpoint_workspace == workspace  # Maximum, not stage + output.
+    # Unprofiled: the first execution's transients sit beside the extent.
+    assert cost.required == int((8 + 2 * retained + workspace + COLD) * 1.1)
+    assert cost.checkpoint_workspace == workspace + COLD  # Not stage + output.
     rank._available_memory_bytes = lambda: 600000000
     assert rank._memory_check_required(baseline.required).fits
     assert not rank._memory_check_required(cost.required).fits
     rank._memory_profiles[signature] = _MemoryProfile(
         bytes_per_token=1, packed_tokens=2
     )
-    assert rank._subforward_cost(**values).required == cost.required
+    # Profiled: the floor alone, without first-execution transients.
+    assert rank._subforward_cost(**values).required == int(
+        (8 + 2 * retained + workspace) * 1.1
+    )
     rank._memory_profiles[signature] = _MemoryProfile(
         bytes_per_token=10**9, packed_tokens=2
     )

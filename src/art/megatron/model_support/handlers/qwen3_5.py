@@ -516,7 +516,7 @@ def _qwen35_text_config(base_model_name_or_path: str, revision: str | None) -> A
         base_model_name_or_path,
         revision=revision,
         local_files_only=True,
-        trust_remote_code=True,
+        trust_remote_code=False,
     )
     return getattr(config, "text_config", config)
 

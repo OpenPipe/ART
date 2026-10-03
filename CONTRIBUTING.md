@@ -40,13 +40,17 @@ These checks are automatically run in CI for all pull requests. If your PR fails
 ### TrainerRank GPU Validation
 
 GPU validation uses two H200s on free `cks-wb3` Kubernetes infrastructure by default.
+Set the repository Actions variable `TRAINER_RANK_GPU_CONTEXT` to `ext-collab2`
+to place required PR GPU jobs there instead; unset it to restore the default.
+This selects infrastructure without reserving capacity or changing validation.
 To select `ext-collab2` for a manual validation of a branch:
 
 ```bash
 gh workflow run trainer-rank-gpu.yml --ref BRANCH -f context=ext-collab2
 ```
 
-These are the only supported contexts; there is no automatic fallback. The default
+The manual input takes precedence over the repository variable. These are the
+only supported contexts; there is no automatic fallback. The default
 uses `CKS_WB3_KUBECONFIG`; `ext-collab2` uses the existing `GPU_IMAGE_KUBECONFIG`
 secret and requires its `skypilot-workload` service account. The selected infrastructure
 is recorded in the job's owner and result receipts. Source checks, time limits,

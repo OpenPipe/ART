@@ -126,7 +126,7 @@ def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):
             8296857600,
             50640 * (checkpoint_coefficient + 128) + 3157761952,
         )
-        assert rank._plan_cost(plan).required == (32685829827 if gate else 32457666243)
+        assert rank._plan_cost(plan).required == (32759649577 if gate else 32531485993)
     selected = rank._select_next_micro_batch(requests, 0)
     assert (
         selected.check.estimated_required_bytes
@@ -147,7 +147,7 @@ def test_original_norm_installation_preserves_shared_return(layer, gated):
         8296857600,
         50640 * (checkpoint_coefficient + 128) + 3157761952,
     )
-    expected = 32685829827 if gated else 32457666243
+    expected = 32759649577 if gated else 32531485993
     assert rank._memory_check(plan).estimated_required_bytes == expected
     assert rank._plan_cost(plan).required == expected
 

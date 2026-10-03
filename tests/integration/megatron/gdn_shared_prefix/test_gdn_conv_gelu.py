@@ -42,6 +42,65 @@ def test_packed_varlen_causal_conv_silu_and_swish_match_reference() -> None:
         )
 
 
+@pytest.mark.parametrize("activation", ("silu", "swish"))
+@pytest.mark.parametrize("final_only", (False, True))
+def test_bf16_silu_matches_materialized_activation(
+    activation: str, final_only: bool
+) -> None:
+    inputs = _packed_inputs(
+        lengths=(0, 1, 2, 3, 4, 5, 127, 128, 129),
+        channels=17,
+        kernel_width=4,
+        has_bias=True,
+        seed=1053,
+    )
+    conv_in, cu, initial, weight, bias, out_grad, final_grad = (
+        value.to(torch.bfloat16) if value.is_floating_point() else value
+        for value in inputs
+        if value is not None
+    )
+    if final_only:
+        # Distinct raw inputs and cotangents make tail routing observable.
+        out_grad.zero_()
+    else:
+        # Exact BF16 operands accumulate to 1 + 1/256, a rounding tie.
+        conv_in.fill_(1)
+        initial.fill_(1)
+        weight[:] = weight.new_tensor([1, 1 / 256, -1, 1])
+        bias.zero_()
+        out_grad.fill_(0.3)
+        final_grad.fill_(0.5)
+    args = conv_in, cu, initial, weight, bias, out_grad, final_grad
+    reference = _run_packed_fused(*args, activation=activation, split_silu=True)
+    candidate = _run_packed_fused(*args, activation=activation)
+    for name, expected in reference.items():
+        actual = candidate[name]
+        assert expected is not None and actual is not None
+        assert expected.dtype == actual.dtype == torch.bfloat16
+        assert torch.isfinite(expected).all() and torch.isfinite(actual).all()
+        # Numeric equality: BF16 SiLU backward may differ in signed-zero bits.
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if not final_only:
+            assert torch.any(expected != 0), name
+    torch.testing.assert_close(
+        candidate["final"],
+        _packed_reference_final(conv_in, cu, initial),
+        rtol=0,
+        atol=0,
+    )
+    if final_only:
+        x = conv_in.detach().requires_grad_(True)
+        state = initial.detach().requires_grad_(True)
+        raw_final = _packed_reference_final(x, cu, state)
+        dx, dstate = torch.autograd.grad(raw_final, (x, state), final_grad)
+        torch.testing.assert_close(candidate["conv_in_grad"], dx, rtol=0, atol=0)
+        torch.testing.assert_close(
+            candidate["conv_initial_grad"], dstate, rtol=0, atol=0
+        )
+        for name in ("weight_grad", "bias_grad"):
+            assert torch.count_nonzero(candidate[name]) == 0
+
+
 def test_packed_varlen_causal_conv_supports_unit_kernel() -> None:
     _run_packed_case(
         lengths=(1, 5),
@@ -204,6 +263,7 @@ def _run_packed_fused(
     final_grad: Tensor,
     *,
     activation: str,
+    split_silu: bool = False,
 ) -> dict[str, Tensor | None]:
     conv_in = conv_in.detach().clone().requires_grad_(True)
     conv_initial = conv_initial.detach().clone().requires_grad_(True)
@@ -215,10 +275,12 @@ def _run_packed_fused(
         conv_initial,
         weight,
         bias,
-        activation=activation,
+        activation="none" if split_silu else activation,
         output_final_state=True,
     )
     assert final is not None
+    if split_silu:
+        out = F.silu(out)
     ((out * out_grad).sum() + (final * final_grad).sum()).backward()
     return _packed_result(conv_in, conv_initial, weight, bias, out, final)
 

@@ -17,6 +17,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
+import hashlib
+import json
 import logging
 import math
 import os
@@ -70,6 +72,7 @@ from art.trainer_rank._prefix_tree_materializer import (  # noqa: F401  # read a
 from art.trainer_rank._prefix_tree_planner import (
     CanonicalPrefixTree,
     PrefixTreeLayout,
+    canonical_token_rows_fingerprint,
 )
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 
@@ -124,6 +127,10 @@ _MEMORY_PROFILE_TRUST_GROWTH = 8
 _MEMORY_SAFETY_FACTOR = 1.10
 _MEMORY_RESERVE_FRACTION = 0.03
 _HEAD_CHUNK_TOKENS = 512
+# An unprofiled full-recompute gradient wave's first execution keeps two fixed
+# 32 MiB transients live at its peak (Qwen3.6-35B-A3B CP2: the RoPE frequencies
+# and a frozen linear's output, at 2k to 20k tokens); warm waves do not.
+_COLD_RECOMPUTE_TRANSIENT_BYTES = 64 * 2**20
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -200,7 +207,15 @@ class ForwardOutput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
 
 @dataclass(slots=True)
 class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
+    """Flattened inputs with optional [tokens, model layers, top-k] expert IDs.
+
+    Routes align with input tokens without a shift and must contain no missing
+    (-1) IDs. Shared token prefixes use the first sequence's routes. Omit routes
+    for normal model routing. Forward logprobs always describe raw model scores.
+    """
+
     input_tokens: torch.Tensor
+    routed_experts: torch.Tensor | None = None
     target_tokens: torch.Tensor | None = None
     top_k: int | None = None
     logits: bool = False
@@ -213,6 +228,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: None = None,
         logits: Literal[False] = False,
@@ -226,6 +242,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: None = None,
         logits: Literal[False] = False,
@@ -239,6 +256,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: int,
         logits: Literal[False] = False,
@@ -252,6 +270,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: None = None,
         logits: Literal[True],
@@ -265,6 +284,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: None = None,
         logits: Literal[False] = False,
@@ -278,6 +298,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: int,
         logits: Literal[False] = False,
@@ -291,6 +312,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: None = None,
         logits: Literal[True],
@@ -304,6 +326,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: None = None,
         logits: Literal[False] = False,
@@ -317,6 +340,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: int,
         logits: Literal[True],
@@ -330,6 +354,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: int,
         logits: Literal[False] = False,
@@ -343,6 +368,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: None = None,
         logits: Literal[True],
@@ -356,6 +382,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: int,
         logits: Literal[True],
@@ -369,6 +396,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: int,
         logits: Literal[False] = False,
@@ -382,6 +410,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: None = None,
         logits: Literal[True],
@@ -395,6 +424,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: None = None,
         top_k: int,
         logits: Literal[True],
@@ -408,6 +438,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor,
         top_k: int,
         logits: Literal[True],
@@ -421,6 +452,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor | None = None,
         top_k: int | None = None,
         logits: bool = False,
@@ -433,6 +465,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         cls,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor | None = None,
         top_k: int | None = None,
         logits: bool = False,
@@ -446,6 +479,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         self,
         *,
         input_tokens: torch.Tensor,
+        routed_experts: torch.Tensor | None = None,
         target_tokens: torch.Tensor | None = None,
         top_k: int | None = None,
         logits: bool = False,
@@ -453,6 +487,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
     ) -> None:
+        self.routed_experts = routed_experts
         self.input_tokens = input_tokens
         self.target_tokens = target_tokens
         self.top_k = top_k
@@ -596,6 +631,14 @@ class _MemoryCheck:
         default=None, compare=False, repr=False
     )
     decision: dict[str, Any] | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
+    # Extrema above are diagnostics; fits is the conjunction of local fits.
+    # Keep each local producer through refreshes of different DP items.
+    local_required_bytes: int | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
+    local_available_bytes: int | None = dataclass_field(
         default=None, compare=False, repr=False
     )
 
@@ -924,6 +967,7 @@ class _ForwardItem:
     request: AnyForwardInput
     input_ids: torch.Tensor
     labels: torch.Tensor | None
+    routed_experts: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -935,6 +979,7 @@ class _PreparedPackedForward:
     positions_by_item: tuple[torch.Tensor, ...]
     source_positions_by_item: tuple[torch.Tensor, ...]
     context_parallel_group: dist.ProcessGroup | None = None
+    token_uids: torch.Tensor | None = None
 
 
 type _RowMatch = tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]
@@ -963,6 +1008,7 @@ class _ForwardGroupPlan:
     items: tuple[_ForwardItem, ...]
     packed: PrefixTreePack
     layout: PrefixTreeLayout | None = None
+    input_row_fingerprints: tuple[tuple[int, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1060,6 +1106,13 @@ class _SubforwardCost:
     # HybridEP buffer growth before the safety factor. It is in required, not
     # retained, and persists across a split, which charges the largest once.
     hybridep_growth: int = 0
+    # Adapter gradients the recompute backward holds beyond the boundaries it
+    # has released (``_checkpoint_adapter_gradient_bytes``), before the safety
+    # factor. Split children training the same slots share them, so a split
+    # charges the largest once; ``..._slots`` names those slots (sorted JSON
+    # of kind/name pairs, "" when none), keeping the cost JSON-serializable.
+    checkpoint_adapter_gradient: int = 0
+    checkpoint_adapter_gradient_slots: str = ""
 
     @property
     def ephemeral(self) -> int:
@@ -1080,13 +1133,21 @@ def _memory_error(
     logical_tokens: int,
     check: _MemoryCheck,
 ) -> TrainerRankMemoryError:
+    # Peak and limit are group extrema (largest demand, smallest budget) that may
+    # come from different ranks; the rank_* pair is this rank's own comparison.
+    local = (
+        ""
+        if check.local_required_bytes is None or check.local_available_bytes is None
+        else f"rank_required_gb={check.local_required_bytes / 1024**3:.3f} "
+        f"rank_available_gb={check.local_available_bytes / 1024**3:.3f} "
+    )
     return TrainerRankMemoryError(
         f"{context}: {message}. "
         f"packed_tokens={packed_tokens} "
         f"logical_tokens={logical_tokens} "
         f"predicted_peak_gb={check.estimated_required_bytes / 1024**3:.3f} "
         f"usable_limit_gb={check.available_bytes / 1024**3:.3f}. "
-        f"{_MEMORY_ERROR_SUGGESTION}",
+        f"{local}{_MEMORY_ERROR_SUGGESTION}",
         predicted_peak_bytes=check.estimated_required_bytes,
         usable_limit_bytes=check.available_bytes,
         suggestion=_MEMORY_ERROR_SUGGESTION,
@@ -1671,7 +1732,10 @@ def _moe_output_bytes_per_token(
                         and not dispatcher.dispatch_preprocess.keywords
                     )
                 )
-                or "routing" in vars(layer.router)
+                or (
+                    "routing" in vars(layer.router)
+                    and not hasattr(layer.router, "_art_rank_original_routing")
+                )
             ):
                 return 0
             tensors = _slot_lora_tensors(lora, slot_ref)
@@ -2940,18 +3004,33 @@ class TrainerRank:
         # backing stores, nor a bound for compiler saves or other backward work.
         # Keep it out of forward retention, including the cold fallback above.
         gradient = checkpoint_retained
+        gradient_slots = self._gradient_slots(group_rows, slot_refs)
+        adapter_gradient = (
+            self._checkpoint_adapter_gradient_bytes(
+                self._checkpoint_gradient_groups(group_rows, slot_refs)
+            )
+            if gradient
+            else 0
+        )
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
         checkpoint_workspace = max(
             checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
+        if gradient and self._memory_profiles.get(signature) is None:
+            checkpoint_workspace += _COLD_RECOMPUTE_TRANSIENT_BYTES
         forward_required = required
         if gradient:
             required = max(
                 required,
                 int(
-                    (checkpoint_retained + checkpoint_workspace + gradient)
+                    (
+                        checkpoint_retained
+                        + checkpoint_workspace
+                        + gradient
+                        + adapter_gradient
+                    )
                     * _MEMORY_SAFETY_FACTOR
                 ),
             )
@@ -2965,6 +3044,22 @@ class TrainerRank:
             checkpoint_input_gradient=gradient,
             checkpoint_peak_increment=required - forward_required,
             hybridep_growth=hybridep_growth_bytes,
+            checkpoint_adapter_gradient=adapter_gradient,
+            checkpoint_adapter_gradient_slots=json.dumps(
+                [
+                    [ref.kind, ref.name]
+                    for ref in sorted(
+                        gradient_slots,
+                        key=lambda ref: (
+                            ref.kind,
+                            ref.name is not None,
+                            ref.name or "",
+                        ),
+                    )
+                ]
+            )
+            if adapter_gradient
+            else "",
         )
 
     def last_forward_telemetry(self) -> dict[str, Any]:
@@ -2980,6 +3075,16 @@ class TrainerRank:
         graph plus the largest subforward's ephemeral share). A call refused
         with ``TrainerRankMemoryError`` is still reflected, with the binding
         check that refused it.
+
+        ``packing_plan_sha256`` commits to ordered local prefix-pack geometry
+        and TP padding, before CP dispatch. ``subforward_packing_plan_sha256``
+        lists the child commitments in execution order, with
+        ``subforward_request_indices`` supplying the outer mapping. These are
+        not unique event IDs: identical child geometries share a digest.
+        ``input_tokens_sha256`` recomposes existing row hashes in original flat
+        request order, independent of packing; it is unavailable if any request
+        was inactive. These are planning-time commitments, not model/target
+        label/caller loss-mask fingerprints or evidence of completed execution.
         """
 
         if self._last_forward_telemetry_snapshot is None:
@@ -3205,7 +3310,7 @@ class TrainerRank:
     ) -> tuple[tuple[tuple["LoRASlotRef | None", bool], tuple[int, ...]], ...]:
         if ensure_slots:
             self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
-        groups: dict[tuple[LoRASlotRef | None, bool], list[int]] = {}
+        groups: dict[tuple[LoRASlotRef | None, bool, bool], list[int]] = {}
         for index, request in enumerate(requests):
             if (
                 request.target_tokens is not None
@@ -3221,10 +3326,14 @@ class TrainerRank:
                             if request.no_grad is None
                             else not request.no_grad
                         ),
+                        request.routed_experts is not None,
                     ),
                     [],
                 ).append(index)
-        return tuple((slot_ref, tuple(indices)) for slot_ref, indices in groups.items())
+        return tuple(
+            ((slot, grad), tuple(indices))
+            for (slot, grad, _routed), indices in groups.items()
+        )
 
     @_backward_region
     def _run_flat_plan_with_memory_tracking(
@@ -3366,6 +3475,7 @@ class TrainerRank:
     def _telemetry_signature(cls, plan: _AnyForwardPlan) -> dict[str, object]:
         return {
             **cls._telemetry_plan_signature(plan),
+            **cls._packing_fingerprints(plan),
             "request_count": plan.request_count,
             "packed_tokens": plan.packed_tokens,
             "logical_tokens": plan.logical_tokens,
@@ -3375,6 +3485,84 @@ class TrainerRank:
             "group_segment_counts": tuple(
                 len(group.packed.segments) for group in plan.groups
             ),
+        }
+
+    @staticmethod
+    def _packing_fingerprints(plan: _AnyForwardPlan) -> dict[str, object]:
+        """Host metadata only: never copy/read tensor values or query CUDA.
+
+        Geometry excludes content, checkpoint names and later CP kernel plans.
+        Input hashes reuse canonical little-endian int64 row commitments; no
+        additional token hashing is done, including for rejected candidates.
+        Keep this high-cardinality evidence outside compile-plan deduplication.
+        """
+
+        def digest(value: object) -> str:
+            return hashlib.sha256(
+                json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest()
+
+        split = isinstance(plan, _SplitForwardPlan)
+        children = plan.subforwards if split else (plan,)
+        mappings = (
+            plan.request_indices if split else (tuple(range(plan.request_count)),)
+        )
+        rows: list[tuple[int, str] | None] = [None] * plan.request_count
+        fingerprints = []
+        for child, mapping in zip(children, mappings, strict=True):
+            groups = []
+            tp = child.signature.topology[1]
+            for group in child.groups:
+                length = int(group.packed.tokens.numel())
+                groups.append(
+                    (
+                        group.request_indices,
+                        group.grad_enabled,
+                        length,
+                        ((length + tp - 1) // tp) * tp,
+                        tuple(
+                            (
+                                segment.sequence_indices,
+                                segment.start,
+                                segment.end,
+                                segment.packed_start,
+                                segment.group_id,
+                                segment.parent_id,
+                            )
+                            for segment in group.packed.segments
+                        ),
+                    )
+                )
+                for index, row in zip(
+                    group.request_indices, group.input_row_fingerprints, strict=False
+                ):
+                    rows[mapping[index]] = row
+            fingerprints.append(
+                digest(
+                    (
+                        "art.prefix-pack/v1",
+                        child.signature.topology,
+                        child.request_count,
+                        groups,
+                    )
+                )
+            )
+        complete_rows = tuple(row for row in rows if row is not None)
+        return {
+            "packing_fingerprint_schema": "art.prefix-pack/v1",
+            "packing_plan_sha256": digest(
+                (
+                    "art.prefix-pack-split/v1",
+                    plan.request_count,
+                    tuple(zip(mappings, fingerprints, strict=True)),
+                )
+            )
+            if split
+            else fingerprints[0],
+            "subforward_packing_plan_sha256": tuple(fingerprints),
+            "input_tokens_sha256": canonical_token_rows_fingerprint(complete_rows)
+            if len(complete_rows) == plan.request_count
+            else None,
         }
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
@@ -3399,7 +3587,20 @@ class TrainerRank:
                 with torch.set_grad_enabled(group.grad_enabled):
                     with use_lora_slot(group.slot_ref):
                         prepared = self._prepare_packed_forward(group.packed)
-                        item_outputs = self._forward_packed(group.items, prepared)
+                        from art.megatron.routed_experts import (
+                            prepare_routes,
+                            use_routes,
+                        )
+
+                        routes = prepare_routes(
+                            group.items,
+                            group.packed,
+                            prepared,
+                            getattr(self, "_routing_bindings", ()),
+                            self.device,
+                        )
+                        with use_routes(routes):
+                            item_outputs = self._forward_packed(group.items, prepared)
                     item_outputs = [
                         replace(
                             output,
@@ -3983,7 +4184,21 @@ class TrainerRank:
                     f"dimensions: input_tokens={input_shape} "
                     f"target_tokens={tuple(labels.shape)}"
                 )
-        return _ForwardItem(request=request, input_ids=input_ids, labels=labels)
+        routes = request.routed_experts
+        if routes is not None:
+            from art.megatron.routed_experts import router_bindings, validate_routes
+
+            if not hasattr(self, "_routing_bindings"):
+                self._routing_bindings = router_bindings(self.runtime.model)
+            routes = validate_routes(
+                routes,
+                int(input_ids.numel()),
+                self.runtime.provider.num_layers,
+                self._routing_bindings,
+            )
+        return _ForwardItem(
+            request=request, input_ids=input_ids, labels=labels, routed_experts=routes
+        )
 
     def _forward_packed(
         self,
@@ -4440,6 +4655,9 @@ class TrainerRank:
         provider = self.runtime.provider
         return _PreparedPackedForward(
             tokens=batch.tokens.to(self.device),
+            token_uids=torch.arange(batch.tokens.numel(), dtype=torch.int64).unsqueeze(
+                0
+            ),
             position_ids=batch.position_ids.to(self.device),
             attention_state=create_prefix_tree_state(
                 group_ids=batch.group_ids,
@@ -4665,6 +4883,7 @@ class TrainerRank:
         )
         return _PreparedPackedForward(
             tokens=prepared.tensors.tokens,
+            token_uids=local_positions,
             position_ids=prepared.tensors.input_pos,
             attention_state=cast("ArtContextParallelState", prepared.attention_state),
             packed_seq_params=prepared.packed_seq_params,
@@ -4704,6 +4923,11 @@ class TrainerRank:
     _checkpoint_moe_bytes_per_token = _memory._checkpoint_moe_bytes_per_token
     _moe_workspace_bytes = _memory._moe_workspace_bytes
     _checkpoint_memory_floor = _memory._checkpoint_memory_floor
+    _gradient_slots = staticmethod(_memory._gradient_slots)
+    _pending_adapter_gradient_bytes = _memory._pending_adapter_gradient_bytes
+    _checkpoint_gradient_groups = _memory._checkpoint_gradient_groups
+    _checkpoint_adapter_gradient_bytes = _memory._checkpoint_adapter_gradient_bytes
+    _adapter_gradient_walk = staticmethod(_memory._adapter_gradient_walk)
     _retained_memory_bytes = _memory._retained_memory_bytes
     _estimate_flat_forward = _memory._estimate_flat_forward
     _update_peak_memory_profile = _memory._update_peak_memory_profile
@@ -4876,6 +5100,8 @@ def _request_mix_key(request: AnyForwardInput) -> str:
         parts.append("logits")
     if request.hidden_states:
         parts.append("hidden")
+    if request.routed_experts is not None:
+        parts.append("routes")
     return "+".join(parts) if parts else "inactive"
 
 

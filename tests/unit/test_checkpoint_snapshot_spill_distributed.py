@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from art.trainer_rank import _checkpoint as cp
 from art.trainer_rank._impl import _CheckpointSlot, _CustomObject
 
 
@@ -39,6 +40,27 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
     )
     output = str(Path(directory) / "failed")
     original_write, original_start = safetensors.torch.save_file, threading.Thread.start
+    original_capture = cp._local_state
+
+    def capture(rank, name, files):
+        captured, optimizer, custom = original_capture(rank, name, files)
+        owned = files["custom_tensors.safetensors"]["p"]
+        return (
+            (
+                cp._LoraSnapshot(
+                    "p", "lora_A.weight", None, 0, {}, {"lora": owned}, None
+                ),
+            ),
+            optimizer,
+            custom,
+        )
+
+    def expand(captured, files):
+        if rank == 0:
+            raise RuntimeError("rank zero writer expansion failed")
+        assert released.wait(15), "parent did not release sibling expansion"
+        torch.testing.assert_close(captured[0].tensors["lora"], torch.tensor([1.0]))
+        return ()
 
     def write(tensors, path):
         if rank == 0 and failure == "write":
@@ -68,6 +90,9 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
             )
             patch.setattr(safetensors.torch, "save_file", write)
             patch.setattr(threading.Thread, "start", start)
+            if failure == "expand":
+                patch.setattr(cp, "_local_state", capture)
+                patch.setattr(cp, "_expand_local_state", expand)
             trainer.prepare_checkpoint_save(output, "a")
             owned = trainer._prepared_checkpoint_saves[output]
             assert owned.writer is not None
@@ -88,6 +113,7 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
             # Restore successful persistence, then reuse both collective groups.
             patch.setattr(safetensors.torch, "save_file", original_write)
             patch.setattr(threading.Thread, "start", original_start)
+            patch.setattr(cp, "_local_state", original_capture)
             following = str(Path(directory) / "following")
             trainer.prepare_checkpoint_save(following, "a")
             trainer.abort_checkpoint_save(following)
@@ -106,7 +132,7 @@ def _worker(rank, directory, failure, action, prepared, released, finalized):
 
 
 @pytest.mark.parametrize("action", ["finish", "abort"])
-@pytest.mark.parametrize("failure", ["start", "write"])
+@pytest.mark.parametrize("failure", ["start", "write", "expand"])
 def test_asymmetric_snapshot_failure_does_not_block_capture(tmp_path, action, failure):
     context = mp.get_context("spawn")
     prepared = [context.Event() for _ in range(2)]

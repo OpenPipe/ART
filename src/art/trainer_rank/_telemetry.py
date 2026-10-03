@@ -1,4 +1,8 @@
-"""Structured host-phase and torch.compile telemetry for trainer-rank processes."""
+"""Structured host-phase timing and Dynamo callback telemetry.
+
+Compile fields cover torch._dynamo callbacks, not all compiler work. Direct
+Triton/FLA JIT and autotuning can take time even when compile_status is "none".
+"""
 
 from __future__ import annotations
 
@@ -154,6 +158,7 @@ def _compile_end(_args: Any) -> None:
                 return
         event: dict[str, object] = {
             "event": "compile",
+            "compile_scope": "torch._dynamo",
             "phase": closed_phase.name if closed_phase is not None else "unscoped",
             **record,
         }
@@ -202,7 +207,7 @@ def phase(
     dedup_signature: Mapping[str, object] | None = None,
     synchronized: bool = False,
 ) -> Iterator[None]:
-    """Emit one structured phase event, including compile work observed within it."""
+    """Emit phase duration and observed Dynamo callbacks; other JIT work is uncounted."""
 
     _install()
     signature_key = json.dumps(
@@ -243,6 +248,7 @@ def phase(
                 "seconds": seconds,
                 "synchronized": synchronized,
                 "signature": signature,
+                "compile_scope": "torch._dynamo",
                 "compile_status": (
                     "recompile"
                     if "recompile" in graph_statuses

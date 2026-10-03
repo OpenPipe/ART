@@ -150,12 +150,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
-      group: trainer-rank-gpu-capacity-${{ inputs.context || 'cks-wb3' }}
+      group: trainer-rank-gpu-capacity-${{ inputs.context || vars.TRAINER_RANK_GPU_CONTEXT || 'cks-wb3' }}
       cancel-in-progress: false
       queue: max
     environment: trainer-rank-gpu-validation
     env:
-      SKY_INFRA: k8s/${{ inputs.context || 'cks-wb3' }}
+      SKY_INFRA: k8s/${{ inputs.context || vars.TRAINER_RANK_GPU_CONTEXT || 'cks-wb3' }}
       EXPECTED_HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
       ADMISSION_DEADLINE: ${{ needs.classify.outputs.admission_deadline }}
     steps:
@@ -186,7 +186,7 @@ jobs:
 
       - name: Configure Kubernetes
         env:
-          KUBECONFIG_VALUE: ${{ secrets[inputs.context == 'ext-collab2' && 'GPU_IMAGE_KUBECONFIG' || 'CKS_WB3_KUBECONFIG'] }}
+          KUBECONFIG_VALUE: ${{ secrets[env.SKY_INFRA == 'k8s/ext-collab2' && 'GPU_IMAGE_KUBECONFIG' || 'CKS_WB3_KUBECONFIG'] }}
         run: |
           set -euo pipefail
           case "${SKY_INFRA}" in
