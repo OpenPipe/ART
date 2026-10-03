@@ -110,6 +110,7 @@ async def test_shared_pool_shutdown_falls_back_without_cancelling_caller(
             self.closed = True
 
     pool = ClosedPool()
+    monkeypatch.setattr(_parallel, "_PROCESS_EXECUTORS", {pool: os.getpid()})
     monkeypatch.setattr(_parallel, "_start_process_executor", lambda _: (pool, 2, ()))
     monkeypatch.setattr(_parallel, "_supports_processes", lambda **_: True)
     monkeypatch.setattr(_parallel, "_processes_enabled", lambda *_: True)
@@ -155,4 +156,51 @@ def test_terminal_cleanup_does_not_join_foreign_parent_pool(
     pool = ForeignPool()
     monkeypatch.setattr(_parallel, "_PROCESS_EXECUTORS", {pool: os.getpid() + 1})
     _parallel._shutdown_process_executor(0)
+    assert not _parallel._PROCESS_EXECUTORS
+
+
+async def test_user_cancellation_exception_is_not_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = asyncio.CancelledError("user tokenization exception")
+
+    class Pool:
+        _shutdown_thread = True
+
+        def submit(self, *_: Any) -> Future[bytes]:
+            future: Future[bytes] = Future()
+            future.set_exception(error)
+            assert not future.cancelled()
+            return future
+
+    pool = Pool()
+    monkeypatch.setattr(_parallel, "_start_process_executor", lambda _: (pool, 2, ()))
+    monkeypatch.setattr(_parallel, "_supports_processes", lambda **_: True)
+    monkeypatch.setattr(_parallel, "_processes_enabled", lambda *_: True)
+    with pytest.raises(asyncio.CancelledError):
+        await art.tokenize(
+            [_exchange_trajectory(i) for i in range(4)], model="test/model"
+        )
+    assert not _parallel._PROCESS_BACKEND_DISABLED
+
+
+@pytest.mark.parametrize("first_cleanup", ["exact", "all", "unknown"])
+def test_foreign_or_unknown_pool_stays_unowned_after_cleanup(
+    monkeypatch: pytest.MonkeyPatch, first_cleanup: str
+) -> None:
+    class ForeignPool:
+        def shutdown(self, **_: Any) -> None:
+            pytest.fail("must not shut down an executor without local ownership")
+
+    pool: Any = ForeignPool()
+    monkeypatch.setattr(
+        _parallel,
+        "_PROCESS_EXECUTORS",
+        {} if first_cleanup == "unknown" else {pool: os.getpid() + 1},
+    )
+    if first_cleanup == "all":
+        _parallel._shutdown_process_executor(0)
+    else:
+        _parallel._shutdown_process_executor(0, pool)
+    _parallel._shutdown_process_executor(0, pool)
     assert not _parallel._PROCESS_EXECUTORS

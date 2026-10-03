@@ -219,7 +219,7 @@ def _release_process_executors(
             ]
             _PROCESS_EXECUTORS.clear()
         else:
-            pid = _PROCESS_EXECUTORS.pop(executor, os.getpid())
+            pid = _PROCESS_EXECUTORS.pop(executor, None)
             owned = [executor] if pid == os.getpid() else []
         if executor is None or _PROCESS_EXECUTOR is executor:
             _PROCESS_EXECUTOR = None
@@ -685,6 +685,7 @@ async def _ordered_process_map(
                 if (
                     task is None
                     or task.cancelling()
+                    or not pending.cancelled()
                     or not getattr(executor, "_shutdown_thread", False)
                 ):
                     raise

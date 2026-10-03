@@ -310,7 +310,9 @@ def test_failed_pool_cleanup_does_not_release_replacement(
         def shutdown(self, **kwargs: bool) -> None:
             closed.append(kwargs)
 
-    _parallel._shutdown_process_executor(0, cast(ProcessPoolExecutor, Failed()))
+    pool = cast(ProcessPoolExecutor, Failed())
+    monkeypatch.setattr(_parallel, "_PROCESS_EXECUTORS", {pool: os.getpid()})
+    _parallel._shutdown_process_executor(0, pool)
     assert _parallel._PROCESS_EXECUTOR is replacement
     assert closed == [{"wait": False, "cancel_futures": True}]
 
@@ -348,7 +350,9 @@ def test_manager_wait_shares_final_reap_deadline(
         def shutdown(self, **kwargs: bool) -> None:
             pass
 
-    _parallel._shutdown_process_executor(0, cast(ProcessPoolExecutor, Pool()))
+    pool = cast(ProcessPoolExecutor, Pool())
+    monkeypatch.setattr(_parallel, "_PROCESS_EXECUTORS", {pool: os.getpid()})
+    _parallel._shutdown_process_executor(0, pool)
     assert joins == [
         ("worker", 0),
         ("worker", 1.0),
@@ -357,7 +361,7 @@ def test_manager_wait_shares_final_reap_deadline(
     ]
 
 
-def test_cleanup_does_not_join_current_manager() -> None:
+def test_cleanup_does_not_join_current_manager(monkeypatch: pytest.MonkeyPatch) -> None:
     class Pool:
         _processes: dict[int, Any] = {}
         _executor_manager_thread = threading.current_thread()
@@ -365,4 +369,6 @@ def test_cleanup_does_not_join_current_manager() -> None:
         def shutdown(self, **kwargs: bool) -> None:
             pass
 
-    _parallel._shutdown_process_executor(0, cast(ProcessPoolExecutor, Pool()))
+    pool = cast(ProcessPoolExecutor, Pool())
+    monkeypatch.setattr(_parallel, "_PROCESS_EXECUTORS", {pool: os.getpid()})
+    _parallel._shutdown_process_executor(0, pool)
