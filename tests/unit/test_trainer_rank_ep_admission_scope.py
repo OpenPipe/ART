@@ -81,10 +81,14 @@ def test_oversized_requires_complete_peer_scope(
         # other DP peers may not have entered memory recovery at all.
         assert all(group is local_group for group, _, _ in calls)
     else:
-        assert calls
-        # Earlier split-price checks can legitimately be TPxCP-local.
-        # The final oversized admission vote must cover the caller scope.
-        assert calls[-1][0] is (None if api == "forward_batches" else local_group)
+        # Earlier split-price checks and later handoffs are distinct votes.
+        votes = [
+            group
+            for group, values, op in calls
+            if len(values) == 3 and op == tr.dist.ReduceOp.MIN
+        ]
+        assert len(votes) == 1
+        assert votes[0] is (None if api == "forward_batches" else local_group)
 
 
 @pytest.mark.parametrize("count", [1, 2])

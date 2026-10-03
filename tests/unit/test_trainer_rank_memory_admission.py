@@ -226,6 +226,7 @@ def test_cpu_shortage_is_not_overwritten_by_fresh_gpu_check(
 @pytest.mark.parametrize("cpu_available", [0, 1_000_000])
 def test_ep_oversized_preserves_graph_host_budget(rank, monkeypatch, cpu_available):
     rank._allow_oversized_batches = True
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_expert_parallel_active", lambda: True)
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 1)
     monkeypatch.setattr(rank, "_available_cpu_memory_bytes", lambda: cpu_available)
