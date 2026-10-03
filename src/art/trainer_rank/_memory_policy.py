@@ -25,6 +25,7 @@ def choose_output_placements(
     *,
     gpu_available_bytes: int,
     required_available_bytes: int | None = None,
+    allow_oversized: bool = False,
 ) -> tuple[OutputDevice, ...]:
     """Place already gathered CPU outputs before making any model-device copy.
 
@@ -32,6 +33,8 @@ def choose_output_placements(
     Fresh GPU headroom excludes live storage and pending restore/staging reserves.
     Explicit model placement is reserved before optional model placement, and
     may be checked against a budget that also credits reusable cache.
+    The oversized opt-in permits required model copies, not extra auto credit;
+    actual allocation failures remain the caller's responsibility.
     """
     if any(
         size < 0 or device not in ("auto", "model", "cpu") for size, device in outputs
@@ -43,12 +46,12 @@ def choose_output_placements(
         if required_available_bytes is None
         else required_available_bytes
     )
-    if required > max(0, budget):
+    if required > max(0, budget) and not allow_oversized:
         raise MemoryError(
             f"Gathered model-device outputs require {required} GPU bytes; "
             f"only {max(0, budget)} bytes are available"
         )
-    remaining = max(0, gpu_available_bytes) - required
+    remaining = max(0, gpu_available_bytes - required)
     placements: list[OutputDevice] = []
     for size, device in outputs:
         if device == "auto":
