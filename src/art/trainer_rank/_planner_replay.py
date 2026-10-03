@@ -351,7 +351,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         for refs in (tuple(g.slot_ref for g in plan.groups), None)
     ]
     facts = {
-        "version": 5,
+        "version": 8,
         "checkpoint_layers": layers,
         "checkpoint_moe_bytes_per_token": rank._checkpoint_moe_bytes_per_token(),
         # Model and process readers of the recomputed layer and staged head,
@@ -402,7 +402,7 @@ def validate(facts: Any) -> None:
             "groups",
         },
     )
-    if type(facts["version"]) is not int or facts["version"] != 5:
+    if type(facts["version"]) is not int or facts["version"] != 8:
         raise ValueError("unsupported runtime facts version")
     for key in (
         "checkpoint_layers",
