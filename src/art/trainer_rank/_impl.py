@@ -149,6 +149,9 @@ _HEAD_CHUNK_TOKENS = 512
 # 32 MiB transients live at its peak (Qwen3.6-35B-A3B CP2: the RoPE frequencies
 # and a frozen linear's output, at 2k to 20k tokens); warm waves do not.
 _COLD_RECOMPUTE_TRANSIENT_BYTES = 64 * 2**20
+# The TP x SP traces (dense Qwen3.8-27B, TP2 and TP4) held a third: TE's 32 MiB
+# cuBLAS workspace, allocated by the process's first wave.
+_SEQUENCE_PARALLEL_COLD_TRANSIENT_BYTES = 3 * 32 * 2**20
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -1299,6 +1302,45 @@ def _gdn_layer_count(model: torch.nn.Module) -> int:
     return sum(isinstance(module, GatedDeltaNet) for module in model.modules())
 
 
+def _mixer_top_gaps(model: torch.nn.Module) -> tuple[int | None, int | None] | None:
+    """Layers between the top decoder layer and the highest attention / GDN layer.
+
+    ``None`` for a mixer kind the decoder lacks; ``None`` overall when the
+    decoder layers are unreadable.
+    """
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return None
+    try:
+        layers = list(_language_model(model).decoder.layers)
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+    gdn = [
+        any(isinstance(module, GatedDeltaNet) for module in layer.modules())
+        for layer in layers
+    ]
+    top = len(layers) - 1
+    return (
+        next((top - index for index in range(top, -1, -1) if not gdn[index]), None),
+        next((top - index for index in range(top, -1, -1) if gdn[index]), None),
+    )
+
+
+def _lora_modules_per_layer(model: torch.nn.Module) -> int:
+    """The most LoRA modules any one decoder layer holds (0 when unreadable)."""
+    try:
+        from art.megatron.lora import LoRA
+
+        layers = list(_language_model(model).decoder.layers)
+    except (AttributeError, ImportError, RuntimeError, TypeError):
+        return 0
+    return max(
+        (sum(type(module) is LoRA for module in layer.modules()) for layer in layers),
+        default=0,
+    )
+
+
 def _moe_layer_count(model: torch.nn.Module) -> int:
     """Number of mixture-of-experts layers in the model (0 when unavailable)."""
 
@@ -2068,10 +2110,13 @@ class TrainerRank:
         # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
         # cost model prices GDN state hand-offs per GDN layer, not per layer.
         self._gdn_layers = _gdn_layer_count(runtime.model[0])
+        self._mixer_top_gaps = _mixer_top_gaps(runtime.model[0])
         if self._gdn_layers == 0 and bool(
             getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
         ):
             self._gdn_layers = self._num_layers
+            self._mixer_top_gaps = (None, 0)
+        self._lora_modules_per_layer = _lora_modules_per_layer(runtime.model[0])
         # A fitted layout cost table applies only to the execution classes it
         # was calibrated on (device class, dtype, model geometry, parallel
         # shape); other runtimes keep the previous score.
@@ -3253,8 +3298,12 @@ class TrainerRank:
         *,
         positions: Sequence[torch.Tensor] | None = None,
         lower_bound: bool = False,
+        uncapped: bool = False,
     ) -> int:
         """Per-group logical bounds or exact packed union; no device-label read.
+
+        Capped at one head chunk unless ``uncapped`` (every projected row, for
+        pricing each chunk's statistics path).
 
         A single sequence's valid rows cannot alias each other. Across requests
         they may share: max is a lower bound, sum an upper bound. Ignore labels
@@ -3292,14 +3341,14 @@ class TrainerRank:
                     row = row.index_select(0, offsets)
                 for position in row.tolist():
                     projected.add(int(position))
-                    if len(projected) >= _HEAD_CHUNK_TOKENS:
+                    if len(projected) >= _HEAD_CHUNK_TOKENS and not uncapped:
                         return _HEAD_CHUNK_TOKENS
-        return min(
-            _HEAD_CHUNK_TOKENS,
+        rows = (
             (max(counts, default=0) if lower_bound else sum(counts))
             if positions is None
-            else len(projected),
+            else len(projected)
         )
+        return rows if uncapped else min(_HEAD_CHUNK_TOKENS, rows)
 
     def _head_target_chunk_rows(
         self,
@@ -3361,28 +3410,23 @@ class TrainerRank:
         chunk_start = first_index // _HEAD_CHUNK_TOKENS * _HEAD_CHUNK_TOKENS
         return min(_HEAD_CHUNK_TOKENS, len(projected) - chunk_start)
 
-    def _sequence_parallel_floor_covered(self, layers: int, tp: int, cp: int) -> bool:
-        """Whether the checkpoint floor covers a dense TP x SP recompute peak.
+    def _sequence_parallel_floor_covered(self, tp: int, cp: int) -> bool:
+        """Whether the explicit TP x SP checkpoint floor applies to this model.
 
-        Traced once: dense Qwen3.8-27B (64 layers) at TP4 with sequence
-        parallelism and CP1. Over the gathered rows, the recomputed layer's peak
-        held its SP-gathered norm input (2H per row), the MLP FC1 stage (6F/TP),
-        the recomputed mixer (within its projection widths / TP), norm outputs
-        and other workspace (each under H), plus one input gradient per
-        sharded row. The floor repeats the sharded boundaries as the
-        input-gradient term, so that repeat must cover this workspace; GDN
-        segment states grow with segments instead and are priced separately.
-        Other TP sizes, CP, MoE, replicated QKV (KV groups below TP), missing
-        geometry and models too shallow or wide for the bound keep today's
+        Traced on dense Qwen3.8-27B (64 layers, GDN and gated attention) at
+        TP4 and at TP2 with sequence parallelism and CP1. The floor covers
+        each rank's boundary shards and the recomputed layer's measured
+        workspace with explicit terms (``_sequence_parallel_workspace_bytes``),
+        so it needs readable mixer geometry but, unlike the earlier repeated-
+        boundary cover, no depth/width bound: shallower and wider dense models
+        are now eligible and priced by the same terms (untraced). Other TP
+        sizes, CP, MoE and replicated QKV (KV groups below TP) keep today's
         pricing.
         """
         geometry = self._geometry
-        if tp != 4 or cp != 1 or self._moe_layers or geometry.moe_experts:
+        if tp not in (2, 4) or cp != 1 or self._moe_layers or geometry.moe_experts:
             return False
-        hidden = self._hidden_size
-        ffn = geometry.ffn_hidden_size or 4 * hidden
-        attention_layers = self._num_layers > self._gdn_layers
-        if attention_layers and (
+        if self._num_layers > self._gdn_layers and (
             geometry.num_attention_heads <= 0
             or geometry.kv_channels <= 0
             # Replicated QKV keeps a global QKV output on every rank.
@@ -3396,28 +3440,7 @@ class TrainerRank:
             geometry.gdn_value_head_dim,
             geometry.gdn_conv_kernel,  # Prices each segment's conv history.
         )
-        if self._gdn_layers and min(gdn_widths) <= 0:
-            return False
-        attention = (
-            (7 if self._attention_output_gate else 5)
-            * geometry.num_attention_heads
-            * geometry.kv_channels
-            + 3 * geometry.num_query_groups * geometry.kv_channels
-            if attention_layers
-            else 0
-        )
-        gdn = (
-            4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
-            + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
-            if self._gdn_layers
-            else 0
-        )
-        # Per gathered row, times TP: the repeat is layers x H; the workspace is
-        # 2H + the FC1 stage (6F/TP, or the SwiGLU live set if wider) +
-        # mixer/TP + H of norms + H of other workspace, and the gradient H/TP.
-        stage = max(6, self._mlp_activation_factor) * ffn
-        workspace = 2 * hidden * tp + stage + max(attention, gdn) + 2 * hidden * tp
-        return layers * hidden >= workspace + hidden
+        return not (self._gdn_layers and min(gdn_widths) <= 0)
 
     def _subforward_cost(
         self,
@@ -3434,8 +3457,10 @@ class TrainerRank:
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
     ) -> _SubforwardCost:
-        checkpoint_memory = self._checkpoint_memory_floor(
-            group_rows, slot_refs, gdn_segments
+        checkpoint_memory = self._sequence_parallel_lora_floor(
+            self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments),
+            group_rows,
+            signature,
         )
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
@@ -3463,11 +3488,14 @@ class TrainerRank:
                 checkpoint_floor[0],
             ),
         )
-        # One logical BF16 input gradient per eligible full/uniform/1 boundary.
+        # One logical BF16 input gradient per eligible full/uniform/1 boundary
+        # (TP x SP: one input-gradient shard; the workspace is explicit).
         # This partial peak allowance is not evidence of simultaneous distinct
         # backing stores, nor a bound for compiler saves or other backward work.
         # Keep it out of forward retention, including the cold fallback above.
-        gradient = checkpoint_retained
+        gradient = self._checkpoint_input_gradient_bytes(
+            group_rows, checkpoint_retained
+        )
         gradient_slots = self._gradient_slots(group_rows, slot_refs)
         adapter_gradient = (
             self._checkpoint_adapter_gradient_bytes(
@@ -3483,7 +3511,7 @@ class TrainerRank:
             checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
         if gradient and self._memory_profiles.get(signature) is None:
-            checkpoint_workspace += _COLD_RECOMPUTE_TRANSIENT_BYTES
+            checkpoint_workspace += self._cold_recompute_transient_bytes()
         forward_required = required
         if gradient:
             required = max(
@@ -5633,14 +5661,12 @@ class TrainerRank:
             chunk_rows = rows[start : start + _HEAD_CHUNK_TOKENS]
             # Recompute vocabulary-sized intermediates one chunk at a time in
             # backward; chunking alone otherwise retains every chunk's logits.
-            local_logits, log_z, local_topk = checkpoint(
-                self._local_head_stats,
+            local_logits, log_z, local_topk = self._checkpointed_head_stats(
                 model,
                 _select_positions(hidden_by_row, chunk_rows),
                 output_weight=output_weight,
                 need_log_z=need_log_z,
                 max_top_k=max_top_k,
-                use_reentrant=False,
             )
             logit_start, logit_end = logit_bounds[chunk_index : chunk_index + 2]
             logit_chunk_offsets = logit_rows[logit_start:logit_end] - start
@@ -5712,6 +5738,38 @@ class TrainerRank:
             # Do not retain prior chunk buffers while the next stats RHS runs.
             del local_logits, chunk_logits
 
+    def _checkpointed_head_stats(
+        self,
+        model: "GPTModel",
+        hidden: torch.Tensor,
+        *,
+        output_weight: torch.Tensor | None,
+        need_log_z: bool,
+        max_top_k: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        """One chunk's head statistics under non-reentrant checkpointing.
+
+        The recompute must save what the forward saved, so it replays the
+        statistics path the forward chose (``path``) instead of attempting
+        the kernels again.
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        return checkpoint(
+            self._local_head_stats,
+            model,
+            hidden,
+            output_weight=output_weight,
+            need_log_z=need_log_z,
+            max_top_k=max_top_k,
+            path=[],
+            use_reentrant=False,
+        )
+
     def _local_head_stats(
         self,
         model: "GPTModel",
@@ -5720,6 +5778,7 @@ class TrainerRank:
         output_weight: torch.Tensor | None,
         need_log_z: bool,
         max_top_k: int,
+        path: list[str] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -5733,15 +5792,58 @@ class TrainerRank:
         log_z: torch.Tensor | None = None
         local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
         if need_log_z:
-            topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
+            # ``path`` holds the forward's statistics path; a checkpoint
+            # recompute replays it rather than attempting the kernels again.
+            recorded = path[0] if path else None
+            topk_stats = (
+                _try_triton_local_topk_stats(local_logits, k=max_top_k)
+                if recorded in (None, "topk")
+                else None
+            )
             logsumexp_stats = (
                 cast(
                     tuple[torch.Tensor, torch.Tensor] | None,
                     _try_triton_stats("local_logsumexp_stats", local_logits),
                 )
-                if topk_stats is None
+                if topk_stats is None and recorded in (None, "logsumexp")
                 else None
             )
+            shape = (int(local_logits.shape[0]), int(local_logits.shape[1]))
+            if recorded is None:
+                if topk_stats is not None or logsumexp_stats is not None:
+                    # A kernel ran at this chunk shape: admission may price it.
+                    getattr(self, "_triton_head_stats_failures", set()).discard(shape)
+                elif _triton_stats_enabled(local_logits.is_cuda, shape[0]):
+                    # An attempted kernel failed at this chunk shape. Admission
+                    # priced the kernel's buffers, so compute the same
+                    # statistics eagerly within them; later admissions price
+                    # the shape for the eager fallback (_triton_head_stats)
+                    # until a kernel succeeds at it again.
+                    if not hasattr(self, "_triton_head_stats_failures"):
+                        self._triton_head_stats_failures = set()
+                    self._triton_head_stats_failures.add(shape)
+                    logsumexp_stats = _eager_local_logsumexp_stats(local_logits)
+                    recorded = "bounded"
+                if path is not None:
+                    path.append(
+                        recorded
+                        or (
+                            "topk"
+                            if topk_stats is not None
+                            else "logsumexp"
+                            if logsumexp_stats is not None
+                            else "eager"
+                        )
+                    )
+            elif recorded == "bounded":
+                logsumexp_stats = _eager_local_logsumexp_stats(local_logits)
+            elif recorded in ("topk", "logsumexp") and (
+                topk_stats is None and logsumexp_stats is None
+            ):
+                raise RuntimeError(
+                    "the head statistics kernel failed in a checkpoint recompute "
+                    "after it succeeded in the forward"
+                )
             stats = topk_stats if topk_stats is not None else logsumexp_stats
             if stats is not None:
                 local_max, local_sum = stats[:2]
@@ -5752,6 +5854,8 @@ class TrainerRank:
                 )
                 log_z = global_max + torch.log(global_sum)
             else:
+                # No kernel attempted (non-CUDA, disabled, short chunk):
+                # admission prices this FP32 fallback's seven buffers.
                 log_z = _vocab_parallel_log_z(local_logits)
 
             if topk_stats is not None:
@@ -6104,6 +6208,10 @@ class TrainerRank:
         _memory._estimate_required_memory_bytes_from_values
     )
     _gdn_segment_layer_bytes = _memory._gdn_segment_layer_bytes
+    _sequence_parallel_workspace_bytes = _memory._sequence_parallel_workspace_bytes
+    _sequence_parallel_lora_floor = _memory._sequence_parallel_lora_floor
+    _cold_recompute_transient_bytes = _memory._cold_recompute_transient_bytes
+    _checkpoint_input_gradient_bytes = _memory._checkpoint_input_gradient_bytes
     _available_memory_bytes = _memory._available_memory_bytes
     _all_ranks_have_memory_profile = _memory._all_ranks_have_memory_profile
     _update_memory_profile = _memory._update_memory_profile
@@ -6836,19 +6944,56 @@ def _try_triton_local_topk_stats(
     )
 
 
+def _triton_stats_enabled(cuda: bool, rows: int) -> bool:
+    """Whether ``_try_triton_stats`` attempts the kernel for a ``rows`` chunk."""
+    return (
+        cuda
+        and os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower()
+        not in {"0", "false"}
+        and rows >= int(os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64"))
+    )
+
+
+@lru_cache(maxsize=None)
+def _triton_stats_importable() -> bool:
+    try:
+        from art.trainer_rank import topk  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _triton_head_stats_available(rank: Any) -> bool:
+    """Whether the head statistics kernels can run on this rank at all."""
+    return (
+        _triton_stats_enabled(rank.device.type == "cuda", 1 << 62)
+        and _triton_stats_importable()
+    )
+
+
+def _triton_head_stats(rank: Any, rows: int, vocabulary: int) -> bool:
+    """The head statistics path a ``rows`` x ``vocabulary`` chunk takes, for admission.
+
+    Mirrors ``_try_triton_stats``'s attempt predicate plus kernel
+    importability. A kernel that imports but fails at run time falls back
+    (unless ART_TRAINER_RANK_TRITON_TOPK=strict makes that fatal); the first
+    such wave was priced for the kernel, and ``_local_head_stats`` then
+    records that chunk shape, priced for the fallback until a kernel succeeds
+    at it again.
+    """
+    return (
+        _triton_stats_enabled(rank.device.type == "cuda", rows)
+        and (rows, vocabulary) not in getattr(rank, "_triton_head_stats_failures", ())
+        and _triton_stats_importable()
+    )
+
+
 def _try_triton_stats(
     name: str,
     local_logits: torch.Tensor,
     **kwargs: object,
 ) -> object | None:
-    if not local_logits.is_cuda:
-        return None
-    if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() in {
-        "0",
-        "false",
-    } or int(local_logits.shape[0]) < int(
-        os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64")
-    ):
+    if not _triton_stats_enabled(local_logits.is_cuda, int(local_logits.shape[0])):
         return None
     try:
         from art.trainer_rank import topk
@@ -6899,6 +7044,80 @@ def _vocab_parallel_topk_from_local(
         logprobs=top_values - log_z.unsqueeze(1),
         tokens=tokens.gather(1, top_offsets),
     )
+
+
+# Row sub-chunks per head chunk for the bounded eager statistics: one FP32
+# sub-chunk is 2 * ceil(rows / 64) / rows of a BF16 chunk buffer: 1/32 when the
+# rows divide by 64, more otherwise (the estimator prices the ceiling).
+_EAGER_STATS_SUBCHUNKS = 64
+
+
+class _EagerLocalStats(torch.autograd.Function):
+    """The statistics kernel's (local max, local sum) contract, computed eagerly.
+
+    The logits are processed in up to ``_EAGER_STATS_SUBCHUNKS`` row sub-chunks
+    of ceil(rows / 64) rows each through one owned FP32 work buffer, beside
+    the logits in forward and beside the logits and their gradient in
+    backward: the kernel path's buffers (topk._LocalStatsFunction) plus that
+    buffer, instead of the unchunked fallback's seven. The logits are never
+    written. Rows are independent; the caller's rescale of local sums to the
+    global maximum equals the unchunked fallback in exact arithmetic, and
+    FP32 rounding may differ when ranks' local maxima differ.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = int(logits.shape[0])
+        step = max(1, -(-rows // _EAGER_STATS_SUBCHUNKS))
+        local_max = logits.max(dim=-1).values.float()
+        local_sum = torch.empty_like(local_max)
+        work = torch.empty(
+            (min(step, rows), int(logits.shape[1])),
+            dtype=torch.float32,
+            device=logits.device,
+        )
+        for start in range(0, rows, step):
+            stop = min(start + step, rows)
+            block = work[: stop - start]
+            block.copy_(logits[start:stop])  # owned: FP32 logits stay intact
+            block.sub_(local_max[start:stop, None]).exp_()
+            local_sum[start:stop] = block.sum(dim=-1)
+        del work
+        ctx.save_for_backward(logits, local_max)
+        ctx.step = step
+        return local_max, local_sum
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        # As the kernel: the local max is a detached shift; only the sum
+        # carries a gradient, exp(logits - local max) per row.
+        _grad_local_max, grad_local_sum = grad_outputs
+        logits, local_max = ctx.saved_tensors
+        grad = torch.empty_like(logits)
+        if grad_local_sum is None:
+            return grad.zero_()
+        rows, step = int(logits.shape[0]), int(ctx.step)
+        work = torch.empty(
+            (min(step, rows), int(logits.shape[1])),
+            dtype=torch.float32,
+            device=logits.device,
+        )
+        for start in range(0, rows, step):
+            stop = min(start + step, rows)
+            block = work[: stop - start]
+            block.copy_(logits[start:stop])  # owned: the saved logits stay intact
+            block.sub_(local_max[start:stop, None]).exp_()
+            block.mul_(grad_local_sum[start:stop, None])
+            grad[start:stop] = block
+        del work
+        return grad
+
+
+def _eager_local_logsumexp_stats(
+    local_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    stats = _EagerLocalStats.apply(local_logits)
+    return cast(tuple[torch.Tensor, torch.Tensor], stats)
 
 
 def _vocab_parallel_log_z(local_logits: torch.Tensor) -> torch.Tensor:

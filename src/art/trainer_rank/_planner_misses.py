@@ -647,6 +647,29 @@ _RANK_FIELDS = frozenset(
     "checkpointed_moe_layers recompute_modules moe_output_bytes_per_token "
     "moe_forward_stages".split()
 )
+# TP x SP floor facts; reports captured before them replay conservatively.
+_OPTIONAL_RANK_FIELDS = frozenset({"mixer_top_gaps", "lora_modules_per_layer"})
+
+
+def _adapter_ranks_unavailable(
+    topology: tuple[int, ...], facts: dict[str, Any], signature: Any
+) -> bool:
+    """A TP x SP floor estimate trains a named adapter whose ranks (the LoRA
+    intermediates' price) were not recorded, as in reports from before
+    sequence-parallel signatures carried slot shapes."""
+    return (
+        topology[1] > 1
+        and bool(facts["checkpoint_layers"])
+        and any(
+            group["grad"] and group["adapter"] is not None for group in facts["groups"]
+        )
+        and not any(
+            len(shape) == 5 and shape[0] == 2
+            for grad, shapes in signature.slot_shapes
+            if grad
+            for shape in shapes
+        )
+    )
 
 
 def _signature_values(values: dict[str, Any]) -> dict[str, Any]:
@@ -711,9 +734,10 @@ def replay(
     if not state["estimates"]:
         raise ValueError("memory replay has no candidate estimates")
     # Reports from before the dense no-grad FC1 floor omit this fact; their
-    # estimator did not price that floor.
+    # estimator did not price that floor. Optional TP x SP floor facts may
+    # also be absent (older reports replay those terms conservatively).
     values: dict[str, Any] = {"dense_fc1_adapted": False, **state["rank"]}
-    if set(values) != _RANK_FIELDS | {"geometry", "topology"}:
+    if set(values) - _OPTIONAL_RANK_FIELDS != _RANK_FIELDS | {"geometry", "topology"}:
         raise ValueError(
             "incomplete replay: immutable rank fields differ (including MoE stages)"
         )
@@ -729,6 +753,21 @@ def replay(
         raise ValueError("incomplete replay: recompute mode is not recorded")
     rank._recorded_one_layer_recompute = values["one_layer_recompute"]
     rank._moe_forward_stages = tuple(tuple(row) for row in values["moe_forward_stages"])
+    gaps = values.get("mixer_top_gaps")
+    if gaps is not None and (
+        type(gaps) is not list
+        or len(gaps) != 2
+        or any(
+            gap is not None and (type(gap) is not int or not 0 <= gap < layers)
+            for gap in gaps
+        )
+    ):
+        raise ValueError("incomplete replay: invalid mixer layer order")
+    rank._mixer_top_gaps = None if gaps is None else tuple(gaps)
+    modules = values.get("lora_modules_per_layer")
+    if modules is not None and (type(modules) is not int or not 0 <= modules < 2**16):
+        raise ValueError("incomplete replay: invalid LoRA module count")
+    rank._lora_modules_per_layer = modules
     rank._geometry = ModelGeometry(**values["geometry"])
     dp, tp, cp, pp = values["topology"]
     rank._topology_key = lambda: (dp, tp, cp, pp)
@@ -854,6 +893,10 @@ def replay(
                 request_cursor += count
                 group_cursor += 1
         key = _impl._MemorySignature(**_signature_values(item["signature"]))
+        if grouped and _adapter_ranks_unavailable(
+            rank._topology_key(), item["runtime_facts"], key
+        ):
+            raise ValueError("incomplete replay: TP x SP adapter ranks unavailable")
         rank._memory_profiles = (
             {key: _impl._MemoryProfile(**item["profile"])}
             if item["profile"] is not None
