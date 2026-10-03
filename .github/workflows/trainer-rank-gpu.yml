@@ -12,6 +12,10 @@ on:
         options:
           - cks-wb3
           - ext-collab2
+      base_sha:
+        description: Exact PR base SHA to bind this manual run for ready-for-review reuse
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -105,6 +109,64 @@ jobs:
                 return;
               }
             }
+            // Manual validation needs prospective base provenance inside the
+            // unchanged manual artifact. Never derive it from this PR later.
+            const manualRuns = await github.rest.actions.listWorkflowRuns({
+              ...context.repo,
+              workflow_id: 'trainer-rank-gpu.yml',
+              event: 'workflow_dispatch',
+              head_sha: pull.head.sha,
+              status: 'success',
+              per_page: 100,
+            });
+            const fs = require('fs');
+            const path = require('path');
+            const {execFileSync} = require('child_process');
+            for (const run of manualRuns.data.workflow_runs.filter(run =>
+              run.id !== context.runId &&
+              run.head_repository?.full_name === pull.head.repo.full_name &&
+              run.head_branch === pull.head.ref &&
+              run.head_sha === pull.head.sha &&
+              run.path === '.github/workflows/trainer-rank-gpu.yml'
+            ).slice(0, 10)) {
+              const directory = fs.mkdtempSync(path.join(process.env.RUNNER_TEMP, 'manual-reuse-'));
+              try {
+                const jobs = await github.rest.actions.listJobsForWorkflowRunAttempt({
+                  ...context.repo, run_id: run.id, attempt_number: run.run_attempt, per_page: 100,
+                });
+                const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                  ...context.repo, run_id: run.id, per_page: 100,
+                });
+                const matches = artifacts.data.artifacts.filter(artifact =>
+                  !artifact.expired && artifact.name ===
+                    `trainer-rank-result-${run.id}-${run.run_attempt}-manual`
+                );
+                if (matches.length !== 1 || matches[0].size_in_bytes > 64 * 1024 * 1024) continue;
+                const artifact = matches[0];
+                const download = await github.rest.actions.downloadArtifact({
+                  ...context.repo, artifact_id: artifact.id, archive_format: 'zip',
+                });
+                const archive = path.join(directory, 'result.zip');
+                fs.writeFileSync(archive, Buffer.from(download.data));
+                const current = await github.rest.actions.getWorkflowRun({
+                  ...context.repo, run_id: run.id,
+                });
+                const receipt = execFileSync('python3', [
+                  'scripts/ci/trainer_rank_manual_reuse.py', 'verify', archive,
+                ], {
+                  input: JSON.stringify({pull, run: current.data, artifact, jobs: jobs.data.jobs}),
+                  encoding: 'utf8', timeout: 30000,
+                });
+                core.info(receipt.trim());
+                core.setOutput('reused', 'true');
+                core.setOutput('run_id', String(run.id));
+                return;
+              } catch (error) {
+                core.warning(`Manual run ${run.id} is not reusable: ${error.message}`);
+              } finally {
+                fs.rmSync(directory, {recursive: true, force: true});
+              }
+            }
 
       - id: changes
         name: Classify changed files
@@ -183,6 +245,12 @@ jobs:
 
       - name: Check admission deadline
         run: python3 scripts/ci/trainer-rank-gpu.py admit "${RUNNER_TEMP}/trainer-rank-result"
+
+      - name: Record prospective manual reuse provenance
+        if: github.event_name == 'workflow_dispatch' && inputs.base_sha != ''
+        env:
+          REUSE_BASE_SHA: ${{ inputs.base_sha }}
+        run: python3 scripts/ci/trainer_rank_manual_reuse.py record "${RUNNER_TEMP}/trainer-rank-result"
 
       - name: Install launch dependencies
         run: |
