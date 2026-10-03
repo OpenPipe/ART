@@ -1801,7 +1801,9 @@ def _dense_mlp_recompute_bytes_per_token(
       per row (6.83F measured, cold and warm, on main with #925). Early real
       q062 runs once showed one more FC1 triplet live (6F, as a recompile can
       leave a graph's outputs live); those traces show none, so it is not
-      priced.
+      priced. Beside it the attention's q/k norm outputs and statistics
+      (0.21H measured) are priced as H/4: with the residual, norm output and
+      input gradient priced elsewhere, a layer's norms are 3.25H.
     - A no-grad layer holds its three 2F FC1 tensors, residual, norm and CP
       gather rows: 263 KB per row measured, priced as 6F + 6H.
 
@@ -1992,7 +1994,9 @@ def _dense_mlp_recompute_bytes_per_token(
     # Each of a layer's adapters, the mixer's too, keeps its rank-wide input
     # product and gradient.
     adapters = 2 * rank
-    return (7 * width + adapters) * 2, (6 * width + 6 * hidden + adapters) * 2
+    return (7 * width + hidden // 4 + adapters) * 2, (
+        6 * width + 6 * hidden + adapters
+    ) * 2
 
 
 def _moe_output_bytes_per_token(
