@@ -1467,6 +1467,7 @@ def _fill_planner_snapshot(
                 "sequence_parallel",
                 "attention_output_gate",
                 "mlp_activation_factor",
+                "dense_fc1_adapted",
                 "gdn_layers",
                 "checkpointed_moe_layers",
                 "moe_output_bytes_per_token",
