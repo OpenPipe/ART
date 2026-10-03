@@ -243,6 +243,7 @@ jobs:
             tests/unit/test_trainer_rank_head_memory.py \
             tests/unit/test_trainer_rank_eager_head_memory.py::test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound \
             tests/unit/test_grouped_planner_replay.py \
+            tests/unit/test_hybridep_planner_replay.py \
             tests/unit/test_planner_runtime_fact_guards.py \
             tests/unit/test_planner_replay_owner_budget.py \
             tests/unit/test_trainer_rank_mixed_head_memory.py \
@@ -299,6 +300,7 @@ jobs:
             --ignore=tests/unit/test_trainer_rank_moe_memory.py \
             --ignore=tests/unit/test_trainer_rank_head_memory.py \
             --ignore=tests/unit/test_grouped_planner_replay.py \
+            --ignore=tests/unit/test_hybridep_planner_replay.py \
             --ignore=tests/unit/test_planner_runtime_fact_guards.py \
             --ignore=tests/unit/test_planner_replay_owner_budget.py \
             --ignore=tests/unit/test_trainer_rank_mixed_head_memory.py \
