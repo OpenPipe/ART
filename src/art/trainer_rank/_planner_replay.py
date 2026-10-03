@@ -38,6 +38,9 @@ _REFUSALS = frozenset(
         "runtime_token_inventory_over_limit",
         "runtime_segment_inventory_over_limit",
         "head_positions_unavailable",
+        "head_statistics_fallback_unsupported",
+        "head_logits_statistics_unsupported",
+        "head_topk_targets_unsupported",
         "runtime_facts_over_limit",
         "runtime_stage_inventory_over_limit",
         "runtime_request_inventory_over_limit",
@@ -103,6 +106,10 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_plan_head_workspace_bytes",
         "_plan_hybridep_growth_bytes",
         "_gdn_segment_layer_bytes",
+        "_sequence_parallel_workspace_bytes",
+        "_sequence_parallel_lora_floor",
+        "_cold_recompute_transient_bytes",
+        "_checkpoint_input_gradient_bytes",
         "_one_layer_recompute",
         "_topology_key",
         "_physical_tokens",
@@ -220,6 +227,28 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             if vocabulary
             else 0
         )
+        if projected and head_statistics_fallback(rank, requests, positions):
+            # The frozen head facts price only the kernel path at TP > 1.
+            raise ValueError("head_statistics_fallback_unsupported")
+        if (
+            projected
+            and rank._topology_key()[1] > 1
+            and any(r.logits for r in requests)
+            and any(
+                r.target_tokens is not None or r.top_k is not None for r in requests
+            )
+        ):
+            # Facts record statistics, not requested logits beside them.
+            raise ValueError("head_logits_statistics_unsupported")
+        if (
+            projected
+            and rank._topology_key()[1] > 1
+            and group.grad_enabled
+            and any(r.top_k is not None for r in requests)
+            and any(r.target_tokens is not None for r in requests)
+        ):
+            # Facts record target rows, not top-k beside them.
+            raise ValueError("head_topk_targets_unsupported")
         backwards = (
             target_backward
             and group.grad_enabled
@@ -306,6 +335,21 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     # primitives before bounded JSON encoding; never retain model/slot objects.
     validate(facts)
     return facts
+
+
+def head_statistics_fallback(rank: Any, requests: Any, positions: Any) -> bool:
+    """Whether any TP > 1 head chunk of these requests runs eager statistics."""
+    if rank._topology_key()[1] == 1 or not any(
+        r.target_tokens is not None or r.top_k is not None for r in requests
+    ):
+        return False
+    vocabulary = _memory._head_vocabulary(rank)
+    return any(
+        not _impl._triton_head_stats(rank, chunk, vocabulary)
+        for chunk in _memory._head_chunk_sizes(
+            rank._head_projection_rows(requests, positions=positions, uncapped=True)
+        )
+    )
 
 
 def validate(facts: Any) -> None:
@@ -672,13 +716,14 @@ class ReplayRank(_impl.TrainerRank):
             None if dimensions is None else tuple(dimensions)
         )
         head = max(
-            _memory._dense_head_bytes(facts["head_vocabulary"], g["head_rows"])
-            * (
-                1
-                if not facts["head_target_backward"]
-                else 7
-                if g["head_statistics"]
-                else 3
+            _memory._frozen_head_bytes(
+                facts["head_vocabulary"],
+                g["head_rows"],
+                g["head_target_rows"],
+                target_backward=facts["head_target_backward"],
+                statistics=g["head_statistics"],
+                grad=g["grad"],
+                tp=self._topology_key()[1],
             )
             for g in groups
         )
