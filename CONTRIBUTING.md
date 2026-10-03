@@ -56,6 +56,17 @@ secret and requires its `skypilot-workload` service account. The selected infras
 is recorded in the job's owner and result receipts. Source checks, time limits,
 job-status validation, and teardown apply equally to both contexts.
 
+To make a manual branch validation eligible for reuse when its PR becomes ready,
+also pass `-f base_sha=EXACT_PR_BASE_SHA`. This records the base before GPU work.
+The ready-for-review check verifies the same source, branch, base, workflow,
+runtime input files, supported producer context, successful native and gate jobs,
+artifact digest, and cleanup receipts for that run attempt. Either supported
+context can qualify regardless of the current default. Missing or mismatched
+evidence falls back to normal GPU validation. Existing PR-event reuse is unchanged.
+Old manual artifacts and runs without `base_sha` cannot qualify retroactively.
+Runtime input identity does not prove identical resolved images behind mutable
+container tags; reuse retains the original run's qualification limits.
+
 ### CI uv Cache
 
 The PR `prek` workflow uses a prebuilt full `uv` cache (stored as a GitHub release asset) to avoid rebuilding heavy dependencies on every run.
