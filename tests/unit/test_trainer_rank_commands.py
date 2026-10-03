@@ -859,7 +859,7 @@ def test_persistent_iterator_captures_no_grad_before_next_callback():
 
 def test_nested_aggregate_outputs_admit_before_any_model_copy():
     rank: Any = _Rank()
-    rank._available_memory_bytes = lambda: 1024 * 1024
+    rank._available_memory_bytes = lambda **_: 1024 * 1024
     view = _view(_Executor(rank, "zero"))
     request = ForwardInput(
         input_tokens=torch.tensor([1]), options=ForwardOptions(output_device="auto")

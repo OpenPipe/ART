@@ -115,7 +115,15 @@ def test_output_placement_credits_cache_less_pending_frees(
 
 @pytest.mark.parametrize(
     ("field", "value"),
-    [("active", None), ("reserved", None), ("active", 9), ("active", 81)],
+    [
+        ("active", None),
+        ("reserved", None),
+        ("active", 9),
+        ("active", 81),
+        ("allocated", None),
+        ("allocated", True),
+        ("allocated", 10.5),
+    ],
 )
 def test_output_placement_cache_credit_needs_consistent_counters(budget, field, value):
     rank, stats = budget

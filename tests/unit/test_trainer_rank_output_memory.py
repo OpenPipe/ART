@@ -38,7 +38,7 @@ def _pending(rank, monkeypatch, *states):
 @pytest.mark.parametrize("policy", ["auto", "model", "cpu"])
 def test_logical_copy_preserves_pending_restore(rank, monkeypatch, policy):
     _pending(rank, monkeypatch, SimpleNamespace(restore_workspace_bytes=100))
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 120)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda **_: 120)
     view = _view(_Executor(rank, "zero"))
     if policy == "model":
         with pytest.raises(MemoryError, match="only 20 bytes"):
@@ -69,7 +69,7 @@ def test_logical_copy_reserves_distinct_checkpoints_and_standalone_heads(
     assert rank._pending_backward_memory() == (100, 192 + 64 + 48)
     assert rank._pending_backward_memory(exclude_staging=("first",)) == (100, 112)
     free = 484
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: free)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda **_: free)
     view = _view(_Executor(rank, "zero"))
     planned = view._place_outputs([_output(handle="a"), _output(handle="b")])
     assert [output.cpu for output in planned] == [(False,), (True,)]
@@ -83,7 +83,7 @@ def test_client_cpu_transport_does_not_consume_worker_gpu_reserve(rank, monkeypa
     view = _view(_Executor(rank, "zero"))
     view._transport_handles = []
     monkeypatch.setattr(
-        rank, "_available_memory_bytes", lambda: pytest.fail("GPU query")
+        rank, "_available_memory_bytes", lambda **_: pytest.fail("GPU query")
     )
     assert view._place_outputs([_output(policy="model")])[0].cpu == (True,)
     assert view._transport_handles == ["new"]
@@ -95,6 +95,6 @@ def test_native_admission_keeps_standalone_head_staging(rank, monkeypatch):
     plan = rank._plan_flat_forward(
         _requests(ForwardOptions(backward_state="replay", output_device="cpu"))[:1]
     )
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 111)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda **_: 111)
     _, check = rank._admit_graph_memory(plan)
     assert not check.fits and check.estimated_required_bytes == 112

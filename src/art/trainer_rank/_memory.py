@@ -18,7 +18,7 @@ from contextlib import nullcontext
 import hashlib
 import math
 from types import MethodType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from art.trainer_rank import _impl
 
@@ -1935,16 +1935,15 @@ def _available_memory_bytes(
         # Small copies made between physical forwards, such as gathered
         # outputs, reuse cached blocks; frees pending on other streams remain
         # active and are not credited.
-        reserved = None if stats is None else stats.get("reserved_bytes.all.current")
-        active = None if stats is None else stats.get("active_bytes.all.current")
-        reusable_reserved = (
-            reserved - active
-            if reusable_cache
-            and type(reserved) is int
-            and type(active) is int
-            and 0 <= allocated <= active <= reserved
-            else 0
-        )
+        counters = [
+            None if stats is None else stats.get(f"{name}_bytes.all.current")
+            for name in ("allocated", "active", "reserved")
+        ]
+        reusable_reserved = 0
+        if reusable_cache and all(type(value) is int for value in counters):
+            used, active, reserved = cast("list[int]", counters)
+            if 0 <= used <= active <= reserved:
+                reusable_reserved = reserved - active
     else:
         # Preserve the previous, unqualified policy for other backends.
         allocated = int(_impl.torch.cuda.memory_allocated(self.device))
