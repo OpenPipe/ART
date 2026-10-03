@@ -2898,27 +2898,20 @@ class TrainerRank:
         return min(_HEAD_CHUNK_TOKENS, len(projected) - chunk_start)
 
     def _sequence_parallel_floor_covered(self, layers: int, tp: int, cp: int) -> bool:
-        """Whether the checkpoint floor covers a dense TP x SP recompute peak.
+        """Whether the explicit TP x SP checkpoint floor applies to this model.
 
-        Traced on dense Qwen3.8-27B (64 layers) at TP4 and at TP2, each with
-        sequence parallelism and CP1. Over the gathered rows, the recomputed
-        layer's peak held its SP-gathered norm input (2H per row), the MLP FC1
-        stage (6F/TP), the recomputed mixer (within its projection widths / TP),
-        norm outputs (about 3.2H per sharded row at both sizes, so 4H/TP per
-        row), other workspace (under H), plus one input gradient per sharded
-        row. The floor repeats the sharded boundaries as the input-gradient
-        term, so that repeat must cover this workspace; GDN segment states grow
-        with segments instead and are priced separately. Other TP sizes, CP,
-        MoE, replicated QKV (KV groups below TP), missing geometry and models
-        too shallow or wide for the bound keep today's pricing.
+        Traced on dense Qwen3.8-27B (64 layers, GDN and gated attention) at
+        TP4 and at TP2 with sequence parallelism and CP1. The floor prices
+        each rank's boundary shards plus the recomputed layer's measured
+        workspace term by term (``_sequence_parallel_workspace_bytes``), so
+        it needs readable mixer geometry but no depth/width cover bound.
+        Other TP sizes, CP, MoE and replicated QKV (KV groups below TP) keep
+        today's pricing.
         """
         geometry = self._geometry
         if tp not in (2, 4) or cp != 1 or self._moe_layers or geometry.moe_experts:
             return False
-        hidden = self._hidden_size
-        ffn = geometry.ffn_hidden_size or 4 * hidden
-        attention_layers = self._num_layers > self._gdn_layers
-        if attention_layers and (
+        if self._num_layers > self._gdn_layers and (
             geometry.num_attention_heads <= 0
             or geometry.kv_channels <= 0
             # Replicated QKV keeps a global QKV output on every rank.
@@ -2932,30 +2925,7 @@ class TrainerRank:
             geometry.gdn_value_head_dim,
             geometry.gdn_conv_kernel,  # Prices each segment's conv history.
         )
-        if self._gdn_layers and min(gdn_widths) <= 0:
-            return False
-        attention = (
-            (7 if self._attention_output_gate else 5)
-            * geometry.num_attention_heads
-            * geometry.kv_channels
-            + 3 * geometry.num_query_groups * geometry.kv_channels
-            if attention_layers
-            else 0
-        )
-        gdn = (
-            4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
-            + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
-            if self._gdn_layers
-            else 0
-        )
-        # Per gathered row, times TP: the repeat is layers x H; the workspace is
-        # 2H + the FC1 stage (6F/TP, or the SwiGLU live set if wider) +
-        # mixer/TP + 4H/TP of norms + H of other workspace, and the gradient H/TP.
-        stage = max(6, self._mlp_activation_factor) * ffn
-        workspace = (
-            2 * hidden * tp + stage + max(attention, gdn) + 4 * hidden + hidden * tp
-        )
-        return layers * hidden >= workspace + hidden
+        return not (self._gdn_layers and min(gdn_widths) <= 0)
 
     def _subforward_cost(
         self,
@@ -3001,11 +2971,14 @@ class TrainerRank:
                 checkpoint_floor[0],
             ),
         )
-        # One logical BF16 input gradient per eligible full/uniform/1 boundary.
+        # One logical BF16 input gradient per eligible full/uniform/1 boundary
+        # (TP x SP: one input-gradient shard; the workspace is explicit).
         # This partial peak allowance is not evidence of simultaneous distinct
         # backing stores, nor a bound for compiler saves or other backward work.
         # Keep it out of forward retention, including the cold fallback above.
-        gradient = checkpoint_retained
+        gradient = self._checkpoint_input_gradient_bytes(
+            group_rows, checkpoint_retained
+        )
         gradient_slots = self._gradient_slots(group_rows, slot_refs)
         adapter_gradient = (
             self._checkpoint_adapter_gradient_bytes(
@@ -4944,6 +4917,8 @@ class TrainerRank:
         _memory._estimate_required_memory_bytes_from_values
     )
     _gdn_segment_layer_bytes = _memory._gdn_segment_layer_bytes
+    _sequence_parallel_workspace_bytes = _memory._sequence_parallel_workspace_bytes
+    _checkpoint_input_gradient_bytes = _memory._checkpoint_input_gradient_bytes
     _available_memory_bytes = _memory._available_memory_bytes
     _all_ranks_have_memory_profile = _memory._all_ranks_have_memory_profile
     _update_memory_profile = _memory._update_memory_profile

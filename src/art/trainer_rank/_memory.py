@@ -636,6 +636,17 @@ def _checkpoint_floor_from_facts(
         + (0 if grad else 4 * rows * self._hidden_size * 2)
         for (rows, grad), ref in zip(group_rows, refs, strict=True)
     )
+    if tp > 1 and gradient_rows:
+        # The recomputed layer's workspace, for the largest gradient group:
+        # groups run their backward one after another.
+        workspace = max(
+            workspace,
+            *(
+                self._sequence_parallel_workspace_bytes(rows)
+                for rows, grad in group_rows
+                if grad
+            ),
+        )
     if tp > 1 and self._gdn_layers and gradient_rows:
         # Recurrent states grow with segments, not rows; backward recomputes
         # one layer at a time. Padding to TP adds up to TP - 1 one-token
@@ -643,6 +654,62 @@ def _checkpoint_floor_from_facts(
         roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
         workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
     return retained, workspace
+
+
+def _sequence_parallel_workspace_bytes(self: TrainerRank, rows: int) -> int:
+    """The recomputed layer's live workspace at a TP x SP backward peak.
+
+    Measured on dense Qwen3.8-27B at TP4 (25,728 rows) and TP2 (20,816 to
+    66,284 rows, one to four GDN segments), cold and warm, at the top GDN
+    layer's MLP FC1 stage. Over the gathered rows: the SP-gathered norm
+    output (2H), the FC1 stage (6F/TP: GEMM output, gate and up LoRA outputs
+    and their sum; the SwiGLU live set if wider) and the recomputed mixer at
+    its projection widths / TP (GDN held 0.885-0.887 of it; the rest covers a
+    first wave's rotary cache). Over the sharded rows: norm outputs (3.22H
+    measured, priced at 3.25H). The input-gradient shard, GDN segment states
+    and cold transients are separate terms.
+    """
+    if rows <= 0:
+        return 0
+    geometry = self._geometry
+    tp = self._topology_key()[1]
+    hidden = self._hidden_size
+    ffn = geometry.ffn_hidden_size or 4 * hidden
+    attention = (
+        (7 if self._attention_output_gate else 5)
+        * geometry.num_attention_heads
+        * geometry.kv_channels
+        + 3 * geometry.num_query_groups * geometry.kv_channels
+        if self._num_layers > self._gdn_layers
+        else 0
+    )
+    gdn = (
+        4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+        + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+        if self._gdn_layers
+        else 0
+    )
+    stage = max(6, self._mlp_activation_factor) * ffn
+    gathered = rows * (2 * hidden + -(-stage // tp) + -(-max(attention, gdn) // tp))
+    sharded = -(-rows // tp) * -(-13 * hidden // 4)
+    return (gathered + sharded) * self._param_dtype_size
+
+
+def _checkpoint_input_gradient_bytes(
+    self: TrainerRank, group_rows: tuple[tuple[int, bool], ...], retained: int
+) -> int:
+    """The input-gradient term beside the checkpoint floor's boundaries.
+
+    TP1 charges one logical gradient per boundary, which also stands in for
+    the recompute workspace. Under TP x SP the workspace is priced
+    explicitly, and the recompute peak held one input-gradient shard of the
+    group being recomputed.
+    """
+    tp = self._topology_key()[1]
+    if not retained or tp == 1:
+        return retained
+    rows = max((rows for rows, grad in group_rows if grad), default=0)
+    return -(-rows // tp) * self._hidden_size * self._param_dtype_size
 
 
 def _gradient_slots(
@@ -1394,7 +1461,9 @@ def _estimate_required_memory_bytes_from_values(
     backward = 0
     if include_checkpoint_input_gradient and retained:
         # The backward's other end and cold transients, as _subforward_cost.
-        backward = retained + self._checkpoint_adapter_gradient_bytes(
+        backward = self._checkpoint_input_gradient_bytes(
+            group_rows, retained
+        ) + self._checkpoint_adapter_gradient_bytes(
             self._checkpoint_gradient_groups(group_rows, slot_refs)
         )
         if profiled is None and any(grad for _, grad in group_rows):
