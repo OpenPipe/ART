@@ -55,6 +55,15 @@ def install_te_cutlass_grouped_gemm_guard() -> None:
             gelu=gelu,
             use_bias=use_bias,
         )
+        if m_splits is not None and not any(m_splits):
+            # TE's grouped GEMM segfaults when every group is empty, e.g. on a CP
+            # rank that owns no tokens of a layer's layout. Forward and dgrad
+            # outputs then have no rows; a non-accumulated wgrad is zero.
+            if not accumulate:
+                for tensor in out:
+                    tensor.zero_()
+            empty = [_torch().empty(0, device=out[0].device)] * len(A)
+            return out, empty, empty
         return original(
             A,
             B,
