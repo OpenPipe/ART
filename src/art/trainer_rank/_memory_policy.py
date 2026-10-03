@@ -225,6 +225,9 @@ class ForwardMemoryCost:
     persistent_bytes: int = 0
     correction_workspace_bytes: int = 0
     gradient_staging_bytes: int = 0
+    # Adapter gradients inside peak_bytes that the walk accumulates into the
+    # staged gradients gradient_staging_bytes already reserves.
+    staged_gradient_bytes: int = 0
     replay_seconds: float | None = None
     cpu_resident_bytes: int = 0
 
@@ -237,6 +240,7 @@ class ForwardMemoryCost:
                 self.persistent_bytes,
                 self.correction_workspace_bytes,
                 self.gradient_staging_bytes,
+                self.staged_gradient_bytes,
                 self.cpu_resident_bytes,
             )
             < 0
@@ -291,7 +295,11 @@ def placement_cost(
             transient = cost.peak_bytes - physical_gpu
         gpu_retained += gpu + cost.persistent_bytes
         cpu_retained += cpu
-        workspace = max(workspace, transient, cost.correction_workspace_bytes)
+        workspace = max(
+            workspace,
+            max(transient, cost.correction_workspace_bytes)
+            - cost.staged_gradient_bytes,
+        )
         staging += cost.gradient_staging_bytes
     return MemoryPlacement(
         backward_state,
