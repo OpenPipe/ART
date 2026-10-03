@@ -92,7 +92,7 @@ def namespace(collectives):
         "_gather_lora_sequence_parallel_region",
         "_copy_lora_tensor_model_parallel_region",
     }
-    nodes = [
+    nodes: list[ast.stmt] = [
         n
         for n in tree.body
         if isinstance(n, ast.FunctionDef)
