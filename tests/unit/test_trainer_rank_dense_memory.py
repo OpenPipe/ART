@@ -250,6 +250,7 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "function_in_proj",
         "function_out_norm",
         "function_out_proj",
+        "function_linear_proj",
         "backward_hook",
         "backward_pre_hook",
         "global_forward_hook",
@@ -449,6 +450,9 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
             )
             for name in ("in_proj", "out_norm", "out_proj")
         },
+        "function_linear_proj": lambda: setattr(
+            layer.self_attention, "linear_proj", lambda *a: None
+        ),
         "backward_hook": lambda: mlp.linear_fc1.register_full_backward_hook(
             lambda *a: None
         ),

@@ -1781,6 +1781,20 @@ def _hybridep_buffer_bytes(capacity: int, ranks: int, hidden: int, experts: int)
 # Transformer Engine's Hopper cuBLAS workspaces: one per grouped-GEMM stream
 # (four) plus the plain GEMM's, each 32 MiB + 1 KiB.
 _TE_CUBLAS_WORKSPACE_BYTES = 5 * (32 * 2**20 + 1024)
+# The plain callables a covered layer, mixer or MLP may hold, each checked by
+# identity in the dense gate, plus ART's forward wrapper and its delegate.
+_DENSE_PLAIN_CALLABLES = frozenset(
+    (
+        "forward",
+        "_art_gdn_island_physical_forward",
+        "_art_physical_forward",
+        "self_attn_bda",
+        "mlp_bda",
+        "bias_dropout_add_exec_handler",
+        "act_fn",
+        "activation_func",
+    )
+)
 
 
 # Largest LoRA rank the dense stage prices (rank-wide intermediates included).
@@ -2000,15 +2014,19 @@ def _dense_mlp_recompute_bytes_per_token(
             or type(getattr(layer, "cross_attention", None)) is not IdentityOp
             or (
                 type(mixer) is GatedDeltaNet
-                and (
-                    vars(mixer).get("act_fn") is not torch.nn.functional.silu
-                    or not all(
-                        isinstance(getattr(mixer, name, None), torch.nn.Module)
-                        for name in ("in_proj", "out_norm", "out_proj")
-                    )
-                )
+                and vars(mixer).get("act_fn") is not torch.nn.functional.silu
             )
             or type(mixer) not in mixers
+            # Any other spec slot the layer, mixer or MLP calls (attention's
+            # output projection, GDN's projections and norm) must be a
+            # registered module, which the walk then checks.
+            or any(
+                callable(value)
+                and not isinstance(value, torch.nn.Module)
+                and name not in _DENSE_PLAIN_CALLABLES
+                for site in (layer, mixer, mlp)
+                for name, value in vars(site).items()
+            )
             or not plain(mixer, _prefix_tree_forward, "_art_physical_forward")
             or any(type(site) is not cls for site, cls in sites)
             or not all(plain(site) for site, _ in sites)
