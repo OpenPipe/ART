@@ -223,6 +223,34 @@ def test_cpu_shortage_is_not_overwritten_by_fresh_gpu_check(
     assert "CPU retained" in str(refusal.error("test"))
 
 
+@pytest.mark.parametrize("cpu_available", [0, 1_000_000])
+def test_ep_oversized_preserves_graph_host_budget(rank, monkeypatch, cpu_available):
+    rank._allow_oversized_batches = True
+    monkeypatch.setattr(rank, "_expert_parallel_active", lambda: True)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 1)
+    monkeypatch.setattr(rank, "_available_cpu_memory_bytes", lambda: cpu_available)
+    monkeypatch.setattr(
+        rank, "_admit_split_rung", lambda *a, **k: pytest.fail("EP split attempted")
+    )
+    requests = _requests(ForwardOptions(backward_state="gpu", output_device="model"))[
+        :2
+    ]
+    if not cpu_available:
+        with pytest.raises(
+            _impl.TrainerRankMemoryError, match="per-rank CPU headroom=0"
+        ):
+            rank._plan_admissible_forward(
+                requests, checkpoint=_impl.Unset, context="test"
+            )
+    else:
+        plan, check = rank._plan_admissible_forward(
+            requests, checkpoint=_impl.Unset, context="test"
+        )
+        assert plan.request_count == 2 and plan.subforward_count == 1
+        assert not check.fits and check.cpu_fits
+        assert all(group.memory_placement is not None for group in plan.groups)
+
+
 def test_retained_weight_versions_stay_in_gpu_budget_even_for_replay(rank, monkeypatch):
     monkeypatch.setattr(
         rank, "_lora_version_capture_bytes", lambda *args: 200, raising=False
