@@ -2,6 +2,8 @@ from typing import Any
 
 MOE_LORA_RANK = 1
 DENSE_LORA_RANK = 8
+# Fixed alpha with alpha/r keeps early updates and good learning rates roughly
+# rank-independent: https://thinkingmachines.ai/blog/lora/
 LORA_ALPHA = 32
 MEGATRON_LORA_RANK_ENV = "ART_MEGATRON_LORA_RANK"
 MEGATRON_LORA_TARGET_MODULES_ENV = "ART_MEGATRON_LORA_TARGET_MODULES"

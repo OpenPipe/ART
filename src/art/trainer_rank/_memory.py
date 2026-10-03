@@ -1176,11 +1176,14 @@ def _refresh_memory_check(
     self: TrainerRank, check: _impl._MemoryCheck, *, sync_across_dp: bool
 ) -> _impl._MemoryCheck:
     decision = _impl._planner_evidence.current(self)
-    # The existing admission operand can already be a cross-rank maximum.
-    # Preserve its local producer separately; never price the plan again.
+    # Re-sample each rank against its own demand, not another DP rank's maximum.
+    # Older synthetic checks may lack the local producer; keep their safe bound.
     with decision.refresh_of(check.sample) if decision is not None else nullcontext():
         return self._memory_check_required(
-            check.estimated_required_bytes, sync_across_dp=sync_across_dp
+            check.estimated_required_bytes
+            if check.local_required_bytes is None
+            else check.local_required_bytes,
+            sync_across_dp=sync_across_dp,
         )
 
 
@@ -1197,7 +1200,7 @@ def _memory_check_required(
         group = None if sync_across_dp else self._forward_memory_group()
         scope = "world" if group is None else "tp_cp"
         values = _impl.torch.tensor(
-            [float(required), 0.0],
+            [float(required), 0.0, 0.0],
             device=self.device if self.device.type == "cuda" else "cpu",
             dtype=_impl.torch.float64,
         )
@@ -1218,8 +1221,12 @@ def _memory_check_required(
             # A healthy communicator carries local failure to every peer
             # in the existing MIN. This cannot repair a poisoned backend.
             values[1] = available
-            _impl.dist.all_reduce(values[1], op=_impl.dist.ReduceOp.MIN, group=group)
+            # Extrema can come from different DP ranks. Agree that every rank
+            # fits its own demand while retaining extrema for diagnostics.
+            values[2] = available >= local_required
+            _impl.dist.all_reduce(values[1:], op=_impl.dist.ReduceOp.MIN, group=group)
             available = int(values[1].item())
+            fits = bool(values[2].item())
         except BaseException as exc:
             if error is None:
                 raise
@@ -1235,6 +1242,7 @@ def _memory_check_required(
             else self._available_memory_bytes(details)
         )
         local_available = available
+        fits = required <= available
     sample = None
     if decision is not None:
         try:
@@ -1253,7 +1261,9 @@ def _memory_check_required(
     return _impl._MemoryCheck(
         estimated_required_bytes=required,
         available_bytes=available,
-        fits=required <= available,
+        fits=fits,
+        local_required_bytes=local_required,
+        local_available_bytes=local_available,
         sample=sample,
     )
 

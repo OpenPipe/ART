@@ -3,12 +3,14 @@ from copy import deepcopy
 import json
 from types import SimpleNamespace
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 import pytest
 
 from art.token_prefix import TokenPrefixCache, apply_prefix_edits
 from art.utils.append_only import chat_prefix_observations, chat_response_prefixes
 from art_inference.append_only import (
+    chat_prefix_scope,
+    merge_chat_delta,
     output_prefix_observations,
     patch_deepseek_renderer,
 )
@@ -55,6 +57,105 @@ class Tokenizer:
 
     def decode(self, tokens, *, skip_special_tokens=False):
         return bytes(tokens).decode()
+
+
+@pytest.mark.parametrize("parallel", [False, True, None])
+@pytest.mark.parametrize("visible_calls", [0, 1, 2])
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_serial_projection_cannot_certify_hidden_sampled_actions(
+    parallel, visible_calls, reasoning
+):
+    class Request(BaseModel):
+        messages: list[dict]
+        parallel_tool_calls: bool | None = None
+        tools: list[dict] = [{"type": "function"}]
+
+    tokenizer = Tokenizer()
+    encode = tokenizer.encode
+    request = Request(messages=[{"role": "user"}], parallel_tool_calls=parallel)
+    calls = [
+        {"type": "function", "function": {"name": name, "arguments": "{}"}}
+        for name in ("first", "second")
+    ]
+    message = {"role": "assistant", "tool_calls": calls[:visible_calls]}
+    if reasoning:
+        message["reasoning_content"] = "thought"
+
+    async def render(value):
+        if len(value.messages) == 1:
+            return encode("prompt:")
+        assistant = value.messages[-1]
+        text = "thought#" if assistant.get("reasoning_content") else ""
+        text += "".join(
+            call["function"]["name"] for call in assistant.get("tool_calls", [])
+        )
+        return encode("prompt:" + text + "END")
+
+    sampled = encode(("\nthought#" if reasoning else "") + "firstsecondEND")
+    choices = [(message, sampled, True), (message, sampled, False)]
+    before = deepcopy((request.model_dump(), choices))
+    entries = asyncio.run(
+        chat_response_prefixes(tokenizer, request, encode("prompt:"), choices, render)
+    )
+    full = [entry for entry in entries if entry[1] == encode("prompt:") + sampled]
+    assert len(full) == (0 if parallel is False else 1)
+    if parallel is False:
+        assert all(b"first" not in bytes(entry[1]) for entry in entries)
+        # A distinct, aligned reasoning boundary survives only if the parsed
+        # action makes it distinguishable from the reasoning-only rendering.
+        assert bool(entries) == bool(reasoning and visible_calls)
+    assert (request.model_dump(), choices) == before
+    for rendered, raw, edits in entries:
+        assert apply_prefix_edits(rendered, edits) == raw
+
+
+def test_serial_non_tool_turn_retains_full_certificate():
+    class Request(BaseModel):
+        messages: list[dict] = []
+        parallel_tool_calls: bool = False
+
+    async def render(value):
+        return [1, 2] if value.messages else [1]
+
+    entries = asyncio.run(
+        chat_response_prefixes(
+            Tokenizer(),
+            Request(),
+            [1],
+            [
+                (
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {"function": {"name": "first", "arguments": "{}"}}
+                        ],
+                    },
+                    [3, 2],
+                    True,
+                ),
+                ({"role": "assistant"}, [2], True),
+            ],
+            render,
+        )
+    )
+    assert len(entries) == 1 and entries[0][1] == [1, 2]
+
+
+def test_policy_scope_keeps_old_certificates_in_a_separate_namespace():
+    from art_inference.token_prefix import TokenPrefixStore
+
+    cache = TokenPrefixStore()
+    base = "a" * 64
+    current = chat_prefix_scope(base)
+    assert current != base
+    assert len(current) == 64
+    assert current == chat_prefix_scope(base)
+    for canonical in ([1, 2], [1, 2, 3]):
+        cache.insert(base, canonical, [9], "lineage")
+    assert cache.lookup(current, [1, 2, 3, 4], "lineage") is None
+    cache.insert(current, [1, 2], [8], "lineage")
+    match = cache.lookup(current, [1, 2, 3, 4], "lineage")
+    assert match is not None and match.raw_prefix == (8,)
 
 
 def test_many_protocol_markers_do_not_multiply_long_prompt_storage():
@@ -293,3 +394,108 @@ def test_history_edits_leave_multimodal_markers_outside_replacements():
     }
     updated = replace_prompt_tokens(original, raw, edits)
     assert updated["mm_placeholders"]["image"][0].offset == 3
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        {},
+        {"id": "partial", "type": "function"},
+        {"id": "partial", "type": "function", "function": {"arguments": "{}"}},
+    ],
+)
+def test_unrenderable_sampled_tool_call_declines_observation(call):
+    request = StrictRequest(messages=[StrictMessage(role="user", content="question")])
+    message = {"role": "assistant", "tool_calls": [call]}
+    before = deepcopy((request.model_dump(), message))
+    rendered = []
+
+    async def render(value):
+        rendered.append(value)
+        return [1]
+
+    assert (
+        asyncio.run(
+            chat_response_prefixes(
+                Tokenizer(), request, [1], [(message, [2], True)], render
+            )
+        )
+        == []
+    )
+    assert rendered == [request]
+    assert (request.model_dump(), message) == before
+
+
+def test_sparse_tool_indices_can_be_filled_by_later_deltas():
+    def part(index, name):
+        return {
+            "index": index,
+            "id": name,
+            "type": "function",
+            "function": {"name": name, "arguments": "{}"},
+        }
+
+    message = {"role": "assistant"}
+    merge_chat_delta(message, {"tool_calls": [part(0, "first"), part(2, "last")]})
+    assert message["tool_calls"][1] == {}
+    merge_chat_delta(message, {"tool_calls": [part(1, "middle")]})
+    request = StrictRequest.model_validate({"messages": [message]})
+    assert request.messages[0].tool_calls is not None
+    assert [call.id for call in request.messages[0].tool_calls] == [
+        "first",
+        "middle",
+        "last",
+    ]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("renderer failed"),
+        ValidationError.from_exception_data("Renderer", []),
+    ],
+)
+def test_response_observer_does_not_swallow_renderer_errors(error):
+    request = StrictRequest(messages=[StrictMessage(role="user", content="question")])
+
+    async def render(value):
+        if len(value.messages) > 1:
+            raise error
+        return [1]
+
+    with pytest.raises(type(error)) as raised:
+        asyncio.run(
+            chat_response_prefixes(
+                Tokenizer(),
+                request,
+                [1],
+                [({"role": "assistant", "content": "answer"}, [2], True)],
+                render,
+            )
+        )
+    assert raised.value is error
+
+
+def test_optional_validation_does_not_swallow_non_validation_value_error(monkeypatch):
+    request = StrictRequest(messages=[StrictMessage(role="user", content="question")])
+    failure = ValueError("request adapter failed outside pydantic validation")
+
+    def validate(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(StrictRequest, "model_validate", validate)
+
+    async def render(value):
+        return [1]
+
+    with pytest.raises(ValueError) as caught:
+        asyncio.run(
+            chat_response_prefixes(
+                Tokenizer(),
+                request,
+                [1],
+                [({"role": "assistant", "content": "answer"}, [2], True)],
+                render,
+            )
+        )
+    assert caught.value is failure
