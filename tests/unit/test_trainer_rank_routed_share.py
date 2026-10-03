@@ -356,11 +356,11 @@ def test_loads_and_snapshots_must_agree_on_their_target(tmp_path: Path, peer):
     gather = _checkpoint._gather
 
     # Gathered tuples: a load's (digest, name, epoch, counter), a snapshot's
-    # (source, destination, config, revision, source epoch, exists) and a
-    # discard's (name, loaded, snapshot, epoch, active).
+    # (source, destination, config, generation, revision, source epoch,
+    # exists) and a discard's (name, loaded, snapshot, epoch, active).
     fields = {
-        "name": {4: 1, 6: 1, 5: 0},
-        "epoch": {4: 2, 6: 4, 5: 3},
+        "name": {4: 1, 7: 1, 5: 0},
+        "epoch": {4: 2, 7: 5, 5: 3},
         "counter": {4: 3},
     }[peer]
 

@@ -2,7 +2,7 @@ from copy import deepcopy
 from typing import Any
 
 import pytest
-from test_recorded_boundaries import _boundary_render
+from test_recorded_boundaries import _boundary_render, _recorded_boundaries
 from test_tokenize import _character_template_history
 
 from art.trajectories import _tokenize as module
@@ -33,13 +33,7 @@ def test_boundary_callback_source_change_cannot_reach_assembly_or_fallback(
 
     monkeypatch.setattr(tokenizer, "decode", mutate)
     with pytest.raises(RuntimeError if outcome == "fatal" else ValueError) as caught:
-        module._tokenize_recorded_chat_boundaries(
-            history,
-            [dict(message) for message in history.messages],
-            tokenizer=tokenizer,
-            render=_boundary_render(tokenizer),
-            _trace=None,
-        )
+        _recorded_boundaries(history, tokenizer, _boundary_render(tokenizer))
     if outcome == "fatal":
         assert caught.value is failure
     else:
@@ -131,16 +125,7 @@ def test_unprovable_boundary_context_declines_before_any_callback(context_kind):
     def forbidden(*args, **kwargs):
         pytest.fail("an unproved boundary must decline before rendering")
 
-    assert (
-        module._tokenize_recorded_chat_boundaries(
-            history,
-            [dict(message) for message in history.messages],
-            tokenizer=tokenizer,
-            render=forbidden,
-            _trace=None,
-        )
-        is None
-    )
+    assert _recorded_boundaries(history, tokenizer, forbidden) is None
     assert not equality_calls
     if isinstance(context, list):
         context.clear()
@@ -187,13 +172,7 @@ def test_boundary_guard_tracks_consumed_stop_evidence(monkeypatch, behavior):
 
     monkeypatch.setattr(ProjectedToolTokenizer, "__call__", observed)
     try:
-        value = module._tokenize_recorded_chat_boundaries(
-            history,
-            [dict(message) for message in history.messages],
-            tokenizer=tokenizer,
-            render=render,
-            _trace=None,
-        )
+        value = _recorded_boundaries(history, tokenizer, render)
     except RuntimeError as error:
         assert behavior == "fatal" and error is fatal
     except ValueError as error:

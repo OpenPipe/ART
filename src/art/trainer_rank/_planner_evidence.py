@@ -226,7 +226,7 @@ def validate(decision: Any, failed: Any) -> None:
             }
             or not isinstance(decision["attempt_id"], str)
             or re.fullmatch("[0-9a-f]{32}", decision["attempt_id"]) is None
-            or decision["operation"] not in {"forward_micro_batches", "dp_rank_forward"}
+            or decision["operation"] not in {"forward_batches", "forward"}
             or decision["reduction_scope"] not in {"world", "tp_cp_or_local"}
             or decision["outcome"]
             not in {"admitted", "admitted_oversized", "refused", "planning_error"}

@@ -4,7 +4,6 @@ from dataclasses import replace
 import hashlib
 import json
 import threading
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,6 +13,7 @@ from art.trainer_rank import TrainerRank
 from art.trainer_rank._impl import (
     _FlatForwardPlan,
     _ForwardGroupPlan,
+    _MemoryCheck,
     _MemorySignature,
     _SplitForwardPlan,
 )
@@ -258,9 +258,7 @@ def test_snapshot_and_event_reuse_hashes_without_tensor_readback(
     rank._layout_cache_lock = threading.Lock()
     rank._planning_seconds_accum = 0.0
     rank._speculative_planning_seconds = 0.0
-    rank._snapshot_planning_telemetry(
-        selected, SimpleNamespace(estimated_required_bytes=0, available_bytes=0)
-    )
+    rank._snapshot_planning_telemetry(selected, _MemoryCheck(0, 0, True))
     for key, value in expected.items():
         assert (
             rank.last_forward_telemetry()[key]

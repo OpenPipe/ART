@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import hashlib
@@ -24,6 +25,8 @@ import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
+    from safetensors import safe_open
+
     from art.megatron.lora import LoRA, LoraShardMeta, LoRASlotRef
     from art.trainer_rank._impl import (
         TrainerRank,
@@ -145,6 +148,7 @@ class _SnapshotSpill:
             ]
         ] = deque()
         self.thread: threading.Thread | None = None
+        self.workspace: dict[Future[tuple[_LocalShard, ...] | None], int] = {}
 
     def submit(
         self,
@@ -154,16 +158,48 @@ class _SnapshotSpill:
     ) -> Future[tuple[_LocalShard, ...] | None]:
         result: Future[tuple[_LocalShard, ...] | None] = Future()
         with self.lock:
+            workspace = max(
+                (
+                    sum(
+                        value.numel()
+                        * value.element_size()
+                        * (1 if value.is_contiguous() else 2)
+                        for value in tensors.values()
+                    )
+                    for tensors in payloads.values()
+                ),
+                default=0,
+            )
+            # Physical LoRA copies are not expanded into payload files yet.
+            # Bound packing/serialization plus deferred per-expert step scalars.
+            self.workspace[result] = max(
+                workspace,
+                2
+                * sum(
+                    sum(
+                        value.numel() * value.element_size()
+                        for value in item.tensors.values()
+                    )
+                    + (
+                        0
+                        if item.step is None
+                        else (1 if item.expert_ids is None else len(item.expert_ids))
+                        * (torch.finfo(torch.get_default_dtype()).bits // 8)
+                    )
+                    for item in captured
+                ),
+            )
             self.pending.append((snapshot, payloads, captured, result))
             if self.thread is None:
-                self.thread = threading.Thread(
-                    target=self._run, name="checkpoint-snapshot"
-                )
                 try:
+                    self.thread = threading.Thread(
+                        target=self._run, name="checkpoint-snapshot"
+                    )
                     self.thread.start()
                 except BaseException:
                     self.thread = None
                     self.pending.pop()
+                    self.workspace.pop(result)
                     raise
         return result
 
@@ -211,6 +247,8 @@ class _SnapshotSpill:
             finally:
                 payloads.clear()
                 tensors = None
+                with self.lock:
+                    self.workspace.pop(result)
                 captured = ()
             if error is None:
                 result.set_result(shards)
@@ -1007,6 +1045,87 @@ def _expand_local_state(
     return tuple(records)
 
 
+_CAPTURE_FRAME_CODES = (_local_state.__code__, _custom_snapshot.__code__)
+
+
+def _admit_snapshot(trainer: TrainerRank, name: str) -> None:
+    """Estimate registered copies without executing user serialization hooks.
+
+    Unregistered allocations, unusually large serialization metadata,
+    payload-expanding hooks and concurrent allocations are outside this estimate.
+    """
+    from ._impl import _custom_named_parameters
+
+    slot = trainer._checkpoint_slots[name]
+    custom_params = {
+        id(param)
+        for key, custom in slot.custom.items()
+        for _, param in _custom_named_parameters(key, custom)
+    }
+    tensors: list[torch.Tensor] = [
+        param for param in slot.params if id(param) not in custom_params
+    ]
+    buffers: list[torch.Tensor] = []
+    for custom in slot.custom.values():
+        if custom.kind == "module":
+            for _, child in cast(torch.nn.Module, custom.value).named_modules(
+                remove_duplicate=False
+            ):
+                tensors.extend(p for p in child._parameters.values() if p is not None)
+                buffers.extend(
+                    value
+                    for key, value in child._buffers.items()
+                    if value is not None
+                    and key not in child._non_persistent_buffers_set
+                )
+        else:
+            (buffers if custom.kind == "buffer" else tensors).append(
+                cast(torch.Tensor, custom.value)
+            )
+    tensors.extend(buffers)
+    cached = slot.custom_payload
+    if cached is not None:
+        tensors.extend(cached.tensors.values())
+        tensors.extend(cached.optimizer.values())
+    size = sum(value.numel() * value.element_size() for value in tensors)
+    if slot.optimizer is not None:
+        step_bytes = torch.finfo(torch.get_default_dtype()).bits // 8
+        # Three FP32 optimizer components and at most one step per expert element.
+        size += sum(
+            3 * master.numel() * max(4, master.element_size())
+            + max(1, master.numel()) * step_bytes
+            for master in slot.optimizer.master_params
+        )
+        if cached is not None:
+            size += sum(
+                12 * cached.tensors[key].numel() + step_bytes
+                for record in cached.records.values()
+                for key in record["trainable_keys"]
+                if f"master/{key}" not in cached.optimizer
+            )
+    # Capture may overlap source copies/zeros and an older writer. Writing holds
+    # captured tensors, contiguous packing, and one file's serialized byte strings.
+    # Fresh headroom already excludes resident captures; do not charge them again.
+    workspace = 0
+    spill = getattr(trainer, "_checkpoint_snapshot_spill", None)
+    if spill is not None:
+        with spill.lock:
+            workspace = max(spill.workspace.values(), default=0)
+    required = max(2 * size + workspace, 3 * size)
+    if buffers and _distributed():
+        # Buffer sync clones logical contents before pickling: no backing views.
+        # Allow one page per tensor for ordinary pickle metadata, the padded
+        # all-gather output, input, and cloning/serialization/deserialization copies.
+        sync = sum(value.numel() * value.element_size() + 4096 for value in buffers)
+        required = max(required, (dist.get_world_size() + 6) * sync + workspace)
+    available = trainer._available_cpu_memory_bytes()
+    if required > available:
+        raise RuntimeError(
+            f"Cannot capture checkpoint: estimated host memory needs {required} additional "
+            f"bytes, {available} available; finish pending saves and retry"
+        )
+
+
 def prepare_checkpoint_save(
     trainer: TrainerRank, output_dir: str, checkpoint_name: str
 ) -> None:
@@ -1037,6 +1156,14 @@ def prepare_checkpoint_save(
                 raise trainer._slot_state_error(
                     f"Unknown checkpoint on at least one rank: {checkpoint_name!r}"
                 )
+            from ._heads import synchronize_head_buffers
+
+            _phase(
+                lambda: _admit_snapshot(trainer, checkpoint_name),
+                "admit checkpoint host memory",
+                group,
+            )
+            synchronize_head_buffers(trainer, (checkpoint_name,))
             config = deepcopy(_validate_save_state(trainer, checkpoint_name))
             if any(value != config for value in _gather(config, group)):
                 raise trainer._slot_state_error(
@@ -1077,6 +1204,14 @@ def prepare_checkpoint_save(
             )
         except BaseException as exc:
             error = exc
+            # Only our completed capture frames own these partial snapshots;
+            # preserve active callers and foreign copy/hook traceback locals.
+            capture_tb = exc.__traceback__
+            while capture_tb is not None:
+                frame_code = capture_tb.tb_frame.f_code
+                if any(frame_code is code for code in _CAPTURE_FRAME_CODES):
+                    capture_tb.tb_frame.clear()
+                capture_tb = capture_tb.tb_next
         try:
             raise_distributed(error, "prepare checkpoint", group)
             if any(value != optimizer for value in _gather(optimizer, group)):
@@ -1144,20 +1279,82 @@ def prepare_checkpoint_save(
             trainer._prepared_checkpoint_saves[output_dir] = prepared
             trainer._finalized_checkpoint_saves.pop(output_dir, None)
             trainer._checkpoint_preparing_saves.discard(output_dir)
-            trainer._checkpoint_save_condition.notify_all()
+
+
+@dataclass
+class _SnapshotBlock:
+    opened: ExitStack
+    payloads: dict[str, tuple[safe_open, list[str], set[str]]] = field(
+        default_factory=dict
+    )
+    shards: dict[str, list[_LocalShard]] | None = None
+
+
+@contextmanager
+def _snapshot_block(group: dist.ProcessGroup | None) -> Iterator[_SnapshotBlock]:
+    opened = ExitStack()
+    primary: BaseException | None = None
+    try:
+        yield _SnapshotBlock(opened)
+    except BaseException as exc:
+        primary = exc
+        raise
+    finally:
+        error: BaseException | None = None
+        try:
+            opened.close()
+        except BaseException as exc:
+            error = exc
+        if primary is None:
+            raise_distributed(error, "close checkpoint snapshot block", group)
+        elif error is not None:
+            # A peer may still be in the block body (including point-to-point
+            # I/O). Do not start a new collective before local abort cleanup.
+            primary.add_note(f"Checkpoint snapshot close also failed: {error!r}")
 
 
 def _read_snapshot(
-    prepared: _PreparedSave, relative: str, prefix: str, keys: Iterable[str]
+    prepared: _PreparedSave,
+    relative: str,
+    prefix: str,
+    keys: Iterable[str] | None = None,
+    *,
+    snapshot: _SnapshotBlock | None = None,
 ) -> dict[str, torch.Tensor]:
-    load = importlib.import_module("safetensors.torch").load_file
-    payload = load(prepared.snapshot / relative)
-    return {key: payload[f"{prefix}/{key}"] for key in keys}
+    safe_open = importlib.import_module("safetensors").safe_open
+    with ExitStack() as opened:
+        if snapshot is None:
+            snapshot = _SnapshotBlock(opened)
+        if relative not in snapshot.payloads:
+            payload = snapshot.opened.enter_context(
+                safe_open(prepared.snapshot / relative, framework="pt", device="cpu")
+            )
+            names = (getattr(payload, "offset_keys", None) or payload.keys)()
+            snapshot.payloads[relative] = payload, names, set(names)
+        payload, names, available = snapshot.payloads[relative]
+        if keys is None:
+            keys = [
+                key.removeprefix(f"{prefix}/")
+                for key in names
+                if key.startswith(f"{prefix}/")
+            ]
+        tensors = {}
+        for key in keys:
+            name = f"{prefix}/{key}"
+            if name not in available:
+                raise KeyError(name)
+            tensors[key] = payload.get_tensor(name)
+        return tensors
 
 
 def _matching_shards(
-    prepared: _PreparedSave, metadata: Sequence[LoraShardMeta]
+    prepared: _PreparedSave,
+    metadata: Sequence[LoraShardMeta],
+    *,
+    snapshot: _SnapshotBlock | None = None,
 ) -> dict[str, list[_LocalShard]]:
+    if snapshot is not None and snapshot.shards is not None:
+        return snapshot.shards
     by_key: dict[str, list[LoraShardMeta]] = {}
     for item in metadata:
         by_key.setdefault(item.key, []).append(item)
@@ -1165,6 +1362,8 @@ def _matching_shards(
     for record in prepared.shards:
         if record.metadata in by_key.get(record.metadata.key, ()):
             matched.setdefault(record.metadata.key, []).append(record)
+    if snapshot is not None:
+        snapshot.shards = matched
     return matched
 
 
@@ -1173,6 +1372,8 @@ def _merge_component(
     metadata: Sequence[LoraShardMeta],
     component: str,
     group: dist.ProcessGroup | None,
+    *,
+    snapshot: _SnapshotBlock | None = None,
 ) -> dict[str, torch.Tensor]:
     from art.megatron.weights.lora_publish import merge_sharded_adapter_entries
 
@@ -1181,7 +1382,7 @@ def _merge_component(
     error: BaseException | None = None
     try:
         if owned:
-            shards = _matching_shards(prepared, owned)
+            shards = _matching_shards(prepared, owned, snapshot=snapshot)
             files = {record.file for records in shards.values() for record in records}
             for relative in files:
                 keys = [
@@ -1194,7 +1395,11 @@ def _merge_component(
                     )
                     == relative
                 ]
-                local.update(_read_snapshot(prepared, relative, component, keys))
+                local.update(
+                    _read_snapshot(
+                        prepared, relative, component, keys, snapshot=snapshot
+                    )
+                )
     except BaseException as exc:
         error = exc
     raise_distributed(error, f"read checkpoint {component} block", group)
@@ -1278,13 +1483,7 @@ def _rank_zero_phase(
     phase: str,
     group: dist.ProcessGroup | None,
 ) -> None:
-    error: BaseException | None = None
-    if _rank() == 0:
-        try:
-            action()
-        except BaseException as exc:
-            error = exc
-    raise_distributed(error, phase, group)
+    _phase(action if _rank() == 0 else lambda: None, phase, group)
 
 
 def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
@@ -1327,68 +1526,76 @@ def _finish(trainer: TrainerRank, prepared: _PreparedSave) -> None:
     lora_shards: list[Path] = []
     try:
         for index, block in enumerate(blocks):
-            block_metadata = [item for item in selected if item.block == block]
-            lora = _merge_component(prepared, block_metadata, "lora", group)
-            relative = f".adapter-{index:06d}.safetensors"
-            _rank_zero_phase(
-                lambda: importlib.import_module("safetensors.torch").save_file(
-                    lora, temporary / relative
-                ),
-                "write checkpoint adapter block",
-                group,
-            )
-            if _rank() == 0:
-                lora_shards.append(temporary / relative)
-            if prepared.optimizer is None:
-                continue
-            files: list[str] = []
-            for component in ("master", "exp_avg", "exp_avg_sq"):
-                tensors = _merge_component(prepared, block_metadata, component, group)
-                relative = f"optimizer/{component}-{index:06d}.safetensors"
-
-                def write_optimizer_block() -> None:
-                    (temporary / "optimizer").mkdir(exist_ok=True)
-                    importlib.import_module("safetensors.torch").save_file(
-                        tensors, temporary / relative
-                    )
-
+            with _snapshot_block(group) as snapshot:
+                block_metadata = [item for item in selected if item.block == block]
+                lora = _merge_component(
+                    prepared, block_metadata, "lora", group, snapshot=snapshot
+                )
+                relative = f".adapter-{index:06d}.safetensors"
                 _rank_zero_phase(
-                    write_optimizer_block, "write checkpoint optimizer block", group
+                    lambda: importlib.import_module("safetensors.torch").save_file(
+                        lora, temporary / relative
+                    ),
+                    "write checkpoint adapter block",
+                    group,
                 )
-                files.append(relative)
-            if _rank() == 0:
-                for key in (item.key for item in block_metadata):
-                    parameters[key] = list(files)
-            owned = [item for item in block_metadata if item.owner_rank == _rank()]
-            local_steps: dict[str, float] = {}
-            error: BaseException | None = None
-            try:
-                for relative in {
-                    record.file
-                    for records in _matching_shards(prepared, owned).values()
-                    for record in records
-                }:
-                    load = importlib.import_module("safetensors.torch").load_file
-                    payload = load(prepared.snapshot / relative)
-                    local_steps.update(
-                        (key.removeprefix("step/"), float(value.item()))
-                        for key, value in payload.items()
-                        if key.startswith("step/")
+                if _rank() == 0:
+                    lora_shards.append(temporary / relative)
+                if prepared.optimizer is None:
+                    continue
+                files: list[str] = []
+                for component in ("master", "exp_avg", "exp_avg_sq"):
+                    tensors = _merge_component(
+                        prepared, block_metadata, component, group, snapshot=snapshot
                     )
-            except BaseException as exc:
-                error = exc
-            raise_distributed(error, "read checkpoint optimizer steps", group)
-            step_values: dict[str, set[float]] = {}
-            for values in _gather(local_steps, group):
-                for key, value in values.items():
-                    step_values.setdefault(key, set()).add(value)
-            if mismatched := {
-                key: values for key, values in step_values.items() if len(values) != 1
-            }:
-                raise trainer._slot_state_error(
-                    f"Optimizer shard steps differ: {mismatched}"
-                )
-            steps.update((key, values.pop()) for key, values in step_values.items())
+                    relative = f"optimizer/{component}-{index:06d}.safetensors"
+
+                    def write_optimizer_block() -> None:
+                        (temporary / "optimizer").mkdir(exist_ok=True)
+                        importlib.import_module("safetensors.torch").save_file(
+                            tensors, temporary / relative
+                        )
+
+                    _rank_zero_phase(
+                        write_optimizer_block, "write checkpoint optimizer block", group
+                    )
+                    files.append(relative)
+                if _rank() == 0:
+                    for key in (item.key for item in block_metadata):
+                        parameters[key] = list(files)
+                owned = [item for item in block_metadata if item.owner_rank == _rank()]
+                local_steps: dict[str, float] = {}
+                error: BaseException | None = None
+                try:
+                    for relative in {
+                        record.file
+                        for records in _matching_shards(
+                            prepared, owned, snapshot=snapshot
+                        ).values()
+                        for record in records
+                    }:
+                        local_steps.update(
+                            (key, float(value.item()))
+                            for key, value in _read_snapshot(
+                                prepared, relative, "step", snapshot=snapshot
+                            ).items()
+                        )
+                except BaseException as exc:
+                    error = exc
+                raise_distributed(error, "read checkpoint optimizer steps", group)
+                step_values: dict[str, set[float]] = {}
+                for values in _gather(local_steps, group):
+                    for key, value in values.items():
+                        step_values.setdefault(key, set()).add(value)
+                if mismatched := {
+                    key: values
+                    for key, values in step_values.items()
+                    if len(values) != 1
+                }:
+                    raise trainer._slot_state_error(
+                        f"Optimizer shard steps differ: {mismatched}"
+                    )
+                steps.update((key, values.pop()) for key, values in step_values.items())
 
         def commit() -> None:
             safe_open = importlib.import_module("safetensors").safe_open
@@ -1478,7 +1685,6 @@ def _advance_save_queue(trainer: TrainerRank, sequence: int) -> None:
         while trainer._checkpoint_save_next in trainer._checkpoint_save_skipped:
             trainer._checkpoint_save_skipped.remove(trainer._checkpoint_save_next)
             trainer._checkpoint_save_next += 1
-        trainer._checkpoint_save_condition.notify_all()
 
 
 def _cleanup_paths(paths: Iterable[Path]) -> BaseException | None:
@@ -1491,38 +1697,6 @@ def _cleanup_paths(paths: Iterable[Path]) -> BaseException | None:
         except BaseException as exc:
             errors.append(exc)
     return BaseExceptionGroup("checkpoint cleanup failed", errors) if errors else None
-
-
-def _claim_finalization(
-    trainer: TrainerRank,
-    output_dir: str,
-    action: Literal["finish", "abort"],
-) -> _PreparedSave | None:
-    with trainer._checkpoint_save_condition:
-        while True:
-            prepared = trainer._prepared_checkpoint_saves.get(output_dir)
-            if prepared is None:
-                if output_dir in trainer._finalized_checkpoint_saves:
-                    return None
-                if action == "abort":
-                    return None
-                raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
-            outcome = trainer._checkpoint_save_outcomes.get(output_dir)
-            if outcome is not None and outcome != action:
-                raise RuntimeError(
-                    f"Checkpoint save was already {outcome}ed: {output_dir}"
-                )
-            if output_dir in trainer._checkpoint_finalizing_saves:
-                trainer._checkpoint_save_condition.wait()
-                continue
-            if outcome is None and prepared.sequence != trainer._checkpoint_save_next:
-                raise RuntimeError(
-                    "Checkpoint saves must be finalized in preparation order: "
-                    f"expected sequence {trainer._checkpoint_save_next}, got "
-                    f"{prepared.sequence}"
-                )
-            trainer._checkpoint_finalizing_saves[output_dir] = action
-            return prepared
 
 
 def _finalize_checkpoint_save(
@@ -1560,18 +1734,26 @@ def _finalize_checkpoint_save(
                 return
             raise RuntimeError(f"Checkpoint save was not prepared: {output_dir}")
         finalized_ranks = _gather(finalized is not None, group)
+        # Abort may finish cleanup without rolling back a committed save.
+        if outcome not in (None, action, "finish"):
+            raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
         if all(finalized_ranks):
             if outcome == "finish" or action == "abort":
                 return
             raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
-        if outcome is not None and outcome != action:
-            raise RuntimeError(f"Checkpoint save was already {outcome}ed: {output_dir}")
-        prepared = (
-            _claim_finalization(trainer, output_dir, action)
-            if finalized is None
-            else None
-        )
+        prepared = local if finalized is None else None
         assert prepared is not None or finalized is not None
+        if prepared is not None:
+            with trainer._checkpoint_save_condition:
+                if (
+                    outcome is None
+                    and prepared.sequence != trainer._checkpoint_save_next
+                ):
+                    raise RuntimeError(
+                        "Checkpoint saves must be finalized in preparation order: "
+                        f"expected sequence {trainer._checkpoint_save_next}, got "
+                        f"{prepared.sequence}"
+                    )
         error: BaseException | None = None
         cleanup_failed = True
         try:
@@ -1662,7 +1844,6 @@ def _finalize_checkpoint_save(
                 )
         finally:
             with trainer._checkpoint_save_condition:
-                trainer._checkpoint_finalizing_saves.pop(output_dir, None)
                 if not cleanup_failed:
                     trainer._prepared_checkpoint_saves.pop(output_dir, None)
                     trainer._checkpoint_save_outcomes.pop(output_dir, None)
@@ -1670,7 +1851,6 @@ def _finalize_checkpoint_save(
                     trainer._finalized_checkpoint_saves[output_dir] = _FinalizedSave(
                         sequence, outcome
                     )
-                trainer._checkpoint_save_condition.notify_all()
 
 
 def finish_checkpoint_save(trainer: TrainerRank, output_dir: str) -> None:
@@ -1701,12 +1881,6 @@ def _load_adapter(
         return {key: handle.get_tensor(key) for key in keys if key in available}
 
 
-def _localized(
-    module: LoRA, tensor: torch.Tensor, parameter: torch.nn.Parameter
-) -> torch.Tensor:
-    return module._localized_weight(tensor, into=parameter).contiguous()
-
-
 def _slot_snapshot(trainer: TrainerRank) -> _SlotSnapshot:
     return tuple(
         (
@@ -1716,7 +1890,7 @@ def _slot_snapshot(trainer: TrainerRank) -> _SlotSnapshot:
             {key: getattr(slot, "ref") for key, slot in module._slot_modules.items()},
         )
         for chunk in trainer.runtime.model
-        for module in chunk.modules()
+        for module in cast("Iterable[LoRA]", chunk.modules())
         if hasattr(module, "_slot_keys") and hasattr(module, "_slot_modules")
     )
 
@@ -1738,6 +1912,22 @@ def _forward_custom_payload(
     for record in payload.records.values():
         record["trainable_keys"] = []
     return PreparedCustomPayload(payload.records, payload.tensors, {})
+
+
+def _reserve_generation(trainer: TrainerRank, group: dist.ProcessGroup | None) -> int:
+    state = trainer._version_state()
+    generation = (
+        max(
+            (
+                state.generation,
+                *(slot.generation for slot in trainer._checkpoint_slots.values()),
+            )
+        )
+        + 1
+    )
+    # Keep the high-water mark even if creation rolls back or a snapshot is discarded.
+    state.generation = max(_gather(generation, group))
+    return state.generation
 
 
 def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> bool:
@@ -1774,6 +1964,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
         source,
         destination,
         dict(source_slot.config),
+        source_slot.generation,
         source_slot.revision,
         source_slot.route_epoch,
         destination_slot is not None,
@@ -1789,6 +1980,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
     destination_ref = trainer._slot_ref(destination)
     custom: dict[str, _CustomObject] = {}
     trackers: list[_CustomTensorTracker] = []
+    generation = _reserve_generation(trainer, group)
     try:
         for chunk in trainer.runtime.model:
             for module in chunk.modules():
@@ -1829,6 +2021,7 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
             custom=custom,
             custom_payload=_forward_custom_payload(source_slot.custom_payload),
             snapshot=True,
+            generation=generation,
         )
         for tracker in trackers:
             tracker.active = True
@@ -1969,7 +2162,9 @@ def _optimizer_state(
                 for key, record in zip(keys, records, strict=True)
             }
             full = module._adapter_weight(tensors, suffix=suffix)
-            components[component].append(_localized(module, full, parameter))
+            components[component].append(
+                module._localized_weight(full, into=parameter).contiguous()
+            )
         key_steps = {source.manifest["steps"][key] for key in keys}
         if len(key_steps) != 1:
             raise RuntimeError(f"Optimizer steps differ for {keys}")
@@ -2022,27 +2217,6 @@ def _validate_base_model(
         raise trainer._slot_state_error(
             f"Checkpoint base model {configured!r} is incompatible with this runtime"
         )
-
-
-def _rollback_load(
-    trainer: TrainerRank,
-    snapshot: _SlotSnapshot,
-    temporary: str,
-    name: str,
-    previous: object,
-    group: dist.ProcessGroup | None,
-) -> None:
-    def rollback() -> None:
-        _restore_slots(snapshot)
-        trainer._checkpoint_slots.pop(temporary, None)
-        if previous is None:
-            trainer._checkpoint_slots.pop(name, None)
-        else:
-            from art.trainer_rank._impl import _CheckpointSlot
-
-            trainer._checkpoint_slots[name] = cast(_CheckpointSlot, previous)
-
-    _phase(rollback, "roll back checkpoint load", group)
 
 
 def load_checkpoint(
@@ -2115,6 +2289,7 @@ def load_checkpoint(
     temporary = f"__art_loading_{uuid.uuid4().hex}"
     snapshot = _slot_snapshot(trainer)
     previous = trainer._checkpoint_slots.get(name)
+    generation = _reserve_generation(trainer, group)
     try:
         loaded = _phase(
             lambda: trainer._load_checkpoint_slot(
@@ -2133,26 +2308,26 @@ def load_checkpoint(
             "validate staged checkpoint",
             group,
         )
-        if forward_only:
-            for param in params:
-                param.requires_grad_(False)
-        from art.trainer_rank._impl import _CheckpointSlot
 
-        trainer._checkpoint_slots[temporary] = _CheckpointSlot(
-            params,
-            config,
-            custom_payload=(
-                _forward_custom_payload(source.custom)
-                if forward_only
-                else source.custom
-            ),
-            snapshot=forward_only,
-        )
-        _phase(
-            lambda: trainer._validate_loaded_checkpoint_config(temporary, config),
-            "validate loaded checkpoint config",
-            group,
-        )
+        def validate_loaded() -> None:
+            if forward_only:
+                for param in params:
+                    param.requires_grad_(False)
+            from art.trainer_rank._impl import _CheckpointSlot
+
+            trainer._checkpoint_slots[temporary] = _CheckpointSlot(
+                params,
+                config,
+                custom_payload=(
+                    _forward_custom_payload(source.custom)
+                    if forward_only
+                    else source.custom
+                ),
+                snapshot=forward_only,
+            )
+            trainer._validate_loaded_checkpoint_config(temporary, config)
+
+        _phase(validate_loaded, "validate loaded checkpoint config", group)
         if (
             not forward_only
             and source.manifest is not None
@@ -2174,12 +2349,24 @@ def load_checkpoint(
         def commit() -> None:
             _commit_slot(trainer, temporary, name)
             staged = trainer._checkpoint_slots.pop(temporary)
+            staged.generation = generation
+            # Reload invalidates old graphs, but publication ordering still uses
+            # this slot's revision independently of the graph generation.
             staged.revision = 0 if previous is None else previous.revision + 1
             trainer._checkpoint_slots[name] = staged
 
         _phase(commit, "commit checkpoint", group)
     except BaseException:
-        _rollback_load(trainer, snapshot, temporary, name, previous, group)
+
+        def rollback() -> None:
+            _restore_slots(snapshot)
+            trainer._checkpoint_slots.pop(temporary, None)
+            if previous is None:
+                trainer._checkpoint_slots.pop(name, None)
+            else:
+                trainer._checkpoint_slots[name] = previous
+
+        _phase(rollback, "roll back checkpoint load", group)
         raise
     trainer._commit_route_epoch(name, previous)
 

@@ -50,7 +50,7 @@ def prefix_tree_pack(
 ) -> PrefixTreePack:
     """Pack token sequences by storing prefix trees once.
 
-    This is the small packing step that lets `TrainerRank.dp_rank_forward()` run one
+    This is the small packing step that lets `TrainerRank.forward()` run one
     model pass over a compact prefix tree instead of replaying the same prompt
     tokens for every request. Think of each input sequence as a path through a
     tree: when several paths start with the same tokens, this function writes
