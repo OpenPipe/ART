@@ -673,7 +673,7 @@ def _search_next_micro_batch(
 
     estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
     plans: dict[int, _impl._FlatForwardPlan] = {}
-    checked_plans: dict[int, _MemoryCheck] = {}
+    checked_plans: dict[int, tuple[_impl._FlatForwardPlan, _MemoryCheck]] = {}
     # Per-width layout mode chosen by admission: False = cost-optimal,
     # True = memory-minimal (full sharing). Materialization must build the
     # same layouts the admitted estimate priced.
@@ -834,8 +834,10 @@ def _search_next_micro_batch(
                 check, trusted, profiled = price(plan)
         else:
             check, trusted, profiled = result
-        if width in plans:
-            checked_plans[width] = check
+        # Graph placement adds host and persistent GPU costs. Ordinary probes
+        # cannot become fallbacks until candidate() has priced their placement.
+        if width in plans and not self._graph_memory_policy_enabled():
+            checked_plans[width] = plans[width], check
         if not check.fits:
             rejected_widths.add(width)
         return check.fits and (trusted or not profiled), trusted
@@ -866,11 +868,13 @@ def _search_next_micro_batch(
                 plan, sync_across_dp=True, sync_planning_errors=True
             )
         )
-        if self._graph_memory_policy_enabled():
+        graph_memory = self._graph_memory_policy_enabled()
+        if graph_memory:
             plan, check = self._admit_graph_memory(plan, sync_across_dp=True)
-            if not check.fits and width > min_width:
-                rejected_widths.add(width)
-                return candidate(max(min_width, width // 2))
+        checked_plans[width] = plan, check
+        if graph_memory and not check.fits and width > min_width:
+            rejected_widths.add(width)
+            return candidate(max(min_width, width // 2))
         cold_start = not self._all_ranks_have_memory_profile(
             packed_tokens=plan.packed_tokens,
             signature=plan.signature,
@@ -884,11 +888,10 @@ def _search_next_micro_batch(
             rejected_candidates=len(rejected_widths),
             cold_start=cold_start,
         )
-        checked_plans[width] = check
         if getattr(self, "_allow_oversized_batches", False):
             smallest = min(
                 checked_plans,
-                key=lambda w: (checked_plans[w].estimated_required_bytes, w),
+                key=lambda w: (checked_plans[w][1].estimated_required_bytes, w),
             )
             if smallest != width:
                 fallback_indices, fallback_inputs = local_slice(smallest)
@@ -897,8 +900,8 @@ def _search_next_micro_batch(
                     fallback=_impl._CandidateMicroBatch(
                         inputs=fallback_inputs,
                         indices=fallback_indices,
-                        plan=plans[smallest],
-                        check=checked_plans[smallest],
+                        plan=checked_plans[smallest][0],
+                        check=checked_plans[smallest][1],
                         stats_global_count=smallest,
                         rejected_candidates=len(rejected_widths),
                         cold_start=True,
