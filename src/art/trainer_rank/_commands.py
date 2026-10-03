@@ -970,15 +970,28 @@ class _RankView:
                 )
                 for tensor, cpu in zip(output.packet.tensors, output.cpu, strict=True)
             )
-        available = (
-            self._rank._available_memory_bytes(reusable_cache=True)
-            if hasattr(self._rank, "_available_memory_bytes")
-            else 1 << 60
+        rank = self._rank
+        pending = (
+            sum(rank._pending_backward_memory())
+            if hasattr(rank, "_pending_backward_memory")
+            else 0
         )
-        if hasattr(self._rank, "_pending_backward_memory"):
-            available -= sum(self._rank._pending_backward_memory())
+        available = required_available = 1 << 60
+        if hasattr(rank, "_available_memory_bytes"):
+            available = rank._available_memory_bytes() - pending
+            # A required model copy would otherwise be refused, so it may also
+            # count reusable cache; optional placement keeps the physical budget.
+            required_available = (
+                rank._available_memory_bytes(reusable_cache=True) - pending
+                if any(device == "model" for _, device in costs)
+                else available
+            )
         placements = iter(
-            choose_output_placements(costs, gpu_available_bytes=available)
+            choose_output_placements(
+                costs,
+                gpu_available_bytes=available,
+                required_available_bytes=required_available,
+            )
         )
         result = []
         for output, _ in outputs:

@@ -24,22 +24,29 @@ def choose_output_placements(
     outputs: Sequence[tuple[int, Literal["auto", "model", "cpu"]]],
     *,
     gpu_available_bytes: int,
+    required_available_bytes: int | None = None,
 ) -> tuple[OutputDevice, ...]:
     """Place already gathered CPU outputs before making any model-device copy.
 
     The caller admits the CPU receive/serialization buffers before gathering.
     Fresh GPU headroom excludes live storage and pending restore/staging reserves.
-    Explicit model placement is reserved before optional model placement.
+    Explicit model placement is reserved before optional model placement, and
+    may be checked against a budget that also credits reusable cache.
     """
     if any(
         size < 0 or device not in ("auto", "model", "cpu") for size, device in outputs
     ):
         raise ValueError("Expected nonnegative output bytes and auto/model/cpu policy")
     required = sum(size for size, device in outputs if device == "model")
-    if required > max(0, gpu_available_bytes):
+    budget = (
+        gpu_available_bytes
+        if required_available_bytes is None
+        else required_available_bytes
+    )
+    if required > max(0, budget):
         raise MemoryError(
             f"Gathered model-device outputs require {required} GPU bytes; "
-            f"only {max(0, gpu_available_bytes)} bytes are available"
+            f"only {max(0, budget)} bytes are available"
         )
     remaining = max(0, gpu_available_bytes) - required
     placements: list[OutputDevice] = []

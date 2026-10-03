@@ -47,6 +47,24 @@ def test_logical_copy_preserves_pending_restore(rank, monkeypatch, policy):
         assert view._place_outputs([_output(policy=policy)])[0].cpu == (True,)
 
 
+def test_required_copy_reuses_cache_but_optional_keeps_physical_budget(
+    rank, monkeypatch
+):
+    _pending(rank, monkeypatch, SimpleNamespace(restore_workspace_bytes=100))
+    monkeypatch.setattr(
+        rank,
+        "_available_memory_bytes",
+        lambda reusable_cache=False: 300 if reusable_cache else 120,
+    )
+    view = _view(_Executor(rank, "zero"))
+    planned = view._place_outputs(
+        [_output(policy="model", handle="a"), _output(policy="auto", handle="b")]
+    )
+    assert [output.cpu for output in planned] == [(False,), (True,)]
+    with pytest.raises(MemoryError, match="only 200 bytes"):
+        view._place_outputs([_output(240, policy="model")])
+
+
 def test_logical_copy_reserves_distinct_checkpoints_and_standalone_heads(
     rank, monkeypatch
 ):
