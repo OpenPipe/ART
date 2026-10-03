@@ -335,22 +335,35 @@ def _group_head_workspace_bytes(
     positions: Sequence[torch.Tensor] | None = None,
     lower_bound: bool = False,
 ) -> int:
-    """One logits buffer, or logits + both dense target-backward gradients.
+    """Partial dense head component: eager statistics or logits copies.
 
-    The supported head path overlaps indexing and statistics gradients
-    with recomputed logits; cold library workspaces remain outside this
-    component. Pair each group's mode with its own projected rows.
+    Capacity reserves the eager path even when optional Triton may succeed.
+    Its BF16 logits, FP32 conversion, subtraction and exp overlap. This is
+    not a bound for row vectors, inter-chunk liveness or library workspaces.
+    Rejection lower bounds retain only the unconditional dense components.
     """
     dense = self._head_workspace_bytes(rows)
-    if (
-        not dense
-        or not grad_enabled
-        or not any(request.target_tokens is not None for request in requests)
+    needs_statistics = any(
+        request.target_tokens is not None or request.top_k is not None
+        for request in requests
+    )
+    if not dense or (
+        not needs_statistics and (lower_bound or not any(r.logits for r in requests))
     ):
         return dense
     if _head_target_backward(self):
+        if not lower_bound:
+            # need_log_z is group-wide, including logits-only chunks and
+            # chunks overlapping ignored labels. A short final chunk can
+            # also take the eager path; optional success is not guaranteed.
+            # Without statistics, local logits and both indexed copies
+            # overlap. Requested output storage is charged separately.
+            return (7 if needs_statistics else 3) * dense
+        if not grad_enabled or not any(
+            request.target_tokens is not None for request in requests
+        ):
+            return dense
         # IndexBackward's dense result overlaps saved logits and grad_logits.
-        # The FP32 fallback already exceeds this three-buffer component.
         target_dense = (
             self._head_workspace_bytes(
                 self._head_target_chunk_rows(
@@ -2161,6 +2174,32 @@ def _estimate_required_memory_bytes_from_values(
         # the traced width, not the per-packed-token floor, which a CP2
         # rank's rows stay well under (Qwen3.8-27B: +5.7% for one group).
         static_compute = max(rows for rows, _ in group_rows) * no_grad
+    no_grad_stage = 0
+    if (
+        not self._geometry.moe_experts
+        and self._geometry.ffn_hidden_size
+        and self._dense_fc1_adapted
+        and signature.topology[1:3] == (1, 1)
+    ):
+        # A dense no-grad layer peaks at its FC1 stage (the base GEMM output,
+        # the adapter output and their sum: 6F, or the SwiGLU live set if
+        # wider) beside the residual pair, embedding and norm output (4H), per
+        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. At CP1 every packed
+        # row is local, which the per-packed-token floor above prices at only
+        # 16H. Groups run one after another, so the largest no-grad group
+        # bounds it.
+        rows = max(
+            (n for n, grad in group_rows if not grad),
+            default=0 if signature.grad_enabled else packed_tokens,
+        )
+        no_grad_stage = (
+            rows
+            * self._param_dtype_size
+            * (
+                max(6, self._mlp_activation_factor) * self._geometry.ffn_hidden_size
+                + 4 * self._hidden_size
+            )
+        )
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry
         hidden = self._hidden_size
@@ -2267,7 +2306,13 @@ def _estimate_required_memory_bytes_from_values(
         peak += gradient
         if profiled is None and any(grad for _, grad in group_rows):
             peak += _impl._COLD_RECOMPUTE_TRANSIENT_BYTES
-    static_compute = max(static_compute, max(retained, checkpoint_floor[0]) + peak)
+    static_compute = max(
+        static_compute,
+        max(retained, checkpoint_floor[0]) + peak,
+        # A no-grad group's forward stage, beside any gradient groups'
+        # boundaries but not the backward's input gradient.
+        max(retained, checkpoint_floor[0]) + no_grad_stage,
+    )
     if signature.topology[2] > 1:
         # Local head results coexist with full CP outputs during gathering.
         # Uneven rank plans can assign all of an item's rows to one rank.

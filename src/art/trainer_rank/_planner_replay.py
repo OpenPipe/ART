@@ -317,6 +317,9 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 "moe_covered": group.grad_enabled
                 and rank._moe_recompute_covered_for(group.slot_ref),
                 "layout": layout,
+                "head_statistics": any(
+                    r.target_tokens is not None or r.top_k is not None for r in requests
+                ),
                 "gdn": None
                 if model is None
                 else {
@@ -456,6 +459,7 @@ def validate(facts: Any) -> None:
                 "adapter",
                 "moe_covered",
                 "layout",
+                "head_statistics",
                 "gdn",
             },
         )
@@ -463,6 +467,7 @@ def validate(facts: Any) -> None:
             integer(group[key])
         if (
             type(group["grad"]) is not bool
+            or type(group["head_statistics"]) is not bool
             or type(group["slot"]) is not str
             or len(group["slot"]) > 4096
         ):
@@ -776,6 +781,10 @@ class ReplayRank(_impl.TrainerRank):
         )
         if (projected, target_rows) != (group["head_rows"], group["head_target_rows"]):
             raise ValueError("head row facts disagree with selected requests/layout")
+        if group["head_statistics"] != any(
+            r.target_tokens is not None or r.top_k is not None for r in requests
+        ):
+            raise ValueError("head statistics facts disagree with selected requests")
 
     def _moe_workspace_bytes(
         self,
@@ -936,12 +945,13 @@ class ReplayRank(_impl.TrainerRank):
                 for g in groups
             )
         head = max(
-            max(
-                _memory._dense_head_bytes(facts["head_vocabulary"], g["head_rows"]),
-                3
-                * _memory._dense_head_bytes(
-                    facts["head_vocabulary"], g["head_target_rows"]
-                ),
+            _memory._dense_head_bytes(facts["head_vocabulary"], g["head_rows"])
+            * (
+                1
+                if not facts["head_target_backward"]
+                else 7
+                if g["head_statistics"]
+                else 3
             )
             for g in groups
         )

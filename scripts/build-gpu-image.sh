@@ -317,28 +317,36 @@ registry_auth_json_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-auth.XXXXXX")"
 build_command_path=""
 build_log_snapshot_path=""
 build_log_offset_path=""
+cleanup_root="${GPU_IMAGE_CLEANUP_ROOT:-$(mktemp -d "${TMPDIR:-/tmp}/art-image-cleanup.XXXXXX")}"
+mkdir -p "${cleanup_root}"
 cleanup_prewarm_pods() {
   local context
   local selector
+  local status=0
 
   selector="art.openpipe/prewarm-name=${prewarm_name},art.openpipe/prewarm-run=${prewarm_run_uid}"
   for context in "${prewarm_contexts[@]}"; do
-    kubectl --context "${context}" delete pod -n "${prewarm_namespace}" \
-      -l "${selector}" \
-      --ignore-not-found --wait=false --request-timeout=30s \
-      >/dev/null 2>&1 || true
+    python3 "${repo_root}/scripts/ci/gpu-image-cleanup.py" --context "${context}" \
+      --namespace "${prewarm_namespace}" --selector "${selector}" \
+      --receipt "${cleanup_root}/trap-prewarm-${context}.json" || status=1
   done
+  return "${status}"
 }
 cleanup() {
-  cleanup_prewarm_pods
+  local status=$? cleanup_status=0
+  trap - EXIT
+  cleanup_prewarm_pods || cleanup_status=1
   rm -f "${registry_auth_json_path}"
   if [[ -n "${context_dir}" ]]; then
     rm -rf "${context_dir}"
     rm -f "${buildkit_manifest_path}" "${build_command_path}" \
       "${build_log_snapshot_path}" "${build_log_offset_path}"
-    "${build_kubectl_cmd[@]}" delete pod -n "${buildkit_namespace}" "${cluster_name}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    python3 "${repo_root}/scripts/ci/gpu-image-cleanup.py" --context "${kube_context}" \
+      --namespace "${buildkit_namespace}" --selector "art.openpipe/build-run=${prewarm_run_uid}" \
+      --receipt "${cleanup_root}/trap-builder.json" || cleanup_status=1
   fi
+  if (( status == 0 )); then status=${cleanup_status}; fi
+  exit "${status}"
 }
 trap cleanup EXIT
 printf '%s' "${registry_auth_json_b64}" | base64 -d > "${registry_auth_json_path}"
@@ -379,6 +387,8 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: ${cluster_name}
+  labels:
+    art.openpipe/build-run: "${prewarm_run_uid}"
   annotations:
     container.apparmor.security.beta.kubernetes.io/buildkitd: unconfined
 spec:
@@ -406,9 +416,7 @@ spec:
       emptyDir: {}
 EOF
 
-"${kubectl_cmd[@]}" delete pod -n "${buildkit_namespace}" "${cluster_name}" \
-  --ignore-not-found --wait=true >/dev/null 2>&1 || true
-"${kubectl_cmd[@]}" apply -n "${buildkit_namespace}" -f "${buildkit_manifest_path}"
+"${kubectl_cmd[@]}" create -n "${buildkit_namespace}" -f "${buildkit_manifest_path}"
 "${kubectl_cmd[@]}" wait -n "${buildkit_namespace}" \
   --for=condition=Ready "pod/${cluster_name}" \
   --timeout="${buildkit_wait_timeout}"
