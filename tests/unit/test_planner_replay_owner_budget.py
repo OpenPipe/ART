@@ -47,7 +47,7 @@ def test_shared_inventory_preflight_precedes_layout_construction(
     elif case == "invalid_facts":
         report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
             "version"
-        ] += 1
+        ] = 2
         reason = "unsupported runtime facts version"
     else:
         monkeypatch.setattr(runtime, "_MAX_INPUT_VALUES", 10)

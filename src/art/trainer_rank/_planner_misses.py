@@ -643,7 +643,7 @@ class Reporter:
 _RANK_FIELDS = frozenset(
     "num_layers hidden_size param_dtype_size recompute_granularity "
     "one_layer_recompute sequence_parallel attention_output_gate "
-    "mlp_activation_factor gdn_layers "
+    "mlp_activation_factor dense_fc1_adapted gdn_layers "
     "checkpointed_moe_layers recompute_modules moe_output_bytes_per_token "
     "moe_forward_stages".split()
 )
@@ -710,7 +710,9 @@ def replay(
     state = payload["memory_replay"]
     if not state["estimates"]:
         raise ValueError("memory replay has no candidate estimates")
-    values = state["rank"]
+    # Reports from before the dense no-grad FC1 floor omit this fact; their
+    # estimator did not price that floor.
+    values: dict[str, Any] = {"dense_fc1_adapted": False, **state["rank"]}
     if set(values) != _RANK_FIELDS | {"geometry", "topology"}:
         raise ValueError(
             "incomplete replay: immutable rank fields differ (including MoE stages)"
@@ -718,6 +720,8 @@ def replay(
     layers = values["num_layers"]
     if type(layers) is not int or not 0 < layers <= _planner_replay.MAX_LAYERS:
         raise ValueError("incomplete replay: recorded layer count out of bounds")
+    if type(values["dense_fc1_adapted"]) is not bool:
+        raise ValueError("incomplete replay: recorded FC1 adapter fact is invalid")
     rank = _planner_replay.ReplayRank.__new__(_planner_replay.ReplayRank)
     for name in _RANK_FIELDS - {"one_layer_recompute"}:
         setattr(rank, "_" + name, values[name])

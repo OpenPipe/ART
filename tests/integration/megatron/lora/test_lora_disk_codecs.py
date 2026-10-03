@@ -1727,6 +1727,7 @@ def _named_lora_checkpoint(
         rank=0,
         world_size=1,
     )
+    trainer._default_slot_ref = None
     trainer._slot_stack = []
     trainer._pending_slot_graphs = {}
     trainer._checkpoint_slots = {}

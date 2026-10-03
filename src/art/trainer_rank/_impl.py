@@ -1309,6 +1309,27 @@ def _moe_layer_count(model: torch.nn.Module) -> int:
     return sum(isinstance(module, BaseMoELayer) for module in model.modules())
 
 
+def _dense_fc1_adapted(model: torch.nn.Module) -> bool:
+    """Whether every decoder layer's MLP FC1 is ART's gated LoRA wrapper, which
+    keeps a 2F adapter output and the sum beside the 2F base output, even for
+    inactive slots."""
+
+    try:
+        from art.megatron.lora import SharedExpertsLinearFC1LoRA
+
+        layers = _language_model(model).decoder.layers
+    except (AttributeError, ImportError, RuntimeError):
+        return False
+    fc1s = [
+        getattr(getattr(layer, "mlp", None), "linear_fc1", None) for layer in layers
+    ]
+    return len(fc1s) > 0 and all(
+        type(fc1) is SharedExpertsLinearFC1LoRA
+        and getattr(fc1, "non_gated", True) is False
+        for fc1 in fc1s
+    )
+
+
 def _expert_parallel_shape(provider: object) -> tuple[int, int]:
     """(EP, ETP) of the initialized runtime, else the provider's configuration."""
 
@@ -2070,6 +2091,7 @@ class TrainerRank:
         }
         spec = getattr(runtime, "model_support_spec", None)
         self._moe_layers = _moe_layer_count(runtime.model[0])
+        self._dense_fc1_adapted = _dense_fc1_adapted(runtime.model[0])
         self._checkpointed_moe_layers = sum(
             getattr(module, "moe_layer_recompute", False) is True
             for module in runtime.model[0].modules()
