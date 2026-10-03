@@ -1912,7 +1912,10 @@ def _gdn_segment_layer_bytes(self: TrainerRank) -> float:
 
 
 def _available_memory_bytes(
-    self: TrainerRank, sample: dict[str, Any] | None = None
+    self: TrainerRank,
+    sample: dict[str, Any] | None = None,
+    *,
+    reusable_cache: bool = False,
 ) -> int:
     if not (_impl.torch.cuda.is_available() and self.device.type == "cuda"):
         return 1 << 60
@@ -1922,14 +1925,26 @@ def _available_memory_bytes(
     if allocator == "native":
         # Cached bytes are not physical free memory. This sample does not
         # reserve memory for execution or the caller's later backward.
-        if sample is None:
+        if sample is None and not reusable_cache:
             allocated = int(_impl.torch.cuda.memory_allocated(self.device))
         else:
             # memory_allocated uses this same stats read. Retain its other
             # already-returned fields without another allocator query.
             stats = _impl.torch.cuda.memory_stats(self.device)
             allocated = int(stats.get("allocated_bytes.all.current", 0))
-        reusable_reserved = 0
+        # Small copies made between physical forwards, such as gathered
+        # outputs, reuse cached blocks; frees pending on other streams remain
+        # active and are not credited.
+        reserved = None if stats is None else stats.get("reserved_bytes.all.current")
+        active = None if stats is None else stats.get("active_bytes.all.current")
+        reusable_reserved = (
+            reserved - active
+            if reusable_cache
+            and type(reserved) is int
+            and type(active) is int
+            and 0 <= allocated <= active <= reserved
+            else 0
+        )
     else:
         # Preserve the previous, unqualified policy for other backends.
         allocated = int(_impl.torch.cuda.memory_allocated(self.device))

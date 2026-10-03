@@ -971,7 +971,7 @@ class _RankView:
                 for tensor, cpu in zip(output.packet.tensors, output.cpu, strict=True)
             )
         available = (
-            self._rank._available_memory_bytes()
+            self._rank._available_memory_bytes(reusable_cache=True)
             if hasattr(self._rank, "_available_memory_bytes")
             else 1 << 60
         )
