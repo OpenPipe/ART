@@ -100,6 +100,41 @@ def test_incomplete_native_counters_grant_no_cache_credit(budget, field, value):
     cast(Mock, torch.cuda.memory_allocated).assert_called_once_with(rank.device)
 
 
+@pytest.mark.parametrize(
+    ("free", "active", "expected"), [(100, 30, 120), (10, 30, 30), (100, 80, 70)]
+)
+def test_output_placement_credits_cache_less_pending_frees(
+    budget, monkeypatch, free, active, expected
+):
+    rank, stats = budget
+    stats["active_bytes.all.current"] = active
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (free, 1000))
+    assert rank._available_memory_bytes(reusable_cache=True) == expected
+    assert rank._available_memory_bytes() == max(0, free - 30)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("active", None),
+        ("reserved", None),
+        ("active", 9),
+        ("active", 81),
+        ("allocated", None),
+        ("allocated", True),
+        ("allocated", 10.5),
+    ],
+)
+def test_output_placement_cache_credit_needs_consistent_counters(budget, field, value):
+    rank, stats = budget
+    key = field + "_bytes.all.current"
+    if value is None:
+        stats.pop(key)
+    else:
+        stats[key] = value
+    assert rank._available_memory_bytes(reusable_cache=True) == 70
+
+
 @pytest.mark.parametrize("backend", ["cudaMallocAsync", "unrecognized"])
 def test_other_backends_retain_legacy_unqualified_credit(budget, monkeypatch, backend):
     rank, _ = budget

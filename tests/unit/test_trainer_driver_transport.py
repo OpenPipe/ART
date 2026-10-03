@@ -68,7 +68,7 @@ async def test_driver_cpu_exports_preserve_old_gradients_and_worker_policy(
         options=ForwardOptions(output_device="model"),
     )
     # Physical worker succeeds, but no aggregate GPU copy can be admitted.
-    rank._available_memory_bytes = lambda: 0
+    rank._available_memory_bytes = lambda **_: 0
     if device == "cuda":
         with pytest.raises(MemoryError, match="Gathered model-device outputs"):
             view.forward(request)
@@ -141,7 +141,7 @@ async def test_driver_cpu_exports_preserve_old_gradients_and_worker_policy(
     torch.testing.assert_close(head.grad, torch.tensor(648.0, device=device))
     assert not state.graphs
     setattr(view, "_attach", attach)
-    rank._available_memory_bytes = lambda: 1 << 60
+    rank._available_memory_bytes = lambda **_: 1 << 60
     native = view.forward(request)
     assert native.hidden_states.device == rank.device
     view.backward(native.hidden_states.sum())
