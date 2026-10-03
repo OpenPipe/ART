@@ -2008,7 +2008,12 @@ def _recover_admission_impl(
 
     def reject() -> Any:
         assert refused is not None
-        if admit_refusal is not None:
+        # EP peers may be outside the DP-local TP x CP group. Only the
+        # already WORLD-coordinated path can agree to bypass admission; a
+        # late WORLD collective here could deadlock asymmetric callers.
+        if admit_refusal is not None and (
+            sync_across_dp or not self._expert_parallel_active()
+        ):
             # Only the exhausted memory-refusal path changes. Every peer
             # must have a supported candidate; never override a failed
             # planning/runtime capability guard or host placement budget.

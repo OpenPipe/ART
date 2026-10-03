@@ -239,13 +239,10 @@ def test_ep_oversized_preserves_graph_host_budget(rank, monkeypatch, cpu_availab
         with pytest.raises(
             _impl.TrainerRankMemoryError, match="per-rank CPU headroom=0"
         ):
-            rank._plan_admissible_forward(
-                requests, checkpoint=_impl.Unset, context="test"
-            )
+            rank._select_next_micro_batch([requests], 0)
     else:
-        plan, check = rank._plan_admissible_forward(
-            requests, checkpoint=_impl.Unset, context="test"
-        )
+        candidate = rank._select_next_micro_batch([requests], 0)
+        plan, check = candidate.plan, candidate.check
         assert plan.request_count == 2 and plan.subforward_count == 1
         assert not check.fits and check.cpu_fits
         assert all(group.memory_placement is not None for group in plan.groups)
