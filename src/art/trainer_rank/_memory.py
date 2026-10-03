@@ -345,12 +345,36 @@ def _group_head_workspace_bytes(
     component. Pair each group's mode with its own projected rows.
     """
     dense = self._head_workspace_bytes(rows)
+    fallback = 0
+    if (
+        dense
+        and self._topology_key()[1] > 1
+        and any(
+            request.target_tokens is not None or request.top_k is not None
+            for request in requests
+        )
+    ):
+        # TP > 1 (priced with the explicit floor): each chunk's statistics
+        # run the Triton kernel, or where ``_try_triton_stats`` declines, the
+        # eager FP32 fallback (``_vocab_parallel_log_z``): BF16 logits, their
+        # FP32 copy, the shifted logits and their exponentials, about seven
+        # BF16 buffers. TP1 keeps its three-buffer charge (inherited).
+        chunk = _impl._HEAD_CHUNK_TOKENS
+        chunks = (min(rows, chunk), rows % chunk if rows > chunk else 0)
+        fallback = 7 * max(
+            (
+                self._head_workspace_bytes(rows)
+                for rows in chunks
+                if rows and not _impl._triton_head_stats(self.device, rows)
+            ),
+            default=0,
+        )
     if (
         not dense
         or not grad_enabled
         or not any(request.target_tokens is not None for request in requests)
     ):
-        return dense
+        return max(dense, fallback)
     if _head_target_backward(self):
         # IndexBackward's dense result overlaps saved logits and grad_logits.
         # The FP32 fallback already exceeds this three-buffer component.
@@ -363,8 +387,8 @@ def _group_head_workspace_bytes(
             if any(request.logits or request.top_k is not None for request in requests)
             else dense
         )
-        return max(dense, 3 * target_dense)
-    return dense
+        return max(dense, 3 * target_dense, fallback)
+    return max(dense, fallback)
 
 
 def _plan_head_workspace_bytes(self: TrainerRank, plan: _impl._FlatForwardPlan) -> int:
@@ -755,13 +779,10 @@ def _sequence_parallel_lora_floor(
     )
     modules = getattr(self, "_lora_modules_per_layer", None)
     if not modules:
-        # Unread (e.g. reports without the recorded count): per-layer mean + 1.
-        modules = (
-            -(
-                -max((len(shapes) for _, shapes in signature.slot_shapes), default=0)
-                // self._num_layers
-            )
-            + 1
+        # Unread (e.g. reports without the recorded count): every adapted
+        # module of the slot, which bounds any one layer's.
+        modules = max(
+            (len(shapes) for grad, shapes in signature.slot_shapes if grad), default=0
         )
     rows = max((rows for rows, grad in group_rows if grad), default=0)
     return retained, workspace + rows * modules * rank * self._param_dtype_size
@@ -1272,12 +1293,20 @@ def _memory_signature_from_requests(
 def _slot_memory_shapes(
     self: TrainerRank, ref: "LoRASlotRef | None"
 ) -> tuple[tuple[int, ...], ...]:
-    """Separate empirical trust across actual selected adapter layouts."""
+    """Separate empirical trust across actual selected adapter layouts.
+
+    Sequence-parallel (TP > 1) models record them too: the explicit TP x SP
+    checkpoint floor prices LoRA intermediates from these ranks.
+    """
     if (
         ref is None
         or ref.name is None
         or isinstance(ref, _impl._LocalLoRASlotRef)
-        or not (getattr(self, "_moe_layers", 0) or getattr(self, "_gdn_layers", 0))
+        or not (
+            getattr(self, "_moe_layers", 0)
+            or getattr(self, "_gdn_layers", 0)
+            or getattr(self, "_sequence_parallel", False)
+        )
     ):
         # Generic/no-component planning must not import Megatron or walk
         # model owners just to construct its existing memory signature.

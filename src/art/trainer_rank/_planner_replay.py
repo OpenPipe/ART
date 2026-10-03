@@ -37,6 +37,7 @@ _REFUSALS = frozenset(
         "runtime_token_inventory_over_limit",
         "runtime_segment_inventory_over_limit",
         "head_positions_unavailable",
+        "head_statistics_fallback_unsupported",
         "runtime_facts_over_limit",
         "runtime_stage_inventory_over_limit",
         "runtime_request_inventory_over_limit",
@@ -222,6 +223,24 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             if vocabulary
             else 0
         )
+        if (
+            projected
+            and rank._topology_key()[1] > 1
+            and any(
+                r.target_tokens is not None or r.top_k is not None for r in requests
+            )
+            and any(
+                rows and not _impl._triton_head_stats(rank.device, rows)
+                for rows in (
+                    min(projected, _impl._HEAD_CHUNK_TOKENS),
+                    projected % _impl._HEAD_CHUNK_TOKENS
+                    if projected > _impl._HEAD_CHUNK_TOKENS
+                    else 0,
+                )
+            )
+        ):
+            # The frozen head facts price only the three-buffer path.
+            raise ValueError("head_statistics_fallback_unsupported")
         backwards = (
             target_backward
             and group.grad_enabled

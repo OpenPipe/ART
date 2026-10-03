@@ -99,7 +99,15 @@ def signature(topology, rank=0, grad=True):
     return _MemorySignature(topology, (1, None), 1, (), grad, (grad,), shapes)
 
 
-def tp_rank(layers=LAYERS, *, ffn=F, topology=TP4, sequence_parallel=True, **config):
+def tp_rank(
+    layers=LAYERS,
+    *,
+    ffn=F,
+    topology=TP4,
+    sequence_parallel=True,
+    decoder_layers=None,
+    **config,
+):
     from megatron.core.transformer.transformer_block import TransformerBlock
 
     block = TransformerBlock.__new__(TransformerBlock)
@@ -122,13 +130,15 @@ def tp_rank(layers=LAYERS, *, ffn=F, topology=TP4, sequence_parallel=True, **con
         **config,
     )
     block.layers = torch.nn.ModuleList(
-        [torch.nn.Linear(1, 1).bfloat16() for _ in range(layers)]
+        decoder_layers or [torch.nn.Linear(1, 1).bfloat16() for _ in range(layers)]
     )
     block.num_layers_per_pipeline_rank = layers
     model: Any = torch.nn.Module()
     model.config = block.config
     model.decoder = block
     model._preprocess = lambda: None
+    if decoder_layers is not None:
+        model.embedding = torch.nn.Linear(1, 1).bfloat16()  # a BF16 parameter
     r: Any = TrainerRank(
         cast(
             Any,
@@ -156,12 +166,64 @@ def tp_rank(layers=LAYERS, *, ffn=F, topology=TP4, sequence_parallel=True, **con
     )
     r._attention_output_gate = True
     r._gdn_layers = layers * 3 // 4
-    # Layers 3, 7, ..., 63 are attention: the top GDN layer is one below.
-    r._mixer_top_gaps = (0, 1)
-    # Six adapted modules per GDN layer, seven per attention layer.
-    r._lora_modules_per_layer = 7
     r._topology_key = lambda: topology
+    if decoder_layers is None:
+        # Layers 3, 7, ..., 63 are attention: the top GDN layer is one below.
+        r._mixer_top_gaps = (0, 1)
+        # Six adapted modules per GDN layer, seven per attention layer.
+        r._lora_modules_per_layer = 7
     return r
+
+
+POLICY_RANK = 8192
+
+
+def adapted_layers(per_layer, *, rank=POLICY_RANK):
+    """Decoder layers of real LoRA modules holding a ``policy`` slot of ``rank``."""
+    from art.megatron.lora import LoRA, LoRASlotRef
+
+    ref = LoRASlotRef("checkpoint", "policy")
+
+    def module():
+        lora = LoRA.__new__(LoRA)
+        torch.nn.Module.__init__(lora)
+        lora._slot_keys = {ref: "policy"}
+        lora._slot_modules = {
+            "policy": SimpleNamespace(
+                A_T=torch.empty(H, rank, device="meta"),
+                B_T=torch.empty(rank, H, device="meta"),
+            )
+        }
+        return lora
+
+    return ref, [
+        torch.nn.ModuleList([module() for _ in range(count)]) for count in per_layer
+    ]
+
+
+def produced_signature(r, ref, rows):
+    """The memory signature the planner builds for one gradient request."""
+    from art.trainer_rank import ForwardInput
+
+    tokens = torch.zeros(rows, dtype=torch.long)
+    return r._memory_signature_from_requests(
+        [ForwardInput(input_tokens=tokens, target_tokens=tokens)],
+        slot_group_count=1,
+        grad_modes=(True,),
+        slot_groups=((ref, True),),
+    )
+
+
+def lora_workspace(r, ref, rows):
+    """The floor's workspace for one gradient group under ``ref``'s signature."""
+    return r._subforward_cost(
+        packed_tokens=rows,
+        output_bytes=rows * 4,
+        signature=produced_signature(r, ref, rows),
+        logical_tokens=rows,
+        gdn_segments=1,
+        group_rows=((rows, True),),
+    ).checkpoint_workspace
 
 
 def _required(
@@ -275,6 +337,36 @@ def test_lora_rank_moves_the_price_by_its_intermediates():
     assert high - low == rows * 7 * (8192 - 128) * 2
 
 
+def test_attention_only_slots_price_their_lora_intermediates():
+    """An attention-only TP2 model: ranks come from the real slot-shape and
+    module-count producers, not a hand-built signature."""
+    rows = 23_878
+    ref, layers = adapted_layers([7] * LAYERS)
+    r = tp_rank(topology=TP2, decoder_layers=layers)
+    r._gdn_layers = 0
+    assert r._mixer_top_gaps == (0, None)  # read from the decoder
+    assert r._lora_modules_per_layer == 7
+    shapes = produced_signature(r, ref, rows).slot_shapes
+    assert shapes == ((True, ((2, H, POLICY_RANK, POLICY_RANK, H),) * 7 * LAYERS),)
+    base = lora_workspace(r, None, rows)
+    # Seven modules' rows x 8,192 BF16 intermediates: 2,738,520,064 bytes.
+    assert lora_workspace(r, ref, rows) - base == rows * 7 * POLICY_RANK * 2
+
+
+def test_an_unknown_per_layer_count_charges_every_adapted_module():
+    """Seven modules concentrated in one of 64 layers: the mean (two) would
+    omit 1,956,085,760 bytes; a report without the count charges all seven."""
+    rows = 23_878
+    ref, layers = adapted_layers([7] + [0] * (LAYERS - 1))
+    r = tp_rank(topology=TP2, decoder_layers=layers)
+    r._mixer_top_gaps = (0, 1)
+    assert r._lora_modules_per_layer == 7
+    live = lora_workspace(r, ref, rows) - lora_workspace(r, None, rows)
+    assert live == rows * 7 * POLICY_RANK * 2
+    r._lora_modules_per_layer = None  # as replayed from an older report
+    assert lora_workspace(r, ref, rows) - lora_workspace(r, None, rows) == live
+
+
 def test_two_gradient_groups_charge_one_group_workspace_and_gradient_shard():
     r = tp_rank(topology=TP2)
     groups = ((20_000, True), (12_000, True))
@@ -371,6 +463,31 @@ def test_the_tp2_head_stage_is_priced_with_the_floor():
     )
     assert head > workspace(512, 2) + SEGMENT * 2
     assert cost.checkpoint_workspace == head + COLD
+
+
+def test_the_tp2_head_stage_follows_the_statistics_path(monkeypatch):
+    from art.trainer_rank import _impl, _memory
+
+    r = _with_head(tp_rank(topology=TP2), 248_320, 2)
+    monkeypatch.setattr(_memory, "_head_target_backward", lambda rank: True)
+    targets = [SimpleNamespace(target_tokens=1, logits=False, top_k=None)]
+    dense = r._head_workspace_bytes(512)
+
+    def head():
+        return r._group_head_workspace_bytes(512, targets, grad_enabled=True)
+
+    # The same predicate as _try_triton_stats: a CPU device, the
+    # ART_TRAINER_RANK_TRITON_TOPK switch and short chunks take the eager
+    # FP32 fallback, about seven BF16 buffers.
+    assert head() == 7 * dense
+    monkeypatch.setattr(_impl, "_triton_head_stats", lambda device, rows: True)
+    assert head() == 3 * dense
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_TOPK", "0")
+    assert not _impl._triton_stats_enabled(True, 512)
+    monkeypatch.delenv("ART_TRAINER_RANK_TRITON_TOPK")
+    assert _impl._triton_stats_enabled(True, 64)
+    assert not _impl._triton_stats_enabled(True, 63)
+    assert not _impl._triton_stats_enabled(False, 512)
 
 
 def test_a_tp2_wide_ffn_is_priced_by_its_fc1_stage():

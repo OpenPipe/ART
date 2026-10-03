@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
-from functools import partial
+from functools import cache, partial
 import hashlib
 import json
 import logging
@@ -5649,19 +5649,42 @@ def _try_triton_local_topk_stats(
     )
 
 
+def _triton_stats_enabled(cuda: bool, rows: int) -> bool:
+    """Whether ``_try_triton_stats`` attempts the kernel for a ``rows`` chunk."""
+    return (
+        cuda
+        and os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower()
+        not in {"0", "false"}
+        and rows >= int(os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64"))
+    )
+
+
+@cache
+def _triton_stats_importable() -> bool:
+    try:
+        from art.trainer_rank import topk  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _triton_head_stats(device: torch.device, rows: int) -> bool:
+    """The head statistics path a ``rows`` chunk takes, for admission.
+
+    The forward also falls back on a kernel error, unless
+    ART_TRAINER_RANK_TRITON_TOPK=strict makes that error fatal.
+    """
+    return _triton_stats_enabled(device.type == "cuda", rows) and (
+        _triton_stats_importable()
+    )
+
+
 def _try_triton_stats(
     name: str,
     local_logits: torch.Tensor,
     **kwargs: object,
 ) -> object | None:
-    if not local_logits.is_cuda:
-        return None
-    if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() in {
-        "0",
-        "false",
-    } or int(local_logits.shape[0]) < int(
-        os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64")
-    ):
+    if not _triton_stats_enabled(local_logits.is_cuda, int(local_logits.shape[0])):
         return None
     try:
         from art.trainer_rank import topk
