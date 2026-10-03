@@ -7,10 +7,22 @@ has exactly three decisions and a four-layout mandatory family.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
-from art.trainer_rank._planner_cost import LayoutFeatures, layout_features
+from art.trainer_rank import _planner_cost
+from art.trainer_rank._planner_cost import (
+    SEGMENT_LENGTH_THRESHOLDS,
+    LayoutFeatures,
+    layout_features,
+    prefix_tree_layout_score,
+)
+from art.trainer_rank._prefix_tree_performance_search import (
+    search_nonuniform_prefix_tree_layouts,
+)
 from art.trainer_rank._prefix_tree_planner import (
+    PlannedSegment,
+    PrefixTreeLayout,
     build_canonical_prefix_tree,
     prefix_tree_layout_candidates,
 )
@@ -67,3 +79,72 @@ def test_layout_features_on_the_sealed_grpo_shape() -> None:
         2,
     )
     assert full.as_dict()["segments_below"] == full.segments_below
+
+
+@pytest.mark.parametrize(
+    "lengths",
+    [(), (0, 0, 1, 8192, 8193, 1 << 40)]
+    + [(t + offset,) for t in SEGMENT_LENGTH_THRESHOLDS for offset in (-1, 0, 1)]
+    + [
+        tuple(t + offset for t in SEGMENT_LENGTH_THRESHOLDS for offset in (-1, 0, 1))
+        * 2
+    ],
+)
+def test_layout_features_strict_thresholds(lengths: tuple[int, ...]) -> None:
+    layout = PrefixTreeLayout(
+        tree_fingerprint="test",
+        selected_decisions=frozenset(),
+        segments=tuple(
+            PlannedSegment((i,), 7, 7 + length, None, None)
+            for i, length in enumerate(lengths)
+        ),
+        packed_tokens=sum(lengths),
+        maximum_depth=int(bool(lengths)),
+        fingerprint="test",
+    )
+    assert layout_features(layout) == LayoutFeatures(
+        packed_tokens=sum(lengths),
+        segment_count=len(lengths),
+        max_depth=int(bool(lengths)),
+        segments_below=tuple(
+            sum(length < threshold for length in lengths)
+            for threshold in SEGMENT_LENGTH_THRESHOLDS
+        ),
+    )
+
+
+@pytest.mark.parametrize("cp_size", [1, 4])
+def test_histogram_preserves_full_search(
+    monkeypatch: pytest.MonkeyPatch, cp_size: int
+) -> None:
+    tree = build_canonical_prefix_tree(_grpo_rows())
+
+    def search():
+        return search_nonuniform_prefix_tree_layouts(
+            tree,
+            lambda layout: prefix_tree_layout_score(
+                layout, cp_size=cp_size, layers=40, uses_gdn=True, gdn_layers=30
+            ),
+            mandatory_candidates=prefix_tree_layout_candidates(tree),
+            refinement_work_budget=2000,
+        )
+
+    actual = search()
+
+    def strict_counts(layout: PrefixTreeLayout) -> LayoutFeatures:
+        lengths = [s.end - s.start for s in layout.segments]
+        return LayoutFeatures(
+            packed_tokens=layout.packed_tokens,
+            segment_count=len(lengths),
+            max_depth=layout.maximum_depth,
+            segments_below=tuple(
+                sum(length < threshold for length in lengths)
+                for threshold in SEGMENT_LENGTH_THRESHOLDS
+            ),
+        )
+
+    monkeypatch.setattr(_planner_cost, "layout_features", strict_counts)
+    expected = search()
+    assert actual.evaluated_refinements > 0
+    assert actual == expected
+    assert actual.fingerprint == expected.fingerprint

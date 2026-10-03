@@ -36,8 +36,10 @@ version-1 score applies.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -89,18 +91,16 @@ class LayoutFeatures:
 
 def layout_features(layout: PrefixTreeLayout) -> LayoutFeatures:
     segment_count = 0
-    below = [0] * len(SEGMENT_LENGTH_THRESHOLDS)
+    below = [0] * (len(SEGMENT_LENGTH_THRESHOLDS) + 1)
     for segment in layout.segments:
         length = segment.end - segment.start
         segment_count += 1
-        for index, threshold in enumerate(SEGMENT_LENGTH_THRESHOLDS):
-            if length < threshold:
-                below[index] += 1
+        below[bisect_right(SEGMENT_LENGTH_THRESHOLDS, length)] += 1
     return LayoutFeatures(
         packed_tokens=layout.packed_tokens,
         segment_count=segment_count,
         max_depth=layout.maximum_depth,
-        segments_below=tuple(below),
+        segments_below=tuple(accumulate(below[:-1])),
     )
 
 
