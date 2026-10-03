@@ -1934,7 +1934,8 @@ def test_checkpoint_merge_rejects_same_key_with_different_metadata(
     )
     tensor = torch.ones(2, 3)
 
-    def read(_prepared, relative, component, keys):
+    def read(_prepared, relative, component, keys, *, snapshot):
+        assert snapshot is None
         assert (relative, component, list(keys)) == ("selected", "master", ["weight"])
         return {"weight": tensor}
 
