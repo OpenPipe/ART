@@ -4611,6 +4611,10 @@ class TrainerRank:
                     priced, signature=replace(priced.signature, memory_placement=())
                 )
                 cost = self._plan_cost(priced)
+                if getattr(priced, "_head_staged", False):
+                    # Pricing staged this copy's head: the executed plan
+                    # must run those fused statistics strictly.
+                    object.__setattr__(flat, "_head_staged", True)
                 timings = getattr(self, "_graph_forward_times", {}).get(
                     self._graph_forward_time_key(priced), ()
                 )
@@ -4812,18 +4816,19 @@ class TrainerRank:
                     )
                     for g in groups
                 )
-                selected_flats.append(
-                    replace(
-                        flat,
-                        groups=tuple(groups),
-                        signature=replace(
-                            flat.signature,
-                            memory_placement=modes
-                            if any(mode != ("gpu", "model") for mode in modes)
-                            else (),
-                        ),
-                    )
+                placed = replace(
+                    flat,
+                    groups=tuple(groups),
+                    signature=replace(
+                        flat.signature,
+                        memory_placement=modes
+                        if any(mode != ("gpu", "model") for mode in modes)
+                        else (),
+                    ),
                 )
+                if getattr(flat, "_head_staged", False):
+                    object.__setattr__(placed, "_head_staged", True)
+                selected_flats.append(placed)
             selected = (
                 replace(plan, subforwards=tuple(selected_flats))
                 if isinstance(plan, _SplitForwardPlan)
