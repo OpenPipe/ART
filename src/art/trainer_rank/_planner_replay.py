@@ -33,6 +33,7 @@ _REFUSALS = frozenset(
     {
         "runtime_group_inventory_over_limit",
         "hybridep_runtime_facts_unsupported",
+        "dense_runtime_facts_unsupported",
         "custom_runtime_estimator_unsupported",
         "runtime_token_inventory_over_limit",
         "runtime_segment_inventory_over_limit",
@@ -89,6 +90,10 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         or rank._parallel_shape.ep > 1
     ):
         raise ValueError("hybridep_runtime_facts_unsupported")
+    # Covered dense CP2 pricing reads the live module walk, TE's workspace
+    # cache and every rank's CP layouts, which these facts do not record.
+    if any(rank._dense_mlp_widths(tuple(g.slot_ref for g in plan.groups))):
+        raise ValueError("dense_runtime_facts_unsupported")
     for name in (
         "_subforward_cost",
         "_split_required_memory",
@@ -658,12 +663,18 @@ class ReplayRank(_impl.TrainerRank):
         )
 
     def _checkpoint_memory_floor(
-        self, group_rows: Any, slot_refs: Any = None, gdn_segments: int = 0
+        self,
+        group_rows: Any,
+        slot_refs: Any = None,
+        gdn_segments: int = 0,
+        layouts: Any = None,
     ) -> tuple[int, int]:
         if self._facts is None:
             return _memory._checkpoint_memory_floor(
-                self, group_rows, slot_refs, gdn_segments
+                self, group_rows, slot_refs, gdn_segments, layouts
             )
+        if layouts is not None:
+            raise ValueError("dense_runtime_facts_unsupported")
         return _memory._checkpoint_floor_from_facts(
             self, group_rows, slot_refs, gdn_segments, self._facts["checkpoint_layers"]
         )
