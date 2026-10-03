@@ -1042,6 +1042,104 @@ def test_cp_layouts_are_replayed_and_frozen(monkeypatch, tmp_path):
         assert result["required_bytes"] != actual["estimates"][0]["required_bytes"]
 
 
+@pytest.mark.parametrize("lengths", [(900, 700, 500), (2047,)])
+def test_cp_layout_adapter_gradients_pair_per_rank_and_replay(
+    lengths, monkeypatch, tmp_path
+):
+    # Pending adapter gradients on per-rank CP2 layouts. Each rank releases
+    # its own boundaries as backward proceeds (a single short sequence puts
+    # every GDN row on rank 0), so its extra meets its own floor, which the
+    # busiest rank's boundaries misprice.
+    from test_trainer_rank_adapter_gradient_memory import lora, parameter
+    from test_trainer_rank_checkpoint_memory import rank as checkpoint_rank
+    from test_trainer_rank_layout_memory import art_cp
+
+    rank = art_cp(checkpoint_rank(), monkeypatch)
+    del rank._topology_key  # the stock reader, over the fixture's CP2 topology
+    layers = tr._language_model(rank.runtime.model[0]).decoder.layers
+    # One 8 MiB BF16 slot gradient per layer (more than a layer's boundaries
+    # on the busiest rank); bound the total by the fixture's real layer count.
+    assert len(layers) * 2**22 * 2 <= 2**29
+    params = [parameter(2**22) for _ in layers]
+    for param, block in zip(params, layers, strict=True):
+        block.add_module("adapter", lora(policy=[param]))
+    rank._checkpoint_slots["policy"] = tr._CheckpointSlot()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    starts = [sum(lengths[:index]) for index in range(len(lengths))]
+    requests = [
+        tr.ForwardInput(
+            input_tokens=torch.arange(start, start + n),
+            hidden_states=True,
+            checkpoint="policy",
+            no_grad=False,
+        )
+        for start, n in zip(starts, lengths, strict=True)
+    ]
+    plan = rank._plan_flat_forward(requests, ensure_slots=False)
+    layouts = rank._plan_group_layouts(plan)
+    assert layouts is not None
+    report, costs = emitted(rank, plan, tmp_path)
+    facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
+    (group,) = facts["groups"]
+    pending = group["adapter"]["pending"]
+    assert group["layout"] is not None and len(pending) == len(layers) + 1
+
+    # Live: each rank's extra (its own boundaries released layer by layer)
+    # sits on that rank's floor, bounded by the floor's workspace.
+    group_rows = rank._plan_group_rows(plan)
+    refs = tuple(g.slot_ref for g in plan.groups)
+    routed = rank._plan_group_routed_rows(plan)
+    retained, workspace = rank._checkpoint_memory_floor(
+        group_rows, refs, routed_rows=routed, layouts=layouts
+    )
+
+    def extra(saved):
+        return max(
+            0,
+            *(
+                sum(pending[i:-1]) + pending[-1] - sum(saved[i + 1 :])
+                for i in range(len(saved))
+            ),
+        )
+
+    paired = max(
+        0,
+        max(
+            rank_retained + max(rank_workspace, workspace) + extra(boundaries)
+            for (rank_retained, rank_workspace), (boundaries,) in zip(
+                rank._layout_checkpoint_rank_floors(refs, routed, layouts),
+                rank._layout_layer_boundaries(layouts),
+                strict=True,
+            )
+        )
+        - retained
+        - workspace,
+    )
+    assert costs[0].checkpoint_adapter_gradient == paired > 0, "live pairing"
+    busiest = rank._checkpoint_adapter_gradient_bytes(
+        rank._checkpoint_gradient_groups(group_rows, refs)
+    )
+    # Both cases price differently from the busiest rank's boundaries.
+    assert paired != busiest
+
+    # Replay recomputes the same paired extra from the frozen facts.
+    actual = reports.replay(report)
+    assert actual["estimates"][0]["required_bytes"] == costs[0].required, (
+        "replay pairing"
+    )
+    assert actual["aggregate"]["matches"]
+    for param in params:
+        param.grad = torch.zeros_like(param)
+    assert reports.replay(report) == actual
+    changed = deepcopy(report)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["groups"][0][
+        "adapter"
+    ]["pending"][0] += 10**12
+    result = reports.replay(changed)["estimates"][0]
+    assert not result["matches"]
+    assert result["required_bytes"] > actual["estimates"][0]["required_bytes"]
+
+
 @pytest.mark.parametrize(
     "change",
     [

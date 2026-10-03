@@ -93,6 +93,32 @@ def _worker(index: int, directory: Path) -> None:
         timeout=timedelta(seconds=10),
     )
     try:
+        # Each participant must fit its own demand. Keep the same agreement in
+        # WORLD and an explicit TP/CP scope, including an empty participant.
+        group = dist.new_group([0, 1])
+        for sync_across_dp in (True, False):
+            rank = TrainerRank.__new__(TrainerRank)
+            rank.device = torch.device("cpu")
+            rank._forward_memory_group = lambda: group
+            for demands, budgets, fits in (
+                ((46, 28), (53, 43), True),
+                ((46, 0), (53, 0), True),
+                ((46, 28), (53, 27), False),
+            ):
+                required, available = demands[index], budgets[index]
+                rank._available_memory_bytes = lambda: available
+                check = rank._memory_check_required(
+                    required, sync_across_dp=sync_across_dp
+                )
+                assert check.fits == fits
+                assert check.estimated_required_bytes == max(demands)
+                assert check.available_bytes == min(budgets)
+                for _ in range(2):
+                    check = rank._refresh_memory_check(
+                        check, sync_across_dp=sync_across_dp
+                    )
+                    assert check.fits == fits and check.local_required_bytes == required
+        dist.barrier()
         for mode in (
             "estimate",
             "materialize",

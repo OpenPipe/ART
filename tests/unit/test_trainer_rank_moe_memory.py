@@ -470,7 +470,7 @@ def test_memory_check_preserves_collective_order(monkeypatch):
     calls = []
 
     def reduce(value, op, group):
-        calls.append((value.item(), op, group))
+        calls.append((value.tolist(), op, group))
 
     monkeypatch.setattr(impl.dist, "all_reduce", reduce)
     estimate = rank._estimate_required_memory_bytes_from_values(
@@ -482,7 +482,7 @@ def test_memory_check_preserves_collective_order(monkeypatch):
     assert not rank._memory_check_required(estimate).fits
     assert calls == [
         (float(estimate), impl.dist.ReduceOp.MAX, group),
-        (6_800_000_000.0, impl.dist.ReduceOp.MIN, group),
+        ([6_800_000_000.0, 0.0], impl.dist.ReduceOp.MIN, group),
     ]
 
 
