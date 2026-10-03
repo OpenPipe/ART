@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import nullcontext
+import gc
 import hashlib
 import math
 from types import MethodType
@@ -774,21 +775,10 @@ def _checkpoint_memory_floor(
     group_rows: tuple[tuple[int, bool], ...],
     slot_refs: tuple["LoRASlotRef | None", ...] | None = None,
     gdn_segments: int = 0,
-    layouts: tuple[_GroupLayout, ...] | None = None,
 ) -> tuple[int, int]:
-    """Saved boundaries and one recomputed layer's workspace.
-
-    With ``layouts`` (``_plan_group_layouts``), a covered dense model prices
-    every CP rank on its own layouts (``_dense_layout_floors``): the largest
-    rank's boundaries and the rest of the largest rank total.
-    """
     layers = _checkpoint_layers(self, group_rows)
     if not layers:
         return 0, 0
-    floors = self._dense_layout_floors(group_rows, slot_refs, layouts)
-    if floors is not None:
-        retained = max(retained for retained, _ in floors)
-        return retained, max(map(sum, floors)) - retained
     retained, workspace = _checkpoint_floor_from_facts(
         self, group_rows, slot_refs, gdn_segments, layers
     )
@@ -1049,27 +1039,27 @@ def _dense_layout_floors(
 ) -> tuple[tuple[int, int], ...] | None:
     """Each CP rank's (boundaries, workspace) for a covered dense model, or None.
 
-    Gradient groups only, on every rank's own layouts. A saved layer input
-    arrives in the GDN layout when the layer follows a GDN layer in its
-    island, else in the attention layout. A recomputed attention layer keeps
-    its mixer width on its attention rows plus the executor's retained
-    records, a GDN layer its width on its GDN rows; either keeps its
-    residual, pre-MLP norm output and MLP stage on those rows. TE's cuBLAS
-    workspace grows only while the process is cold.
+    All groups gradient or all no-grad, on every rank's own layouts. A saved
+    layer input arrives in the GDN layout when the layer follows a GDN layer
+    in its island, else in the attention layout. A recomputed attention
+    layer keeps its mixer width on its attention rows plus the executor's
+    retained records, a GDN layer its width on its GDN rows; either keeps
+    its residual, pre-MLP norm output and MLP stage on those rows. A no-grad
+    layer holds its stage on its rows. A GDN layer also holds each of the
+    rank's segments' recurrent states (``_gdn_segment_layer_bytes``).
     """
     refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
-    if layouts is None or not group_rows or not all(grad for _, grad in group_rows):
+    if layouts is None or len({grad for _, grad in group_rows}) != 1:
         return None
-    dense, _ = self._dense_mlp_widths(refs)
-    if not dense:
+    stage, no_grad = self._dense_mlp_widths(refs)
+    if not stage:
         return None
+    gradient = group_rows[0][1]
     hidden = self._hidden_size * 2
     inputs = self._layer_gdn_inputs()
     gdn_inputs = sum(inputs)
     attention_inputs = len(inputs) - gdn_inputs
     widths = self._dense_mixer_widths()
-    beside = 2 * hidden + dense
-    growth = self._te_workspace_growth_bytes()
     floors: list[tuple[int, int]] = []
     for rank in range(len(layouts[0].attention_rows)):
         retained = workspace = 0
@@ -1078,14 +1068,17 @@ def _dense_layout_floors(
             gdn = (
                 attention if layout.gdn_rows is None else max(1, layout.gdn_rows[rank])
             )
-            retained += hidden * (attention_inputs * attention + gdn_inputs * gdn)
+            segments = layout.gdn_segments[rank] if layout.gdn_segments else 0
+            if gradient:
+                retained += hidden * (attention_inputs * attention + gdn_inputs * gdn)
             for kind, rows, extra in (
-                ("attention", attention, layout.attention_retained[rank]),
-                ("gdn", gdn, 0),
+                ("attention", attention, layout.attention_retained[rank] * gradient),
+                ("gdn", gdn, math.ceil(segments * self._gdn_segment_layer_bytes())),
             ):
                 if kind in widths:
-                    workspace = max(workspace, rows * (widths[kind] + beside) + extra)
-        floors.append((retained, workspace + growth))
+                    per_row = widths[kind] + 2 * hidden + stage if gradient else no_grad
+                    workspace = max(workspace, rows * per_row + extra)
+        floors.append((retained, workspace))
     return tuple(floors)
 
 
@@ -1171,7 +1164,7 @@ def _layout_layer_boundaries(
 
 
 def _layout_pricing_supported(
-    self: TrainerRank, topology: tuple[int, int, int, int], *, gradient_groups: bool
+    self: TrainerRank, topology: tuple[int, int, int, int]
 ) -> bool:
     """Whether layout-aware pricing models this runtime and plan shape.
 
@@ -1179,7 +1172,7 @@ def _layout_pricing_supported(
     the busiest-rank pricing.
     """
     _dp, tp, cp, pp = topology
-    if (tp, cp, pp) != (1, 2, 1) or not gradient_groups:
+    if (tp, cp, pp) != (1, 2, 1):
         return False
     if not self._dense_mlp_widths()[0]:
         return False
@@ -1247,20 +1240,25 @@ def _minimum_layouts(
 
 
 def _te_workspace_growth_bytes(self: TrainerRank) -> int:
-    """Transformer Engine's cuBLAS workspaces, while the process is cold.
+    """Transformer Engine's cuBLAS workspaces, until this device has its own.
 
-    TE allocates them at its first GEMMs and keeps them for the process. A
-    covered dense model runs no grouped GEMM, so one cached workspace marks
-    the process warm. The cold call allocates only that one, but about 130 MB
-    of other first-use buffers beside it (Qwen3.8-27B CP2: 164 MB in all),
-    which the full allowance covers.
+    TE caches a workspace per (device, overlap, grouped GEMM) for the
+    process. A covered dense model runs ordinary GEMMs only, so this
+    device's ordinary entry marks it warm; an unreadable cache counts as
+    cold. A cold call allocates only that one, but about 130 MB of other
+    first-use buffers beside it (Qwen3.8-27B CP2: 164 MB in all), which the
+    full allowance covers.
     """
     try:
         from transformer_engine.pytorch.cpp_extensions import gemm
     except ImportError:
         return _impl._TE_CUBLAS_WORKSPACE_BYTES
-    info = getattr(gemm.get_cublas_workspace, "cache_info", None)
-    if callable(info) and info().currsize:
+    # functools.lru_cache keeps its entries in a dict its wrapper references.
+    key = (self.device.index, False, False)
+    if any(
+        type(entries) is dict and key in entries
+        for entries in gc.get_referents(gemm.get_cublas_workspace)
+    ):
         return 0
     return _impl._TE_CUBLAS_WORKSPACE_BYTES
 
@@ -1957,7 +1955,9 @@ def _estimate_required_memory_bytes_from_values(
     # A covered dense CP2 rank's no-grad width (_dense_mlp_widths).
     _dense_stage, covered = (
         self._dense_mlp_widths(slot_refs)
-        if not signature.grad_enabled and signature.topology[2] == 2 and group_rows
+        if not signature.grad_enabled
+        and group_rows
+        and self._layout_pricing_supported(signature.topology)
         else (0, 0)
     )
     if covered or (
@@ -1987,8 +1987,6 @@ def _estimate_required_memory_bytes_from_values(
             )
         )
         if covered:
-            # TE's cuBLAS workspace, until the process's first GEMM.
-            no_grad_stage += self._te_workspace_growth_bytes()
             static_compute = no_grad_stage
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry
@@ -2104,6 +2102,9 @@ def _estimate_required_memory_bytes_from_values(
         # boundaries but not the backward's input gradient.
         max(retained, checkpoint_floor[0]) + no_grad_stage,
     )
+    if covered:
+        # TE's cuBLAS workspace persists beside whichever stage peaks.
+        static_compute += self._te_workspace_growth_bytes()
     if signature.topology[2] > 1:
         # Local head results coexist with full CP outputs during gathering.
         # Uneven rank plans can assign all of an item's rows to one rank.

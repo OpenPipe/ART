@@ -663,18 +663,12 @@ class ReplayRank(_impl.TrainerRank):
         )
 
     def _checkpoint_memory_floor(
-        self,
-        group_rows: Any,
-        slot_refs: Any = None,
-        gdn_segments: int = 0,
-        layouts: Any = None,
+        self, group_rows: Any, slot_refs: Any = None, gdn_segments: int = 0
     ) -> tuple[int, int]:
         if self._facts is None:
             return _memory._checkpoint_memory_floor(
-                self, group_rows, slot_refs, gdn_segments, layouts
+                self, group_rows, slot_refs, gdn_segments
             )
-        if layouts is not None:
-            raise ValueError("dense_runtime_facts_unsupported")
         return _memory._checkpoint_floor_from_facts(
             self, group_rows, slot_refs, gdn_segments, self._facts["checkpoint_layers"]
         )

@@ -480,10 +480,7 @@ def _split_chunk_lower_cost(
         # Where exact plans price each rank's layouts, bound them from below
         # the same way rather than with the busiest-rank widths.
         group_layouts=self._minimum_layouts(group_physical_rows, signature.topology[2])
-        if self._layout_pricing_supported(
-            signature.topology,
-            gradient_groups=all(grad for _, grad in group_rows),
-        )
+        if self._layout_pricing_supported(signature.topology)
         else None,
         slot_refs=tuple(ref for (ref, _), _ in groups),
         head_workspace_bytes=head_workspace_bytes,
@@ -555,14 +552,15 @@ def _plan_group_layouts(
 ) -> tuple[_GroupLayout, ...] | None:
     """Every rank's CP layouts per group, where layout pricing is modeled.
 
-    Only CP2 at TP1/PP1 with gradient groups, ART's CP core attention with
-    no softmax offset, and GDN layers marked with island boundaries; the
-    executor's retained set is validated there. Elsewhere ``None`` keeps
-    the busiest-rank pricing.
+    Only CP2 at TP1/PP1 for a covered dense model, all groups gradient or
+    all no-grad, ART's CP core attention with no softmax offset, and GDN
+    layers marked with island boundaries (``_layout_pricing_supported``).
+    Elsewhere ``None`` keeps the busiest-rank pricing.
     """
-    if not plan.groups or not self._layout_pricing_supported(
-        plan.signature.topology,
-        gradient_groups=all(group.grad_enabled for group in plan.groups),
+    if (
+        not plan.groups
+        or len({group.grad_enabled for group in plan.groups}) != 1
+        or not self._layout_pricing_supported(plan.signature.topology)
     ):
         return None
     started = _impl.time.perf_counter()
@@ -597,7 +595,7 @@ def _compute_group_layouts(
     layouts = []
     for group in plan.groups:
         batch = _impl._pad_packed_batch(group.packed, multiple=int(topology.tp))
-        attention, gdn, rank_plans = context_parallel_rank_layouts(
+        attention, gdn, segments, rank_plans = context_parallel_rank_layouts(
             group_ids=batch.group_ids,
             parent_ids=batch.parent_ids,
             topology=topology,
@@ -624,6 +622,7 @@ def _compute_group_layouts(
                     )
                     for rank_plan in rank_plans
                 ),
+                gdn_segments=segments or (),
             )
         )
     return tuple(layouts)

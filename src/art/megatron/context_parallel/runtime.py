@@ -442,11 +442,18 @@ def context_parallel_rank_layouts(
     original_seq_len: int,
     build_gdn_execution_spec: bool,
     gdn_planner_config: Any | None = None,
-) -> tuple[tuple[int, ...], tuple[int, ...] | None, tuple[RankRuntimePlan, ...]]:
-    """Each CP rank's attention rows, GDN rows and attention stage plan.
+) -> tuple[
+    tuple[int, ...],
+    tuple[int, ...] | None,
+    tuple[int, ...] | None,
+    tuple[RankRuntimePlan, ...],
+]:
+    """Each CP rank's attention rows, GDN rows, GDN segments and attention plan.
 
     Uses the cached planning bundle and per-rank runtime plans that execution
-    builds, so a memory estimate sees the layouts the ranks will run.
+    builds, so a memory estimate sees the layouts the ranks will run. A
+    rank's GDN segments are its own and every chained one (a chain can run
+    on every rank): each holds recurrent states while a GDN layer runs.
     """
     planning_key, bundle, _group_ids_cpu, _parent_ids_cpu = (
         _get_or_build_planning_bundle(
@@ -459,15 +466,19 @@ def context_parallel_rank_layouts(
         )
     )
     attention = tuple(bundle.token_layout_index.token_counts_by_rank)
-    gdn = None
+    gdn = segments = None
     if build_gdn_execution_spec:
-        gdn = tuple(
-            _plan_gdn_global_execution(
-                planning_key=planning_key,
-                bundle=bundle,
-                topology=topology,
-                gdn_planner_config=gdn_planner_config,
-            ).gdn_token_counts_by_rank
+        decision = _plan_gdn_global_execution(
+            planning_key=planning_key,
+            bundle=bundle,
+            topology=topology,
+            gdn_planner_config=gdn_planner_config,
+        )
+        gdn = tuple(decision.gdn_token_counts_by_rank)
+        chained = sum(map(len, decision.chain_segments_by_depth))
+        segments = tuple(
+            chained + sum(map(len, depths))
+            for depths in decision.segments_by_rank_depth
         )
     plans = tuple(
         _get_or_build_bundle_rank_plan(
@@ -479,7 +490,7 @@ def context_parallel_rank_layouts(
         )
         for rank in range(len(attention))
     )
-    return attention, gdn, plans
+    return attention, gdn, segments, plans
 
 
 def _normalized_chunk_size(

@@ -6,6 +6,8 @@ groups run one after another.
 """
 
 from dataclasses import replace
+import functools
+import math
 from types import MethodType, SimpleNamespace
 from typing import Any
 
@@ -141,8 +143,12 @@ def _dense_rank(stage: int = STAGE, no_grad: int = NO_GRAD):
 
 
 def _at_cp2(r):
-    # After cheap estimation (which declines under CP): price as a CP2 rank.
+    # After cheap estimation (which declines under CP): price as a CP2 rank,
+    # standing in for ART's CP attention and GDN islands (``art_cp``).
     r._topology_key = lambda: CP2
+    r._layout_pricing_supported = lambda topology: (
+        topology[1:] == (1, 2, 1) and bool(r._dense_mlp_widths()[0])
+    )
     return r
 
 
@@ -204,6 +210,8 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "norm_delegate",
         "slot_selector",
         "active_selector",
+        "child_class_forward",
+        "helper_override",
         "chunks",
     ],
 )
@@ -237,6 +245,10 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     class Attention(SelfAttention):
         def forward(self, *args, **kwargs):  # A class-level override.
             return super().forward(*args, **kwargs)
+
+    class Norm(torch.nn.LayerNorm):
+        def forward(self, input):  # A class-level forward outside the traced packages.
+            return input
 
     custom = MethodType(lambda self, *a, **k: None, layer)
 
@@ -327,6 +339,10 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         "active_selector": lambda: setattr(
             mlp.linear_fc1.gate_lora, "active_lora_tensors", lambda: None
         ),
+        "child_class_forward": mixer_child(
+            lambda child: setattr(child, "__class__", Norm)
+        ),
+        "helper_override": lambda: setattr(layer, "_forward_mlp", custom),
         "chunks": lambda: None,
     }
     edits[change]()
@@ -419,7 +435,7 @@ def test_covered_dense_recompute_charges_one_gradient_and_its_stage(rows):
     )
     # The dense head shares the decoder stage (it is not staged).
     head = layout_price(r, (*values[:4], 10**9), layouts)
-    assert head.checkpoint_workspace == 10**9 + COLD
+    assert head.checkpoint_workspace == 10**9 + r._te_workspace_growth_bytes() + COLD
     # Without layouts or the traced stage, dense keeps main's pricing: one
     # gradient per boundary.
     assert price(r, values).checkpoint_input_gradient == rows * LAYERS * HIDDEN * 2
@@ -485,6 +501,7 @@ def test_layout_floor_prices_each_rank_and_layer_type(gdn):
             gdn_key_head_dim=64,
             gdn_value_heads=8,
             gdn_value_head_dim=64,
+            gdn_conv_kernel=4,
         )
     # Each layer's saved input layout (``_layer_gdn_inputs``).
     inputs = tuple(bool(gdn and index) for index in range(4))
@@ -493,33 +510,46 @@ def test_layout_floor_prices_each_rank_and_layer_type(gdn):
         attention_rows=(100, 80),
         gdn_rows=(120, 60) if gdn else None,
         attention_retained=(5_000, 90_000),
+        gdn_segments=(3, 40),
     )
     # An attention layer keeps its input norm output and five query- and
     # KV-width tensors beside the executor's records; a GDN layer its traced
-    # width, CP exchange included.
+    # width, CP exchange included, and its segments' recurrent states.
     widths = r._dense_mixer_widths()
     assert widths["attention"] == (HIDDEN + 5 * 16 * 256 + 5 * 2 * 256) * 2
+    states = r._gdn_segment_layer_bytes()
     if gdn:
         assert (
             widths["gdn"]
             == (2 * HIDDEN + 2 * 4 * 64 + 2 * 8 * 64 + 7 * 8 * 64 + 64 * 8) * 2
         )
+        assert states == 2 * (4 * 8 * 64 * 64 + 2 * (2 * 4 * 64 + 8 * 64) * 3)
 
-    def total(rank):
+    def floor(rank, grad=True):
         attention = layout.attention_rows[rank]
         gdn_rows = attention if layout.gdn_rows is None else layout.gdn_rows[rank]
         rows = {"attention": attention, "gdn": gdn_rows}
+        extra = {
+            "attention": layout.attention_retained[rank] * grad,
+            "gdn": math.ceil(layout.gdn_segments[rank] * states),
+        }
+        per_row = {
+            k: widths[k] + 2 * HIDDEN * 2 + STAGE if grad else NO_GRAD for k in widths
+        }
         ledger = HIDDEN * 2 * sum(gdn_rows if g else attention for g in inputs)
-        stage = max(
-            rows[k] * (widths[k] + 2 * HIDDEN * 2 + STAGE)
-            + (layout.attention_retained[rank] if k == "attention" else 0)
-            for k in widths
-        )
-        return ledger, ledger + stage + r._te_workspace_growth_bytes()
+        stage = max(rows[k] * per_row[k] + extra[k] for k in widths)
+        return ledger * grad, stage
 
-    retained, workspace = r._checkpoint_memory_floor(((100, True),), None, 0, (layout,))
-    assert retained == max(total(0)[0], total(1)[0])
-    assert retained + workspace == max(total(0)[1], total(1)[1])
+    assert r._dense_layout_floors(((100, True),), None, (layout,)) == (
+        floor(0),
+        floor(1),
+    )
+    no_grad = r._dense_layout_floors(((100, False),), None, (layout,))
+    assert no_grad == (floor(0, False), floor(1, False))
+    # Mixed waves keep main's pricing.
+    assert (
+        r._dense_layout_floors(((100, True), (9, False)), None, (layout,) * 2) is None
+    )
 
 
 def _no_grad_required(r, group_rows, *, topology=CP2, packed=40_000):
@@ -563,22 +593,24 @@ def test_no_grad_groups_price_the_largest_groups_own_rows():
     assert _no_grad_required(wide, (12_000, 8_000)) == int((12_000 * 10**6 + te) * 1.1)
 
 
-def test_te_workspace_growth_lasts_until_the_first_gemm(monkeypatch):
+def test_te_workspace_growth_lasts_until_this_devices_gemm_workspace(monkeypatch):
     gemm = pytest.importorskip("transformer_engine.pytorch.cpp_extensions.gemm")
-    entries = [0]
 
-    class Cached:
-        def cache_info(self):
-            return SimpleNamespace(currsize=entries[0])
+    @functools.lru_cache(maxsize=None)
+    def get_cublas_workspace(device, ub, grouped_gemm):
+        return None
 
-    monkeypatch.setattr(gemm, "get_cublas_workspace", Cached())
+    monkeypatch.setattr(gemm, "get_cublas_workspace", get_cublas_workspace)
     dense = _at_cp2(_dense_rank())
-    assert dense._te_workspace_growth_bytes() == _TE_CUBLAS_WORKSPACE_BYTES
-    # Process-cold no-grad waves charge it too.
+    device = dense.device.index
+    # Grouped, overlap and other devices' workspaces leave this device cold,
+    # and process-cold no-grad waves charge the growth too.
+    for key in ((device, False, True), (device, True, False), (7, False, False)):
+        get_cublas_workspace(*key)
+        assert dense._te_workspace_growth_bytes() == _TE_CUBLAS_WORKSPACE_BYTES
     no_grad = _no_grad_required(dense, (500,), packed=1000)
     assert no_grad == int((500 * NO_GRAD + _TE_CUBLAS_WORKSPACE_BYTES) * 1.1)
-    # A dense model runs no grouped GEMM: its plain workspace makes it warm.
-    entries[0] = 1
+    get_cublas_workspace(device, False, False)
     assert dense._te_workspace_growth_bytes() == 0
     assert _no_grad_required(dense, (500,), packed=1000) == int(500 * NO_GRAD * 1.1)
 
@@ -754,7 +786,7 @@ def test_only_a_covered_dense_model_prices_layouts(monkeypatch):
     assert layout.gdn_rows is not None and sum(layout.gdn_rows) == plan.packed_tokens
     # Each rank's retention is the executor mirror over that rank's own plan.
     (group,) = plan.groups
-    _, _, rank_plans = context_parallel_rank_layouts(
+    _, _, segments, rank_plans = context_parallel_rank_layouts(
         group_ids=group.packed.group_ids,
         parent_ids=group.packed.parent_ids,
         topology=ParallelTopology(tp=1, cp=2),
@@ -776,6 +808,8 @@ def test_only_a_covered_dense_model_prices_layouts(monkeypatch):
         )
         for rank_plan in rank_plans
     )
+    assert segments is not None and layout.gdn_segments == segments
+    assert all(n >= 1 for n in segments)
     cost = r._plan_cost(plan)
     rows = sum(n for n, grad in r._plan_group_rows(plan) if grad)
     assert cost.checkpoint_input_gradient == rows * HIDDEN * 2
@@ -785,9 +819,91 @@ def test_only_a_covered_dense_model_prices_layouts(monkeypatch):
         assert (
             other._plan_group_layouts(other._plan_flat_forward(_cp_requests())) is None
         )
-    # No-grad plans and other topologies keep it too.
+    # No-grad plans are priced on layouts too; mixed plans are not.
     no_grad = [replace(q, no_grad=True) for q in _cp_requests()]
-    assert r._plan_group_layouts(r._plan_flat_forward(no_grad)) is None
+    assert r._plan_group_layouts(r._plan_flat_forward(no_grad)) is not None
+    mixed = [no_grad[0], *_cp_requests((700, 500))]
+    assert r._plan_group_layouts(r._plan_flat_forward(mixed)) is None
+
+
+def _short_and_branching(no_grad=False):
+    """64 short independent requests, then 8 continuations of one prefix."""
+    start, out = 0, []
+    for _ in range(64):
+        out.append(torch.arange(start, start + 40))
+        start += 40
+    prefix = torch.arange(start, start + 256)
+    out += [
+        torch.cat([prefix, torch.arange(9000 + 30 * i, 9030 + 30 * i)])
+        for i in range(8)
+    ]
+    return [
+        ForwardInput(input_tokens=t, hidden_states=True, no_grad=no_grad) for t in out
+    ]
+
+
+@pytest.mark.parametrize("no_grad", [False, True])
+def test_gdn_segment_states_are_priced_on_each_ranks_layouts(monkeypatch, no_grad):
+    r = art_cp(_dense_rank(), monkeypatch)
+    plan = r._plan_flat_forward(_short_and_branching(no_grad))
+    (layout,) = r._plan_group_layouts(plan)
+    # Every independent request and branch is a segment on some rank.
+    assert sum(layout.gdn_segments) >= 72
+    states = math.ceil(max(layout.gdn_segments) * r._gdn_segment_layer_bytes())
+    stateless = replace(layout, gdn_segments=())
+    monkeypatch.setattr(r, "_plan_group_layouts", lambda plan: (stateless,))
+    without = r._plan_cost(plan).required
+    monkeypatch.setattr(r, "_plan_group_layouts", lambda plan: (layout,))
+    with_states = r._plan_cost(plan).required
+    assert int(states * 1.1) // 2 < with_states - without <= int(states * 1.1) + 1
+
+
+def test_adapter_gradients_pair_with_each_ranks_boundaries(monkeypatch):
+    r = _at_cp2(_dense_rank())
+    policy = r._slot_ref("policy")
+    groups = ((100, True),)
+    layout = _GroupLayout((100, 40), None, (0, 0))
+    # Large pending gradients against small boundaries: rank 1 releases less.
+    pending = (8_000_000,) * LAYERS + (3_000_000,)
+    monkeypatch.setattr(r, "_pending_adapter_gradient_bytes", lambda refs: pending)
+    monkeypatch.setattr(
+        _impl, "_dense_mlp_recompute_bytes_per_token", lambda *a, **k: (STAGE, NO_GRAD)
+    )
+    floors = r._dense_layout_floors(groups, (policy,), (layout,))
+    boundaries = max(retained for retained, _ in floors)
+    workspace = max(map(sum, floors)) - boundaries
+    extras = [
+        r._adapter_gradient_walk([(pending, (HIDDEN * 2 * rows,) * LAYERS)])
+        for rows in layout.attention_rows
+    ]
+    expected = max(
+        rank_retained + max(rank_workspace, workspace) + extra
+        for (rank_retained, rank_workspace), extra in zip(floors, extras, strict=True)
+    ) - (boundaries + workspace)
+    assert expected > 0 and extras[1] > extras[0]
+    signature = _MemorySignature(CP2, (1, None), 1, (), True, (True,))
+    cost = r._subforward_cost(
+        packed_tokens=140,
+        output_bytes=0,
+        signature=signature,
+        logical_tokens=140,
+        group_rows=groups,
+        group_layouts=(layout,),
+        slot_refs=(policy,),
+    )
+    assert cost.checkpoint_adapter_gradient == expected
+
+
+def test_no_grad_pricing_needs_the_layout_gate():
+    """Without ART's CP attention and GDN islands, no-grad waves keep main's."""
+    dense, plain = _dense_rank(), _dense_rank(0, 0)
+    for r in (dense, plain):
+        r._topology_key = lambda: CP2
+    assert dense._dense_mlp_widths() != (0, 0)
+    assert not dense._layout_pricing_supported(CP2)
+    assert _no_grad_required(dense, (12_000, 8_000)) == _no_grad_required(
+        plain, (12_000, 8_000)
+    )
 
 
 def test_split_lower_bound_stays_below_the_exact_dense_price(monkeypatch):

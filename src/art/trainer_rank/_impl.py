@@ -29,7 +29,7 @@ import struct
 import threading
 import time
 import traceback
-from types import MethodType, TracebackType
+from types import FunctionType, MethodType, TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1150,6 +1150,8 @@ class _GroupLayout:
     # What each rank's recomputed CP attention keeps for backward beyond its
     # own-row activations (``retained_stage_record_bytes``).
     attention_retained: tuple[int, ...]
+    # Each rank's GDN segments, which hold recurrent states (none if unknown).
+    gdn_segments: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1783,6 +1785,14 @@ _TE_CUBLAS_WORKSPACE_BYTES = 5 * (32 * 2**20 + 1024)
 
 # Largest LoRA rank the dense stage prices (rank-wide intermediates included).
 _DENSE_LORA_RANK_LIMIT = 256
+# Packages whose module forwards the dense stage was traced through.
+_TRACED_PACKAGES = (
+    "torch.nn.",
+    "transformer_engine.",
+    "megatron.core.",
+    "megatron.bridge.",
+    "art.megatron.",
+)
 
 
 def _dense_no_grad_row_elements(
@@ -1858,10 +1868,22 @@ def _dense_mlp_recompute_bytes_per_token(
         return 0, 0
 
     def plain(module: Any, wrapper: Any = None, delegate: str = "") -> bool:
-        """No hooks, and no forward but the class's or ART's traced wrapper,
-        which must still call the class's own forward."""
+        """No hooks, a class forward from the traced packages, no instance
+        override of a class method (an executed helper such as
+        ``_forward_mlp``), and no forward but the class's or ART's traced
+        wrapper, which must still call the class's own forward."""
         forward = vars(module).get("forward")
-        if module._forward_hooks or module._forward_pre_hooks:
+        if (
+            module._forward_hooks
+            or module._forward_pre_hooks
+            or not type(module).forward.__module__.startswith(_TRACED_PACKAGES)
+            or any(
+                name != "forward"
+                and isinstance(value, (FunctionType, MethodType))
+                and isinstance(getattr(type(module), name, None), FunctionType)
+                for name, value in vars(module).items()
+            )
+        ):
             return False
         if forward is None:
             return True
@@ -3714,14 +3736,15 @@ class TrainerRank:
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
     ) -> _SubforwardCost:
+        dense = self._dense_layout_floors(group_rows, slot_refs, group_layouts)
+        if dense is None:
+            floor = self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments)
+        else:
+            # The largest rank's boundaries and the rest of the largest rank total.
+            boundaries = max(retained for retained, _ in dense)
+            floor = boundaries, max(map(sum, dense)) - boundaries
         checkpoint_memory = self._sequence_parallel_lora_floor(
-            self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments)
-            if group_layouts is None
-            else self._checkpoint_memory_floor(
-                group_rows, slot_refs, gdn_segments, group_layouts
-            ),
-            group_rows,
-            signature,
+            floor, group_rows, signature
         )
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
@@ -3757,7 +3780,6 @@ class TrainerRank:
         gradient = self._checkpoint_input_gradient_bytes(
             group_rows, checkpoint_retained
         )
-        dense = self._dense_layout_floors(group_rows, slot_refs, group_layouts)
         if dense is not None:
             # A covered dense model's recomputed layer holds one H-wide input
             # gradient at its peak (Qwen3.8-27B CP2 traces); each rank pairs
@@ -3785,6 +3807,9 @@ class TrainerRank:
         )
         if gradient and self._memory_profiles.get(signature) is None:
             checkpoint_workspace += self._cold_recompute_transient_bytes()
+        if gradient and dense is not None:
+            # TE's cuBLAS workspace persists beside whichever stage peaks.
+            checkpoint_workspace += self._te_workspace_growth_bytes()
         forward_required = required
         if gradient:
             required = max(
