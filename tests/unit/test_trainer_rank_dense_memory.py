@@ -172,16 +172,81 @@ def _at_cp2(r):
 
 
 def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
-    # A GDN/attention hybrid with ART's wrappers, as traced.
-    layers = [_dense_layer(gdn=index != 2) for index in range(3)]
+    from megatron.core.extensions.transformer_engine import (
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.transformer.identity_op import IdentityOp
+    from transformer_engine.pytorch import RMSNorm
+
+    from art.megatron import lora as lora_module
+    from art.megatron.context_parallel.core_attention import (
+        ArtContextParallelCoreAttention,
+    )
+    from art.megatron.flex_attn.attention import (
+        FlexAttentionWrapper,
+        FlexDotProductAttention,
+    )
+    from art.megatron.gdn.operator import _empty_safe_norm_forward
+
+    def wrapped(cls, name, child):
+        # An ART wrapper around its base (no adapters: those add rank terms).
+        module = _module(cls)
+        setattr(module, name, _module(child))
+        return module
+
+    def wrapped_norm():
+        norm: Any = _module(RMSNorm)
+        norm._art_empty_safe_norm_physical_forward = norm.forward
+        norm.forward = MethodType(_empty_safe_norm_forward, norm)
+        return norm
+
+    # A GDN/attention hybrid with every module class the real decoder builds
+    # (ART's CP and CP1 core attention included) and ART's wrappers, as traced.
+    layers = [_dense_layer(gdn=index < 2) for index in range(4)]
+    for index, layer in enumerate(layers):
+        layer.input_layernorm = _module(IdentityOp)
+        layer.pre_cross_attn_layernorm = _module(IdentityOp)
+        layer.pre_mlp_layernorm = _module(IdentityOp)
+        mixer = layer.self_attention
+        projection = lora_module.SelfAttentionLinearProjLoRA
+        if index < 2:
+            mixer.in_proj = wrapped(
+                lora_module.GatedDeltaNetInProjLoRA,
+                "in_proj",
+                TELayerNormColumnParallelLinear,
+            )
+            mixer.conv1d = torch.nn.Conv1d(4, 4, 4, groups=4)
+            mixer.out_norm = wrapped_norm()
+            mixer.out_proj = wrapped(projection, "linear_proj", TERowParallelLinear)
+            continue
+        mixer.linear_qkv = wrapped(
+            lora_module.SelfAttentionLinearQKVLoRA,
+            "linear_qkv",
+            TELayerNormColumnParallelLinear,
+        )
+        mixer.core_attention = (
+            wrapped(
+                ArtContextParallelCoreAttention, "dense_kernel", FlexAttentionWrapper
+            )
+            if index == 2
+            else wrapped(
+                FlexDotProductAttention, "flex_attention", FlexAttentionWrapper
+            )
+        )
+        mixer.linear_proj = wrapped(projection, "linear_proj", TERowParallelLinear)
+        mixer.q_layernorm, mixer.k_layernorm = wrapped_norm(), wrapped_norm()
+    adapter = layers[0].mlp.linear_fc1.gate_lora
+    adapter._slot_keys = {}
+    adapter._slot_modules = torch.nn.ModuleDict(
+        {"slot_0": _module(lora_module.LoRASlot)}
+    )
     for layer in layers:
         _wrap_like_art(layer)
     model = _dense_model(layers)
     assert _dense_mlp_recompute_bytes_per_token([model]) == (STAGE, NO_GRAD)
     # The decoder's final norm, untouched or behind ART's empty-safe wrapper.
-    from art.megatron.gdn.operator import _empty_safe_norm_forward
-
-    norm: Any = torch.nn.LayerNorm(HIDDEN)
+    norm: Any = _module(RMSNorm)
     model.decoder.final_layernorm = norm
     assert _dense_mlp_recompute_bytes_per_token([model]) == (STAGE, NO_GRAD)
     norm._art_empty_safe_norm_physical_forward = norm.forward
@@ -268,6 +333,9 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "mlp_norm",
         "custom_rng_tracker",
         "decoder_callback",
+        "sequential_norm",
+        "sequential_final_norm",
+        "sequential_linear_proj",
         "chunks",
     ],
 )
@@ -280,6 +348,7 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.transformer_block import TransformerBlock
     from megatron.core.transformer.transformer_layer import TransformerLayer
+    from transformer_engine.pytorch import RMSNorm
 
     from art.megatron import lora as lora_module
     from art.megatron.gdn import operator as gdn_operator
@@ -319,7 +388,7 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     def mixer_child(edit):
         # A child the mixer runs, such as its core attention or a norm.
         def apply():
-            child = torch.nn.LayerNorm(4)
+            child = _module(RMSNorm)
             edit(child)
             layer.self_attention.core_attention = child
 
@@ -328,7 +397,7 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     def final_norm(edit):
         # The decoder's final norm runs after the layers.
         def apply():
-            norm = torch.nn.LayerNorm(4)
+            norm = _module(RMSNorm)
             edit(norm)
             model.decoder.final_layernorm = norm
 
@@ -344,6 +413,13 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
 
     mlp_norm = _module(MLP)
     mlp_norm.activation_func = retaining
+
+    def sequential():
+        # Stock torch.nn forwards without callables or hooks, yet autograd
+        # retains its activations beyond the priced allowance.
+        return torch.nn.Sequential(
+            torch.nn.Linear(8, 8).requires_grad_(False), torch.nn.SiLU()
+        )
 
     def foreign_norm_delegate(norm):
         norm._art_empty_safe_norm_physical_forward = MethodType(lambda self, x: x, norm)
@@ -512,6 +588,14 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
             lambda: None,
         ),
         "decoder_callback": lambda: setattr(model.decoder, "callback", retaining),
+        "sequential_norm": lambda: setattr(layer, "input_layernorm", sequential()),
+        "sequential_final_norm": lambda: setattr(
+            model.decoder, "final_layernorm", sequential()
+        ),
+        # An untargeted projection slot, which no site check covers.
+        "sequential_linear_proj": lambda: setattr(
+            layer.self_attention, "linear_proj", sequential()
+        ),
         "chunks": lambda: None,
     }
     cleanup: list[Any] = []
@@ -814,7 +898,9 @@ def test_every_adapter_the_layer_runs_is_priced_beside_arts_norm_wrapper():
     # A mixer adapter keeps its rank-wide products beside the MLP's.
     layers[1].self_attention.qkv_lora = _adapter(lora_module, HIDDEN, HIDDEN, 32)
     # ART's empty-safe norm wrapper still calls the norm's own forward.
-    norm: Any = torch.nn.LayerNorm(HIDDEN)
+    from transformer_engine.pytorch import RMSNorm
+
+    norm: Any = _module(RMSNorm)
     norm._art_empty_safe_norm_physical_forward = norm.forward
     norm.forward = MethodType(_empty_safe_norm_forward, norm)
     layers[0].self_attention.q_layernorm = norm

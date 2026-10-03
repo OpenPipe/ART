@@ -1783,14 +1783,6 @@ def _hybridep_buffer_bytes(capacity: int, ranks: int, hidden: int, experts: int)
 _TE_CUBLAS_WORKSPACE_BYTES = 5 * (32 * 2**20 + 1024)
 # Largest LoRA rank the dense stage prices (rank-wide intermediates included).
 _DENSE_LORA_RANK_LIMIT = 256
-# Packages whose module forwards the dense stage was traced through.
-_TRACED_PACKAGES = (
-    "torch.nn.",
-    "transformer_engine.",
-    "megatron.core.",
-    "megatron.bridge.",
-    "art.megatron.",
-)
 
 
 def _dense_no_grad_row_elements(
@@ -1841,7 +1833,6 @@ def _dense_mlp_recompute_bytes_per_token(
         return 0, 0
     try:
         from megatron.core.extensions.transformer_engine import (
-            TEFusedResidualRMSNorm,
             TELayerNormColumnParallelLinear,
             TERowParallelLinear,
         )
@@ -1853,7 +1844,15 @@ def _dense_mlp_recompute_bytes_per_token(
         from megatron.core.transformer.mlp import MLP
         from megatron.core.transformer.transformer_block import TransformerBlock
         from megatron.core.transformer.transformer_layer import TransformerLayer
+        from transformer_engine.pytorch import RMSNorm
 
+        from art.megatron.context_parallel.core_attention import (
+            ArtContextParallelCoreAttention,
+        )
+        from art.megatron.flex_attn.attention import (
+            FlexAttentionWrapper,
+            FlexDotProductAttention,
+        )
         from art.megatron.gdn import operator as gdn_operator
         from art.megatron.gdn.operator import (
             _empty_safe_norm_forward,
@@ -1861,8 +1860,11 @@ def _dense_mlp_recompute_bytes_per_token(
             _prefix_tree_forward,
         )
         from art.megatron.lora import (
+            GatedDeltaNetInProjLoRA,
             LoRA,
+            LoRASlot,
             SelfAttentionLinearProjLoRA,
+            SelfAttentionLinearQKVLoRA,
             SharedExpertsLinearFC1LoRA,
             SharedExpertsLinearFC2LoRA,
         )
@@ -1886,11 +1888,10 @@ def _dense_mlp_recompute_bytes_per_token(
     }
 
     def plain(module: Any, wrapper: Any = None, delegate: str = "") -> bool:
-        """No hooks, a class forward from the traced packages, no plain
-        callable attribute but the stock ones above (such as a configured
-        activation, or an executed helper like ``_forward_mlp``), and no forward
-        but the class's or ART's traced wrapper, which must still call the
-        class's own forward."""
+        """An allowed class (below), no hooks, no plain callable attribute but
+        the stock ones above (such as a configured activation, or an executed
+        helper like ``_forward_mlp``), and no forward but the class's or ART's
+        traced wrapper, which must still call the class's own forward."""
         forward = vars(module).get("forward")
         if (
             module._forward_hooks
@@ -1899,9 +1900,7 @@ def _dense_mlp_recompute_bytes_per_token(
             or module._backward_pre_hooks
             # Megatron's CUDA-graph path dispatches on this attribute alone.
             or hasattr(module, "cudagraph_manager")
-            # Its hidden fused implementation is outside the walk; untraced.
-            or (TEFusedResidualRMSNorm and isinstance(module, TEFusedResidualRMSNorm))
-            or not type(module).forward.__module__.startswith(_TRACED_PACKAGES)
+            or type(module) not in allowed
             or any(
                 name not in ("forward", delegate)
                 and callable(value)
@@ -1939,6 +1938,33 @@ def _dense_mlp_recompute_bytes_per_token(
         pass
     else:
         mixers.add(Qwen3VLSelfAttention)
+
+    # Every module class the real Qwen3.8-27B decoder builds, by exact type:
+    # Megatron's layer, mixers, MLP, identities and TE projections and norms,
+    # GDN's convolution, ART's LoRA wrappers with their slot dict, and ART's CP
+    # (and CP1) core attention with its flex kernel.
+    allowed = mixers | {
+        TransformerBlock,
+        TransformerLayer,
+        IdentityOp,
+        IdentityFuncOp,
+        MLP,
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+        RMSNorm,
+        torch.nn.Conv1d,
+        torch.nn.ModuleDict,
+        LoRA,
+        LoRASlot,
+        SelfAttentionLinearQKVLoRA,
+        SelfAttentionLinearProjLoRA,
+        GatedDeltaNetInProjLoRA,
+        SharedExpertsLinearFC1LoRA,
+        SharedExpertsLinearFC2LoRA,
+        ArtContextParallelCoreAttention,
+        FlexDotProductAttention,
+        FlexAttentionWrapper,
+    }
 
     def traced(module: Any) -> bool:
         """``plain``, or ART's empty-safe norm wrapper around the class forward."""
@@ -2012,7 +2038,7 @@ def _dense_mlp_recompute_bytes_per_token(
             or vars(layer).get("bias_dropout_add_exec_handler") is not torch.enable_grad
             or type(getattr(layer, "cross_attn_bda", None)) is not IdentityFuncOp
             # Executed slots a spec could fill with a function: the stock
-            # cross attention, and GDN's activation and input projection.
+            # cross attention, and GDN's activation.
             or type(getattr(layer, "cross_attention", None)) is not IdentityOp
             or (
                 type(mixer) is GatedDeltaNet
@@ -2054,9 +2080,7 @@ def _dense_mlp_recompute_bytes_per_token(
                 return 0, 0
             if not isinstance(child, LoRA):
                 continue
-            if type(child) is not LoRA or any(
-                name in vars(child) for name in ("_slot", "active_lora_tensors")
-            ):
+            if any(name in vars(child) for name in ("_slot", "active_lora_tensors")):
                 return 0, 0
             tensors = _slot_lora_tensors(child, slot_ref)
             if tensors is None:
