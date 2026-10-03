@@ -244,7 +244,7 @@ def _find_admissible_forward(
         check = self._memory_check(plan)
     if check.fits:
         return plan, check
-    best = (plan, check)
+    best = cost_optimal = (plan, check)
     # Best effort before splitting: the memory-minimal (full sharing)
     # layouts may fit where the cost-optimal ones do not.
     plan = self._plan_flat_forward(
@@ -269,12 +269,18 @@ def _find_admissible_forward(
             f"{refusal_prefix}; a single request cannot be split",
         )
     if self._expert_parallel_active():
+        # EP cannot split internally, but either unsplit plan is supported.
+        # The opt-in relaxes GPU admission, never the host-memory budget.
+        oversized = getattr(self, "_allow_oversized_batches", False)
+        if oversized and not best[1].cpu_fits:
+            if cost_optimal[1].cpu_fits:
+                best = cost_optimal
+            elif check.cpu_fits:
+                best = (plan, check)
         return _impl._ForwardRefusal(
-            plan,
-            check,
+            *(best if oversized else (plan, check)),
             f"{refusal_prefix}; unable to find a feasible split: internal "
             "splitting is disabled under expert parallelism in this release",
-            overridable=False,
         )
     # A rejected lower bound normally avoids materializing the rung. If
     # ranks disagree on the opt-in, keep that original behavior everywhere
@@ -2003,8 +2009,8 @@ def _recover_admission_impl(
         assert refused is not None
         if admit_refusal is not None:
             # Only the exhausted memory-refusal path changes. Every peer
-            # must have a supported candidate; never override an EP or
-            # failed planning/runtime capability guard or host placement budget.
+            # must have a supported candidate; never override a failed
+            # planning/runtime capability guard or host placement budget.
             allowed = (
                 getattr(self, "_allow_oversized_batches", False)
                 and refused.overridable
