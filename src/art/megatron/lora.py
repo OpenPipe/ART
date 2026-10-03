@@ -26,6 +26,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.mappings import (
+    copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
@@ -421,18 +422,21 @@ def _compile_disabled_collective(function: _F) -> _F:
 _gather_lora_sequence_parallel_region = _compile_disabled_collective(
     gather_from_sequence_parallel_region
 )
+_copy_lora_tensor_model_parallel_region = _compile_disabled_collective(
+    copy_to_tensor_model_parallel_region
+)
 
 
 def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
     if _linear_disables_tensor_parallel_comm(linear):
         return x
-    if (
-        bool(getattr(linear, "sequence_parallel", False))
-        and int(getattr(linear, "tp_size", 1)) > 1
-    ):
+    if int(getattr(linear, "tp_size", 1)) <= 1:
+        return x
+    if bool(getattr(linear, "sequence_parallel", False)):
         # Torch 2.11 compiled autograd drops the gather's input-gradient edge.
         return _gather_lora_sequence_parallel_region(x)
-    return x
+    # The base column linear reduces only its own input cotangent.
+    return _copy_lora_tensor_model_parallel_region(x)
 
 
 def _set_lora_parallel_metadata(
