@@ -1888,10 +1888,10 @@ def _dense_mlp_recompute_bytes_per_token(
     }
 
     def plain(module: Any, wrapper: Any = None, delegate: str = "") -> bool:
-        """An allowed class (below), no hooks, no plain callable attribute but
-        the stock ones above (such as a configured activation, or an executed
-        helper like ``_forward_mlp``), and no forward but the class's or ART's
-        traced wrapper, which must still call the class's own forward."""
+        """No hooks, no plain callable attribute but the stock ones above (such
+        as a configured activation, or an executed helper like
+        ``_forward_mlp``), and no forward but the class's or ART's traced
+        wrapper, which must still call the class's own forward."""
         forward = vars(module).get("forward")
         if (
             module._forward_hooks
@@ -1900,7 +1900,6 @@ def _dense_mlp_recompute_bytes_per_token(
             or module._backward_pre_hooks
             # Megatron's CUDA-graph path dispatches on this attribute alone.
             or hasattr(module, "cudagraph_manager")
-            or type(module) not in allowed
             or any(
                 name not in ("forward", delegate)
                 and callable(value)
@@ -1939,46 +1938,96 @@ def _dense_mlp_recompute_bytes_per_token(
     else:
         mixers.add(Qwen3VLSelfAttention)
 
-    # Every module class the real Qwen3.8-27B decoder builds, by exact type:
-    # Megatron's layer, mixers, MLP, identities and TE projections and norms,
-    # GDN's convolution, ART's LoRA wrappers with their slot dict, and ART's CP
-    # (and CP1) core attention with its flex kernel.
-    allowed = mixers | {
-        TransformerBlock,
-        TransformerLayer,
-        IdentityOp,
-        IdentityFuncOp,
-        MLP,
-        TELayerNormColumnParallelLinear,
-        TERowParallelLinear,
-        RMSNorm,
-        torch.nn.Conv1d,
-        torch.nn.ModuleDict,
-        LoRA,
-        LoRASlot,
-        SelfAttentionLinearQKVLoRA,
-        SelfAttentionLinearProjLoRA,
-        GatedDeltaNetInProjLoRA,
-        SharedExpertsLinearFC1LoRA,
-        SharedExpertsLinearFC2LoRA,
-        ArtContextParallelCoreAttention,
-        FlexDotProductAttention,
-        FlexAttentionWrapper,
+    # The structure the real Qwen3.8-27B decoder builds: each allowed class
+    # (exact type; subclasses are unmeasured) with exactly the child slots its
+    # ``_modules`` may hold and the exact classes each slot allows (None:
+    # absent). "*" is any key of a container.
+    none, norm, lora = type(None), {RMSNorm}, {LoRA}
+    column, row = {TELayerNormColumnParallelLinear}, {TERowParallelLinear}
+    projection = {SelfAttentionLinearProjLoRA}
+    attention = {
+        "linear_qkv": column | {SelfAttentionLinearQKVLoRA},
+        "core_attention": {ArtContextParallelCoreAttention, FlexDotProductAttention},
+        "linear_proj": row | projection,
+        "q_layernorm": norm | {none},
+        "k_layernorm": norm | {none},
+    }
+    template: dict[type, Mapping[str, Iterable[type]]] = {
+        TransformerBlock: {
+            "layers": {torch.nn.ModuleList},
+            "final_layernorm": norm | {none},
+        },
+        torch.nn.ModuleList: {"*": {TransformerLayer}},
+        TransformerLayer: {
+            "input_layernorm": {IdentityOp},
+            "self_attention": mixers,
+            "pre_cross_attn_layernorm": {IdentityOp},
+            "cross_attention": {IdentityOp},
+            "cross_attn_bda": {IdentityFuncOp},
+            "pre_mlp_layernorm": {IdentityOp},
+            "mlp": {MLP},
+        },
+        **dict.fromkeys(mixers - {GatedDeltaNet}, attention),
+        GatedDeltaNet: {
+            "in_proj": column | {GatedDeltaNetInProjLoRA},
+            "conv1d": {torch.nn.Conv1d},
+            "out_norm": norm,
+            "out_proj": row | projection,
+        },
+        MLP: {
+            "linear_fc1": {SharedExpertsLinearFC1LoRA},
+            "linear_fc2": {SharedExpertsLinearFC2LoRA},
+        },
+        SharedExpertsLinearFC1LoRA: {
+            "linear_fc1": column,
+            "gate_lora": lora,
+            "up_lora": lora,
+        },
+        SharedExpertsLinearFC2LoRA: {"row_parallel_lora": projection},
+        SelfAttentionLinearProjLoRA: {"linear_proj": row, "lora": lora},
+        # Untargeted q, k or v projections hold no adapter.
+        SelfAttentionLinearQKVLoRA: {
+            "linear_qkv": column,
+            **dict.fromkeys(
+                ("q_proj_lora", "k_proj_lora", "v_proj_lora"), lora | {none}
+            ),
+        },
+        GatedDeltaNetInProjLoRA: {"in_proj": column, "qkv_lora": lora, "z_lora": lora},
+        LoRA: {"_slot_modules": {torch.nn.ModuleDict}},
+        torch.nn.ModuleDict: {"*": {LoRASlot}},
+        ArtContextParallelCoreAttention: {"dense_kernel": {FlexAttentionWrapper}},
+        FlexDotProductAttention: {"flex_attention": {FlexAttentionWrapper}},
+        **dict.fromkeys((IdentityOp, IdentityFuncOp, *column, *row, *norm), {}),
+        **dict.fromkeys((torch.nn.Conv1d, LoRASlot, FlexAttentionWrapper), {}),
+    }
+    # ART's traced forward wrappers, each still calling the class's forward.
+    wrappers = {
+        TransformerLayer: (
+            _gdn_island_layer_forward,
+            "_art_gdn_island_physical_forward",
+        ),
+        GatedDeltaNet: (_prefix_tree_forward, "_art_physical_forward"),
+        RMSNorm: (_empty_safe_norm_forward, "_art_empty_safe_norm_physical_forward"),
     }
 
-    def traced(module: Any) -> bool:
-        """``plain``, or ART's empty-safe norm wrapper around the class forward."""
-        return plain(module) or plain(
-            module, _empty_safe_norm_forward, "_art_empty_safe_norm_physical_forward"
+    def fits(module: Any) -> bool:
+        """``plain`` behind its class's wrapper (if any), holding exactly the
+        template's child slots, each an allowed class that fits in turn."""
+        slots = template.get(type(module))
+        if slots is None or not plain(module, *wrappers.get(type(module), (None, ""))):
+            return False
+        children = module._modules
+        return all(
+            type(child := children.get(name)) in slots.get(name, slots.get("*", ()))
+            and (child is None or fits(child))
+            for name in children.keys() | slots.keys() - {"*"}
         )
 
-    # The decoder and its final norm (run after the layers) are traced too.
-    final = getattr(decoder, "final_layernorm", None)
+    # The decoder, its layers and final norm, and all they hold.
     hooks = torch.nn.modules.module
     if (
         type(decoder) is not TransformerBlock
-        or not plain(decoder)
-        or (final is not None and not all(map(traced, final.modules())))
+        or not fits(decoder)
         # PyTorch's global module hooks and ART's GDN trace callbacks run
         # beside every covered module.
         or hooks._global_forward_hooks
@@ -2004,51 +2053,12 @@ def _dense_mlp_recompute_bytes_per_token(
     }
     width = hidden = rank = 0
     for layer in layers:
-        mlp = getattr(layer, "mlp", None)
-        config = getattr(mlp, "config", None)
-        fc1, fc2 = getattr(mlp, "linear_fc1", None), getattr(mlp, "linear_fc2", None)
-        row = getattr(fc2, "row_parallel_lora", None)
-        adapters = (
-            getattr(fc1, "gate_lora", None),
-            getattr(fc1, "up_lora", None),
-            getattr(row, "lora", None),
-        )
-        sites = (
-            (mlp, MLP),
-            (fc1, SharedExpertsLinearFC1LoRA),
-            (getattr(fc1, "linear_fc1", None), TELayerNormColumnParallelLinear),
-            (fc2, SharedExpertsLinearFC2LoRA),
-            (row, SelfAttentionLinearProjLoRA),
-            (getattr(row, "linear_proj", None), TERowParallelLinear),
-            *((adapter, LoRA) for adapter in adapters),
-        )
+        config = getattr(layer.mlp, "config", None)
+        fc1 = layer.mlp.linear_fc1
         ffn = getattr(config, "ffn_hidden_size", None)
         size = getattr(config, "hidden_size", None)
-        mixer = getattr(layer, "self_attention", None)
         if (
-            type(layer) is not TransformerLayer
-            or not plain(
-                layer, _gdn_island_layer_forward, "_art_gdn_island_physical_forward"
-            )
-            # Executed callables the layer holds as plain attributes: the traced
-            # spec's bias-dropout-add factory and grad context (its cross
-            # attention's is a module, walked below).
-            or vars(layer).get("self_attn_bda") is not get_bias_dropout_add
-            or vars(layer).get("mlp_bda") is not get_bias_dropout_add
-            or vars(layer).get("bias_dropout_add_exec_handler") is not torch.enable_grad
-            or type(getattr(layer, "cross_attn_bda", None)) is not IdentityFuncOp
-            # Executed slots a spec could fill with a function: the stock
-            # cross attention, and GDN's activation.
-            or type(getattr(layer, "cross_attention", None)) is not IdentityOp
-            or (
-                type(mixer) is GatedDeltaNet
-                and vars(mixer).get("act_fn") is not torch.nn.functional.silu
-            )
-            or type(mixer) not in mixers
-            or not plain(mixer, _prefix_tree_forward, "_art_physical_forward")
-            or any(type(site) is not cls for site, cls in sites)
-            or not all(plain(site) for site, _ in sites)
-            or type(ffn) is not int
+            type(ffn) is not int
             or ffn <= 0
             or type(size) is not int
             or size <= 0
@@ -2063,22 +2073,15 @@ def _dense_mlp_recompute_bytes_per_token(
             or getattr(config, "fp8", None)
             or getattr(config, "fp4", None)
             or getattr(config, "activation_func", None) is not torch.nn.functional.silu
-            or getattr(mlp, "activation_func", None) is not torch.nn.functional.silu
             or getattr(config, "activation_func_clamp_value", None) is not None
             or getattr(config, "glu_linear_offset", 0.0) != 0.0
         ):
             return 0, 0
-        # Everything else the layer runs, the mixer's children included, must
-        # be the traced execution too: no hooks, and no forward but ART's
-        # empty-safe norm wrapper. Every adapter must be an exact LoRA whose
-        # selector is the one execution uses, within the priced rank.
+        # Every adapter's selector must be the one execution uses, within the
+        # priced rank.
         layer_rank = 0
         for child in layer.modules():
-            if child is layer or child is mixer:
-                continue
-            if not traced(child):
-                return 0, 0
-            if not isinstance(child, LoRA):
+            if type(child) is not LoRA:
                 continue
             if any(name in vars(child) for name in ("_slot", "active_lora_tensors")):
                 return 0, 0

@@ -49,6 +49,7 @@ def _adapter(lora_module, inputs: int, outputs: int, rank: int = RANK):
     lora = _module(lora_module.LoRA)
     lora.A_T = torch.nn.Parameter(torch.empty(inputs, rank, dtype=torch.bfloat16))
     lora.B_T = torch.nn.Parameter(torch.empty(rank, outputs, dtype=torch.bfloat16))
+    lora._slot_modules = torch.nn.ModuleDict()
     return lora
 
 
@@ -107,13 +108,28 @@ def _dense_layer(gdn: bool = False) -> Any:
     from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
     from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 
+    from art.megatron.context_parallel.core_attention import (
+        ArtContextParallelCoreAttention,
+    )
+    from art.megatron.flex_attn.attention import FlexAttentionWrapper
+
     layer = _module(TransformerLayer)
-    layer.self_attention = _module(GatedDeltaNet if gdn else SelfAttention)
+    mixer = layer.self_attention = _module(GatedDeltaNet if gdn else SelfAttention)
     if gdn:
-        layer.self_attention.act_fn = torch.nn.functional.silu
-        layer.self_attention.in_proj = _module(TELayerNormColumnParallelLinear)
-        layer.self_attention.out_norm = _module(RMSNorm)
-        layer.self_attention.out_proj = _module(TERowParallelLinear)
+        mixer.act_fn = torch.nn.functional.silu
+        mixer.in_proj = _module(TELayerNormColumnParallelLinear)
+        mixer.conv1d = torch.nn.Conv1d(4, 4, 4, groups=4)
+        mixer.out_norm = _module(RMSNorm)
+        mixer.out_proj = _module(TERowParallelLinear)
+    else:
+        # Untargeted projections, ART's CP core attention and q/k norms.
+        mixer.linear_qkv = _module(TELayerNormColumnParallelLinear)
+        mixer.core_attention = _module(ArtContextParallelCoreAttention)
+        mixer.core_attention.dense_kernel = _module(FlexAttentionWrapper)
+        mixer.linear_proj = _module(TERowParallelLinear)
+        mixer.q_layernorm, mixer.k_layernorm = _module(RMSNorm), _module(RMSNorm)
+    for name in ("input_layernorm", "pre_cross_attn_layernorm", "pre_mlp_layernorm"):
+        setattr(layer, name, _module(IdentityOp))  # Fused into the projections.
     layer.mlp = mlp
     # The stock spec's bias-dropout-add factories, grad context and cross
     # attention.
@@ -176,71 +192,17 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         TELayerNormColumnParallelLinear,
         TERowParallelLinear,
     )
-    from megatron.core.transformer.identity_op import IdentityOp
     from transformer_engine.pytorch import RMSNorm
 
     from art.megatron import lora as lora_module
-    from art.megatron.context_parallel.core_attention import (
-        ArtContextParallelCoreAttention,
-    )
     from art.megatron.flex_attn.attention import (
         FlexAttentionWrapper,
         FlexDotProductAttention,
     )
     from art.megatron.gdn.operator import _empty_safe_norm_forward
 
-    def wrapped(cls, name, child):
-        # An ART wrapper around its base (no adapters: those add rank terms).
-        module = _module(cls)
-        setattr(module, name, _module(child))
-        return module
-
-    def wrapped_norm():
-        norm: Any = _module(RMSNorm)
-        norm._art_empty_safe_norm_physical_forward = norm.forward
-        norm.forward = MethodType(_empty_safe_norm_forward, norm)
-        return norm
-
-    # A GDN/attention hybrid with every module class the real decoder builds
-    # (ART's CP and CP1 core attention included) and ART's wrappers, as traced.
-    layers = [_dense_layer(gdn=index < 2) for index in range(4)]
-    for index, layer in enumerate(layers):
-        layer.input_layernorm = _module(IdentityOp)
-        layer.pre_cross_attn_layernorm = _module(IdentityOp)
-        layer.pre_mlp_layernorm = _module(IdentityOp)
-        mixer = layer.self_attention
-        projection = lora_module.SelfAttentionLinearProjLoRA
-        if index < 2:
-            mixer.in_proj = wrapped(
-                lora_module.GatedDeltaNetInProjLoRA,
-                "in_proj",
-                TELayerNormColumnParallelLinear,
-            )
-            mixer.conv1d = torch.nn.Conv1d(4, 4, 4, groups=4)
-            mixer.out_norm = wrapped_norm()
-            mixer.out_proj = wrapped(projection, "linear_proj", TERowParallelLinear)
-            continue
-        mixer.linear_qkv = wrapped(
-            lora_module.SelfAttentionLinearQKVLoRA,
-            "linear_qkv",
-            TELayerNormColumnParallelLinear,
-        )
-        mixer.core_attention = (
-            wrapped(
-                ArtContextParallelCoreAttention, "dense_kernel", FlexAttentionWrapper
-            )
-            if index == 2
-            else wrapped(
-                FlexDotProductAttention, "flex_attention", FlexAttentionWrapper
-            )
-        )
-        mixer.linear_proj = wrapped(projection, "linear_proj", TERowParallelLinear)
-        mixer.q_layernorm, mixer.k_layernorm = wrapped_norm(), wrapped_norm()
-    adapter = layers[0].mlp.linear_fc1.gate_lora
-    adapter._slot_keys = {}
-    adapter._slot_modules = torch.nn.ModuleDict(
-        {"slot_0": _module(lora_module.LoRASlot)}
-    )
+    # A GDN/attention hybrid with ART's wrappers, as traced.
+    layers = [_dense_layer(gdn=index != 2) for index in range(3)]
     for layer in layers:
         _wrap_like_art(layer)
     model = _dense_model(layers)
@@ -255,6 +217,42 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
     assert _dense_mlp_recompute_bytes_per_token([model], hidden_size=HIDDEN + 1) == (
         0,
         0,
+    )
+
+    def wrapped(name, base, slot, *adapters):
+        # An ART LoRA wrapper around its TE base, with its adapters.
+        module = _module(getattr(lora_module, name))
+        setattr(module, slot, _module(base))
+        for adapter in adapters:
+            setattr(module, adapter, _adapter(lora_module, HIDDEN, HIDDEN))
+        return module
+
+    # Targeted mixer projections (q and v only), ART's CP1 core attention, a
+    # LoRA slot and wrapped mixer norms: every class on the real path. Each
+    # adapter keeps its rank-wide products beside the MLP's.
+    gdn, attention = layers[0].self_attention, layers[2].self_attention
+    column, row = TELayerNormColumnParallelLinear, TERowParallelLinear
+    gdn.in_proj = wrapped(
+        "GatedDeltaNetInProjLoRA", column, "in_proj", "qkv_lora", "z_lora"
+    )
+    gdn.out_proj = wrapped("SelfAttentionLinearProjLoRA", row, "linear_proj", "lora")
+    attention.linear_qkv = wrapped(
+        "SelfAttentionLinearQKVLoRA", column, "linear_qkv", "q_proj_lora", "v_proj_lora"
+    )
+    attention.linear_proj = wrapped(
+        "SelfAttentionLinearProjLoRA", row, "linear_proj", "lora"
+    )
+    attention.core_attention = _module(FlexDotProductAttention)
+    attention.core_attention.flex_attention = _module(FlexAttentionWrapper)
+    for module in (gdn.out_norm, attention.q_layernorm):
+        module._art_empty_safe_norm_physical_forward = module.forward
+        module.forward = MethodType(_empty_safe_norm_forward, module)
+    slots = layers[1].mlp.linear_fc1.gate_lora._slot_modules
+    slots["slot_0"] = _module(lora_module.LoRASlot)
+    ranks = 2 * 6 * RANK
+    assert _dense_mlp_recompute_bytes_per_token([model]) == (
+        (7 * FFN + HIDDEN // 4 + ranks) * 2,
+        (6 * FFN + 4 * HIDDEN + HIDDEN // 4 + ranks) * 2,
     )
 
 
@@ -336,6 +334,11 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "sequential_norm",
         "sequential_final_norm",
         "sequential_linear_proj",
+        "stock_mlp_norm",
+        "stock_mlp_final_norm",
+        "te_linear_norm",
+        "te_linear_final_norm",
+        "extra_slot",
         "chunks",
     ],
 )
@@ -343,8 +346,11 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEFusedResidualRMSNorm,
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
     )
     from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.transformer_block import TransformerBlock
     from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -386,11 +392,11 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     custom = MethodType(lambda self, *a, **k: None, layer)
 
     def mixer_child(edit):
-        # A child the mixer runs, such as its core attention or a norm.
+        # A child the mixer runs: its q norm.
         def apply():
             child = _module(RMSNorm)
             edit(child)
-            layer.self_attention.core_attention = child
+            layer.self_attention.q_layernorm = child
 
         return apply
 
@@ -413,6 +419,12 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
 
     mlp_norm = _module(MLP)
     mlp_norm.activation_func = retaining
+
+    def projection(rank):
+        wrapper = _module(lora_module.SelfAttentionLinearProjLoRA)
+        wrapper.linear_proj = _module(TERowParallelLinear)
+        wrapper.lora = _adapter(lora_module, HIDDEN, HIDDEN, rank)
+        return wrapper
 
     def sequential():
         # Stock torch.nn forwards without callables or hooks, yet autograd
@@ -483,7 +495,7 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
             mlp.linear_fc1, "up_lora", _adapter(lora_module, HIDDEN, FFN, 512)
         ),
         "mixer_adapter_rank": lambda: setattr(
-            layer.self_attention, "qkv_lora", _adapter(lora_module, HIDDEN, HIDDEN, 512)
+            layer.self_attention, "linear_proj", projection(512)
         ),
         "mixer_child_hook": mixer_child(
             lambda child: child.register_forward_hook(lambda *args: None)
@@ -547,8 +559,9 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
             )
             for name in ("in_proj", "out_norm", "out_proj")
         },
-        "function_linear_proj": lambda: setattr(
-            layer.self_attention, "linear_proj", lambda *a: None
+        "function_linear_proj": lambda: (
+            delattr(layer.self_attention, "linear_proj"),
+            setattr(layer.self_attention, "linear_proj", lambda *a: None),
         ),
         "backward_hook": lambda: mlp.linear_fc1.register_full_backward_hook(
             lambda *a: None
@@ -596,6 +609,20 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         "sequential_linear_proj": lambda: setattr(
             layer.self_attention, "linear_proj", sequential()
         ),
+        # Stock modules of allowed classes in the wrong slot.
+        "stock_mlp_norm": lambda: setattr(
+            layer, "pre_mlp_layernorm", _dense_layer().mlp
+        ),
+        "stock_mlp_final_norm": lambda: setattr(
+            model.decoder, "final_layernorm", _dense_layer().mlp
+        ),
+        "te_linear_norm": lambda: setattr(
+            layer, "input_layernorm", _module(TELayerNormColumnParallelLinear)
+        ),
+        "te_linear_final_norm": lambda: setattr(
+            model.decoder, "final_layernorm", _module(TERowParallelLinear)
+        ),
+        "extra_slot": lambda: setattr(layer, "extra", _module(IdentityOp)),
         "chunks": lambda: None,
     }
     cleanup: list[Any] = []
@@ -879,35 +906,14 @@ def test_the_traced_qwen_attention_mixer_is_accepted():
     )
     layers = [_dense_layer(gdn=index != 1) for index in range(3)]
     qwen = _module(bridge.Qwen3VLSelfAttention)
+    for name, child in layers[1].self_attention.named_children():
+        setattr(qwen, name, child)
     layers[1].self_attention = qwen  # Overrides forward, as traced.
     for layer in layers:
         _wrap_like_art(layer)
     assert _dense_mlp_recompute_bytes_per_token([_dense_model(layers)]) == (
         STAGE,
         NO_GRAD,
-    )
-
-
-def test_every_adapter_the_layer_runs_is_priced_beside_arts_norm_wrapper():
-    from art.megatron import lora as lora_module
-    from art.megatron.gdn.operator import _empty_safe_norm_forward
-
-    layers = [_dense_layer(gdn=index != 2) for index in range(3)]
-    for layer in layers:
-        _wrap_like_art(layer)
-    # A mixer adapter keeps its rank-wide products beside the MLP's.
-    layers[1].self_attention.qkv_lora = _adapter(lora_module, HIDDEN, HIDDEN, 32)
-    # ART's empty-safe norm wrapper still calls the norm's own forward.
-    from transformer_engine.pytorch import RMSNorm
-
-    norm: Any = _module(RMSNorm)
-    norm._art_empty_safe_norm_physical_forward = norm.forward
-    norm.forward = MethodType(_empty_safe_norm_forward, norm)
-    layers[0].self_attention.q_layernorm = norm
-    ranks = 2 * (3 * RANK + 32)
-    assert _dense_mlp_recompute_bytes_per_token([_dense_model(layers)]) == (
-        (7 * FFN + HIDDEN // 4 + ranks) * 2,
-        (6 * FFN + 4 * HIDDEN + HIDDEN // 4 + ranks) * 2,
     )
 
 
