@@ -68,10 +68,20 @@ def test_submit_once_records_request_before_wait_and_actual_job(
     ci.write_json(tmp_path / "owner.json", owner)
     monkeypatch.setenv("SKY_INFRA", "k8s/unapproved")  # Use recorded ownership.
 
+    def launch(*args, **kwargs):
+        receipt = ci.read_bound(tmp_path, "cleanup.json", owner)
+        assert receipt["physical_absence"] == "UNKNOWN"
+        assert receipt["confirmed"] is False
+        return "request-17"
+
+    sky.launch.side_effect = launch
+
     def get(request):
         assert request == "request-17"
         assert ci.read_bound(tmp_path, "request.json", owner)["request_id"] == request
-        return 17, NS(cluster_name=owner["cluster"])
+        return 17, NS(
+            cluster_name=owner["cluster"], cluster_name_on_cloud="physical-suffix"
+        )
 
     sky.get.side_effect = get
     ci.worker(tmp_path, "launch")
@@ -86,6 +96,12 @@ def test_submit_once_records_request_before_wait_and_actual_job(
         task, cluster_name=owner["cluster"], retry_until_up=True
     )
     assert ci.read_bound(tmp_path, "job.json", owner)["job_id"] == 17
+    assert ci.read_bound(tmp_path, "physical.json", owner)["cloud_name"] == (
+        "physical-suffix"
+    )
+    assert ci.read_bound(tmp_path, "cleanup.json", owner)["physical_absence"] == (
+        "UNKNOWN"
+    )
     sky.tail_logs.assert_not_called()
 
 
@@ -247,7 +263,7 @@ def test_receipt_failure_still_cancels_and_preserves_error(
 
 def test_late_success_does_not_bypass_deadline(tmp_path, owner, monkeypatch):
     calls = scenario(monkeypatch, tmp_path, owner, ["SUCCEEDED"])
-    clock = iter([0, 0, 0, 2])
+    clock = iter([0, 0, 0, 0, 2])
     monkeypatch.setattr(ci.time, "monotonic", lambda: next(clock))
     with pytest.raises(TimeoutError):
         ci.supervise(tmp_path, owner, timeout=1)
@@ -759,6 +775,9 @@ def test_cleanup_resources_records_uids_and_confines_deletion(
         list_namespaced_pod=Mock(side_effect=[NS(items=[pod]), NS(items=[])]),
         list_namespaced_service=Mock(return_value=NS(items=[])),
         delete_namespaced_pod=Mock(),
+        read_namespaced_pod=Mock(
+            return_value=NS(metadata=NS(name="pod", namespace="ci", uid="replacement"))
+        ),
     )
     connection = NS(close=Mock())
 
@@ -800,3 +819,184 @@ def test_cleanup_resources_records_uids_and_confines_deletion(
             _request_timeout=(3, 10),
         )
     connection.close.assert_called_once()
+
+
+def test_handle_is_retained_before_job_receipt_failure(
+    tmp_path, owner, sky, monkeypatch
+):
+    sky.get.return_value = (
+        17,
+        NS(cluster_name=owner["cluster"], cluster_name_on_cloud="actual-cloud-suffix"),
+    )
+    write = ci.write_json
+
+    def fail_job(path, data):
+        if path.name == "job.json":
+            raise OSError("interrupted after handle")
+        write(path, data)
+
+    monkeypatch.setattr(ci, "write_json", fail_job)
+    with pytest.raises(OSError, match="after handle"):
+        ci.worker(tmp_path, "launch")
+    physical = ci.read_bound(tmp_path, "physical.json", owner)
+    assert physical["cloud_name"] == "actual-cloud-suffix"
+    assert physical["namespace"] == "default"
+    assert (
+        ci.read_bound(tmp_path, "cleanup.json", owner)["physical_absence"] == "UNKNOWN"
+    )
+
+
+def test_initial_identity_capture_precedes_job_polling(tmp_path, owner, monkeypatch):
+    calls = scenario(monkeypatch, tmp_path, owner, ["SUCCEEDED"])
+    assert ci.supervise(tmp_path, owner, poll_seconds=0) == 0
+    assert calls[:3] == ["launch", "resources", "status"]
+
+
+def test_initial_identity_failure_preserves_job_result(tmp_path, owner, monkeypatch):
+    scenario(
+        monkeypatch,
+        tmp_path,
+        owner,
+        ["SUCCEEDED"],
+        failures={"resources": subprocess.TimeoutExpired("resources", 20)},
+    )
+    assert ci.supervise(tmp_path, owner, poll_seconds=0) == 0
+
+
+def test_interrupted_provisioning_captures_ids_before_cancelling(
+    tmp_path, owner, monkeypatch
+):
+    ci.write_json(tmp_path / "allocation.json", {**owner, "namespace": "ci"})
+    ci.write_json(tmp_path / "launch-attempt.json", owner)
+    ci.write_json(tmp_path / "request.json", {**owner, "request_id": "request-17"})
+    calls = scenario(
+        monkeypatch, tmp_path, owner, [], failures={"launch": TimeoutError("launch")}
+    )
+    with pytest.raises(TimeoutError):
+        ci.supervise(tmp_path, owner)
+    assert calls == ["launch", "resources", "cancel_request"]
+
+
+@pytest.fixture
+def kube_receipts(tmp_path, owner, monkeypatch):
+    ci.write_json(tmp_path / "allocation.json", {**owner, "namespace": "ci"})
+    pod = NS(
+        metadata=NS(
+            name="physical-head",
+            uid="original-uid",
+            namespace="ci",
+            labels={
+                ci.LABEL: owner["label"],
+                "skypilot-cluster-name": "physical-suffix",
+            },
+        )
+    )
+
+    class ApiException(Exception):
+        def __init__(self, status):
+            self.status = status
+
+    api = NS(
+        list_namespaced_pod=Mock(return_value=NS(items=[pod])),
+        list_namespaced_service=Mock(return_value=NS(items=[])),
+        read_namespaced_pod=Mock(side_effect=ApiException(404)),
+        delete_namespaced_pod=Mock(),
+    )
+    connection = NS(close=Mock())
+    monkeypatch.setitem(
+        sys.modules,
+        "kubernetes",
+        NS(
+            client=NS(
+                CoreV1Api=lambda _: api,
+                ApiException=ApiException,
+                V1DeleteOptions=NS,
+                V1Preconditions=NS,
+            ),
+            config=NS(new_client_from_config=lambda **_: connection),
+        ),
+    )
+    return api, pod, ApiException
+
+
+def test_partial_resource_query_retains_exact_pod(tmp_path, owner, kube_receipts):
+    api, pod, _ = kube_receipts
+    api.list_namespaced_service.side_effect = OSError("service query unavailable")
+    with pytest.raises(OSError):
+        ci.resources(tmp_path, owner, delete=False)
+    receipt = ci.read_bound(tmp_path, "resources.json", owner)
+    assert receipt["observed"][0]["uid"] == pod.metadata.uid
+    assert receipt["observed"][0]["cloud_name"] == "physical-suffix"
+    assert receipt["remaining"] is None
+    assert receipt["exact_uid_absence"] == "UNKNOWN"
+
+
+@pytest.mark.parametrize("state", ["absent", "replaced", "relabelled", "forbidden"])
+def test_exact_uid_absence_requires_named_query(tmp_path, owner, kube_receipts, state):
+    api, pod, error = kube_receipts
+    ci.resources(tmp_path, owner, delete=False)
+    api.list_namespaced_pod.return_value = NS(items=[])
+    # A later empty pre-cleanup query must not discard the live-job receipt.
+    ci.resources(tmp_path, owner, delete=False)
+    if state in {"replaced", "relabelled"}:
+        api.read_namespaced_pod.side_effect = None
+        api.read_namespaced_pod.return_value = NS(
+            metadata=NS(
+                name=pod.metadata.name,
+                namespace="ci",
+                uid="new-uid" if state == "replaced" else pod.metadata.uid,
+            )
+        )
+    elif state == "forbidden":
+        api.read_namespaced_pod.side_effect = error(403)
+    if state in {"relabelled", "forbidden"}:
+        with pytest.raises((ValueError, error)):
+            ci.resources(tmp_path, owner, delete=True)
+    else:
+        ci.resources(tmp_path, owner, delete=True)
+    receipt = ci.read_bound(tmp_path, "resources-cleanup.json", owner)
+    assert receipt["exact_uid_absence"] == (
+        "ABSENT" if state in {"absent", "replaced"} else "UNKNOWN"
+    )
+    api.read_namespaced_pod.assert_called_once_with(
+        "physical-head", "ci", _request_timeout=(3, 10)
+    )
+    api.delete_namespaced_pod.assert_not_called()
+
+
+def test_empty_resource_history_is_unknown(tmp_path, owner, kube_receipts):
+    api, _, _ = kube_receipts
+    api.list_namespaced_pod.return_value = NS(items=[])
+    ci.resources(tmp_path, owner, delete=True)
+    assert (
+        ci.read_bound(tmp_path, "resources-cleanup.json", owner)["exact_uid_absence"]
+        == "UNKNOWN"
+    )
+
+
+@pytest.mark.parametrize("stop_api", [True, False])
+@pytest.mark.parametrize("receipt", [True, False])
+def test_cleanup_absence_requires_stopped_creator_and_uid_receipt(
+    tmp_path, owner, monkeypatch, stop_api, receipt
+):
+    ci.write_json(tmp_path / "launch-attempt.json", owner)
+    if receipt:
+        ci.write_json(
+            tmp_path / "resources-cleanup.json",
+            {
+                **owner,
+                "observed": [{"kind": "pod", "name": "pod", "uid": "original"}],
+                "remaining": [],
+                "exact_uid_absence": "ABSENT",
+            },
+        )
+
+    def run(root, operation, timeout):
+        if operation == "stop_api" and not stop_api:
+            raise TimeoutError("creator still running")
+
+    monkeypatch.setattr(ci, "run_worker", run)
+    assert ci.cleanup(tmp_path) == (0 if stop_api else 105)
+    assert ci.read_bound(tmp_path, "cleanup.json", owner)["physical_absence"] == (
+        "ABSENT" if stop_api and receipt else "UNKNOWN"
+    )

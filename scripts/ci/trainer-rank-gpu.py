@@ -53,6 +53,10 @@ def launch_task(root, owner):
         root / "allocation.json",
         {**owner, "namespace": kube_utils.get_namespace(context=context)},
     )
+    write_json(
+        root / "cleanup.json",
+        {**owner, "confirmed": False, "physical_absence": "UNKNOWN"},
+    )
     task = sky.Task.from_yaml("scripts/ci/trainer-rank-gpu.sky.yaml")
     task.set_resources_override(
         {
@@ -71,9 +75,21 @@ def resources(root, owner, *, delete):
 
     allocation = read_bound(root, "allocation.json", owner)
     namespace = allocation["namespace"]
+    retained = (
+        read_bound(root, "resources.json", allocation)["observed"]
+        if (root / "resources.json").exists()
+        else []
+    )
+    target = root / ("resources-cleanup.json" if delete else "resources.json")
+    receipt = {
+        **allocation,
+        "observed": retained,
+        "remaining": None,
+        "exact_uid_absence": "UNKNOWN",
+    }
+    write_json(target, receipt)
     connection = config.new_client_from_config(context=owner["infra"].split("/", 1)[1])
     api = client.CoreV1Api(connection)
-    retained = []
     try:
         while True:
             found = []
@@ -95,14 +111,36 @@ def resources(root, owner, *, delete):
                         "kind": kind,
                         "name": metadata.name,
                         "uid": metadata.uid,
+                        "cloud_name": metadata.labels.get("skypilot-cluster-name"),
                     }
                     found.append(identity)
                     if identity not in retained:
                         retained.append(identity)
-            write_json(
-                root / ("resources-cleanup.json" if delete else "resources.json"),
-                {**allocation, "observed": retained, "remaining": found},
-            )
+                        # Retain each UID even if the next resource query fails.
+                        write_json(target, receipt)
+            receipt["remaining"] = found
+            write_json(target, receipt)
+            if delete and not found:
+                # A removed nonce label is not proof that the original UID is gone.
+                for item in retained:
+                    try:
+                        current = getattr(api, f"read_namespaced_{item['kind']}")(
+                            item["name"], namespace, _request_timeout=(3, 10)
+                        ).metadata
+                    except client.ApiException as error:
+                        if error.status != 404:
+                            raise
+                    else:
+                        if (
+                            current.name != item["name"]
+                            or current.namespace != namespace
+                            or not current.uid
+                            or current.uid == item["uid"]
+                        ):
+                            raise ValueError("Original resource absence is unproven")
+                if retained:
+                    receipt["exact_uid_absence"] = "ABSENT"
+                    write_json(target, receipt)
             if not delete or not found:
                 return
             for item in found:
@@ -145,6 +183,16 @@ def worker(root, operation):
                 raise ValueError(
                     "Sky launch returned a different cluster or invalid job ID"
                 )
+            cloud_name = getattr(handle, "cluster_name_on_cloud", None)
+            write_json(
+                root / "physical.json",
+                {
+                    **read_bound(root, "allocation.json", owner),
+                    "cloud_name": cloud_name if isinstance(cloud_name, str) else None,
+                    "source": "sky.launch.handle",
+                    "namespace_source": "prelaunch_context_configuration",
+                },
+            )
             write_json(root / "job.json", {**owner, "job_id": job_id})
         except BaseException:
             try:
@@ -322,6 +370,10 @@ def supervise(root, owner, timeout=35 * 60, poll_seconds=10):
             min(deadline - time.monotonic(), owner["admission_deadline"] - time.time()),
         )
         job = read_bound(root, "job.json", owner)
+        try:
+            run_worker(root, "resources", min(20, deadline - time.monotonic()))
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+            print(f"::warning::Initial resource receipt failed: {error}", flush=True)
         while True:
             try:
                 run_worker(root, "status", min(30, deadline - time.monotonic()))
@@ -379,6 +431,9 @@ def supervise(root, owner, timeout=35 * 60, poll_seconds=10):
         operations = (["cancel"] if not terminal else []) + ["logs"] if job else []
         if job is None and (root / "request.json").exists():
             operations = ["cancel_request"]
+        if not terminal and (root / "allocation.json").exists():
+            # Cancellation may remove pending Pods before cleanup can observe them.
+            operations.insert(0, "resources")
         outcomes = {}
         for operation in operations:
             try:
@@ -457,8 +512,27 @@ def cleanup(root):
         except BaseException as error:
             outcomes[operation] = {"success": False, "error": repr(error)}
     confirmed = all(outcome["success"] for outcome in outcomes.values())
+    physical_absence = "UNKNOWN"
+    if outcomes["stop_api"]["success"] and outcomes["remove_resources"]["success"]:
+        try:
+            evidence = read_bound(root, "resources-cleanup.json", owner)
+            if (
+                evidence.get("observed")
+                and evidence.get("remaining") == []
+                and evidence.get("exact_uid_absence") == "ABSENT"
+            ):
+                physical_absence = "ABSENT"
+        except (OSError, ValueError, KeyError):
+            pass
     write_json(
-        root / "cleanup.json", {**owner, "confirmed": confirmed, "operations": outcomes}
+        root / "cleanup.json",
+        {
+            **owner,
+            "confirmed": confirmed,
+            "physical_absence": physical_absence,
+            "physical_absence_scope": "retained Pod and Service UIDs",
+            "operations": outcomes,
+        },
     )
     return 0 if confirmed else 105
 
