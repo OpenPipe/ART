@@ -146,7 +146,7 @@ jobs:
     timeout-minutes: 45
     environment: trainer-rank-gpu-validation
     env:
-      SKY_INFRA: k8s/${{ inputs.context || 'cks-wb3' }}
+      SKY_INFRA: k8s/${{ inputs.context || vars.TRAINER_RANK_GPU_CONTEXT || 'cks-wb3' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -172,7 +172,7 @@ jobs:
 
       - name: Configure Kubernetes
         env:
-          KUBECONFIG_VALUE: ${{ secrets[inputs.context == 'ext-collab2' && 'GPU_IMAGE_KUBECONFIG' || 'CKS_WB3_KUBECONFIG'] }}
+          KUBECONFIG_VALUE: ${{ secrets[env.SKY_INFRA == 'k8s/ext-collab2' && 'GPU_IMAGE_KUBECONFIG' || 'CKS_WB3_KUBECONFIG'] }}
         run: |
           set -euo pipefail
           case "${SKY_INFRA}" in

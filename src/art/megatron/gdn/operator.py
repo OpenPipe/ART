@@ -1516,6 +1516,9 @@ def _layout_token_uids_enabled() -> bool:
 def _set_active_routing_replay_layout(
     layout: Literal["attention", "gdn"],
 ) -> None:
+    from art.megatron.routed_experts import set_routing_layout
+
+    set_routing_layout(layout)
     controller = _active_routing_replay_controller()
     if controller is None:
         return
@@ -2339,6 +2342,7 @@ def run_gdn_bucket(
             output_final_state=output_final_state,
             use_qk_l2norm_in_kernel=False,
             cu_seqlens=None if dense_local_bucket else bucket.cu_seqlens,
+            cu_seqlens_cpu=None if dense_local_bucket else bucket.cu_seqlens_cpu,
         )
         if dense_local_bucket:
             recurrent_out = recurrent_out.reshape(

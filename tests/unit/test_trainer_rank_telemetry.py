@@ -56,6 +56,7 @@ def test_phase_reports_compile_attribution_and_recompiles(
         "seconds": 5.0,
         "synchronized": True,
         "signature": {"packed_tokens": 128},
+        "compile_scope": "torch._dynamo",
         "compile_status": "new_graph",
         "compile_seconds": 2.0,
         "compiles": [
@@ -149,6 +150,7 @@ def test_phase_without_compilation_reports_errors(
             "seconds": 3.0,
             "synchronized": False,
             "signature": {"checkpoint_count": 1},
+            "compile_scope": "torch._dynamo",
             "compile_status": "none",
             "compile_seconds": 0.0,
             "compiles": [],
@@ -222,6 +224,7 @@ def test_compile_finishing_after_phase_close_emits_attributed_event(
     assert events[0]["compiles"] == []
     assert events[1] == {
         "event": "compile",
+        "compile_scope": "torch._dynamo",
         "phase": "forward",
         "signature": {"packed_tokens": 96},
         "phase_closed": True,
