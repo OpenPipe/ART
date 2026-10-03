@@ -144,9 +144,25 @@ jobs:
             echo "### TrainerRank GPU validation not required" >> "${GITHUB_STEP_SUMMARY}"
           fi
 
+  api-enclosure:
+    name: Qualify CI API enclosure (CPU only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Qualify detached-child retirement without Sky or credentials
+        run: python3 scripts/ci/trainer_rank_api.py probe "${RUNNER_TEMP}/api-enclosure-probe"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: api-enclosure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/api-enclosure-probe
+
   validate:
     name: Run on 2x H200
-    needs: classify
+    needs: [classify, api-enclosure]
     if: needs.classify.outputs.required == 'true' && needs.classify.outputs.reused != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -156,6 +172,7 @@ jobs:
       queue: max
     environment: trainer-rank-gpu-validation
     env:
+      SKYPILOT_DISABLE_LOCAL_API_SERVER: "1"
       SKY_INFRA: k8s/${{ inputs.context || vars.TRAINER_RANK_GPU_CONTEXT || 'cks-wb3' }}
       EXPECTED_HEAD_SHA: ${{ needs.classify.outputs.head_sha }}
       ADMISSION_DEADLINE: ${{ needs.classify.outputs.admission_deadline }}
@@ -240,8 +257,6 @@ jobs:
           uv pip install --python "${sky_venv}/bin/python" \
             'skypilot[kubernetes,remote] @ git+https://github.com/OpenPipe/skypilot-modal.git@924100745348cb0d880ba9e1f64b4e54cb1c0898' \
             'kubernetes==34.1.0'
-          sky="${sky_venv}/bin/sky"
-          "${sky}" check kubernetes
           "${sky_venv}/bin/python" scripts/ci/trainer-rank-gpu.py \
             "${RUNNER_TEMP}/trainer-rank-result"
 
@@ -263,11 +278,12 @@ jobs:
 
   gate:
     name: trainer-rank-gpu-validation
-    needs: [classify, validate]
+    needs: [classify, api-enclosure, validate]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - env:
+          ENCLOSURE_RESULT: ${{ needs.api-enclosure.result }}
           CLASSIFY_RESULT: ${{ needs.classify.result }}
           REQUIRED: ${{ needs.classify.outputs.required }}
           REUSED: ${{ needs.classify.outputs.reused }}
@@ -275,6 +291,10 @@ jobs:
           RESULT: ${{ needs.validate.result }}
         run: |
           set -euo pipefail
+          if [ "${ENCLOSURE_RESULT}" != "success" ]; then
+            echo "CI API enclosure qualification failed." >&2
+            exit 1
+          fi
           if [ "${CLASSIFY_RESULT}" != "success" ]; then
             echo "TrainerRank GPU classification failed." >&2
             exit 1

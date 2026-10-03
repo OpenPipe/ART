@@ -3,8 +3,8 @@
 SkyPilot returns an actual job ID from launch. Each SDK operation runs in a
 bounded child; only that job's SUCCEEDED status passes. An always-run workflow
 step requests cancellation and checks retained resource UIDs. The admission
-deadline bounds the client wait, not provider creation. Successful API shutdown
-does not prove creator retirement; cleanup receipts keep that state UNKNOWN.
+deadline bounds the client wait, not provider creation. The owned API cgroup
+must be retired before the final retained-UID reconciliation.
 """
 
 import json
@@ -15,6 +15,8 @@ import subprocess
 import sys
 import time
 import uuid
+
+import trainer_rank_api as api_service
 
 NONTERMINAL = {"INIT", "PENDING", "SETTING_UP", "RUNNING"}
 INFRAS = {"k8s/cks-wb3", "k8s/ext-collab2"}
@@ -169,9 +171,21 @@ def resources(root, owner, *, delete):
 
 
 def worker(root, operation):
+    owner = json.loads((root / "owner.json").read_text())
+    if operation == "stop_api":
+        api_service.stop(root, owner)
+        return
+    if operation in {"resources", "remove_resources"}:
+        if operation == "remove_resources":
+            api_service.require_retired(root, owner)
+        resources(root, owner, delete=operation == "remove_resources")
+        return
+    api_service.client_environment(root, owner)
     import sky
 
-    owner = json.loads((root / "owner.json").read_text())
+    if operation == "check":
+        sky.get(sky.check(clouds=["kubernetes"]))
+        return
     cluster = owner["cluster"]
     if operation == "launch":
         task = launch_task(root, owner)
@@ -232,22 +246,6 @@ def worker(root, operation):
             raise ValueError("Sky returned a different cluster")
         if clusters:
             sky.get(sky.down(cluster))
-        return
-    if operation == "stop_api":
-        # This workflow owns the entire ephemeral runner and its local API.
-        # Best-effort shutdown: the SDK snapshots descendants before killing
-        # the parent, so an absent API process does not prove creator retirement.
-        if (
-            os.environ.get("GITHUB_ACTIONS") != "true"
-            or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
-        ):
-            raise ValueError("API cleanup requires an isolated GitHub-hosted runner")
-        sky.api_stop()  # The maintained SDK rejects remote API endpoints.
-        if sky.api_status(all_status=True, limit=1):
-            raise RuntimeError("The CI API still reports requests after stopping")
-        return
-    if operation in {"resources", "remove_resources"}:
-        resources(root, owner, delete=operation == "remove_resources")
         return
     job_id = read_bound(root, "job.json", owner)["job_id"]
     if operation == "status":
@@ -435,16 +433,26 @@ def supervise(root, owner, timeout=35 * 60, poll_seconds=10):
                 job = read_bound(root, "job.json", owner)
             except Exception:
                 pass
-        operations = (["cancel"] if not terminal else []) + ["logs"] if job else []
-        if job is None and (root / "request.json").exists():
-            operations = ["cancel_request"]
-        if not terminal and (root / "allocation.json").exists():
-            # Request cancellation before diagnostics can prolong capacity wait.
-            operations.insert(1, "resources")
+        operations = ["logs"] if terminal else []
+        if not terminal:
+            if job:
+                operations.append("cancel")
+            elif (root / "request.json").exists():
+                operations.append("cancel_request")
+            # Retire creators before any census, logs, or teardown delays. A
+            # terminal cancellation receipt alone does not join SDK executors.
+            operations.append("stop_api")
         outcomes = {}
         for operation in operations:
             try:
-                run_worker(root, operation, 30)
+                run_worker(
+                    root,
+                    operation,
+                    min(
+                        5 if operation.startswith("cancel") else 30,
+                        owner["cleanup_deadline"] - time.time(),
+                    ),
+                )
                 outcomes[operation] = {"success": True}
             except Exception as error:
                 outcomes[operation] = {"success": False, "error": repr(error)}
@@ -501,30 +509,51 @@ def admit(root):
 
 
 def cleanup(root):
-    if not (root / "launch-attempt.json").exists():
+    if (
+        not (root / "api-plan.json").exists()
+        and not (root / "launch-attempt.json").exists()
+    ):
         return 0
     owner = json.loads((root / "owner.json").read_text())
-
-    read_bound(root, "launch-attempt.json", owner)
+    if (root / "launch-attempt.json").exists():
+        read_bound(root, "launch-attempt.json", owner)
+    terminal = False
+    try:
+        result = read_bound(root, "result.json", owner)
+        terminal = result["status"] in EXIT_CODES and result["status"] is not None
+        read_bound(root, "job.json", owner)
+    except (OSError, ValueError, KeyError):
+        terminal = False
+    operations = []
+    if not (root / "api-retired.json").exists():
+        if terminal:
+            operations.append(("down", 90))
+        elif (root / "request.json").exists():
+            operations.append(("cancel_request", 5))
+        elif (root / "job.json").exists():
+            operations.append(("cancel", 5))
+    operations.append(("stop_api", 30))
+    if (root / "allocation.json").exists():
+        operations.append(("remove_resources", 90))
     outcomes = {}
-    # A failed/unknown cancellation must not prevent best-effort physical cleanup.
-    for operation, limit in [
-        ("cancel_request", 30),
-        ("resources", 20),
-        ("down", 90),
-        ("stop_api", 30),
-        ("remove_resources", 90),
-    ]:
+    retired = False
+    for operation, limit in operations:
         try:
+            if operation == "remove_resources":
+                # Do not reconcile final absence while creators may still run.
+                api_service.require_retired(root, owner)
             run_worker(
                 root, operation, min(limit, owner["cleanup_deadline"] - time.time())
             )
+            if operation == "stop_api":
+                api_service.require_retired(root, owner)
+                retired = True
             outcomes[operation] = {"success": True}
         except BaseException as error:
             outcomes[operation] = {"success": False, "error": repr(error)}
     operations_succeeded = all(outcome["success"] for outcome in outcomes.values())
     physical_absence = "UNKNOWN"
-    if outcomes["remove_resources"]["success"]:
+    if outcomes.get("remove_resources", {}).get("success"):
         try:
             evidence = read_bound(root, "resources-cleanup.json", owner)
             if (
@@ -542,7 +571,8 @@ def cleanup(root):
             "operations_succeeded": operations_succeeded,
             "physical_absence": physical_absence,
             "physical_absence_scope": "retained Pod and Service UIDs",
-            "creator_quiescence": "UNKNOWN",
+            "creator_quiescence": "RETIRED" if retired else "UNKNOWN",
+            "creator_quiescence_scope": "owned local API cgroup; excludes provider in-flight requests",
             "operations": outcomes,
         },
     )
@@ -567,6 +597,8 @@ def main(root):
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, interrupted)
+    api_service.start(root, owner)
+    run_worker(root, "check", min(60, owner["admission_deadline"] - time.time()))
     return supervise(root, owner, timeout=max(0, owner["work_deadline"] - time.time()))
 
 

@@ -15,10 +15,18 @@ from unittest.mock import Mock
 import pytest
 
 SCRIPT = Path(__file__).parents[2] / "scripts/ci/trainer-rank-gpu.py"
+sys.path.insert(0, str(SCRIPT.parent))
 spec = importlib.util.spec_from_file_location("trainer_rank_gpu_ci", SCRIPT)
 assert spec is not None and spec.loader is not None
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+
+
+@pytest.fixture(autouse=True)
+def service_boundary(monkeypatch):
+    # Service controls have dedicated file-backed tests; never create a unit here.
+    for name in ("start", "client_environment", "require_retired"):
+        monkeypatch.setattr(ci.api_service, name, Mock())
 
 
 @pytest.fixture
@@ -204,7 +212,7 @@ def test_remote_terminal_result_controls_exit(
     calls = scenario(monkeypatch, tmp_path, owner, ["SETTING_UP", "RUNNING", status])
     assert ci.supervise(tmp_path, owner, poll_seconds=0) == code
     assert calls.count("launch") == 1
-    assert calls[-1] == "logs"
+    assert calls[-1] == ("logs" if status is not None else "stop_api")
     assert ("cancel" in calls) is (status is None)
     assert json.loads((tmp_path / "result.json").read_text())["status"] == status
 
@@ -243,7 +251,7 @@ def test_interruption_attempts_exact_cancel_and_logs(
     with pytest.raises(type(error)) as raised:
         ci.supervise(tmp_path, owner, poll_seconds=0)
     assert raised.value is error
-    assert calls[-2:] == ["cancel", "logs"]
+    assert calls[-2:] == ["cancel", "stop_api"]
 
 
 def test_repeated_query_failure_and_cleanup_errors_preserve_primary(
@@ -261,7 +269,7 @@ def test_repeated_query_failure_and_cleanup_errors_preserve_primary(
         ci.supervise(tmp_path, owner, poll_seconds=0)
     assert raised.value is primary
     assert calls.count("status") == 3
-    assert calls[-2:] == ["cancel", "logs"]
+    assert calls[-2:] == ["cancel", "stop_api"]
 
 
 def test_receipt_failure_still_cancels_and_preserves_error(
@@ -280,7 +288,7 @@ def test_receipt_failure_still_cancels_and_preserves_error(
     with pytest.raises(OSError) as raised:
         ci.supervise(tmp_path, owner, poll_seconds=0)
     assert raised.value is primary
-    assert calls[-2:] == ["cancel", "logs"]
+    assert calls[-2:] == ["cancel", "stop_api"]
 
 
 def test_late_success_does_not_bypass_deadline(tmp_path, owner, monkeypatch):
@@ -289,7 +297,7 @@ def test_late_success_does_not_bypass_deadline(tmp_path, owner, monkeypatch):
     monkeypatch.setattr(ci.time, "monotonic", lambda: next(clock))
     with pytest.raises(TimeoutError):
         ci.supervise(tmp_path, owner, timeout=1)
-    assert calls[-2:] == ["cancel", "logs"]
+    assert calls[-2:] == ["cancel", "stop_api"]
 
 
 def test_real_bounded_child_kills_waiting_fork_descendant(tmp_path):
@@ -377,7 +385,11 @@ def test_launch_timeout_cancels_only_recorded_request(
     with pytest.raises(TimeoutError) as raised:
         ci.supervise(tmp_path, owner)
     assert raised.value is error
-    assert calls == (["launch", "cancel_request"] if known_request else ["launch"])
+    assert calls == [
+        "launch",
+        *(["cancel_request"] if known_request else []),
+        "stop_api",
+    ]
     # A lost launch reply does not prove the remote test never started.
     assert ci.read_bound(tmp_path, "result.json", owner)["status"] == (
         "UNCONFIRMED" if attempted else "NOT_RUN"
@@ -396,7 +408,7 @@ def test_capacity_wait_uses_original_admission_expiry(tmp_path, owner, monkeypat
     monkeypatch.setattr(ci, "run_worker", run)
     with pytest.raises(TimeoutError):
         ci.supervise(tmp_path, owner, timeout=2100)
-    assert calls == [("launch", 7)]
+    assert calls == [("launch", 7), ("stop_api", 30)]
 
 
 @pytest.mark.parametrize(
@@ -432,6 +444,13 @@ def test_main_rejects_invalid_scope_before_launch(tmp_path, monkeypatch, key, va
 @pytest.mark.parametrize("infra", ["k8s/cks-wb3", "k8s/ext-collab2"])
 def test_real_worker_round_trip_with_fake_sdk(tmp_path, infra):
     """Exercise the actual direct Python parent/worker JSON transport, without Sky."""
+    (tmp_path / "sitecustomize.py").write_text(f"""
+import sys
+sys.path.insert(0, {str(SCRIPT.parent)!r})
+import trainer_rank_api
+trainer_rank_api.start = lambda *a, **kw: None
+trainer_rank_api.client_environment = lambda *a, **kw: None
+""")
     (tmp_path / "sky.py").write_text("""
 import os
 import socket
@@ -460,6 +479,7 @@ def get(value):
     if value == "launch-request":
         return 17, NS(cluster_name=Path(os.environ["FAKE_CLUSTER"]).read_text())
     return value
+def check(**kwargs): return "checked"
 def job_status(cluster, *, job_ids):
     assert job_ids == [17]
     return {17:NS(value="SUCCEEDED")}
@@ -678,6 +698,7 @@ def test_setup_consumes_original_admitted_work_window(tmp_path, monkeypatch):
     now[0] = 400
     run = Mock(return_value=0)
     monkeypatch.setattr(ci, "supervise", run)
+    monkeypatch.setattr(ci, "run_worker", Mock())
     assert ci.main(root) == 0
     assert run.call_args.kwargs["timeout"] == 1800
     assert json.loads((root / "owner.json").read_text())["cleanup_deadline"] == 2500
@@ -742,6 +763,8 @@ def test_request_cancellation_does_not_claim_unknown_terminal(
 
 def test_cleanup_is_finite_and_reports_unknown_cancel(tmp_path, owner, monkeypatch):
     ci.write_json(tmp_path / "launch-attempt.json", owner)
+    ci.write_json(tmp_path / "request.json", {**owner, "request_id": "request"})
+    ci.write_json(tmp_path / "allocation.json", owner)
     now = [owner["cleanup_deadline"] - 5]
     monkeypatch.setattr(ci.time, "time", lambda: now[0])
     calls = []
@@ -756,43 +779,36 @@ def test_cleanup_is_finite_and_reports_unknown_cancel(tmp_path, owner, monkeypat
     assert ci.cleanup(tmp_path) == 105
     assert calls == [
         ("cancel_request", 5),
-        ("resources", 4),
-        ("down", 3),
-        ("stop_api", 2),
-        ("remove_resources", 1),
+        ("stop_api", 4),
+        ("remove_resources", 3),
     ]
     receipt = ci.read_bound(tmp_path, "cleanup.json", owner)
     assert receipt["operations_succeeded"] is False
-    assert receipt["creator_quiescence"] == "UNKNOWN"
+    assert receipt["creator_quiescence"] == "RETIRED"
     assert receipt["operations"]["remove_resources"]["success"] is True
 
 
-def test_api_cleanup_is_limited_to_its_ephemeral_runner(
+def test_api_cleanup_uses_owned_enclosure_without_sdk_shutdown(
     tmp_path, owner, sky, monkeypatch
 ):
-    monkeypatch.setenv("GITHUB_ACTIONS", "true")
-    monkeypatch.setenv("RUNNER_ENVIRONMENT", "self-hosted")
-    with pytest.raises(ValueError, match="isolated GitHub-hosted"):
-        ci.worker(tmp_path, "stop_api")
-    sky.api_stop.assert_not_called()
-    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
-    sky.api_status.return_value = []
+    stop = Mock()
+    monkeypatch.setattr(ci.api_service, "stop", stop)
     ci.worker(tmp_path, "stop_api")
-    sky.api_stop.assert_called_once_with()
+    stop.assert_called_once_with(tmp_path, owner)
+    sky.api_stop.assert_not_called()
+    sky.api_status.assert_not_called()
 
 
-def test_api_cleanup_detects_surviving_server_with_only_terminal_requests(
-    tmp_path, owner, sky, monkeypatch
-):
-    monkeypatch.setenv("GITHUB_ACTIONS", "true")
-    monkeypatch.setenv("RUNNER_ENVIRONMENT", "github-hosted")
-    sky.api_status.side_effect = lambda **options: (
-        [NS(request_id="request-17", status="CANCELLED")]
-        if options.get("all_status")
-        else []
+def test_missing_enclosure_blocks_check_and_launch(tmp_path, owner, sky, monkeypatch):
+    monkeypatch.setattr(
+        ci.api_service,
+        "client_environment",
+        Mock(side_effect=ValueError("unowned API")),
     )
-    with pytest.raises(RuntimeError, match="still reports requests"):
-        ci.worker(tmp_path, "stop_api")
+    for operation in ("check", "launch"):
+        with pytest.raises(ValueError, match="unowned API"):
+            ci.worker(tmp_path, operation)
+    sky.launch.assert_not_called()
 
 
 @pytest.mark.parametrize("foreign", [False, True])
@@ -924,7 +940,7 @@ def test_interrupted_provisioning_cancels_before_diagnostics(
     with pytest.raises(TimeoutError):
         ci.supervise(tmp_path, owner)
     assert late_jobs == []
-    assert calls == ["launch", "cancel_request", "resources"]
+    assert calls == ["launch", "cancel_request", "stop_api"]
 
 
 @pytest.fixture
@@ -1026,10 +1042,15 @@ def test_empty_resource_history_is_unknown(tmp_path, owner, kube_receipts):
 
 @pytest.mark.parametrize("stop_api", [True, False])
 @pytest.mark.parametrize("receipt", [True, False])
-def test_cleanup_distinguishes_uid_absence_from_unknown_creator_lifetime(
+def test_cleanup_requires_creator_retirement_before_uid_reconciliation(
     tmp_path, owner, monkeypatch, stop_api, receipt
 ):
     ci.write_json(tmp_path / "launch-attempt.json", owner)
+    ci.write_json(tmp_path / "allocation.json", owner)
+    if not stop_api:
+        monkeypatch.setattr(
+            ci.api_service, "require_retired", Mock(side_effect=ValueError("unproven"))
+        )
     if receipt:
         ci.write_json(
             tmp_path / "resources-cleanup.json",
@@ -1049,6 +1070,87 @@ def test_cleanup_distinguishes_uid_absence_from_unknown_creator_lifetime(
     assert ci.cleanup(tmp_path) == (0 if stop_api else 105)
     result = ci.read_bound(tmp_path, "cleanup.json", owner)
     assert result["operations_succeeded"] is stop_api
-    assert result["creator_quiescence"] == "UNKNOWN"
-    assert result["physical_absence"] == ("ABSENT" if receipt else "UNKNOWN")
+    assert result["creator_quiescence"] == ("RETIRED" if stop_api else "UNKNOWN")
+    assert result["physical_absence"] == (
+        "ABSENT" if receipt and stop_api else "UNKNOWN"
+    )
     assert result["physical_absence_scope"] == "retained Pod and Service UIDs"
+
+
+@pytest.mark.parametrize("status", ["SUCCEEDED", "FAILED", "CANCELLED"])
+def test_completed_launch_teardown_precedes_creator_retirement(
+    tmp_path, owner, monkeypatch, status
+):
+    ci.write_json(tmp_path / "launch-attempt.json", owner)
+    ci.write_json(tmp_path / "job.json", {**owner, "job_id": 17})
+    ci.write_json(tmp_path / "result.json", {**owner, "job_id": 17, "status": status})
+    ci.write_json(tmp_path / "allocation.json", owner)
+    calls = []
+
+    def run(root, operation, timeout):
+        calls.append((operation, timeout))
+
+    monkeypatch.setattr(ci, "run_worker", run)
+    assert ci.cleanup(tmp_path) == 0
+    assert calls == [("down", 90), ("stop_api", 30), ("remove_resources", 90)]
+
+
+def test_lost_launch_and_cancel_failure_retire_before_any_diagnostics(
+    tmp_path, owner, monkeypatch
+):
+    ci.write_json(tmp_path / "launch-attempt.json", owner)
+    ci.write_json(tmp_path / "request.json", {**owner, "request_id": "request"})
+    ci.write_json(tmp_path / "allocation.json", owner)
+    calls = []
+
+    def run(root, operation, timeout):
+        calls.append(operation)
+        if operation in {"launch", "cancel_request"}:
+            raise TimeoutError(operation)
+        if operation == "stop_api":
+            ci.write_json(root / "api-retired.json", owner)
+
+    monkeypatch.setattr(ci, "run_worker", run)
+    with pytest.raises(TimeoutError):
+        ci.supervise(tmp_path, owner)
+    assert calls == ["launch", "cancel_request", "stop_api"]
+    assert ci.cleanup(tmp_path) == 0
+    assert calls[-2:] == ["stop_api", "remove_resources"]
+
+
+def test_startup_failure_without_launch_still_retires_owned_service(
+    tmp_path, owner, monkeypatch
+):
+    ci.write_json(tmp_path / "api-plan.json", owner)
+    run = Mock()
+    monkeypatch.setattr(ci, "run_worker", run)
+    assert ci.cleanup(tmp_path) == 0
+    assert run.call_args.args[1:] == ("stop_api", 30)
+
+
+def test_missing_retirement_receipt_blocks_direct_cleanup(tmp_path, owner, monkeypatch):
+    ci.write_json(tmp_path / "launch-attempt.json", owner)
+    ci.write_json(tmp_path / "allocation.json", owner)
+    monkeypatch.setattr(
+        ci.api_service, "require_retired", Mock(side_effect=FileNotFoundError)
+    )
+    run = Mock()
+    monkeypatch.setattr(ci, "run_worker", run)
+    assert ci.cleanup(tmp_path) == 105
+    assert [call.args[1] for call in run.call_args_list] == ["stop_api"]
+    receipt = ci.read_bound(tmp_path, "cleanup.json", owner)
+    assert receipt["creator_quiescence"] == receipt["physical_absence"] == "UNKNOWN"
+
+
+def test_unsupported_enclosure_blocks_sky_check_and_submission(
+    tmp_path, owner, monkeypatch
+):
+    monkeypatch.setattr(
+        ci.api_service, "start", Mock(side_effect=ValueError("unsupported enclosure"))
+    )
+    run = Mock()
+    monkeypatch.setattr(ci, "run_worker", run)
+    with pytest.raises(ValueError, match="unsupported enclosure"):
+        ci.main(tmp_path)
+    run.assert_not_called()
+    assert not (tmp_path / "launch-attempt.json").exists()
