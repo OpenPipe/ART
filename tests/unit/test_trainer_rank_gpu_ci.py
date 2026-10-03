@@ -412,10 +412,20 @@ def test_real_worker_round_trip_with_fake_sdk(tmp_path, infra):
     """Exercise the actual direct Python parent/worker JSON transport, without Sky."""
     (tmp_path / "sky.py").write_text("""
 import os
+import socket
 import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
+def deny_network(*args, **kwargs): raise AssertionError("Fake SDK worker must stay offline")
+socket.socket.connect = socket.getaddrinfo = deny_network
 sys.modules["sky.provision.kubernetes"] = NS(utils=NS(get_namespace=lambda **_: "default"))
+sys.modules["kubernetes"] = NS(
+    client=NS(CoreV1Api=lambda _: NS(
+        list_namespaced_pod=lambda *a, **kw: NS(items=[]),
+        list_namespaced_service=lambda *a, **kw: NS(items=[]),
+    )),
+    config=NS(new_client_from_config=lambda **kw: NS(close=lambda: None)),
+)
 class Task:
     @classmethod
     def from_yaml(cls, path): return cls()
@@ -464,6 +474,7 @@ def tail_logs(cluster, *, job_id, follow):
     assert result.returncode == 0, result.stderr
     assert json.loads((root / "result.json").read_text())["job_id"] == 17
     assert json.loads((root / "result.json").read_text())["infra"] == infra
+    assert json.loads((root / "resources.json").read_text())["remaining"] == []
     assert "fake complete log" in (root / "logs.log").read_text()
 
 
