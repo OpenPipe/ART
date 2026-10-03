@@ -1,16 +1,4 @@
-"""TrainerRank micro-batch planning, split search and admission.
-
-These are ``TrainerRank`` method bodies moved out of ``_impl`` verbatim: each
-function takes the owning rank as ``self`` and ``TrainerRank`` binds them as
-methods, so ``self._x(...)`` dispatch and per-instance overrides keep working.
-
-Module globals the bodies used to read from ``_impl`` (``torch``, ``dist``,
-``time``, ``_telemetry_phase``, sibling helpers, plan/cost types) are still
-resolved through ``_impl`` at call time, so tests that patch ``_impl.dist`` and
-friends keep intercepting them. Only pure stdlib helpers and prefix-tree /
-planner-cost functions that nothing patches are imported here directly.
-Referencing ``_impl`` as a module also lets the circular import resolve lazily.
-"""
+"""TrainerRank micro-batch planning, split search and admission."""
 
 from __future__ import annotations
 
@@ -73,7 +61,7 @@ if TYPE_CHECKING:
     )
 
 
-def _forward_micro_batches(
+def _forward_batches(
     self: TrainerRank,
     inputs: Iterable[ForwardInputs],
     *,
@@ -113,7 +101,7 @@ def _forward_micro_batches(
                     self._run_flat_plan_with_memory_tracking(
                         candidate.plan,
                         check=candidate.check,
-                        context="forward_micro_batches",
+                        context="forward_batches",
                     )
                 )
                 # This wave's peak interval, which its caller phase continues.
@@ -123,7 +111,7 @@ def _forward_micro_batches(
                     self._execute_split_plan_with_memory_tracking(
                         candidate.plan,
                         check=candidate.check,
-                        context="forward_micro_batches",
+                        context="forward_batches",
                     )
                 )
             flat_outputs = iter(tracked_outputs)
@@ -138,8 +126,6 @@ def _forward_micro_batches(
             # Do not retain our completed graph through a new handoff traceback.
             del tracked_outputs, flat_outputs, outputs
             raise
-        if backward is not None:
-            backward.attach(tracked_outputs)
         stop = start + candidate.stats_global_count
         if stop < len(items):
             self._last_global_micro_batch_size = max(
@@ -253,7 +239,10 @@ def _find_admissible_forward(
     if ensure_slots:
         self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
     plan = self._plan_flat_forward(requests, checkpoint=checkpoint, ensure_slots=False)
-    check = self._memory_check(plan)
+    if self._graph_memory_policy_enabled():
+        plan, check = self._admit_graph_memory(plan)
+    else:
+        check = self._memory_check(plan)
     if check.fits:
         return plan, check
     best = (plan, check)
@@ -262,7 +251,10 @@ def _find_admissible_forward(
     plan = self._plan_flat_forward(
         requests, checkpoint=checkpoint, memory_minimal=True, ensure_slots=False
     )
-    check = self._memory_check(plan)
+    if self._graph_memory_policy_enabled():
+        plan, check = self._admit_graph_memory(plan)
+    else:
+        check = self._memory_check(plan)
     if check.fits:
         return plan, check
     if check.estimated_required_bytes < best[1].estimated_required_bytes:
@@ -362,20 +354,22 @@ def _admit_split_rung(
     more than one rung may need exact planning before one executes.
     """
 
-    lower = [
-        self._split_chunk_lower_cost(
-            [requests[index] for index in chunk],
-            [rows[index] for index in chunk],
-            checkpoint=checkpoint,
-        )
-        for chunk in chunks
-    ]
-    check = self._split_rung_check(lower)
+    managed = self._graph_memory_policy_enabled()
     if keep_rejected is None:
         keep_rejected = getattr(self, "_allow_oversized_batches", False)
-    if not check.fits and not keep_rejected:
-        return None, check
-    best: tuple[_SplitForwardPlan | None, _MemoryCheck] = (None, check)
+    if not managed:
+        lower = [
+            self._split_chunk_lower_cost(
+                [requests[index] for index in chunk],
+                [rows[index] for index in chunk],
+                checkpoint=checkpoint,
+            )
+            for chunk in chunks
+        ]
+        check = self._split_rung_check(lower)
+        if not check.fits and not keep_rejected:
+            return None, check
+    best: tuple[_impl._SplitForwardPlan, _MemoryCheck] | None = None
     for memory_minimal in (False, True):
         plans = [
             self._plan_flat_forward(
@@ -400,14 +394,18 @@ def _admit_split_rung(
             request_indices=tuple(tuple(chunks[i]) for i in order),
             request_count=len(requests),
         )
-        check = self._split_plan_memory_check(split, costs)
+        if managed:
+            split, check = self._admit_graph_memory(split)
+        else:
+            check = self._split_plan_memory_check(split, costs)
         if check.fits:
             return split, check
         if (
-            best[0] is None
+            best is None
             or check.estimated_required_bytes < best[1].estimated_required_bytes
         ):
             best = (split, check)
+    assert best is not None
     return best if keep_rejected else (None, check)
 
 
@@ -800,6 +798,8 @@ def _snapshot_planning_telemetry(
         "predicted_peak_bytes": check.estimated_required_bytes,
         "usable_limit_bytes": check.available_bytes,
     }
+    if check.fallback_costs is not None:
+        self._last_forward_telemetry_snapshot["fallback_costs"] = check.fallback_costs
 
 
 def _select_next_micro_batch(
@@ -809,7 +809,9 @@ def _select_next_micro_batch(
     *,
     checkpoint: AdapterSelection = _impl.Unset,
 ) -> _CandidateMicroBatch[ForwardInputsT]:
-    def admit(refusal: _ForwardRefusal) -> _CandidateMicroBatch[ForwardInputsT]:
+    def admit(
+        refusal: _impl._ForwardRefusal,
+    ) -> _impl._CandidateMicroBatch[ForwardInputsT]:
         dp_rank, dp_size = self._dp_rank_and_size()
         width = min(len(items) - start, dp_size)
         indices = _impl._local_wave_indices(start, width, dp_rank, dp_size)
@@ -827,7 +829,7 @@ def _select_next_micro_batch(
         lambda: self._search_next_micro_batch(items, start, checkpoint=checkpoint),
         lambda value: (value.plan, value.check),
         lambda value, check: replace(value, check=check),
-        context="forward_micro_batches",
+        context="forward_batches",
         sync_across_dp=True,
         admit_refusal=admit,
     )
@@ -853,7 +855,7 @@ def _search_next_micro_batch(
         return indices, [items[index] for index in indices]
 
     estimates: dict[int, tuple[_MemoryCheck, bool, bool] | None] = {}
-    plans: dict[int, _FlatForwardPlan] = {}
+    plans: dict[int, _impl._FlatForwardPlan] = {}
     checked_plans: dict[int, _MemoryCheck] = {}
     # Per-width layout mode chosen by admission: False = cost-optimal,
     # True = memory-minimal (full sharing). Materialization must build the
@@ -1017,7 +1019,7 @@ def _search_next_micro_batch(
             # admit on the materialized plan, trying the cost-optimal
             # layouts first and the memory-minimal layouts if those do not
             # fit or fall outside the profile's trust window.
-            def price(plan: _FlatForwardPlan) -> tuple[_MemoryCheck, bool, bool]:
+            def price(plan: _impl._FlatForwardPlan) -> tuple[_MemoryCheck, bool, bool]:
                 check = self._memory_check(
                     plan, sync_across_dp=True, sync_planning_errors=True
                 )
@@ -1045,7 +1047,7 @@ def _search_next_micro_batch(
             rejected_widths.add(width)
         return check.fits and (trusted or not profiled), trusted
 
-    def materialize(width: int) -> _FlatForwardPlan:
+    def materialize(width: int) -> _impl._FlatForwardPlan:
         width = normalize(width)
         plan = plans.get(width)
         if plan is None:
@@ -1059,7 +1061,7 @@ def _search_next_micro_batch(
             plans[width] = plan
         return plan
 
-    def candidate(width: int) -> _CandidateMicroBatch[ForwardInputsT]:
+    def candidate(width: int) -> _impl._CandidateMicroBatch[ForwardInputsT]:
         width = normalize(width)
         indices, local_inputs = local_slice(width)
         plan = materialize(width)
@@ -1071,6 +1073,11 @@ def _search_next_micro_batch(
                 plan, sync_across_dp=True, sync_planning_errors=True
             )
         )
+        if self._graph_memory_policy_enabled():
+            plan, check = self._admit_graph_memory(plan, sync_across_dp=True)
+            if not check.fits and width > min_width:
+                rejected_widths.add(width)
+                return candidate(max(min_width, width // 2))
         cold_start = not self._all_ranks_have_memory_profile(
             packed_tokens=plan.packed_tokens,
             signature=plan.signature,
@@ -1623,6 +1630,8 @@ def _fill_planner_snapshot(
                     missing = [
                         f"runtime_facts_unavailable:{_planner_replay.refusal_reason(error)}"
                     ]
+            if any(g.memory_placement is not None for g in child.groups):
+                missing.append("graph_placement_admission_unavailable")
             estimates.append(
                 {
                     "signature": asdict(child.signature),
@@ -1657,6 +1666,12 @@ def _fill_planner_snapshot(
             self._split_required_memory(costs),
             int(floor * _impl._MEMORY_SAFETY_FACTOR),
         )
+        if any(group.memory_placement is not None for group in plan.groups):
+            # Placement also prices version snapshots and outstanding graphs;
+            # the unplaced model estimate cannot recreate that admission.
+            if check.sample is None or check.sample.local_required_bytes is None:
+                raise ValueError("graph placement admission sample unavailable")
+            local_required = check.sample.local_required_bytes
         rank_fields = {
             name: getattr(self, "_" + name)
             for name in (
@@ -1678,7 +1693,7 @@ def _fill_planner_snapshot(
         rank_fields["geometry"] = asdict(self._geometry)
         rank_fields["topology"] = list(plan.signature.topology)
 
-        def version(tensor: torch.Tensor | None) -> int | None:
+        def version(tensor: _impl.torch.Tensor | None) -> int | None:
             try:
                 return None if tensor is None else tensor._version
             except RuntimeError:
@@ -1721,6 +1736,9 @@ def _fill_planner_snapshot(
                     "hidden_states": item.request.hidden_states,
                     "no_grad": item.request.no_grad,
                     "checkpoint": str(item.request.checkpoint),
+                    "options": asdict(
+                        _impl._resolved_request_policy(item.request.options)
+                    ),
                 },
             )
             for group in plan.groups
@@ -1933,11 +1951,11 @@ def _complete_planner_observation(
         _impl._planner_misses._warn("could not finish planner-miss observation")
 
 
-def finish_planner_observation(self: TrainerRank) -> None:
+def finish_planner_observation(self: _impl.TrainerRank) -> None:
     """Release execution context without sampling an unbounded caller peak.
 
     ART compares completed peaks at its existing profiling boundaries:
-    dp_rank_forward's return or forward_micro_batches' iterator resume.
+    forward's return or forward_batches' iterator resume.
     Caladan calls this at execution end. Direct callers can report a caught
     caller OOM before cleanup, then call this method to release the context.
     An abandoned microbatch iterator cannot mint a completed comparison.
@@ -1948,7 +1966,7 @@ def finish_planner_observation(self: TrainerRank) -> None:
         _impl._planner_misses._warn("could not finish planner-miss execution")
 
 
-def report_planner_oom(self: TrainerRank, error: BaseException) -> None:
+def report_planner_oom(self: _impl.TrainerRank, error: BaseException) -> None:
     """Persist a caught CUDA OOM before caller cleanup, then leave it alone.
 
     This does not suppress, retry, or recover the original failure. An OOM
@@ -2040,7 +2058,7 @@ def report_planner_oom(self: TrainerRank, error: BaseException) -> None:
         _impl._planner_misses._warn("could not persist planner OOM report")
 
 
-def discard_planner_observation(self: TrainerRank) -> None:
+def discard_planner_observation(self: _impl.TrainerRank) -> None:
     try:
         observation = getattr(self, "_planner_observation", None)
         if observation is not None:
@@ -2193,19 +2211,20 @@ def _recover_admission_impl(
 ) -> Any:
     """Pure search, at most one smaller-plan refresh, then one recovery."""
     original: TrainerRankMemoryError | None = None
-    refused: _ForwardRefusal | None = None
-    best: _ForwardRefusal | None = None
+    refused: _impl._ForwardRefusal | None = None
+    best: _impl._ForwardRefusal | None = None
 
     def reject() -> Any:
         assert refused is not None
         if admit_refusal is not None:
             # Only the exhausted memory-refusal path changes. Every peer
             # must have a supported candidate; never override an EP or
-            # failed planning/runtime capability guard.
+            # failed planning/runtime capability guard or host placement budget.
             allowed = (
                 getattr(self, "_allow_oversized_batches", False)
                 and refused.overridable
                 and best is not None
+                and best.check.cpu_fits
             )
             selected = None
             if allowed:
@@ -2307,12 +2326,16 @@ def _recover_admission_impl(
                 self._snapshot_planning_telemetry(refused.plan, refused.check)
                 return reject()
         assert refused is not None
-        if self._try_cache_recovery(
+        reclaimed = self._reclaim_graph_memory(
+            refused.check, sync_across_dp=sync_across_dp
+        )
+        recovered = self._try_cache_recovery(
             refused.check,
             sync_across_dp=sync_across_dp,
             owner=owner,
             started=started,
-        ):
+        )
+        if reclaimed or recovered:
             value = search()
             result = finish(value)
             if result is not None:

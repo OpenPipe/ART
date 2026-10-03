@@ -387,14 +387,14 @@ def test_execution_binds_strictness_to_the_staged_admission(monkeypatch):
     monkeypatch.setattr(r, "_topology", lambda: None)
     monkeypatch.setattr(r, "_validate_hybridep_topology", lambda: None)
     monkeypatch.setattr(r, "_configure_hybridep", lambda *a, **k: None)
-    monkeypatch.setattr(r, "_prepare_packed_forward", lambda packed: None)
     seen = []
 
-    def forward_packed(items, prepared):
+    def execute_group(group):
+        # Each group's forward runs inside _execute_graph_group (#925).
         seen.append(_impl._HEAD_STATISTICS_STRICT.get())
-        return [ForwardOutput(None, None, None, None)] * len(items)
+        return [ForwardOutput(None, None, None, None)] * len(group.items)
 
-    monkeypatch.setattr(r, "_forward_packed", forward_packed)
+    monkeypatch.setattr(r, "_execute_graph_group", execute_group)
     r._execute_flat_plan(plan)
     assert seen == [False, False]  # Never priced staged.
     assert r._plan_head_backward_traced(plan) is True
@@ -410,6 +410,40 @@ def test_execution_binds_strictness_to_the_staged_admission(monkeypatch):
     _impl._TRITON_STATS_STATE["failed"] = True
     assert r._plan_head_backward_traced(plan) is False
     assert plan._head_staged is True
+
+
+def test_graph_memory_admission_keeps_the_staged_mark(monkeypatch):
+    # #925's admission prices dataclass copies and executes another copy;
+    # a head priced as staged must still run strictly on the executed plan.
+    from types import SimpleNamespace
+
+    from test_trainer_rank_head_memory import rank as head_rank
+    from test_trainer_rank_head_memory import request
+
+    from art.trainer_rank import _impl
+
+    monkeypatch.setattr(
+        _impl,
+        "_TRITON_STATS_STATE",
+        {"succeeded": {"local_logsumexp_stats"}, "failed": False},
+    )
+    r = head_rank()
+    monkeypatch.setattr(r, "_moe_recompute_covered_for", lambda ref: True)
+    plan = r._plan_flat_forward([request(512, grad=True), request(16, hidden=True)])
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    monkeypatch.setattr(r, "_topology", lambda: SimpleNamespace(tp=1, cp=2))
+    monkeypatch.setattr(r, "_available_memory_bytes", lambda *a: 10**12)
+    monkeypatch.setattr(r, "_available_cpu_memory_bytes", lambda: 10**12)
+    monkeypatch.setattr(
+        r,
+        "_plan_group_rows",
+        lambda p: tuple(
+            (int(g.packed.tokens.numel()), g.grad_enabled) for g in p.groups
+        ),
+    )
+    selected, check = r._admit_graph_memory(plan)
+    assert check.fits and selected is not plan
+    assert getattr(selected, "_head_staged", False), "staged mark lost in admission"
 
 
 def test_an_eligible_head_the_price_does_not_stage_is_not_strict(monkeypatch):

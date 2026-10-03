@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, Literal
+from typing import Any, Literal, cast
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,6 +15,22 @@ from pydantic import BaseModel, ConfigDict, Field
 from .specs import TrainerRuntimeSpec
 
 _PACKAGES = ("megatron-core", "torchmonarch", "transformer-engine", "transformers")
+
+
+def configure_reusable_backward() -> None:
+    """Set native compile policy before loading artifacts or compiling forwards."""
+    import torch
+    from torch._functorch import config as functorch_config
+
+    # A backward-only toggle would bypass AOT's donated-buffer safety check.
+    # This cannot repair graphs already compiled by an external runtime.
+    cast(Any, functorch_config).donated_buffer = False
+    # AOT hashes the flag, but Inductor's lower FX cache does not. Separate
+    # donating kernels there too, preserving any caller-provided cache tag.
+    suffix = "|art-retained-backward-v1"
+    tag = torch.compiler.config.cache_key_tag
+    if not tag.endswith(suffix):
+        torch.compiler.config.cache_key_tag = tag + suffix
 
 
 class CompileCacheEvent(BaseModel):
@@ -79,6 +95,8 @@ def _compile_cache_key(spec: TrainerRuntimeSpec, rank: int) -> str:
             "compile_workarounds": os.environ.get(
                 "ART_MEGATRON_COMPILE_WORKAROUNDS", "1"
             ),
+            "donated_buffer": False,
+            "cache_key_tag": torch.compiler.config.cache_key_tag,
         },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -91,6 +109,7 @@ class TrainerCompileCache:
     def __init__(
         self, spec: TrainerRuntimeSpec, *, rank: int, cache_root: Path
     ) -> None:
+        configure_reusable_backward()
         self.key = _compile_cache_key(spec, rank)
         self.path = cache_root / "megatron" / "compile_cache" / "v1" / self.key
         self.path.parent.mkdir(parents=True, exist_ok=True)

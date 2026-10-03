@@ -3,13 +3,14 @@
 from dataclasses import replace
 import math
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 import weakref
 
 import pytest
 import torch
+from trainer_rank_test_support import fake_rank, recompute_model
 
-from art.trainer_rank import ForwardInput, TrainerRank
+from art.trainer_rank import ForwardInput, ForwardOutput, TrainerRank
 from art.trainer_rank._impl import (
     _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD,
 )
@@ -75,22 +76,14 @@ def layer() -> Any:
 
 def _rank(layer=None):
     model = layer if layer is not None else torch.nn.Linear(1, 1).bfloat16()
-    return TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[model],
-                optimizer=None,
-                provider=SimpleNamespace(
-                    hidden_size=2048,
-                    num_layers=40,
-                    recompute_granularity="full",
-                    recompute_method="uniform",
-                    recompute_num_layers=1,
-                ),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
+    return fake_rank(
+        TrainerRank,
+        [model],
+        hidden_size=2048,
+        num_layers=40,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
     )
 
 
@@ -743,7 +736,6 @@ def test_split_charges_the_largest_hybridep_growth_beside_any_child_peak():
 def hybrid_checkpoint_rank(layer, monkeypatch):
     from megatron.core.transformer.transformer_block import TransformerBlock
     from test_trainer_rank_converted_memory import weights
-    from test_trainer_rank_pending_memory import module
 
     with torch.device("meta"):
         moe = _hybridep(weights(layer, 8), 2)
@@ -758,51 +750,18 @@ def hybrid_checkpoint_rank(layer, monkeypatch):
             fc.lora.B_T = torch.nn.Parameter(
                 torch.empty(128, 8, outputs, dtype=torch.bfloat16)
             )
-        decoder = module(TransformerBlock)
-        decoder.config = SimpleNamespace(
-            hidden_size=2048,
-            num_layers=40,
-            padded_vocab_size=32,
-            params_dtype=torch.bfloat16,
-            recompute_granularity="full",
-            recompute_method="uniform",
-            recompute_num_layers=1,
-            distribute_saved_activations=False,
-            sequence_parallel=False,
-            fp32_residual_connection=False,
-            cpu_offloading=False,
-            cuda_graph_impl="none",
-            fp8=None,
-            fp4=None,
-        )
-        decoder.num_layers_per_pipeline_rank = 40
-        decoder.layers = torch.nn.ModuleList(
-            [moe] + [torch.nn.Linear(1, 1).bfloat16() for _ in range(39)]
-        )
-        model: Any = torch.nn.Module()
-        model.config, model.decoder = decoder.config, decoder
-        model._preprocess = lambda: None
+        model = recompute_model(TransformerBlock, 2048, 40, False, layers=(moe,))
         # Only distributed topology is mocked. Real constructor metadata selects
         # the HybridEP coefficient, without loading a model or initializing CUDA.
         monkeypatch.setattr(TrainerRank, "_topology_key", lambda self: (1, 1, 2, 1))
-        rank = TrainerRank(
-            cast(
-                Any,
-                SimpleNamespace(
-                    model=[model],
-                    optimizer=None,
-                    provider=SimpleNamespace(
-                        hidden_size=2048,
-                        num_layers=40,
-                        expert_model_parallel_size=2,
-                        expert_tensor_parallel_size=1,
-                        num_moe_experts=256,
-                    ),
-                    model_support_handler=SimpleNamespace(
-                        build_gdn_execution_spec=False
-                    ),
-                ),
-            )
+        rank = fake_rank(
+            TrainerRank,
+            [model],
+            hidden_size=2048,
+            num_layers=40,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+            num_moe_experts=256,
         )
     # This branch prices HybridEP routed rows on the EP group's balanced share.
     assert rank._moe_output_bytes_per_token == 217908
@@ -943,6 +902,62 @@ def test_hybridep_high_water_needs_a_live_larger_graph(
     before = tuple(refs)
     assert rank._checkpoint_memory_floor(groups) == baseline
     assert tuple(refs) == before and rank._pending_hybridep_graphs is refs
+
+
+@pytest.mark.parametrize("profiled", [False, True], ids=["cold", "profiled"])
+def test_hybridep_admission_ignores_consumed_graph_with_retained_sibling(
+    hybrid_checkpoint_rank,
+    profiled,
+):
+    rank = hybrid_checkpoint_rank
+    signature = replace(_signature(), topology=(1, 1, 2, 1))
+    if profiled:
+        rank._memory_profiles[signature] = _MemoryProfile(
+            bytes_per_token=1, packed_tokens=2
+        )
+    cold = 0 if profiled else COLD
+    values = dict(
+        packed_tokens=2,
+        logical_tokens=2,
+        output_bytes=8,
+        signature=signature,
+        group_rows=((2, True),),
+    )
+    baseline = rank._subforward_cost(**values)
+    rank._available_memory_bytes = lambda: 600000000
+    assert rank._memory_check_required(baseline.required).fits
+    rank._hybridep_rows_high_water = 218751
+    rank._hybridep_graph_tracking = True
+    value = torch.tensor(2.0, requires_grad=True)
+    (output,) = rank._track_slot_graph_outputs(
+        None, [ForwardOutput(None, None, value.square(), value.pow(3))]
+    )
+    refs = rank._pending_hybridep_graphs
+    (marker_ref,) = refs
+    assert marker_ref() is not None and not marker_ref().item()
+    live = rank._subforward_cost(**values)
+    retained, workspace = rank._checkpoint_memory_floor(values["group_rows"])
+    # The combine output, with the TE workspaces live beside it.
+    assert workspace == 218752 * 2048 * 2 + rank._te_workspace_growth_bytes()
+    assert live.checkpoint_adapter_gradient == 0
+    # The cold allowance is separate from the live graph's dense-output extent.
+    assert live.checkpoint_workspace == workspace + cold
+    assert live.required == int((8 + 2 * retained + workspace + cold) * 1.1)
+    assert not rank._memory_check_required(live.required).fits
+
+    assert output.hidden_states is not None
+    output.hidden_states.backward()
+    assert output.logits is not None and output.logits.grad_fn is not None
+    assert marker_ref() is not None and marker_ref().item()
+    # The unused sibling retains the consumed marker. Price and admit before
+    # any execution helper prunes it or resets the communication high-water.
+    consumed = rank._subforward_cost(**values)
+    assert consumed == baseline
+    assert rank._memory_check_required(consumed.required).fits
+    assert rank._pending_hybridep_graphs is refs and refs == [marker_ref]
+    assert marker_ref() is not None and marker_ref().item()
+    assert rank._hybridep_rows_high_water == 218751
+    assert rank._hybridep_graph_tracking and rank._hybridep_buffer_id is None
 
 
 @pytest.mark.parametrize(
