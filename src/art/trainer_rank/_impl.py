@@ -4496,6 +4496,20 @@ class TrainerRank:
                     if group.grad_enabled and group.slot_ref not in staged_slots:
                         staged_slots.add(group.slot_ref)
                         staging += self._lora_gradient_staging_bytes(group.slot_ref)
+                credit = cost.checkpoint_adapter_gradient
+                if credit:
+                    # The walk repeats a slot's inventory per gradient group
+                    # (e.g. routed and unrouted); one batch stages each target once.
+                    credit = min(
+                        credit,
+                        sum(
+                            self._pending_adapter_gradient_bytes(
+                                g.slot_ref
+                                for g in groups
+                                if g.grad_enabled and g.slot_ref is not None
+                            )
+                        ),
+                    )
                 yield (
                     flat_index,
                     indices,
@@ -4514,7 +4528,7 @@ class TrainerRank:
                         backward_required=any(group.grad_enabled for group in groups),
                         persistent_bytes=persistent,
                         gradient_staging_bytes=staging,
-                        staged_gradient_bytes=cost.checkpoint_adapter_gradient,
+                        staged_gradient_bytes=credit,
                         replay_seconds=max(timings) if len(timings) >= 2 else None,
                         correction_workspace_bytes=cost.required
                         if any(

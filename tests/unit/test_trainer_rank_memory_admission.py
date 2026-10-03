@@ -250,24 +250,38 @@ def test_gradient_transaction_reserves_one_aggregate_per_slot_across_children(
     assert check.fits
 
 
-@pytest.mark.parametrize("adapter_gradient, workspace", [(0, 20), (15, 5), (40, 0)])
+@pytest.mark.parametrize(
+    "adapter_gradient, corrections, workspace",
+    [(0, None, 120), (15, None, 105), (40, None, 100), (40, "always", 200)],
+)
 def test_staging_reserve_holds_the_walks_priced_adapter_gradients(
-    rank, monkeypatch, adapter_gradient, workspace
+    rank, monkeypatch, adapter_gradient, corrections, workspace
 ):
-    # The recompute walk accumulates adapter gradients into the staged batch the
-    # 3x reserve holds; the forward cost prices the same bytes (#1002).
+    # The walk's pending adapter gradients (#1002) are a subset of the staged
+    # aggregate in the 3x reserve, at most one share of distinct targets. A
+    # no-grad correction forward allocates none of them: no credit.
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 1 << 40)
     monkeypatch.setattr(rank, "_lora_gradient_staging_bytes", lambda _ref: 60)
+    monkeypatch.setattr(rank, "_pending_adapter_gradient_bytes", lambda _refs: (20,))
     monkeypatch.setattr(rank, "_lora_version_capture_bytes", lambda *_args: 0)
     monkeypatch.setattr(
         rank,
         "_plan_cost",
         lambda plan: _impl._SubforwardCost(
-            100, 80, checkpoint_adapter_gradient=adapter_gradient
+            200, 80, checkpoint_adapter_gradient=adapter_gradient
         ),
     )
+    options = (
+        ForwardOptions(
+            stale_gradient_corrections=(
+                ImportanceSamplingGradientCorrection(policy=corrections),
+            )
+        )
+        if corrections
+        else None
+    )
     ref = rank._slot_ref("student")
-    plans = [rank._plan_flat_forward([request]) for request in _requests()[:2]]
+    plans = [rank._plan_flat_forward([r]) for r in _requests(options)[:2]]
     plans = [replace(p, groups=(replace(p.groups[0], slot_ref=ref),)) for p in plans]
     _, check = rank._admit_graph_memory(plans[0])
     assert check.estimated_required_bytes == 80 + 10 + 60 + workspace
