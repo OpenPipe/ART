@@ -1885,7 +1885,7 @@ def _dense_mlp_recompute_bytes_per_token(
             # Megatron's CUDA-graph path dispatches on this attribute alone.
             or hasattr(module, "cudagraph_manager")
             # Its hidden fused implementation is outside the walk; untraced.
-            or (TEFusedResidualRMSNorm and type(module) is TEFusedResidualRMSNorm)
+            or (TEFusedResidualRMSNorm and isinstance(module, TEFusedResidualRMSNorm))
             or not type(module).forward.__module__.startswith(_TRACED_PACKAGES)
             or any(
                 name not in ("forward", delegate)
@@ -2002,7 +2002,7 @@ def _dense_mlp_recompute_bytes_per_token(
                 type(mixer) is GatedDeltaNet
                 and (
                     vars(mixer).get("act_fn") is not torch.nn.functional.silu
-                    or not isinstance(mixer._modules.get("in_proj"), torch.nn.Module)
+                    or not isinstance(getattr(mixer, "in_proj", None), torch.nn.Module)
                 )
             )
             or type(mixer) not in mixers

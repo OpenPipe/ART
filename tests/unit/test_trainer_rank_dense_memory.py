@@ -252,6 +252,7 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "gdn_trace_hooks",
         "cudagraph_manager",
         "fused_residual_norm",
+        "fused_residual_norm_subclass",
         "chunks",
     ],
 )
@@ -267,6 +268,9 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
     from art.megatron import lora as lora_module
     from art.megatron.gdn import operator as gdn_operator
     from art.megatron.gdn.operator import _empty_safe_norm_forward
+
+    assert TEFusedResidualRMSNorm is not None
+    fused_norm_subclass = type("Norm", (TEFusedResidualRMSNorm,), {})
 
     layers = [_dense_layer(gdn=index != 1) for index in range(3)]
     for wrapped in layers:
@@ -457,6 +461,9 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         "cudagraph_manager": lambda: setattr(layer, "cudagraph_manager", object()),
         "fused_residual_norm": mixer_child(
             lambda child: setattr(child, "__class__", TEFusedResidualRMSNorm)
+        ),
+        "fused_residual_norm_subclass": mixer_child(
+            lambda child: setattr(child, "__class__", fused_norm_subclass)
         ),
         "chunks": lambda: None,
     }
