@@ -13,10 +13,14 @@ also lets the circular import resolve lazily.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import nullcontext
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import wraps
 import hashlib
 import math
+from threading import get_ident
 from types import MethodType
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +32,53 @@ if TYPE_CHECKING:
 
     from art.megatron.lora import LoRASlotRef
     from art.trainer_rank._impl import AdapterSelection, AnyForwardInput, TrainerRank
+
+
+_MoeTerms = tuple[int, tuple[tuple[int, int], ...]]
+
+
+@dataclass
+class _MoeEvaluation:
+    rank: Any
+    terms: dict[Any, _MoeTerms] = field(default_factory=dict)
+    thread: int = field(default_factory=get_ident)
+    active: bool = True
+
+    def owns(self, rank: Any) -> bool:
+        return self.active and self.rank is rank and self.thread == get_ident()
+
+
+_moe_evaluation: ContextVar[_MoeEvaluation | None] = ContextVar(
+    "moe_memory_evaluation", default=None
+)
+
+
+def _memory_evaluation(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Reuse row-independent terms only during synchronous memory arithmetic.
+
+    The model/slots cannot change within this evaluation. Every later call
+    rechecks their live owners, hooks, tensors and dtype; no result is kept on
+    the rank, and physical/host memory sampling is never cached.
+    """
+
+    @wraps(fn)
+    def evaluate(self, *args, **kwargs):
+        if not getattr(self, "_moe_layers", 0):
+            return fn(self, *args, **kwargs)
+        current = _moe_evaluation.get()
+        if current is not None and current.owns(self):
+            return fn(self, *args, **kwargs)
+        evaluation = _MoeEvaluation(self)
+        token = _moe_evaluation.set(evaluation)
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            evaluation.active = False
+            evaluation.terms.clear()  # Copied contexts cannot retain reusable terms.
+            evaluation.rank = None
+            _moe_evaluation.reset(token)
+
+    return evaluate
 
 
 def _split_required_memory(costs: Sequence[_impl._SubforwardCost]) -> int:
@@ -643,6 +694,13 @@ def _moe_workspace_terms(
     this rank's exact dispatcher wrapper. Ordinary non-checkpoint gradients
     retain only forward-stage coverage.
     """
+    evaluation = _moe_evaluation.get()
+    cache = (
+        evaluation.terms if evaluation is not None and evaluation.owns(self) else None
+    )
+    key = checkpoint_grad, slot_ref
+    if cache is not None and key in cache:
+        return cache[key]
     coefficient = (
         self._checkpoint_moe_bytes_per_token()
         if checkpoint_grad
@@ -674,7 +732,10 @@ def _moe_workspace_terms(
         for stage in stages
     ):
         raise ValueError("Invalid constructor converted-weight stages")
-    return coefficient, stages
+    terms = coefficient, stages
+    if cache is not None:
+        cache[key] = terms
+    return terms
 
 
 def _moe_workspace_from_terms(
@@ -1520,6 +1581,7 @@ def _slot_memory_shapes(
     return tuple(shapes)
 
 
+@_memory_evaluation
 def _memory_check(
     self: TrainerRank,
     forward: _impl._FlatForwardPlan,
@@ -1657,6 +1719,7 @@ def _forward_memory_group() -> dist.ProcessGroup | None:
         return None
 
 
+@_memory_evaluation
 def _estimate_required_memory_bytes_from_values(
     self: TrainerRank,
     *,

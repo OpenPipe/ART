@@ -3442,6 +3442,7 @@ class TrainerRank:
         )
         return not (self._gdn_layers and min(gdn_widths) <= 0)
 
+    @_memory._memory_evaluation
     def _subforward_cost(
         self,
         *,
