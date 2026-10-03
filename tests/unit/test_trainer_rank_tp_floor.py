@@ -465,7 +465,7 @@ def test_the_tp2_head_stage_follows_the_statistics_path(monkeypatch):
     # ART_TRAINER_RANK_TRITON_TOPK switch and short chunks take the eager
     # FP32 fallback, about seven BF16 buffers.
     assert _head_stage(r, _labelled(512)) == 7 * dense
-    monkeypatch.setattr(_impl, "_triton_head_stats", lambda rank, rows: True)
+    monkeypatch.setattr(_impl, "_triton_head_stats", lambda rank, rows, vocab: True)
     assert _head_stage(r, _labelled(512)) == 3 * dense
     monkeypatch.setenv("ART_TRAINER_RANK_TRITON_TOPK", "0")
     assert not _impl._triton_stats_enabled(True, 512)
@@ -510,28 +510,81 @@ def test_every_head_chunk_is_priced_for_its_own_statistics_path(
     assert head_statistics_fallback(r, _labelled(rows), None) == eager
 
 
-def test_an_observed_kernel_failure_prices_the_fallback_from_then_on(monkeypatch):
+def _cuda_head(monkeypatch, vocabulary=248_320):
+    """A TP2 rank with a head on a CUDA device whose kernels import."""
     from art.trainer_rank import _impl, _memory
 
-    r = _with_head(tp_rank(topology=TP2), 248_320, 2)
-    r.device = torch.device("cuda", 0)  # a CUDA rank whose kernels import
+    r = _with_head(tp_rank(topology=TP2), vocabulary, 2)
+    r.device = torch.device("cuda", 0)
     monkeypatch.setattr(_impl, "_triton_stats_importable", lambda: True)
     monkeypatch.setattr(_memory, "_head_target_backward", lambda rank: True)
-    dense = r._head_workspace_bytes(512)
-    assert dense > 0
-    logits = torch.zeros(512, 8)
-    stats = (torch.zeros(512), torch.ones(512))
+    return r
 
-    def statistics(*, top_k, logsumexp, max_top_k):
-        """Run the head statistics with the given kernel outcomes."""
+
+def _positioned(*positions):
+    """Labelled requests and their packed positions."""
+    requests = [_labelled(len(row))[0] for row in positions]
+    return requests, [torch.tensor(row) for row in positions]
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "exact"),
+    [
+        # Sol: two 812-row requests sharing 600 positions, a 1,024-row union
+        # of two kernel chunks; one request alone has a 300-row eager tail.
+        (range(812), [*range(600), *range(812, 1024)], 3 * 512 * 124_160 * 2),
+        # Two 512-row requests sharing 212 positions: their no-sharing sum is
+        # two kernel chunks, but the 812-row union has a 300-row eager tail.
+        (range(512), [*range(212), *range(512, 812)], 7 * 300 * 124_160 * 2),
+    ],
+)
+def test_head_bounds_envelope_every_possible_projected_union(
+    monkeypatch, first, second, exact
+):
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "512")
+    r = _cuda_head(monkeypatch)
+    requests, positions = _positioned(list(first), second)
+
+    def charge(**bounds):
+        rows = r._head_projection_rows(
+            requests,
+            positions=bounds.get("positions"),
+            lower_bound=bounds.get("lower_bound", False),
+        )
+        return r._group_head_workspace_bytes(
+            rows, requests, grad_enabled=True, **bounds
+        )
+
+    # The selected layout's packed union prices every chunk exactly.
+    assert charge(positions=positions) == exact
+    # Width search: the rejection bound never exceeds it, the acceptance
+    # bound never falls below it.
+    assert charge(lower_bound=True) <= exact <= charge()
+
+
+def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
+    from art.trainer_rank import _impl
+
+    r = _cuda_head(monkeypatch, vocabulary=16)  # an 8-entry vocabulary shard
+
+    def statistics(rows, *, top_k, logsumexp, max_top_k=0):
+        """Run one head chunk's statistics with the given kernel outcomes."""
+        logits = torch.zeros(rows, 8)
+        stats = (torch.zeros(rows), torch.ones(rows))
         with monkeypatch.context() as patch:
             patch.setattr(
                 TrainerRank, "_local_logits_from_hidden_rows", lambda *a, **k: logits
             )
             # The chunk is attempted (as on CUDA) and the kernels return these.
             patch.setattr(_impl, "_triton_stats_enabled", lambda cuda, rows: True)
-            patch.setattr(_impl, "_try_triton_local_topk_stats", lambda *a, **k: top_k)
-            patch.setattr(_impl, "_try_triton_stats", lambda *a, **k: logsumexp)
+            patch.setattr(
+                _impl,
+                "_try_triton_local_topk_stats",
+                lambda *a, **k: stats if top_k else None,
+            )
+            patch.setattr(
+                _impl, "_try_triton_stats", lambda *a, **k: stats if logsumexp else None
+            )
             patch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
             patch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
             patch.setattr(_impl, "_vocab_parallel_log_z", lambda t: t[:, 0].float())
@@ -539,16 +592,22 @@ def test_an_observed_kernel_failure_prices_the_fallback_from_then_on(monkeypatch
                 None, logits, output_weight=None, need_log_z=True, max_top_k=max_top_k
             )
 
+    def priced(rows):
+        return _head_stage(r, _labelled(rows)) // r._head_workspace_bytes(rows)
+
     # A fused top-k failure recovered by the Triton logsumexp: no fallback.
-    statistics(top_k=None, logsumexp=stats, max_top_k=4)
-    assert not getattr(r, "_triton_head_stats_failed", False)
-    assert _head_stage(r, _labelled(512)) == 3 * dense
-    # An attempted kernel that fails takes the eager fallback, and the rank
-    # remembers it (the failing wave itself was priced for the kernel): later
-    # admissions price seven buffers.
-    statistics(top_k=None, logsumexp=None, max_top_k=0)
-    assert r._triton_head_stats_failed
-    assert _head_stage(r, _labelled(512)) == 7 * dense
+    statistics(512, top_k=False, logsumexp=True, max_top_k=4)
+    assert priced(512) == 3
+    # A 64-row kernel failure takes the eager fallback (that wave was priced
+    # for the kernel); 64-row chunks are priced for the fallback from then on.
+    statistics(64, top_k=False, logsumexp=False)
+    assert priced(64) == 7
+    # A 512-row chunk whose kernel succeeds stays priced for the kernel.
+    statistics(512, top_k=False, logsumexp=True)
+    assert priced(512) == 3
+    # A later 64-row success clears that shape.
+    statistics(64, top_k=False, logsumexp=True)
+    assert priced(64) == 3
 
 
 def test_replay_declines_tp_sp_adapter_estimates_without_ranks():
@@ -559,6 +618,10 @@ def test_replay_declines_tp_sp_adapter_estimates_without_ranks():
     ranked = signature(TP2, rank=4)
     assert _adapter_ranks_unavailable(TP2, facts, bare)
     assert not _adapter_ranks_unavailable(TP2, facts, ranked)
+    # Gradient entries without a usable (2-D) rank shape decline as well.
+    for shapes in (((True, ()),), ((True, ((),)),), ((False, ((2, H, 4, 4, H),)),)):
+        partial = replace(bare, slot_shapes=shapes)
+        assert _adapter_ranks_unavailable(TP2, facts, partial)
     assert not _adapter_ranks_unavailable((1, 1, 1, 1), facts, bare)
     base = {"checkpoint_layers": 64, "groups": [{"grad": True, "adapter": None}]}
     assert not _adapter_ranks_unavailable(TP2, base, bare)

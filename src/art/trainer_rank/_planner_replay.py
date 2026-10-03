@@ -307,14 +307,15 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
 
 def head_statistics_fallback(rank: Any, requests: Any, positions: Any) -> bool:
     """Whether any TP > 1 head chunk of these requests runs eager statistics."""
-    return (
-        rank._topology_key()[1] > 1
-        and any(r.target_tokens is not None or r.top_k is not None for r in requests)
-        and any(
-            not _impl._triton_head_stats(rank, chunk)
-            for chunk in _memory._head_chunk_sizes(
-                rank._head_projection_rows(requests, positions=positions, uncapped=True)
-            )
+    if rank._topology_key()[1] == 1 or not any(
+        r.target_tokens is not None or r.top_k is not None for r in requests
+    ):
+        return False
+    vocabulary = _memory._head_vocabulary(rank)
+    return any(
+        not _impl._triton_head_stats(rank, chunk, vocabulary)
+        for chunk in _memory._head_chunk_sizes(
+            rank._head_projection_rows(requests, positions=positions, uncapped=True)
         )
     )
 

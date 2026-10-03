@@ -360,21 +360,26 @@ def _group_head_workspace_bytes(
         # eager FP32 fallback (``_vocab_parallel_log_z``): BF16 logits, their
         # FP32 copy, the shifted logits and their exponentials, about seven
         # BF16 buffers. TP1 keeps its three-buffer charge (inherited).
-        fallback = 7 * max(
-            (
-                self._head_workspace_bytes(chunk)
-                for chunk in _head_chunk_sizes(
-                    self._head_projection_rows(
-                        requests,
-                        positions=positions,
-                        lower_bound=lower_bound,
-                        uncapped=True,
-                    )
-                )
-                if not _impl._triton_head_stats(self, chunk)
-            ),
-            default=0,
+        low = self._head_projection_rows(
+            requests, positions=positions, lower_bound=True, uncapped=True
         )
+        if positions is not None:
+            # The selected layout's packed union: every chunk exactly.
+            fallback = _head_fallback_bytes(self, low, low)
+        elif lower_bound:
+            # A rejection bound monotone in rows: chunks may all run the
+            # kernel unless it cannot run at all.
+            fallback = (
+                0
+                if _impl._triton_head_stats_available(self)
+                else 7 * self._head_workspace_bytes(low)
+            )
+        else:
+            # An acceptance bound: any projected count the union can take.
+            high = self._head_projection_rows(
+                requests, positions=positions, uncapped=True
+            )
+            fallback = _head_fallback_bytes(self, low, high)
     if (
         not dense
         or not grad_enabled
@@ -395,6 +400,23 @@ def _group_head_workspace_bytes(
         )
         return max(dense, 3 * target_dense, fallback)
     return max(dense, fallback)
+
+
+def _head_fallback_bytes(self: TrainerRank, low: int, high: int) -> int:
+    """Seven BF16 buffers of the largest head chunk that runs the eager fallback
+    for any projected-row count from ``low`` to ``high``."""
+    chunk = _impl._HEAD_CHUNK_TOKENS
+    vocabulary = _head_vocabulary(self)
+    sizes: set[int] = set()
+    if high - low >= chunk:
+        sizes.update(range(1, min(high, chunk) + 1))  # every tail occurs
+    else:
+        for rows in range(low, high + 1):
+            sizes.update(_head_chunk_sizes(rows))
+    eager = [
+        size for size in sizes if not _impl._triton_head_stats(self, size, vocabulary)
+    ]
+    return 7 * self._head_workspace_bytes(max(eager)) if eager else 0
 
 
 def _head_chunk_sizes(rows: int) -> tuple[int, ...]:
@@ -1146,10 +1168,26 @@ def _estimate_flat_forward(
                         for request in head_requests
                     )
                 )
-                if lower != upper or (
-                    mixed_targets
-                    and self._head_target_chunk_rows(head_requests, lower_bound=True)
-                    != self._head_target_chunk_rows(head_requests)
+                # TP > 1 heads price each chunk's statistics path, so the
+                # exact count needs the packed union beyond one chunk too.
+                spread = (
+                    self._topology_key()[1] > 1
+                    and upper == _impl._HEAD_CHUNK_TOKENS
+                    and self._head_projection_rows(
+                        head_requests, lower_bound=True, uncapped=True
+                    )
+                    != self._head_projection_rows(head_requests, uncapped=True)
+                )
+                if (
+                    lower != upper
+                    or spread
+                    or (
+                        mixed_targets
+                        and self._head_target_chunk_rows(
+                            head_requests, lower_bound=True
+                        )
+                        != self._head_target_chunk_rows(head_requests)
+                    )
                 ):
                     packed = _impl.materialize_prefix_tree_layout(
                         tuple(

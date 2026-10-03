@@ -5731,7 +5731,10 @@ class TrainerRank:
                 else None
             )
             stats = topk_stats if topk_stats is not None else logsumexp_stats
+            shape = (int(local_logits.shape[0]), int(local_logits.shape[1]))
             if stats is not None:
+                # A kernel ran at this chunk shape: admission may price it.
+                getattr(self, "_triton_head_stats_failures", set()).discard(shape)
                 local_max, local_sum = stats[:2]
                 local_max = local_max.detach()
                 global_max = _all_reduce_tensor_parallel_max(local_max)
@@ -5740,12 +5743,13 @@ class TrainerRank:
                 )
                 log_z = global_max + torch.log(global_sum)
             else:
-                if _triton_stats_enabled(
-                    local_logits.is_cuda, int(local_logits.shape[0])
-                ):
-                    # An attempted kernel failed: admission prices the eager
-                    # fallback from now on (_triton_head_stats).
-                    self._triton_head_stats_failed = True
+                if _triton_stats_enabled(local_logits.is_cuda, shape[0]):
+                    # An attempted kernel failed at this chunk shape: admission
+                    # prices it for the eager fallback (_triton_head_stats)
+                    # until a kernel succeeds at that shape again.
+                    if not hasattr(self, "_triton_head_stats_failures"):
+                        self._triton_head_stats_failures = set()
+                    self._triton_head_stats_failures.add(shape)
                 log_z = _vocab_parallel_log_z(local_logits)
 
             if topk_stats is not None:
@@ -6849,18 +6853,27 @@ def _triton_stats_importable() -> bool:
     return True
 
 
-def _triton_head_stats(rank: Any, rows: int) -> bool:
-    """The head statistics path a ``rows`` chunk takes, for admission.
+def _triton_head_stats_available(rank: Any) -> bool:
+    """Whether the head statistics kernels can run on this rank at all."""
+    return (
+        _triton_stats_enabled(rank.device.type == "cuda", 1 << 62)
+        and _triton_stats_importable()
+    )
+
+
+def _triton_head_stats(rank: Any, rows: int, vocabulary: int) -> bool:
+    """The head statistics path a ``rows`` x ``vocabulary`` chunk takes, for admission.
 
     Mirrors ``_try_triton_stats``'s attempt predicate plus kernel
     importability. A kernel that imports but fails at run time falls back
     (unless ART_TRAINER_RANK_TRITON_TOPK=strict makes that fatal); the first
-    such wave was priced for the kernel, and ``_local_head_stats`` then marks
-    the rank so later admissions price the fallback.
+    such wave was priced for the kernel, and ``_local_head_stats`` then
+    records that chunk shape, priced for the fallback until a kernel succeeds
+    at it again.
     """
     return (
         _triton_stats_enabled(rank.device.type == "cuda", rows)
-        and not getattr(rank, "_triton_head_stats_failed", False)
+        and (rows, vocabulary) not in getattr(rank, "_triton_head_stats_failures", ())
         and _triton_stats_importable()
     )
 

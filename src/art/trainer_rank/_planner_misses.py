@@ -663,7 +663,12 @@ def _adapter_ranks_unavailable(
         and any(
             group["grad"] and group["adapter"] is not None for group in facts["groups"]
         )
-        and not any(grad for grad, _ in signature.slot_shapes)
+        and not any(
+            len(shape) == 5 and shape[0] == 2
+            for grad, shapes in signature.slot_shapes
+            if grad
+            for shape in shapes
+        )
     )
 
 
