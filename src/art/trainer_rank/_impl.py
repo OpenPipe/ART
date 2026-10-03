@@ -7047,15 +7047,16 @@ def _vocab_parallel_topk_from_local(
 
 
 # Row sub-chunks per head chunk for the bounded eager statistics: one FP32
-# sub-chunk is 1/32 of a BF16 chunk buffer.
+# sub-chunk is 2 * ceil(rows / 64) / rows of a BF16 chunk buffer: 1/32 when the
+# rows divide by 64, more otherwise (the estimator prices the ceiling).
 _EAGER_STATS_SUBCHUNKS = 64
 
 
 class _EagerLocalStats(torch.autograd.Function):
     """The statistics kernel's (local max, local sum) contract, computed eagerly.
 
-    The logits are processed in ``_EAGER_STATS_SUBCHUNKS`` row sub-chunks
-    (ceil(rows / 64) rows each) through one owned FP32 work buffer, beside
+    The logits are processed in up to ``_EAGER_STATS_SUBCHUNKS`` row sub-chunks
+    of ceil(rows / 64) rows each through one owned FP32 work buffer, beside
     the logits in forward and beside the logits and their gradient in
     backward: the kernel path's buffers (topk._LocalStatsFunction) plus that
     buffer, instead of the unchunked fallback's seven. The logits are never
