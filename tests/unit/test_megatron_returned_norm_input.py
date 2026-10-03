@@ -2,7 +2,8 @@
 
 import ast
 from copy import deepcopy
-from math import prod
+from itertools import product
+from math import prod, sqrt
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -156,6 +157,115 @@ def namespace():
 
 
 class ReturnedNormInputTests(unittest.TestCase):
+    def test_norm_vjp_has_one_tp_owner(self):
+        # Model the public collective adjoints and TE's local returned-norm
+        # contract, then check the input VJP against a separate loss finite
+        # difference. This is binary64 CPU math, not a BF16/native oracle.
+        tree, ns, calls, _, _, _ = namespace()
+        flags = {
+            node.name: next(
+                assignment.value
+                for assignment in ast.walk(node)
+                if isinstance(assignment, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "return_layernorm_output_gathered"
+                    for target in assignment.targets
+                )
+            )
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name in FAMILIES
+        }
+        rows = ((0.7, -1.2), (1.5, 0.2), (-0.4, 0.9), (0.1, -0.8))
+        dense = ((0.4, -0.2), (-0.8, 0.3))
+        adapter = ((0.7, 0.5), (0.2, -0.6))
+
+        def add(*values):
+            return tuple(map(sum, zip(*values, strict=True)))
+
+        def norm_vjp(row, cotangent):
+            inv = 1 / sqrt(sum(x * x for x in row) / len(row) + 1e-5)
+            dot = sum(x * g for x, g in zip(row, cotangent, strict=True))
+            return tuple(
+                inv * g - x * inv**3 * dot / len(row)
+                for x, g in zip(row, cotangent, strict=True)
+            )
+
+        for family, tp, sp, outer, arm in product(
+            FAMILIES,
+            (1, 2),
+            (False, True),
+            (False, True),
+            ("dense", "adapter", "combined"),
+        ):
+            with self.subTest(family=family, tp=tp, sp=sp, outer=outer, arm=arm):
+                group = SimpleNamespace(size=lambda: tp)
+                linear = SimpleNamespace(
+                    tp_size=tp,
+                    tp_group=group,
+                    sequence_parallel=sp,
+                    parallel_mode=None if outer else "column",
+                )
+                gathered = eval(
+                    compile(ast.Expression(flags[family]), str(SOURCE), "eval"),
+                    {"linear_qkv": linear, "in_proj": linear, "linear_fc1": linear},
+                )
+                calls.clear()
+                local_rows = len(rows) // tp if sp and not outer else len(rows)
+                ns["_column_parallel_lora_input"](
+                    Tensor((local_rows, 1, 2)), linear, returned_norm=True
+                )
+                dc = dense[:tp] if arm != "adapter" else ((0.0, 0.0),) * tp
+                ac = adapter[:tp] if arm != "dense" else ((0.0, 0.0),) * tp
+                coefficients = [add(d, a) for d, a in zip(dc, ac, strict=True)]
+
+                def loss(values):
+                    return sum(
+                        sum(x * c for x, c in zip(row, coefficient, strict=True))
+                        / sqrt(sum(x * x for x in row) / len(row) + 1e-5)
+                        for row in values
+                        for coefficient in coefficients
+                    )
+
+                summed_adapter = bool(calls) and (
+                    calls[0][0] == "copy" or calls[0][2] is True
+                )
+                # Ordinary TE reduces dense dgrad before adding this branch.
+                # Overlap's outer edge reduces the whole local norm VJP.
+                cots = [
+                    add(
+                        dc[rank] if outer else add(*dc),
+                        (0.0, 0.0)
+                        if gathered
+                        else add(*ac)
+                        if summed_adapter
+                        else ac[rank],
+                    )
+                    for rank in range(tp)
+                ]
+                for rank in range(tp):
+                    actual = [
+                        add(*(norm_vjp(row, cot) for cot in cots))
+                        if outer
+                        else norm_vjp(row, cots[rank])
+                        for row in rows
+                    ]
+                    indices = (
+                        range(rank * len(rows) // tp, (rank + 1) * len(rows) // tp)
+                        if sp
+                        else range(len(rows))
+                    )
+                    for i in indices:
+                        for j in range(len(rows[i])):
+                            plus, minus = (
+                                [list(row) for row in rows],
+                                [list(row) for row in rows],
+                            )
+                            plus[i][j] += 1e-6
+                            minus[i][j] -= 1e-6
+                            expected = (loss(plus) - loss(minus)) / 2e-6
+                            self.assertAlmostEqual(actual[i][j], expected, delta=2e-9)
+
     def test_local_return_and_compile_boundaries(self):
         tree, _, _, boundaries, copy, gather = namespace()
         flags = [
