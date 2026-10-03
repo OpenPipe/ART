@@ -882,7 +882,8 @@ def test_hybridep_admission_ignores_consumed_graph_with_retained_sibling(
     assert marker_ref() is not None and not marker_ref().item()
     live = rank._subforward_cost(**values)
     retained, workspace = rank._checkpoint_memory_floor(values["group_rows"])
-    assert workspace == 218752 * 2048 * 2
+    # The combine output, with the TE workspaces live beside it.
+    assert workspace == 218752 * 2048 * 2 + rank._te_workspace_growth_bytes()
     assert live.checkpoint_adapter_gradient == 0
     # The cold allowance is separate from the live graph's dense-output extent.
     assert live.checkpoint_workspace == workspace + cold
