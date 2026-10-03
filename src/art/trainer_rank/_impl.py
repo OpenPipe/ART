@@ -2900,20 +2900,20 @@ class TrainerRank:
     def _sequence_parallel_floor_covered(self, layers: int, tp: int, cp: int) -> bool:
         """Whether the checkpoint floor covers a dense TP x SP recompute peak.
 
-        Traced once: dense Qwen3.8-27B (64 layers) at TP4 with sequence
-        parallelism and CP1. Over the gathered rows, the recomputed layer's peak
-        held its SP-gathered norm input (2H per row), the MLP FC1 stage (6F/TP),
-        the recomputed mixer (within its projection widths / TP), norm outputs
-        and other workspace (each under H), plus one input gradient per
-        sharded row. The floor repeats the sharded boundaries as the
-        input-gradient term, so that repeat must cover this workspace; GDN
-        segment states grow with segments instead and are priced separately.
-        Other TP sizes, CP, MoE, replicated QKV (KV groups below TP), missing
-        geometry and models too shallow or wide for the bound keep today's
-        pricing.
+        Traced on dense Qwen3.8-27B (64 layers) at TP4 and at TP2, each with
+        sequence parallelism and CP1. Over the gathered rows, the recomputed
+        layer's peak held its SP-gathered norm input (2H per row), the MLP FC1
+        stage (6F/TP), the recomputed mixer (within its projection widths / TP),
+        norm outputs (about 3.2H per sharded row at both sizes, so 4H/TP per
+        row), other workspace (under H), plus one input gradient per sharded
+        row. The floor repeats the sharded boundaries as the input-gradient
+        term, so that repeat must cover this workspace; GDN segment states grow
+        with segments instead and are priced separately. Other TP sizes, CP,
+        MoE, replicated QKV (KV groups below TP), missing geometry and models
+        too shallow or wide for the bound keep today's pricing.
         """
         geometry = self._geometry
-        if tp != 4 or cp != 1 or self._moe_layers or geometry.moe_experts:
+        if tp not in (2, 4) or cp != 1 or self._moe_layers or geometry.moe_experts:
             return False
         hidden = self._hidden_size
         ffn = geometry.ffn_hidden_size or 4 * hidden
@@ -2950,9 +2950,11 @@ class TrainerRank:
         )
         # Per gathered row, times TP: the repeat is layers x H; the workspace is
         # 2H + the FC1 stage (6F/TP, or the SwiGLU live set if wider) +
-        # mixer/TP + H of norms + H of other workspace, and the gradient H/TP.
+        # mixer/TP + 4H/TP of norms + H of other workspace, and the gradient H/TP.
         stage = max(6, self._mlp_activation_factor) * ffn
-        workspace = 2 * hidden * tp + stage + max(attention, gdn) + 2 * hidden * tp
+        workspace = (
+            2 * hidden * tp + stage + max(attention, gdn) + 4 * hidden + hidden * tp
+        )
         return layers * hidden >= workspace + hidden
 
     def _subforward_cost(
