@@ -1358,6 +1358,17 @@ def _layout_checkpoint_rank_floors(
     widths = self._recomputed_mixer_widths(stage_buffers=False)
     moe = self._checkpoint_moe_bytes_per_token()
     dense, _ = self._dense_mlp_widths(refs)
+    if dense and "attention" in widths:
+        # A covered dense attention layer keeps its input norm output and
+        # five query- and five KV-width tensors beside the executor's
+        # records: Qwen3.8-27B CP2 traces, 78.1 and 79.9 KB per row on the
+        # two ranks (81.9 KB priced).
+        geometry = self._geometry
+        q = geometry.num_attention_heads * geometry.kv_channels or self._hidden_size
+        kv = geometry.num_query_groups * geometry.kv_channels or self._hidden_size
+        widths["attention"] = self._param_dtype_size * (
+            self._hidden_size + 5 * q + 5 * kv
+        )
     beside = (
         2 * hidden + self._moe_checkpoint_state_bytes_per_token()
         if moe

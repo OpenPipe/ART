@@ -450,6 +450,10 @@ def test_dense_widths_stay_at_tp1(monkeypatch, tp, sequence_parallel):
 def test_layout_floor_prices_the_dense_stage_per_layer_type(gdn):
     r = _at_cp2(_dense_rank())
     plain = _at_cp2(_dense_rank(0, 0))
+    for x in (r, plain):
+        x._geometry = replace(
+            x._geometry, num_attention_heads=16, num_query_groups=2, kv_channels=256
+        )
     if gdn:
         for x in (r, plain):
             x._gdn_layers = 3
@@ -474,9 +478,14 @@ def test_layout_floor_prices_the_dense_stage_per_layer_type(gdn):
     assert dense[0] == base[0]
     # Every layer type's recomputed stage gains the residual, norm and MLP
     # stage on its own rows: the busiest rank's largest stage grows by it.
+    # A dense attention layer keeps its input norm output and five query-
+    # and KV-width tensors beside the executor's records, not the generic
+    # width.
     widths = r._recomputed_mixer_widths(stage_buffers=False)
+    traced = {**widths, "attention": (HIDDEN + 5 * 16 * 256 + 5 * 2 * 256) * 2}
+    assert traced["attention"] < widths["attention"]
     rows = {"attention": 100, "gdn": 120} if gdn else {"attention": 100}
-    grown = max(rows[k] * (widths[k] + 2 * HIDDEN * 2 + STAGE) for k in rows)
+    grown = max(rows[k] * (traced[k] + 2 * HIDDEN * 2 + STAGE) for k in rows)
     plain_stage = max(rows[k] * widths[k] for k in rows)
     assert (
         sum(dense) - sum(base) == grown - plain_stage + r._te_workspace_growth_bytes()
