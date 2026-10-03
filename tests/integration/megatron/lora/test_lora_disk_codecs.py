@@ -1,3 +1,5 @@
+import asyncio
+from datetime import timedelta
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,9 @@ from typing import Any, cast
 import pytest
 from safetensors.torch import load_file, save_file
 import torch
+import torch.distributed as dist
+
+from tests.unit.trainer_rank_test_support import gloo_group, spawn_and_join
 
 pytest.importorskip("megatron.bridge.models.gpt_provider")
 
@@ -1584,12 +1589,133 @@ def test_runtime_resolution_failure_uses_trainer_failure_group(
     assert synchronized_groups == [failure_group]
 
 
-def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
+def _export_preparation_failure_worker(
+    rank: int, init_method: str, failure_case: tuple[str, int, int]
+) -> None:
+    failure_site, failure_call, failing_rank = failure_case
+    with (
+        gloo_group(rank, init_method, timeout=10),
+        pytest.MonkeyPatch.context() as monkeypatch,
+    ):
+        monkeypatch.setattr(lora_module.ps, "get_data_parallel_rank", lambda **_: rank)
+        monkeypatch.setattr(lora_module.ps, "get_tensor_model_parallel_rank", lambda: 0)
+        monkeypatch.setattr(
+            lora_module.ps, "get_tensor_model_parallel_world_size", lambda: 1
+        )
+        monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
+        prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+        lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+        trainer, adapter, _config = _named_lora_checkpoint(prefix, lora)
+        trainer.runtime.rank, trainer.runtime.world_size = rank, 2
+        group = dist.new_group(backend="gloo", timeout=timedelta(seconds=10))
+        trainer._checkpoint_process_group = group
+        trainer._checkpoint_finalize_process_group = group
+        failure = (
+            asyncio.CancelledError("injected local collection cancellation")
+            if failure_site == "packed"
+            else RuntimeError("injected export preparation failure")
+        )
+        metadata_calls: list[object] = []
+        exchanges: list[object] = []
+        canonical = lora_publish._canonical_global_metadata
+        exchange = _lora_export._exchange_vllm_lora_publish
+
+        def metadata(local: list[Any]) -> list[Any]:
+            metadata_calls.append(local)
+            result = canonical(local)
+            if (
+                rank == failing_rank
+                and failure_site == "metadata"
+                and len(metadata_calls) == failure_call
+            ):
+                raise failure
+            return result
+
+        def exchange_tensors(plan: _lora_export._VllmLoraPublishPlan):
+            exchanges.append(plan)
+            return exchange(plan)
+
+        with pytest.MonkeyPatch.context() as inject:
+            if failure_site != "metadata":
+                collector = (
+                    "collect_local_lora_entries"
+                    if failure_site == "dense"
+                    else "collect_local_packed_expert_entries"
+                )
+                collect = getattr(lora_publish, collector)
+
+                def collect_or_fail(*args: Any, **kwargs: Any):
+                    result = collect(*args, **kwargs)
+                    if rank == failing_rank:
+                        raise failure
+                    return result
+
+                inject.setattr(lora_publish, collector, collect_or_fail)
+            inject.setattr(lora_publish, "_canonical_global_metadata", metadata)
+            inject.setattr(
+                _lora_export, "_exchange_vllm_lora_publish", exchange_tensors
+            )
+            with pytest.raises(BaseException, match="injected") as caught:
+                trainer._prepare_lora_export("retry", "student", owner_id="owner")
+            if rank == failing_rank:
+                assert caught.value is failure
+            else:
+                assert isinstance(caught.value, RuntimeError)
+                assert "Another rank failed" in str(caught.value)
+            assert len(metadata_calls) == (
+                failure_call if failure_site == "metadata" else 0
+            )
+            assert exchanges == []
+            assert not getattr(trainer, "_prepared_lora_exports", {})
+
+        revision, timings = trainer._prepare_lora_export(
+            "retry", "student", owner_id="owner"
+        )
+        assert revision == 0
+        assert set(timings) == {
+            "slot_validation",
+            "runtime_validation",
+            "plan_collect",
+            "exchange",
+            "d2h",
+        }
+        if rank == 0:
+            owner, prepared = trainer._prepared_lora_exports["retry"]
+            assert owner == "owner"
+            _assert_tensors_equal(
+                _lora_export._build_vllm_lora_tensors_from_inputs(prepared)[0],
+                adapter,
+            )
+        trainer._abort_lora_export("retry", owner_id="owner")
+        assert not getattr(trainer, "_prepared_lora_exports", {})
+        for reuse_group in (group, None):
+            completed = torch.tensor(1)
+            dist.all_reduce(completed, group=reuse_group)
+            assert completed.item() == 2
+
+
+@pytest.mark.parametrize(
+    "failure_case",
+    [("dense", 1, 0), ("packed", 1, 0), ("metadata", 1, 0), ("metadata", 2, 1)],
+    ids=["dense", "packed", "metadata", "metadata-2-rank1"],
+)
+def test_export_preparation_failure_is_collective_and_retryable(
     tmp_path: Path,
-):
-    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
-    lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    baseline = (lora.A_T.detach().clone(), lora.B_T.detach().clone())
+    monkeypatch: pytest.MonkeyPatch,
+    failure_case: tuple[str, int, int],
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    spawn_and_join(
+        _export_preparation_failure_worker,
+        args=(f"file://{tmp_path / 'export'}", failure_case),
+        timeout=90,
+        failure=f"collective export {failure_case[0]} failure test hung",
+    )
+
+
+def _named_lora_checkpoint(
+    prefix: str, lora: LoRA
+) -> tuple[TrainerRank, dict[str, torch.Tensor], dict[str, Any]]:
     adapter = {
         f"{prefix}.lora_A.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
         f"{prefix}.lora_B.weight": torch.arange(8, dtype=torch.float32).reshape(4, 2),
@@ -1601,12 +1727,17 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
         rank=0,
         world_size=1,
     )
+    trainer._default_slot_ref = None
     trainer._slot_stack = []
     trainer._pending_slot_graphs = {}
     trainer._checkpoint_slots = {}
     trainer._skipped_forward_waves = {}
     trainer._snapshot_checkpoint_names = set()
     trainer._checkpoint_prefetch_sources = {}
+    trainer._checkpoint_sources = {}
+    trainer._checkpoint_slot_writes = {}
+    trainer._checkpoint_snapshot_lru = {}
+    trainer._checkpoint_snapshot_cache_size = 2
     trainer._checkpoint_prefetch_lock = threading.Lock()
     trainer._checkpoint_mutation_lock = threading.RLock()
     config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
@@ -1615,6 +1746,16 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
         tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
         cast(_AdapterConfig, config),
     )
+    return trainer, adapter, config
+
+
+def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
+    tmp_path: Path,
+):
+    prefix = "base_model.model.model.layers.0.self_attn.q_proj"
+    lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
+    baseline = (lora.A_T.detach().clone(), lora.B_T.detach().clone())
+    trainer, adapter, config = _named_lora_checkpoint(prefix, lora)
     output_dir = tmp_path / "checkpoint"
 
     assert trainer.export_lora(str(output_dir), "student") == 0
@@ -1631,31 +1772,7 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
 def test_prepared_lora_export_is_immutable_and_abortable(tmp_path: Path):
     prefix = "base_model.model.model.layers.0.self_attn.q_proj"
     lora = LoRA(prefix, 3, 4, 2, 2, torch.float32, torch.device("cpu"))
-    adapter = {
-        f"{prefix}.lora_A.weight": torch.arange(6, dtype=torch.float32).reshape(2, 3),
-        f"{prefix}.lora_B.weight": torch.arange(8, dtype=torch.float32).reshape(4, 2),
-    }
-    trainer = TrainerRank.__new__(TrainerRank)
-    trainer.runtime = SimpleNamespace(
-        model=[lora],
-        model_support_handler=DEFAULT_DENSE_HANDLER,
-        rank=0,
-        world_size=1,
-    )
-    trainer._slot_stack = []
-    trainer._pending_slot_graphs = {}
-    trainer._checkpoint_slots = {}
-    trainer._skipped_forward_waves = {}
-    trainer._snapshot_checkpoint_names = set()
-    trainer._checkpoint_prefetch_sources = {}
-    trainer._checkpoint_prefetch_lock = threading.Lock()
-    trainer._checkpoint_mutation_lock = threading.RLock()
-    config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
-    assert trainer._load_checkpoint_slot("student", adapter, alpha=2) == 1
-    trainer._checkpoint_slots["student"] = _CheckpointSlot(
-        tuple(trainer._iter_slot_parameters(trainer._slot_ref("student"))),
-        cast(_AdapterConfig, config),
-    )
+    trainer, adapter, config = _named_lora_checkpoint(prefix, lora)
 
     revision, capture_timings = trainer._prepare_lora_export(
         "first", "student", owner_id="owner"
@@ -1812,9 +1929,11 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
     )
 
 
+@pytest.mark.parametrize("internal_ffn", [128, 1024])
 def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     tmp_path: Path,
     monkeypatch,
+    internal_ffn: int,
 ):
     monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
@@ -1834,7 +1953,7 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     gate_up_lora = LoRA(
         adapter_model_prefix=f"{group_prefix}.{{expert}}.gate_up_proj",
         in_features=hidden,
-        out_features=2 * intermediate,
+        out_features=2 * internal_ffn,
         rank=rank,
         alpha=rank,
         dtype=torch.float32,
@@ -1843,7 +1962,7 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     )
     down_lora = LoRA(
         adapter_model_prefix=f"{group_prefix}.{{expert}}.down_proj",
-        in_features=intermediate,
+        in_features=internal_ffn,
         out_features=hidden,
         rank=rank,
         alpha=rank,
@@ -1857,10 +1976,18 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
             full[f"{expert_prefix}.gate_up_proj.lora_A.weight"].T
         )
         gate_up_lora.B_T.data[expert].copy_(
-            full[f"{expert_prefix}.gate_up_proj.lora_B.weight"].T
+            torch.nn.functional.pad(
+                full[f"{expert_prefix}.gate_up_proj.lora_B.weight"].T.reshape(
+                    rank, 2, intermediate
+                ),
+                (0, internal_ffn - intermediate),
+            ).flatten(1)
         )
         down_lora.A_T.data[expert].copy_(
-            full[f"{expert_prefix}.down_proj.lora_A.weight"].T
+            torch.nn.functional.pad(
+                full[f"{expert_prefix}.down_proj.lora_A.weight"].T,
+                (0, 0, 0, internal_ffn - intermediate),
+            )
         )
         down_lora.B_T.data[expert].copy_(
             full[f"{expert_prefix}.down_proj.lora_B.weight"].T

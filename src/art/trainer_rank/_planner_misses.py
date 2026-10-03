@@ -52,6 +52,8 @@ _SOURCE_NAMES = (
     "_prefix_tree_performance_search.py",
     "_planner_misses.py",
     "_gdn_memory.py",
+    "_memory_policy.py",
+    "_options.py",
     "_planner_replay.py",
     "_planner_evidence.py",
     "_planner_retention.py",
@@ -102,10 +104,60 @@ class _ReportTooLarge(ValueError):
     pass
 
 
+def _json_chunks(value: Any, encoder: json.JSONEncoder, active: set[int]):
+    # Token inventories dominate reports. Encode small native-int blocks in C,
+    # keeping bounded incremental rejection instead of allocating a whole report.
+    sequence = type(value) in (list, tuple)
+    mapping = type(value) is dict and all(type(key) is str for key in value)
+    if not sequence and not mapping:
+        if type(value) in (str, int, float, bool, type(None)):
+            yield encoder.encode(value)
+        else:
+            yield from encoder.iterencode(value)
+        return
+    identity = id(value)
+    if identity in active:
+        raise ValueError("Circular reference detected")
+    active.add(identity)
+    try:
+        if mapping:
+            yield "{"
+            for index, (key, item) in enumerate(sorted(value.items())):
+                if index:
+                    yield ","
+                yield encoder.encode(key)
+                yield ":"
+                yield from _json_chunks(item, encoder, active)
+            yield "}"
+        else:
+            yield "["
+            start = 0
+            while start < len(value):
+                block = value[start : start + 1024]
+                if all(
+                    type(item) is int and -(1 << 63) <= item < 1 << 63 for item in block
+                ):
+                    if start:
+                        yield ","
+                    yield encoder.encode(block)[1:-1]
+                    start += len(block)
+                else:
+                    # Subclass iterators can mutate later native-list entries.
+                    stop = start + len(block)
+                    while start < stop and start < len(value):
+                        if start:
+                            yield ","
+                        yield from _json_chunks(value[start], encoder, active)
+                        start += 1
+            yield "]"
+    finally:
+        active.remove(identity)
+
+
 def _encode(record: dict[str, Any], *, limit: int = MAX_REPORT_BYTES) -> bytes:
     chunks = bytearray()
     encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
-    for chunk in encoder.iterencode(record):
+    for chunk in _json_chunks(record, encoder, set()):
         encoded = chunk.encode("utf-8")
         if len(chunks) + len(encoded) + 1 > limit:
             raise _ReportTooLarge("report exceeds byte limit")
@@ -462,6 +514,9 @@ class Reporter:
             <= threshold * predicted_peak_bytes
         ):
             return None
+        retention = None
+        record = None
+        path = None
         try:
             if (predicted_peak_bytes is not None and predicted_peak_bytes < 0) or (
                 observed_peak_bytes is not None and observed_peak_bytes < 0
@@ -471,22 +526,7 @@ class Reporter:
             planning_budget = planning and not (
                 failure is not None and failure["type"] == "OutOfMemoryError"
             )
-            if retention is not None and not _planner_retention.remaining(
-                retention,
-                count_limit=MAX_PLANNING_REPORTS
-                if planning_budget
-                else MAX_SPOOL_REPORTS,
-                byte_limit=MAX_PLANNING_SPOOL_BYTES
-                if planning_budget
-                else MAX_SPOOL_BYTES,
-            ):
-                # Only definitive exhaustion can skip construction without changing
-                # which smaller reports or static-cap fallbacks remain retainable.
-                _planner_retention.omit_unmeasured(retention)
-                raise _planner_retention.RetentionLimitReached(
-                    "assigned planner retention exhausted before construction"
-                )
-            record: dict[str, Any] = {
+            record = {
                 "format": 2,
                 "kind": "art-planner-miss",
                 "event": event,
@@ -515,6 +555,21 @@ class Reporter:
                 "incomplete_reasons": [],
                 "replay_scope": "cpu-memory-estimator; GPU execution requires checkpoint/runtime",
             }
+            if retention is not None and not _planner_retention.remaining(
+                retention,
+                count_limit=MAX_PLANNING_REPORTS
+                if planning_budget
+                else MAX_SPOOL_REPORTS,
+                byte_limit=MAX_PLANNING_SPOOL_BYTES
+                if planning_budget
+                else MAX_SPOOL_BYTES,
+            ):
+                # Only definitive exhaustion can skip construction without changing
+                # which smaller reports or static-cap fallbacks remain retainable.
+                _planner_retention.omit_unmeasured(retention)
+                raise _planner_retention.RetentionLimitReached(
+                    "assigned planner retention exhausted before construction"
+                )
             try:
                 record["replay"] = dict(replay_factory())
                 record["replay"]["source_files"] = _source_files()
@@ -566,6 +621,14 @@ class Reporter:
                 else f"local persistence failed ({type(exc).__name__})"
             )
             return None
+        finally:
+            if retention is not None and record is not None:
+                try:
+                    _planner_retention.summarize(
+                        retention, record, retained=path is not None
+                    )
+                except Exception as exc:
+                    _warn(f"capture summary unavailable ({type(exc).__name__})")
         if not record["replay_complete"]:
             _warn(f"partial replay retained at {path}")
         if _sink is not None:
@@ -580,16 +643,42 @@ class Reporter:
 _RANK_FIELDS = frozenset(
     "num_layers hidden_size param_dtype_size recompute_granularity "
     "one_layer_recompute sequence_parallel attention_output_gate "
-    "mlp_activation_factor gdn_layers "
+    "mlp_activation_factor dense_fc1_adapted gdn_layers "
     "checkpointed_moe_layers recompute_modules moe_output_bytes_per_token "
     "moe_forward_stages".split()
 )
+# TP x SP floor facts; reports captured before them replay conservatively.
+_OPTIONAL_RANK_FIELDS = frozenset({"mixer_top_gaps", "lora_modules_per_layer"})
+
+
+def _adapter_ranks_unavailable(
+    topology: tuple[int, ...], facts: dict[str, Any], signature: Any
+) -> bool:
+    """A TP x SP floor estimate trains a named adapter whose ranks (the LoRA
+    intermediates' price) were not recorded, as in reports from before
+    sequence-parallel signatures carried slot shapes."""
+    return (
+        topology[1] > 1
+        and bool(facts["checkpoint_layers"])
+        and any(
+            group["grad"] and group["adapter"] is not None for group in facts["groups"]
+        )
+        and not any(
+            len(shape) == 5 and shape[0] == 2
+            for grad, shapes in signature.slot_shapes
+            if grad
+            for shape in shapes
+        )
+    )
 
 
 def _signature_values(values: dict[str, Any]) -> dict[str, Any]:
     values = dict(values)
     for name in ("topology", "planner_coefficients", "request_mix", "grad_modes"):
         values[name] = tuple(values[name])
+    values["memory_placement"] = tuple(
+        tuple(placement) for placement in values.get("memory_placement", ())
+    )
     slots = []
     raw_slots = values.get("slot_shapes", ())
     if not isinstance(raw_slots, (list, tuple)):
@@ -644,11 +733,19 @@ def replay(
     state = payload["memory_replay"]
     if not state["estimates"]:
         raise ValueError("memory replay has no candidate estimates")
-    values = state["rank"]
-    if set(values) != _RANK_FIELDS | {"geometry", "topology"}:
+    # Reports from before the dense no-grad FC1 floor omit this fact; their
+    # estimator did not price that floor. Optional TP x SP floor facts may
+    # also be absent (older reports replay those terms conservatively).
+    values: dict[str, Any] = {"dense_fc1_adapted": False, **state["rank"]}
+    if set(values) - _OPTIONAL_RANK_FIELDS != _RANK_FIELDS | {"geometry", "topology"}:
         raise ValueError(
             "incomplete replay: immutable rank fields differ (including MoE stages)"
         )
+    layers = values["num_layers"]
+    if type(layers) is not int or not 0 < layers <= _planner_replay.MAX_LAYERS:
+        raise ValueError("incomplete replay: recorded layer count out of bounds")
+    if type(values["dense_fc1_adapted"]) is not bool:
+        raise ValueError("incomplete replay: recorded FC1 adapter fact is invalid")
     rank = _planner_replay.ReplayRank.__new__(_planner_replay.ReplayRank)
     for name in _RANK_FIELDS - {"one_layer_recompute"}:
         setattr(rank, "_" + name, values[name])
@@ -656,6 +753,21 @@ def replay(
         raise ValueError("incomplete replay: recompute mode is not recorded")
     rank._recorded_one_layer_recompute = values["one_layer_recompute"]
     rank._moe_forward_stages = tuple(tuple(row) for row in values["moe_forward_stages"])
+    gaps = values.get("mixer_top_gaps")
+    if gaps is not None and (
+        type(gaps) is not list
+        or len(gaps) != 2
+        or any(
+            gap is not None and (type(gap) is not int or not 0 <= gap < layers)
+            for gap in gaps
+        )
+    ):
+        raise ValueError("incomplete replay: invalid mixer layer order")
+    rank._mixer_top_gaps = None if gaps is None else tuple(gaps)
+    modules = values.get("lora_modules_per_layer")
+    if modules is not None and (type(modules) is not int or not 0 <= modules < 2**16):
+        raise ValueError("incomplete replay: invalid LoRA module count")
+    rank._lora_modules_per_layer = modules
     rank._geometry = ModelGeometry(**values["geometry"])
     dp, tp, cp, pp = values["topology"]
     rank._topology_key = lambda: (dp, tp, cp, pp)
@@ -781,6 +893,10 @@ def replay(
                 request_cursor += count
                 group_cursor += 1
         key = _impl._MemorySignature(**_signature_values(item["signature"]))
+        if grouped and _adapter_ranks_unavailable(
+            rank._topology_key(), item["runtime_facts"], key
+        ):
+            raise ValueError("incomplete replay: TP x SP adapter ranks unavailable")
         rank._memory_profiles = (
             {key: _impl._MemoryProfile(**item["profile"])}
             if item["profile"] is not None

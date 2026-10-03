@@ -51,6 +51,7 @@ class DefaultDenseHandler:
     is_moe = False
     cp_supported = True
     native_vllm_lora_status = "disabled"
+    trust_remote_code = False
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         return base_config

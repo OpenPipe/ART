@@ -37,6 +37,8 @@ class TrainerRuntimeSpec(_Spec):
     model_support_key: str = Field(min_length=1)
     handler_name: str = Field(min_length=1)
     lora_rank: int = Field(ge=1)
+    # Fixed alpha supports LR transfer across ranks through alpha/r scaling.
+    # https://thinkingmachines.ai/blog/lora/
     lora_alpha: float = Field(default=32.0, gt=0)
     lora_target_modules: tuple[str, ...]
     dtype: Literal["bfloat16", "float16", "float32"]

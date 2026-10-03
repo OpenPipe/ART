@@ -77,6 +77,75 @@ def test_selected_grouped_cost_recomputed(
     assert not torch.cuda.is_initialized()
 
 
+@pytest.mark.parametrize("split", [False, True])
+def test_placement_admission_with_runtime_facts_stays_incomplete(
+    split, monkeypatch, tmp_path
+):
+    from art.trainer_rank import ForwardOptions, _planner_evidence
+
+    rank = head_rank()
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda *_args: 10**12)
+    monkeypatch.setattr(rank, "_available_cpu_memory_bytes", lambda: 10**12)
+    options = ForwardOptions(
+        backward_state="replay" if split else "gpu",
+        output_device="cpu" if split else "model",
+    )
+    items = [replace(request(rows, grad=True), options=options) for rows in (65, 33)]
+    plan = (
+        tr._SplitForwardPlan(
+            tuple(rank._plan_flat_forward([item]) for item in items), ((0,), (1,)), 2
+        )
+        if split
+        else rank._plan_flat_forward(items)
+    )
+    children = plan.subforwards if isinstance(plan, tr._SplitForwardPlan) else (plan,)
+    unplaced = rank._split_required_memory([rank._plan_cost(p) for p in children])
+    with _planner_evidence.scope(
+        _planner_evidence.Decision("forward", sync_across_dp=False, owner=rank)
+    ):
+        plan, check = rank._admit_graph_memory(plan)
+    assert check.fits and check.cpu_fits and check.cpu_required_bytes > 0
+    assert check.sample is not None
+    local = check.sample.local_required_bytes
+    assert local is not None
+    assert local == check.estimated_required_bytes and local != unplaced
+    rank._begin_planner_observation(
+        plan, replace(check, estimated_required_bytes=local + 123)
+    )
+    observation = rank._planner_observation
+    assert observation is not None and observation["comparable"]
+    path = rank._planner_reporter.report(
+        predicted_peak_bytes=observation["predicted"],
+        observed_peak_bytes=local * 2,
+        phase="forward",
+        admission_peak_bytes=local + 123,
+        replay_factory=observation["replay"],
+    )
+    assert path is not None
+    rank.finish_planner_observation()
+    report = reports.validate_report(path.read_bytes())
+    payload = report["replay"]
+    assert payload["local_admission_peak_bytes"] == local
+    assert payload["reduced_admission_peak_bytes"] == local + 123
+    assert report["predicted_peak_bytes"] == round(local / tr._MEMORY_SAFETY_FACTOR)
+    assert payload["requests"][0]["options"]["backward_state"] == options.backward_state
+    assert payload["requests"][0]["options"]["output_device"] == options.output_device
+    assert [r["target_tokens"] for r in payload["requests"]] == [
+        list(range(65)),
+        list(range(33)),
+    ]
+    assert all(
+        e["runtime_facts"] is not None for e in payload["memory_replay"]["estimates"]
+    )
+    # Without the placement boundary, unchanged-source replay reconstructs every
+    # model estimate but incorrectly claims it can reproduce placement admission.
+    assert not report["replay_complete"], reports.replay(report)
+    assert report["incomplete_reasons"] == ["graph_placement_admission_unavailable"]
+    with pytest.raises(ValueError, match="graph_placement_admission_unavailable"):
+        reports.replay(report)
+
+
 def test_runtime_dimensions_change_recomputed_cost_not_expected_answer(tmp_path):
     rank = head_rank()
     rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
@@ -90,6 +159,31 @@ def test_runtime_dimensions_change_recomputed_cost_not_expected_answer(tmp_path)
         result = reports.replay(changed)
         assert result["estimates"][0]["matches"] is False
         assert result["aggregate"]["matches"] is False
+
+
+@pytest.mark.parametrize("mode", ["target", "top_k", "logits", "ignored_mixed"])
+@pytest.mark.parametrize("grad", [False, True])
+@pytest.mark.parametrize("stock_scale", [False, True])
+def test_eager_head_capacity_replays_output_modes(tmp_path, mode, grad, stock_scale):
+    rank = head_rank()
+    if not stock_scale:
+        rank.runtime.model[0]._scale_logits = lambda logits: logits
+    item = request(65, grad=grad)
+    if mode == "top_k":
+        item = replace(item, target_tokens=None, top_k=2)
+    elif mode in {"logits", "ignored_mixed"}:
+        item = replace(item, target_tokens=None, logits=True)
+    items = [item]
+    if mode == "ignored_mixed":
+        items.append(request(65, grad=grad, ignored=True))
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward(items, memory_minimal=True)
+    multiplier = 1 if not stock_scale else 7 if mode != "logits" else 3
+    assert rank._plan_head_workspace_bytes(plan) == multiplier * 65 * 248320 * 2
+    report, _ = emitted(rank, plan, tmp_path)
+    result = reports.replay(report)
+    assert result["aggregate"]["matches"]
+    assert all(item["matches"] for item in result["estimates"] + result["layouts"])
 
 
 def test_legacy_grouped_report_cannot_enable_replay_by_flipping_flag(
@@ -171,8 +265,140 @@ def test_selected_slot_terms_are_replayed_and_frozen(layer, tmp_path):
     )
 
 
+def adapter_report(layer, tmp_path):
+    """A grouped report whose gradient slot has pending adapter gradients."""
+    from test_trainer_rank_adapter_gradient_memory import lora, parameter
+    from test_trainer_rank_converted_memory import weights
+    from test_trainer_rank_pending_memory import rank_with_moe
+    from test_trainer_rank_slot_memory import load_slot
+    from test_trainer_rank_slot_memory import request as slot_request
+
+    rank, _ = rank_with_moe(weights(layer, 8))
+    load_slot(rank, "small", 1)
+    load_slot(rank, "large", 64)
+    # Unallocated slot gradients the recompute backward will allocate: small,
+    # distinct per-layer sizes (the fixture has 40 layers; keep this bounded).
+    layers = tr._language_model(rank.runtime.model[0]).decoder.layers
+    assert len(layers) <= 64
+    sizes = [16 * (index + 1) for index in range(len(layers))]
+    assert sum(sizes) * 2 <= 66_560  # BF16 bytes, checked before allocating.
+    params = []
+    for size, block in zip(sizes, layers, strict=True):
+        params.append(parameter(size))
+        block.add_module("adapter", lora(large=[params[-1]]))
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward(
+        [slot_request("small", rows=2), slot_request("large", rows=65, grad=True)],
+        ensure_slots=False,
+    )
+    original, costs = emitted(rank, plan, tmp_path)
+    return original, costs, params
+
+
+def test_selected_adapter_gradients_are_replayed_and_frozen(layer, tmp_path):
+    original, costs, params = adapter_report(layer, tmp_path)
+    assert costs[0].checkpoint_adapter_gradient > 0
+    groups = original["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ]
+    assert groups[0]["adapter"] is None
+    assert groups[1]["adapter"]["name"] == "large" and any(
+        groups[1]["adapter"]["pending"]
+    )
+    actual = reports.replay(original)
+    assert actual["aggregate"]["matches"]
+    assert all(item["matches"] for item in actual["estimates"])
+    # Gradients allocated after selection cannot change the replayed answer.
+    for param in params:
+        param.grad = torch.zeros_like(param)
+    assert reports.replay(original) == actual
+    changed = deepcopy(original)
+    changed["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]["groups"][1][
+        "adapter"
+    ]["pending"][0] += 10**12
+    result = reports.replay(changed)
+    assert not result["estimates"][0]["matches"]
+    assert (
+        result["estimates"][0]["required_bytes"]
+        > actual["estimates"][0]["required_bytes"]
+    )
+
+
 @pytest.mark.parametrize(
-    "change", ["version", "group", "layout", "gdn_segment", "budget"]
+    "change",
+    ["gradient", "length", "value", "kind_length", "kindless_pending", "mixed_kinds"],
+)
+def test_adapter_fact_validation_rejects_forged_input(change, layer, tmp_path):
+    report, _, _ = adapter_report(layer, tmp_path)
+    group = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+        "groups"
+    ][1]
+    adapter = group["adapter"]
+    if change == "gradient":
+        group["grad"] = False
+    elif change == "length":
+        adapter["pending"] = [0] * 1026
+    elif change == "value":
+        adapter["pending"][0] = 1.5
+    elif change == "kind_length":
+        adapter["kind"] = "k" * 65
+    elif change == "kindless_pending":
+        adapter["kind"] = None
+    else:
+        groups = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"][
+            "groups"
+        ]
+        groups[0]["grad"] = True
+        groups[0]["adapter"] = {"kind": None, "name": "base", "pending": []}
+    # Name the refusal: a forged fact must fail validation, not a later check.
+    message = (
+        "invalid runtime dimension"
+        if change == "value"
+        else "invalid adapter gradient facts"
+    )
+    with pytest.raises(ValueError, match=message):
+        reports.replay(report)
+
+
+@pytest.mark.parametrize("layers", [2**10 + 1, 0, 40.0])
+def test_replay_bounds_the_recorded_layer_count(layers, pending_rank, tmp_path):
+    rank = pending_rank
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, _ = emitted(
+        rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
+    )
+    # Replay sizes per-layer tuples from this field; refuse it before costing.
+    report["replay"]["memory_replay"]["rank"]["num_layers"] = layers
+    with pytest.raises(ValueError, match="layer count"):
+        reports.replay(report)
+
+
+def test_custom_adapter_gradient_reader_is_explicitly_incomplete(monkeypatch):
+    from art.trainer_rank import _planner_replay
+
+    rank = _rank(monkeypatch)
+    plan = rank._plan_flat_forward([_request(1)])
+    original = rank._pending_adapter_gradient_bytes
+    monkeypatch.setattr(
+        rank, "_pending_adapter_gradient_bytes", lambda refs: original(refs)
+    )
+    with pytest.raises(ValueError, match="custom_runtime_estimator"):
+        _planner_replay.capture(rank, plan)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "version",
+        "parent_version",
+        "future_version",
+        "group",
+        "layout",
+        "gdn_segment",
+        "head_statistics",
+        "head_statistics_type",
+        "budget",
+    ],
 )
 def test_fact_validation_rejects_inconsistent_or_unbounded_input(
     change, pending_rank, tmp_path
@@ -183,14 +409,20 @@ def test_fact_validation_rejects_inconsistent_or_unbounded_input(
         rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
     )
     facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
-    if change == "version":
-        facts["version"] = 2
+    if change in {"version", "parent_version", "future_version"}:
+        facts["version"] = {"version": 1, "parent_version": 2, "future_version": 4}[
+            change
+        ]
     elif change == "group":
         facts["groups"][0]["rows"] += 1
     elif change == "layout":
         facts["groups"][0]["layout_fingerprint"] = "wrong"
     elif change == "gdn_segment":
         facts["groups"][0]["gdn"]["segments"][0]["end"] += 1
+    elif change == "head_statistics":
+        facts["groups"][0]["head_statistics"] = False
+    elif change == "head_statistics_type":
+        facts["groups"][0]["head_statistics"] = 1
     else:
         facts["groups"] *= 1025
     with pytest.raises(ValueError):

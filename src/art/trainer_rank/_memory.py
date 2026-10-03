@@ -13,7 +13,7 @@ also lets the circular import resolve lazily.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from contextlib import nullcontext
 import hashlib
 import math
@@ -45,12 +45,32 @@ def _split_required_memory(costs: Sequence[_impl._SubforwardCost]) -> int:
     if any(cost.checkpoint_input_gradient for cost in costs):
         # The caller owns all returned graphs. A calibrated forward-retained
         # discount cannot replace the sum of their input-gradient extents.
+        # Children training the same slots share their adapter gradients,
+        # allocated once by whichever child's backward reaches a layer
+        # first; the largest child's extra covers any order. Different
+        # slots have disjoint gradients, charged per child.
+        adapter = [
+            cost.checkpoint_adapter_gradient
+            for cost in costs
+            if cost.checkpoint_adapter_gradient
+        ]
+        shared = (
+            len(
+                {
+                    cost.checkpoint_adapter_gradient_slots
+                    for cost in costs
+                    if cost.checkpoint_adapter_gradient
+                }
+            )
+            <= 1
+        )
         checkpoint = (
             sum(
                 cost.checkpoint_retained + cost.checkpoint_input_gradient
                 for cost in costs
             )
             + max(cost.checkpoint_workspace for cost in costs)
+            + ((max(adapter) if shared else sum(adapter)) if adapter else 0)
             + growth
         )
         required = max(required, int(checkpoint * _impl._MEMORY_SAFETY_FACTOR))
@@ -110,6 +130,7 @@ def _split_memory_key(plan: _impl._SplitForwardPlan) -> bytes | None:
                     signature.request_mix,
                     signature.grad_enabled,
                     signature.grad_modes,
+                    signature.memory_placement,
                     signature.slot_shapes,
                     signature.short_requests,
                     p.packed_tokens,
@@ -213,13 +234,22 @@ def _split_plan_memory_check(
 
 
 def _head_vocabulary(self: TrainerRank) -> int:
-    """Runtime eligibility and vocabulary, without reading parameter values."""
+    """Runtime eligibility and this rank's vocabulary, without reading values.
+
+    TP > 1 runs the same 512-row chunked head over each rank's vocabulary
+    shard; it is priced only where the explicit TP x SP checkpoint floor
+    applies, whose shallow shapes it can dominate.
+    """
+    _, tp, _, pp = self._topology_key()
     if (
         self._padded_vocab_size is None
         or len(self.runtime.model) != 1
-        or self._topology_key()[1::2] != (1, 1)
+        or pp != 1
+        or self._padded_vocab_size % tp
+        or (tp > 1 and not _checkpoint_layers(self, ((1, True),)))
     ):
         return 0
+    vocabulary = self._padded_vocab_size // tp
     try:
         model = _impl._language_model(self.runtime.model[0])
     except (AttributeError, RuntimeError):
@@ -250,8 +280,8 @@ def _head_vocabulary(self: TrainerRank) -> int:
     if (
         type(weight) not in (_impl.torch.Tensor, _impl.torch.nn.Parameter)
         or weight.dtype is not _impl.torch.bfloat16
-        or tuple(weight.shape) != (self._padded_vocab_size, self._hidden_size)
-        or head.output_size_per_partition != self._padded_vocab_size
+        or tuple(weight.shape) != (vocabulary, self._hidden_size)
+        or head.output_size_per_partition != vocabulary
         or head.output_size != self._padded_vocab_size
         or head.input_size != self._hidden_size
         or getattr(config, "params_dtype", None) is not _impl.torch.bfloat16
@@ -267,13 +297,14 @@ def _head_vocabulary(self: TrainerRank) -> int:
             for name in (
                 "_project_head",
                 "_project_vocab_parallel",
+                "_checkpointed_head_stats",
                 "_local_head_stats",
                 "_local_logits_from_hidden_rows",
             )
         )
     ):
         return 0
-    return int(self._padded_vocab_size)
+    return int(vocabulary)
 
 
 def _dense_head_bytes(vocabulary: int, rows: int) -> int:
@@ -309,22 +340,46 @@ def _group_head_workspace_bytes(
     positions: Sequence[torch.Tensor] | None = None,
     lower_bound: bool = False,
 ) -> int:
-    """One logits buffer, or logits + both dense target-backward gradients.
+    """Partial dense head component: eager statistics or logits copies.
 
-    The supported head path overlaps indexing and statistics gradients
-    with recomputed logits; cold library workspaces remain outside this
-    component. Pair each group's mode with its own projected rows.
+    Capacity reserves the eager path even when optional Triton may succeed.
+    Its BF16 logits, FP32 conversion, subtraction and exp overlap. This is
+    not a bound for row vectors, inter-chunk liveness or library workspaces.
+    Rejection lower bounds retain only the unconditional dense components.
+    TP > 1 heads (priced with the explicit TP x SP floor) instead follow each
+    chunk's statistics path: ``_tp_head_workspace_bytes``.
     """
     dense = self._head_workspace_bytes(rows)
-    if (
-        not dense
-        or not grad_enabled
-        or not any(request.target_tokens is not None for request in requests)
+    if dense and self._topology_key()[1] > 1:
+        return _tp_head_workspace_bytes(
+            self,
+            rows,
+            requests,
+            grad_enabled=grad_enabled,
+            positions=positions,
+            lower_bound=lower_bound,
+        )
+    needs_statistics = any(
+        request.target_tokens is not None or request.top_k is not None
+        for request in requests
+    )
+    if not dense or (
+        not needs_statistics and (lower_bound or not any(r.logits for r in requests))
     ):
         return dense
     if _head_target_backward(self):
+        if not lower_bound:
+            # need_log_z is group-wide, including logits-only chunks and
+            # chunks overlapping ignored labels. A short final chunk can
+            # also take the eager path; optional success is not guaranteed.
+            # Without statistics, local logits and both indexed copies
+            # overlap. Requested output storage is charged separately.
+            return (7 if needs_statistics else 3) * dense
+        if not grad_enabled or not any(
+            request.target_tokens is not None for request in requests
+        ):
+            return dense
         # IndexBackward's dense result overlaps saved logits and grad_logits.
-        # The FP32 fallback already exceeds this three-buffer component.
         target_dense = (
             self._head_workspace_bytes(
                 self._head_target_chunk_rows(
@@ -336,6 +391,151 @@ def _group_head_workspace_bytes(
         )
         return max(dense, 3 * target_dense)
     return dense
+
+
+def _tp_head_workspace_bytes(
+    self: TrainerRank,
+    rows: int,
+    requests: Sequence[AnyForwardInput],
+    *,
+    grad_enabled: bool,
+    positions: Sequence[torch.Tensor] | None = None,
+    lower_bound: bool = False,
+) -> int:
+    """The TP > 1 head component, per chunk statistics path (#1068's model at TP1).
+
+    The eager FP32 statistics keep #1068's seven BF16 buffers. Chunks whose
+    kernel is attempted run it, or after a failure the bounded eager
+    statistics (``_impl._EagerLocalStats``): the kernel path's buffers plus
+    ``_eager_stats_extra_bytes``. A gradient wave's kernel path holds the
+    saved logits and the statistics gradient, plus a dense gradient per
+    gathered output kind: the target gather's and top-k's scatter. Requested
+    logits hold the local logits, their indexed copy, the gather buffer and
+    its concatenation (Megatron's gather along the vocabulary): 2 + 2 TP.
+    """
+    dense = self._head_workspace_bytes(rows)
+    if not _head_target_backward(self):
+        return dense
+    tp = self._topology_key()[1]
+    needs_statistics = any(
+        request.target_tokens is not None or request.top_k is not None
+        for request in requests
+    )
+    if not needs_statistics:
+        logits = any(request.logits for request in requests)
+        return dense if lower_bound or not logits else (2 + 2 * tp) * dense
+    kernel = dense
+    if grad_enabled:
+        # Saved logits and the statistics gradient, then each gathered
+        # output's dense gradient: top-k's scatter and the target gather's.
+        kernel = 2 * dense
+        if any(request.top_k is not None for request in requests):
+            kernel += dense
+        if any(request.target_tokens is not None for request in requests):
+            kernel += (
+                self._head_workspace_bytes(
+                    self._head_target_chunk_rows(
+                        requests, positions=positions, lower_bound=lower_bound
+                    )
+                )
+                if any(
+                    request.logits or request.top_k is not None for request in requests
+                )
+                else dense
+            )
+    low = self._head_projection_rows(
+        requests, positions=positions, lower_bound=True, uncapped=True
+    )
+    if lower_bound:
+        # A rejection bound monotone in rows: only unconditional components,
+        # and the eager statistics only when no kernel can run at all.
+        return max(
+            kernel,
+            0
+            if _impl._triton_head_stats_available(self)
+            else 7 * self._head_workspace_bytes(low),
+        )
+    if positions is not None:
+        # The selected layout's packed union: every chunk exactly.
+        fallback = _head_fallback_bytes(self, low, low)
+    else:
+        # An acceptance bound: any projected count the union can take.
+        high = self._head_projection_rows(requests, positions=positions, uncapped=True)
+        fallback = _head_fallback_bytes(self, low, high)
+    logits = (2 + 2 * tp) * dense if any(request.logits for request in requests) else 0
+    return max(
+        kernel + _eager_stats_extra_bytes(_head_vocabulary(self), rows),
+        fallback,
+        logits,
+    )
+
+
+def _eager_stats_extra_bytes(vocabulary: int, rows: int) -> int:
+    """The bounded eager statistics' live increment over the kernel path for a
+    ``rows`` x ``vocabulary`` head chunk (``_impl._EagerLocalStats``): one FP32
+    row sub-chunk, plus per-row FP32 maxima, sums and their gradient."""
+    rows = min(rows, _impl._HEAD_CHUNK_TOKENS)
+    step = -(-rows // _impl._EAGER_STATS_SUBCHUNKS)
+    return 4 * vocabulary * step + 16 * rows
+
+
+def _frozen_head_bytes(
+    vocabulary: int,
+    rows: int,
+    target_rows: int,
+    *,
+    target_backward: bool,
+    statistics: bool,
+    grad: bool,
+    tp: int,
+) -> int:
+    """Replay's head charge from frozen facts, as live admission prices it.
+
+    TP1 is #1068's capacity charge. TP > 1 is ``_tp_head_workspace_bytes``'s
+    kernel path plus the bounded statistics' increment, or the gathered logits
+    copies. Capture declines TP > 1 waves with an eager chunk, with logits
+    beside statistics, or with top-k beside targets in a gradient wave: the
+    facts record none of these. A gradient wave with statistics but no target
+    rows is therefore top-k only.
+    """
+    dense = _dense_head_bytes(vocabulary, rows)
+    if not target_backward:
+        return dense
+    if tp == 1:
+        return dense * (7 if statistics else 3)
+    if not statistics:
+        return (2 + 2 * tp) * dense
+    kernel = dense
+    if grad:
+        kernel = 2 * dense + (
+            _dense_head_bytes(vocabulary, target_rows) if target_rows else dense
+        )
+    return kernel + _eager_stats_extra_bytes(vocabulary, rows)
+
+
+def _head_fallback_bytes(self: TrainerRank, low: int, high: int) -> int:
+    """Seven BF16 buffers of the largest head chunk that runs the eager fallback
+    for any projected-row count from ``low`` to ``high``."""
+    chunk = _impl._HEAD_CHUNK_TOKENS
+    vocabulary = _head_vocabulary(self)
+    sizes: set[int] = set()
+    if high - low >= chunk:
+        sizes.update(range(1, min(high, chunk) + 1))  # every tail occurs
+    else:
+        for rows in range(low, high + 1):
+            sizes.update(_head_chunk_sizes(rows))
+    eager = [
+        size for size in sizes if not _impl._triton_head_stats(self, size, vocabulary)
+    ]
+    return 7 * self._head_workspace_bytes(max(eager)) if eager else 0
+
+
+def _head_chunk_sizes(rows: int) -> tuple[int, ...]:
+    """The distinct chunk sizes the head runs over ``rows`` projected rows."""
+    chunk = _impl._HEAD_CHUNK_TOKENS
+    return tuple(
+        size for size in (min(rows, chunk), rows % chunk * (rows > chunk)) if size
+    )
 
 
 def _plan_head_workspace_bytes(self: TrainerRank, plan: _impl._FlatForwardPlan) -> int:
@@ -502,8 +702,10 @@ def _checkpoint_layers(
     This is not a bound for custom preprocessing, attention, or all backward.
     With sequence parallelism a rank saves only its shard of each boundary;
     that is priced only where ``_sequence_parallel_floor_covered`` holds,
-    and there, for gradient waves, the recomputed GDN layer's recurrent
-    states for ``gdn_segments`` (gradient groups' segments) plus padding.
+    and there, for gradient waves, with the recomputed layer's explicit
+    workspace (``_sequence_parallel_workspace_bytes``) and its GDN layer's
+    recurrent states for ``gdn_segments`` (gradient groups' segments) plus
+    padding, beside one input-gradient shard instead of the TP1 repeat.
     """
     if not group_rows or len(self.runtime.model) != 1:
         return 0
@@ -543,7 +745,7 @@ def _checkpoint_layers(
         or self._param_dtype_size != 2
         or next(self.runtime.model[0].parameters()).dtype is not _impl.torch.bfloat16
         or pp != 1
-        or (tp > 1 and not self._sequence_parallel_floor_covered(layers, tp, cp))
+        or (tp > 1 and not self._sequence_parallel_floor_covered(tp, cp))
         or any(
             type(getattr(config, name, None)) is not type(value)
             or getattr(config, name) != value
@@ -583,7 +785,9 @@ def _checkpoint_memory_floor(
         and self._moe_memory_supported
     ):
         hybrid_rows = max(rows for rows, _ in group_rows)
-        if any(ref() is not None for ref in self._pending_hybridep_graphs):
+        if any(
+            _impl._graph_marker_is_live(ref) for ref in self._pending_hybridep_graphs
+        ):
             hybrid_rows = max(hybrid_rows, self._hybridep_rows_high_water)
     if hybrid_rows is not None:
         workspace = max(workspace, -(-hybrid_rows // 4) * 4 * self._hidden_size * 2)
@@ -616,6 +820,17 @@ def _checkpoint_floor_from_facts(
         + (0 if grad else 4 * rows * self._hidden_size * 2)
         for (rows, grad), ref in zip(group_rows, refs, strict=True)
     )
+    if tp > 1 and gradient_rows:
+        # The recomputed layer's workspace, for the largest gradient group:
+        # groups run their backward one after another.
+        workspace = max(
+            workspace,
+            *(
+                self._sequence_parallel_workspace_bytes(rows)
+                for rows, grad in group_rows
+                if grad
+            ),
+        )
     if tp > 1 and self._gdn_layers and gradient_rows:
         # Recurrent states grow with segments, not rows; backward recomputes
         # one layer at a time. Padding to TP adds up to TP - 1 one-token
@@ -623,6 +838,305 @@ def _checkpoint_floor_from_facts(
         roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
         workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
     return retained, workspace
+
+
+def _sequence_parallel_workspace_bytes(self: TrainerRank, rows: int) -> int:
+    """The recomputed layer's live workspace at a TP x SP backward peak.
+
+    Traced on dense Qwen3.8-27B at TP4 (25,728 rows) and TP2 (20,816 to
+    66,284 rows, one to four GDN segments), cold and warm: every peak was a
+    recomputed layer's MLP FC1 stage. Its workspace covers, over the gathered
+    rows, the SP-gathered norm output (2H), the FC1 stage (6F/TP: GEMM
+    output, gate and up LoRA outputs and their sum; the SwiGLU live set if
+    wider) and the recomputed mixer at its projection widths / TP (GDN held
+    0.885-0.887 of that bound); over the sharded rows, norm outputs (3.22H
+    measured, priced at 3.25H); and the wave length's fp32 rotary cache
+    (``kv_channels`` per row bounds the traced 64-dim partial rotary).
+
+    Recomputing layer i holds the L-shard ``retained`` term's i + 1
+    checkpoint inputs plus its own residual: L + 1 - gap shards, where gap
+    counts the layers above it. Each mixer kind peaks at its highest layer;
+    the boundary shards beyond L are charged here, per kind, from the
+    decoder's layer order (one extra shard for a kind whose order is
+    unknown). In the traced model the top layer is attention and the top GDN
+    layer (one below) peaks: exactly L shards. The input-gradient shard, LoRA
+    intermediates, GDN segment states and cold transients are separate terms.
+    """
+    if rows <= 0:
+        return 0
+    geometry = self._geometry
+    tp = self._topology_key()[1]
+    hidden = self._hidden_size
+    ffn = geometry.ffn_hidden_size or 4 * hidden
+    attention_layers = self._num_layers > self._gdn_layers
+    attention = (
+        (7 if self._attention_output_gate else 5)
+        * geometry.num_attention_heads
+        * geometry.kv_channels
+        + 3 * geometry.num_query_groups * geometry.kv_channels
+    )
+    gdn = (
+        4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+        + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
+    )
+    shard = -(-rows // tp) * hidden
+    gaps = getattr(self, "_mixer_top_gaps", None) or (None, None)
+    peak = (
+        max(
+            rows * -(-width // tp) + (1 - (0 if gap is None else gap)) * shard
+            for present, width, gap in (
+                (attention_layers, attention, gaps[0]),
+                (bool(self._gdn_layers), gdn, gaps[1]),
+            )
+            if present
+        )
+        if self._num_layers
+        else 0
+    )
+    stage = max(6, self._mlp_activation_factor) * ffn
+    gathered = rows * (2 * hidden + -(-stage // tp))
+    sharded = -(-rows // tp) * -(-13 * hidden // 4)
+    rotary = 2 * rows * geometry.kv_channels if attention_layers else 0
+    return (gathered + sharded + peak + rotary) * self._param_dtype_size
+
+
+def _sequence_parallel_lora_floor(
+    self: TrainerRank,
+    floor: tuple[int, int],
+    group_rows: tuple[tuple[int, bool], ...],
+    signature: _impl._MemorySignature,
+) -> tuple[int, int]:
+    """Add the recomputed layer's LoRA ``x @ A`` intermediates to a TP x SP floor.
+
+    Each adapted module of the recomputed layer saves rows x rank over the
+    gathered rows (FC1 gate/up measured 16 B/row at rank 4). Charge the
+    decoder's most-adapted layer at the gradient slots' largest rank, from
+    the signature's slot shapes ((ndim, *A.shape, *B.shape) per module).
+    """
+    retained, workspace = floor
+    if not retained or self._topology_key()[1] == 1:
+        return floor
+    rank = max(
+        (
+            shape[2]
+            for grad, shapes in signature.slot_shapes
+            if grad
+            for shape in shapes
+            if len(shape) == 5 and shape[0] == 2
+        ),
+        default=0,
+    )
+    modules = getattr(self, "_lora_modules_per_layer", None)
+    if not modules:
+        # Unread (e.g. reports without the recorded count): every adapted
+        # module of the slot, which bounds any one layer's.
+        modules = max(
+            (len(shapes) for grad, shapes in signature.slot_shapes if grad), default=0
+        )
+    rows = max((rows for rows, grad in group_rows if grad), default=0)
+    return retained, workspace + rows * modules * rank * self._param_dtype_size
+
+
+def _cold_recompute_transient_bytes(self: TrainerRank) -> int:
+    """Fixed transients of an unprofiled gradient wave's first execution."""
+    return (
+        _impl._SEQUENCE_PARALLEL_COLD_TRANSIENT_BYTES
+        if self._topology_key()[1] > 1
+        else _impl._COLD_RECOMPUTE_TRANSIENT_BYTES
+    )
+
+
+def _checkpoint_input_gradient_bytes(
+    self: TrainerRank, group_rows: tuple[tuple[int, bool], ...], retained: int
+) -> int:
+    """The input-gradient term beside the checkpoint floor's boundaries.
+
+    TP1 charges one logical gradient per boundary, which also stands in for
+    the recompute workspace. Under TP x SP the workspace is priced
+    explicitly, and the recompute peak held one input-gradient shard of the
+    group being recomputed.
+    """
+    tp = self._topology_key()[1]
+    if not retained or tp == 1:
+        return retained
+    rows = max((rows for rows, grad in group_rows if grad), default=0)
+    return -(-rows // tp) * self._hidden_size * self._param_dtype_size
+
+
+def _gradient_slots(
+    group_rows: Sequence[tuple[int, bool]],
+    slot_refs: Sequence[LoRASlotRef | None] | None,
+) -> frozenset[LoRASlotRef]:
+    """Gradient groups' adapter slots; the base model (no name) has none."""
+    return frozenset(
+        ref
+        for (_, grad), ref in zip(
+            group_rows, slot_refs or (None,) * len(group_rows), strict=True
+        )
+        if grad and ref is not None and ref.name is not None
+    )
+
+
+def _pending_adapter_gradient_bytes(
+    self: TrainerRank, refs: Iterable[LoRASlotRef]
+) -> tuple[int, ...]:
+    """Local adapter gradient bytes the next backward allocates, per decoder layer.
+
+    One entry per decoder layer, then one for parameters outside the
+    decoder. Backward reaches a parameter's highest decoder layer first, so
+    a parameter shared across layers counts there once; those outside the
+    decoder count as live throughout. Only unallocated gradients count:
+    within a step, later waves find the rest in the availability baseline.
+    Empty when none is pending.
+    """
+    refs = tuple(dict.fromkeys(refs))
+    if not refs or len(self.runtime.model) != 1:
+        return ()
+    try:
+        from art.megatron.lora import LoRA
+    except ModuleNotFoundError as error:
+        if error.name != "megatron":
+            raise
+        return ()
+    chunk = self.runtime.model[0]
+    try:
+        layers = _impl._language_model(chunk).decoder.layers
+    except (AttributeError, RuntimeError):
+        return ()
+    layer_of: dict[int, int] = {}
+    params: dict[int, torch.nn.Parameter] = {}
+
+    def slot_params(
+        modules: Iterable[torch.nn.Module],
+    ) -> Iterator[torch.nn.Parameter]:
+        for module in modules:
+            # A LoRA without slot tables holds no slot parameters.
+            if isinstance(module, LoRA) and "_slot_keys" in vars(module):
+                for ref in refs:
+                    yield from module.lora_slot_params(ref)
+
+    for index, layer in enumerate(layers):
+        for param in slot_params(layer.modules()):
+            params[id(param)] = param
+            layer_of[id(param)] = max(layer_of.get(id(param), -1), index)
+    # Outside the decoder (a head runs its backward first) is live
+    # throughout, even for a parameter or module a decoder layer also uses:
+    # walk every path except through the layers themselves.
+    outside: list[torch.nn.Module] = []
+    visited: set[int] = set()
+    pending_modules: list[torch.nn.Module] = [chunk]
+    while pending_modules:
+        module = pending_modules.pop()
+        if module is layers or id(module) in visited:
+            continue
+        visited.add(id(module))
+        outside.append(module)
+        pending_modules.extend(module.children())
+    for param in slot_params(outside):
+        params[id(param)] = param
+        layer_of[id(param)] = len(layers)
+    # A checkpoint's other trainable parameters (custom objects) have no
+    # decoder position; count them as live throughout.
+    for ref in refs:
+        slot = (
+            None
+            if ref.name is None
+            else getattr(self, "_checkpoint_slots", {}).get(ref.name)
+        )
+        for param in () if slot is None else slot.params:
+            if id(param) not in params:
+                params[id(param)] = param
+                layer_of[id(param)] = len(layers)
+    sizes = [0] * (len(layers) + 1)
+    for param_id, param in params.items():
+        if (
+            param.requires_grad
+            and param.grad is None
+            and getattr(param, "main_grad", None) is None
+        ):
+            sizes[layer_of[param_id]] += param.numel() * param.element_size()
+    return tuple(sizes) if any(sizes) else ()
+
+
+def _checkpoint_gradient_groups(
+    self: TrainerRank,
+    group_rows: Sequence[tuple[int, bool]],
+    slot_refs: Sequence[LoRASlotRef | None] | None,
+) -> tuple[tuple[LoRASlotRef | None, tuple[int, ...]], ...]:
+    """Each gradient group's adapter slot and per-layer saved boundaries.
+
+    In execution order, as ``_checkpoint_memory_floor`` prices them: every
+    decoder layer saves the group's rows (this rank's TP shard). The base
+    model (no name) has no adapter slot.
+    """
+    tp = self._topology_key()[1]
+    return tuple(
+        (
+            ref if ref is not None and ref.name is not None else None,
+            (-(-rows // tp) * self._hidden_size * 2,) * self._num_layers,
+        )
+        for (rows, grad), ref in zip(
+            group_rows, slot_refs or (None,) * len(group_rows), strict=True
+        )
+        if grad
+    )
+
+
+def _checkpoint_adapter_gradient_bytes(
+    self: TrainerRank, groups: Sequence[tuple[LoRASlotRef | None, Sequence[int]]]
+) -> int:
+    """The recompute backward's adapter-gradient peak beyond released boundaries.
+
+    ``groups`` gives each gradient group's adapter slot (None for the base
+    model) and each decoder layer's saved-boundary bytes
+    (``_adapter_gradient_walk``).
+    """
+    chains = []
+    for slot, boundaries in groups:
+        pending = () if slot is None else self._pending_adapter_gradient_bytes((slot,))
+        if pending and len(pending) != len(boundaries) + 1:
+            return 0
+        chains.append((pending or (0,) * (len(boundaries) + 1), boundaries))
+    return self._adapter_gradient_walk(chains)
+
+
+def _adapter_gradient_walk(
+    chains: Sequence[tuple[Sequence[int], Sequence[int]]],
+) -> int:
+    """The adapter-gradient peak beyond the floor over gradient groups' backward.
+
+    Each chain is a gradient group's pending gradient bytes (per decoder
+    layer, then outside the decoder) and saved-boundary bytes per layer.
+    Backward recomputes the last layer first. While it recomputes layer i it
+    still holds the saved boundaries of layers 0..i and every adapter
+    gradient allocated so far: those of layers i..L-1 (a layer allocates its
+    own during its backward) and any outside the decoder. The floor already
+    prices all L boundaries at once, so one group's extra peak is
+    max(0, max over i of gradients(i..) - boundaries(i+1..)), taken at every
+    layer over the real per-layer gradient sizes and the caller's per-layer
+    boundaries, not along a uniform-layer line. A short
+    first wave peaks at layer 0 (Qwen3.6-35B-A3B CP2: 830-900 MB of expert
+    LoRA gradients live at its peak), a long one at the last layer.
+    Groups run their backward one after another, not layer by layer
+    together: autograd drains the last-forwarded group's chain first, and
+    separate backward calls can come in either order. While one group runs,
+    each group already run holds all its gradients and none of its
+    boundaries, and each group yet to run all its boundaries. Any set of the
+    other groups can have run first, so the worst adds every other group
+    whose gradients outweigh its boundaries.
+    """
+    nets = [sum(pending) - sum(boundaries) for pending, boundaries in chains]
+    others = sum(max(0, net) for net in nets)
+    worst = 0
+    for (pending, boundaries), net in zip(chains, nets, strict=True):
+        extra = gradients = pending[-1]
+        released = 0
+        for index in range(len(boundaries) - 1, -1, -1):
+            gradients += pending[index]
+            extra = max(extra, gradients - released)
+            released += boundaries[index]
+        worst = max(worst, extra + others - max(0, net))
+    return worst
 
 
 def _retained_memory_bytes(
@@ -705,6 +1219,19 @@ def _estimate_flat_forward(
             # This cheap return type has no slot metadata. Materialize the
             # exact plan instead of admitting with the constructor rank.
             return None
+        gradient_slots = [
+            ref
+            for (ref, grad), _ in groups
+            if grad and ref is not None and ref.name is not None
+        ]
+        if (
+            gradient_slots
+            and getattr(self, "_recompute_granularity", None) == "full"
+            and self._pending_adapter_gradient_bytes(gradient_slots)
+        ):
+            # The step's first backward allocates adapter gradients that
+            # only slot metadata can price; the exact plan carries it.
+            return None
         if (
             any(mode for (_, mode), _ in groups)
             and _impl._gdn_memory.model_shapes(self) is not None
@@ -752,10 +1279,26 @@ def _estimate_flat_forward(
                         for request in head_requests
                     )
                 )
-                if lower != upper or (
-                    mixed_targets
-                    and self._head_target_chunk_rows(head_requests, lower_bound=True)
-                    != self._head_target_chunk_rows(head_requests)
+                # TP > 1 heads price each chunk's statistics path, so the
+                # exact count needs the packed union beyond one chunk too.
+                spread = (
+                    self._topology_key()[1] > 1
+                    and upper == _impl._HEAD_CHUNK_TOKENS
+                    and self._head_projection_rows(
+                        head_requests, lower_bound=True, uncapped=True
+                    )
+                    != self._head_projection_rows(head_requests, uncapped=True)
+                )
+                if (
+                    lower != upper
+                    or spread
+                    or (
+                        mixed_targets
+                        and self._head_target_chunk_rows(
+                            head_requests, lower_bound=True
+                        )
+                        != self._head_target_chunk_rows(head_requests)
+                    )
                 ):
                     packed = _impl.materialize_prefix_tree_layout(
                         tuple(
@@ -915,12 +1458,20 @@ def _memory_signature_from_requests(
 def _slot_memory_shapes(
     self: TrainerRank, ref: "LoRASlotRef | None"
 ) -> tuple[tuple[int, ...], ...]:
-    """Separate empirical trust across actual selected adapter layouts."""
+    """Separate empirical trust across actual selected adapter layouts.
+
+    Sequence-parallel (TP > 1) models record them too: the explicit TP x SP
+    checkpoint floor prices LoRA intermediates from these ranks.
+    """
     if (
         ref is None
         or ref.name is None
         or isinstance(ref, _impl._LocalLoRASlotRef)
-        or not (getattr(self, "_moe_layers", 0) or getattr(self, "_gdn_layers", 0))
+        or not (
+            getattr(self, "_moe_layers", 0)
+            or getattr(self, "_gdn_layers", 0)
+            or getattr(self, "_sequence_parallel", False)
+        )
     ):
         # Generic/no-component planning must not import Megatron or walk
         # model owners just to construct its existing memory signature.
@@ -967,12 +1518,24 @@ def _refresh_memory_check(
     self: TrainerRank, check: _impl._MemoryCheck, *, sync_across_dp: bool
 ) -> _impl._MemoryCheck:
     decision = _impl._planner_evidence.current(self)
-    # The existing admission operand can already be a cross-rank maximum.
-    # Preserve its local producer separately; never price the plan again.
+    # Re-sample each rank against its own demand, not another DP rank's maximum.
+    # Older synthetic checks may lack the local producer; keep their safe bound.
     with decision.refresh_of(check.sample) if decision is not None else nullcontext():
-        return self._memory_check_required(
-            check.estimated_required_bytes, sync_across_dp=sync_across_dp
+        refreshed = self._memory_check_required(
+            check.estimated_required_bytes
+            if check.local_required_bytes is None
+            else check.local_required_bytes,
+            sync_across_dp=sync_across_dp,
         )
+    return _impl.replace(
+        check,
+        estimated_required_bytes=refreshed.estimated_required_bytes,
+        available_bytes=refreshed.available_bytes,
+        fits=refreshed.fits and check.cpu_fits,
+        sample=refreshed.sample,
+        local_required_bytes=refreshed.local_required_bytes,
+        local_available_bytes=refreshed.local_available_bytes,
+    )
 
 
 def _memory_check_required(
@@ -988,7 +1551,7 @@ def _memory_check_required(
         group = None if sync_across_dp else self._forward_memory_group()
         scope = "world" if group is None else "tp_cp"
         values = _impl.torch.tensor(
-            [float(required), 0.0],
+            [float(required), 0.0, 0.0],
             device=self.device if self.device.type == "cuda" else "cpu",
             dtype=_impl.torch.float64,
         )
@@ -1009,8 +1572,12 @@ def _memory_check_required(
             # A healthy communicator carries local failure to every peer
             # in the existing MIN. This cannot repair a poisoned backend.
             values[1] = available
-            _impl.dist.all_reduce(values[1], op=_impl.dist.ReduceOp.MIN, group=group)
+            # Extrema can come from different DP ranks. Agree that every rank
+            # fits its own demand while retaining extrema for diagnostics.
+            values[2] = available >= local_required
+            _impl.dist.all_reduce(values[1:], op=_impl.dist.ReduceOp.MIN, group=group)
             available = int(values[1].item())
+            fits = bool(values[2].item())
         except BaseException as exc:
             if error is None:
                 raise
@@ -1026,6 +1593,7 @@ def _memory_check_required(
             else self._available_memory_bytes(details)
         )
         local_available = available
+        fits = required <= available
     sample = None
     if decision is not None:
         try:
@@ -1044,7 +1612,9 @@ def _memory_check_required(
     return _impl._MemoryCheck(
         estimated_required_bytes=required,
         available_bytes=available,
-        fits=required <= available,
+        fits=fits,
+        local_required_bytes=local_required,
+        local_available_bytes=local_available,
         sample=sample,
     )
 
@@ -1081,6 +1651,32 @@ def _estimate_required_memory_bytes_from_values(
     static_compute = (
         packed_tokens * self._hidden_size * self._param_dtype_size * activation_factor
     )
+    no_grad_stage = 0
+    if (
+        not self._geometry.moe_experts
+        and self._geometry.ffn_hidden_size
+        and self._dense_fc1_adapted
+        and signature.topology[1:3] == (1, 1)
+    ):
+        # A dense no-grad layer peaks at its FC1 stage (the base GEMM output,
+        # the adapter output and their sum: 6F, or the SwiGLU live set if
+        # wider) beside the residual pair, embedding and norm output (4H), per
+        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. At CP1 every packed
+        # row is local, which the per-packed-token floor above prices at only
+        # 16H. Groups run one after another, so the largest no-grad group
+        # bounds it.
+        rows = max(
+            (n for n, grad in group_rows if not grad),
+            default=0 if signature.grad_enabled else packed_tokens,
+        )
+        no_grad_stage = (
+            rows
+            * self._param_dtype_size
+            * (
+                max(6, self._mlp_activation_factor) * self._geometry.ffn_hidden_size
+                + 4 * self._hidden_size
+            )
+        )
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry
         hidden = self._hidden_size
@@ -1168,15 +1764,32 @@ def _estimate_required_memory_bytes_from_values(
         ),
     )
     retained, workspace = (
-        self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments)
+        self._sequence_parallel_lora_floor(
+            self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments),
+            group_rows,
+            signature,
+        )
         if checkpoint_memory is None
         else checkpoint_memory
     )
+    backward = 0
+    if include_checkpoint_input_gradient and retained:
+        # The backward's other end and cold transients, as _subforward_cost.
+        backward = self._checkpoint_input_gradient_bytes(
+            group_rows, retained
+        ) + self._checkpoint_adapter_gradient_bytes(
+            self._checkpoint_gradient_groups(group_rows, slot_refs)
+        )
+        if profiled is None and any(grad for _, grad in group_rows):
+            backward += self._cold_recompute_transient_bytes()
     static_compute = max(
         static_compute,
         max(retained, checkpoint_floor[0])
         + max(workspace, head_workspace_bytes, checkpoint_floor[1])
-        + (retained if include_checkpoint_input_gradient else 0),
+        + backward,
+        # A no-grad group's forward stage, beside any gradient groups'
+        # boundaries but not the backward's input gradient.
+        max(retained, checkpoint_floor[0]) + no_grad_stage,
     )
     if signature.topology[2] > 1:
         # Local head results coexist with full CP outputs during gathering.

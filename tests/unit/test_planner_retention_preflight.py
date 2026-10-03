@@ -31,7 +31,10 @@ def test_definitive_exhaustion_skips_factory_source_and_encoding(
         assert emit(reporter, replay_factory=unexpected, oom=oom) is None
     assert calls == []
     assert reporter.failures == 1
-    assert ledger(bound) == {
+    value = ledger(bound)
+    summary = value.pop("event_summaries")["oom" if oom else "estimate_miss"]
+    assert summary["omitted"] == 1 and summary["retained"] == 0
+    assert value == {
         "allowance": bound.identity(),
         "charges": {},
         "omitted": 1,

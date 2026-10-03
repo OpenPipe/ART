@@ -6,17 +6,21 @@ import asyncio
 from collections import OrderedDict
 from collections.abc import (
     Callable,
+    Generator,
     Iterable,
     Iterator,
     Mapping,
     Sequence,
 )
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from copy import deepcopy
+from dataclasses import dataclass, fields, is_dataclass, replace
 from dataclasses import field as dataclass_field
-from functools import partial
+from functools import lru_cache, partial
+import hashlib
+import json
 import logging
 import math
 import os
@@ -25,7 +29,7 @@ import struct
 import threading
 import time
 import traceback
-from types import TracebackType
+from types import MethodType, TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -50,28 +54,43 @@ from typing_extensions import TypeIs
 from art.megatron.prefix_tree_packing import (
     PrefixTreePack,
     _local_position_pairs,
-    estimate_prefix_tree_packed_tokens,  # noqa: F401  # read as ``_impl.X`` by _memory / _micro_batch_planner
+    estimate_prefix_tree_packed_tokens,
 )
-from art.trainer_rank import (  # noqa: F401  # ``_gdn_memory`` is read as ``_impl.X`` by _memory / _micro_batch_planner
-    _gdn_memory,
-    _planner_evidence,
-    _planner_misses,
-)
+from art.trainer_rank import _gdn_memory, _planner_evidence, _planner_misses
 from art.trainer_rank._backward_work import BackwardWork
 from art.trainer_rank._backward_work import region as _backward_region
+from art.trainer_rank._memory_policy import (
+    ForwardMemoryCost,
+    MemoryPlacement,
+    host_memory_budget,
+    local_rank_count,
+    placement_cost,
+)
+from art.trainer_rank._options import (
+    ForwardOptions,
+    ResolvedForwardOptions,
+    Unset,
+    _Unset,
+    resolve_forward_options,
+)
 from art.trainer_rank._planner_cost import (
     ModelGeometry,
     ParallelShape,
     select_scoring,
 )
-from art.trainer_rank._prefix_tree_materializer import (  # noqa: F401  # read as ``_impl.X`` by _memory / _micro_batch_planner
-    materialize_prefix_tree_layout,
-)
+from art.trainer_rank._prefix_tree_materializer import materialize_prefix_tree_layout
 from art.trainer_rank._prefix_tree_planner import (
     CanonicalPrefixTree,
     PrefixTreeLayout,
+    canonical_token_rows_fingerprint,
 )
+from art.trainer_rank._rng import TrainerRNG, caller_group
 from art.trainer_rank._telemetry import phase as _telemetry_phase
+from art.trainer_rank._versions import (
+    CheckpointVersion,
+    CheckpointVersions,
+    VersionedGradient,
+)
 
 if TYPE_CHECKING:
     from megatron.core.models.gpt.gpt_model import GPTModel
@@ -81,7 +100,7 @@ if TYPE_CHECKING:
         ArtContextParallelState,
         ParallelTopology,
     )
-    from art.megatron.lora import LoRASlotRef
+    from art.megatron.lora import LoRASlotRef, LoRAVersion
     from art.megatron.prefix_tree_state import PrefixTreeAttentionState
     from art.megatron.train import TrainingRuntime
     from art.trainer_rank._checkpoint import (
@@ -92,7 +111,9 @@ if TYPE_CHECKING:
         _PreparedSave,
         _SnapshotSpill,
     )
-    from art.trainer_rank._lora_export import _PreparedLoraExport
+    from art.trainer_rank._lora_export import _VllmLoraPublishInputs
+
+    from ._heads import ModuleHandle
 
 
 @dataclass(frozen=True)
@@ -124,6 +145,13 @@ _MEMORY_PROFILE_TRUST_GROWTH = 8
 _MEMORY_SAFETY_FACTOR = 1.10
 _MEMORY_RESERVE_FRACTION = 0.03
 _HEAD_CHUNK_TOKENS = 512
+# An unprofiled full-recompute gradient wave's first execution keeps two fixed
+# 32 MiB transients live at its peak (Qwen3.6-35B-A3B CP2: the RoPE frequencies
+# and a frozen linear's output, at 2k to 20k tokens); warm waves do not.
+_COLD_RECOMPUTE_TRANSIENT_BYTES = 64 * 2**20
+# The TP x SP traces (dense Qwen3.8-27B, TP2 and TP4) held a third: TE's 32 MiB
+# cuBLAS workspace, allocated by the process's first wave.
+_SEQUENCE_PARALLEL_COLD_TRANSIENT_BYTES = 3 * 32 * 2**20
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -173,11 +201,6 @@ class _AdapterConfig(TypedDict):
     hidden_size: NotRequired[int]
 
 
-class _Unset:
-    pass
-
-
-Unset = _Unset()
 type AdapterSelection = str | None | _Unset
 
 
@@ -215,6 +238,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
     hidden_states: bool = False
     no_grad: bool | None = None
     checkpoint: AdapterSelection = Unset
+    options: ForwardOptions | None = None
 
     @overload
     def __new__(
@@ -228,6 +252,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[False] = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[None, None, None, None]": ...
 
     @overload
@@ -242,6 +267,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[False] = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[torch.Tensor, None, None, None]": ...
 
     @overload
@@ -256,6 +282,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[False] = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[None, TopK, None, None]": ...
 
     @overload
@@ -270,6 +297,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[False] = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[None, None, torch.Tensor, None]": ...
 
     @overload
@@ -284,6 +312,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[True],
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[None, None, None, torch.Tensor]": ...
 
     @overload
@@ -298,6 +327,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[False] = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[torch.Tensor, TopK, None, None]": ...
 
     @overload
@@ -312,6 +342,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[False] = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[torch.Tensor, None, torch.Tensor, None]": ...
 
     @overload
@@ -326,6 +357,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[True],
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[torch.Tensor, None, None, torch.Tensor]": ...
 
     @overload
@@ -340,6 +372,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[False] = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[None, TopK, torch.Tensor, None]": ...
 
     @overload
@@ -354,6 +387,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[True],
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[None, TopK, None, torch.Tensor]": ...
 
     @overload
@@ -368,6 +402,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[True],
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[None, None, torch.Tensor, torch.Tensor]": ...
 
     @overload
@@ -382,6 +417,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[False] = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[torch.Tensor, TopK, torch.Tensor, None]": ...
 
     @overload
@@ -396,6 +432,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[True],
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[torch.Tensor, TopK, None, torch.Tensor]": ...
 
     @overload
@@ -410,6 +447,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[True],
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[torch.Tensor, None, torch.Tensor, torch.Tensor]": ...
 
     @overload
@@ -424,6 +462,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[True],
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[None, TopK, torch.Tensor, torch.Tensor]": ...
 
     @overload
@@ -438,6 +477,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: Literal[True],
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[torch.Tensor, TopK, torch.Tensor, torch.Tensor]": ...
 
     @overload
@@ -452,6 +492,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: bool = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> "ForwardInput[torch.Tensor | None, TopK | None, torch.Tensor | None, torch.Tensor | None]": ...
 
     def __new__(
@@ -465,6 +506,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: bool = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> Self:
         return object.__new__(cls)
 
@@ -479,6 +521,7 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         hidden_states: bool = False,
         no_grad: bool | None = None,
         checkpoint: AdapterSelection = Unset,
+        options: ForwardOptions | None = None,
     ) -> None:
         self.routed_experts = routed_experts
         self.input_tokens = input_tokens
@@ -488,7 +531,11 @@ class ForwardInput(Generic[LogprobsT, TopKT, LogitsT, HiddenStatesT]):
         self.hidden_states = hidden_states
         self.no_grad = no_grad
         self.checkpoint = checkpoint
+        self.options = options
         self.__post_init__()
+
+    def __getnewargs_ex__(self) -> tuple[tuple[()], dict[str, torch.Tensor]]:
+        return (), {"input_tokens": self.input_tokens}
 
     def __post_init__(self) -> None:
         if self.top_k is not None and self.top_k < 1:
@@ -620,10 +667,22 @@ class _MemoryCheck:
     estimated_required_bytes: int
     available_bytes: int
     fits: bool
+    cpu_required_bytes: int = 0
+    cpu_available_bytes: int = 0
+    cpu_fits: bool = True
+    fallback_costs: dict[str, Any] | None = None
     sample: _planner_evidence.MemorySample | None = dataclass_field(
         default=None, compare=False, repr=False
     )
     decision: dict[str, Any] | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
+    # Extrema above are diagnostics; fits is the conjunction of local fits.
+    # Keep each local producer through refreshes of different DP items.
+    local_required_bytes: int | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
+    local_available_bytes: int | None = dataclass_field(
         default=None, compare=False, repr=False
     )
 
@@ -663,23 +722,6 @@ class _CandidateMicroBatch(Generic[ForwardInputsT]):
     rejected_candidates: int
     cold_start: bool
     fallback: _CandidateMicroBatch[ForwardInputsT] | None = None
-
-
-class _SlotGraphSentinel(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx: FunctionCtx,
-        tensor: torch.Tensor,
-        marker: torch.Tensor,
-    ) -> torch.Tensor:
-        ctx.save_for_backward(marker)
-        return tensor
-
-    @staticmethod
-    def backward(
-        ctx: FunctionCtx, *grad_outputs: torch.Tensor
-    ) -> tuple[torch.Tensor, None]:
-        return grad_outputs[0], None
 
 
 class _GatherContextParallelRows(torch.autograd.Function):
@@ -737,6 +779,17 @@ class _CustomSlotGraphSentinel(torch.autograd.Function):
         return grad_outputs[0], None
 
 
+def _track_slot_graph_tensor(
+    tensor: torch.Tensor, marker: torch.Tensor
+) -> torch.Tensor:
+    # This Function saves only a CPU, non-gradient control marker. Preserve its
+    # wrapper identity even under caller hooks, without intercepting activations.
+    with torch.autograd.graph.saved_tensors_hooks(
+        lambda value: value, lambda value: value
+    ):
+        return cast(torch.Tensor, _CustomSlotGraphSentinel.apply(tensor, marker))
+
+
 @dataclass(eq=False)
 class _CustomTensorTracker:
     trainer: weakref.ReferenceType[TrainerRank]
@@ -744,6 +797,7 @@ class _CustomTensorTracker:
     name: str
     generation: object
     active: bool = False
+    buffer_revision: int = 0
 
     def validate(self) -> TrainerRank:
         trainer = self.trainer()
@@ -831,6 +885,18 @@ class _TrackedParameter(torch.nn.Parameter):
     ) -> None:
         del data, tracker, requires_grad
 
+    def register_hook(self, hook: Any) -> Any:
+        """Run once on summed captured uses per backward; removal affects old graphs."""
+        from ._parameter_hooks import register_parameter_hook
+
+        self._art_tracker.validate()
+        return register_parameter_hook(self, hook)
+
+    def register_post_accumulate_grad_hook(self, hook: Any) -> Any:
+        from ._parameter_hooks import reject_post_accumulate_hook
+
+        return reject_post_accumulate_hook()
+
     def __setattr__(self, name: str, value: object) -> None:
         if name == "grad":
             with torch._C.DisableTorchFunctionSubclass():
@@ -880,6 +946,7 @@ class _CustomObject:
     kind: Literal["module", "parameter", "buffer"]
     value: torch.nn.Module | torch.nn.Parameter | torch.Tensor
     generation: object
+    handle: torch.nn.Module | None = None
 
 
 @dataclass
@@ -891,6 +958,7 @@ class _CheckpointSlot:
     custom: dict[str, _CustomObject] = dataclass_field(default_factory=dict)
     custom_payload: "PreparedCustomPayload | None" = None
     snapshot: bool = False
+    generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -979,6 +1047,7 @@ class _MemorySignature:
     request_mix: tuple[str, ...]
     grad_enabled: bool
     grad_modes: tuple[bool, ...]
+    memory_placement: tuple[tuple[str, str], ...] = ()
     slot_shapes: tuple[tuple[bool, tuple[tuple[int, ...], ...]], ...] = ()
     # Short single-target requests keep the logical extrapolation, but share
     # the profile learned from longer requests of the same signature.
@@ -992,7 +1061,9 @@ class _ForwardGroupPlan:
     request_indices: tuple[int, ...]
     items: tuple[_ForwardItem, ...]
     packed: PrefixTreePack
+    memory_placement: MemoryPlacement | None = None
     layout: PrefixTreeLayout | None = None
+    input_row_fingerprints: tuple[tuple[int, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1090,6 +1161,13 @@ class _SubforwardCost:
     # HybridEP buffer growth before the safety factor. It is in required, not
     # retained, and persists across a split, which charges the largest once.
     hybridep_growth: int = 0
+    # Adapter gradients the recompute backward holds beyond the boundaries it
+    # has released (``_checkpoint_adapter_gradient_bytes``), before the safety
+    # factor. Split children training the same slots share them, so a split
+    # charges the largest once; ``..._slots`` names those slots (sorted JSON
+    # of kind/name pairs, "" when none), keeping the cost JSON-serializable.
+    checkpoint_adapter_gradient: int = 0
+    checkpoint_adapter_gradient_slots: str = ""
 
     @property
     def ephemeral(self) -> int:
@@ -1098,7 +1176,7 @@ class _SubforwardCost:
 
 _MEMORY_ERROR_SUGGESTION = (
     "Use smaller top-level items, reduce output requests, or call "
-    "dp_rank_forward with already-DP-local smaller inputs."
+    "forward with already-DP-local smaller inputs."
 )
 
 
@@ -1110,13 +1188,27 @@ def _memory_error(
     logical_tokens: int,
     check: _MemoryCheck,
 ) -> TrainerRankMemoryError:
+    # Peak and limit are group extrema (largest demand, smallest budget) that may
+    # come from different ranks; the rank_* pair is this rank's own comparison.
+    local = (
+        ""
+        if check.local_required_bytes is None or check.local_available_bytes is None
+        else f"rank_required_gb={check.local_required_bytes / 1024**3:.3f} "
+        f"rank_available_gb={check.local_available_bytes / 1024**3:.3f} "
+    )
     return TrainerRankMemoryError(
         f"{context}: {message}. "
         f"packed_tokens={packed_tokens} "
         f"logical_tokens={logical_tokens} "
         f"predicted_peak_gb={check.estimated_required_bytes / 1024**3:.3f} "
         f"usable_limit_gb={check.available_bytes / 1024**3:.3f}. "
-        f"{_MEMORY_ERROR_SUGGESTION}",
+        + (
+            f"CPU retained bytes={check.cpu_required_bytes}, "
+            f"per-rank CPU headroom={check.cpu_available_bytes}. "
+            if not check.cpu_fits
+            else ""
+        )
+        + f"{local}{_MEMORY_ERROR_SUGGESTION}",
         predicted_peak_bytes=check.estimated_required_bytes,
         usable_limit_bytes=check.available_bytes,
         suggestion=_MEMORY_ERROR_SUGGESTION,
@@ -1210,6 +1302,45 @@ def _gdn_layer_count(model: torch.nn.Module) -> int:
     return sum(isinstance(module, GatedDeltaNet) for module in model.modules())
 
 
+def _mixer_top_gaps(model: torch.nn.Module) -> tuple[int | None, int | None] | None:
+    """Layers between the top decoder layer and the highest attention / GDN layer.
+
+    ``None`` for a mixer kind the decoder lacks; ``None`` overall when the
+    decoder layers are unreadable.
+    """
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return None
+    try:
+        layers = list(_language_model(model).decoder.layers)
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+    gdn = [
+        any(isinstance(module, GatedDeltaNet) for module in layer.modules())
+        for layer in layers
+    ]
+    top = len(layers) - 1
+    return (
+        next((top - index for index in range(top, -1, -1) if not gdn[index]), None),
+        next((top - index for index in range(top, -1, -1) if gdn[index]), None),
+    )
+
+
+def _lora_modules_per_layer(model: torch.nn.Module) -> int:
+    """The most LoRA modules any one decoder layer holds (0 when unreadable)."""
+    try:
+        from art.megatron.lora import LoRA
+
+        layers = list(_language_model(model).decoder.layers)
+    except (AttributeError, ImportError, RuntimeError, TypeError):
+        return 0
+    return max(
+        (sum(type(module) is LoRA for module in layer.modules()) for layer in layers),
+        default=0,
+    )
+
+
 def _moe_layer_count(model: torch.nn.Module) -> int:
     """Number of mixture-of-experts layers in the model (0 when unavailable)."""
 
@@ -1218,6 +1349,27 @@ def _moe_layer_count(model: torch.nn.Module) -> int:
     except ImportError:
         return 0
     return sum(isinstance(module, BaseMoELayer) for module in model.modules())
+
+
+def _dense_fc1_adapted(model: torch.nn.Module) -> bool:
+    """Whether every decoder layer's MLP FC1 is ART's gated LoRA wrapper, which
+    keeps a 2F adapter output and the sum beside the 2F base output, even for
+    inactive slots."""
+
+    try:
+        from art.megatron.lora import SharedExpertsLinearFC1LoRA
+
+        layers = _language_model(model).decoder.layers
+    except (AttributeError, ImportError, RuntimeError):
+        return False
+    fc1s = [
+        getattr(getattr(layer, "mlp", None), "linear_fc1", None) for layer in layers
+    ]
+    return len(fc1s) > 0 and all(
+        type(fc1) is SharedExpertsLinearFC1LoRA
+        and getattr(fc1, "non_gated", True) is False
+        for fc1 in fc1s
+    )
 
 
 def _expert_parallel_shape(provider: object) -> tuple[int, int]:
@@ -1883,10 +2035,12 @@ from art.trainer_rank import _memory, _micro_batch_planner, _optimizer, _slots
 
 
 class TrainerRank:
-    def __init__(self, runtime: TrainingRuntime) -> None:
-        options = _planner_misses.parse_options(os.environ)
-        self._allow_oversized_batches = options.allow_oversized_batches
-        self._planner_reporter = _planner_misses.Reporter(options.threshold_pct)
+    def __init__(
+        self, runtime: TrainingRuntime, *, options: ForwardOptions | None = None
+    ) -> None:
+        planner_options = _planner_misses.parse_options(os.environ)
+        self._allow_oversized_batches = planner_options.allow_oversized_batches
+        self._planner_reporter = _planner_misses.Reporter(planner_options.threshold_pct)
         self._planner_observation_context: ContextVar[dict[str, Any] | None] = (
             ContextVar("trainer_rank_planner_observation", default=None)
         )
@@ -1910,8 +2064,11 @@ class TrainerRank:
         # TP calibrates itself online, and the fitted layout cost model prices
         # TP explicitly. The cold retained-activation floor also distinguishes
         # tensor/sequence-parallel storage from gathered LoRA inputs.
+        self._forward_options = options
+        resolve_forward_options(options)
         self.runtime: TrainingRuntime = runtime
         self.device: torch.device = next(runtime.model[0].parameters()).device
+        self._rng = TrainerRNG(self.device)
         self._param_dtype_size = _dtype_size(next(runtime.model[0].parameters()).dtype)
         try:
             metadata_model = _language_model(runtime.model[0])
@@ -1953,10 +2110,13 @@ class TrainerRank:
         # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
         # cost model prices GDN state hand-offs per GDN layer, not per layer.
         self._gdn_layers = _gdn_layer_count(runtime.model[0])
+        self._mixer_top_gaps = _mixer_top_gaps(runtime.model[0])
         if self._gdn_layers == 0 and bool(
             getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
         ):
             self._gdn_layers = self._num_layers
+            self._mixer_top_gaps = (None, 0)
+        self._lora_modules_per_layer = _lora_modules_per_layer(runtime.model[0])
         # A fitted layout cost table applies only to the execution classes it
         # was calibrated on (device class, dtype, model geometry, parallel
         # shape); other runtimes keep the previous score.
@@ -1976,6 +2136,7 @@ class TrainerRank:
         }
         spec = getattr(runtime, "model_support_spec", None)
         self._moe_layers = _moe_layer_count(runtime.model[0])
+        self._dense_fc1_adapted = _dense_fc1_adapted(runtime.model[0])
         self._checkpointed_moe_layers = sum(
             getattr(module, "moe_layer_recompute", False) is True
             for module in runtime.model[0].modules()
@@ -2052,7 +2213,14 @@ class TrainerRank:
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
         self._snapshot_checkpoint_names: set[str] = set()
-        self._prepared_lora_exports: dict[str, tuple[str, _PreparedLoraExport]] = {}
+        self._checkpoint_sources: dict[
+            str,
+            tuple[str, Callable[[], AbstractContextManager[PreparedCheckpoint]], bool],
+        ] = {}
+        self._checkpoint_snapshot_lru: OrderedDict[str, None] = OrderedDict()
+        self._checkpoint_snapshot_cache_size = 2
+        self._checkpoint_slot_writes: dict[str, int] = {}
+        self._prepared_lora_exports: dict[str, tuple[str, _VllmLoraPublishInputs]] = {}
         self._checkpoint_prefetches: dict[str, Future[PreparedCheckpoint]] = {}
         self._checkpoint_prefetch_sources: dict[str, str] = {}
         self._checkpoint_prefetch_lock = threading.Lock()
@@ -2068,7 +2236,6 @@ class TrainerRank:
         self._checkpoint_save_next = 0
         self._checkpoint_save_skipped: set[int] = set()
         self._checkpoint_preparing_saves: set[str] = set()
-        self._checkpoint_finalizing_saves: dict[str, Literal["finish", "abort"]] = {}
         self._checkpoint_save_outcomes: dict[str, Literal["finish", "abort"]] = {}
         self._prepared_checkpoint_saves: dict[str, _PreparedSave] = {}
         self._finalized_checkpoint_saves: dict[str, _FinalizedSave] = {}
@@ -2081,6 +2248,9 @@ class TrainerRank:
         self._hybridep_rows_high_water = 0
         self._cache_recovery_state = _CacheRecoveryState()
         self._memory_profiles: dict[_MemorySignature, _MemoryProfile] = {}
+        self._graph_forward_times: OrderedDict[tuple[Any, ...], tuple[float, ...]] = (
+            OrderedDict()
+        )
         # Tracked peak-counter resets, and the latest (resets, peak) reading.
         self._peak_resets = 0
         self._peak_reading: tuple[int, int] | None = None
@@ -2116,7 +2286,168 @@ class TrainerRank:
         for slot in self._checkpoint_slots.values():
             for param in slot.params:
                 param.grad = None
+        self._version_state().clear()
         self._prune_slot_graphs()
+
+    def _version_state(self) -> CheckpointVersions:
+        state = getattr(self, "_checkpoint_versions", None)
+        if state is None:
+            state = self._checkpoint_versions = CheckpointVersions(self)
+        return state
+
+    def _capture_checkpoint_version(self, name: str) -> CheckpointVersion:
+        return self._version_state().capture(name)
+
+    def _validate_checkpoint_version(
+        self, version: CheckpointVersion, max_gradient_staleness: int = 2
+    ) -> None:
+        self._version_state().validate(version, max_gradient_staleness)
+
+    def _snapshot_parameter(
+        self,
+        parameter: torch.nn.Parameter,
+        version: CheckpointVersion,
+        max_gradient_staleness: int = 2,
+    ) -> torch.nn.Parameter:
+        state = self._version_state()
+        state.validate(version, max_gradient_staleness)
+        with torch._C.DisableTorchFunctionSubclass():
+            result = torch.nn.Parameter(
+                parameter.detach().clone(), requires_grad=parameter.requires_grad
+            )
+        state.track(result, parameter, version, max_gradient_staleness)
+        return result
+
+    def _commit_versioned_gradients(
+        self, gradients: Sequence[VersionedGradient]
+    ) -> None:
+        self._version_state().accumulate(gradients)
+
+    def _gradient_transaction(
+        self, *, before_commit: Callable[[Callable[[], None]], None] | None = None
+    ) -> Any:
+        return self._version_state().transaction(before_commit=before_commit)
+
+    def _capture_lora_version(
+        self,
+        ref: LoRASlotRef | None,
+        max_gradient_staleness: int = 2,
+        *,
+        origin: CheckpointVersion | None = None,
+    ) -> LoRAVersion | None:
+        if ref is None or ref.name is None or not torch.is_grad_enabled():
+            return None
+        from art.megatron.lora import LoRA, LoRASlot, LoRAVersion
+
+        state = self._version_state()
+        weight_version = state.capture(ref.name)
+        version = weight_version if origin is None else origin
+        if version.checkpoint != ref.name:
+            raise ValueError("LoRA replay origin belongs to a different checkpoint")
+        state.validate(version, max_gradient_staleness)
+        key = (weight_version, version, max_gradient_staleness)
+        if cached := state.lora.get(key):
+            return cached
+        slots: dict[int, LoRASlot] = {}
+        for chunk in self.runtime.model:
+            for module in chunk.modules():
+                if not isinstance(module, LoRA) or id(module) in slots:
+                    continue
+                current = module._slot(ref)
+                if current is None:
+                    continue
+                captured = slots[id(module)] = LoRASlot(
+                    ref=ref,
+                    a_t=current.A_T,
+                    b_t=current.B_T,
+                    alpha=current.alpha,
+                    a_template=current.A_T,
+                    b_template=current.B_T,
+                    requires_grad=current.A_T.requires_grad,
+                )
+                for snapshot, parameter in zip(
+                    (captured.A_T, captured.B_T),
+                    (current.A_T, current.B_T),
+                    strict=True,
+                ):
+                    snapshot.requires_grad_(parameter.requires_grad)
+                    state.track(snapshot, parameter, version, max_gradient_staleness)
+        captured_version = LoRAVersion(
+            ref,
+            version,
+            slots,
+            lambda: state.validate(version, max_gradient_staleness),
+            weight_version,
+        )
+        state.lora[key] = captured_version
+        return captured_version
+
+    def _lora_version_capture_bytes(
+        self,
+        ref: LoRASlotRef | None,
+        max_gradient_staleness: int = 2,
+        *,
+        origin: CheckpointVersion | None = None,
+    ) -> int:
+        if ref is None or ref.name is None or not torch.is_grad_enabled():
+            return 0
+        state = self._version_state()
+        version = state.capture(ref.name)
+        key = (version, version if origin is None else origin, max_gradient_staleness)
+        if key in state.lora:
+            return 0
+        return sum(
+            param.numel() * param.element_size()
+            for param in self._checkpoint_slots[ref.name].params
+            if not getattr(param, "_art_custom_checkpoint_param", False)
+        )
+
+    def _lora_gradient_staging_bytes(self, ref: LoRASlotRef | None) -> int:
+        """Reserve current, staged and replacement gradients across later backwards.
+
+        Several forwards can be admitted before their first backward creates
+        ``.grad``. Existing gradients are already in the sampled memory baseline.
+        Registered custom heads share this transaction, including streamed remote
+        cotangents. Later registrations and arbitrary head activations are not
+        predicted by an earlier model forward.
+        """
+        if ref is None or ref.name is None:
+            return 0
+        return _gradient_staging_bytes(self._checkpoint_slots[ref.name].params)
+
+    def _pending_backward_memory(
+        self, *, checkpoints: Iterable[str] = (), exclude_staging: Iterable[str] = ()
+    ) -> tuple[int, int]:
+        """Return additional restore and gradient bytes beside sampled live storage."""
+        cache = getattr(self, "_graph_cache", None)
+        states = () if cache is None else tuple(cache.state(h) for h in cache.handles())
+        names = set(checkpoints) | {
+            version.checkpoint
+            for state in states
+            for version in getattr(state, "checkpoint_versions", ())
+        }
+        excluded = set(exclude_staging)
+        staging = sum(
+            self._lora_gradient_staging_bytes(self._slot_ref(name))
+            for name in names - excluded
+            if name in self._checkpoint_slots
+        )
+        # Head losses can remain live without a model cache record. Preserve their
+        # registration reserve without charging unrelated unused LoRA targets.
+        staging += _gradient_staging_bytes(
+            parameter
+            for name, slot in self._checkpoint_slots.items()
+            if name not in names | excluded
+            for parameter in slot.params
+            if getattr(parameter, "_art_custom_checkpoint_param", False)
+        )
+        return (
+            max(
+                (getattr(state, "restore_workspace_bytes", 0) for state in states),
+                default=0,
+            ),
+            staging,
+        )
 
     def module(
         self,
@@ -2124,14 +2455,14 @@ class TrainerRank:
         factory: Callable[[], ModuleT],
         *,
         checkpoint: AdapterSelection = Unset,
-    ) -> ModuleT:
+    ) -> ModuleHandle:
         """Return a checkpoint-owned module, registering it on first access.
 
         Registration is collective across TrainerRank processes. The returned module is
         bound to the resolved checkpoint and is not selected by later push/pop calls.
         """
         value = self._custom_object(name, "module", factory, checkpoint=checkpoint)
-        return cast(ModuleT, value)
+        return cast("ModuleHandle", value)
 
     def parameter(
         self,
@@ -2140,7 +2471,10 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
     ) -> torch.nn.Parameter:
-        """Return a replicated checkpoint-owned trainable parameter."""
+        """Register or retrieve a checkpoint-owned trainable tensor.
+
+        The tensor is replicated across TrainerRank processes.
+        """
         value = self._custom_object(name, "parameter", factory, checkpoint=checkpoint)
         return cast(torch.nn.Parameter, value)
 
@@ -2151,7 +2485,10 @@ class TrainerRank:
         *,
         checkpoint: AdapterSelection = Unset,
     ) -> torch.Tensor:
-        """Return a replicated checkpoint-owned persistent tensor."""
+        """Register or retrieve a checkpoint-owned persistent buffer.
+
+        The tensor is replicated across TrainerRank processes.
+        """
         value = self._custom_object(name, "buffer", factory, checkpoint=checkpoint)
         return cast(torch.Tensor, value)
 
@@ -2189,6 +2526,7 @@ class TrainerRank:
             raise TrainerRankSlotStateError(
                 "Custom checkpoint object registration differs across ranks"
             )
+        self._rng.synchronize(caller_group())
         slot = self._checkpoint_slots[checkpoint_name]
         existing = slot.custom.get(name)
         registered = None if existing is None else existing.kind
@@ -2203,7 +2541,7 @@ class TrainerRank:
                     f"Checkpoint {checkpoint_name!r} already registers {name!r} "
                     f"as a {existing.kind}, not a {kind}"
                 )
-            return existing.value
+            return existing.handle if existing.handle is not None else existing.value
         custom: _CustomObject | None = None
         try:
             value = factory()
@@ -2211,7 +2549,9 @@ class TrainerRank:
             if kind == "module":
                 if not isinstance(value, torch.nn.Module):
                     raise TypeError("module() factory must return torch.nn.Module")
-                value = value.to(device=self.device)
+                from ._heads import move_module
+
+                value = move_module(deepcopy(value), self.device)
                 if slot.snapshot:
                     value.requires_grad_(False)
             elif kind == "parameter":
@@ -2255,18 +2595,45 @@ class TrainerRank:
                 extended_optimizer = self._extend_dynamic_optimizer(
                     checkpoint_name, named_params
                 )
+            self._admit_custom_gradient_storage(checkpoint_name, new_params)
         except BaseException as exc:
             error = exc
-        _checkpoint.raise_distributed(
-            error, f"stage custom checkpoint object {name!r}", group
-        )
-        assert tracker is not None
+        try:
+            _checkpoint.raise_distributed(
+                error, f"stage custom checkpoint object {name!r}", group
+            )
+        except BaseException:
+            # A retained registration traceback must not own rejected tensors.
+            value = custom = tracker = extended_optimizer = None
+            named_params = new_params = ()
+            raise
+        assert tracker is not None and custom is not None
         if extended_optimizer is not None:
             slot.optimizer = extended_optimizer
         slot.custom[name] = custom
         slot.params += new_params
         tracker.active = True
-        return custom.value
+        return custom.handle if custom.handle is not None else custom.value
+
+    def _admit_custom_gradient_storage(
+        self, checkpoint: str, parameters: Sequence[torch.nn.Parameter]
+    ) -> None:
+        """Price known new targets beside existing graph restore reservations."""
+        try:
+            if not self._graph_memory_policy_enabled():
+                return
+            workspace, staging = self._pending_backward_memory(
+                checkpoints=(checkpoint,)
+            )
+            required = _gradient_staging_bytes(parameters) + staging + workspace
+            available = self._available_memory_bytes()
+            if required > available:
+                raise TrainerRankMemoryError(
+                    f"Registering custom parameters needs {required} GPU bytes for "
+                    f"gradient staging and existing graph restoration; available={available}"
+                )
+        finally:
+            parameters = ()
 
     def _initialize_custom_object(
         self,
@@ -2317,8 +2684,8 @@ class TrainerRank:
 
     @staticmethod
     async def _await_checkpoint_prefetch(
-        future: Future[PreparedCheckpoint],
-    ) -> PreparedCheckpoint:
+        future: Future[T],
+    ) -> T:
         return await asyncio.shield(asyncio.wrap_future(future))
 
     def snapshot_checkpoint(self, source: str, destination: str) -> bool:
@@ -2426,10 +2793,11 @@ class TrainerRank:
         return TrainerRankSlotStateError(message)
 
     @overload
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
@@ -2441,12 +2809,13 @@ class TrainerRank:
     ]: ...
 
     @overload
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[
             Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
@@ -2458,12 +2827,13 @@ class TrainerRank:
     ]: ...
 
     @overload
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[
             Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
@@ -2475,7 +2845,7 @@ class TrainerRank:
     ]: ...
 
     @overload
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[
             Iterable[
@@ -2485,6 +2855,7 @@ class TrainerRank:
             ]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
@@ -2503,15 +2874,49 @@ class TrainerRank:
         ]
     ]: ...
 
-    def forward_micro_batches(
+    def forward_batches(
         self,
         inputs: Iterable[ForwardInputs],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
-        """Yield admitted micro-batches; the caller runs its loss and backward.
+        """Forward replicated inputs in adaptive data-parallel microbatches.
+
+        Per-input checkpoints and `no_grad` values override the method defaults.
+        `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables
+        grads and `False` enables them.
+        Input and target tensors may be on a different device from the trainer;
+        ART moves its packed model inputs and labels internally without mutating
+        the caller-owned `ForwardInput` objects.
+
+        Per-position outputs contain the full flattened input sequence in source
+        order, including with context parallelism. Logical callbacks execute
+        once per DP rank; use `backward(loss)` to route cotangents to internal
+        TP/CP participants. Direct physical callers must invoke matching
+        forwards and backwards on their TP/CP peers. `reduce` combines only
+        distinct data-parallel batches.
+
+        Model PyTorch randomness advances separately from caller randomness,
+        seeded when the physical TrainerRank is constructed. Direct physical
+        callers continue their TP/CP leader's default CPU and trainer-device CUDA
+        streams before each yield/forward return and custom-object factory. This
+        keeps matching random masks and custom-head dropout consistent without
+        synchronizing DP workers. Python/NumPy RNGs, explicit generators, other
+        devices, concurrent RNG use and rank-dependent control flow are outside
+        this contract. Checkpoint saves do not persist RNG state; activation
+        checkpointing must preserve RNG for correct recomputation.
+
+        Empty local microbatches are skipped unless `yield_empty=True`. Every
+        rank must use the same setting. When a wave skips ranks, TrainerRank
+        collective methods raise if called from its loop body; fully populated
+        waves permit them. Use `yield_empty=True` for per-wave collectives,
+        including reductions on ranks with no outputs. Exhaust or close a retained
+        iterator before making collective calls after an early exit. Guards apply
+        on the iterator's thread; raw torch.distributed calls are not guarded.
+        Collective calls must still match across ranks.
 
         Admission learns each call's whole peak, including the caller's loss
         and backward. For grad-enabled single-target requests of at least 64
@@ -2527,20 +2932,35 @@ class TrainerRank:
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
-        batches = self._forward_micro_batches(
+        inputs = cast(
+            Iterable[ForwardInputs], self._capture_forward_options(inputs, options)
+        )
+        batches = self._forward_batches(
             inputs, checkpoint=checkpoint, yield_empty=yield_empty
         )
+        return self._yield_forward_batches(
+            batches, enabled=enabled, yield_empty=yield_empty
+        )
+
+    def _yield_forward_batches(
+        self,
+        batches: Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None],
+        *,
+        enabled: bool,
+        yield_empty: bool,
+    ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
         token = object()
         try:
             while True:
-                self._guard_forward_collective("forward_micro_batches")
-                with torch.set_grad_enabled(enabled):
+                self._guard_forward_collective("forward_batches")
+                with torch.set_grad_enabled(enabled), self._rng.model():
                     try:
                         batch = next(batches)
                     except StopIteration:
                         return
                 if not yield_empty and not batch.outputs:
                     continue
+                self._rng.synchronize(caller_group())
                 if (
                     not yield_empty
                     and batch.stats.global_count < self._dp_rank_and_size()[1]
@@ -2558,11 +2978,31 @@ class TrainerRank:
         finally:
             batches.close()
 
+    def _capture_forward_options(
+        self, inputs: ForwardInputs, options: ForwardOptions | None
+    ) -> ForwardInputs:
+        from ._graphs import _snapshot
+
+        # Input enumeration already happens at submission; only execution is
+        # lazy. Own the submitted tensor storage before returning an iterator.
+        materialized = _snapshot(_materialize(inputs))
+        constructor = getattr(self, "_forward_options", None)
+
+        def capture(value: ForwardInputs) -> ForwardInputs:
+            if isinstance(value, ForwardInput):
+                if constructor is None and options is None:
+                    return replace(value)
+                resolved = resolve_forward_options(constructor, options, value.options)
+                return replace(value, options=ForwardOptions(**vars(resolved)))
+            return _rebuild_forward_tree(value, [capture(child) for child in value])
+
+        return capture(materialized)
+
     def _guard_forward_collective(self, operation: str) -> None:
         for thread, start, stop in tuple(self._skipped_forward_waves.values()):
             if thread == threading.get_ident():
                 raise RuntimeError(
-                    f"{operation} cannot run during forward_micro_batches wave "
+                    f"{operation} cannot run during forward_batches wave "
                     f"[{start}, {stop}): yield_empty=False skips some data-parallel "
                     "ranks. Move collective calls after the iterator or use "
                     "yield_empty=True on every rank."
@@ -2604,21 +3044,33 @@ class TrainerRank:
             )
 
     @overload
-    def dp_rank_forward(
+    def forward(
+        self,
+        inputs: ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT],
+        *,
+        options: ForwardOptions | None = None,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
+    ) -> ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]: ...
+
+    @overload
+    def forward(
         self,
         inputs: Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> Sequence[ForwardOutput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]: ...
 
     @overload
-    def dp_rank_forward(
+    def forward(
         self,
         inputs: Iterable[
             Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> Sequence[
@@ -2626,12 +3078,13 @@ class TrainerRank:
     ]: ...
 
     @overload
-    def dp_rank_forward(
+    def forward(
         self,
         inputs: Iterable[
             Iterable[Iterable[ForwardInput[LogprobsT, TopKT, LogitsT, HiddenStatesT]]]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> Sequence[
@@ -2639,7 +3092,7 @@ class TrainerRank:
     ]: ...
 
     @overload
-    def dp_rank_forward(
+    def forward(
         self,
         inputs: Iterable[
             Iterable[
@@ -2649,6 +3102,7 @@ class TrainerRank:
             ]
         ],
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> Sequence[
@@ -2657,31 +3111,63 @@ class TrainerRank:
         ]
     ]: ...
 
-    def dp_rank_forward(
+    def forward(
         self,
         inputs: ForwardInputs,
         *,
+        options: ForwardOptions | None = None,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
     ) -> ForwardOutputs:
-        self._guard_forward_collective("dp_rank_forward")
+        """Forward inputs already local to this data-parallel rank.
+
+        Outputs contain full sequences in source order on every TP/CP rank,
+        with the same loss and reduction contract as `forward_batches`.
+
+        Per-input checkpoints and `no_grad` values override the method defaults.
+        `no_grad=None` inherits the ambient PyTorch grad mode; `True` disables
+        grads and `False` enables them.
+        Input and target tensors may be on a different device from the trainer;
+        ART moves its packed model inputs and labels internally without mutating
+        the caller-owned `ForwardInput` objects.
+        """
+        self._guard_forward_collective("forward")
         backward = self._backward_work()
         if backward is not None:
             backward.harvest()
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         with torch.set_grad_enabled(enabled):
-            self._reset_planning_telemetry()
-            materialized = _materialize(inputs)
+            # Caller iterators may draw their own inputs; only ART's internal
+            # execution belongs to the private model stream.
+            materialized = self._capture_forward_options(inputs, options)
             requests = list(_flatten(materialized))
-            plan, check = self._plan_admissible_forward(
-                requests, checkpoint=checkpoint, context="dp_rank_forward"
+        error: BaseException | None = None
+        try:
+            with torch.set_grad_enabled(enabled), self._rng.model():
+                self._reset_planning_telemetry()
+                plan, check = self._plan_admissible_forward(
+                    requests, checkpoint=checkpoint, context="forward"
+                )
+                tracked_outputs = self._execute_admitted_plan(
+                    plan, check=check, context="forward"
+                )
+                outputs = _unflatten(materialized, iter(tracked_outputs))
+        except BaseException as exc:
+            error = exc
+        # Failed peers must leave this frontier before the command layer's
+        # error exchange, just as successful peers do. Caller RNG is restored
+        # by model() before this collective, including on execution failure.
+        try:
+            self._rng.synchronize(caller_group())
+        except BaseException as sync_error:
+            if error is None:
+                raise
+            self._memory_error_with_reduction_note(
+                error, sync_error, operation="RNG synchronization"
             )
-            tracked_outputs = self._execute_admitted_plan(
-                plan, check=check, context="dp_rank_forward"
-            )
-            if backward is not None:
-                backward.attach(tracked_outputs)
-            return _unflatten(materialized, iter(tracked_outputs))
+        if error is not None:
+            raise error
+        return outputs
 
     def _execute_admitted_plan(
         self, plan: _AnyForwardPlan, *, check: _MemoryCheck, context: str
@@ -2698,6 +3184,49 @@ class TrainerRank:
         self._complete_planner_observation(phase="forward")
         return outputs
 
+    @contextmanager
+    def _forward_handoff(self, *, advance: bool) -> Iterator[None]:
+        # Only intermediate TP/CP frontiers can race the next model collective.
+        group = caller_group() if advance else None
+        if group is None or dist.get_world_size(group) == 1:
+            yield
+            return
+        error: BaseException | None = None
+        try:
+            yield
+        except BaseException as exc:
+            error = exc
+        try:
+            (failed,) = self._recovery_reduce(
+                [float(error is not None)], op="MAX", sync_across_dp=False
+            )
+        except BaseException as exchange_error:
+            if error is None:
+                raise
+            self._memory_error_with_reduction_note(
+                error, exchange_error, operation="forward handoff"
+            )
+        else:
+            if error is None and failed:
+                raise RuntimeError("Forward handoff failed on another rank")
+        if error is not None:
+            raise error
+
+    def _discard_forward_graphs(
+        self, previous: tuple[str, ...], error: BaseException
+    ) -> None:
+        cache = getattr(self, "_graph_cache", None)
+        if cache is not None:
+            previous_handles = set(previous)
+            for handle in cache.handles():
+                if handle not in previous_handles:
+                    try:
+                        cache.release(handle)
+                    except BaseException as cleanup_error:
+                        self._memory_error_with_reduction_note(
+                            error, cleanup_error, operation="forward graph release"
+                        )
+
     @_backward_region
     def _execute_split_plan_with_memory_tracking(
         self, plan: _SplitForwardPlan, *, check: _MemoryCheck, context: str
@@ -2705,40 +3234,51 @@ class TrainerRank:
         state = self._recovery_state()
         work_before = state.work
         self._begin_planner_observation(plan, check)
+        previous = self._graph_cache.handles() if hasattr(self, "_graph_cache") else ()
+        outputs: list[AnyForwardOutput] = []
+        output: AnyForwardOutput | None = None
+        merged: list[AnyForwardOutput | None] = []
         self._planner_observing_split = True
         try:
             baseline, peak = None, 0
-            merged: list[AnyForwardOutput | None] = [None] * plan.request_count
+            merged = [None] * plan.request_count
             for ordinal, (subforward, indices) in enumerate(
                 zip(plan.subforwards, plan.request_indices, strict=True)
             ):
-                try:
-                    outputs, child_baseline = self._run_flat_plan_with_memory_tracking(
-                        subforward, check=check, context=context
-                    )
-                    if child_baseline is not None:
-                        if baseline is None:
-                            baseline = child_baseline
-                        peak = max(
-                            peak, int(torch.cuda.max_memory_allocated(self.device))
+                with self._forward_handoff(advance=ordinal + 1 < plan.subforward_count):
+                    try:
+                        outputs, child_baseline = (
+                            self._run_flat_plan_with_memory_tracking(
+                                subforward, check=check, context=context
+                            )
                         )
-                except TrainerRankMemoryError as error:
-                    # Model execution already began, so no replanning is possible
-                    # and the caller must not mistake this for an up-front refusal.
-                    raise TrainerRankPartialExecutionError(
-                        f"{context}: subforward {ordinal + 1} of "
-                        f"{plan.subforward_count} failed during execution "
-                        f"({ordinal} of {plan.subforward_count} completed). {error}",
-                        predicted_peak_bytes=error.predicted_peak_bytes,
-                        usable_limit_bytes=error.usable_limit_bytes,
-                        suggestion=error.suggestion,
-                    ) from error
-                for index, output in zip(indices, outputs, strict=True):
-                    merged[index] = output
+                        if child_baseline is not None:
+                            if baseline is None:
+                                baseline = child_baseline
+                            peak = max(
+                                peak, int(torch.cuda.max_memory_allocated(self.device))
+                            )
+                    except TrainerRankMemoryError as error:
+                        # Model execution already began, so no replanning is possible
+                        # and the caller must not mistake this for an up-front refusal.
+                        raise TrainerRankPartialExecutionError(
+                            f"{context}: subforward {ordinal + 1} of "
+                            f"{plan.subforward_count} failed during execution "
+                            f"({ordinal} of {plan.subforward_count} completed). {error}",
+                            predicted_peak_bytes=error.predicted_peak_bytes,
+                            usable_limit_bytes=error.usable_limit_bytes,
+                            suggestion=error.suggestion,
+                        ) from error
+                    for index, output in zip(indices, outputs, strict=True):
+                        merged[index] = output
             if any(output is None for output in merged):
                 raise AssertionError("split execution did not cover every request")
             return cast(list[AnyForwardOutput], merged), baseline, peak
-        except BaseException:
+        except BaseException as error:
+            outputs.clear()
+            merged.clear()
+            output = None
+            self._discard_forward_graphs(previous, error)
             state.work = work_before
             raise
         finally:
@@ -2758,8 +3298,12 @@ class TrainerRank:
         *,
         positions: Sequence[torch.Tensor] | None = None,
         lower_bound: bool = False,
+        uncapped: bool = False,
     ) -> int:
         """Per-group logical bounds or exact packed union; no device-label read.
+
+        Capped at one head chunk unless ``uncapped`` (every projected row, for
+        pricing each chunk's statistics path).
 
         A single sequence's valid rows cannot alias each other. Across requests
         they may share: max is a lower bound, sum an upper bound. Ignore labels
@@ -2797,14 +3341,14 @@ class TrainerRank:
                     row = row.index_select(0, offsets)
                 for position in row.tolist():
                     projected.add(int(position))
-                    if len(projected) >= _HEAD_CHUNK_TOKENS:
+                    if len(projected) >= _HEAD_CHUNK_TOKENS and not uncapped:
                         return _HEAD_CHUNK_TOKENS
-        return min(
-            _HEAD_CHUNK_TOKENS,
+        rows = (
             (max(counts, default=0) if lower_bound else sum(counts))
             if positions is None
-            else len(projected),
+            else len(projected)
         )
+        return rows if uncapped else min(_HEAD_CHUNK_TOKENS, rows)
 
     def _head_target_chunk_rows(
         self,
@@ -2866,28 +3410,23 @@ class TrainerRank:
         chunk_start = first_index // _HEAD_CHUNK_TOKENS * _HEAD_CHUNK_TOKENS
         return min(_HEAD_CHUNK_TOKENS, len(projected) - chunk_start)
 
-    def _sequence_parallel_floor_covered(self, layers: int, tp: int, cp: int) -> bool:
-        """Whether the checkpoint floor covers a dense TP x SP recompute peak.
+    def _sequence_parallel_floor_covered(self, tp: int, cp: int) -> bool:
+        """Whether the explicit TP x SP checkpoint floor applies to this model.
 
-        Traced once: dense Qwen3.8-27B (64 layers) at TP4 with sequence
-        parallelism and CP1. Over the gathered rows, the recomputed layer's peak
-        held its SP-gathered norm input (2H per row), the MLP FC1 stage (6F/TP),
-        the recomputed mixer (within its projection widths / TP), norm outputs
-        and other workspace (each under H), plus one input gradient per
-        sharded row. The floor repeats the sharded boundaries as the
-        input-gradient term, so that repeat must cover this workspace; GDN
-        segment states grow with segments instead and are priced separately.
-        Other TP sizes, CP, MoE, replicated QKV (KV groups below TP), missing
-        geometry and models too shallow or wide for the bound keep today's
+        Traced on dense Qwen3.8-27B (64 layers, GDN and gated attention) at
+        TP4 and at TP2 with sequence parallelism and CP1. The floor covers
+        each rank's boundary shards and the recomputed layer's measured
+        workspace with explicit terms (``_sequence_parallel_workspace_bytes``),
+        so it needs readable mixer geometry but, unlike the earlier repeated-
+        boundary cover, no depth/width bound: shallower and wider dense models
+        are now eligible and priced by the same terms (untraced). Other TP
+        sizes, CP, MoE and replicated QKV (KV groups below TP) keep today's
         pricing.
         """
         geometry = self._geometry
-        if tp != 4 or cp != 1 or self._moe_layers or geometry.moe_experts:
+        if tp not in (2, 4) or cp != 1 or self._moe_layers or geometry.moe_experts:
             return False
-        hidden = self._hidden_size
-        ffn = geometry.ffn_hidden_size or 4 * hidden
-        attention_layers = self._num_layers > self._gdn_layers
-        if attention_layers and (
+        if self._num_layers > self._gdn_layers and (
             geometry.num_attention_heads <= 0
             or geometry.kv_channels <= 0
             # Replicated QKV keeps a global QKV output on every rank.
@@ -2901,28 +3440,7 @@ class TrainerRank:
             geometry.gdn_value_head_dim,
             geometry.gdn_conv_kernel,  # Prices each segment's conv history.
         )
-        if self._gdn_layers and min(gdn_widths) <= 0:
-            return False
-        attention = (
-            (7 if self._attention_output_gate else 5)
-            * geometry.num_attention_heads
-            * geometry.kv_channels
-            + 3 * geometry.num_query_groups * geometry.kv_channels
-            if attention_layers
-            else 0
-        )
-        gdn = (
-            4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
-            + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
-            if self._gdn_layers
-            else 0
-        )
-        # Per gathered row, times TP: the repeat is layers x H; the workspace is
-        # 2H + the FC1 stage (6F/TP, or the SwiGLU live set if wider) +
-        # mixer/TP + H of norms + H of other workspace, and the gradient H/TP.
-        stage = max(6, self._mlp_activation_factor) * ffn
-        workspace = 2 * hidden * tp + stage + max(attention, gdn) + 2 * hidden * tp
-        return layers * hidden >= workspace + hidden
+        return not (self._gdn_layers and min(gdn_widths) <= 0)
 
     def _subforward_cost(
         self,
@@ -2939,8 +3457,10 @@ class TrainerRank:
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
     ) -> _SubforwardCost:
-        checkpoint_memory = self._checkpoint_memory_floor(
-            group_rows, slot_refs, gdn_segments
+        checkpoint_memory = self._sequence_parallel_lora_floor(
+            self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments),
+            group_rows,
+            signature,
         )
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
@@ -2968,23 +3488,41 @@ class TrainerRank:
                 checkpoint_floor[0],
             ),
         )
-        # One logical BF16 input gradient per eligible full/uniform/1 boundary.
+        # One logical BF16 input gradient per eligible full/uniform/1 boundary
+        # (TP x SP: one input-gradient shard; the workspace is explicit).
         # This partial peak allowance is not evidence of simultaneous distinct
         # backing stores, nor a bound for compiler saves or other backward work.
         # Keep it out of forward retention, including the cold fallback above.
-        gradient = checkpoint_retained
+        gradient = self._checkpoint_input_gradient_bytes(
+            group_rows, checkpoint_retained
+        )
+        gradient_slots = self._gradient_slots(group_rows, slot_refs)
+        adapter_gradient = (
+            self._checkpoint_adapter_gradient_bytes(
+                self._checkpoint_gradient_groups(group_rows, slot_refs)
+            )
+            if gradient
+            else 0
+        )
         checkpoint_retained = output_bytes + max(
             checkpoint_retained, checkpoint_floor[0]
         )
         checkpoint_workspace = max(
             checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
+        if gradient and self._memory_profiles.get(signature) is None:
+            checkpoint_workspace += self._cold_recompute_transient_bytes()
         forward_required = required
         if gradient:
             required = max(
                 required,
                 int(
-                    (checkpoint_retained + checkpoint_workspace + gradient)
+                    (
+                        checkpoint_retained
+                        + checkpoint_workspace
+                        + gradient
+                        + adapter_gradient
+                    )
                     * _MEMORY_SAFETY_FACTOR
                 ),
             )
@@ -2998,13 +3536,29 @@ class TrainerRank:
             checkpoint_input_gradient=gradient,
             checkpoint_peak_increment=required - forward_required,
             hybridep_growth=hybridep_growth_bytes,
+            checkpoint_adapter_gradient=adapter_gradient,
+            checkpoint_adapter_gradient_slots=json.dumps(
+                [
+                    [ref.kind, ref.name]
+                    for ref in sorted(
+                        gradient_slots,
+                        key=lambda ref: (
+                            ref.kind,
+                            ref.name is not None,
+                            ref.name or "",
+                        ),
+                    )
+                ]
+            )
+            if adapter_gradient
+            else "",
         )
 
     def last_forward_telemetry(self) -> dict[str, Any]:
         """Concise planner telemetry for the most recent planned forward.
 
         ``planning_ms`` is critical-path planning accumulated across the whole
-        public call (all waves of ``forward_micro_batches``, including the
+        public call (all waves of ``forward_batches``, including the
         synchronous cost of submitting speculative work);
         ``speculative_planning_ms`` is worker CPU time hidden under the
         caller's GPU work; ``selected_max_depth`` describes the most recently
@@ -3013,19 +3567,30 @@ class TrainerRank:
         graph plus the largest subforward's ephemeral share). A call refused
         with ``TrainerRankMemoryError`` is still reflected, with the binding
         check that refused it.
+
+        ``packing_plan_sha256`` commits to ordered local prefix-pack geometry
+        and TP padding, before CP dispatch. ``subforward_packing_plan_sha256``
+        lists the child commitments in execution order, with
+        ``subforward_request_indices`` supplying the outer mapping. These are
+        not unique event IDs: identical child geometries share a digest.
+        ``input_tokens_sha256`` recomposes existing row hashes in original flat
+        request order, independent of packing; it is unavailable if any request
+        was inactive. These are planning-time commitments, not model/target
+        label/caller loss-mask fingerprints or evidence of completed execution.
         """
 
         if self._last_forward_telemetry_snapshot is None:
             raise RuntimeError("no forward has completed planning yet")
         return dict(self._last_forward_telemetry_snapshot)
 
-    def dp_reduce(
+    def reduce(
         self,
         tensor: torch.Tensor,
         *,
         op: dist.ReduceOp.RedOpType = dist.ReduceOp.SUM,
     ) -> None:
-        self._guard_forward_collective("dp_reduce")
+        """Reduce in place over data-parallel batches, excluding TP/CP replicas."""
+        self._guard_forward_collective("reduce")
         from megatron.core import parallel_state as ps
 
         # Public outputs are CP-replicated; internal shard reductions still include CP.
@@ -3034,6 +3599,36 @@ class TrainerRank:
             op=op,
             group=ps.get_data_parallel_group(with_context_parallel=False),
         )
+
+    def backward(
+        self,
+        loss: torch.Tensor | Sequence[torch.Tensor],
+        gradient: torch.Tensor | Sequence[torch.Tensor | None] | None = None,
+        *,
+        retain_graph: bool = False,
+    ) -> None:
+        """Collect a complete local backward before committing model cotangents."""
+
+        from ._commands import _coordinate_call
+
+        preflight = partial(_coordinate_call, group=self._forward_memory_group())
+        with self._gradient_transaction(before_commit=preflight):
+            packets = []
+            cache = self._forward_graph_cache()
+
+            def collect() -> None:
+                packets.extend(
+                    (packet.handle, packet.gradients)
+                    for packet in self._forward_cotangent_collector().backward(
+                        loss, gradient, retain_graph=retain_graph
+                    )
+                )
+                cache.validate_many(packets)
+
+            preflight(collect)
+            cache.backward_many(
+                packets, retain_graph=retain_graph, coordinate=preflight
+            )
 
     def _compact_lora_slot_keys(self) -> None:
         from art.megatron.lora import LoRA
@@ -3208,9 +3803,9 @@ class TrainerRank:
         if len(set(configurations)) == 1:
             return
         raise ValueError(
-            "forward_micro_batches requires the same top-level input count and "
+            "forward_batches requires the same top-level input count and "
             "yield_empty setting on every "
-            "distributed rank. Pass already-DP-local inputs to dp_rank_forward instead. "
+            "distributed rank. Pass already-DP-local inputs to forward instead. "
             f"Observed (count, yield_empty) by rank: {configurations}."
         )
 
@@ -3238,7 +3833,9 @@ class TrainerRank:
     ) -> tuple[tuple[tuple["LoRASlotRef | None", bool], tuple[int, ...]], ...]:
         if ensure_slots:
             self._ensure_checkpoint_slots_for(requests, checkpoint=checkpoint)
-        groups: dict[tuple[LoRASlotRef | None, bool, bool], list[int]] = {}
+        groups: dict[
+            tuple[LoRASlotRef | None, bool, ResolvedForwardOptions, bool], list[int]
+        ] = {}
         for index, request in enumerate(requests):
             if (
                 request.target_tokens is not None
@@ -3254,13 +3851,14 @@ class TrainerRank:
                             if request.no_grad is None
                             else not request.no_grad
                         ),
+                        _resolved_request_policy(request.options),
                         request.routed_experts is not None,
                     ),
                     [],
                 ).append(index)
         return tuple(
-            ((slot, grad), tuple(indices))
-            for (slot, grad, _routed), indices in groups.items()
+            ((slot_ref, grad), tuple(indices))
+            for (slot_ref, grad, _options, _routed), indices in groups.items()
         )
 
     @_backward_region
@@ -3316,6 +3914,7 @@ class TrainerRank:
             )
         if seconds is not None and plan.packed_tokens > 0:
             try:
+                self._record_graph_forward_time(plan, seconds)
                 self._record_recovery_work(context, seconds)
             except Exception:
                 self._recovery_state().invalid = True
@@ -3403,6 +4002,7 @@ class TrainerRank:
     def _telemetry_signature(cls, plan: _AnyForwardPlan) -> dict[str, object]:
         return {
             **cls._telemetry_plan_signature(plan),
+            **cls._packing_fingerprints(plan),
             "request_count": plan.request_count,
             "packed_tokens": plan.packed_tokens,
             "logical_tokens": plan.logical_tokens,
@@ -3412,6 +4012,84 @@ class TrainerRank:
             "group_segment_counts": tuple(
                 len(group.packed.segments) for group in plan.groups
             ),
+        }
+
+    @staticmethod
+    def _packing_fingerprints(plan: _AnyForwardPlan) -> dict[str, object]:
+        """Host metadata only: never copy/read tensor values or query CUDA.
+
+        Geometry excludes content, checkpoint names and later CP kernel plans.
+        Input hashes reuse canonical little-endian int64 row commitments; no
+        additional token hashing is done, including for rejected candidates.
+        Keep this high-cardinality evidence outside compile-plan deduplication.
+        """
+
+        def digest(value: object) -> str:
+            return hashlib.sha256(
+                json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest()
+
+        split = isinstance(plan, _SplitForwardPlan)
+        children = plan.subforwards if split else (plan,)
+        mappings = (
+            plan.request_indices if split else (tuple(range(plan.request_count)),)
+        )
+        rows: list[tuple[int, str] | None] = [None] * plan.request_count
+        fingerprints = []
+        for child, mapping in zip(children, mappings, strict=True):
+            groups = []
+            tp = child.signature.topology[1]
+            for group in child.groups:
+                length = int(group.packed.tokens.numel())
+                groups.append(
+                    (
+                        group.request_indices,
+                        group.grad_enabled,
+                        length,
+                        ((length + tp - 1) // tp) * tp,
+                        tuple(
+                            (
+                                segment.sequence_indices,
+                                segment.start,
+                                segment.end,
+                                segment.packed_start,
+                                segment.group_id,
+                                segment.parent_id,
+                            )
+                            for segment in group.packed.segments
+                        ),
+                    )
+                )
+                for index, row in zip(
+                    group.request_indices, group.input_row_fingerprints, strict=False
+                ):
+                    rows[mapping[index]] = row
+            fingerprints.append(
+                digest(
+                    (
+                        "art.prefix-pack/v1",
+                        child.signature.topology,
+                        child.request_count,
+                        groups,
+                    )
+                )
+            )
+        complete_rows = tuple(row for row in rows if row is not None)
+        return {
+            "packing_fingerprint_schema": "art.prefix-pack/v1",
+            "packing_plan_sha256": digest(
+                (
+                    "art.prefix-pack-split/v1",
+                    plan.request_count,
+                    tuple(zip(mappings, fingerprints, strict=True)),
+                )
+            )
+            if split
+            else fingerprints[0],
+            "subforward_packing_plan_sha256": tuple(fingerprints),
+            "input_tokens_sha256": canonical_token_rows_fingerprint(complete_rows)
+            if len(complete_rows) == plan.request_count
+            else None,
         }
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
@@ -3427,50 +4105,249 @@ class TrainerRank:
             if plan.groups
             else None
         )
+        previous = self._graph_cache.handles() if hasattr(self, "_graph_cache") else ()
+        item_outputs: list[AnyForwardOutput] = []
+        output: AnyForwardOutput | None = None
         try:
             for group_index, group in enumerate(plan.groups):
-                from art.megatron.lora import use_lora_slot
-
-                if hybridep is not None:
-                    self._set_hybridep_rows(hybridep[0][group_index])
-                with torch.set_grad_enabled(group.grad_enabled):
-                    with use_lora_slot(group.slot_ref):
-                        prepared = self._prepare_packed_forward(group.packed)
-                        from art.megatron.routed_experts import (
-                            prepare_routes,
-                            use_routes,
-                        )
-
-                        routes = prepare_routes(
-                            group.items,
-                            group.packed,
-                            prepared,
-                            getattr(self, "_routing_bindings", ()),
-                            self.device,
-                        )
-                        with use_routes(routes):
-                            item_outputs = self._forward_packed(group.items, prepared)
-                    item_outputs = [
-                        replace(
-                            output,
-                            checkpoint=(
-                                None if group.slot_ref is None else group.slot_ref.name
-                            ),
-                            no_grad=not group.grad_enabled,
-                        )
-                        for output in item_outputs
-                    ]
-                    item_outputs = self._track_slot_graph_outputs(
-                        group.slot_ref, item_outputs
-                    )
-                for index, output in zip(
-                    group.request_indices, item_outputs, strict=True
-                ):
-                    outputs[index] = output
+                with self._forward_handoff(advance=group_index + 1 < len(plan.groups)):
+                    if hybridep is not None:
+                        self._set_hybridep_rows(hybridep[0][group_index])
+                    with torch.set_grad_enabled(group.grad_enabled):
+                        item_outputs = self._execute_graph_group(group)
+                    for index, output in zip(
+                        group.request_indices, item_outputs, strict=True
+                    ):
+                        outputs[index] = output
+        except BaseException as error:
+            outputs.clear()
+            item_outputs.clear()
+            output = None
+            self._discard_forward_graphs(previous, error)
+            raise
         finally:
             if hybridep is not None:
                 self._set_hybridep_rows(hybridep[1])
         return outputs
+
+    def _forward_graph_cache(self):
+        from ._graphs import GraphCache
+
+        if not hasattr(self, "_graph_cache"):
+            self._graph_cache = GraphCache()
+        return self._graph_cache
+
+    def _forward_cotangent_collector(self):
+        from ._tensors import CotangentCollector
+
+        if not hasattr(self, "_cotangent_collector"):
+            self._cotangent_collector = CotangentCollector()
+        return self._cotangent_collector
+
+    def _execute_graph_group(self, group: _ForwardGroupPlan) -> list[AnyForwardOutput]:
+        from art.megatron.lora import use_lora_slot
+
+        from ._corrections import capture_forward_corrections
+        from ._options import resolve_forward_options
+        from ._tensors import (
+            TensorPacket,
+            flatten_tensors,
+            managed_tree,
+            unflatten_tensors,
+        )
+
+        options = resolve_forward_options(
+            getattr(self, "_forward_options", None),
+            input=group.items[0].request.options,
+        )
+        placement = getattr(group, "memory_placement", None)
+        retention = (
+            options.backward_state if placement is None else placement.backward_state
+        )
+        retention = "gpu" if retention == "auto" else retention
+        output_device = (
+            options.output_device if placement is None else placement.output_device
+        )
+        output_device = "cpu" if output_device == "cpu" else None
+        ref = group.slot_ref
+        topology = self._topology()
+        spec = None
+
+        def execute(captured: _ForwardGroupPlan) -> tuple[torch.Tensor, ...]:
+            nonlocal spec
+            if self._topology() != topology:
+                raise TrainerRankRuntimeSupportError(
+                    "Forward replay requires its original parallel topology"
+                )
+            hybrid = self._configure_hybridep((captured.packed,), topology=topology)
+            try:
+                if hybrid is not None:
+                    self._set_hybridep_rows(hybrid[0][0])
+                prepared = self._prepare_packed_forward(captured.packed)
+                from art.megatron.routed_experts import prepare_routes, use_routes
+
+                routes = prepare_routes(
+                    captured.items,
+                    captured.packed,
+                    prepared,
+                    getattr(self, "_routing_bindings", ()),
+                    self.device,
+                )
+                with use_routes(routes):
+                    outputs = self._forward_packed(captured.items, prepared)
+                outputs = [
+                    replace(
+                        output,
+                        checkpoint=None if ref is None else ref.name,
+                        no_grad=not captured.grad_enabled,
+                    )
+                    for output in outputs
+                ]
+                tensors, captured_spec = flatten_tensors(outputs)
+                if spec is not None and captured_spec != spec:
+                    raise RuntimeError("Forward replay changed its output tree")
+                spec = captured_spec
+                # Observe physical backward, including replay, before the cache
+                # replaces these outputs with detached caller cotangent proxies.
+                backward = self._backward_work()
+                if backward is not None:
+                    backward.attach(outputs)
+                return tensors
+            finally:
+                if hybrid is not None:
+                    self._set_hybridep_rows(hybrid[1])
+
+        if not group.grad_enabled:
+            with torch.no_grad(), use_lora_slot(ref):
+                tensors = execute(group)
+            assert spec is not None
+            outputs = unflatten_tensors(spec, tensors)
+            return (
+                outputs
+                if output_device is None
+                else managed_tree(outputs, device=output_device)
+            )
+
+        version = self._capture_lora_version(ref, options.max_gradient_staleness)
+        # Saved views of externally owned parameters must not duplicate whole
+        # frozen model weights or immutable LoRA captures into every CPU graph.
+        parameters = [
+            tensor
+            for chunk in self.runtime.model
+            for tensor in (
+                *chunk.parameters(),
+                *(buffer for _, buffer in chunk.named_buffers()),
+            )
+        ]
+        if version is not None:
+            parameters.extend(
+                parameter
+                for slot in version.slots.values()
+                for parameter in slot.parameters()
+            )
+        storages = {
+            (parameter.device, parameter.untyped_storage().data_ptr())
+            for parameter in parameters
+        }
+        tracker = None
+        devices = ()
+        if self.device.type == "cuda":
+            from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+
+            tracker = get_cuda_rng_tracker()
+            devices = (
+                self.device.index
+                if self.device.index is not None
+                else torch.cuda.current_device(),
+            )
+        cache = self._forward_graph_cache()
+        handle = None
+        try:
+            handle, tensors = cache.run(
+                execute,
+                group,
+                context_factory=lambda: use_lora_slot(ref, version=version),
+                validate_backward=None if version is None else version.validate,
+                retention=retention,
+                checkpoint_versions=() if version is None else (version.version,),
+                options=options,
+                cuda_devices=devices,
+                rng_tracker=tracker,
+                keep_on_device=lambda tensor: (
+                    (tensor.device, tensor.untyped_storage().data_ptr()) in storages
+                ),
+                output_device=output_device,
+                execution_peak_bytes=getattr(placement, "execution_peak_bytes", 0),
+            )
+            if topology.cp > 1 and retention != "replay":
+                residual = cache.state(handle).non_offloadable_bytes
+                if residual is not None:
+                    profiles = getattr(self, "_graph_residency", None)
+                    if profiles is None:
+                        self._graph_residency = profiles = OrderedDict()
+                    key = self._graph_residency_key(group)
+                    profiles[key] = max(residual, profiles.pop(key, 0))
+                    if len(profiles) > 256:
+                        profiles.popitem(last=False)
+            assert spec is not None
+            if version is not None:
+
+                @contextmanager
+                def current_context():
+                    current = self._capture_lora_version(
+                        ref, options.max_gradient_staleness, origin=version.version
+                    )
+                    assert current is not None
+                    previous_storages = storages.copy()
+                    storages.update(
+                        (parameter.device, parameter.untyped_storage().data_ptr())
+                        for slot in current.slots.values()
+                        for parameter in slot.parameters()
+                    )
+                    try:
+                        with use_lora_slot(ref, version=current):
+                            yield
+                    finally:
+                        storages.clear()
+                        storages.update(previous_storages)
+
+                cache.set_corrections(
+                    handle,
+                    capture_forward_corrections(
+                        unflatten_tensors(spec, tensors), tensors, options
+                    ),
+                    is_stale=lambda: (
+                        self._capture_checkpoint_version(
+                            version.version.checkpoint
+                        ).revision
+                        != version.weight_version.revision
+                    ),
+                    current_context_factory=current_context,
+                )
+            packet = TensorPacket(
+                handle, spec, tensors, tuple(tensor.requires_grad for tensor in tensors)
+            )
+            outputs = self._forward_cotangent_collector().attach(
+                packet,
+                managed=output_device is not None,
+                on_release=partial(cache.release, handle),
+            )
+            # Track the caller graph outside saved-state hooks, which detach markers.
+            # Consumption also ends the lifetime of unused sibling outputs.
+            return self._track_slot_graph_outputs(ref, outputs)
+        except BaseException:
+            # No caller owns a failed handoff; a partial bridge may also release.
+            try:
+                if handle is not None:
+                    cache.release(handle)
+            finally:
+                # A retained traceback must not own this failed call's captures.
+                # Clear its closure cell, never the shared version or live graphs.
+                del version
+                packet = outputs = None
+                tensors = ()
+                parameters.clear()
+            raise
 
     def _forward_output_metadata(
         self,
@@ -3485,7 +4362,7 @@ class TrainerRank:
             ref = self._slot_stack[-1] if self._slot_stack else self._default_slot_ref
             name = None if ref is None else ref.name
         else:
-            name = cast(str | None, selection)
+            name = selection
         enabled = (
             torch.is_grad_enabled() if request.no_grad is None else not request.no_grad
         )
@@ -3500,7 +4377,7 @@ class TrainerRank:
 
     def _has_live_hybridep_graphs(self) -> bool:
         graphs = self._hybridep_graphs()
-        graphs[:] = [marker for marker in graphs if marker() is not None]
+        graphs[:] = [marker for marker in graphs if _graph_marker_is_live(marker)]
         return bool(graphs)
 
     def _topology_key(self) -> tuple[int, int, int, int]:
@@ -3526,6 +4403,470 @@ class TrainerRank:
 
         multiple = max(1, self._topology_key()[1])
         return packed_tokens + (-packed_tokens % multiple)
+
+    def _graph_memory_policy_enabled(self) -> bool:
+        return self.device.type == "cuda" and hasattr(self, "_forward_graph_cache")
+
+    def _available_cpu_memory_bytes(self) -> int:
+        world = (
+            dist.get_world_size()
+            if dist.is_available() and dist.is_initialized()
+            else 1
+        )
+        return host_memory_budget(
+            local_world_size=local_rank_count(world_size=world)
+        ).available_bytes
+
+    @staticmethod
+    def _graph_forward_time_key(plan: _FlatForwardPlan) -> tuple[Any, ...]:
+        return (
+            replace(plan.signature, memory_placement=()),
+            plan.packed_tokens,
+            plan.logical_tokens,
+            tuple(group.packed.segments for group in plan.groups),
+        )
+
+    def _record_graph_forward_time(
+        self, plan: _FlatForwardPlan, seconds: float
+    ) -> None:
+        if (
+            not math.isfinite(seconds)
+            or seconds <= 0
+            or any(
+                group.memory_placement is not None
+                and group.memory_placement.backward_state != "gpu"
+                for group in plan.groups
+            )
+        ):
+            return
+        profiles = getattr(self, "_graph_forward_times", None)
+        if profiles is None:
+            self._graph_forward_times = profiles = OrderedDict()
+        key = self._graph_forward_time_key(plan)
+        profiles[key] = (*profiles.pop(key, ())[-2:], seconds)
+        if len(profiles) > 256:
+            profiles.popitem(last=False)
+
+    def _graph_residency_key(self, group: _ForwardGroupPlan) -> tuple[Any, ...]:
+        return (
+            self._topology_key(),
+            group.packed.segments,
+            group.grad_enabled,
+            tuple(
+                (
+                    item.request.input_tokens.numel(),
+                    None
+                    if item.request.target_tokens is None
+                    else item.request.target_tokens.numel(),
+                    item.request.top_k,
+                    item.request.logits,
+                    item.request.hidden_states,
+                )
+                for item in group.items
+            ),
+        )
+
+    def _graph_memory_units(
+        self, plan: _AnyForwardPlan
+    ) -> Iterator[
+        tuple[int, tuple[int, ...], ForwardMemoryCost, ResolvedForwardOptions]
+    ]:
+        """Use existing aggregate profiles when all physical groups share policy."""
+        flats = plan.subforwards if isinstance(plan, _SplitForwardPlan) else (plan,)
+        staged_slots, captured = set(), set()
+        for flat_index, flat in enumerate(flats):
+            policies = [
+                _resolved_request_policy(g.items[0].request.options)
+                for g in flat.groups
+            ]
+            partitions = (
+                [tuple(range(len(flat.groups)))]
+                if len(set(policies)) <= 1
+                else [(i,) for i in range(len(flat.groups))]
+            )
+            for indices in partitions:
+                if not indices:
+                    continue
+                groups = tuple(flat.groups[i] for i in indices)
+                requests = [item.request for group in groups for item in group.items]
+                policy = policies[indices[0]]
+                priced = (
+                    flat
+                    if len(indices) == len(flat.groups)
+                    else replace(
+                        flat,
+                        groups=groups,
+                        packed_tokens=sum(
+                            self._physical_tokens(int(g.packed.tokens.numel()))
+                            for g in groups
+                        ),
+                        logical_tokens=sum(
+                            int(r.input_tokens.numel()) for r in requests
+                        ),
+                        inactive_logical_tokens=0,
+                        output_bytes=self._estimate_group_request_output_bytes(
+                            requests
+                        ),
+                        signature=self._memory_signature_from_requests(
+                            requests,
+                            slot_group_count=len(groups),
+                            grad_modes=tuple(g.grad_enabled for g in groups),
+                            slot_groups=tuple(
+                                (g.slot_ref, g.grad_enabled) for g in groups
+                            ),
+                        ),
+                    )
+                )
+                # CPU/replay observations cannot lower the GPU retention model.
+                priced = replace(
+                    priced, signature=replace(priced.signature, memory_placement=())
+                )
+                cost = self._plan_cost(priced)
+                timings = getattr(self, "_graph_forward_times", {}).get(
+                    self._graph_forward_time_key(priced), ()
+                )
+                output = priced.output_bytes
+                retained = max(output, cost.retained)
+                transient = max(0, cost.required - retained)
+                residual = 0
+                if priced.signature.topology[2] > 1:
+                    profiles = getattr(self, "_graph_residency", {})
+                    observed = [
+                        profiles.get(self._graph_residency_key(g)) for g in groups
+                    ]
+                    # CP owns raw stage graphs outside saved-variable hooks.
+                    # Until this exact layout is observed, grant no release credit.
+                    residual = (
+                        int(sum(observed) * _MEMORY_SAFETY_FACTOR)
+                        if all(value is not None for value in observed)
+                        else retained
+                    )
+                    retained = max(retained, residual)
+                version_bytes = getattr(self, "_lora_version_capture_bytes", None)
+                persistent = staging = 0
+                for group in groups:
+                    # Later children and groups reuse the first one's live capture.
+                    key = (group.slot_ref, policy.max_gradient_staleness)
+                    if group.grad_enabled and version_bytes and key not in captured:
+                        captured.add(key)
+                        persistent += version_bytes(*key)
+                    if group.grad_enabled and group.slot_ref not in staged_slots:
+                        staged_slots.add(group.slot_ref)
+                        staging += self._lora_gradient_staging_bytes(group.slot_ref)
+                credit = cost.checkpoint_adapter_gradient
+                if credit:
+                    # The walk repeats a slot's inventory per gradient group
+                    # (e.g. routed and unrouted); one batch stages each target once.
+                    credit = min(
+                        credit,
+                        sum(
+                            self._pending_adapter_gradient_bytes(
+                                g.slot_ref
+                                for g in groups
+                                if g.grad_enabled and g.slot_ref is not None
+                            )
+                        ),
+                    )
+                yield (
+                    flat_index,
+                    indices,
+                    ForwardMemoryCost(
+                        peak_bytes=max(cost.required, retained + transient),
+                        retained_bytes=retained,
+                        cpu_resident_bytes=residual,
+                        output_bytes=output,
+                        replay_bytes=sum(
+                            _snapshot_tensor_bytes(group)
+                            + 64 * 1024
+                            + _correction_state_bytes(group, policy)
+                            for group in groups
+                            if group.grad_enabled
+                        ),
+                        backward_required=any(group.grad_enabled for group in groups),
+                        persistent_bytes=persistent,
+                        gradient_staging_bytes=staging,
+                        staged_gradient_bytes=credit,
+                        replay_seconds=max(timings) if len(timings) >= 2 else None,
+                        correction_workspace_bytes=cost.required
+                        if any(
+                            correction.policy == "always"
+                            for correction in policy.stale_gradient_corrections
+                        )
+                        else 0,
+                    ),
+                    policy,
+                )
+
+    def _graph_memory_candidates(
+        self,
+        units: Sequence[
+            tuple[int, tuple[int, ...], ForwardMemoryCost, ResolvedForwardOptions]
+        ],
+        *,
+        sync_across_dp: bool,
+    ) -> Iterator[
+        tuple[
+            Literal["gpu", "cpu", "replay"],
+            Literal["model", "cpu"],
+            dict[str, Any] | None,
+        ]
+    ]:
+        # Avoid timing work and its collective entirely on the GPU headroom path.
+        yield "gpu", "model", None
+        yield "gpu", "cpu", None
+        eligible = [
+            cost
+            for _, _, cost, options in units
+            if cost.backward_required
+            and options.backward_state == "auto"
+            and options.allow_cpu_offload
+            and options.allow_replay
+        ]
+        stats = getattr(getattr(self, "_graph_cache", None), "transfer_stats", None)
+        transfer_bytes = sum(
+            cost.retained_bytes - cost.output_bytes for cost in eligible
+        )
+        trusted = bool(stats) and all(
+            cost.replay_seconds is not None for cost in eligible
+        )
+        if stats is not None and trusted:
+            trusted = all(
+                math.isfinite(value) and value > 0
+                for value in (
+                    stats.offload_bytes,
+                    stats.offload_seconds,
+                    stats.restore_bytes,
+                    stats.restore_seconds,
+                )
+            ) and (
+                min(stats.offload_seconds, stats.restore_seconds) >= 0.001
+                and transfer_bytes <= 2 * min(stats.offload_bytes, stats.restore_bytes)
+            )
+        cpu_seconds = 0.0
+        if stats is not None and trusted:
+            cpu_seconds = transfer_bytes * (
+                stats.offload_seconds / stats.offload_bytes
+                + stats.restore_seconds / stats.restore_bytes
+            )
+        replay_seconds = sum(cost.replay_seconds or 0.0 for cost in eligible)
+        cpu_seconds, replay_seconds, missing = self._recovery_reduce(
+            [cpu_seconds, replay_seconds, float(bool(eligible) and not trusted)],
+            op="MAX",
+            sync_across_dp=sync_across_dp,
+        )
+        prefer_replay = (
+            not missing and replay_seconds > 0 and replay_seconds * 1.1 < cpu_seconds
+        )
+        evidence = {
+            "source": "insufficient_samples"
+            if missing
+            else "measured_forward_and_transfers",
+            "cpu_extra_seconds": cpu_seconds,
+            "replay_extra_seconds": replay_seconds,
+            "preferred": "replay" if prefer_replay else "cpu",
+        }
+        for state in ("replay", "cpu") if prefer_replay else ("cpu", "replay"):
+            yield state, "model", evidence
+            yield state, "cpu", evidence
+
+    @overload
+    def _admit_graph_memory(
+        self, plan: _FlatForwardPlan, *, sync_across_dp: bool = False
+    ) -> tuple[_FlatForwardPlan, _MemoryCheck]: ...
+
+    @overload
+    def _admit_graph_memory(
+        self, plan: _SplitForwardPlan, *, sync_across_dp: bool = False
+    ) -> tuple[_SplitForwardPlan, _MemoryCheck]: ...
+
+    def _admit_graph_memory(
+        self, plan: _AnyForwardPlan, *, sync_across_dp: bool = False
+    ) -> tuple[_AnyForwardPlan, _MemoryCheck]:
+        """Try a bounded placement ladder without changing root/group structure."""
+        units = list(self._graph_memory_units(plan))
+        cpu_available = self._available_cpu_memory_bytes()
+        planned_checkpoints = {
+            group.slot_ref.name
+            for group in plan.groups
+            if group.grad_enabled
+            and group.slot_ref is not None
+            and group.slot_ref.name is not None
+        }
+        prior_workspace, prior_staging = self._pending_backward_memory(
+            exclude_staging=planned_checkpoints
+        )
+        flats = plan.subforwards if isinstance(plan, _SplitForwardPlan) else (plan,)
+        for state, device, evidence in self._graph_memory_candidates(
+            units, sync_across_dp=sync_across_dp
+        ):
+            placements = []
+            for _, _, cost, options in units:
+                selected_state = options.backward_state
+                if selected_state == "auto":
+                    selected_state = state
+                    if selected_state == "replay" and not options.allow_replay:
+                        selected_state = "cpu"
+                    if selected_state == "cpu" and not options.allow_cpu_offload:
+                        selected_state = "gpu"
+                placements.append(
+                    placement_cost(
+                        (cost,),
+                        backward_state=selected_state,
+                        output_device=device
+                        if options.output_device == "auto"
+                        else options.output_device,
+                    )
+                )
+            selected_groups = [list(flat.groups) for flat in flats]
+            for (flat_index, indices, _, _), placement in zip(
+                units, placements, strict=True
+            ):
+                for index in indices:
+                    selected_groups[flat_index][index] = replace(
+                        selected_groups[flat_index][index], memory_placement=placement
+                    )
+            selected_flats = []
+            for flat, groups in zip(flats, selected_groups, strict=True):
+                modes = tuple(
+                    (
+                        cast(MemoryPlacement, g.memory_placement).backward_state,
+                        cast(MemoryPlacement, g.memory_placement).output_device,
+                    )
+                    for g in groups
+                )
+                selected_flats.append(
+                    replace(
+                        flat,
+                        groups=tuple(groups),
+                        signature=replace(
+                            flat.signature,
+                            memory_placement=modes
+                            if any(mode != ("gpu", "model") for mode in modes)
+                            else (),
+                        ),
+                    )
+                )
+            selected = (
+                replace(plan, subforwards=tuple(selected_flats))
+                if isinstance(plan, _SplitForwardPlan)
+                else selected_flats[0]
+            )
+            required = (
+                prior_staging
+                + sum(p.gpu_retained_bytes + p.gpu_backward_bytes for p in placements)
+                + max(
+                    prior_workspace,
+                    max(
+                        (
+                            p.gpu_required_bytes
+                            - p.gpu_retained_bytes
+                            - p.gpu_backward_bytes
+                            for p in placements
+                        ),
+                        default=0,
+                    ),
+                )
+            )
+            if isinstance(selected, _SplitForwardPlan):
+                key = self._split_memory_key(selected)
+                required = max(
+                    required,
+                    0
+                    if key is None
+                    else int(
+                        self._split_memory_floors.get(key, 0) * _MEMORY_SAFETY_FACTOR
+                    ),
+                )
+            check = self._memory_check_required(required, sync_across_dp=sync_across_dp)
+            cpu_required = sum(p.cpu_required_bytes for p in placements)
+            # One fixed reduction per candidate keeps policy choice identical on
+            # every physical participant, including locally empty DP ownership.
+            cpu_margin = self._recovery_reduce(
+                [float(cpu_available - cpu_required)],
+                op="MIN",
+                sync_across_dp=sync_across_dp,
+            )[0]
+            check = replace(
+                check,
+                fits=check.fits and cpu_margin >= 0,
+                cpu_required_bytes=cpu_required,
+                cpu_available_bytes=cpu_available,
+                cpu_fits=cpu_margin >= 0,
+                fallback_costs=evidence,
+            )
+            if check.fits:
+                return selected, check
+        return selected, check
+
+    def _reclaim_graph_memory(
+        self, check: _MemoryCheck, *, sync_across_dp: bool
+    ) -> bool:
+        if not self._graph_memory_policy_enabled():
+            return False
+        cache = getattr(self, "_graph_cache", None)
+        actions = []
+        # DP partitions can own different numbers of graphs; only TP/CP peers
+        # coordinate individual records. WORLD sees one final success exchange.
+        with self._planning_status(sync_across_dp):
+            handles = () if cache is None else cache.handles()
+            counts = self._recovery_reduce(
+                [float(len(handles)), -float(len(handles))],
+                op="MAX",
+                sync_across_dp=False,
+            )
+            if counts[0] != -counts[1]:
+                raise RuntimeError(
+                    "Physical participants have different graph cache lengths"
+                )
+            cpu_available = max(
+                0, self._available_cpu_memory_bytes() - check.cpu_required_bytes
+            )
+            for handle in handles:
+                assert cache is not None
+                state = cache.state(handle)
+                can_offload, can_replay, cpu_margin = self._recovery_reduce(
+                    [
+                        float(state.offloadable and state.retention == "gpu"),
+                        float(state.replayable and state.retention != "replay"),
+                        float(cpu_available - state.offload_bytes),
+                    ],
+                    op="MIN",
+                    sync_across_dp=False,
+                )
+                if can_offload and cpu_margin >= 0 and check.cpu_fits:
+                    actions.append((cache.offload, handle))
+                    cpu_available -= state.offload_bytes
+                elif can_replay:
+                    actions.append((cache.evict, handle))
+            # Finish all collective decisions before a transfer/allocation can
+            # fail, so peers still reach the final error exchange on failure.
+            error: BaseException | None = None
+            try:
+                for operation, handle in actions:
+                    operation(handle)
+                if actions:
+                    # Native allocator accounting only credits physical free bytes.
+                    # Release reclaimed graph storage once, on this refusal path.
+                    torch.cuda.empty_cache()
+            except BaseException as exc:
+                error = exc
+            try:
+                succeeded = self._recovery_reduce(
+                    [float(error is None)], op="MIN", sync_across_dp=False
+                )[0]
+            except BaseException as exchange_error:
+                if error is None:
+                    raise
+                raise self._memory_error_with_reduction_note(error, exchange_error)
+            if error is not None:
+                raise error
+            if not succeeded:
+                raise RuntimeError("Graph reclamation failed on another physical rank")
+        return bool(
+            self._recovery_reduce(
+                [float(bool(actions))], op="MAX", sync_across_dp=sync_across_dp
+            )[0]
+        )
 
     @contextmanager
     def _cache_recovery_episode(
@@ -3618,7 +4959,7 @@ class TrainerRank:
         return None
 
     def _record_recovery_work(self, context: str, seconds: float) -> None:
-        if context not in ("forward_micro_batches", "dp_rank_forward"):
+        if context not in ("forward_batches", "forward"):
             return
         state = self._recovery_state()
         try:
@@ -3692,7 +5033,10 @@ class TrainerRank:
 
     @staticmethod
     def _memory_error_with_reduction_note(
-        error: BaseException, exchange_error: BaseException | None
+        error: BaseException,
+        exchange_error: BaseException | None,
+        *,
+        operation: str = "memory reduction",
     ) -> BaseException:
         # Raise outside the exchange handler to preserve the local error's chain.
         # A secondary poisoned-communicator failure is diagnostic, not the primary.
@@ -3700,7 +5044,7 @@ class TrainerRank:
             try:
                 BaseException.add_note(
                     error,
-                    "Secondary memory reduction failure:\n"
+                    f"Secondary {operation} failure:\n"
                     + "".join(traceback.format_exception(exchange_error)),
                 )
             except BaseException:
@@ -4317,14 +5661,12 @@ class TrainerRank:
             chunk_rows = rows[start : start + _HEAD_CHUNK_TOKENS]
             # Recompute vocabulary-sized intermediates one chunk at a time in
             # backward; chunking alone otherwise retains every chunk's logits.
-            local_logits, log_z, local_topk = checkpoint(
-                self._local_head_stats,
+            local_logits, log_z, local_topk = self._checkpointed_head_stats(
                 model,
                 _select_positions(hidden_by_row, chunk_rows),
                 output_weight=output_weight,
                 need_log_z=need_log_z,
                 max_top_k=max_top_k,
-                use_reentrant=False,
             )
             logit_start, logit_end = logit_bounds[chunk_index : chunk_index + 2]
             logit_chunk_offsets = logit_rows[logit_start:logit_end] - start
@@ -4396,6 +5738,38 @@ class TrainerRank:
             # Do not retain prior chunk buffers while the next stats RHS runs.
             del local_logits, chunk_logits
 
+    def _checkpointed_head_stats(
+        self,
+        model: "GPTModel",
+        hidden: torch.Tensor,
+        *,
+        output_weight: torch.Tensor | None,
+        need_log_z: bool,
+        max_top_k: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        """One chunk's head statistics under non-reentrant checkpointing.
+
+        The recompute must save what the forward saved, so it replays the
+        statistics path the forward chose (``path``) instead of attempting
+        the kernels again.
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        return checkpoint(
+            self._local_head_stats,
+            model,
+            hidden,
+            output_weight=output_weight,
+            need_log_z=need_log_z,
+            max_top_k=max_top_k,
+            path=[],
+            use_reentrant=False,
+        )
+
     def _local_head_stats(
         self,
         model: "GPTModel",
@@ -4404,6 +5778,7 @@ class TrainerRank:
         output_weight: torch.Tensor | None,
         need_log_z: bool,
         max_top_k: int,
+        path: list[str] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -4417,15 +5792,58 @@ class TrainerRank:
         log_z: torch.Tensor | None = None
         local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
         if need_log_z:
-            topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
+            # ``path`` holds the forward's statistics path; a checkpoint
+            # recompute replays it rather than attempting the kernels again.
+            recorded = path[0] if path else None
+            topk_stats = (
+                _try_triton_local_topk_stats(local_logits, k=max_top_k)
+                if recorded in (None, "topk")
+                else None
+            )
             logsumexp_stats = (
                 cast(
                     tuple[torch.Tensor, torch.Tensor] | None,
                     _try_triton_stats("local_logsumexp_stats", local_logits),
                 )
-                if topk_stats is None
+                if topk_stats is None and recorded in (None, "logsumexp")
                 else None
             )
+            shape = (int(local_logits.shape[0]), int(local_logits.shape[1]))
+            if recorded is None:
+                if topk_stats is not None or logsumexp_stats is not None:
+                    # A kernel ran at this chunk shape: admission may price it.
+                    getattr(self, "_triton_head_stats_failures", set()).discard(shape)
+                elif _triton_stats_enabled(local_logits.is_cuda, shape[0]):
+                    # An attempted kernel failed at this chunk shape. Admission
+                    # priced the kernel's buffers, so compute the same
+                    # statistics eagerly within them; later admissions price
+                    # the shape for the eager fallback (_triton_head_stats)
+                    # until a kernel succeeds at it again.
+                    if not hasattr(self, "_triton_head_stats_failures"):
+                        self._triton_head_stats_failures = set()
+                    self._triton_head_stats_failures.add(shape)
+                    logsumexp_stats = _eager_local_logsumexp_stats(local_logits)
+                    recorded = "bounded"
+                if path is not None:
+                    path.append(
+                        recorded
+                        or (
+                            "topk"
+                            if topk_stats is not None
+                            else "logsumexp"
+                            if logsumexp_stats is not None
+                            else "eager"
+                        )
+                    )
+            elif recorded == "bounded":
+                logsumexp_stats = _eager_local_logsumexp_stats(local_logits)
+            elif recorded in ("topk", "logsumexp") and (
+                topk_stats is None and logsumexp_stats is None
+            ):
+                raise RuntimeError(
+                    "the head statistics kernel failed in a checkpoint recompute "
+                    "after it succeeded in the forward"
+                )
             stats = topk_stats if topk_stats is not None else logsumexp_stats
             if stats is not None:
                 local_max, local_sum = stats[:2]
@@ -4436,6 +5854,8 @@ class TrainerRank:
                 )
                 log_z = global_max + torch.log(global_sum)
             else:
+                # No kernel attempted (non-CUDA, disabled, short chunk):
+                # admission prices this FP32 fallback's seven buffers.
                 log_z = _vocab_parallel_log_z(local_logits)
 
             if topk_stats is not None:
@@ -4758,9 +6178,6 @@ class TrainerRank:
             tensor_parallel.gather_from_tensor_model_parallel_region(logits),
         )
 
-    # Memory estimation, profiling and admission accounting live in
-    # ``_memory``; binding the functions here keeps ``self._x(...)`` dispatch
-    # and per-instance overrides (tests monkeypatch these) behaving as before.
     _split_required_memory = staticmethod(_memory._split_required_memory)
     _split_memory_key = staticmethod(_memory._split_memory_key)
     _record_split_memory_floor = _memory._record_split_memory_floor
@@ -4772,6 +6189,11 @@ class TrainerRank:
     _checkpoint_moe_bytes_per_token = _memory._checkpoint_moe_bytes_per_token
     _moe_workspace_bytes = _memory._moe_workspace_bytes
     _checkpoint_memory_floor = _memory._checkpoint_memory_floor
+    _gradient_slots = staticmethod(_memory._gradient_slots)
+    _pending_adapter_gradient_bytes = _memory._pending_adapter_gradient_bytes
+    _checkpoint_gradient_groups = _memory._checkpoint_gradient_groups
+    _checkpoint_adapter_gradient_bytes = _memory._checkpoint_adapter_gradient_bytes
+    _adapter_gradient_walk = staticmethod(_memory._adapter_gradient_walk)
     _retained_memory_bytes = _memory._retained_memory_bytes
     _estimate_flat_forward = _memory._estimate_flat_forward
     _update_peak_memory_profile = _memory._update_peak_memory_profile
@@ -4786,15 +6208,15 @@ class TrainerRank:
         _memory._estimate_required_memory_bytes_from_values
     )
     _gdn_segment_layer_bytes = _memory._gdn_segment_layer_bytes
+    _sequence_parallel_workspace_bytes = _memory._sequence_parallel_workspace_bytes
+    _sequence_parallel_lora_floor = _memory._sequence_parallel_lora_floor
+    _cold_recompute_transient_bytes = _memory._cold_recompute_transient_bytes
+    _checkpoint_input_gradient_bytes = _memory._checkpoint_input_gradient_bytes
     _available_memory_bytes = _memory._available_memory_bytes
     _all_ranks_have_memory_profile = _memory._all_ranks_have_memory_profile
     _update_memory_profile = _memory._update_memory_profile
 
-    # Micro-batch planning, split search and admission live in
-    # ``_micro_batch_planner``; binding the functions here keeps ``self._x(...)``
-    # dispatch and per-instance overrides (tests monkeypatch these) behaving as
-    # before.
-    _forward_micro_batches = _micro_batch_planner._forward_micro_batches
+    _forward_batches = _micro_batch_planner._forward_batches
     _plan_admissible_forward = _micro_batch_planner._plan_admissible_forward
     _find_admissible_forward = _micro_batch_planner._find_admissible_forward
     _admit_split_rung = _micro_batch_planner._admit_split_rung
@@ -4831,12 +6253,13 @@ class TrainerRank:
     _plan_retained_tokens = _micro_batch_planner._plan_retained_tokens
     _planning_status = _micro_batch_planner._planning_status
 
-    # Checkpoint-slot bookkeeping lives in ``_slots``; binding the
-    # functions here keeps ``self._x(...)`` dispatch and per-instance
-    # overrides (tests monkeypatch these) behaving as before.
     _resolve_custom_checkpoint = _slots._resolve_custom_checkpoint
     prefetch_checkpoints = _slots.prefetch_checkpoints
     _register_checkpoint_prefetch = _slots._register_checkpoint_prefetch
+    _register_checkpoint_source = _slots._register_checkpoint_source
+    _checkpoint_slot_write = _slots._checkpoint_slot_write
+    _checkpoint_snapshot_state = _slots._checkpoint_snapshot_state
+    _trim_checkpoint_snapshots = _slots._trim_checkpoint_snapshots
     _checkpoint_prefetch_waiter = _slots._checkpoint_prefetch_waiter
     _prefetched_checkpoint = _slots._prefetched_checkpoint
     _load_registered_checkpoint = _slots._load_registered_checkpoint
@@ -4866,9 +6289,6 @@ class TrainerRank:
     _guard_checkpoint_can_step = _slots._guard_checkpoint_can_step
     _guard_checkpoints_can_step = _slots._guard_checkpoints_can_step
 
-    # Dynamic-optimizer management lives in ``_optimizer``; binding the
-    # functions here keeps ``self._x(...)`` dispatch and per-instance
-    # overrides (tests monkeypatch these) behaving as before.
     _extend_dynamic_optimizer = _optimizer._extend_dynamic_optimizer
     optim_step = _optimizer.optim_step
     _guard_optim_step_configuration = _optimizer._guard_optim_step_configuration
@@ -5076,6 +6496,14 @@ def _include_in_distributed_grad_norm(param: torch.nn.Parameter) -> bool:
     return shard_group is None or shard_group.size() <= 1 or shard_group.rank() == 0
 
 
+def _gradient_staging_bytes(parameters: Iterable[torch.nn.Parameter]) -> int:
+    return sum(
+        param.numel() * param.element_size() * (3 - (param.grad is not None))
+        for param in parameters
+        if param.requires_grad
+    )
+
+
 def _custom_parameters(custom: _CustomObject) -> Iterator[torch.nn.Parameter]:
     if custom.kind == "module":
         yield from cast(torch.nn.Module, custom.value).parameters()
@@ -5100,6 +6528,18 @@ def _tracked_tensor_function(
     args: tuple[object, ...],
     kwargs: dict[str, object],
 ) -> object:
+    from ._heads import (
+        _stage_local_buffers,
+        head_call_arguments,
+        mutates_tensor,
+        readonly_buffer_views,
+        tensor_metadata_function,
+        tensor_mutation_targets,
+    )
+    from ._tensors import _map_tensor_arguments
+
+    if (captured := head_call_arguments(args, kwargs)) is not None:
+        return func(*captured[0], **captured[1])
     del types
     tracked = tuple(
         value
@@ -5109,9 +6549,9 @@ def _tracked_tensor_function(
     trackers = {id(value._art_tracker): value._art_tracker for value in tracked}
     for tracker in trackers.values():
         tracker.validate()
-    if getattr(func, "__name__", "") in {
+    if tensor_metadata_function(func) or getattr(func, "__name__", "") in {
         "__format__",
-        "__get__",
+        "__set__",
         "__hash__",
         "__len__",
         "__repr__",
@@ -5119,9 +6559,31 @@ def _tracked_tensor_function(
     }:
         with torch._C.DisableTorchFunctionSubclass():
             return func(*args, **kwargs)
+    if torch._C._current_graph_task_id() >= 0 and any(
+        value._art_tracker.active for value in tracked
+    ):
+        raise RuntimeError(
+            "Live checkpoint tensor used during backward recomputation; capture "
+            "parameter.clone() or head.snapshot() before activation checkpointing"
+        )
 
     markers: dict[int, torch.Tensor] = {}
     replacements: dict[int, torch.Tensor] = {}
+
+    mutating = mutates_tensor(func, kwargs)
+    mutation_targets = tensor_mutation_targets(func, args, kwargs)
+    from ._parameter_hooks import parameter_hook_active
+
+    if parameter_hook_active.get() and any(
+        isinstance(value, _TrackedParameter) and id(value) in mutation_targets
+        for value in tracked
+    ):
+        raise RuntimeError("Parameter hooks must not mutate checkpoint parameters")
+    if getattr(func, "__name__", "") == "requires_grad_" and any(
+        value._art_tracker.active for value in tracked
+    ):
+        raise RuntimeError("Set checkpoint parameter trainability in its factory")
+    copied_buffers: list[tuple[torch.Tensor, torch.Tensor]] = []
 
     def replace(value: object) -> object:
         if isinstance(value, _TrackedParameter | _TrackedTensor):
@@ -5132,42 +6594,70 @@ def _tracked_tensor_function(
             with torch._C.DisableTorchFunctionSubclass():
                 if (
                     tracker.active
+                    and id(value) not in mutation_targets
                     and isinstance(value, _TrackedParameter)
                     and value.requires_grad
                     and torch.is_grad_enabled()
                 ):
                     marker = markers.get(id(tracker))
                     if marker is None:
-                        marker = torch.zeros((), dtype=torch.bool)
+                        marker = torch.zeros((), dtype=torch.bool, device="cpu")
                         markers[id(tracker)] = marker
                         tracker.record(marker)
-                    result = _CustomSlotGraphSentinel.apply(
-                        value.as_subclass(torch.Tensor), marker
+                    trainer = tracker.validate()
+                    assert tracker.ref.name is not None
+                    from ._heads import head_staleness
+
+                    snapshot = trainer._snapshot_parameter(
+                        value,
+                        trainer._capture_checkpoint_version(tracker.ref.name),
+                        head_staleness(trainer),
                     )
+                    result = _track_slot_graph_tensor(snapshot, marker)
+                elif tracker.active and id(value) not in mutation_targets:
+                    # Detached/no-grad reads can still be saved by a later graph.
+                    result = value.as_subclass(torch.Tensor).detach().clone()
+                    if isinstance(value, _TrackedTensor):
+                        copied_buffers.append((value, result))
                 else:
                     result = value.as_subclass(torch.Tensor)
             replacements[id(value)] = result
             return result
-        if isinstance(value, tuple):
-            values = tuple(replace(item) for item in value)
-            return type(value)(*values) if hasattr(value, "_fields") else values
-        if isinstance(value, list):
-            return [replace(item) for item in value]
-        if isinstance(value, dict):
-            return {key: replace(item) for key, item in value.items()}
-        return value
+        return _map_tensor_arguments(replace, value)
 
     result = func(
         *cast(tuple[object, ...], replace(args)),
         **cast(dict[str, object], replace(kwargs)),
     )
+    changed_buffers: set[_CustomTensorTracker] = set()
+    staged = _stage_local_buffers(
+        {str(index): target for index, (target, _) in enumerate(copied_buffers)},
+        {str(index): value for index, (_, value) in enumerate(copied_buffers)},
+    )
+    with torch.no_grad(), torch._C.DisableTorchFunctionSubclass():
+        for target, value in staged:
+            target.copy_(value)
+            changed_buffers.add(cast(_TrackedTensor, target)._art_tracker)
+    if mutating:
+        changed_buffers.update(
+            value._art_tracker
+            for value in tracked
+            if isinstance(value, _TrackedTensor) and id(value) in mutation_targets
+        )
+    for tracker in changed_buffers:
+        tracker.buffer_revision += 1
+    if mutating:
+        for value in tracked:
+            if result is replacements[id(value)]:
+                result = value
+                break
     if markers and not any(
         isinstance(value, torch.Tensor) and value.requires_grad
         for value in _walk_objects(result)
     ):
         for marker in markers.values():
             marker.fill_(True)
-    return result
+    return readonly_buffer_views(result, [value for _, value in copied_buffers])
 
 
 def _graph_marker_is_live(
@@ -5201,36 +6691,25 @@ def _track_custom_object(
         return _CustomObject(custom.kind, value, custom.generation)
 
     module = cast(torch.nn.Module, custom.value)
-    parameters: dict[int, torch.nn.Parameter] = {}
-    buffers: dict[int, torch.Tensor] = {}
+    replacements: dict[tuple[str, int], torch.Tensor] = {}
     for child in module.modules():
-        for key, source in child._parameters.items():
-            if source is None:
-                continue
-            value = parameters.get(id(source))
-            if value is None:
-                with torch.no_grad():
-                    value = _TrackedParameter(
-                        source.detach().clone(), tracker, source.requires_grad
+        for kind in ("parameter", "buffer"):
+            for key, source in getattr(child, f"_{kind}s").items():
+                if source is None:
+                    continue
+                identity = (kind, id(source))
+                if identity not in replacements:
+                    replacements[identity] = cast(
+                        torch.Tensor,
+                        _track_custom_object(
+                            _CustomObject(kind, source, custom.generation), tracker
+                        ).value,
                     )
-                value.__dict__.update(
-                    (attribute, item)
-                    for attribute, item in source.__dict__.items()
-                    if attribute != "_art_tracker"
-                )
-                value._art_tracker = tracker
-                parameters[id(source)] = value
-            child._parameters[key] = value
-        for key, source in child._buffers.items():
-            if source is None:
-                continue
-            value = buffers.get(id(source))
-            if value is None:
-                with torch.no_grad():
-                    value = _TrackedTensor(source.detach().clone(), tracker)
-                buffers[id(source)] = value
-            child._buffers[key] = value
-    return custom
+                getattr(child, f"_{kind}s")[key] = replacements[identity]
+    from ._heads import native_module_handle
+
+    tracker.validate()
+    return replace(custom, handle=native_module_handle(custom, tracker))
 
 
 def _custom_layout(
@@ -5386,11 +6865,11 @@ def _validate_custom_optimizer_state(
         for name, tensor in tensors.items()
         if tuple(tensor.shape) != expected_shape or tensor.dtype != torch.float32
     ]
-    if invalid or not math.isfinite(state.step) or state.step < 0:
+    if invalid or state.step < 0 or not state.step.is_integer():
         raise TrainerRankSlotStateError(
             f"Custom optimizer state for {checkpoint!r}/{key!r} is invalid; "
             f"expected FP32 tensors with shape {expected_shape} and a nonnegative "
-            f"finite step (invalid={invalid}, step={state.step})."
+            f"finite integer step (invalid={invalid}, step={state.step})."
         )
 
 
@@ -5465,19 +6944,56 @@ def _try_triton_local_topk_stats(
     )
 
 
+def _triton_stats_enabled(cuda: bool, rows: int) -> bool:
+    """Whether ``_try_triton_stats`` attempts the kernel for a ``rows`` chunk."""
+    return (
+        cuda
+        and os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower()
+        not in {"0", "false"}
+        and rows >= int(os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64"))
+    )
+
+
+@lru_cache(maxsize=None)
+def _triton_stats_importable() -> bool:
+    try:
+        from art.trainer_rank import topk  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _triton_head_stats_available(rank: Any) -> bool:
+    """Whether the head statistics kernels can run on this rank at all."""
+    return (
+        _triton_stats_enabled(rank.device.type == "cuda", 1 << 62)
+        and _triton_stats_importable()
+    )
+
+
+def _triton_head_stats(rank: Any, rows: int, vocabulary: int) -> bool:
+    """The head statistics path a ``rows`` x ``vocabulary`` chunk takes, for admission.
+
+    Mirrors ``_try_triton_stats``'s attempt predicate plus kernel
+    importability. A kernel that imports but fails at run time falls back
+    (unless ART_TRAINER_RANK_TRITON_TOPK=strict makes that fatal); the first
+    such wave was priced for the kernel, and ``_local_head_stats`` then
+    records that chunk shape, priced for the fallback until a kernel succeeds
+    at it again.
+    """
+    return (
+        _triton_stats_enabled(rank.device.type == "cuda", rows)
+        and (rows, vocabulary) not in getattr(rank, "_triton_head_stats_failures", ())
+        and _triton_stats_importable()
+    )
+
+
 def _try_triton_stats(
     name: str,
     local_logits: torch.Tensor,
     **kwargs: object,
 ) -> object | None:
-    if not local_logits.is_cuda:
-        return None
-    if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() in {
-        "0",
-        "false",
-    } or int(local_logits.shape[0]) < int(
-        os.environ.get("ART_TRAINER_RANK_TRITON_MIN_ROWS", "64")
-    ):
+    if not _triton_stats_enabled(local_logits.is_cuda, int(local_logits.shape[0])):
         return None
     try:
         from art.trainer_rank import topk
@@ -5528,6 +7044,80 @@ def _vocab_parallel_topk_from_local(
         logprobs=top_values - log_z.unsqueeze(1),
         tokens=tokens.gather(1, top_offsets),
     )
+
+
+# Row sub-chunks per head chunk for the bounded eager statistics: one FP32
+# sub-chunk is 2 * ceil(rows / 64) / rows of a BF16 chunk buffer: 1/32 when the
+# rows divide by 64, more otherwise (the estimator prices the ceiling).
+_EAGER_STATS_SUBCHUNKS = 64
+
+
+class _EagerLocalStats(torch.autograd.Function):
+    """The statistics kernel's (local max, local sum) contract, computed eagerly.
+
+    The logits are processed in up to ``_EAGER_STATS_SUBCHUNKS`` row sub-chunks
+    of ceil(rows / 64) rows each through one owned FP32 work buffer, beside
+    the logits in forward and beside the logits and their gradient in
+    backward: the kernel path's buffers (topk._LocalStatsFunction) plus that
+    buffer, instead of the unchunked fallback's seven. The logits are never
+    written. Rows are independent; the caller's rescale of local sums to the
+    global maximum equals the unchunked fallback in exact arithmetic, and
+    FP32 rounding may differ when ranks' local maxima differ.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = int(logits.shape[0])
+        step = max(1, -(-rows // _EAGER_STATS_SUBCHUNKS))
+        local_max = logits.max(dim=-1).values.float()
+        local_sum = torch.empty_like(local_max)
+        work = torch.empty(
+            (min(step, rows), int(logits.shape[1])),
+            dtype=torch.float32,
+            device=logits.device,
+        )
+        for start in range(0, rows, step):
+            stop = min(start + step, rows)
+            block = work[: stop - start]
+            block.copy_(logits[start:stop])  # owned: FP32 logits stay intact
+            block.sub_(local_max[start:stop, None]).exp_()
+            local_sum[start:stop] = block.sum(dim=-1)
+        del work
+        ctx.save_for_backward(logits, local_max)
+        ctx.step = step
+        return local_max, local_sum
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        # As the kernel: the local max is a detached shift; only the sum
+        # carries a gradient, exp(logits - local max) per row.
+        _grad_local_max, grad_local_sum = grad_outputs
+        logits, local_max = ctx.saved_tensors
+        grad = torch.empty_like(logits)
+        if grad_local_sum is None:
+            return grad.zero_()
+        rows, step = int(logits.shape[0]), int(ctx.step)
+        work = torch.empty(
+            (min(step, rows), int(logits.shape[1])),
+            dtype=torch.float32,
+            device=logits.device,
+        )
+        for start in range(0, rows, step):
+            stop = min(start + step, rows)
+            block = work[: stop - start]
+            block.copy_(logits[start:stop])  # owned: the saved logits stay intact
+            block.sub_(local_max[start:stop, None]).exp_()
+            block.mul_(grad_local_sum[start:stop, None])
+            grad[start:stop] = block
+        del work
+        return grad
+
+
+def _eager_local_logsumexp_stats(
+    local_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    stats = _EagerLocalStats.apply(local_logits)
+    return cast(tuple[torch.Tensor, torch.Tensor], stats)
 
 
 def _vocab_parallel_log_z(local_logits: torch.Tensor) -> torch.Tensor:
@@ -5629,8 +7219,50 @@ def _chunk_boundaries(
 
 def _select_positions(values: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
     if int(positions.numel()) == 0:
-        return values[:0]
+        return values[:0].clone()
     return values.index_select(0, positions.to(device=values.device))
+
+
+@lru_cache(maxsize=256)
+def _resolved_request_policy(options: ForwardOptions | None) -> ResolvedForwardOptions:
+    return resolve_forward_options(input=options)
+
+
+def _correction_state_bytes(
+    group: _ForwardGroupPlan, options: ResolvedForwardOptions
+) -> int:
+    if not group.grad_enabled or not options.stale_gradient_corrections:
+        return 0
+    topk = sum(
+        item.input_ids.numel() * (item.request.top_k or 0) for item in group.items
+    )
+    logprobs = 4 * (
+        topk
+        + sum(item.labels.numel() for item in group.items if item.labels is not None)
+    )
+    # Explicit always also stages corrected cotangents.
+    return topk * 8 + logprobs * (
+        2
+        if any(c.policy == "always" for c in options.stale_gradient_corrections)
+        else 1
+    )
+
+
+def _snapshot_tensor_bytes(value: object) -> int:
+    """Graph replay snapshots copy each tensor occurrence in the captured plan."""
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if is_dataclass(value) and not isinstance(value, type):
+        return sum(
+            _snapshot_tensor_bytes(getattr(value, f.name))
+            for f in fields(value)
+            if f.init
+        )
+    if isinstance(value, dict):
+        return sum(_snapshot_tensor_bytes(item) for item in value.values())
+    if isinstance(value, (tuple, list)):
+        return sum(_snapshot_tensor_bytes(item) for item in value)
+    return 0
 
 
 def _batch_seq_logits(logits: torch.Tensor, *, seq_len: int) -> torch.Tensor:
@@ -5650,7 +7282,19 @@ def _batch_seq_logits(logits: torch.Tensor, *, seq_len: int) -> torch.Tensor:
 def _materialize(inputs: ForwardInputs) -> ForwardInputs:
     if isinstance(inputs, ForwardInput):
         return inputs
-    return [_materialize(item) for item in _nested_forward_children(inputs)]
+    return _rebuild_forward_tree(
+        inputs, [_materialize(item) for item in _nested_forward_children(inputs)]
+    )
+
+
+def _rebuild_forward_tree(template: Any, children: list[Any]) -> Any:
+    if isinstance(template, tuple):
+        return (
+            type(template)(*children)
+            if hasattr(template, "_fields")
+            else tuple(children)
+        )
+    return children
 
 
 def _is_forward_input(inputs: ForwardInputs) -> TypeIs[AnyForwardInput]:
@@ -5670,7 +7314,10 @@ def _unflatten(
 ) -> ForwardOutputs:
     if isinstance(template, ForwardInput):
         return next(outputs)
-    return [_unflatten(item, outputs) for item in _nested_forward_children(template)]
+    return _rebuild_forward_tree(
+        template,
+        [_unflatten(item, outputs) for item in _nested_forward_children(template)],
+    )
 
 
 def _nested_forward_children(inputs: ForwardInputs) -> Iterator[ForwardInputs]:

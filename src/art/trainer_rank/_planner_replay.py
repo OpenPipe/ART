@@ -11,14 +11,22 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict
 import json
 from types import MethodType, SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import _gdn_memory, _impl, _memory
 
 _MAX_BYTES = 262144
 _MAX_GROUPS = 1024
+# Replay sizes per-layer tuples from this recorded rank field; bound it as capture does.
+MAX_LAYERS = 1024
 _MAX_SEGMENTS = 4096
 _MAX_INPUT_VALUES = 1_000_000
+
+
+# Estimators bound on TrainerRank as plain functions, not methods.
+_STATIC_ESTIMATORS = frozenset(
+    {"_split_required_memory", "_gradient_slots", "_adapter_gradient_walk"}
+)
 
 
 _REFUSALS = frozenset(
@@ -29,6 +37,9 @@ _REFUSALS = frozenset(
         "runtime_token_inventory_over_limit",
         "runtime_segment_inventory_over_limit",
         "head_positions_unavailable",
+        "head_statistics_fallback_unsupported",
+        "head_logits_statistics_unsupported",
+        "head_topk_targets_unsupported",
         "runtime_facts_over_limit",
         "runtime_stage_inventory_over_limit",
         "runtime_request_inventory_over_limit",
@@ -68,7 +79,10 @@ def _fact_budget() -> Callable[[int], None]:
 
 
 def capture(rank: Any, plan: Any) -> dict[str, Any]:
-    if rank._num_layers > 1024 or not 0 < len(plan.groups) <= _MAX_GROUPS:
+    if (
+        not 0 < rank._num_layers <= MAX_LAYERS
+        or not 0 < len(plan.groups) <= _MAX_GROUPS
+    ):
         raise ValueError("runtime_group_inventory_over_limit")
     if (
         getattr(rank.runtime.provider, "expert_model_parallel_size", 1) > 1
@@ -91,17 +105,26 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         "_plan_head_workspace_bytes",
         "_plan_hybridep_growth_bytes",
         "_gdn_segment_layer_bytes",
+        "_sequence_parallel_workspace_bytes",
+        "_sequence_parallel_lora_floor",
+        "_cold_recompute_transient_bytes",
+        "_checkpoint_input_gradient_bytes",
         "_one_layer_recompute",
         "_topology_key",
         "_physical_tokens",
         "_plan_group_rows",
         "_plan_retained_tokens",
+        "_gradient_slots",
+        "_pending_adapter_gradient_bytes",
+        "_checkpoint_gradient_groups",
+        "_checkpoint_adapter_gradient_bytes",
+        "_adapter_gradient_walk",
     ):
         method = getattr(rank, name)
         expected = getattr(_impl.TrainerRank, name)
         supported = (
             method is expected
-            if name == "_split_required_memory"  # The sole static estimator.
+            if name in _STATIC_ESTIMATORS
             else type(method) is MethodType
             and method.__self__ is rank
             and method.__func__ is expected
@@ -202,6 +225,28 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             if vocabulary
             else 0
         )
+        if projected and head_statistics_fallback(rank, requests, positions):
+            # The frozen head facts price only the kernel path at TP > 1.
+            raise ValueError("head_statistics_fallback_unsupported")
+        if (
+            projected
+            and rank._topology_key()[1] > 1
+            and any(r.logits for r in requests)
+            and any(
+                r.target_tokens is not None or r.top_k is not None for r in requests
+            )
+        ):
+            # Facts record statistics, not requested logits beside them.
+            raise ValueError("head_logits_statistics_unsupported")
+        if (
+            projected
+            and rank._topology_key()[1] > 1
+            and group.grad_enabled
+            and any(r.top_k is not None for r in requests)
+            and any(r.target_tokens is not None for r in requests)
+        ):
+            # Facts record target rows, not top-k beside them.
+            raise ValueError("head_topk_targets_unsupported")
         backwards = (
             target_backward
             and group.grad_enabled
@@ -214,6 +259,18 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             if backwards
             else 0
         )
+        adapter = None
+        if group.grad_enabled and name is not None:
+            # The live estimator reads this slot's unallocated gradient bytes
+            # per decoder layer; freeze them with the selection.
+            kind = getattr(group.slot_ref, "kind", None)
+            if kind is not None and (type(kind) is not str or len(kind) > 64):
+                raise ValueError("runtime_slot_identity_unsupported")
+            pending = rank._pending_adapter_gradient_bytes((group.slot_ref,))
+            if len(pending) > 1025:
+                raise ValueError("runtime_shape_inventory_over_limit")
+            reserve(128 + 12 * len(name) + 24 * len(pending))
+            adapter = {"kind": kind, "name": name, "pending": [int(v) for v in pending]}
         model = _gdn_memory.model_shapes(rank, group.slot_ref) if has_grad else None
         if model is not None:
             if len(model[1]) > 1024:
@@ -231,6 +288,10 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 "gradient": terms(True, group.slot_ref),
                 "head_rows": projected,
                 "head_target_rows": target_rows,
+                "adapter": adapter,
+                "head_statistics": any(
+                    r.target_tokens is not None or r.top_k is not None for r in requests
+                ),
                 "gdn": None
                 if model is None
                 else {
@@ -253,7 +314,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             }
         )
     facts = {
-        "version": 1,
+        "version": 3,
         "checkpoint_layers": _memory._checkpoint_layers(
             rank, rank._plan_group_rows(plan)
         ),
@@ -266,6 +327,21 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     # primitives before bounded JSON encoding; never retain model/slot objects.
     validate(facts)
     return facts
+
+
+def head_statistics_fallback(rank: Any, requests: Any, positions: Any) -> bool:
+    """Whether any TP > 1 head chunk of these requests runs eager statistics."""
+    if rank._topology_key()[1] == 1 or not any(
+        r.target_tokens is not None or r.top_k is not None for r in requests
+    ):
+        return False
+    vocabulary = _memory._head_vocabulary(rank)
+    return any(
+        not _impl._triton_head_stats(rank, chunk, vocabulary)
+        for chunk in _memory._head_chunk_sizes(
+            rank._head_projection_rows(requests, positions=positions, uncapped=True)
+        )
+    )
 
 
 def validate(facts: Any) -> None:
@@ -290,7 +366,7 @@ def validate(facts: Any) -> None:
             "groups",
         },
     )
-    if type(facts["version"]) is not int or facts["version"] != 1:
+    if type(facts["version"]) is not int or facts["version"] != 3:
         raise ValueError("unsupported runtime facts version")
     for key in (
         "checkpoint_layers",
@@ -319,6 +395,8 @@ def validate(facts: Any) -> None:
                 "gradient",
                 "head_rows",
                 "head_target_rows",
+                "adapter",
+                "head_statistics",
                 "gdn",
             },
         )
@@ -326,6 +404,7 @@ def validate(facts: Any) -> None:
             integer(group[key])
         if (
             type(group["grad"]) is not bool
+            or type(group["head_statistics"]) is not bool
             or type(group["slot"]) is not str
             or len(group["slot"]) > 4096
         ):
@@ -363,6 +442,25 @@ def validate(facts: Any) -> None:
                     raise ValueError("invalid MoE stage")
                 for value in stage:
                     integer(value)
+        adapter = group["adapter"]
+        if adapter is not None:
+            fields(adapter, {"kind", "name", "pending"})
+            if (
+                not group["grad"]
+                or (adapter["kind"] is not None and type(adapter["kind"]) is not str)
+                or len(adapter["kind"] or "") > 64
+                or type(adapter["name"]) is not str
+                or len(adapter["name"]) > 4096
+                or type(adapter["pending"]) is not list
+                or len(adapter["pending"]) > 1025
+            ):
+                raise ValueError("invalid adapter gradient facts")
+            reserve(128 + 12 * len(adapter["name"]) + 24 * len(adapter["pending"]))
+            for value in adapter["pending"]:
+                integer(value)
+            # A slot without a kind (megatron-less reference) has none pending.
+            if adapter["kind"] is None and any(adapter["pending"]):
+                raise ValueError("invalid adapter gradient facts")
         gdn = group["gdn"]
         if gdn is not None:
             fields(gdn, {"layers", "shapes", "segments"})
@@ -390,6 +488,14 @@ def validate(facts: Any) -> None:
                 )
                 for value in segment.values():
                     integer(value)
+    # Live slot references all have a kind, or (without megatron) none do.
+    kinds = {
+        group["adapter"]["kind"] is None
+        for group in groups
+        if group["adapter"] is not None
+    }
+    if len(kinds) > 1:
+        raise ValueError("invalid adapter gradient facts")
     if len(json.dumps(facts, separators=(",", ":"))) > _MAX_BYTES:
         raise ValueError("runtime_facts_over_limit")
 
@@ -420,10 +526,53 @@ def validate_tokens(inventories: Iterable[Any]) -> None:
         count(value)
 
 
+class _ReplaySlot(NamedTuple):
+    """A frozen adapter slot identity (the live LoRASlotRef's kind and name)."""
+
+    kind: str | None
+    name: str
+
+
 class ReplayRank(_impl.TrainerRank):
     """The real estimator with runtime metadata readers replaced by frozen facts."""
 
     _facts: dict[str, Any] | None = None
+
+    def _replay_slots(self, slot_refs: Any) -> Any:
+        # Replay passes each group's index; map it to that group's frozen slot.
+        if self._facts is None or slot_refs is None:
+            return slot_refs
+        groups = self._facts["groups"]
+        return tuple(
+            None
+            if (adapter := groups[index]["adapter"]) is None
+            else _ReplaySlot(adapter["kind"], adapter["name"])
+            for index in slot_refs
+        )
+
+    def _gradient_slots(self, group_rows: Any, slot_refs: Any) -> Any:
+        return _memory._gradient_slots(group_rows, self._replay_slots(slot_refs))
+
+    def _checkpoint_gradient_groups(self, group_rows: Any, slot_refs: Any) -> Any:
+        return _memory._checkpoint_gradient_groups(
+            self, group_rows, self._replay_slots(slot_refs)
+        )
+
+    def _pending_adapter_gradient_bytes(self, refs: Any) -> tuple[int, ...]:
+        if self._facts is None:
+            return _memory._pending_adapter_gradient_bytes(self, refs)
+        refs = tuple(dict.fromkeys(refs))
+        if not refs:
+            return ()
+        if len(refs) != 1:
+            raise ValueError("replayed adapter gradients are frozen per slot")
+        for group in self._facts["groups"]:
+            adapter = group["adapter"]
+            if adapter is not None and (adapter["kind"], adapter["name"]) == tuple(
+                refs[0]
+            ):
+                return tuple(adapter["pending"])
+        return ()
 
     def _head_workspace_bytes(self, rows: int) -> int:
         assert self._facts is not None
@@ -490,6 +639,10 @@ class ReplayRank(_impl.TrainerRank):
         )
         if (projected, target_rows) != (group["head_rows"], group["head_target_rows"]):
             raise ValueError("head row facts disagree with selected requests/layout")
+        if group["head_statistics"] != any(
+            r.target_tokens is not None or r.top_k is not None for r in requests
+        ):
+            raise ValueError("head statistics facts disagree with selected requests")
 
     def _moe_workspace_bytes(
         self, rows: int, *, checkpoint_grad: bool = False, slot_ref: Any = None
@@ -530,12 +683,14 @@ class ReplayRank(_impl.TrainerRank):
         if arguments.get("hybridep_growth_bytes", 0):
             raise ValueError("hybridep_runtime_facts_unsupported")
         head = max(
-            max(
-                _memory._dense_head_bytes(facts["head_vocabulary"], g["head_rows"]),
-                3
-                * _memory._dense_head_bytes(
-                    facts["head_vocabulary"], g["head_target_rows"]
-                ),
+            _memory._frozen_head_bytes(
+                facts["head_vocabulary"],
+                g["head_rows"],
+                g["head_target_rows"],
+                target_backward=facts["head_target_backward"],
+                statistics=g["head_statistics"],
+                grad=g["grad"],
+                tp=self._topology_key()[1],
             )
             for g in groups
         )

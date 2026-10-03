@@ -3,20 +3,49 @@ from __future__ import annotations
 from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
+import pickle
+import sys
 import threading
+from types import SimpleNamespace
 import weakref
 
 import pytest
 import safetensors.torch
-from test_trainer_rank_validation import _prepared_save, _save_state_trainer
+from test_trainer_rank_validation import (
+    _adapter_config,
+    _prepared_save,
+    _save_state_trainer,
+)
 import torch
 
 from art.trainer_rank import _checkpoint as cp
 from art.trainer_rank._impl import _CheckpointSlot, _CustomObject, _DynamicOptimizer
 
 
-def test_captured_cpu_custom_optimizer_is_independent() -> None:
+def _snapshot_trainer(monkeypatch, parameter=None):
     trainer = _save_state_trainer()
+    if parameter is None:
+        parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    trainer._checkpoint_slots["a"] = _CheckpointSlot(
+        params=(parameter,),
+        config=_adapter_config(target_modules=("q_proj",)),
+        custom={"p": _CustomObject("parameter", parameter, object())},
+    )
+    monkeypatch.setattr(trainer, "_slot_ref", lambda _: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "art.megatron.lora",
+        SimpleNamespace(LoRA=type("UnusedLoRA", (), {})),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "art.megatron.weights.lora_publish",
+        SimpleNamespace(collect_local_lora_entries=lambda *a, **kw: ({}, [])),
+    )
+    return trainer
+
+
+def test_captured_cpu_custom_optimizer_is_independent(monkeypatch) -> None:
     parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
     buffer = torch.tensor([3.0])
     master = torch.nn.Parameter(parameter.detach().clone())
@@ -26,20 +55,14 @@ def test_captured_cpu_custom_optimizer_is_independent() -> None:
         "exp_avg": torch.ones(2),
         "exp_avg_sq": torch.full((2,), 2.0),
     }
-    trainer._checkpoint_slots["a"] = _CheckpointSlot(
-        params=(parameter,),
-        config={
-            "base_model_name_or_path": "test/model",
-            "r": 1,
-            "lora_alpha": 1,
-            "target_modules": ["q_proj"],
-        },
-        optimizer=_DynamicOptimizer(optimizer, (master,)),
-        custom={
-            "p": _CustomObject("parameter", parameter, object()),
-            "b": _CustomObject("buffer", buffer, object()),
-        },
-    )
+    trainer = _snapshot_trainer(monkeypatch, parameter)
+    slot = trainer._checkpoint_slots["a"]
+    slot.optimizer = _DynamicOptimizer(optimizer, (master,))
+    slot.custom["b"] = _CustomObject("buffer", buffer, object())
+    # Parameter/buffer copies alone fit; the optimizer capture does not.
+    monkeypatch.setattr(trainer, "_available_cpu_memory_bytes", lambda: 36)
+    with pytest.raises(RuntimeError, match="checkpoint.*host memory"):
+        cp._admit_snapshot(trainer, "a")
     payloads = {}
     records = cp._custom_snapshot(trainer, "a", payloads)
     before = {
@@ -85,6 +108,7 @@ def test_one_spill_writer_drains_payloads_without_finalization(tmp_path, monkeyp
         assert entered.wait(3)
         assert all(not result.done() for result in results)
         assert len(spill.pending) == 7
+        assert list(spill.workspace.values()) == [16] * 8
     finally:
         release.set()
         assert worker is not None
@@ -93,7 +117,7 @@ def test_one_spill_writer_drains_payloads_without_finalization(tmp_path, monkeyp
     for result in results:
         result.result()
     assert len(set(calls)) == 1
-    assert spill.thread is None and not spill.pending
+    assert spill.thread is None and not spill.pending and not spill.workspace
     assert all(not values for values in payloads)
     assert all(ref() is None for ref in refs)
 
@@ -167,35 +191,12 @@ def test_failed_spill_does_not_strand_following_save(tmp_path, monkeypatch):
     assert caught.value is error
     second.result(3)
     assert (tmp_path / "second/v.safetensors").is_file()
+    assert not spill.workspace
 
 
 def test_rank_prepare_returns_before_disk_and_owns_capture(tmp_path, monkeypatch):
-    import sys
-    from types import SimpleNamespace
-
-    trainer = _save_state_trainer()
-    parameter = torch.nn.Parameter(torch.tensor([1.0]))
-    trainer._checkpoint_slots["a"] = _CheckpointSlot(
-        params=(parameter,),
-        config={
-            "base_model_name_or_path": "test/model",
-            "r": 1,
-            "lora_alpha": 1,
-            "target_modules": ["q_proj"],
-        },
-        custom={"p": _CustomObject("parameter", parameter, object())},
-    )
-    monkeypatch.setattr(trainer, "_slot_ref", lambda _: None)
-    monkeypatch.setitem(
-        sys.modules,
-        "art.megatron.lora",
-        SimpleNamespace(LoRA=type("UnusedLoRA", (), {})),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "art.megatron.weights.lora_publish",
-        SimpleNamespace(collect_local_lora_entries=lambda *a, **kw: ({}, [])),
-    )
+    trainer = _snapshot_trainer(monkeypatch)
+    parameter = trainer._checkpoint_slots["a"].params[0]
     entered, release = threading.Event(), threading.Event()
     saved = {}
     original = safetensors.torch.save_file
@@ -226,19 +227,20 @@ def test_rank_prepare_returns_before_disk_and_owns_capture(tmp_path, monkeypatch
     assert not trainer._prepared_checkpoint_saves
 
 
-def test_writer_start_failure_has_no_orphaned_backlog(tmp_path, monkeypatch):
+@pytest.mark.parametrize("stage", ("__init__", "start"))
+def test_writer_start_failure_has_no_orphaned_backlog(tmp_path, monkeypatch, stage):
     spill = cp._SnapshotSpill()
     error = RuntimeError("cannot start writer")
 
-    def fail(_self):
+    def fail(_self, *args, **kwargs):
         raise error
 
     with monkeypatch.context() as patch:
-        patch.setattr(threading.Thread, "start", fail)
+        patch.setattr(threading.Thread, stage, fail)
         with pytest.raises(RuntimeError) as caught:
             spill.submit(tmp_path / "failed", {"v.safetensors": {"v": torch.ones(1)}})
         assert caught.value is error
-    assert spill.thread is None and not spill.pending
+    assert spill.thread is None and not spill.pending and not spill.workspace
     spill.submit(tmp_path / "next", {"v.safetensors": {"v": torch.ones(1)}}).result(3)
     assert (tmp_path / "next/v.safetensors").is_file()
 
@@ -249,12 +251,7 @@ def test_start_failure_is_owned_until_collective_finalization(
 ):
     trainer = _save_state_trainer()
     trainer._checkpoint_slots["a"] = _CheckpointSlot(
-        config={
-            "base_model_name_or_path": "test/model",
-            "r": 1,
-            "lora_alpha": 1,
-            "target_modules": ["q_proj"],
-        }
+        config=_adapter_config(target_modules=("q_proj",))
     )
     monkeypatch.setattr(cp, "_validate_save_state", lambda *_: {})
     refs = []
@@ -441,6 +438,147 @@ def test_noncontiguous_cpu_packing_is_owned_by_writer(tmp_path, monkeypatch, fai
     assert threads == [worker]
     assert raw() is None and all(ref() is None for ref in packed)
     assert isinstance(result.exception(), OSError) if fails else result.result() is None
+
+
+@pytest.mark.parametrize("backlog", ("empty", "active", "queued"))
+def test_snapshot_capture_admission_precedes_allocation(tmp_path, monkeypatch, backlog):
+    parameter = torch.nn.Parameter(torch.arange(12.0).reshape(3, 4).T)
+    if backlog == "queued":
+        parameter.data = parameter.data.contiguous()
+    trainer = _snapshot_trainer(monkeypatch, parameter)
+    entered, release = threading.Event(), threading.Event()
+    available = 384
+    calls = []
+    original_state, original_write = cp._local_state, safetensors.torch.save_file
+
+    def capture(*args):
+        calls.append(args[1])
+        return original_state(*args)
+
+    def write(tensors, path):
+        entered.set()
+        assert release.wait(3)
+        original_write(tensors, path)
+
+    monkeypatch.setattr(trainer, "_available_cpu_memory_bytes", lambda: available)
+    monkeypatch.setattr(cp, "_local_state", capture)
+    monkeypatch.setattr(safetensors.torch, "save_file", write)
+    output = str(tmp_path / "refused")
+    try:
+        if backlog != "empty":
+            for index in range(2):
+                trainer.prepare_checkpoint_save(str(tmp_path / str(index)), "a")
+                parameter.data = parameter.data.T.contiguous().T
+            assert entered.wait(3)
+            assert len(trainer._checkpoint_snapshot_spill.pending) == 1
+        # Headroom is additional allocation, already excluding resident captures.
+        available = 144 if backlog != "empty" else 0
+        with pytest.raises(RuntimeError, match="checkpoint.*host memory"):
+            trainer.prepare_checkpoint_save(output, "a")
+        assert len(calls) == (2 if backlog != "empty" else 0)
+        assert len(trainer._prepared_checkpoint_saves) == (
+            2 if backlog != "empty" else 0
+        )
+        assert not trainer._checkpoint_preparing_saves
+        assert not list(tmp_path.glob(".refused.*"))
+        if backlog != "empty":
+            # Existing captures are already resident: do not charge them twice.
+            available = 192
+            trainer.prepare_checkpoint_save(output, "a")
+            assert len(calls) == 3
+    finally:
+        release.set()
+        for pending in list(trainer._prepared_checkpoint_saves):
+            trainer.abort_checkpoint_save(pending)
+    # Reservations must disappear on drain, and a refused destination is reusable.
+    available = 144
+    trainer.prepare_checkpoint_save(output, "a")
+    trainer.abort_checkpoint_save(output)
+    assert not trainer._prepared_checkpoint_saves
+    torch.testing.assert_close(parameter, torch.arange(12.0).reshape(3, 4).T)
+
+
+@pytest.mark.parametrize("has_optimizer", (False, True))
+def test_lazy_custom_snapshot_admission_counts_cached_state(monkeypatch, has_optimizer):
+    trainer = _snapshot_trainer(monkeypatch)
+    slot = trainer._checkpoint_slots["a"]
+    payloads = {}
+    records = cp._custom_snapshot(trainer, "a", payloads)
+    slot.custom.clear()
+    slot.params = ()
+    cached_optimizer: dict[str, torch.Tensor] = (
+        {
+            f"{key}/p": torch.ones(1)
+            for key in ("master", "exp_avg", "exp_avg_sq", "step")
+        }
+        if has_optimizer
+        else {}
+    )
+    slot.custom_payload = cp.PreparedCustomPayload(
+        records, payloads["custom_tensors.safetensors"], cached_optimizer
+    )
+    slot.optimizer = _DynamicOptimizer(
+        torch.optim.Adam((torch.nn.Parameter(torch.ones(1)),)), ()
+    )
+    # Both loaded optimizer data and synthesized missing state need admission.
+    monkeypatch.setattr(trainer, "_available_cpu_memory_bytes", lambda: 12)
+    with pytest.raises(RuntimeError, match="checkpoint.*host memory"):
+        cp._admit_snapshot(trainer, "a")
+
+
+def test_module_snapshot_admission_reads_metadata_without_hooks(monkeypatch):
+    parameter = torch.nn.Parameter(torch.ones(2))
+    trainer = _snapshot_trainer(monkeypatch, parameter)
+    module = torch.nn.Module()
+    module.register_parameter("left", parameter)
+    module.register_parameter("right", parameter)
+    module.register_buffer("scratch", torch.ones(2), persistent=False)
+    hooks = []
+    module.register_state_dict_pre_hook(lambda *_: hooks.append(True))
+    trainer._checkpoint_slots["a"].custom["p"] = _CustomObject(
+        "module", module, object()
+    )
+    available = 47
+    monkeypatch.setattr(trainer, "_available_cpu_memory_bytes", lambda: available)
+    with pytest.raises(RuntimeError, match="checkpoint.*host memory"):
+        cp._admit_snapshot(trainer, "a")
+    assert not hooks
+    # Two eight-byte saved keys, capture/packing/serialization; no scratch buffer.
+    available = 48
+    cp._admit_snapshot(trainer, "a")
+    assert not hooks
+    cp._custom_snapshot(trainer, "a", {})
+    assert hooks == [True]
+
+
+@pytest.mark.parametrize("world", (2, 8))
+@pytest.mark.parametrize("kind", ("buffer", "module"))
+def test_snapshot_admission_counts_buffer_gather(monkeypatch, world, kind):
+    from art.trainer_rank._heads import _plain
+
+    trainer = _snapshot_trainer(monkeypatch)
+    buffer = torch.ones(64)[1:3]
+    value: torch.Tensor | torch.nn.Module = buffer
+    if kind == "module":
+        value = torch.nn.Module()
+        value.register_buffer("saved", buffer)
+        value.register_buffer("scratch", torch.ones(64), persistent=False)
+    trainer._checkpoint_slots["a"].custom["b"] = _CustomObject(kind, value, object())
+    payload = _plain(buffer).cpu()
+    assert payload.untyped_storage().nbytes() == 8  # Not the 256-byte backing view.
+    assert 8 < len(pickle.dumps({("a", "b"): (0, {"saved": payload})})) <= 4104
+    trainer._checkpoint_snapshot_spill = SimpleNamespace(
+        lock=threading.Lock(), workspace={Future(): 512}
+    )
+    monkeypatch.setattr(cp, "_distributed", lambda: True)
+    monkeypatch.setattr(cp.dist, "get_world_size", lambda: world)
+    # Padded gather plus cloning/serialization/deserialization and an old writer.
+    available = (world + 6) * 4104 + 512 - 1
+    monkeypatch.setattr(trainer, "_available_cpu_memory_bytes", lambda: available)
+    with pytest.raises(RuntimeError, match="checkpoint.*host memory"):
+        cp._admit_snapshot(trainer, "a")
+    available += 1
+    cp._admit_snapshot(trainer, "a")
 
 
 def test_failed_expansion_releases_physical_snapshot_and_drains_next(

@@ -213,7 +213,7 @@ jobs:
       - name: Run Megatron lightweight tests
         run: |
           megatron_runtime/.venv/bin/python -c "import megatron.core.packed_seq_params"
-          megatron_runtime/.venv/bin/python -m pytest --nbval --current-env --tb=short \
+          megatron_runtime/.venv/bin/python -m pytest -v --nbval --current-env --tb=short \
             tests/unit/test_megatron_reference_logprobs.py \
             tests/unit/test_preprocessing_tokenize.py::test_gemma4_normalizes_json_tool_arguments_for_mapping_template \
             tests/unit/test_moe_routing_replay.py \
@@ -224,18 +224,24 @@ jobs:
             tests/unit/test_prefix_tree_grad_parity.py \
             tests/unit/test_prefix_tree_packing.py \
             tests/unit/test_trainer_rank_handoff_budget.py \
+            tests/unit/test_trainer_rank_graph_backward_work.py \
             tests/unit/test_qwen35_adapter_config.py \
             tests/unit/test_trainer_rank_physical_reserve.py \
             tests/unit/test_trainer_rank_validation.py \
             tests/unit/test_trainer_rank_weird_shapes.py \
+            tests/unit/test_trainer_rank_slot_graph_lifetime.py \
+            tests/unit/test_trainer_rank_forward_handoff.py \
+            tests/unit/test_trainer_rank_commands.py::test_gloo_dp2_parallel_participation_and_gradients \
             tests/unit/test_trainer_rank_admission_inputs.py \
             tests/unit/test_trainer_rank_checkpoint_memory.py \
             tests/unit/test_trainer_rank_profile_warm.py \
             tests/unit/test_trainer_rank_tp_floor.py \
             tests/unit/test_trainer_rank_checkpoint_gradient_memory.py \
+            tests/unit/test_trainer_rank_adapter_gradient_memory.py \
             tests/unit/test_trainer_rank_slot_memory.py \
             tests/unit/test_trainer_rank_moe_memory.py \
             tests/unit/test_trainer_rank_head_memory.py \
+            tests/unit/test_trainer_rank_eager_head_memory.py::test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound \
             tests/unit/test_grouped_planner_replay.py \
             tests/unit/test_planner_runtime_fact_guards.py \
             tests/unit/test_planner_replay_owner_budget.py \
@@ -249,6 +255,7 @@ jobs:
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
             tests/acceptance/trainer_rank_planner \
+            tests/integration/megatron/lora/test_lora_disk_codecs.py::test_export_preparation_failure_is_collective_and_retryable \
             tests/integration/megatron/test_sft_packing.py::test_sft_packing_preserves_training_targets \
             tests/integration/megatron/model_support/test_dispatcher_graph_retention.py \
             tests/integration/megatron/gdn_shared_prefix/test_gdn_planner_runtime_model.py \
@@ -264,6 +271,8 @@ jobs:
           uv run --no-sync pytest --nbval --current-env --tb=short tests/unit \
             --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
             --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
+            --deselect=tests/unit/test_trainer_rank_commands.py::test_gloo_dp2_parallel_participation_and_gradients \
+            --deselect=tests/unit/test_trainer_rank_eager_head_memory.py::test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound \
             --ignore=tests/unit/test_megatron_reference_logprobs.py \
             --ignore=tests/unit/test_moe_routing_replay.py \
             --ignore=tests/unit/test_moe_routing_real_path.py \
@@ -273,15 +282,19 @@ jobs:
             --ignore=tests/unit/test_prefix_tree_grad_parity.py \
             --ignore=tests/unit/test_prefix_tree_packing.py \
             --ignore=tests/unit/test_trainer_rank_handoff_budget.py \
+            --ignore=tests/unit/test_trainer_rank_graph_backward_work.py \
             --ignore=tests/unit/test_qwen35_adapter_config.py \
             --ignore=tests/unit/test_trainer_rank_physical_reserve.py \
             --ignore=tests/unit/test_trainer_rank_validation.py \
             --ignore=tests/unit/test_trainer_rank_weird_shapes.py \
+            --ignore=tests/unit/test_trainer_rank_slot_graph_lifetime.py \
+            --ignore=tests/unit/test_trainer_rank_forward_handoff.py \
             --ignore=tests/unit/test_trainer_rank_admission_inputs.py \
             --ignore=tests/unit/test_trainer_rank_checkpoint_memory.py \
             --ignore=tests/unit/test_trainer_rank_profile_warm.py \
             --ignore=tests/unit/test_trainer_rank_tp_floor.py \
             --ignore=tests/unit/test_trainer_rank_checkpoint_gradient_memory.py \
+            --ignore=tests/unit/test_trainer_rank_adapter_gradient_memory.py \
             --ignore=tests/unit/test_trainer_rank_slot_memory.py \
             --ignore=tests/unit/test_trainer_rank_moe_memory.py \
             --ignore=tests/unit/test_trainer_rank_head_memory.py \

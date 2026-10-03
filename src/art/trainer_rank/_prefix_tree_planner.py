@@ -106,14 +106,6 @@ def canonical_token_rows_fingerprint(
     return digest.hexdigest()
 
 
-def _content_fingerprint(rows: Sequence[torch.Tensor]) -> Fingerprint:
-    """Hash ordered rows through composable per-row int64 fingerprints."""
-
-    return canonical_token_rows_fingerprint(
-        tuple((int(row.numel()), canonical_token_row_fingerprint(row)) for row in rows)
-    )
-
-
 def _token_row(sequence: Sequence[int] | torch.Tensor) -> torch.Tensor:
     """Normalize one input row to a contiguous CPU int64 tensor."""
 
@@ -157,6 +149,8 @@ class CanonicalPrefixTree:
     content_fingerprint: Fingerprint
     structure_fingerprint: Fingerprint
     fingerprint: Fingerprint
+    # Retain already-computed row commitments for packing-independent telemetry.
+    row_fingerprints: tuple[Fingerprint, ...]
 
     @property
     def maximum_shared_depth(self) -> int:
@@ -244,10 +238,13 @@ def _finalize_canonical_prefix_tree(
     *,
     sequence_lengths: tuple[int, ...],
     segments: tuple[CanonicalSegment, ...],
-    content_fingerprint: Fingerprint,
+    row_fingerprints: tuple[Fingerprint, ...],
 ) -> CanonicalPrefixTree:
     """Finalize shared tree identities and terminal metadata exactly once."""
 
+    content_fingerprint = canonical_token_rows_fingerprint(
+        tuple(zip(sequence_lengths, row_fingerprints, strict=True))
+    )
     structure_payload = {
         "schema": _TREE_SCHEMA_VERSION,
         "sequence_lengths": sequence_lengths,
@@ -294,6 +291,7 @@ def _finalize_canonical_prefix_tree(
         content_fingerprint=content_fingerprint,
         structure_fingerprint=structure_fingerprint,
         fingerprint=tree_fingerprint,
+        row_fingerprints=row_fingerprints,
     )
 
 
@@ -385,7 +383,7 @@ def build_canonical_prefix_tree(
     return _finalize_canonical_prefix_tree(
         sequence_lengths=lengths,
         segments=tuple(segments),
-        content_fingerprint=_content_fingerprint(rows),
+        row_fingerprints=tuple(canonical_token_row_fingerprint(row) for row in rows),
     )
 
 

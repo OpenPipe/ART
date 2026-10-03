@@ -340,7 +340,7 @@ def _without_inline_reasoning_parser(template: str) -> str:
     selected = set()
     shared = set()
 
-    def writes_content(node: nodes.Assign | nodes.AssignBlock) -> bool:
+    def writes_content(node: nodes.Assign) -> bool:
         target = node.target
         return (
             isinstance(target, nodes.Name)
@@ -385,18 +385,9 @@ def _without_inline_reasoning_parser(template: str) -> str:
         initialized.update(
             n.name for n in node.find_all(nodes.Name) if n.ctx == "store"
         )
-        for child in (
-            node,
-            *node.find_all((nodes.Macro, nodes.Import, nodes.FromImport)),
-        ):
+        for child in (node, *node.find_all(nodes.Macro)):
             if isinstance(child, nodes.Macro):
                 initialized.add(child.name)
-            elif isinstance(child, nodes.Import):
-                initialized.add(child.target)
-            elif isinstance(child, nodes.FromImport):
-                initialized.update(
-                    name if isinstance(name, str) else name[1] for name in child.names
-                )
 
     def visit(
         body: Sequence[nodes.Node],
@@ -456,43 +447,18 @@ def _without_inline_reasoning_parser(template: str) -> str:
                             # Publishing a new binding can release an old
                             # object whose destructor observes the new value.
                             shared.update(bindings)
-                else:
-                    # Macro/loop/with/block bodies have independent bindings.
-                    for _, value in node.iter_fields():
-                        if isinstance(value, list) and all(
-                            isinstance(n, nodes.Node) for n in value
-                        ):
-                            # Jinja initializes loop locals before each body;
-                            # parameters/targets already have arbitrary values.
-                            local_names = (
-                                {
-                                    n.name
-                                    for n in (
-                                        node.target,
-                                        *node.target.find_all(nodes.Name),
-                                    )
-                                    if isinstance(n, nodes.Name)
-                                }
-                                if isinstance(node, nodes.For) and value is node.body
-                                else None
-                            )
-                            if isinstance(node, nodes.Macro):
-                                local_names = {arg.name for arg in node.args}
-                            elif isinstance(node, nodes.With):
-                                local_names = {
-                                    bound.name
-                                    for target in node.targets
-                                    for bound in (target, *target.find_all(nodes.Name))
-                                    if isinstance(bound, nodes.Name)
-                                }
-                            visit(
-                                value,
-                                set(),
-                                local_names,
-                                isinstance(node, nodes.For) and value is node.body,
-                            )
-                    if isinstance(node, nodes.AssignBlock) and writes_content(node):
-                        bindings.clear()
+                elif isinstance(node, nodes.Macro):
+                    # Macro parameters already have arbitrary values.
+                    visit(node.body, set(), {arg.name for arg in node.args})
+                elif isinstance(node, nodes.For):
+                    # Only the loop body has fresh loop-local bindings.
+                    local_names = {
+                        n.name
+                        for n in (node.target, *node.target.find_all(nodes.Name))
+                        if isinstance(n, nodes.Name)
+                    }
+                    visit(node.body, set(), local_names, True)
+                    visit(node.else_, set())
         return bindings
 
     visit(tree.body, set())

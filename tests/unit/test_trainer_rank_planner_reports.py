@@ -236,6 +236,101 @@ def test_spool_symlink_refuses(tmp_path):
     assert not list(target.iterdir())
 
 
+@pytest.mark.parametrize("adapted", [True, False, None])
+def test_replay_prices_the_recorded_dense_fc1_floor(adapted, tmp_path):
+    # A dense CP1 no-grad estimate: rows x (6F + 4H) x 2 with F 32, H 8 is
+    # 1,792 B for 4 rows, above 5H x 2 per packed token (320 B). Reports from
+    # before the floor (no recorded fact, None) replay without it.
+    rank_fields: dict[str, Any] = {
+        "num_layers": 4,
+        "hidden_size": 8,
+        "param_dtype_size": 2,
+        "recompute_granularity": "full",
+        "one_layer_recompute": True,
+        "sequence_parallel": False,
+        "attention_output_gate": False,
+        "mlp_activation_factor": 3,
+        "gdn_layers": 0,
+        "checkpointed_moe_layers": 0,
+        "recompute_modules": [],
+        "moe_output_bytes_per_token": 0,
+        "moe_forward_stages": [],
+        "geometry": {
+            "hidden_size": 8,
+            "ffn_hidden_size": 32,
+            "num_attention_heads": 2,
+            "num_query_groups": 2,
+            "kv_channels": 4,
+        },
+        "topology": [1, 1, 1, 1],
+    }
+    if adapted is not None:
+        rank_fields["dense_fc1_adapted"] = adapted
+    required = int((1792 if adapted else 320) * 1.1)
+    estimate = {
+        "signature": {
+            "topology": [1, 1, 1, 1],
+            "planner_coefficients": [2, None],
+            "slot_group_count": 1,
+            "request_mix": ["target:single"],
+            "grad_enabled": False,
+            "grad_modes": [False],
+            "slot_shapes": [],
+        },
+        "profile": None,
+        "arguments": {
+            "packed_tokens": 4,
+            "output_bytes": 0,
+            "logical_tokens": 4,
+            "gdn_segments": 0,
+            "retained_tokens": 4,
+            "group_rows": [],
+        },
+        "expected_required_bytes": required,
+        "retained_bytes": required,
+        "cost_components": {
+            "required": required,
+            "retained": required,
+            "checkpoint_retained": 0,
+            "checkpoint_workspace": 0,
+            "checkpoint_input_gradient": 0,
+            "checkpoint_peak_increment": 0,
+            "hybridep_growth": 0,
+            "checkpoint_adapter_gradient": 0,
+            "checkpoint_adapter_gradient_slots": "",
+        },
+    }
+    payload = {
+        "memory_replay": {"rank": rank_fields, "estimates": [estimate]},
+        "split_memory_floor_bytes": 0,
+        "local_admission_peak_bytes": required,
+        "reduced_admission_peak_bytes": required,
+        "safety_factor": 1.1,
+        "layouts": [],
+    }
+    path = report(
+        tmp_path,
+        predicted_peak_bytes=required,
+        observed_peak_bytes=2 * required,
+        admission_peak_bytes=required,
+        replay_factory=lambda: payload,
+    )
+    result = reports.replay(reports.validate_report(path.read_bytes()))
+    assert result["estimates"] == [
+        {"required_bytes": required, "retained_bytes": required, "matches": True}
+    ]
+    rank_fields["dense_fc1_adapted"] = 1
+    path = report(
+        tmp_path,
+        predicted_peak_bytes=required,
+        observed_peak_bytes=2 * required,
+        admission_peak_bytes=required,
+        replay_factory=lambda: payload,
+    )
+    with pytest.raises(ValueError, match="FC1 adapter fact"):
+        reports.replay(reports.validate_report(path.read_bytes()))
+
+
 def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
     from art.trainer_rank._prefix_tree_planner import (
         build_canonical_prefix_tree,
@@ -299,6 +394,8 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
                     "checkpoint_input_gradient": 0,
                     "checkpoint_peak_increment": 0,
                     "hybridep_growth": 0,
+                    "checkpoint_adapter_gradient": 0,
+                    "checkpoint_adapter_gradient_slots": "",
                 },
             }
         ],
@@ -357,11 +454,14 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
     unrecorded["replay"]["memory_replay"]["rank"]["one_layer_recompute"] = None
     with pytest.raises(ValueError, match="recompute mode is not recorded"):
         reports.replay(unrecorded)
-    drifted = reports.validate_report(path.read_bytes())
-    drifted["replay"]["source_files"]["_impl.py"]["sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="source differs"):
-        reports.replay(drifted)
-    assert reports.replay(drifted, allow_source_drift=True)["source_matches"] is False
+    for name in ("_impl.py", "_memory_policy.py", "_options.py"):
+        drifted = reports.validate_report(path.read_bytes())
+        drifted["replay"]["source_files"][name]["sha256"] = "0" * 64
+        with pytest.raises(ValueError, match="source differs"):
+            reports.replay(drifted)
+        assert (
+            reports.replay(drifted, allow_source_drift=True)["source_matches"] is False
+        )
     assert "_gdn_memory.py" in reports._source_files()
     assert "_memory.py" in reports._source_files()
     assert "_micro_batch_planner.py" in reports._source_files()
@@ -387,6 +487,7 @@ def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
         "checkpoint_workspace",
         "checkpoint_peak_increment",
         "hybridep_growth",
+        "checkpoint_adapter_gradient",
     ):
         altered = json.loads(path.read_bytes())
         altered["replay"]["memory_replay"]["estimates"][0]["cost_components"][
@@ -469,6 +570,7 @@ def test_actual_emitted_split_recomputes_frozen_runtime_facts(
     assert original["incomplete_reasons"] == []
     snapshot = original["replay"]
     assert snapshot["memory_replay"]["rank"]["moe_forward_stages"] == []
+    assert snapshot["memory_replay"]["rank"]["dense_fc1_adapted"] is False
     assert len(snapshot["layouts"]) == 2
     assert snapshot["local_admission_peak_bytes"] == local
     assert snapshot["reduced_admission_peak_bytes"] == local + 123
@@ -491,7 +593,8 @@ def test_actual_emitted_split_recomputes_frozen_runtime_facts(
 
 
 @pytest.mark.parametrize("slots", [[], [[True, [[3, 8], []]], [False, []]]])
-def test_signature_json_roundtrip_is_immutable(slots):
+@pytest.mark.parametrize("placements", [[], [["gpu", "model"], ["replay", "cpu"]]])
+def test_signature_json_roundtrip_is_immutable(slots, placements):
     from art.trainer_rank._impl import _MemorySignature
 
     values: dict[str, Any] = dict(
@@ -502,6 +605,7 @@ def test_signature_json_roundtrip_is_immutable(slots):
         grad_enabled=True,
         grad_modes=[True],
         slot_shapes=slots,
+        memory_placement=placements,
     )
     old = dict(values)
     for name in ("topology", "planner_coefficients", "request_mix", "grad_modes"):
@@ -513,6 +617,7 @@ def test_signature_json_roundtrip_is_immutable(slots):
     assert key.slot_shapes == tuple(
         (enabled, tuple(map(tuple, shapes))) for enabled, shapes in slots
     )
+    assert key.memory_placement == tuple(map(tuple, placements))
 
 
 @pytest.mark.parametrize(
