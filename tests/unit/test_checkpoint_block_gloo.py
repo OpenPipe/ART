@@ -261,10 +261,12 @@ def _worker(rank, root):
                             error, RuntimeError
                         ) and "Another rank failed" in str(error)
                     if case in ("read-close", "cancel-close"):
+                        # Failed bodies unwind locally: only the rank whose
+                        # reader also failed can attach that secondary detail.
                         assert any(
                             "snapshot close also failed" in note.lower()
-                            for note in error.__notes__
-                        )
+                            for note in getattr(error, "__notes__", ())
+                        ) == (rank == 1)
                     assert not prepared.destination.exists()
                 assert not handles
                 assert (

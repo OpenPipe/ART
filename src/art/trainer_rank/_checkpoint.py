@@ -1174,12 +1174,12 @@ def _snapshot_block(group: dist.ProcessGroup | None) -> Iterator[_SnapshotBlock]
             opened.close()
         except BaseException as exc:
             error = exc
-        try:
+        if primary is None:
             raise_distributed(error, "close checkpoint snapshot block", group)
-        except BaseException as exc:
-            if primary is None:
-                raise
-            primary.add_note(f"Checkpoint snapshot close also failed: {exc!r}")
+        elif error is not None:
+            # A peer may still be in the block body (including point-to-point
+            # I/O). Do not start a new collective before local abort cleanup.
+            primary.add_note(f"Checkpoint snapshot close also failed: {error!r}")
 
 
 def _read_snapshot(
