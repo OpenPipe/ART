@@ -1,13 +1,14 @@
 import asyncio
 from collections import defaultdict
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import replace
 import json
 import random
+from typing import LiteralString
 
 import pytest
 
-from art.token_prefix import (
+from art_inference.token_prefix import (
     COMPACT_PREFIX_VERSION,
     CompactPrefixStore,
     PrefixEdit,
@@ -226,6 +227,75 @@ def test_compact_payload_rejects_invalid_token_and_edit_bounds() -> None:
         pass
     else:
         raise AssertionError("accepted an unreachable rendered length")
+
+
+@pytest.mark.parametrize("field", ["rendered_digest", "raw_digest"])
+@pytest.mark.parametrize(
+    "digest", ["0123456789abcdef" * 4, "0123456789ABCDEF" * 4, "0123456789aBcDeF" * 4]
+)
+def test_compact_payload_normalizes_ascii_hex_digests(field: str, digest: str) -> None:
+    candidate = compact_prefix_candidate([1, 2, 3], [8, 9, 3])
+    payload = compact_candidate_payload(candidate) | {field: digest}
+
+    assert compact_candidate_from_payload(payload) == replace(
+        candidate, **{field: digest.lower()}
+    )
+
+
+@pytest.mark.parametrize("field", ["rendered_digest", "raw_digest"])
+@pytest.mark.parametrize(
+    "digest",
+    [
+        "",
+        "a" * 63,
+        "a" * 65,
+        "a" * 64 + "\n",
+        *[
+            character + "a" * 63
+            for character in ("g", "Ｇ", "ａ", "١", "é", "\n", "\0", "\ud800")
+        ],
+        None,
+        True,
+        0,
+        b"a" * 64,
+        [],
+        {},
+    ],
+)
+def test_compact_payload_rejects_invalid_digests(field: str, digest: object) -> None:
+    payload = compact_candidate_payload(compact_prefix_candidate([1, 2], [3, 2]))
+
+    with pytest.raises(ValueError, match="^invalid token-prefix candidate$"):
+        compact_candidate_from_payload(payload | {field: digest})
+
+
+@pytest.mark.parametrize("field", ["rendered_digest", "raw_digest"])
+def test_compact_payload_preserves_digest_subclass_validation(field: str) -> None:
+    class ValidLength(str):
+        def __len__(self) -> int:
+            return 64
+
+    class InvalidLength(str):
+        def __len__(self) -> int:
+            return 63
+
+    class ValidCharacters(str):
+        def __iter__(self) -> Iterator[LiteralString]:
+            return iter(("A",) * 64)
+
+    class InvalidCharacters(str):
+        def __iter__(self) -> Iterator[LiteralString]:
+            return iter(("g",))
+
+    candidate = compact_prefix_candidate([1, 2], [3, 2])
+    payload = compact_candidate_payload(candidate)
+    for digest in (ValidLength("A" * 63), ValidCharacters("g" * 64)):
+        assert compact_candidate_from_payload(payload | {field: digest}) == replace(
+            candidate, **{field: digest.lower()}
+        )
+    for digest in (InvalidLength("A" * 64), InvalidCharacters("A" * 64)):
+        with pytest.raises(ValueError, match="^invalid token-prefix candidate$"):
+            compact_candidate_from_payload(payload | {field: digest})
 
 
 def test_compact_prefix_hashes_requested_lengths_consistently() -> None:

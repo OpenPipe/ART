@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 def _default_limits() -> httpx.Limits:
     return httpx.Limits(
-        max_connections=100_000,
+        max_connections=None,
         max_keepalive_connections=100_000,
         keepalive_expiry=60.0,
     )

@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from .tensors import (
         TensorizedHistory,
         TensorizedMultiHistoryTrajectory,
+        TensorizedTopK,
         TensorizedTrajectory,
         TensorizedTrajectoryGroup,
     )
@@ -168,6 +169,9 @@ class TokenFlag(IntFlag):
     STOP = 1 << 3
     # Best-effort provenance that the token came from a concrete response.
     OUTPUT = 1 << 4
+    # Explicit server provenance for sampled/top-k logprobs. Neither means unknown.
+    RAW_LOGPROBS = 1 << 5
+    PROCESSED_LOGPROBS = 1 << 6
 
 
 class ChatCompletionsRequest(TypedDict, total=False, extra_items=Any):
@@ -1164,6 +1168,27 @@ class TrajectoryGroup(_CompactModel):
         ).tensorize(device=device)
 
 
+class TokenizedTopK(_StringInterningModel):
+    """Parallel [token positions, k] arrays, matching TrainerRank's TopK layout.
+
+    Rows align with scored tokens; TrainerRank forward rows predict the next
+    token instead. Missing entries use token ID -1 and a NaN logprob.
+    """
+
+    model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
+    tokens: list[list[pydantic.StrictInt]]
+    logprobs: list[list[float]]
+
+    @pydantic.model_validator(mode="after")
+    def validate_shape(self) -> Self:
+        if len(self.tokens) != len(self.logprobs):
+            raise ValueError("top_k fields differ in length")
+        widths = {len(row) for row in self.tokens + self.logprobs}
+        if len(widths) > 1 or any(token < -1 for row in self.tokens for token in row):
+            raise ValueError("top_k requires rectangular arrays and token IDs >= -1")
+        return self
+
+
 class TokenizedHistory(_StringInterningModel):
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
 
@@ -1172,6 +1197,13 @@ class TokenizedHistory(_StringInterningModel):
     tokens: list[int]
     logprobs: list[float]
     flags: list[TokenFlag]
+    routed_experts: list[list[list[pydantic.StrictInt]]] | None = pydantic.Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    """Expert IDs [tokens, layers, top-k]; -1 denotes unavailable routing."""
+    top_k: TokenizedTopK | None = pydantic.Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
     @pydantic.field_serializer("history")
     def serialize_source_history(
@@ -1188,6 +1220,12 @@ class TokenizedHistory(_StringInterningModel):
     def validate_tokenwise_lengths(self) -> TokenizedHistory:
         if not (len(self.tokens) == len(self.logprobs) == len(self.flags)):
             raise ValueError("Tokenized history fields differ in length")
+        if self.top_k is not None and len(self.top_k.tokens) != len(self.tokens):
+            raise ValueError("Tokenized top_k differs in length from tokens")
+        if self.routed_experts is not None:
+            from ._routed_experts import validate_routes
+
+            validate_routes(self.routed_experts, len(self.tokens))
         needs_output = False
         for flag in self.flags:
             if not flag & TokenFlag.SAMPLED:
@@ -1459,6 +1497,40 @@ def compact_validate[T](
     from ._compact import validate
 
     return validate(payload, type=type, device=device)
+
+
+@overload
+def compact_validate_json[T](
+    payload: str | bytes | bytearray | memoryview,
+    *,
+    type: TypeForm[T],
+    device: torch.device | str | None = None,
+) -> T: ...
+
+
+@overload
+def compact_validate_json(
+    payload: str | bytes | bytearray | memoryview,
+    *,
+    type: None = None,
+    device: torch.device | str | None = None,
+) -> _CompactValidated: ...
+
+
+def compact_validate_json[T](
+    payload: str | bytes | bytearray | memoryview,
+    *,
+    type: TypeForm[T] | None = None,
+    device: torch.device | str | None = None,
+) -> T | _CompactValidated:
+    """Validate compact JSON without copying its privately parsed containers.
+
+    Uses orjson's JSON syntax and numeric behavior. NaN/Infinity literals are
+    rejected; use compact_validate() for Python payloads containing those values.
+    """
+    from ._compact import validate_json
+
+    return validate_json(payload, type=type, device=device)
 
 
 @overload
@@ -1853,6 +1925,7 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
 _TENSOR_EXPORTS = frozenset(
     {
         "TensorizedHistory",
+        "TensorizedTopK",
         "TensorizedMultiHistoryTrajectory",
         "TensorizedTrajectory",
         "TensorizedTrajectoryGroup",
@@ -1912,9 +1985,11 @@ __all__ = [
     "TrajectoryGroup",
     "TokenizedTrajectory",
     "TokenizedHistory",
+    "TokenizedTopK",
     "TokenizedMultiHistoryTrajectory",
     "TokenizedTrajectoryGroup",
     "TensorizedHistory",
+    "TensorizedTopK",
     "TensorizedMultiHistoryTrajectory",
     "TensorizedTrajectory",
     "TensorizedTrajectoryGroup",
@@ -1927,6 +2002,7 @@ __all__ = [
     "compact_memory",
     "compact_dump",
     "compact_validate",
+    "compact_validate_json",
     "current_trajectory",
     "no_capture",
     "trajectory",

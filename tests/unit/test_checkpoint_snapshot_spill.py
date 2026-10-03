@@ -441,3 +441,42 @@ def test_noncontiguous_cpu_packing_is_owned_by_writer(tmp_path, monkeypatch, fai
     assert threads == [worker]
     assert raw() is None and all(ref() is None for ref in packed)
     assert isinstance(result.exception(), OSError) if fails else result.result() is None
+
+
+def test_failed_expansion_releases_physical_snapshot_and_drains_next(
+    tmp_path, monkeypatch
+):
+    import gc
+
+    value = torch.ones(8)
+    captured = cp._LoraSnapshot(
+        "p", "lora_A.weight", None, 0, {}, {"lora": value}, None
+    )
+    value_ref, snapshot_ref = weakref.ref(value), weakref.ref(captured)
+    error = RuntimeError("expert expansion failed")
+
+    def fail(captured, files):
+        assert captured[0].tensors["lora"] is value_ref()
+        raise error
+
+    monkeypatch.setattr(cp, "_expand_local_state", fail)
+    spill = cp._SnapshotSpill()
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        result = spill.submit(tmp_path / "failed", {}, (captured,))
+        del value, captured
+        worker = spill.thread
+        if worker is not None:
+            worker.join(3)
+            assert not worker.is_alive()
+        assert result.exception(3) is error
+        assert error.__traceback__ is not None
+        assert value_ref() is None and snapshot_ref() is None
+        spill.submit(tmp_path / "next", {"v.safetensors": {"v": torch.ones(1)}}).result(
+            3
+        )
+        assert (tmp_path / "next/v.safetensors").is_file()
+    finally:
+        if enabled:
+            gc.enable()

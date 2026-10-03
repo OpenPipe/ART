@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import math
 import os
 import time
 from typing import Any, cast, overload
@@ -20,7 +21,7 @@ from .client import Scenario, TauBenchClient, _get_default_client, _sharded_tran
 openai_clients: dict[tuple[str, str], AsyncOpenAI] = {}
 CONTEXT_TOKEN_LIMIT = 32_768
 DEFAULT_MAX_COMPLETION_TOKENS = 4096
-_POLICY_CONNECTION_LIMIT = 100_000
+_POLICY_KEEPALIVE_LIMIT = 100_000
 _POLICY_CONNECT_RETRIES = 2
 _POLICY_MAX_RETRIES = 1
 _POLICY_HTTP_TIMEOUT = httpx.Timeout(connect=10, read=10 * 60, write=30, pool=30)
@@ -34,6 +35,7 @@ async def rollout(
     /,
     *,
     client: TauBenchClient | None = None,
+    environment_idle_timeout_seconds: float | None = None,
     max_turns: int | None = None,
     chat_completion_kwargs: dict[str, Any] | None = None,
     user_model_name: str = "gpt-4.1-2025-04-14",
@@ -53,6 +55,7 @@ async def rollout(
     /,
     *,
     client: TauBenchClient | None = None,
+    environment_idle_timeout_seconds: float | None = None,
     base_model: str | None = None,
     max_turns: int | None = None,
     chat_completion_kwargs: dict[str, Any] | None = None,
@@ -72,6 +75,7 @@ async def rollout(
     /,
     *,
     client: TauBenchClient | None = None,
+    environment_idle_timeout_seconds: float | None = None,
     base_model: str | None = None,
     max_turns: int | None = None,
     chat_completion_kwargs: dict[str, Any] | None = None,
@@ -81,6 +85,17 @@ async def rollout(
     retrieval_config: str | None = None,
     retrieval_config_kwargs: dict[str, Any] | None = None,
 ) -> Trajectory:
+    """Run a scenario, optionally overriding the server environment's idle timeout.
+
+    Callers overriding the timeout must separately bound their rollout lifetime.
+    """
+    if environment_idle_timeout_seconds is not None and (
+        not math.isfinite(environment_idle_timeout_seconds)
+        or environment_idle_timeout_seconds < 1
+    ):
+        raise ValueError(
+            "Environment idle timeout must be finite and at least one second"
+        )
     started = time.perf_counter()
     client = _get_default_client(client)
     task_id = scenario.task.id
@@ -96,7 +111,9 @@ async def rollout(
         retrieval_config=retrieval_config,
         retrieval_config_kwargs=retrieval_config_kwargs,
         idle_timeout_seconds=(
-            _STRING_POLICY_ENV_IDLE_TIMEOUT_SECONDS
+            environment_idle_timeout_seconds
+            if environment_idle_timeout_seconds is not None
+            else _STRING_POLICY_ENV_IDLE_TIMEOUT_SECONDS
             if isinstance(base_url_or_model, str)
             and (
                 chat_completion_kwargs is None
@@ -266,8 +283,8 @@ def _completion_client_and_model(
                 transport=_sharded_transport(
                     retries=_POLICY_CONNECT_RETRIES,
                     limits=httpx.Limits(
-                        max_connections=_POLICY_CONNECTION_LIMIT,
-                        max_keepalive_connections=_POLICY_CONNECTION_LIMIT,
+                        max_connections=None,
+                        max_keepalive_connections=_POLICY_KEEPALIVE_LIMIT,
                     ),
                 ),
             ),
