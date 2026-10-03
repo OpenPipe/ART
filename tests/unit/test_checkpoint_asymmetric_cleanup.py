@@ -158,6 +158,7 @@ def _worker(rank, root, scope, close_fails):
             return self.inner.get_tensor(key)
 
     def receipt(**extra):
+        assert failed_at is not None
         path = root / "rank1-cleaned.json"
         temporary = path.with_suffix(".tmp")
         temporary.write_text(
