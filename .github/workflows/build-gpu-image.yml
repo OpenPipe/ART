@@ -246,12 +246,15 @@ jobs:
           }
           cleanup() {
             cleanup_status=0
-            mkdir -p "${GPU_IMAGE_CLEANUP_ROOT}"
+            receipt_status=0
+            cleanup_log="${GPU_IMAGE_CLEANUP_ROOT}/smoke-down.log"
+            mkdir -p "${GPU_IMAGE_CLEANUP_ROOT}" || { receipt_status=$?; cleanup_log=/dev/stderr; }
             timeout --signal=TERM --kill-after=5s 60s "${sky_cmd[@]}" down -y "${cluster}" \
-              > "${GPU_IMAGE_CLEANUP_ROOT}/smoke-down.log" 2>&1 || cleanup_status=$?
+              > "${cleanup_log}" 2>&1 || cleanup_status=$?
             printf '{"cluster":"%s","operation":"sky_down","returncode":%s}\n' \
-              "${cluster}" "${cleanup_status}" > "${GPU_IMAGE_CLEANUP_ROOT}/smoke-down.json"
-            return "${cleanup_status}"
+              "${cluster}" "${cleanup_status}" > "${GPU_IMAGE_CLEANUP_ROOT}/smoke-down.json" || receipt_status=$?
+            if [ "${cleanup_status}" -ne 0 ]; then return "${cleanup_status}"; fi
+            return "${receipt_status}"
           }
           finish() {
             status=$?

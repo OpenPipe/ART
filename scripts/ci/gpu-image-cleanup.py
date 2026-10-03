@@ -98,6 +98,7 @@ def cleanup(context, namespace, selector, kinds, receipt, seconds=60):
                 for item in items:
                     metadata = item["metadata"]
                     name, uid = metadata["name"], metadata["uid"]
+                    resource_version = metadata.get("resourceVersion")
                     if (
                         metadata.get("namespace") != namespace
                         or item.get("kind", "").lower() != kind
@@ -107,9 +108,13 @@ def cleanup(context, namespace, selector, kinds, receipt, seconds=60):
                         )
                         or not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", name)
                         or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", uid)
+                        or not isinstance(resource_version, str)
+                        or not resource_version
                     ):
                         raise ValueError("Kubernetes returned an unowned resource")
-                    identity = dict(kind=kind, name=name, uid=uid)
+                    identity = dict(
+                        kind=kind, name=name, uid=uid, resourceVersion=resource_version
+                    )
                     found.append(identity)
                     if identity not in observed:
                         observed.append(identity)
@@ -125,7 +130,9 @@ def cleanup(context, namespace, selector, kinds, receipt, seconds=60):
                     body=dict(
                         apiVersion="v1",
                         kind="DeleteOptions",
-                        preconditions=dict(uid=item["uid"]),
+                        preconditions=dict(
+                            uid=item["uid"], resourceVersion=item["resourceVersion"]
+                        ),
                     ),
                 )
             time.sleep(min(0.2, max(0, deadline - time.monotonic())))

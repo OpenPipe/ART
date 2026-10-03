@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 import yaml
@@ -25,6 +26,7 @@ def resource(kind="Pod", uid="owned-uid", **metadata):
             "namespace": "default",
             "name": "owned",
             "uid": uid,
+            "resourceVersion": "1",
             "labels": {LABEL: "123-1"},
             **metadata,
         },
@@ -33,7 +35,11 @@ def resource(kind="Pod", uid="owned-uid", **metadata):
 
 @pytest.fixture
 def api(monkeypatch):
-    state = {"pod": [resource()], "service": [resource("Service")], "events": []}
+    state: dict[str, Any] = {
+        "pod": [resource()],
+        "service": [resource("Service")],
+        "events": [],
+    }
     elapsed = 0
     clock = cleanup.time.monotonic
 
@@ -82,7 +88,7 @@ def api(monkeypatch):
         else:
             assert args[:2] == ["delete", "--raw"]
             body = json.loads(Path(args[4]).read_text())
-            assert body["preconditions"] == {"uid": "owned-uid"}
+            assert body["preconditions"]["uid"] == "owned-uid"
             namespace = state.get("namespace", "default")
             assert args[2] in (
                 f"/api/v1/namespaces/{namespace}/pods/owned",
@@ -101,8 +107,29 @@ def api(monkeypatch):
                 for kind in ("pod", "service"):
                     state[kind] = []
                 raise subprocess.CalledProcessError(1, argv)
+            kind = "pod" if "/pods/" in args[2] else "service"
+            metadata = state[kind][0]["metadata"]
+            race = state.get("race")
+            if race and (not state.get("races") or race == "continuous_update"):
+                metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
+                state["races"] = state.get("races", 0) + 1
+                if race == "relabel":
+                    metadata["labels"] = {LABEL: "peer"}
+                    state["peer"] = state[kind][0]
+            if (
+                "resourceVersion" in body["preconditions"]
+                and body["preconditions"]["resourceVersion"]
+                != metadata["resourceVersion"]
+            ):
+                state["conflicts"] = state.get("conflicts", 0) + 1
+                if race == "relabel":
+                    state[kind] = []  # The next selector census excludes the peer.
+                output.write_text("Error from server (Conflict)")
+                raise subprocess.CalledProcessError(1, argv)
+            if race == "relabel":
+                state["peer_deleted"] = True
             if not state.get("finalizer"):
-                state["pod" if "/pods/" in args[2] else "service"] = []
+                state[kind] = []
 
     monkeypatch.setattr(cleanup.gpu_ci, "run_child", command)
     return state
@@ -125,13 +152,43 @@ def test_uid_cleanup_observes_absence_and_retains_only_metadata(api, tmp_path):
     assert receipt["creator_quiescence"] == "UNKNOWN"
     assert {item["kind"] for item in receipt["observed"]} == {"pod", "service"}
     assert json.loads((tmp_path / "receipt.json").read_text()) == receipt
-    assert all(set(item) == {"kind", "name", "uid"} for item in receipt["observed"])
+    assert all(
+        set(item) == {"kind", "name", "uid", "resourceVersion"}
+        for item in receipt["observed"]
+    )
 
 
 def test_uid_replacement_conflict_preserves_peer(api, tmp_path):
     api["replacement"] = True
     assert exercise(tmp_path)["outcome"] == "ABSENT"
     assert api["replacement_preserved"]
+
+
+def test_same_uid_relabel_after_census_preserves_peer(api, tmp_path):
+    api["race"] = "relabel"
+    api["service"] = []
+    assert exercise(tmp_path)["outcome"] == "ABSENT"
+    assert not api.get("peer_deleted"), "UID-only deletion removed the relabelled peer"
+    assert api["peer"]["metadata"]["uid"] == "owned-uid"
+    assert api["peer"]["metadata"]["labels"] == {LABEL: "peer"}
+    assert api["conflicts"] == 1
+
+
+def test_owned_version_update_recensuses_before_delete(api, tmp_path):
+    api["race"] = "owned_update"
+    api["service"] = []
+    result = exercise(tmp_path)
+    assert result["outcome"] == "ABSENT" and api["conflicts"] == 1
+    assert [item["resourceVersion"] for item in result["observed"]] == ["1", "2"]
+
+
+def test_continuous_version_conflicts_exhaust_budget_as_unknown(api, tmp_path):
+    api["race"] = "continuous_update"
+    api["service"] = []
+    with pytest.raises(TimeoutError):
+        exercise(tmp_path)
+    assert api["conflicts"] > 1
+    assert json.loads((tmp_path / "receipt.json").read_text())["outcome"] == "UNKNOWN"
 
 
 def test_smoke_census_uses_the_effective_context_namespace(api, tmp_path):
@@ -181,6 +238,9 @@ def test_unproved_cleanup_is_unknown_and_fails(api, tmp_path, fault):
         resource(namespace="peer"),
         resource(labels={LABEL: "peer"}),
         resource(uid=""),
+        resource(resourceVersion=""),
+        resource(resourceVersion=None),
+        resource(resourceVersion=1),
         resource(name="../peer"),
         resource("Secret"),
     ],
@@ -191,6 +251,14 @@ def test_foreign_identity_never_reaches_delete(api, tmp_path, item):
         exercise(tmp_path)
     assert all(event[0] != "delete" for event in api["events"])
     assert json.loads((tmp_path / "receipt.json").read_text())["outcome"] == "UNKNOWN"
+
+
+def test_resource_version_is_opaque(api, tmp_path):
+    api["pod"] = [resource(resourceVersion="opaque:version")]
+    api["service"] = []
+    result = exercise(tmp_path)
+    assert result["outcome"] == "ABSENT"
+    assert result["observed"][0]["resourceVersion"] == "opaque:version"
 
 
 def test_workflow_cleanup_is_always_bounded_and_uploaded():
@@ -268,10 +336,20 @@ def test_smoke_metadata_reaches_pods_and_services_offline(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "work,down,expected", [(0, 0, 0), (0, 7, 7), (23, 0, 23), (23, 7, 23)]
+    "work,down,fault,expected",
+    [
+        (0, 0, None, 0),
+        (0, 7, None, 7),
+        (23, 0, None, 23),
+        (23, 7, None, 23),
+        (0, 0, "receipt", 1),
+        (23, 0, "receipt", 23),
+        (0, 0, "mkdir", 37),
+        (23, 0, "mkdir", 23),
+    ],
 )
 def test_actual_smoke_trap_records_cleanup_and_preserves_work_failure(
-    tmp_path, work, down, expected
+    tmp_path, work, down, fault, expected
 ):
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/build-gpu-image.yml").read_text()
@@ -283,22 +361,31 @@ def test_actual_smoke_trap_records_cleanup_and_preserves_work_failure(
     ]
     sky = tmp_path / "offline-sky"
     sky.write_text(
-        f"#!{sys.executable}\nimport sys\nassert sys.argv[1:3] == ['down', '-y']\nsys.exit({down})\n"
+        f"#!{sys.executable}\nimport pathlib, sys\nassert sys.argv[1:3] == ['down', '-y']\n"
+        f"pathlib.Path({str(tmp_path / 'down-attempted')!r}).touch()\nsys.exit({down})\n"
     )
     sky.chmod(0o700)
+    receipts = tmp_path / "receipts"
+    receipts.mkdir()
+    if fault == "receipt":
+        (receipts / "smoke-down.json").mkdir()
     script = tmp_path / "smoke.sh"
     script.write_text(
         f'set -euo pipefail\nsky_cmd=("{sky}")\ncluster=art-gpu-smoke-123-1\n'
-        "dump_diagnostics() { :; }\n" + trap + f"\nexit {work}\n"
+        "dump_diagnostics() { :; }\n"
+        + ("mkdir() { return 37; }\n" if fault == "mkdir" else "")
+        + trap
+        + f"\nexit {work}\n"
     )
     result = subprocess.run(
         ["bash", str(script)],
-        env={**os.environ, "GPU_IMAGE_CLEANUP_ROOT": str(tmp_path / "receipts")},
+        env={**os.environ, "GPU_IMAGE_CLEANUP_ROOT": str(receipts)},
         capture_output=True,
         timeout=10,
     )
     assert result.returncode == expected, result.stderr
-    assert (
-        json.loads((tmp_path / "receipts/smoke-down.json").read_text())["returncode"]
-        == down
-    )
+    assert (tmp_path / "down-attempted").exists()
+    if fault is None:
+        assert (
+            json.loads((receipts / "smoke-down.json").read_text())["returncode"] == down
+        )
