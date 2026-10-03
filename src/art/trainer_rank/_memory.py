@@ -1058,14 +1058,20 @@ def _te_workspace_growth_bytes(self: TrainerRank) -> int:
     """Transformer Engine's cuBLAS workspaces, until its GEMMs allocate them.
 
     The first plain and grouped GEMMs allocate them during a call, and TE
-    keeps them for the process; later calls see them as used memory.
+    keeps them for the process; later calls see them as used memory. A
+    covered dense model (``_dense_mlp_widths``) runs no grouped GEMM, so
+    its plain workspace alone marks the process warm. Its process-cold call
+    allocates only that one, but about 130 MB of other first-use buffers
+    beside it (Qwen3.8-27B CP2: 164 MB in all), which the full allowance
+    covers.
     """
     try:
         from transformer_engine.pytorch.cpp_extensions import gemm
     except ImportError:
         return _impl._TE_CUBLAS_WORKSPACE_BYTES
     info = getattr(gemm.get_cublas_workspace, "cache_info", None)
-    if callable(info) and info().currsize >= 2:
+    dense = getattr(self, "_dense_recompute_bytes_per_token", 0)
+    if callable(info) and info().currsize >= (1 if dense else 2):
         return 0
     return _impl._TE_CUBLAS_WORKSPACE_BYTES
 

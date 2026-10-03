@@ -19,6 +19,7 @@ from art.trainer_rank._impl import (
     _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD,
 )
 from art.trainer_rank._impl import (
+    _TE_CUBLAS_WORKSPACE_BYTES,
     Unset,
     _dense_mlp_recompute_bytes_per_token,
     _GroupLayout,
@@ -568,6 +569,27 @@ def test_no_grad_only_waves_charge_te_workspace_growth():
     _, plain = _at_cp2(_dense_rank(0, 0))._checkpoint_memory_floor(((500, False),))
     assert dense == 500 * NO_GRAD + r._te_workspace_growth_bytes()
     assert plain == 500 * 4 * HIDDEN * 2
+
+
+def test_a_covered_dense_process_is_warm_once_its_plain_workspace_exists(
+    monkeypatch,
+):
+    gemm = pytest.importorskip("transformer_engine.pytorch.cpp_extensions.gemm")
+    entries = [0]
+
+    class Cached:
+        def cache_info(self):
+            return SimpleNamespace(currsize=entries[0])
+
+    monkeypatch.setattr(gemm, "get_cublas_workspace", Cached())
+    dense, moe = _at_cp2(_dense_rank()), rank()
+    assert dense._te_workspace_growth_bytes() == moe._te_workspace_growth_bytes()
+    assert dense._te_workspace_growth_bytes() == _TE_CUBLAS_WORKSPACE_BYTES
+    # A dense model runs no grouped GEMM: its plain workspace makes it warm.
+    entries[0] = 1
+    assert dense._te_workspace_growth_bytes() == 0
+    assert moe._te_workspace_growth_bytes() == _TE_CUBLAS_WORKSPACE_BYTES
+    assert dense._checkpoint_memory_floor(((500, False),))[1] == 500 * NO_GRAD
 
 
 def test_the_traced_qwen_attention_mixer_is_accepted():
