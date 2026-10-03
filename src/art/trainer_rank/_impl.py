@@ -2002,7 +2002,10 @@ def _dense_mlp_recompute_bytes_per_token(
                 type(mixer) is GatedDeltaNet
                 and (
                     vars(mixer).get("act_fn") is not torch.nn.functional.silu
-                    or not isinstance(getattr(mixer, "in_proj", None), torch.nn.Module)
+                    or not all(
+                        isinstance(getattr(mixer, name, None), torch.nn.Module)
+                        for name in ("in_proj", "out_norm", "out_proj")
+                    )
                 )
             )
             or type(mixer) not in mixers

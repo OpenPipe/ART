@@ -63,6 +63,7 @@ def _dense_layer(gdn: bool = False) -> Any:
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.transformer_layer import TransformerLayer
+    from transformer_engine.pytorch import RMSNorm
 
     from art.megatron import lora as lora_module
 
@@ -108,6 +109,8 @@ def _dense_layer(gdn: bool = False) -> Any:
     if gdn:
         layer.self_attention.act_fn = torch.nn.functional.silu
         layer.self_attention.in_proj = _module(TELayerNormColumnParallelLinear)
+        layer.self_attention.out_norm = _module(RMSNorm)
+        layer.self_attention.out_proj = _module(TERowParallelLinear)
     layer.mlp = mlp
     # The stock spec's bias-dropout-add factories, grad context and cross
     # attention.
@@ -245,6 +248,8 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "function_cross_attention",
         "gdn_activation",
         "function_in_proj",
+        "function_out_norm",
+        "function_out_proj",
         "backward_hook",
         "backward_pre_hook",
         "global_forward_hook",
@@ -434,10 +439,16 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         "gdn_activation": lambda: setattr(
             gdn_layer.self_attention, "act_fn", torch.nn.functional.gelu
         ),
-        "function_in_proj": lambda: (
-            delattr(gdn_layer.self_attention, "in_proj"),
-            setattr(gdn_layer.self_attention, "in_proj", lambda *a: None),
-        ),
+        **{
+            f"function_{name}": functools.partial(
+                lambda name: (
+                    delattr(gdn_layer.self_attention, name),
+                    setattr(gdn_layer.self_attention, name, lambda *a: None),
+                ),
+                name,
+            )
+            for name in ("in_proj", "out_norm", "out_proj")
+        },
         "backward_hook": lambda: mlp.linear_fc1.register_full_backward_hook(
             lambda *a: None
         ),
