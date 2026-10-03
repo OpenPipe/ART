@@ -3,12 +3,14 @@ from __future__ import annotations
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from art.megatron.context_parallel.types import ParallelTopology
 from art.preprocessing.pack import PackedTensors
+
+if TYPE_CHECKING:
+    from art.megatron.context_parallel.types import ParallelTopology
 
 ROOT_OUTPUT_TOKEN_UIDS_ATTR = "_art_root_output_token_uids"
 TRACE_ROW_TOKEN_UIDS_ATTR = "_art_trace_row_token_uids"

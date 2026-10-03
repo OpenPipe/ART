@@ -1884,6 +1884,9 @@ def _estimate_group_request_output_bytes(
 ) -> int:
     total = 0
     for request in requests:
+        if request.routed_experts is not None:
+            # Retained int64 replay targets for attention and GDN layouts.
+            total += 2 * request.routed_experts.numel() * 8
         seq_len = int(request.input_tokens.numel())
         if request.target_tokens is not None:
             total += int(request.target_tokens.numel()) * _impl._dtype_size(

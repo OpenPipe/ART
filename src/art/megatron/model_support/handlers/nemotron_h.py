@@ -534,6 +534,9 @@ class NemotronHHandler(DefaultMoeHandler):
     key = "nemotron_h_moe"
     has_recurrent_layers = True
     native_vllm_lora_status = "validated"
+    # Nemotron-3-Nano ships its modeling code with the checkpoint, and the
+    # identity LoRA layer names depend on that implementation.
+    trust_remote_code = True
 
     def identity_lora_model_config(self, base_config: Any) -> Any:
         model_config = copy(base_config)

@@ -5,8 +5,10 @@ from typing import Any, cast
 
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
+from openai.types.completion_choice import CompletionChoice
 
 COMPLETION_LOGPROBS_KEY = "art_completion_logprobs"
+COMPLETION_LOGPROBS_KEYS = ("compact_logprobs", COMPLETION_LOGPROBS_KEY)
 
 
 def _ids(value: Any, field: str) -> list[int]:
@@ -28,10 +30,47 @@ def _logprobs(values: Any, tokens: Any) -> list[float] | None:
     return [float(x) for x in values]
 
 
-def choice_completion_logprobs(choice: Choice) -> list[float] | None:
+def choice_completion_logprobs(choice: Choice | CompletionChoice) -> list[float] | None:
     """Return ART's exact sampled logprobs, when the provider supplied them."""
     extra = choice.model_extra or {}
-    return _logprobs(extra.get(COMPLETION_LOGPROBS_KEY), extra.get("token_ids"))
+    values = [
+        _logprobs(extra[key], extra.get("token_ids"))
+        for key in COMPLETION_LOGPROBS_KEYS
+        if key in extra
+    ]
+    if len(values) == 2 and values[0] != values[1]:
+        raise ValueError("Compact completion logprob fields disagree")
+    return values[0] if values else None
+
+
+def has_completion_logprobs(choice: Choice | CompletionChoice) -> bool:
+    return any(key in (choice.model_extra or {}) for key in COMPLETION_LOGPROBS_KEYS)
+
+
+def compact_prompt_logprobs(extra: dict[str, Any], tokens: Any) -> list[float] | None:
+    """Decode unavailable (null) and impossible (\"-inf\") prompt scores."""
+    values = extra.get("compact_prompt_logprobs")
+    if values is None:
+        return None
+    if (
+        not isinstance(values, list)
+        or not isinstance(tokens, list)
+        or len(values) != len(tokens)
+    ):
+        raise ValueError("compact_prompt_logprobs must match prompt token IDs")
+    result = []
+    for value in values:
+        if value is None:
+            result.append(math.nan)
+        elif value == "-inf":
+            result.append(-math.inf)
+        elif type(value) in (float, int) and math.isfinite(value):
+            result.append(float(value))
+        else:
+            raise ValueError(
+                "compact_prompt_logprobs requires finite numbers, null, or '-inf'"
+            )
+    return result
 
 
 def attach_dynamo_token_metadata(response: ChatCompletion) -> None:

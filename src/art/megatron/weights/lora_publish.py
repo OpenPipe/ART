@@ -110,7 +110,8 @@ def collect_local_lora_entries(
             continue
         for key, value in module.sharded_lora_state_dict(slot_ref).items():
             target_dtype = adapter_dtypes[key] if key in adapter_dtypes else value.dtype
-            local_tensors[key] = value.to(target_dtype).contiguous()
+            # Capture and transport own packing; keep live transposed views here.
+            local_tensors[key] = value.to(target_dtype)
         local_manifest.update(module.sharded_lora_manifest(slot_ref))
 
     if set(local_tensors) != set(local_manifest):
