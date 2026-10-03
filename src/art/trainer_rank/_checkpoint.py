@@ -1198,7 +1198,7 @@ def _read_snapshot(
             payload = snapshot.opened.enter_context(
                 safe_open(prepared.snapshot / relative, framework="pt", device="cpu")
             )
-            names = payload.offset_keys()
+            names = (getattr(payload, "offset_keys", None) or payload.keys)()
             snapshot.payloads[relative] = payload, names, set(names)
         payload, names, available = snapshot.payloads[relative]
         if keys is None:
