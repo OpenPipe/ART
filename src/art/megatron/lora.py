@@ -1443,7 +1443,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         super().__init__()
         self.provider = provider
         linear_qkv.return_layernorm_output = True
-        linear_qkv.return_layernorm_output_gathered = True
+        linear_qkv.return_layernorm_output_gathered = linear_qkv.tp_size > 1
         self.linear_qkv = linear_qkv
         assert self.provider.kv_channels is not None
         assert self.provider.num_query_groups is not None
@@ -1762,7 +1762,7 @@ class ComponentwiseColumnParallelLinearLoRA(torch.nn.Module):
             )
         if isinstance(in_proj, TELayerNormColumnParallelLinear):
             in_proj.return_layernorm_output = True
-            in_proj.return_layernorm_output_gathered = True
+            in_proj.return_layernorm_output_gathered = in_proj.tp_size > 1
         self.in_proj = in_proj
         self.lora = _parallel_lora(
             adapter_model_prefix=adapter_model_prefix,
@@ -1942,7 +1942,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         super().__init__()
         if isinstance(linear_fc1, TELayerNormColumnParallelLinear):
             linear_fc1.return_layernorm_output = True
-            linear_fc1.return_layernorm_output_gathered = True
+            linear_fc1.return_layernorm_output_gathered = linear_fc1.tp_size > 1
         self.linear_fc1 = linear_fc1
         self.out_features = int(linear_fc1.weight.shape[0])
         self.non_gated = bool(non_gated)
