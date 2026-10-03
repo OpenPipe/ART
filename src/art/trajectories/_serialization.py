@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
 import math
-import threading
-from typing import Any, Literal, SupportsIndex, cast
+from typing import Any, Literal, cast
 
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
@@ -16,44 +14,82 @@ from pydantic.main import IncEx
 from ..openai import ART_MOE_ROUTING_METADATA_KEY
 
 type _StringPool = dict[str, str]
-_PICKLE_STATE = threading.local()
-
-
-@contextmanager
-def _without_pickle_string_interning():
-    previous = getattr(_PICKLE_STATE, "skip_string_interning", False)
-    _PICKLE_STATE.skip_string_interning = True
-    try:
-        yield
-    finally:
-        _PICKLE_STATE.skip_string_interning = previous
 
 
 class _StringInterningModel(BaseModel):
-    """Intern strings once, immediately before this graph is pickled."""
+    """Trajectory model without automatic string interning during pickle."""
 
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
-
-    # Process-local optimization state: omitting it from Pydantic private state keeps
-    # equality and serialization unchanged, and lets a receiving process prepare the
-    # graph again after local mutation.
-    __slots__ = ("_art_pickle_strings_interned",)
-
-    def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
-        if not getattr(_PICKLE_STATE, "skip_string_interning", False) and not getattr(
-            self, "_art_pickle_strings_interned", False
-        ):
-            _intern_strings(self)
-        return super().__reduce_ex__(protocol)
-
-    def _mark_pickle_strings_interned(self) -> None:
-        object.__setattr__(self, "_art_pickle_strings_interned", True)
 
 
 def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
     """Share equal strings inside supported model and built-in container graphs."""
 
-    _intern_value(value, {} if pool is None else pool, {})
+    # Discover hash-sensitive state before changing any alias, including aliases
+    # visited before a set member or dictionary key. Arbitrary hashes can depend
+    # on nested mutable state, so this fallback protects the whole input graph.
+    pending = [(value, False)]
+    seen: dict[tuple[int, bool], object] = {}
+    numeric_lists: dict[int, object] = {}
+    while pending:
+        item, hashed = pending.pop()
+        kind = type(item)
+        if (
+            item is None
+            or kind is str
+            or kind is bytes
+            or kind is bool
+            or kind is int
+            or kind is float
+            or kind is complex
+        ):
+            continue
+        if hashed and kind is not tuple and kind is not frozenset:
+            return
+        item_id = id(item)
+        visit = (item_id, hashed)
+        if visit in seen:
+            continue
+        seen[visit] = item
+        if isinstance(item, BaseModel):
+            if kind.__hash__ is not None:
+                return
+            pending.extend((child, False) for child in item.__dict__.values())
+            for extra in (item.__pydantic_extra__, item.__pydantic_private__):
+                if extra is not None:
+                    pending.append((extra, False))
+        elif isinstance(item, dict):
+            # Base methods read subclass storage without invoking user iterators.
+            pending.extend((key, True) for key in dict.keys(item))
+            pending.extend((child, False) for child in dict.values(item))
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            if kind is list and all(
+                child is None
+                or type(child) is bool
+                or type(child) is float
+                or type(child) is int
+                for child in item
+            ):
+                numeric_lists[item_id] = item
+            else:
+                base = next(
+                    cls
+                    for cls in (list, tuple, set, frozenset)
+                    if isinstance(item, cls)
+                )
+                child_hashed = hashed or base in (set, frozenset)
+                pending.extend(
+                    (child, child_hashed) for child in base.__iter__(cast(Any, item))
+                )
+        elif (
+            is_dataclass(item)
+            and type(kind.__module__) is str
+            and kind.__module__.startswith("art.trajectories")
+        ):
+            if kind.__hash__ is not None:
+                return
+            pending.extend((getattr(item, field.name), False) for field in fields(item))
+    _intern_value(value, {} if pool is None else pool, numeric_lists)
 
 
 def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> object:
@@ -63,12 +99,6 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         value, (bytes, bytearray, memoryview, bool, int, float, complex)
     ):
         return value
-    if isinstance(value, list) and all(
-        item is None or type(item) is bool or type(item) is float or type(item) is int
-        for item in value
-    ):
-        return value
-
     value_id = id(value)
     if value_id in memo:
         return memo[value_id]
@@ -81,37 +111,29 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         if extra is not None and id(extra) not in memo:
             memo[id(extra)] = extra
             _intern_mapping(cast(dict[object, object], extra), pool, memo)
-        if isinstance(value, _StringInterningModel):
-            value._mark_pickle_strings_interned()
         return value
-    if isinstance(value, dict):
+    if type(value) is dict:
         memo[value_id] = value
         _intern_mapping(cast(dict[object, object], value), pool, memo)
         return value
-    if isinstance(value, list):
+    if type(value) is list:
         memo[value_id] = value
         items = cast(list[object], value)
         for index, item in enumerate(items):
             items[index] = _intern_value(item, pool, memo)
         return value
-    if isinstance(value, tuple):
+    if type(value) is tuple or type(value) is frozenset or type(value) is set:
+        # Preserve immutable aliases and cycles, and set hash-table order. Rebuilding
+        # a set can also rehash opaque members after clearing the original contents.
         memo[value_id] = value
-        result = tuple(_intern_value(item, pool, memo) for item in value)
-        memo[value_id] = result
-        return result
-    if isinstance(value, set):
-        memo[value_id] = value
-        values = cast(set[object], value)
-        items = [_intern_value(item, pool, memo) for item in values]
-        values.clear()
-        values.update(items)
+        for item in value:
+            _intern_value(item, pool, memo)
         return value
-    if isinstance(value, frozenset):
-        memo[value_id] = value
-        result = frozenset(_intern_value(item, pool, memo) for item in value)
-        memo[value_id] = result
-        return result
-    if is_dataclass(value) and type(value).__module__.startswith("art.trajectories"):
+    if (
+        is_dataclass(value)
+        and type(type(value).__module__) is str
+        and type(value).__module__.startswith("art.trajectories")
+    ):
         memo[value_id] = value
         for field in fields(value):
             object.__setattr__(
@@ -126,15 +148,25 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
 def _intern_mapping(
     value: dict[object, object], pool: _StringPool, memo: dict[int, object]
 ) -> None:
-    replacements: list[tuple[str, str]] = []
+    if type(value) is not dict:
+        return
+    # Opaque keys can reject even assigning an unchanged value. Visit descendants
+    # without rehashing keys or replacing direct values in these mappings.
+    if not all(type(key) is str for key in value):
+        for item in value.values():
+            _intern_value(item, pool, memo)
+        return
+    replacements: dict[int, str] = {}
     for key, item in value.items():
         if type(key) is str:
             interned = pool.setdefault(key, key)
             if interned is not key:
-                replacements.append((key, interned))
+                replacements[id(key)] = interned
         value[key] = _intern_value(item, pool, memo)
-    for key, interned in replacements:
-        value[interned] = value.pop(key)
+    if replacements:
+        items = [(replacements.get(id(key), key), item) for key, item in value.items()]
+        value.clear()
+        value.update(items)
 
 
 def serialize_messages_and_choices(items: list[Any]) -> list[dict[str, Any]]:
