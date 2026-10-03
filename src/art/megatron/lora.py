@@ -1670,7 +1670,8 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
     ) -> None:
         super().__init__()
         in_proj.return_layernorm_output = True
-        in_proj.return_layernorm_output_gathered = True
+        # TP1 returns a local norm tensor; TE must consume its cotangent.
+        in_proj.return_layernorm_output_gathered = in_proj.tp_size > 1
         self.in_proj = in_proj
         self.num_value_heads_per_partition = (
             gated_delta_net.num_value_heads // ps.get_tensor_model_parallel_world_size()

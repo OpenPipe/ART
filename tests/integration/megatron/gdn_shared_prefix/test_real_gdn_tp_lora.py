@@ -22,7 +22,11 @@ import torch.multiprocessing as mp  # noqa: E402
 from torch.multiprocessing.reductions import StorageWeakRef  # noqa: E402
 from torch.utils._python_dispatch import TorchDispatchMode  # noqa: E402
 
-from art.megatron.lora import apply_lora_adapters  # noqa: E402
+from art.megatron.lora import (  # noqa: E402
+    LoRASlotRef,
+    apply_lora_adapters,
+    use_lora_slot,
+)
 from art.megatron.model_support import QWEN3_5_MOE_SPEC  # noqa: E402
 from art.megatron.model_support.handlers import QWEN3_5_MOE_HANDLER  # noqa: E402
 
@@ -127,6 +131,71 @@ def test_real_qwen35_gdn_lora_releases_components_before_add(
                 assert gradient is not None
                 assert torch.isfinite(gradient).all()
                 assert torch.count_nonzero(gradient) > 0
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA is required for the real TE GDN projection backward.",
+)
+@pytest.mark.parametrize("adapter", ("active", "restored", "zero_B", "inactive"))
+def test_real_gdn_tp1_lora_norm_input_gradient(adapter: str) -> None:
+    with _single_rank_model_parallel():
+        gdn, _ = _make_matching_gdn_pair(tp_size=1, lora=True)
+        projection = gdn.in_proj
+        inner = projection.in_proj
+        assert inner.tp_size == 1 and not inner.sequence_parallel
+        projection.requires_grad_(False)
+        ref = LoRASlotRef("checkpoint", "norm-gradient")
+        with torch.no_grad():
+            # Eliminate the base input gradient so it cannot mask a lost LoRA term.
+            inner.weight.zero_()
+            inner.layer_norm_weight.fill_(0 if inner.zero_centered_gamma else 1)
+            assert inner.layer_norm_bias is None
+            for lora in (projection.qkv_lora, projection.z_lora):
+                lora.A_T.zero_()
+                lora.B_T.zero_()
+                a = torch.arange(lora.in_features, device=lora.A_T.device)
+                lora.A_T[:, 0].copy_((a % 7 - 3).float() / 8)
+                if adapter != "zero_B":
+                    lora.B_T[0].fill_(1 / 8)
+                if adapter == "restored":
+                    prefix = lora.adapter_model_prefix
+                    assert lora.load_lora_slot(
+                        ref,
+                        {
+                            f"{prefix}.lora_A.weight": lora.A_T.T.clone(),
+                            f"{prefix}.lora_B.weight": lora.B_T.T.clone(),
+                        },
+                        alpha=lora.alpha,
+                        requires_grad=False,
+                    )
+                    # The restored slot, not a nonzero template, must supply the edge.
+                    lora.A_T.zero_()
+                    lora.B_T.zero_()
+        selected = ref if adapter == "restored" else None
+        if adapter == "inactive":
+            selected = LoRASlotRef("checkpoint", None)
+        x = torch.arange(8 * 64, device=inner.weight.device).reshape(8, 1, 64)
+        x = ((x % 17 - 8).float() / 8).to(GDN_CORRECTNESS_DTYPE).requires_grad_()
+        with use_lora_slot(selected):
+            for lora in (projection.qkv_lora, projection.z_lora):
+                active = lora.active_lora_tensors()
+                if adapter == "inactive":
+                    assert active is None
+                else:
+                    assert active is not None
+                    assert bool(torch.count_nonzero(active[1])) == (adapter != "zero_B")
+            output, bias = projection(x)
+            assert bias is None
+            weights = torch.arange(output.shape[-1], device=x.device) % 5 + 1
+            (dx,) = torch.autograd.grad((output.float() * weights).sum(), x)
+        assert torch.isfinite(output).all() and torch.isfinite(dx).all()
+        if adapter in ("active", "restored"):
+            assert torch.count_nonzero(output) > 0
+            assert torch.count_nonzero(dx) > 0
+        else:
+            assert torch.count_nonzero(output) == 0
+            assert torch.count_nonzero(dx) == 0
 
 
 @pytest.mark.skipif(
