@@ -531,7 +531,7 @@ if [[ "${pull_image_repo}" != "${image_repo}" ]]; then
   echo "  ${pull_image_repo}:${image_tag}"
 fi
 image_digest="$(
-  uv run --no-project python - "${build_log_snapshot_path}" "${image_repo}" "${image_tag}" <<'PY'
+  build_command uv run --no-project python - "${build_log_snapshot_path}" "${image_repo}" "${image_tag}" <<'PY'
 import re
 import sys
 from pathlib import Path

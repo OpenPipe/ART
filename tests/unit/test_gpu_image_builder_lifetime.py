@@ -46,7 +46,7 @@ elif 'cp' in args:
         pathlib.Path(args[-1]).write_text('#1 pushing manifest for registry.invalid/art:latest@sha256:'+'a'*64+' 0.1s done\n')
 elif 'exec' in args:
     if '/tmp/art-build.exit' in args[-1] and args[-1].startswith('if '):
-        if mode in ('success', 'processor_hang', 'final_processor_hang'): print('0')
+        if mode in ('success', 'processor_hang', 'final_processor_hang', 'digest_processor_hang'): print('0')
         elif mode in ('failed', 'failed_final_processor_hang'): print('42')
         elif mode != 'pending': raise AssertionError(mode)
 elif 'get' in args:
@@ -73,7 +73,7 @@ if len(sys.argv) > 6 and 'art-gpu-build-log.' in sys.argv[5]:
     count = int(counter.read_text()) + 1 if counter.exists() else 1
     counter.write_text(str(count))
     mode = os.environ.get('FAKE_BUILD_MODE')
-    if mode == 'processor_hang' or (mode in ('final_processor_hang', 'failed_final_processor_hang') and count == 2):
+    if mode == 'processor_hang' or (mode in ('final_processor_hang', 'failed_final_processor_hang') and count == 2) or (mode == 'digest_processor_hang' and count == 3):
         time.sleep(60)
 os.execv(sys.executable, [sys.executable, *sys.argv[4:]])
 """
@@ -188,6 +188,7 @@ def test_builder_preserves_build_failure_and_cleanup(builder):
         ("processor_hang", 124, 1),
         ("final_processor_hang", 124, 2),
         ("failed_final_processor_hang", 42, 2),
+        ("digest_processor_hang", 124, 3),
     ],
 )
 def test_builder_bounds_log_processor_and_preserves_known_failure(
