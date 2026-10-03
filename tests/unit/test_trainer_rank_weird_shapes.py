@@ -1057,11 +1057,18 @@ def test_forward_raises_before_expected_oom_with_actionable_context(
 
 
 def test_memory_error_reports_rank_local_pair_when_known() -> None:
-    kwargs = dict(
-        context="dp_rank_forward", message="m", packed_tokens=1, logical_tokens=1
-    )
-    extrema = str(_memory_error(check=_MemoryCheck(10, 1, False), **kwargs))
-    assert "rank_required_gb=" not in extrema
+    def message(check: _MemoryCheck) -> str:
+        return str(
+            _memory_error(
+                context="dp_rank_forward",
+                message="m",
+                packed_tokens=1,
+                logical_tokens=1,
+                check=check,
+            )
+        )
+
+    assert "rank_required_gb=" not in message(_MemoryCheck(10, 1, False))
     check = _MemoryCheck(
         10,
         1,
@@ -1071,7 +1078,7 @@ def test_memory_error_reports_rank_local_pair_when_known() -> None:
     )
     assert (
         "usable_limit_gb=0.000. rank_required_gb=3.000 rank_available_gb=2.000 Use"
-        in str(_memory_error(check=check, **kwargs))
+        in message(check)
     )
 
 
