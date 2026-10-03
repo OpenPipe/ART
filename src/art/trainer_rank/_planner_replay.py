@@ -346,7 +346,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         raise ValueError("runtime_shape_inventory_over_limit")
     reserve(8 * len(inputs))
     facts = {
-        "version": 4,
+        "version": 7,
         "checkpoint_layers": layers,
         "checkpoint_moe_bytes_per_token": rank._checkpoint_moe_bytes_per_token(),
         # Model and process readers of the recomputed layer and staged head,
@@ -393,7 +393,7 @@ def validate(facts: Any) -> None:
             "groups",
         },
     )
-    if type(facts["version"]) is not int or facts["version"] != 4:
+    if type(facts["version"]) is not int or facts["version"] != 7:
         raise ValueError("unsupported runtime facts version")
     for key in (
         "checkpoint_layers",
