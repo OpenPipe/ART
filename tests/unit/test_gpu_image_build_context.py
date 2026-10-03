@@ -45,7 +45,10 @@ def test_gpu_image_node_prewarm_reuses_an_existing_digest(tmp_path: Path) -> Non
     bin_dir.mkdir()
     kubectl_log = tmp_path / "kubectl.log"
     kubectl = bin_dir / "kubectl"
-    kubectl.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$KUBECTL_LOG"\n')
+    kubectl.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$KUBECTL_LOG"\n'
+        'case " $* " in *" get pod "*" -o json "*) printf \'{"items":[]}\' ;; esac\n'
+    )
     kubectl.chmod(0o755)
     digest = "sha256:" + "a" * 64
     env = {
@@ -54,6 +57,7 @@ def test_gpu_image_node_prewarm_reuses_an_existing_digest(tmp_path: Path) -> Non
         "KUBECTL_LOG": str(kubectl_log),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "REGISTRY_AUTH_JSON_B64": base64.b64encode(b"{}").decode(),
+        "GPU_IMAGE_CLEANUP_ROOT": str(tmp_path / "cleanup"),
     }
 
     result = subprocess.run(
@@ -190,6 +194,7 @@ def test_gpu_image_node_prewarm_pulls_the_digest_on_present_nodes(
         "#!/bin/sh\n"
         'printf "%s\\n" "$*" >> "$KUBECTL_LOG"\n'
         'case " $* " in\n'
+        '  *" get pod "*" -o json "*) printf \'{"items":[]}\' ;;\n'
         '  *" get nodes "*"hypervisor=true"*) exit 0 ;;\n'
         '  *" get nodes "*) printf "gpu-node-a\\n" ;;\n'
         '  *" create secret "*) printf "kind: Secret\\n" ;;\n'
@@ -208,6 +213,7 @@ def test_gpu_image_node_prewarm_pulls_the_digest_on_present_nodes(
         "KUBECTL_LOG": str(kubectl_log),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "REGISTRY_AUTH_JSON_B64": base64.b64encode(b"{}").decode(),
+        "GPU_IMAGE_CLEANUP_ROOT": str(tmp_path / "cleanup"),
     }
 
     result = subprocess.run(
