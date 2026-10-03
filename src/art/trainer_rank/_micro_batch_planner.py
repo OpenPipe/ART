@@ -244,7 +244,7 @@ def _find_admissible_forward(
         check = self._memory_check(plan)
     if check.fits:
         return plan, check
-    best = (plan, check)
+    best = cost_optimal = (plan, check)
     # Best effort before splitting: the memory-minimal (full sharing)
     # layouts may fit where the cost-optimal ones do not.
     plan = self._plan_flat_forward(
@@ -270,13 +270,15 @@ def _find_admissible_forward(
         )
     if self._expert_parallel_active():
         # EP cannot split internally, but either unsplit plan is supported.
-        # Retain the lowest estimate for the explicit oversized opt-in only.
+        # The opt-in relaxes GPU admission, never the host-memory budget.
+        oversized = getattr(self, "_allow_oversized_batches", False)
+        if oversized and not best[1].cpu_fits:
+            if cost_optimal[1].cpu_fits:
+                best = cost_optimal
+            elif check.cpu_fits:
+                best = (plan, check)
         return _impl._ForwardRefusal(
-            *(
-                best
-                if getattr(self, "_allow_oversized_batches", False)
-                else (plan, check)
-            ),
+            *(best if oversized else (plan, check)),
             f"{refusal_prefix}; unable to find a feasible split: internal "
             "splitting is disabled under expert parallelism in this release",
         )

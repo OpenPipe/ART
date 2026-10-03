@@ -804,3 +804,38 @@ def test_ten_percent_strict_contract(tmp_path, observed, emitted):
         replay_factory=lambda: {},
     )
     assert (p is not None) == emitted
+
+
+@pytest.mark.parametrize("safe_is_minimal", [False, True])
+def test_ep_override_chooses_host_admissible_unsplit_plan(monkeypatch, safe_is_minimal):
+    rank = _oversized(monkeypatch)
+    monkeypatch.setattr(rank, "_expert_parallel_active", lambda: True)
+    original = rank._plan_flat_forward
+    plans = {}
+
+    def plan(*args, memory_minimal=False, **kwargs):
+        value = original(*args, memory_minimal=memory_minimal, **kwargs)
+        plans[id(value)] = memory_minimal
+        return value
+
+    def check(value, **kwargs):
+        safe = plans[id(value)] == safe_is_minimal
+        return tr._MemoryCheck(
+            20 if safe else 10,
+            5,
+            False,
+            cpu_required_bytes=1 if safe else 20,
+            cpu_available_bytes=10,
+            cpu_fits=safe,
+        )
+
+    monkeypatch.setattr(rank, "_plan_flat_forward", plan)
+    monkeypatch.setattr(rank, "_memory_check", check)
+    monkeypatch.setattr(
+        rank, "_admit_split_rung", lambda *a, **k: pytest.fail("EP split")
+    )
+    executed = _recording_executor(monkeypatch, rank)
+    rank.forward([_request(0), _request(1)])
+    assert len(executed) == 1
+    assert plans[id(executed[0])] == safe_is_minimal
+    assert rank.last_forward_telemetry()["predicted_peak_bytes"] == 20
