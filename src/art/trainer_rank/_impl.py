@@ -1843,17 +1843,19 @@ def _dense_mlp_recompute_bytes_per_token(
         return 0, 0
     try:
         from megatron.core.extensions.transformer_engine import (
+            TEFusedResidualRMSNorm,
             TELayerNormColumnParallelLinear,
             TERowParallelLinear,
         )
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
         from megatron.core.transformer.attention import SelfAttention
-        from megatron.core.transformer.identity_op import IdentityFuncOp
+        from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
         from megatron.core.transformer.mlp import MLP
         from megatron.core.transformer.transformer_block import TransformerBlock
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
+        from art.megatron.gdn import operator as gdn_operator
         from art.megatron.gdn.operator import (
             _empty_safe_norm_forward,
             _gdn_island_layer_forward,
@@ -1878,6 +1880,12 @@ def _dense_mlp_recompute_bytes_per_token(
         if (
             module._forward_hooks
             or module._forward_pre_hooks
+            or module._backward_hooks
+            or module._backward_pre_hooks
+            # Megatron's CUDA-graph path dispatches on this attribute alone.
+            or hasattr(module, "cudagraph_manager")
+            # Its hidden fused implementation is outside the walk; untraced.
+            or (TEFusedResidualRMSNorm and type(module) is TEFusedResidualRMSNorm)
             or not type(module).forward.__module__.startswith(_TRACED_PACKAGES)
             or any(
                 name not in ("forward", delegate)
@@ -1924,10 +1932,18 @@ def _dense_mlp_recompute_bytes_per_token(
 
     # The decoder and its final norm (run after the layers) are traced too.
     final = getattr(decoder, "final_layernorm", None)
+    hooks = torch.nn.modules.module
     if (
         type(decoder) is not TransformerBlock
         or not plain(decoder)
         or (final is not None and not all(map(traced, final.modules())))
+        # PyTorch's global module hooks and ART's GDN trace callbacks run
+        # beside every covered module.
+        or hooks._global_forward_hooks
+        or hooks._global_forward_pre_hooks
+        or hooks._global_backward_hooks
+        or hooks._global_backward_pre_hooks
+        or getattr(gdn_operator, "_GDN_TRACE_TOKEN_UID_HOOKS", None) is not None
     ):
         return 0, 0
     expected = {
@@ -1979,6 +1995,16 @@ def _dense_mlp_recompute_bytes_per_token(
             or vars(layer).get("mlp_bda") is not get_bias_dropout_add
             or vars(layer).get("bias_dropout_add_exec_handler") is not torch.enable_grad
             or type(getattr(layer, "cross_attn_bda", None)) is not IdentityFuncOp
+            # Executed slots a spec could fill with a function: the stock
+            # cross attention, and GDN's activation and input projection.
+            or type(getattr(layer, "cross_attention", None)) is not IdentityOp
+            or (
+                type(mixer) is GatedDeltaNet
+                and (
+                    vars(mixer).get("act_fn") is not torch.nn.functional.silu
+                    or not isinstance(mixer._modules.get("in_proj"), torch.nn.Module)
+                )
+            )
             or type(mixer) not in mixers
             or not plain(mixer, _prefix_tree_forward, "_art_physical_forward")
             or any(type(site) is not cls for site, cls in sites)

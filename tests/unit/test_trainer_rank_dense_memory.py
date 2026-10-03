@@ -101,15 +101,20 @@ def _dense_layer(gdn: bool = False) -> Any:
     mlp.linear_fc1 = fc1
     mlp.linear_fc2 = fc2
     from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-    from megatron.core.transformer.identity_op import IdentityFuncOp
+    from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 
     layer = _module(TransformerLayer)
     layer.self_attention = _module(GatedDeltaNet if gdn else SelfAttention)
+    if gdn:
+        layer.self_attention.act_fn = torch.nn.functional.silu
+        layer.self_attention.in_proj = _module(TELayerNormColumnParallelLinear)
     layer.mlp = mlp
-    # The stock spec's bias-dropout-add factories and grad context.
+    # The stock spec's bias-dropout-add factories, grad context and cross
+    # attention.
     layer.self_attn_bda = layer.mlp_bda = get_bias_dropout_add
     layer.bias_dropout_add_exec_handler = torch.enable_grad
     layer.cross_attn_bda = _module(IdentityFuncOp)
+    layer.cross_attention = _module(IdentityOp)
     return layer
 
 
@@ -237,16 +242,30 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "custom_self_attn_bda",
         "custom_cross_attn_bda",
         "custom_bda_handler",
+        "function_cross_attention",
+        "gdn_activation",
+        "function_in_proj",
+        "backward_hook",
+        "backward_pre_hook",
+        "global_forward_hook",
+        "global_backward_hook",
+        "gdn_trace_hooks",
+        "cudagraph_manager",
+        "fused_residual_norm",
         "chunks",
     ],
 )
 def test_anything_but_the_traced_execution_keeps_the_allowance(change):
-    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TEFusedResidualRMSNorm,
+    )
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.transformer_block import TransformerBlock
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     from art.megatron import lora as lora_module
+    from art.megatron.gdn import operator as gdn_operator
     from art.megatron.gdn.operator import _empty_safe_norm_forward
 
     layers = [_dense_layer(gdn=index != 1) for index in range(3)]
@@ -404,11 +423,51 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         "custom_bda_handler": lambda: setattr(
             layer, "bias_dropout_add_exec_handler", torch.no_grad
         ),
+        "function_cross_attention": lambda: (
+            delattr(layer, "cross_attention"),
+            setattr(layer, "cross_attention", lambda *a, **k: None),
+        ),
+        "gdn_activation": lambda: setattr(
+            gdn_layer.self_attention, "act_fn", torch.nn.functional.gelu
+        ),
+        "function_in_proj": lambda: (
+            delattr(gdn_layer.self_attention, "in_proj"),
+            setattr(gdn_layer.self_attention, "in_proj", lambda *a: None),
+        ),
+        "backward_hook": lambda: mlp.linear_fc1.register_full_backward_hook(
+            lambda *a: None
+        ),
+        "backward_pre_hook": lambda: layer.register_full_backward_pre_hook(
+            lambda *a: None
+        ),
+        "global_forward_hook": lambda: cleanup.append(
+            torch.nn.modules.module.register_module_forward_hook(lambda *a: None)
+        ),
+        "global_backward_hook": lambda: cleanup.append(
+            torch.nn.modules.module.register_module_full_backward_hook(lambda *a: None)
+        ),
+        "gdn_trace_hooks": lambda: cleanup.append(
+            SimpleNamespace(
+                remove=functools.partial(
+                    gdn_operator.set_gdn_trace_token_uid_hooks,
+                    gdn_operator.set_gdn_trace_token_uid_hooks(object()),
+                )
+            )
+        ),
+        "cudagraph_manager": lambda: setattr(layer, "cudagraph_manager", object()),
+        "fused_residual_norm": mixer_child(
+            lambda child: setattr(child, "__class__", TEFusedResidualRMSNorm)
+        ),
         "chunks": lambda: None,
     }
-    edits[change]()
-    models = [model] * (2 if change == "chunks" else 1)
-    assert _dense_mlp_recompute_bytes_per_token(models) == (0, 0)
+    cleanup: list[Any] = []
+    try:
+        edits[change]()
+        models = [model] * (2 if change == "chunks" else 1)
+        assert _dense_mlp_recompute_bytes_per_token(models) == (0, 0)
+    finally:
+        for handle in cleanup:
+            handle.remove()
 
 
 def test_moe_models_never_price_the_dense_stage(monkeypatch, layer):
