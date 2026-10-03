@@ -98,6 +98,9 @@ def _dense_layer(gdn: bool = False) -> Any:
     row = _module(lora_module.SelfAttentionLinearProjLoRA)
     row.lora = _adapter(lora_module, FFN, HIDDEN)
     row.linear_proj = _module(TERowParallelLinear)
+    from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
+
+    row.linear_proj.get_rng_state_tracker = get_cuda_rng_tracker
     fc2.row_parallel_lora = row
     mlp.linear_fc1 = fc1
     mlp.linear_fc2 = fc2
@@ -142,6 +145,7 @@ def _dense_model(layers: list[Any]) -> Any:
 
     block = _module(TransformerBlock)
     block.layers = torch.nn.ModuleList(layers)
+    block.group_prefetch_offload_commit_async = lambda x: x  # TE, offload off.
     model: Any = torch.nn.Module()
     model.decoder = block
     model._preprocess = lambda: None  # Marks a GPT model for _language_model.
@@ -259,6 +263,11 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "cudagraph_manager",
         "fused_residual_norm",
         "fused_residual_norm_subclass",
+        "encoder_layer_norm",
+        "encoder_final_norm",
+        "mlp_norm",
+        "custom_rng_tracker",
+        "decoder_callback",
         "chunks",
     ],
 )
@@ -268,6 +277,7 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         TEFusedResidualRMSNorm,
     )
     from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.transformer_block import TransformerBlock
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -323,6 +333,17 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
             model.decoder.final_layernorm = norm
 
         return apply
+
+    # Stock torch.nn and Megatron modules a norm builder could return, each
+    # running a configured activation that could retain tensors.
+    def retaining(x):
+        return torch.nn.functional.silu(x)
+
+    def encoder():
+        return torch.nn.TransformerEncoderLayer(8, 1, 8, activation=retaining)
+
+    mlp_norm = _module(MLP)
+    mlp_norm.activation_func = retaining
 
     def foreign_norm_delegate(norm):
         norm._art_empty_safe_norm_physical_forward = MethodType(lambda self, x: x, norm)
@@ -480,6 +501,17 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         "fused_residual_norm_subclass": mixer_child(
             lambda child: setattr(child, "__class__", fused_norm_subclass)
         ),
+        "encoder_layer_norm": lambda: setattr(layer, "input_layernorm", encoder()),
+        "encoder_final_norm": lambda: setattr(
+            model.decoder, "final_layernorm", encoder()
+        ),
+        "mlp_norm": lambda: setattr(layer, "pre_mlp_layernorm", mlp_norm),
+        "custom_rng_tracker": lambda: setattr(
+            mlp.linear_fc2.row_parallel_lora.linear_proj,
+            "get_rng_state_tracker",
+            lambda: None,
+        ),
+        "decoder_callback": lambda: setattr(model.decoder, "callback", retaining),
         "chunks": lambda: None,
     }
     cleanup: list[Any] = []

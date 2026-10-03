@@ -1781,22 +1781,6 @@ def _hybridep_buffer_bytes(capacity: int, ranks: int, hidden: int, experts: int)
 # Transformer Engine's Hopper cuBLAS workspaces: one per grouped-GEMM stream
 # (four) plus the plain GEMM's, each 32 MiB + 1 KiB.
 _TE_CUBLAS_WORKSPACE_BYTES = 5 * (32 * 2**20 + 1024)
-# The plain callables a covered layer, mixer or MLP may hold, each checked by
-# identity in the dense gate, plus ART's forward wrapper and its delegate.
-_DENSE_PLAIN_CALLABLES = frozenset(
-    (
-        "forward",
-        "_art_gdn_island_physical_forward",
-        "_art_physical_forward",
-        "self_attn_bda",
-        "mlp_bda",
-        "bias_dropout_add_exec_handler",
-        "act_fn",
-        "activation_func",
-    )
-)
-
-
 # Largest LoRA rank the dense stage prices (rank-wide intermediates included).
 _DENSE_LORA_RANK_LIMIT = 256
 # Packages whose module forwards the dense stage was traced through.
@@ -1863,6 +1847,7 @@ def _dense_mlp_recompute_bytes_per_token(
         )
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+        from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
         from megatron.core.transformer.attention import SelfAttention
         from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
         from megatron.core.transformer.mlp import MLP
@@ -1885,11 +1870,27 @@ def _dense_mlp_recompute_bytes_per_token(
         # Without the traced owner types nothing can match; keep the allowance.
         return 0, 0
 
+    # The only plain (non-module) callables a walked module may hold, by exact
+    # owner type: each must be the stock value the real construction stores.
+    stock: dict[tuple[type, str], Any] = {
+        (TransformerLayer, "self_attn_bda"): get_bias_dropout_add,
+        (TransformerLayer, "mlp_bda"): get_bias_dropout_add,
+        (TransformerLayer, "bias_dropout_add_exec_handler"): torch.enable_grad,
+        (GatedDeltaNet, "act_fn"): torch.nn.functional.silu,
+        (MLP, "activation_func"): torch.nn.functional.silu,
+        # Read only while initializing the weight.
+        (TERowParallelLinear, "get_rng_state_tracker"): get_cuda_rng_tracker,
+        # Transformer Engine's fresh identity lambda; the decoder calls it only
+        # under cpu_offloading, which the config check below rejects.
+        (TransformerBlock, "group_prefetch_offload_commit_async"): Ellipsis,
+    }
+
     def plain(module: Any, wrapper: Any = None, delegate: str = "") -> bool:
-        """No hooks, a class forward from the traced packages, no instance
-        callable shadowing a class callable (an executed helper such as
-        ``_forward_mlp``), and no forward but the class's or ART's traced
-        wrapper, which must still call the class's own forward."""
+        """No hooks, a class forward from the traced packages, no plain
+        callable attribute but the stock ones above (such as a configured
+        activation, or an executed helper like ``_forward_mlp``), and no forward
+        but the class's or ART's traced wrapper, which must still call the
+        class's own forward."""
         forward = vars(module).get("forward")
         if (
             module._forward_hooks
@@ -1904,7 +1905,8 @@ def _dense_mlp_recompute_bytes_per_token(
             or any(
                 name not in ("forward", delegate)
                 and callable(value)
-                and callable(getattr(type(module), name, None))
+                and (owned := stock.get((type(module), name))) is not value
+                and owned is not Ellipsis
                 for name, value in vars(module).items()
             )
         ):
@@ -2017,16 +2019,6 @@ def _dense_mlp_recompute_bytes_per_token(
                 and vars(mixer).get("act_fn") is not torch.nn.functional.silu
             )
             or type(mixer) not in mixers
-            # Any other spec slot the layer, mixer or MLP calls (attention's
-            # output projection, GDN's projections and norm) must be a
-            # registered module, which the walk then checks.
-            or any(
-                callable(value)
-                and not isinstance(value, torch.nn.Module)
-                and name not in _DENSE_PLAIN_CALLABLES
-                for site in (layer, mixer, mlp)
-                for name, value in vars(site).items()
-            )
             or not plain(mixer, _prefix_tree_forward, "_art_physical_forward")
             or any(type(site) is not cls for site, cls in sites)
             or not all(plain(site) for site, _ in sites)
