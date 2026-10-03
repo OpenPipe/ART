@@ -4445,7 +4445,7 @@ class TrainerRank:
     ]:
         """Use existing aggregate profiles when all physical groups share policy."""
         flats = plan.subforwards if isinstance(plan, _SplitForwardPlan) else (plan,)
-        staged_slots = set()
+        staged_slots, captured = set(), set()
         for flat_index, flat in enumerate(flats):
             policies = [
                 _resolved_request_policy(g.items[0].request.options)
@@ -4515,20 +4515,30 @@ class TrainerRank:
                     )
                     retained = max(retained, residual)
                 version_bytes = getattr(self, "_lora_version_capture_bytes", None)
-                persistent = (
-                    sum(
-                        version_bytes(group.slot_ref, policy.max_gradient_staleness)
-                        for group in groups
-                        if group.grad_enabled
-                    )
-                    if version_bytes is not None
-                    else 0
-                )
-                staging = 0
+                persistent = staging = 0
                 for group in groups:
+                    # Later children and groups reuse the first one's live capture.
+                    key = (group.slot_ref, policy.max_gradient_staleness)
+                    if group.grad_enabled and version_bytes and key not in captured:
+                        captured.add(key)
+                        persistent += version_bytes(*key)
                     if group.grad_enabled and group.slot_ref not in staged_slots:
                         staged_slots.add(group.slot_ref)
                         staging += self._lora_gradient_staging_bytes(group.slot_ref)
+                credit = cost.checkpoint_adapter_gradient
+                if credit:
+                    # The walk repeats a slot's inventory per gradient group
+                    # (e.g. routed and unrouted); one batch stages each target once.
+                    credit = min(
+                        credit,
+                        sum(
+                            self._pending_adapter_gradient_bytes(
+                                g.slot_ref
+                                for g in groups
+                                if g.grad_enabled and g.slot_ref is not None
+                            )
+                        ),
+                    )
                 yield (
                     flat_index,
                     indices,
@@ -4547,6 +4557,7 @@ class TrainerRank:
                         backward_required=any(group.grad_enabled for group in groups),
                         persistent_bytes=persistent,
                         gradient_staging_bytes=staging,
+                        staged_gradient_bytes=credit,
                         replay_seconds=max(timings) if len(timings) >= 2 else None,
                         correction_workspace_bytes=cost.required
                         if any(
