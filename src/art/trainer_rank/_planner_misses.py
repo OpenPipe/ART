@@ -645,6 +645,8 @@ _RANK_FIELDS = frozenset(
     "checkpointed_moe_layers recompute_modules moe_output_bytes_per_token "
     "moe_forward_stages".split()
 )
+# TP x SP floor facts; reports captured before them replay conservatively.
+_OPTIONAL_RANK_FIELDS = frozenset({"mixer_top_gaps", "lora_modules_per_layer"})
 
 
 def _signature_values(values: dict[str, Any]) -> dict[str, Any]:
@@ -706,7 +708,7 @@ def replay(
     if not state["estimates"]:
         raise ValueError("memory replay has no candidate estimates")
     values = state["rank"]
-    if set(values) != _RANK_FIELDS | {"geometry", "topology"}:
+    if set(values) - _OPTIONAL_RANK_FIELDS != _RANK_FIELDS | {"geometry", "topology"}:
         raise ValueError(
             "incomplete replay: immutable rank fields differ (including MoE stages)"
         )
@@ -720,6 +722,21 @@ def replay(
         raise ValueError("incomplete replay: recompute mode is not recorded")
     rank._recorded_one_layer_recompute = values["one_layer_recompute"]
     rank._moe_forward_stages = tuple(tuple(row) for row in values["moe_forward_stages"])
+    gaps = values.get("mixer_top_gaps")
+    if gaps is not None and (
+        type(gaps) is not list
+        or len(gaps) != 2
+        or any(
+            gap is not None and (type(gap) is not int or not 0 <= gap < layers)
+            for gap in gaps
+        )
+    ):
+        raise ValueError("incomplete replay: invalid mixer layer order")
+    rank._mixer_top_gaps = None if gaps is None else tuple(gaps)
+    modules = values.get("lora_modules_per_layer")
+    if modules is not None and (type(modules) is not int or not 0 <= modules < 2**16):
+        raise ValueError("incomplete replay: invalid LoRA module count")
+    rank._lora_modules_per_layer = modules
     rank._geometry = ModelGeometry(**values["geometry"])
     dp, tp, cp, pp = values["topology"]
     rank._topology_key = lambda: (dp, tp, cp, pp)

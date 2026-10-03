@@ -233,13 +233,22 @@ def _split_plan_memory_check(
 
 
 def _head_vocabulary(self: TrainerRank) -> int:
-    """Runtime eligibility and vocabulary, without reading parameter values."""
+    """Runtime eligibility and this rank's vocabulary, without reading values.
+
+    TP > 1 runs the same 512-row chunked head over each rank's vocabulary
+    shard; it is priced only where the explicit TP x SP checkpoint floor
+    applies, whose shallow shapes it can dominate.
+    """
+    _, tp, _, pp = self._topology_key()
     if (
         self._padded_vocab_size is None
         or len(self.runtime.model) != 1
-        or self._topology_key()[1::2] != (1, 1)
+        or pp != 1
+        or self._padded_vocab_size % tp
+        or (tp > 1 and not _checkpoint_layers(self, ((1, True),)))
     ):
         return 0
+    vocabulary = self._padded_vocab_size // tp
     try:
         model = _impl._language_model(self.runtime.model[0])
     except (AttributeError, RuntimeError):
@@ -270,8 +279,8 @@ def _head_vocabulary(self: TrainerRank) -> int:
     if (
         type(weight) not in (_impl.torch.Tensor, _impl.torch.nn.Parameter)
         or weight.dtype is not _impl.torch.bfloat16
-        or tuple(weight.shape) != (self._padded_vocab_size, self._hidden_size)
-        or head.output_size_per_partition != self._padded_vocab_size
+        or tuple(weight.shape) != (vocabulary, self._hidden_size)
+        or head.output_size_per_partition != vocabulary
         or head.output_size != self._padded_vocab_size
         or head.input_size != self._hidden_size
         or getattr(config, "params_dtype", None) is not _impl.torch.bfloat16
@@ -293,7 +302,7 @@ def _head_vocabulary(self: TrainerRank) -> int:
         )
     ):
         return 0
-    return int(self._padded_vocab_size)
+    return int(vocabulary)
 
 
 def _dense_head_bytes(vocabulary: int, rows: int) -> int:
@@ -522,8 +531,10 @@ def _checkpoint_layers(
     This is not a bound for custom preprocessing, attention, or all backward.
     With sequence parallelism a rank saves only its shard of each boundary;
     that is priced only where ``_sequence_parallel_floor_covered`` holds,
-    and there, for gradient waves, the recomputed GDN layer's recurrent
-    states for ``gdn_segments`` (gradient groups' segments) plus padding.
+    and there, for gradient waves, with the recomputed layer's explicit
+    workspace (``_sequence_parallel_workspace_bytes``) and its GDN layer's
+    recurrent states for ``gdn_segments`` (gradient groups' segments) plus
+    padding, beside one input-gradient shard instead of the TP1 repeat.
     """
     if not group_rows or len(self.runtime.model) != 1:
         return 0
@@ -563,7 +574,7 @@ def _checkpoint_layers(
         or self._param_dtype_size != 2
         or next(self.runtime.model[0].parameters()).dtype is not _impl.torch.bfloat16
         or pp != 1
-        or (tp > 1 and not self._sequence_parallel_floor_covered(layers, tp, cp))
+        or (tp > 1 and not self._sequence_parallel_floor_covered(tp, cp))
         or any(
             type(getattr(config, name, None)) is not type(value)
             or getattr(config, name) != value
@@ -659,15 +670,24 @@ def _checkpoint_floor_from_facts(
 def _sequence_parallel_workspace_bytes(self: TrainerRank, rows: int) -> int:
     """The recomputed layer's live workspace at a TP x SP backward peak.
 
-    Measured on dense Qwen3.8-27B at TP4 (25,728 rows) and TP2 (20,816 to
-    66,284 rows, one to four GDN segments), cold and warm, at the top GDN
-    layer's MLP FC1 stage. Over the gathered rows: the SP-gathered norm
-    output (2H), the FC1 stage (6F/TP: GEMM output, gate and up LoRA outputs
-    and their sum; the SwiGLU live set if wider) and the recomputed mixer at
-    its projection widths / TP (GDN held 0.885-0.887 of it; the rest covers a
-    first wave's rotary cache). Over the sharded rows: norm outputs (3.22H
-    measured, priced at 3.25H). The input-gradient shard, GDN segment states
-    and cold transients are separate terms.
+    Traced on dense Qwen3.8-27B at TP4 (25,728 rows) and TP2 (20,816 to
+    66,284 rows, one to four GDN segments), cold and warm: every peak was a
+    recomputed layer's MLP FC1 stage. Its workspace covers, over the gathered
+    rows, the SP-gathered norm output (2H), the FC1 stage (6F/TP: GEMM
+    output, gate and up LoRA outputs and their sum; the SwiGLU live set if
+    wider) and the recomputed mixer at its projection widths / TP (GDN held
+    0.885-0.887 of that bound); over the sharded rows, norm outputs (3.22H
+    measured, priced at 3.25H); and the wave length's fp32 rotary cache
+    (``kv_channels`` per row bounds the traced 64-dim partial rotary).
+
+    Recomputing layer i holds the L-shard ``retained`` term's i + 1
+    checkpoint inputs plus its own residual: L + 1 - gap shards, where gap
+    counts the layers above it. Each mixer kind peaks at its highest layer;
+    the boundary shards beyond L are charged here, per kind, from the
+    decoder's layer order (one extra shard for a kind whose order is
+    unknown). In the traced model the top layer is attention and the top GDN
+    layer (one below) peaks: exactly L shards. The input-gradient shard, LoRA
+    intermediates, GDN segment states and cold transients are separate terms.
     """
     if rows <= 0:
         return 0
@@ -675,24 +695,85 @@ def _sequence_parallel_workspace_bytes(self: TrainerRank, rows: int) -> int:
     tp = self._topology_key()[1]
     hidden = self._hidden_size
     ffn = geometry.ffn_hidden_size or 4 * hidden
+    attention_layers = self._num_layers > self._gdn_layers
     attention = (
         (7 if self._attention_output_gate else 5)
         * geometry.num_attention_heads
         * geometry.kv_channels
         + 3 * geometry.num_query_groups * geometry.kv_channels
-        if self._num_layers > self._gdn_layers
-        else 0
     )
     gdn = (
         4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
         + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
-        if self._gdn_layers
+    )
+    shard = -(-rows // tp) * hidden
+    gaps = getattr(self, "_mixer_top_gaps", None) or (None, None)
+    peak = (
+        max(
+            rows * -(-width // tp) + (1 - (0 if gap is None else gap)) * shard
+            for present, width, gap in (
+                (attention_layers, attention, gaps[0]),
+                (bool(self._gdn_layers), gdn, gaps[1]),
+            )
+            if present
+        )
+        if self._num_layers
         else 0
     )
     stage = max(6, self._mlp_activation_factor) * ffn
-    gathered = rows * (2 * hidden + -(-stage // tp) + -(-max(attention, gdn) // tp))
+    gathered = rows * (2 * hidden + -(-stage // tp))
     sharded = -(-rows // tp) * -(-13 * hidden // 4)
-    return (gathered + sharded) * self._param_dtype_size
+    rotary = 2 * rows * geometry.kv_channels if attention_layers else 0
+    return (gathered + sharded + peak + rotary) * self._param_dtype_size
+
+
+def _sequence_parallel_lora_floor(
+    self: TrainerRank,
+    floor: tuple[int, int],
+    group_rows: tuple[tuple[int, bool], ...],
+    signature: _impl._MemorySignature,
+) -> tuple[int, int]:
+    """Add the recomputed layer's LoRA ``x @ A`` intermediates to a TP x SP floor.
+
+    Each adapted module of the recomputed layer saves rows x rank over the
+    gathered rows (FC1 gate/up measured 16 B/row at rank 4). Charge the
+    decoder's most-adapted layer at the gradient slots' largest rank, from
+    the signature's slot shapes ((ndim, *A.shape, *B.shape) per module).
+    """
+    retained, workspace = floor
+    if not retained or self._topology_key()[1] == 1:
+        return floor
+    rank = max(
+        (
+            shape[2]
+            for grad, shapes in signature.slot_shapes
+            if grad
+            for shape in shapes
+            if len(shape) == 5 and shape[0] == 2
+        ),
+        default=0,
+    )
+    modules = getattr(self, "_lora_modules_per_layer", None)
+    if not modules:
+        # Unread (e.g. reports without the recorded count): per-layer mean + 1.
+        modules = (
+            -(
+                -max((len(shapes) for _, shapes in signature.slot_shapes), default=0)
+                // self._num_layers
+            )
+            + 1
+        )
+    rows = max((rows for rows, grad in group_rows if grad), default=0)
+    return retained, workspace + rows * modules * rank * self._param_dtype_size
+
+
+def _cold_recompute_transient_bytes(self: TrainerRank) -> int:
+    """Fixed transients of an unprofiled gradient wave's first execution."""
+    return (
+        _impl._SEQUENCE_PARALLEL_COLD_TRANSIENT_BYTES
+        if self._topology_key()[1] > 1
+        else _impl._COLD_RECOMPUTE_TRANSIENT_BYTES
+    )
 
 
 def _checkpoint_input_gradient_bytes(
@@ -1454,7 +1535,11 @@ def _estimate_required_memory_bytes_from_values(
         ),
     )
     retained, workspace = (
-        self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments)
+        self._sequence_parallel_lora_floor(
+            self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments),
+            group_rows,
+            signature,
+        )
         if checkpoint_memory is None
         else checkpoint_memory
     )
@@ -1467,7 +1552,7 @@ def _estimate_required_memory_bytes_from_values(
             self._checkpoint_gradient_groups(group_rows, slot_refs)
         )
         if profiled is None and any(grad for _, grad in group_rows):
-            backward += _impl._COLD_RECOMPUTE_TRANSIENT_BYTES
+            backward += self._cold_recompute_transient_bytes()
     static_compute = max(
         static_compute,
         max(retained, checkpoint_floor[0])

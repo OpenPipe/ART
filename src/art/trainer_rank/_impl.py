@@ -131,6 +131,9 @@ _HEAD_CHUNK_TOKENS = 512
 # 32 MiB transients live at its peak (Qwen3.6-35B-A3B CP2: the RoPE frequencies
 # and a frozen linear's output, at 2k to 20k tokens); warm waves do not.
 _COLD_RECOMPUTE_TRANSIENT_BYTES = 64 * 2**20
+# The TP x SP traces (dense Qwen3.8-27B, TP2 and TP4) held a third: TE's 32 MiB
+# cuBLAS workspace, allocated by the process's first wave.
+_SEQUENCE_PARALLEL_COLD_TRANSIENT_BYTES = 3 * 32 * 2**20
 _PLANNER_REFINEMENT_BUDGET = 2_000
 _LAYOUT_SELECTION_CACHE_LIMIT = 64
 
@@ -1241,6 +1244,45 @@ def _gdn_layer_count(model: torch.nn.Module) -> int:
     return sum(isinstance(module, GatedDeltaNet) for module in model.modules())
 
 
+def _mixer_top_gaps(model: torch.nn.Module) -> tuple[int | None, int | None] | None:
+    """Layers between the top decoder layer and the highest attention / GDN layer.
+
+    ``None`` for a mixer kind the decoder lacks; ``None`` overall when the
+    decoder layers are unreadable.
+    """
+    try:
+        from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    except ImportError:
+        return None
+    try:
+        layers = list(_language_model(model).decoder.layers)
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+    gdn = [
+        any(isinstance(module, GatedDeltaNet) for module in layer.modules())
+        for layer in layers
+    ]
+    top = len(layers) - 1
+    return (
+        next((top - index for index in range(top, -1, -1) if not gdn[index]), None),
+        next((top - index for index in range(top, -1, -1) if gdn[index]), None),
+    )
+
+
+def _lora_modules_per_layer(model: torch.nn.Module) -> int:
+    """The most LoRA modules any one decoder layer holds (0 when unreadable)."""
+    try:
+        from art.megatron.lora import LoRA
+
+        layers = list(_language_model(model).decoder.layers)
+    except (AttributeError, ImportError, RuntimeError, TypeError):
+        return 0
+    return max(
+        (sum(type(module) is LoRA for module in layer.modules()) for layer in layers),
+        default=0,
+    )
+
+
 def _moe_layer_count(model: torch.nn.Module) -> int:
     """Number of mixture-of-experts layers in the model (0 when unavailable)."""
 
@@ -1984,10 +2026,13 @@ class TrainerRank:
         # Layers that run the gated-delta-net path (Qwen3.5-4B: 24 of 32); the
         # cost model prices GDN state hand-offs per GDN layer, not per layer.
         self._gdn_layers = _gdn_layer_count(runtime.model[0])
+        self._mixer_top_gaps = _mixer_top_gaps(runtime.model[0])
         if self._gdn_layers == 0 and bool(
             getattr(runtime.model_support_handler, "build_gdn_execution_spec", False)
         ):
             self._gdn_layers = self._num_layers
+            self._mixer_top_gaps = (None, 0)
+        self._lora_modules_per_layer = _lora_modules_per_layer(runtime.model[0])
         # A fitted layout cost table applies only to the execution classes it
         # was calibrated on (device class, dtype, model geometry, parallel
         # shape); other runtimes keep the previous score.
@@ -2897,16 +2942,18 @@ class TrainerRank:
         chunk_start = first_index // _HEAD_CHUNK_TOKENS * _HEAD_CHUNK_TOKENS
         return min(_HEAD_CHUNK_TOKENS, len(projected) - chunk_start)
 
-    def _sequence_parallel_floor_covered(self, layers: int, tp: int, cp: int) -> bool:
+    def _sequence_parallel_floor_covered(self, tp: int, cp: int) -> bool:
         """Whether the explicit TP x SP checkpoint floor applies to this model.
 
         Traced on dense Qwen3.8-27B (64 layers, GDN and gated attention) at
-        TP4 and at TP2 with sequence parallelism and CP1. The floor prices
-        each rank's boundary shards plus the recomputed layer's measured
-        workspace term by term (``_sequence_parallel_workspace_bytes``), so
-        it needs readable mixer geometry but no depth/width cover bound.
-        Other TP sizes, CP, MoE and replicated QKV (KV groups below TP) keep
-        today's pricing.
+        TP4 and at TP2 with sequence parallelism and CP1. The floor covers
+        each rank's boundary shards and the recomputed layer's measured
+        workspace with explicit terms (``_sequence_parallel_workspace_bytes``),
+        so it needs readable mixer geometry but, unlike the earlier repeated-
+        boundary cover, no depth/width bound: shallower and wider dense models
+        are now eligible and priced by the same terms (untraced). Other TP
+        sizes, CP, MoE and replicated QKV (KV groups below TP) keep today's
+        pricing.
         """
         geometry = self._geometry
         if tp not in (2, 4) or cp != 1 or self._moe_layers or geometry.moe_experts:
@@ -2942,8 +2989,10 @@ class TrainerRank:
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
     ) -> _SubforwardCost:
-        checkpoint_memory = self._checkpoint_memory_floor(
-            group_rows, slot_refs, gdn_segments
+        checkpoint_memory = self._sequence_parallel_lora_floor(
+            self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments),
+            group_rows,
+            signature,
         )
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=packed_tokens,
@@ -2994,7 +3043,7 @@ class TrainerRank:
             checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
         if gradient and self._memory_profiles.get(signature) is None:
-            checkpoint_workspace += _COLD_RECOMPUTE_TRANSIENT_BYTES
+            checkpoint_workspace += self._cold_recompute_transient_bytes()
         forward_required = required
         if gradient:
             required = max(
@@ -4918,6 +4967,8 @@ class TrainerRank:
     )
     _gdn_segment_layer_bytes = _memory._gdn_segment_layer_bytes
     _sequence_parallel_workspace_bytes = _memory._sequence_parallel_workspace_bytes
+    _sequence_parallel_lora_floor = _memory._sequence_parallel_lora_floor
+    _cold_recompute_transient_bytes = _memory._cold_recompute_transient_bytes
     _checkpoint_input_gradient_bytes = _memory._checkpoint_input_gradient_bytes
     _available_memory_bytes = _memory._available_memory_bytes
     _all_ranks_have_memory_profile = _memory._all_ranks_have_memory_profile

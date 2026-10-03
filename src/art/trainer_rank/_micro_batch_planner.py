@@ -1460,6 +1460,11 @@ def _fill_planner_snapshot(
         rank_fields["recompute_modules"] = sorted(self._recompute_modules)
         rank_fields["one_layer_recompute"] = self._one_layer_recompute()
         rank_fields["moe_forward_stages"] = getattr(self, "_moe_forward_stages", ())
+        gaps = getattr(self, "_mixer_top_gaps", None)
+        rank_fields["mixer_top_gaps"] = None if gaps is None else list(gaps)
+        rank_fields["lora_modules_per_layer"] = getattr(
+            self, "_lora_modules_per_layer", 0
+        )
         rank_fields["geometry"] = asdict(self._geometry)
         rank_fields["topology"] = list(plan.signature.topology)
 
