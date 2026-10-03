@@ -1150,8 +1150,8 @@ class _GroupLayout:
     # What each rank's recomputed CP attention keeps for backward beyond its
     # own-row activations (``retained_stage_record_bytes``).
     attention_retained: tuple[int, ...]
-    # Each rank's GDN segments, which hold recurrent states (none if unknown).
-    gdn_segments: tuple[int, ...] = ()
+    # Each rank's GDN recurrent states held at once (none if unknown).
+    gdn_states: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1914,7 +1914,19 @@ def _dense_mlp_recompute_bytes_per_token(
     else:
         mixers.add(Qwen3VLSelfAttention)
 
-    if type(decoder) is not TransformerBlock or not plain(decoder):
+    def traced(module: Any) -> bool:
+        """``plain``, or ART's empty-safe norm wrapper around the class forward."""
+        return plain(module) or plain(
+            module, _empty_safe_norm_forward, "_art_empty_safe_norm_physical_forward"
+        )
+
+    # The decoder and its final norm (run after the layers) are traced too.
+    final = getattr(decoder, "final_layernorm", None)
+    if (
+        type(decoder) is not TransformerBlock
+        or not plain(decoder)
+        or (final is not None and not all(map(traced, final.modules())))
+    ):
         return 0, 0
     expected = {
         "gated_linear_unit": True,
@@ -1990,14 +2002,7 @@ def _dense_mlp_recompute_bytes_per_token(
         for child in layer.modules():
             if child is layer or child is mixer:
                 continue
-            if not (
-                plain(child)
-                or plain(
-                    child,
-                    _empty_safe_norm_forward,
-                    "_art_empty_safe_norm_physical_forward",
-                )
-            ):
+            if not traced(child):
                 return 0, 0
             if not isinstance(child, LoRA):
                 continue

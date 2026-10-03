@@ -595,7 +595,7 @@ def _compute_group_layouts(
     layouts = []
     for group in plan.groups:
         batch = _impl._pad_packed_batch(group.packed, multiple=int(topology.tp))
-        attention, gdn, segments, rank_plans = context_parallel_rank_layouts(
+        attention, gdn, states, rank_plans = context_parallel_rank_layouts(
             group_ids=batch.group_ids,
             parent_ids=batch.parent_ids,
             topology=topology,
@@ -622,7 +622,7 @@ def _compute_group_layouts(
                     )
                     for rank_plan in rank_plans
                 ),
-                gdn_segments=segments or (),
+                gdn_states=states or (),
             )
         )
     return tuple(layouts)

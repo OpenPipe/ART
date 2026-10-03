@@ -159,6 +159,15 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         _wrap_like_art(layer)
     model = _dense_model(layers)
     assert _dense_mlp_recompute_bytes_per_token([model]) == (STAGE, NO_GRAD)
+    # The decoder's final norm, untouched or behind ART's empty-safe wrapper.
+    from art.megatron.gdn.operator import _empty_safe_norm_forward
+
+    norm: Any = torch.nn.LayerNorm(HIDDEN)
+    model.decoder.final_layernorm = norm
+    assert _dense_mlp_recompute_bytes_per_token([model]) == (STAGE, NO_GRAD)
+    norm._art_empty_safe_norm_physical_forward = norm.forward
+    norm.forward = MethodType(_empty_safe_norm_forward, norm)
+    assert _dense_mlp_recompute_bytes_per_token([model]) == (STAGE, NO_GRAD)
     assert _dense_mlp_recompute_bytes_per_token([model], hidden_size=HIDDEN + 1) == (
         0,
         0,
@@ -214,6 +223,9 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "helper_override",
         "helper_partial",
         "helper_callable",
+        "final_norm_hook",
+        "final_norm_class_forward",
+        "final_norm_override",
         "chunks",
     ],
 )
@@ -260,6 +272,15 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
             child = torch.nn.LayerNorm(4)
             edit(child)
             layer.self_attention.core_attention = child
+
+        return apply
+
+    def final_norm(edit):
+        # The decoder's final norm runs after the layers.
+        def apply():
+            norm = torch.nn.LayerNorm(4)
+            edit(norm)
+            model.decoder.final_layernorm = norm
 
         return apply
 
@@ -350,6 +371,15 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         ),
         "helper_callable": lambda: setattr(
             layer, "_forward_mlp", type("Helper", (), {"__call__": lambda *a: None})()
+        ),
+        "final_norm_hook": final_norm(
+            lambda norm: norm.register_forward_hook(lambda *args: None)
+        ),
+        "final_norm_class_forward": final_norm(
+            lambda norm: setattr(norm, "__class__", Norm)
+        ),
+        "final_norm_override": final_norm(
+            lambda norm: setattr(norm, "forward", MethodType(lambda s, x: x, norm))
         ),
         "chunks": lambda: None,
     }
@@ -518,7 +548,7 @@ def test_layout_floor_prices_each_rank_and_layer_type(gdn):
         attention_rows=(100, 80),
         gdn_rows=(120, 60) if gdn else None,
         attention_retained=(5_000, 90_000),
-        gdn_segments=(3, 40),
+        gdn_states=(3, 40),
     )
     # An attention layer keeps its input norm output and five query- and
     # KV-width tensors beside the executor's records; a GDN layer its traced
@@ -539,7 +569,7 @@ def test_layout_floor_prices_each_rank_and_layer_type(gdn):
         rows = {"attention": attention, "gdn": gdn_rows}
         extra = {
             "attention": layout.attention_retained[rank] * grad,
-            "gdn": math.ceil(layout.gdn_segments[rank] * states),
+            "gdn": math.ceil(layout.gdn_states[rank] * states / 2),
         }
         per_row = {
             k: widths[k] + 2 * HIDDEN * 2 + STAGE if grad else NO_GRAD for k in widths
@@ -794,7 +824,7 @@ def test_only_a_covered_dense_model_prices_layouts(monkeypatch):
     assert layout.gdn_rows is not None and sum(layout.gdn_rows) == plan.packed_tokens
     # Each rank's retention is the executor mirror over that rank's own plan.
     (group,) = plan.groups
-    _, _, segments, rank_plans = context_parallel_rank_layouts(
+    _, _, states, rank_plans = context_parallel_rank_layouts(
         group_ids=group.packed.group_ids,
         parent_ids=group.packed.parent_ids,
         topology=ParallelTopology(tp=1, cp=2),
@@ -816,8 +846,8 @@ def test_only_a_covered_dense_model_prices_layouts(monkeypatch):
         )
         for rank_plan in rank_plans
     )
-    assert segments is not None and layout.gdn_segments == segments
-    assert all(n >= 1 for n in segments)
+    assert states is not None and layout.gdn_states == states
+    assert all(n >= 2 for n in states)
     cost = r._plan_cost(plan)
     rows = sum(n for n, grad in r._plan_group_rows(plan) if grad)
     assert cost.checkpoint_input_gradient == rows * HIDDEN * 2
@@ -855,15 +885,90 @@ def test_gdn_segment_states_are_priced_on_each_ranks_layouts(monkeypatch, no_gra
     r = art_cp(_dense_rank(), monkeypatch)
     plan = r._plan_flat_forward(_short_and_branching(no_grad))
     (layout,) = r._plan_group_layouts(plan)
-    # Every independent request and branch is a segment on some rank.
-    assert sum(layout.gdn_segments) >= 72
-    states = math.ceil(max(layout.gdn_segments) * r._gdn_segment_layer_bytes())
-    stateless = replace(layout, gdn_segments=())
+    # Every independent request and branch is a segment on some rank, with an
+    # initial and a final state.
+    assert sum(layout.gdn_states) >= 2 * 72
+    states = math.ceil(max(layout.gdn_states) * r._gdn_segment_layer_bytes() / 2)
+    stateless = replace(layout, gdn_states=())
     monkeypatch.setattr(r, "_plan_group_layouts", lambda plan: (stateless,))
     without = r._plan_cost(plan).required
     monkeypatch.setattr(r, "_plan_group_layouts", lambda plan: (layout,))
     with_states = r._plan_cost(plan).required
     assert int(states * 1.1) // 2 < with_states - without <= int(states * 1.1) + 1
+
+
+def test_gdn_states_include_parents_imported_from_another_rank(monkeypatch):
+    """A prefix tree whose parents and children run on different CP ranks:
+    each rank holds an initial and a final state per executed segment plus
+    every parent state the executor's exchange imports."""
+    from art.megatron.context_parallel.runtime import (
+        _get_or_build_planning_bundle,
+        _plan_gdn_global_execution,
+        _plan_gdn_rank_execution,
+    )
+    from art.megatron.context_parallel.types import ParallelTopology
+    from art.megatron.training.microbatches import (
+        _context_parallel_config_for_provider,
+        _gdn_planner_config_for_provider,
+    )
+
+    r = art_cp(_dense_rank(), monkeypatch)
+    prefix, key = torch.arange(1000), 100_000
+    requests = []
+    for _ in range(3):
+        middle = torch.arange(key, key + 300)
+        for leaf in range(3):
+            tail = torch.arange(key + 1000 * (leaf + 1), key + 1000 * (leaf + 1) + 200)
+            requests.append(torch.cat([prefix, middle, tail]))
+        key += 10_000
+    plan = r._plan_flat_forward(
+        [ForwardInput(input_tokens=t, hidden_states=True) for t in requests]
+    )
+    (layout,) = r._plan_group_layouts(plan)
+    (group,) = plan.groups
+    topology = ParallelTopology(tp=1, cp=2)
+    config = _context_parallel_config_for_provider(
+        r.runtime.provider, r.device, r.runtime.model_support_handler
+    )
+    gdn_config = _gdn_planner_config_for_provider(
+        r.runtime.provider, r.runtime.model_support_handler
+    )
+    planning, bundle, _, _ = _get_or_build_planning_bundle(
+        group_ids=group.packed.group_ids,
+        parent_ids=group.packed.parent_ids,
+        topology=topology,
+        config=config,
+        original_seq_len=int(group.packed.tokens.shape[1]),
+        build_gdn_execution_spec=True,
+    )
+    decision = _plan_gdn_global_execution(
+        planning_key=planning,
+        bundle=bundle,
+        topology=topology,
+        gdn_planner_config=gdn_config,
+    )
+    imported = [
+        sum(
+            len(exchange.dest_family_indices)
+            for exchange in _plan_gdn_rank_execution(
+                planning_key=planning,
+                bundle=bundle,
+                topology=topology,
+                cp_rank=rank,
+                gdn_planner_config=gdn_config,
+            ).tree_state_exchanges_by_depth
+            if exchange is not None
+        )
+        for rank in range(2)
+    ]
+    assert any(imported), "the tree must import a parent state across ranks"
+    chains = sum(map(len, decision.chain_segments_by_depth))
+    executed = [
+        chains + sum(map(len, depths)) for depths in decision.segments_by_rank_depth
+    ]
+    assert layout.gdn_states == tuple(
+        2 * n + received for n, received in zip(executed, imported, strict=True)
+    )
 
 
 def test_adapter_gradients_pair_with_each_ranks_boundaries(monkeypatch):

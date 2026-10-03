@@ -448,12 +448,14 @@ def context_parallel_rank_layouts(
     tuple[int, ...] | None,
     tuple[RankRuntimePlan, ...],
 ]:
-    """Each CP rank's attention rows, GDN rows, GDN segments and attention plan.
+    """Each CP rank's attention rows, GDN rows, GDN states and attention plan.
 
     Uses the cached planning bundle and per-rank runtime plans that execution
     builds, so a memory estimate sees the layouts the ranks will run. A
-    rank's GDN segments are its own and every chained one (a chain can run
-    on every rank): each holds recurrent states while a GDN layer runs.
+    rank's GDN states bound what its GDN layer can hold at once: an initial
+    and a final state per executed segment (its own and every chained one)
+    and each parent state imported from another rank, as the executor's
+    state exchange (``_build_tree_state_exchanges_by_depth``) imports them.
     """
     planning_key, bundle, _group_ids_cpu, _parent_ids_cpu = (
         _get_or_build_planning_bundle(
@@ -466,7 +468,7 @@ def context_parallel_rank_layouts(
         )
     )
     attention = tuple(bundle.token_layout_index.token_counts_by_rank)
-    gdn = segments = None
+    gdn = states = None
     if build_gdn_execution_spec:
         decision = _plan_gdn_global_execution(
             planning_key=planning_key,
@@ -475,10 +477,22 @@ def context_parallel_rank_layouts(
             gdn_planner_config=gdn_planner_config,
         )
         gdn = tuple(decision.gdn_token_counts_by_rank)
-        chained = sum(map(len, decision.chain_segments_by_depth))
-        segments = tuple(
-            chained + sum(map(len, depths))
-            for depths in decision.segments_by_rank_depth
+        assert bundle.gdn_execution_spec is not None  # the decision needs it
+        owner, chained = decision.owner_by_node, decision.chained_nodes
+        imported: list[set[int]] = [set() for _ in gdn]
+        parents = bundle.gdn_execution_spec.tree_parent_indices
+        for child, parent in enumerate(parents):
+            if parent < 0 or chained[parent]:
+                continue
+            for rank in range(len(gdn)) if chained[child] else (owner[child],):
+                if rank != owner[parent]:
+                    imported[rank].add(parent)
+        chains = sum(map(len, decision.chain_segments_by_depth))
+        states = tuple(
+            2 * (chains + sum(map(len, depths))) + len(received)
+            for depths, received in zip(
+                decision.segments_by_rank_depth, imported, strict=True
+            )
         )
     plans = tuple(
         _get_or_build_bundle_rank_plan(
@@ -490,7 +504,7 @@ def context_parallel_rank_layouts(
         )
         for rank in range(len(attention))
     )
-    return attention, gdn, segments, plans
+    return attention, gdn, states, plans
 
 
 def _normalized_chunk_size(

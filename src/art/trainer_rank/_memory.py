@@ -1045,8 +1045,9 @@ def _dense_layout_floors(
     layer keeps its mixer width on its attention rows plus the executor's
     retained records, a GDN layer its width on its GDN rows; either keeps
     its residual, pre-MLP norm output and MLP stage on those rows. A no-grad
-    layer holds its stage on its rows. A GDN layer also holds each of the
-    rank's segments' recurrent states (``_gdn_segment_layer_bytes``).
+    layer holds its stage on its rows. A GDN layer also holds the rank's
+    recurrent states (``_GroupLayout.gdn_states``, half a
+    ``_gdn_segment_layer_bytes`` each).
     """
     refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
     if layouts is None or len({grad for _, grad in group_rows}) != 1:
@@ -1068,12 +1069,12 @@ def _dense_layout_floors(
             gdn = (
                 attention if layout.gdn_rows is None else max(1, layout.gdn_rows[rank])
             )
-            segments = layout.gdn_segments[rank] if layout.gdn_segments else 0
+            states = layout.gdn_states[rank] if layout.gdn_states else 0
             if gradient:
                 retained += hidden * (attention_inputs * attention + gdn_inputs * gdn)
             for kind, rows, extra in (
                 ("attention", attention, layout.attention_retained[rank] * gradient),
-                ("gdn", gdn, math.ceil(segments * self._gdn_segment_layer_bytes())),
+                ("gdn", gdn, math.ceil(states * self._gdn_segment_layer_bytes() / 2)),
             ):
                 if kind in widths:
                     per_row = widths[kind] + 2 * hidden + stage if gradient else no_grad
