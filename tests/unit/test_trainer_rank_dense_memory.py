@@ -27,9 +27,9 @@ from art.trainer_rank._impl import (
 
 HIDDEN, LAYERS, FFN, RANK = 2048, 40, 5632, 8
 CP2 = (1, 1, 2, 1)
-# 7F traced FC1 stage + one more FC1 triplet (6F) of early-run recompile
-# residue, plus the adapters' rank-wide intermediates.
-STAGE = (13 * FFN + 6 * RANK) * 2
+# The 7F traced FC1 stage (no recompile residue), plus the adapters'
+# rank-wide intermediates.
+STAGE = (7 * FFN + 6 * RANK) * 2
 # Three 2F FC1 tensors, residual/norm/CP-gather rows, rank intermediates.
 NO_GRAD = (6 * FFN + 6 * HIDDEN + 6 * RANK) * 2
 
@@ -155,7 +155,7 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         0,
     )
     # Qwen3.8-27B at rank 8: F 17,408, H 5,120.
-    assert (13 * 17408 + 48) * 2 == 452_704
+    assert (7 * 17408 + 48) * 2 == 243_808
 
 
 @pytest.mark.parametrize(
@@ -372,8 +372,8 @@ def test_covered_dense_recompute_charges_one_gradient_and_its_stage(rows):
     cost = price(r, values)
     assert cost.checkpoint_input_gradient == rows * HIDDEN * 2
     # The recomputed mixer keeps its activations beside the residual, the
-    # norm output and the MLP stage (with its recompile residue); with no
-    # learned profile the floor alone carries it.
+    # norm output and the MLP stage; with no learned profile the floor alone
+    # carries it.
     assert r._memory_profiles.get(values[2]) is None
     per_row = r._recomputed_mixer_bytes_per_token() + 2 * HIDDEN * 2 + STAGE
     assert cost.checkpoint_workspace >= rows * per_row + r._te_workspace_growth_bytes()
@@ -591,7 +591,7 @@ def test_every_adapter_the_layer_runs_is_priced_beside_arts_norm_wrapper():
     layers[0].self_attention.q_layernorm = norm
     ranks = 2 * (3 * RANK + 32)
     assert _dense_mlp_recompute_bytes_per_token([_dense_model(layers)]) == (
-        (13 * FFN + ranks) * 2,
+        (7 * FFN + ranks) * 2,
         (6 * FFN + 6 * HIDDEN + ranks) * 2,
     )
 
@@ -621,13 +621,13 @@ def test_named_slots_are_read_through_the_lookup_execution_uses():
 
     for adapter in adapters:
         load(adapter, 16)
-    widths = (13 * FFN + 2 * 3 * 16) * 2, (6 * FFN + 6 * HIDDEN + 2 * 3 * 16) * 2
+    widths = (7 * FFN + 2 * 3 * 16) * 2, (6 * FFN + 6 * HIDDEN + 2 * 3 * 16) * 2
     assert _dense_mlp_recompute_bytes_per_token([model], policy) == widths
     # A slot without an adapter on one module runs the base output there.
     for layer in layers:
         layer.mlp.linear_fc1.up_lora._slot_keys = {}
     assert _dense_mlp_recompute_bytes_per_token([model], policy) == (
-        (13 * FFN + 2 * 2 * 16) * 2,
+        (7 * FFN + 2 * 2 * 16) * 2,
         (6 * FFN + 6 * HIDDEN + 2 * 2 * 16) * 2,
     )
     load(adapters[0], 300)  # Loaded wider than the priced rank.

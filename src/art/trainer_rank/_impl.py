@@ -1798,9 +1798,10 @@ def _dense_mlp_recompute_bytes_per_token(
 
     - A recomputed layer's peak sits in its FC1 stage: the base output, the
       LoRA gate/up output and their sum (2F each) plus one F-wide tensor, 7F
-      per row (238 KB measured). Early in real q062 runs one rank at a time
-      held about one more FC1 triplet (6F; +4.8 GB at 23,552 rows), as a
-      recompile can leave a graph's outputs live; that is priced too.
+      per row (6.83F measured, cold and warm, on main with #925). Early real
+      q062 runs once showed one more FC1 triplet live (6F, as a recompile can
+      leave a graph's outputs live); those traces show none, so it is not
+      priced.
     - A no-grad layer holds its three 2F FC1 tensors, residual, norm and CP
       gather rows: 263 KB per row measured, priced as 6F + 6H.
 
@@ -1991,9 +1992,7 @@ def _dense_mlp_recompute_bytes_per_token(
     # Each of a layer's adapters, the mixer's too, keeps its rank-wide input
     # product and gradient.
     adapters = 2 * rank
-    return (7 * width + 6 * width + adapters) * 2, (
-        6 * width + 6 * hidden + adapters
-    ) * 2
+    return (7 * width + adapters) * 2, (6 * width + 6 * hidden + adapters) * 2
 
 
 def _moe_output_bytes_per_token(
