@@ -39,6 +39,7 @@ _REFUSALS = frozenset(
         "head_positions_unavailable",
         "head_statistics_fallback_unsupported",
         "head_logits_statistics_unsupported",
+        "head_topk_targets_unsupported",
         "runtime_facts_over_limit",
         "runtime_stage_inventory_over_limit",
         "runtime_request_inventory_over_limit",
@@ -237,6 +238,15 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         ):
             # Facts record statistics, not requested logits beside them.
             raise ValueError("head_logits_statistics_unsupported")
+        if (
+            projected
+            and rank._topology_key()[1] > 1
+            and group.grad_enabled
+            and any(r.top_k is not None for r in requests)
+            and any(r.target_tokens is not None for r in requests)
+        ):
+            # Facts record target rows, not top-k beside them.
+            raise ValueError("head_topk_targets_unsupported")
         backwards = (
             target_backward
             and group.grad_enabled
@@ -679,6 +689,7 @@ class ReplayRank(_impl.TrainerRank):
                 g["head_target_rows"],
                 target_backward=facts["head_target_backward"],
                 statistics=g["head_statistics"],
+                grad=g["grad"],
                 tp=self._topology_key()[1],
             )
             for g in groups

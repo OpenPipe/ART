@@ -714,6 +714,28 @@ def test_a_failed_kernel_falls_back_within_the_kernel_buffers(monkeypatch):
     assert torch.allclose(gradient.float(), expected.float(), rtol=1e-2, atol=1e-6)
 
 
+def test_the_bounded_statistics_never_write_fp32_logits(monkeypatch):
+    """An FP32 logits chunk: ``.float()`` would alias it, so every sub-chunk
+    goes through an owned FP32 work buffer."""
+    from art.trainer_rank import _impl
+
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+    torch.manual_seed(2)
+    logits = torch.randn(512, 1_000, dtype=torch.float32, requires_grad=True)
+    original = logits.detach().clone()
+    local_max, local_sum = _impl._eager_local_logsumexp_stats(logits)
+    log_z = local_max.detach() + torch.log(local_sum)
+    assert torch.equal(logits.detach(), original)
+    weights = torch.randn(512)
+    (gradient,) = torch.autograd.grad((log_z * weights).sum(), logits)
+    assert torch.equal(logits.detach(), original)
+    reference = _impl._vocab_parallel_log_z(logits)
+    (expected,) = torch.autograd.grad((reference * weights).sum(), logits)
+    assert torch.allclose(log_z, reference, rtol=1e-6, atol=1e-6)
+    assert torch.allclose(gradient, expected, rtol=1e-5, atol=1e-7)
+
+
 def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failure(
     monkeypatch,
 ):
@@ -747,53 +769,141 @@ def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failur
     assert (512, 1_000) in r._triton_head_stats_failures
 
 
+def _requests(rows, *, targets=True, top_k=None, logits=False):
+    tokens = torch.zeros(rows, dtype=torch.long)
+    return [
+        SimpleNamespace(
+            input_tokens=tokens,
+            target_tokens=tokens if targets else None,
+            logits=logits,
+            top_k=top_k,
+        )
+    ]
+
+
 def test_replay_prices_the_tp2_head_stage_as_live_admission(monkeypatch):
     from art.trainer_rank import _memory
 
     r = _cuda_head(monkeypatch)  # kernel path: capture declines the fallback
-    logits = [
-        SimpleNamespace(
-            input_tokens=torch.zeros(512, dtype=torch.long),
-            target_tokens=None,
-            logits=True,
-            top_k=None,
-        )
-    ]
-    for rows, grad, requests in (
-        (512, True, _labelled(512)),
-        (512, False, _labelled(512)),
-        (300, True, _labelled(300)),
-        (512, False, logits),
-    ):
+    dense = r._head_workspace_bytes(512)
+    cases = (
+        # rows, gradient, requests, target rows (as captured), kernel buffers
+        (512, True, _requests(512), 512, 3),  # logits, statistics, target gather
+        (512, False, _requests(512), 0, 1),
+        (300, True, _requests(300), 300, 3),
+        # Top-k only: logits, statistics gradient and top-k's scatter.
+        (512, True, _requests(512, targets=False, top_k=4), 0, 3),
+        (512, False, _requests(512, targets=False, top_k=4), 0, 1),
+    )
+    for rows, grad, requests, target_rows, buffers in cases:
         live = r._group_head_workspace_bytes(rows, requests, grad_enabled=grad)
-        statistics = requests[0].target_tokens is not None
-        # Capture's target rows: the projection, for target-only backward.
-        target_rows = rows if grad and statistics else 0
+        bounded = _memory._eager_stats_extra_bytes(124_160, rows)
+        assert live == buffers * r._head_workspace_bytes(rows) + bounded
         frozen = _memory._frozen_head_bytes(
             124_160,
             rows,
             target_rows,
             target_backward=True,
-            statistics=statistics,
+            statistics=True,
+            grad=grad,
             tp=2,
         )
         assert frozen == live
-    # The kernel path, not #1068's TP1 eager reservation, prices a TP2 chunk;
-    # requested logits keep its local logits plus both copies, each gathered
-    # to the full vocabulary (1 + 2 TP buffers).
-    dense = r._head_workspace_bytes(512)
-    assert r._group_head_workspace_bytes(512, _labelled(512), grad_enabled=True) == (
-        3 * dense + BOUNDED
-    )
-    assert r._group_head_workspace_bytes(512, logits, grad_enabled=False) == 5 * dense
-    # TP1 replay is #1068's capacity charge.
+    # Requested logits: the local logits, their indexed copy, the gather
+    # buffer and its concatenation (2 + 2 TP buffers), live and replayed.
+    logits = _requests(512, targets=False, logits=True)
+    assert r._group_head_workspace_bytes(512, logits, grad_enabled=False) == 6 * dense
+    for tp, units in ((2, 6), (4, 10)):
+        assert (
+            _memory._frozen_head_bytes(
+                124_160,
+                512,
+                0,
+                target_backward=True,
+                statistics=False,
+                grad=False,
+                tp=tp,
+            )
+            == units * dense
+        )
+    # TP1 replay is #1068's capacity charge (its gather is the identity).
     for statistics, units in ((True, 7), (False, 3)):
         assert (
             _memory._frozen_head_bytes(
-                1_000, 512, 0, target_backward=True, statistics=statistics, tp=1
+                1_000,
+                512,
+                0,
+                target_backward=True,
+                statistics=statistics,
+                grad=True,
+                tp=1,
             )
             == units * 512 * 1_000 * 2
         )
+
+
+class _ShapeChangingKernel(torch.autograd.Function):
+    """A mocked statistics kernel saving a different tensor set than the eager
+    paths (as the real kernel's top-k tokens do)."""
+
+    @staticmethod
+    def forward(ctx, logits):
+        local_max = logits.max(dim=-1).values.float()
+        local_sum = torch.exp(logits.float() - local_max[:, None]).sum(dim=-1)
+        ctx.save_for_backward(logits, local_max, torch.empty(logits.shape[0], 0))
+        return local_max, local_sum
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        _grad_max, grad_sum = grad_outputs
+        logits, local_max, _ = ctx.saved_tensors
+        return (torch.exp(logits.float() - local_max[:, None]) * grad_sum[:, None]).to(
+            logits.dtype
+        )
+
+
+@pytest.mark.parametrize("forward_fails", [True, False])
+def test_a_checkpoint_recompute_replays_the_forward_statistics_path(
+    monkeypatch, forward_fails
+):
+    """Schulman: a kernel that fails in the forward and succeeds in the
+    recompute (or the reverse) changed the saved tensors, a CheckpointError
+    under non-reentrant checkpointing."""
+    from art.trainer_rank import _impl
+
+    r = _cuda_head(monkeypatch, vocabulary=64)
+    weight = torch.randn(16, 32)
+    monkeypatch.setattr(
+        TrainerRank,
+        "_local_logits_from_hidden_rows",
+        lambda self, model, hidden, output_weight: hidden @ weight,
+    )
+    monkeypatch.setattr(_impl, "_triton_stats_enabled", lambda cuda, rows: True)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+    attempts = []
+
+    def kernel(name, logits, **kwargs):
+        # The first attempt (the forward) fails or succeeds; later ones flip.
+        attempts.append(name)
+        succeeds = (len(attempts) > 1) == forward_fails
+        return _ShapeChangingKernel.apply(logits) if succeeds else None
+
+    monkeypatch.setattr(_impl, "_try_triton_stats", kernel)
+    hidden = torch.randn(64, 16, requires_grad=True)
+    _, log_z, _ = r._checkpointed_head_stats(
+        None, hidden, output_weight=None, need_log_z=True, max_top_k=0
+    )
+    if forward_fails:
+        # The recompute replays the bounded eager statistics: no kernel retry.
+        log_z.sum().backward()
+        assert attempts == ["local_logsumexp_stats"]
+        assert hidden.grad is not None
+    else:
+        # A kernel that fails only in the recompute cannot reproduce the
+        # forward's saved tensors: a clear error, not a CheckpointError.
+        with pytest.raises(RuntimeError, match="failed in a checkpoint recompute"):
+            log_z.sum().backward()
 
 
 def test_replay_declines_tp_sp_adapter_estimates_without_ranks():

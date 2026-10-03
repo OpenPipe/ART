@@ -297,6 +297,7 @@ def _head_vocabulary(self: TrainerRank) -> int:
             for name in (
                 "_project_head",
                 "_project_vocab_parallel",
+                "_checkpointed_head_stats",
                 "_local_head_stats",
                 "_local_logits_from_hidden_rows",
             )
@@ -406,8 +407,11 @@ def _tp_head_workspace_bytes(
     The eager FP32 statistics keep #1068's seven BF16 buffers. Chunks whose
     kernel is attempted run it, or after a failure the bounded eager
     statistics (``_impl._EagerLocalStats``): the kernel path's buffers plus
-    ``_eager_stats_extra_bytes``. Requested logits keep #1068's local logits
-    plus both indexed copies, each gathered to the full vocabulary here.
+    ``_eager_stats_extra_bytes``. A gradient wave's kernel path holds the
+    saved logits and the statistics gradient, plus a dense gradient per
+    gathered output kind: the target gather's and top-k's scatter. Requested
+    logits hold the local logits, their indexed copy, the gather buffer and
+    its concatenation (Megatron's gather along the vocabulary): 2 + 2 TP.
     """
     dense = self._head_workspace_bytes(rows)
     if not _head_target_backward(self):
@@ -419,20 +423,26 @@ def _tp_head_workspace_bytes(
     )
     if not needs_statistics:
         logits = any(request.logits for request in requests)
-        return dense if lower_bound or not logits else (1 + 2 * tp) * dense
+        return dense if lower_bound or not logits else (2 + 2 * tp) * dense
     kernel = dense
-    if grad_enabled and any(request.target_tokens is not None for request in requests):
-        # IndexBackward's dense result overlaps saved logits and grad_logits.
-        target_dense = (
-            self._head_workspace_bytes(
-                self._head_target_chunk_rows(
-                    requests, positions=positions, lower_bound=lower_bound
+    if grad_enabled:
+        # Saved logits and the statistics gradient, then each gathered
+        # output's dense gradient: top-k's scatter and the target gather's.
+        kernel = 2 * dense
+        if any(request.top_k is not None for request in requests):
+            kernel += dense
+        if any(request.target_tokens is not None for request in requests):
+            kernel += (
+                self._head_workspace_bytes(
+                    self._head_target_chunk_rows(
+                        requests, positions=positions, lower_bound=lower_bound
+                    )
                 )
+                if any(
+                    request.logits or request.top_k is not None for request in requests
+                )
+                else dense
             )
-            if any(request.logits or request.top_k is not None for request in requests)
-            else dense
-        )
-        kernel = max(dense, 3 * target_dense)
     low = self._head_projection_rows(
         requests, positions=positions, lower_bound=True, uncapped=True
     )
@@ -452,7 +462,7 @@ def _tp_head_workspace_bytes(
         # An acceptance bound: any projected count the union can take.
         high = self._head_projection_rows(requests, positions=positions, uncapped=True)
         fallback = _head_fallback_bytes(self, low, high)
-    logits = (1 + 2 * tp) * dense if any(request.logits for request in requests) else 0
+    logits = (2 + 2 * tp) * dense if any(request.logits for request in requests) else 0
     return max(
         kernel + _eager_stats_extra_bytes(_head_vocabulary(self), rows),
         fallback,
@@ -476,13 +486,17 @@ def _frozen_head_bytes(
     *,
     target_backward: bool,
     statistics: bool,
+    grad: bool,
     tp: int,
 ) -> int:
     """Replay's head charge from frozen facts, as live admission prices it.
 
-    TP1 is #1068's capacity charge. TP > 1 prices the kernel path plus the
-    bounded statistics' increment, or the gathered logits copies: capture
-    declines TP > 1 waves with an eager chunk or with logits beside statistics.
+    TP1 is #1068's capacity charge. TP > 1 is ``_tp_head_workspace_bytes``'s
+    kernel path plus the bounded statistics' increment, or the gathered logits
+    copies. Capture declines TP > 1 waves with an eager chunk, with logits
+    beside statistics, or with top-k beside targets in a gradient wave: the
+    facts record none of these. A gradient wave with statistics but no target
+    rows is therefore top-k only.
     """
     dense = _dense_head_bytes(vocabulary, rows)
     if not target_backward:
@@ -490,10 +504,13 @@ def _frozen_head_bytes(
     if tp == 1:
         return dense * (7 if statistics else 3)
     if not statistics:
-        return (1 + 2 * tp) * dense
-    return max(
-        dense, 3 * _dense_head_bytes(vocabulary, target_rows)
-    ) + _eager_stats_extra_bytes(vocabulary, rows)
+        return (2 + 2 * tp) * dense
+    kernel = dense
+    if grad:
+        kernel = 2 * dense + (
+            _dense_head_bytes(vocabulary, target_rows) if target_rows else dense
+        )
+    return kernel + _eager_stats_extra_bytes(vocabulary, rows)
 
 
 def _head_fallback_bytes(self: TrainerRank, low: int, high: int) -> int:

@@ -5661,14 +5661,12 @@ class TrainerRank:
             chunk_rows = rows[start : start + _HEAD_CHUNK_TOKENS]
             # Recompute vocabulary-sized intermediates one chunk at a time in
             # backward; chunking alone otherwise retains every chunk's logits.
-            local_logits, log_z, local_topk = checkpoint(
-                self._local_head_stats,
+            local_logits, log_z, local_topk = self._checkpointed_head_stats(
                 model,
                 _select_positions(hidden_by_row, chunk_rows),
                 output_weight=output_weight,
                 need_log_z=need_log_z,
                 max_top_k=max_top_k,
-                use_reentrant=False,
             )
             logit_start, logit_end = logit_bounds[chunk_index : chunk_index + 2]
             logit_chunk_offsets = logit_rows[logit_start:logit_end] - start
@@ -5740,6 +5738,38 @@ class TrainerRank:
             # Do not retain prior chunk buffers while the next stats RHS runs.
             del local_logits, chunk_logits
 
+    def _checkpointed_head_stats(
+        self,
+        model: "GPTModel",
+        hidden: torch.Tensor,
+        *,
+        output_weight: torch.Tensor | None,
+        need_log_z: bool,
+        max_top_k: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
+    ]:
+        """One chunk's head statistics under non-reentrant checkpointing.
+
+        The recompute must save what the forward saved, so it replays the
+        statistics path the forward chose (``path``) instead of attempting
+        the kernels again.
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        return checkpoint(
+            self._local_head_stats,
+            model,
+            hidden,
+            output_weight=output_weight,
+            need_log_z=need_log_z,
+            max_top_k=max_top_k,
+            path=[],
+            use_reentrant=False,
+        )
+
     def _local_head_stats(
         self,
         model: "GPTModel",
@@ -5748,6 +5778,7 @@ class TrainerRank:
         output_weight: torch.Tensor | None,
         need_log_z: bool,
         max_top_k: int,
+        path: list[str] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -5761,29 +5792,58 @@ class TrainerRank:
         log_z: torch.Tensor | None = None
         local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
         if need_log_z:
-            topk_stats = _try_triton_local_topk_stats(local_logits, k=max_top_k)
+            # ``path`` holds the forward's statistics path; a checkpoint
+            # recompute replays it rather than attempting the kernels again.
+            recorded = path[0] if path else None
+            topk_stats = (
+                _try_triton_local_topk_stats(local_logits, k=max_top_k)
+                if recorded in (None, "topk")
+                else None
+            )
             logsumexp_stats = (
                 cast(
                     tuple[torch.Tensor, torch.Tensor] | None,
                     _try_triton_stats("local_logsumexp_stats", local_logits),
                 )
-                if topk_stats is None
+                if topk_stats is None and recorded in (None, "logsumexp")
                 else None
             )
             shape = (int(local_logits.shape[0]), int(local_logits.shape[1]))
-            if topk_stats is not None or logsumexp_stats is not None:
-                # A kernel ran at this chunk shape: admission may price it.
-                getattr(self, "_triton_head_stats_failures", set()).discard(shape)
-            elif _triton_stats_enabled(local_logits.is_cuda, shape[0]):
-                # An attempted kernel failed at this chunk shape. Admission
-                # priced the kernel's buffers, so compute the same statistics
-                # eagerly within them; later admissions price the shape for
-                # the eager fallback (_triton_head_stats) until a kernel
-                # succeeds at it again.
-                if not hasattr(self, "_triton_head_stats_failures"):
-                    self._triton_head_stats_failures = set()
-                self._triton_head_stats_failures.add(shape)
+            if recorded is None:
+                if topk_stats is not None or logsumexp_stats is not None:
+                    # A kernel ran at this chunk shape: admission may price it.
+                    getattr(self, "_triton_head_stats_failures", set()).discard(shape)
+                elif _triton_stats_enabled(local_logits.is_cuda, shape[0]):
+                    # An attempted kernel failed at this chunk shape. Admission
+                    # priced the kernel's buffers, so compute the same
+                    # statistics eagerly within them; later admissions price
+                    # the shape for the eager fallback (_triton_head_stats)
+                    # until a kernel succeeds at it again.
+                    if not hasattr(self, "_triton_head_stats_failures"):
+                        self._triton_head_stats_failures = set()
+                    self._triton_head_stats_failures.add(shape)
+                    logsumexp_stats = _eager_local_logsumexp_stats(local_logits)
+                    recorded = "bounded"
+                if path is not None:
+                    path.append(
+                        recorded
+                        or (
+                            "topk"
+                            if topk_stats is not None
+                            else "logsumexp"
+                            if logsumexp_stats is not None
+                            else "eager"
+                        )
+                    )
+            elif recorded == "bounded":
                 logsumexp_stats = _eager_local_logsumexp_stats(local_logits)
+            elif recorded in ("topk", "logsumexp") and (
+                topk_stats is None and logsumexp_stats is None
+            ):
+                raise RuntimeError(
+                    "the head statistics kernel failed in a checkpoint recompute "
+                    "after it succeeded in the forward"
+                )
             stats = topk_stats if topk_stats is not None else logsumexp_stats
             if stats is not None:
                 local_max, local_sum = stats[:2]
@@ -6994,11 +7054,14 @@ _EAGER_STATS_SUBCHUNKS = 64
 class _EagerLocalStats(torch.autograd.Function):
     """The statistics kernel's (local max, local sum) contract, computed eagerly.
 
-    Row sub-chunks keep one FP32 sub-chunk beside the BF16 logits in forward,
-    and beside the logits and their BF16 gradient in backward: the kernel
-    path's buffers (topk._LocalStatsFunction) plus 1/32 of one, instead of
-    the unchunked fallback's seven. Rows are independent, so sub-chunking
-    changes no per-row value.
+    The logits are processed in ``_EAGER_STATS_SUBCHUNKS`` row sub-chunks
+    (ceil(rows / 64) rows each) through one owned FP32 work buffer, beside
+    the logits in forward and beside the logits and their gradient in
+    backward: the kernel path's buffers (topk._LocalStatsFunction) plus that
+    buffer, instead of the unchunked fallback's seven. The logits are never
+    written. Rows are independent; the caller's rescale of local sums to the
+    global maximum equals the unchunked fallback in exact arithmetic, and
+    FP32 rounding may differ when ranks' local maxima differ.
     """
 
     @staticmethod
@@ -7007,11 +7070,18 @@ class _EagerLocalStats(torch.autograd.Function):
         step = max(1, -(-rows // _EAGER_STATS_SUBCHUNKS))
         local_max = logits.max(dim=-1).values.float()
         local_sum = torch.empty_like(local_max)
+        work = torch.empty(
+            (min(step, rows), int(logits.shape[1])),
+            dtype=torch.float32,
+            device=logits.device,
+        )
         for start in range(0, rows, step):
-            block = logits[start : start + step].float()
-            block.sub_(local_max[start : start + step, None]).exp_()
-            local_sum[start : start + step] = block.sum(dim=-1)
-            del block
+            stop = min(start + step, rows)
+            block = work[: stop - start]
+            block.copy_(logits[start:stop])  # owned: FP32 logits stay intact
+            block.sub_(local_max[start:stop, None]).exp_()
+            local_sum[start:stop] = block.sum(dim=-1)
+        del work
         ctx.save_for_backward(logits, local_max)
         ctx.step = step
         return local_max, local_sum
@@ -7026,12 +7096,19 @@ class _EagerLocalStats(torch.autograd.Function):
         if grad_local_sum is None:
             return grad.zero_()
         rows, step = int(logits.shape[0]), int(ctx.step)
+        work = torch.empty(
+            (min(step, rows), int(logits.shape[1])),
+            dtype=torch.float32,
+            device=logits.device,
+        )
         for start in range(0, rows, step):
-            block = logits[start : start + step].float()
-            block.sub_(local_max[start : start + step, None]).exp_()
-            block.mul_(grad_local_sum[start : start + step, None])
-            grad[start : start + step] = block
-            del block
+            stop = min(start + step, rows)
+            block = work[: stop - start]
+            block.copy_(logits[start:stop])  # owned: the saved logits stay intact
+            block.sub_(local_max[start:stop, None]).exp_()
+            block.mul_(grad_local_sum[start:stop, None])
+            grad[start:stop] = block
+        del work
         return grad
 
 
