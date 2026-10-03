@@ -75,9 +75,11 @@ jobs:
       BUILD_CLUSTER_NAME: art-gpu-build-${{ github.run_id }}-${{ github.run_attempt }}
       PREWARM_RUN_UID: ${{ github.run_id }}-${{ github.run_attempt }}
       PREWARM_INFRAS: ${{ inputs.prewarm_infras || 'k8s/cks-wb3 k8s/ext-collab2 k8s/serverless-training-central' }}
-      GPU_IMAGE_CLEANUP_ROOT: ${{ runner.temp }}/art-image-cleanup
 
     steps:
+      - name: Set image cleanup directory
+        run: echo "GPU_IMAGE_CLEANUP_ROOT=${RUNNER_TEMP}/art-image-cleanup" >> "${GITHUB_ENV}"
+
       - uses: actions/checkout@v4
 
       - name: Install uv
