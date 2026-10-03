@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future
+from contextlib import ExitStack
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import hashlib
@@ -1748,6 +1749,19 @@ def _forward_custom_payload(
 
 
 def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> bool:
+    group = _ensure_group(trainer)
+    with ExitStack() as publication:
+        _phase(
+            lambda: publication.enter_context(
+                trainer._checkpoint_slot_write(destination)
+            ),
+            "reserve checkpoint snapshot",
+            group,
+        )
+        return _snapshot_checkpoint(trainer, source, destination)
+
+
+def _snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> bool:
     """Clone one loaded checkpoint into a forward-only resident slot."""
     from art.trainer_rank._impl import (
         _CheckpointSlot,
@@ -1853,6 +1867,23 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
 
 
 def discard_snapshot_checkpoint(
+    trainer: TrainerRank, checkpoint: str, *, allow_missing: bool = False
+) -> None:
+    from art.trainer_rank._impl import Unset
+
+    group = _ensure_group(trainer)
+    with ExitStack() as publication:
+        _phase(
+            lambda: publication.enter_context(
+                trainer._checkpoint_slot_write(checkpoint, Unset)
+            ),
+            "reserve checkpoint discard",
+            group,
+        )
+        _discard_snapshot_checkpoint(trainer, checkpoint, allow_missing=allow_missing)
+
+
+def _discard_snapshot_checkpoint(
     trainer: TrainerRank, checkpoint: str, *, allow_missing: bool = False
 ) -> None:
     """Collectively discard a forward-only resident checkpoint snapshot."""
@@ -2054,6 +2085,26 @@ def _rollback_load(
 
 
 def load_checkpoint(
+    trainer: TrainerRank,
+    source: PreparedCheckpoint,
+    name: str,
+    *,
+    forward_only: bool = False,
+    _source_owner: object = None,
+) -> None:
+    group = _ensure_group(trainer)
+    with ExitStack() as publication:
+        _phase(
+            lambda: publication.enter_context(
+                trainer._checkpoint_slot_write(name, _source_owner)
+            ),
+            "reserve checkpoint load",
+            group,
+        )
+        _load_checkpoint(trainer, source, name, forward_only=forward_only)
+
+
+def _load_checkpoint(
     trainer: TrainerRank,
     source: PreparedCheckpoint,
     name: str,

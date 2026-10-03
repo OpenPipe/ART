@@ -13,7 +13,12 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from art.trainer_rank import TrainerRank, TrainerRankSlotStateError, _checkpoint
+from art.trainer_rank import (
+    MaterializedCheckpoint,
+    TrainerRank,
+    TrainerRankSlotStateError,
+    _checkpoint,
+)
 from art.trainer_rank._impl import _CheckpointSlot
 from tests.unit.test_trainer_rank_validation import _runtime, _slot_ref
 
@@ -37,7 +42,7 @@ def fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
         trainer._register_checkpoint_source(name, "immutable:" + name, prepare)
 
-    def load(rank, root, name, *, forward_only=False):
+    def load(rank, root, name, *, forward_only=False, **_ownership):
         assert entered.count(name) == exited.count(name) + 1
         loads.append(name)
         rank._checkpoint_slots[name] = _CheckpointSlot(
@@ -188,6 +193,235 @@ def test_mutable_resident_collision_does_not_freeze_or_replace_weights(
     assert not entered and not trainer._checkpoint_sources
 
 
+@pytest.mark.parametrize("fails", [False, True])
+def test_source_admission_cannot_race_legacy_slot_publication(
+    tmp_path, monkeypatch, fails
+):
+    trainer, remember, _entered, _exited, _loads = fixture(tmp_path, monkeypatch)
+    trainer._register_checkpoint_prefetch(
+        "saved", str(tmp_path), lambda: cast(Any, tmp_path)
+    ).result()
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+
+    def publish(rank, _prepared, name, *, forward_only=False):
+        entered.set()
+        assert release.wait(5)
+        if fails:
+            raise OSError("native load failed")
+        rank._checkpoint_slots[name] = _CheckpointSlot(snapshot=forward_only)
+
+    def load():
+        try:
+            trainer.load_checkpoint("saved")
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(_checkpoint, "load_checkpoint", publish)
+    worker = threading.Thread(target=load)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(TrainerRankSlotStateError, match="in-flight"):
+            remember("saved", 3)
+        assert not trainer._checkpoint_sources
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not trainer._checkpoint_slot_writes
+    if fails:
+        assert len(errors) == 1 and isinstance(errors[0], OSError)
+        remember("saved", 3)
+    else:
+        assert not errors and not trainer._checkpoint_slots["saved"].snapshot
+        with pytest.raises(TrainerRankSlotStateError, match="different ownership"):
+            remember("saved", 3)
+
+
+def test_native_snapshot_publication_and_remembered_names_exclude_each_other(
+    tmp_path, monkeypatch
+):
+    trainer, remember, _entered, _exited, _loads = fixture(tmp_path, monkeypatch)
+    trainer._checkpoint_slots["training"] = _CheckpointSlot()
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+
+    def publish(rank, _source, destination):
+        entered.set()
+        assert release.wait(5)
+        rank._checkpoint_slots[destination] = _CheckpointSlot(snapshot=True)
+        return True
+
+    def snapshot():
+        try:
+            trainer.snapshot_checkpoint("training", "saved")
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(_checkpoint, "_snapshot_checkpoint", publish)
+    worker = threading.Thread(target=snapshot)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(TrainerRankSlotStateError, match="in-flight"):
+            remember("saved", 3)
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not errors and not trainer._checkpoint_slot_writes
+    with pytest.raises(TrainerRankSlotStateError, match="different ownership"):
+        remember("saved", 3)
+    remember("remembered", 3)
+    with pytest.raises(TrainerRankSlotStateError, match="immutable source"):
+        trainer.snapshot_checkpoint("training", "remembered")
+
+
+def test_direct_native_load_cannot_replace_remembered_source(tmp_path, monkeypatch):
+    native_load = _checkpoint.load_checkpoint
+    trainer, remember, _entered, _exited, _loads = fixture(tmp_path, monkeypatch)
+    remember("saved", 3)
+    with pytest.raises(TrainerRankSlotStateError, match="immutable source"):
+        native_load(trainer, cast(Any, object()), "saved")
+    assert not trainer._checkpoint_slot_writes
+
+
+def test_source_admission_cannot_race_snapshot_discard_rollback(tmp_path, monkeypatch):
+    trainer, remember, _entered, _exited, _loads = fixture(tmp_path, monkeypatch)
+    slot = _CheckpointSlot(snapshot=True)
+    trainer._checkpoint_slots["saved"] = slot
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+    raise_distributed = _checkpoint.raise_distributed
+
+    def pause(error, phase, group):
+        if phase == "discard checkpoint snapshot":
+            assert "saved" not in trainer._checkpoint_slots
+            entered.set()
+            assert release.wait(5)
+            raise RuntimeError("discard failed")
+        return raise_distributed(error, phase, group)
+
+    def discard():
+        try:
+            trainer._discard_snapshot_checkpoint("saved")
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(_checkpoint, "raise_distributed", pause)
+    worker = threading.Thread(target=discard)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(TrainerRankSlotStateError, match="in-flight"):
+            remember("saved", 3)
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and len(errors) == 1
+    assert trainer._checkpoint_slots["saved"] is slot
+    assert not trainer._checkpoint_sources and not trainer._checkpoint_slot_writes
+
+
+def test_public_load_reserves_ownership_before_collective_branch(tmp_path, monkeypatch):
+    trainer, remember, _entered, _exited, _loads = fixture(tmp_path, monkeypatch)
+    trainer._register_checkpoint_prefetch(
+        "saved", str(tmp_path), lambda: cast(Any, tmp_path)
+    ).result()
+    entered, release = threading.Event(), threading.Event()
+    errors = []
+    gather = _checkpoint._gather
+
+    def pause(value, group):
+        if isinstance(value, tuple) and value == ("saved", None, False):
+            entered.set()
+            assert release.wait(5)
+        return gather(value, group)
+
+    def load():
+        try:
+            trainer.load_checkpoint("saved")
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(_checkpoint, "_gather", pause)
+    monkeypatch.setattr(
+        _checkpoint,
+        "load_checkpoint",
+        lambda rank, _source, name: rank._checkpoint_slots.update(
+            {name: _CheckpointSlot()}
+        ),
+    )
+    worker = threading.Thread(target=load)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(TrainerRankSlotStateError, match="in-flight"):
+            remember("saved", 3)
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and not errors and not trainer._checkpoint_slot_writes
+
+
+async def test_remembrance_detaches_eager_future_and_late_registration_is_admission(
+    tmp_path, monkeypatch
+):
+    import gc
+    import weakref
+
+    trainer, remember, _entered, _exited, _loads = fixture(tmp_path, monkeypatch)
+    tensor = torch.ones(3)
+    reference = weakref.ref(tensor)
+    future = trainer._register_checkpoint_prefetch(
+        "saved", str(tmp_path), lambda: cast(Any, tensor)
+    )
+    assert future.result() is tensor
+    remember("saved", 3)
+    assert (
+        not trainer._checkpoint_prefetch_sources and not trainer._checkpoint_prefetches
+    )
+    assert reference() is not None  # The already admitted waiter still owns its result.
+    del tensor, future
+    gc.collect()
+    assert reference() is None
+    future = trainer._register_checkpoint_prefetch(
+        "saved",
+        str(tmp_path),
+        lambda: pytest.fail("remembered source prepared eagerly"),
+    )
+    assert future.done() and future.result() is None
+    await trainer._checkpoint_prefetch_waiter("saved")
+    assert (
+        not trainer._checkpoint_prefetch_sources and not trainer._checkpoint_prefetches
+    )
+
+
+def test_remembrance_preserves_other_waiters_and_inflight_future_custody(
+    tmp_path, monkeypatch
+):
+    trainer, remember, _entered, _exited, _loads = fixture(tmp_path, monkeypatch)
+    entered, release = threading.Event(), threading.Event()
+
+    def prepare():
+        entered.set()
+        assert release.wait(5)
+        return cast(Any, tmp_path)
+
+    future = trainer._register_checkpoint_prefetch("saved", str(tmp_path), prepare)
+    assert entered.wait(5)
+    assert trainer._register_checkpoint_prefetch("other", str(tmp_path)) is future
+    try:
+        remember("saved", 3)
+        assert list(trainer._checkpoint_prefetch_sources) == ["other"]
+        assert list(trainer._checkpoint_prefetches.values()) == [future]
+        remember("other", 3)
+        assert not trainer._checkpoint_prefetches
+        assert not future.cancelled() and not future.done()
+    finally:
+        release.set()
+    assert future.result(timeout=5) == tmp_path
+
+
 def test_failed_preparation_can_retry_and_always_releases_load_lease(
     tmp_path, monkeypatch
 ):
@@ -288,6 +522,15 @@ def _mixed_residency_worker(index: int, directory: str) -> None:
             with pytest.raises(TrainerRankSlotStateError, match="live outputs"):
                 trainer._ensure_checkpoint_slots(("saved",))
             assert "saved" in trainer._checkpoint_sources
+            trainer._register_checkpoint_prefetch(
+                "partial", str(root), lambda: cast(Any, root)
+            ).result()
+            if index == 0:
+                source("partial", 3)
+            with pytest.raises(
+                TrainerRankSlotStateError, match="source differs across ranks"
+            ):
+                trainer.load_checkpoint(MaterializedCheckpoint("partial", str(root)))
             dist.barrier()
     finally:
         dist.destroy_process_group()

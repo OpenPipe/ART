@@ -2261,6 +2261,9 @@ def _checkpoint_load_failure_worker(
         )
         trainer._checkpoint_process_group = None
         trainer._checkpoint_slots = {}
+        trainer._checkpoint_sources = {}
+        trainer._checkpoint_slot_writes = {}
+        trainer._checkpoint_prefetch_lock = threading.Lock()
         trainer._slot_stack = []
         trainer._local_lora_adapter_templates = lambda: {}  # type: ignore[method-assign]
         trainer._guard_slot_can_load = lambda _ref: None  # type: ignore[method-assign]

@@ -2089,6 +2089,7 @@ class TrainerRank:
         ] = {}
         self._checkpoint_snapshot_lru: OrderedDict[str, None] = OrderedDict()
         self._checkpoint_snapshot_cache_size = 2
+        self._checkpoint_slot_writes: dict[str, int] = {}
         self._prepared_lora_exports: dict[str, tuple[str, _PreparedLoraExport]] = {}
         self._checkpoint_prefetches: dict[str, Future[PreparedCheckpoint]] = {}
         self._checkpoint_prefetch_sources: dict[str, str] = {}
@@ -2354,8 +2355,8 @@ class TrainerRank:
 
     @staticmethod
     async def _await_checkpoint_prefetch(
-        future: Future[PreparedCheckpoint],
-    ) -> PreparedCheckpoint:
+        future: Future[T],
+    ) -> T:
         return await asyncio.shield(asyncio.wrap_future(future))
 
     def snapshot_checkpoint(self, source: str, destination: str) -> bool:
@@ -5000,6 +5001,7 @@ class TrainerRank:
     prefetch_checkpoints = _slots.prefetch_checkpoints
     _register_checkpoint_prefetch = _slots._register_checkpoint_prefetch
     _register_checkpoint_source = _slots._register_checkpoint_source
+    _checkpoint_slot_write = _slots._checkpoint_slot_write
     _checkpoint_snapshot_state = _slots._checkpoint_snapshot_state
     _trim_checkpoint_snapshots = _slots._trim_checkpoint_snapshots
     _checkpoint_prefetch_waiter = _slots._checkpoint_prefetch_waiter
