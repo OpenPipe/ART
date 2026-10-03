@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextlib import contextmanager
 from dataclasses import fields, is_dataclass
 import math
-import threading
-from typing import Any, Literal, SupportsIndex, cast
-import weakref
+from typing import Any, Literal, cast
 
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
@@ -17,43 +14,12 @@ from pydantic.main import IncEx
 from ..openai import ART_MOE_ROUTING_METADATA_KEY
 
 type _StringPool = dict[str, str]
-_PICKLE_STATE = threading.local()
-_OPAQUE_PICKLE_MODELS: weakref.WeakValueDictionary[int, _StringInterningModel] = (
-    weakref.WeakValueDictionary()
-)
-
-
-@contextmanager
-def _without_pickle_string_interning():
-    previous = getattr(_PICKLE_STATE, "skip_string_interning", False)
-    _PICKLE_STATE.skip_string_interning = True
-    try:
-        yield
-    finally:
-        _PICKLE_STATE.skip_string_interning = previous
 
 
 class _StringInterningModel(BaseModel):
-    """Intern strings once, immediately before this graph is pickled."""
+    """Trajectory model without automatic string interning during pickle."""
 
     model_config = pydantic.ConfigDict(ser_json_inf_nan="strings")
-
-    # Process-local optimization state: omitting it from Pydantic private state keeps
-    # equality and serialization unchanged, and lets a receiving process prepare the
-    # graph again after local mutation.
-    __slots__ = ("_art_pickle_strings_interned",)
-
-    def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
-        if (
-            not getattr(_PICKLE_STATE, "skip_string_interning", False)
-            and not getattr(self, "_art_pickle_strings_interned", False)
-            and _OPAQUE_PICKLE_MODELS.get(id(self)) is not self
-        ):
-            _intern_strings(self)
-        return super().__reduce_ex__(protocol)
-
-    def _mark_pickle_strings_interned(self) -> None:
-        object.__setattr__(self, "_art_pickle_strings_interned", True)
 
 
 def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
@@ -65,8 +31,6 @@ def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
     pending = [(value, False)]
     seen: dict[tuple[int, bool], object] = {}
     numeric_lists: dict[int, object] = {}
-    models: list[_StringInterningModel] = []
-    opaque = False
     while pending:
         item, hashed = pending.pop()
         kind = type(item)
@@ -81,16 +45,15 @@ def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
         ):
             continue
         if hashed and kind is not tuple and kind is not frozenset:
-            opaque = True
+            return
         item_id = id(item)
         visit = (item_id, hashed)
         if visit in seen:
             continue
         seen[visit] = item
         if isinstance(item, BaseModel):
-            opaque |= kind.__hash__ is not None
-            if isinstance(item, _StringInterningModel):
-                models.append(item)
+            if kind.__hash__ is not None:
+                return
             pending.extend((child, False) for child in item.__dict__.values())
             for extra in (item.__pydantic_extra__, item.__pydantic_private__):
                 if extra is not None:
@@ -118,17 +81,14 @@ def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
                 pending.extend(
                     (child, child_hashed) for child in base.__iter__(cast(Any, item))
                 )
-        elif kind.__module__.startswith("art.trajectories") and is_dataclass(item):
-            opaque |= kind.__hash__ is not None
+        elif (
+            is_dataclass(item)
+            and type(kind.__module__) is str
+            and kind.__module__.startswith("art.trajectories")
+        ):
+            if kind.__hash__ is not None:
+                return
             pending.extend((getattr(item, field.name), False) for field in fields(item))
-    if opaque:
-        # Nested ART models otherwise restart interning from their own pickle
-        # reducers, after the enclosing hash-sensitive graph has been examined.
-        # Keep this bookkeeping outside model state: even our private flag may
-        # participate in a custom hash. Integer keys never hash the model.
-        for model in models:
-            _OPAQUE_PICKLE_MODELS[id(model)] = model
-        return
     _intern_value(value, {} if pool is None else pool, numeric_lists)
 
 
@@ -151,8 +111,6 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         if extra is not None and id(extra) not in memo:
             memo[id(extra)] = extra
             _intern_mapping(cast(dict[object, object], extra), pool, memo)
-        if isinstance(value, _StringInterningModel):
-            value._mark_pickle_strings_interned()
         return value
     if type(value) is dict:
         memo[value_id] = value
@@ -171,7 +129,11 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         for item in value:
             _intern_value(item, pool, memo)
         return value
-    if is_dataclass(value) and type(value).__module__.startswith("art.trajectories"):
+    if (
+        is_dataclass(value)
+        and type(type(value).__module__) is str
+        and type(value).__module__.startswith("art.trajectories")
+    ):
         memo[value_id] = value
         for field in fields(value):
             object.__setattr__(

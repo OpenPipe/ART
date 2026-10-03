@@ -28,7 +28,7 @@ from . import (
     Trajectory,
     TrajectoryGroup,
 )
-from ._serialization import _rebind_history_sources, _without_pickle_string_interning
+from ._serialization import _rebind_history_sources
 
 _ResultT = TypeVar("_ResultT")
 _ValueT = TypeVar("_ValueT")
@@ -578,11 +578,10 @@ def _process_payloads(
     values: Sequence[Trajectory], options: _ProcessOptions
 ) -> list[bytes]:
     try:
-        with _without_pickle_string_interning():
-            return [
-                pickle.dumps((value, options), protocol=pickle.HIGHEST_PROTOCOL)
-                for value in values
-            ]
+        return [
+            pickle.dumps((value, options), protocol=pickle.HIGHEST_PROTOCOL)
+            for value in values
+        ]
     except Exception as error:
         raise _ProcessTransferError(
             f"could not serialize process input: {type(error).__name__}: {error}"

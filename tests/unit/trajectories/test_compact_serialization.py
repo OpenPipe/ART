@@ -85,7 +85,7 @@ def test_explicit_memory_compaction_interns_nested_models_keys_and_cycles() -> N
     assert next(iter(trajectory.metadata["frozenset"])) == canonical
 
 
-def test_only_pickle_boundary_interns_validated_finished_and_grouped_values() -> None:
+def test_only_explicit_boundary_interns_validated_finished_and_grouped_values() -> None:
     repeated = _long()
     trajectory = art.Trajectory.model_validate(
         {"metadata": {"first": _fresh(repeated), "second": _fresh(repeated)}}
@@ -119,6 +119,11 @@ def test_only_pickle_boundary_interns_validated_finished_and_grouped_values() ->
         deep.trajectories[0].metadata["first"]
         is not deep.trajectories[1].metadata["value"]
     )
+    before = (trajectory.metadata["first"], trajectory.metadata["second"])
+    pickle.dumps(group)
+    assert trajectory.metadata["first"] is before[0]
+    assert trajectory.metadata["second"] is before[1]
+    tr.compact_memory(group)
     restored = pickle.loads(pickle.dumps(group))
     canonical = trajectory.metadata["first"]
     assert trajectory.metadata["second"] is canonical
@@ -179,6 +184,8 @@ def test_capture_defers_interning_and_no_capture_hides_scope() -> None:
             assert hidden_token is None
 
     pickle.dumps(trajectory)
+    assert exchange.request["model"] is not exchange.response.model
+    tr.compact_memory(trajectory)
     assert exchange.request["model"] is exchange.response.model
 
 
@@ -900,13 +907,14 @@ def test_compact_json_round_trips_all_kinds_and_protocol_source_joins() -> None:
                         )
 
 
-def test_pickle_interning_reduces_pickle_and_compact_json_sizes() -> None:
+def test_explicit_interning_reduces_pickle_and_compact_json_sizes() -> None:
     trajectory = art.Trajectory()
     repeated = _long() * 4
     trajectory.metadata["items"] = [_fresh(repeated) for _ in range(200)]
     items = trajectory.metadata["items"]
     before_memory = sum(sys.getsizeof(item) for item in items)
     before_pickle = len(pickle.dumps(trajectory.model_dump()))
+    tr.compact_memory(trajectory)
     pickled = pickle.dumps(trajectory)
     after_memory = sum(
         sys.getsizeof(item) for item in {id(item): item for item in items}.values()
@@ -919,9 +927,7 @@ def test_pickle_interning_reduces_pickle_and_compact_json_sizes() -> None:
     assert _json_size(compact) < _json_size(plain) / 4
 
 
-def test_pickle_prepares_nested_graph_once_and_receiver_can_prepare_again(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_pickle_never_runs_implicit_compaction(monkeypatch: pytest.MonkeyPatch) -> None:
     from art.trajectories import _serialization
 
     repeated = _long()
@@ -929,28 +935,17 @@ def test_pickle_prepares_nested_graph_once_and_receiver_can_prepare_again(
         metadata={"first": _fresh(repeated), "second": _fresh(repeated)}
     )
     group = art.TrajectoryGroup([trajectory])
-    calls: list[object] = []
-    intern_strings = _serialization._intern_strings
 
-    def counted(value: object, pool: dict[str, str] | None = None) -> None:
-        calls.append(value)
-        intern_strings(value, pool)
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("pickle must not mutate the live graph")
 
-    monkeypatch.setattr(_serialization, "_intern_strings", counted)
-
+    monkeypatch.setattr(_serialization, "_intern_strings", forbidden)
     payload = pickle.dumps(group)
-    assert calls == [group]
     pickle.dumps(group)
-    assert calls == [group]
-
     restored = pickle.loads(payload)
     restored.trajectories[0].metadata["third"] = _fresh(repeated)
     pickle.dumps(restored)
-    assert calls == [group, restored]
-    assert (
-        restored.trajectories[0].metadata["third"]
-        is restored.trajectories[0].metadata["first"]
-    )
+    assert trajectory.metadata["first"] is not trajectory.metadata["second"]
 
 
 def test_cloudpickle_preserves_shared_references() -> None:

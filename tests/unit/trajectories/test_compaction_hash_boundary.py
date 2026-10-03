@@ -7,7 +7,6 @@ from pydantic import BaseModel, ConfigDict
 import pytest
 
 from art.trajectories import Trajectory, compact_memory
-from art.trajectories._serialization import _OPAQUE_PICKLE_MODELS
 
 
 class IdentityLabel(BaseModel):
@@ -172,14 +171,11 @@ def test_internal_bookkeeping_does_not_mutate_hash_sensitive_model(kind):
     assert contains(kind, restored.metadata["container"], restored.metadata["member"])
 
 
-def test_opaque_pickle_identity_bookkeeping_does_not_retain_models():
+def test_explicit_fallback_does_not_retain_models():
     child = Trajectory()
     outer = Trajectory(metadata={"member": IdentityLabel(label="x"), "child": child})
     compact_memory(outer)
-    identities = id(outer), id(child)
     refs = weakref.ref(outer), weakref.ref(child)
-    assert all(identity in _OPAQUE_PICKLE_MODELS for identity in identities)
     del child, outer
     gc.collect()
     assert all(ref() is None for ref in refs)
-    assert all(identity not in _OPAQUE_PICKLE_MODELS for identity in identities)

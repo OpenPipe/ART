@@ -77,6 +77,7 @@ def test_key_compaction_preserves_order_values_and_cycles(use_pickle):
     )
     before = list(mapping)
 
+    compact_memory(trajectory)
     restored = (
         pickle.loads(pickle.dumps(trajectory))
         if use_pickle
