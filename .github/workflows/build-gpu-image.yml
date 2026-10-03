@@ -280,7 +280,8 @@ jobs:
               --config kubernetes.pod_config.spec.activeDeadlineSeconds=604800 \
               "EXPECTED_ART_IMAGE_REVISION=${GITHUB_SHA} python -c '${smoke_code}'"
 
-          kubectl --context cks-wb3 get pods -n default \
+          smoke_namespace="$(kubectl config view -o jsonpath='{.contexts[?(@.name=="cks-wb3")].context.namespace}')"
+          kubectl --context cks-wb3 get pods -n "${smoke_namespace:-default}" \
             -l "art.openpipe/image-run=${PREWARM_RUN_UID}" \
             -o jsonpath='{range .items[*]}{.metadata.name} {.spec.containers[0].image}{"\n"}{end}'
 
@@ -342,7 +343,7 @@ jobs:
           python3 scripts/ci/gpu-image-cleanup.py --context cks-wb3 \
             --selector "art.openpipe/build-run=${PREWARM_RUN_UID}" \
             --receipt "${GPU_IMAGE_CLEANUP_ROOT}/builder.json" || status=1
-          python3 scripts/ci/gpu-image-cleanup.py --context cks-wb3 --kinds pod service \
+          python3 scripts/ci/gpu-image-cleanup.py --context cks-wb3 --namespace-from-context --kinds pod service \
             --selector "art.openpipe/image-run=${PREWARM_RUN_UID}" \
             --receipt "${GPU_IMAGE_CLEANUP_ROOT}/smoke.json" || status=1
           while IFS= read -r infra; do

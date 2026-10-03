@@ -22,7 +22,10 @@ def cleanup(context, namespace, selector, kinds, receipt, seconds=60):
         raise ValueError("Bounded temporary Pod/Service cleanup required")
     labels = dict(part.split("=", 1) for part in selector.split(","))
     if (
-        not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", namespace)
+        (
+            namespace is not None
+            and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", namespace)
+        )
         or not any(
             key in labels
             for key in (
@@ -77,6 +80,15 @@ def cleanup(context, namespace, selector, kinds, receipt, seconds=60):
             return (Path(directory) / "stdout").read_text()
 
     try:
+        if namespace is None:
+            config = json.loads(command("config", "view", "-o", "json"))
+            contexts = [item for item in config["contexts"] if item["name"] == context]
+            if len(contexts) != 1:
+                raise ValueError("Exact smoke kubeconfig context required")
+            namespace = contexts[0]["context"].get("namespace") or "default"
+            if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", namespace):
+                raise ValueError("Invalid context namespace")
+            result["namespace"] = namespace
         while True:
             found = []
             for kind in kinds:
@@ -129,6 +141,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--context", required=True)
     parser.add_argument("--namespace", default="default")
+    parser.add_argument("--namespace-from-context", action="store_true")
     parser.add_argument("--selector", required=True)
     parser.add_argument("--kinds", nargs="+", default=["pod"])
     parser.add_argument("--receipt", type=Path, required=True)
@@ -138,7 +151,7 @@ def main():
         json.dumps(
             cleanup(
                 args.context,
-                args.namespace,
+                None if args.namespace_from_context else args.namespace,
                 args.selector,
                 args.kinds,
                 args.receipt,

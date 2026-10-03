@@ -49,8 +49,31 @@ def api(monkeypatch):
         assert 0 < seconds <= 2
         args = argv[4:]
         state["events"].append(args)
-        if args[0] == "get":
-            assert args[2:] == ["-n", "default", "-l", f"{LABEL}=123-1", "-o", "json"]
+        if args[0] == "config":
+            Path(stdout.name).write_text(
+                json.dumps(
+                    {
+                        "contexts": [
+                            {
+                                "name": state.get("context_name", "offline"),
+                                "context": {
+                                    "namespace": state.get("namespace", "default")
+                                },
+                            }
+                        ]
+                    }
+                )
+            )
+            output.write_text("")
+        elif args[0] == "get":
+            assert args[2:] == [
+                "-n",
+                state.get("namespace", "default"),
+                "-l",
+                f"{LABEL}=123-1",
+                "-o",
+                "json",
+            ]
             if state.get("get_error"):
                 output.write_text("offline API unavailable")
                 raise subprocess.CalledProcessError(1, argv)
@@ -60,9 +83,10 @@ def api(monkeypatch):
             assert args[:2] == ["delete", "--raw"]
             body = json.loads(Path(args[4]).read_text())
             assert body["preconditions"] == {"uid": "owned-uid"}
+            namespace = state.get("namespace", "default")
             assert args[2] in (
-                "/api/v1/namespaces/default/pods/owned",
-                "/api/v1/namespaces/default/services/owned",
+                f"/api/v1/namespaces/{namespace}/pods/owned",
+                f"/api/v1/namespaces/{namespace}/services/owned",
             )
             output.write_text("")
             Path(stdout.name).write_text("")
@@ -110,6 +134,37 @@ def test_uid_replacement_conflict_preserves_peer(api, tmp_path):
     assert api["replacement_preserved"]
 
 
+def test_smoke_census_uses_the_effective_context_namespace(api, tmp_path):
+    api["namespace"] = "smoke-owned"
+    api["pod"] = [resource(namespace="smoke-owned")]
+    api["service"] = [resource("Service", namespace="smoke-owned")]
+    result = cleanup.cleanup(
+        "offline",
+        None,
+        f"{LABEL}=123-1",
+        ["pod", "service"],
+        tmp_path / "receipt.json",
+        seconds=2,
+    )
+    assert result["namespace"] == "smoke-owned" and result["outcome"] == "ABSENT"
+
+
+def test_missing_smoke_context_cannot_claim_absence(api, tmp_path):
+    api["context_name"] = "peer"
+    with pytest.raises(ValueError, match="Exact smoke"):
+        cleanup.cleanup(
+            "offline",
+            None,
+            f"{LABEL}=123-1",
+            ["pod"],
+            tmp_path / "receipt.json",
+            seconds=2,
+        )
+    result = json.loads((tmp_path / "receipt.json").read_text())
+    assert result["outcome"] == "UNKNOWN" and result["namespace"] is None
+    assert all(event[0] == "config" for event in api["events"])
+
+
 @pytest.mark.parametrize("fault", ["get_error", "delete_error", "finalizer"])
 def test_unproved_cleanup_is_unknown_and_fails(api, tmp_path, fault):
     api[fault] = True
@@ -150,6 +205,7 @@ def test_workflow_cleanup_is_always_bounded_and_uploaded():
     )
     assert fallback["if"] == "${{ always() }}" and fallback["timeout-minutes"] == 6
     assert "--kinds pod service" in fallback["run"]
+    assert "--namespace-from-context" in fallback["run"]
     assert "|| true" not in fallback["run"]
     upload = next(
         step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
