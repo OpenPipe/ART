@@ -1,0 +1,79 @@
+---
+title: "SkyPilot"
+description: "Provision a GPU for ART on Kubernetes or any cloud with SkyPilot"
+---
+
+# SkyPilot Integration
+
+`LocalBackend` needs a machine with a modern NVIDIA GPU. If you don't have one handy, [SkyPilot](https://github.com/skypilot-org/skypilot) can launch it for you on Kubernetes or any major cloud (AWS, GCP, Azure, and [more](https://docs.skypilot.co/en/latest/getting-started/installation.html)). This requires no ART-side code: `LocalBackend` runs unchanged on the machine SkyPilot provisions.
+
+## Setup
+
+Install SkyPilot with the infrastructure you use, then verify your credentials:
+
+```bash
+pip install "skypilot[kubernetes]"  # or [aws], [gcp], [azure], ...
+sky check
+```
+
+## Define the machine
+
+Create `art.yaml` next to your training script:
+
+```yaml
+resources:
+  accelerators: ["H100:1", "H200:1", "A100-80GB:1"]  # tried in order
+
+workdir: .  # sync this directory to the cluster
+
+envs:
+  PYTHONUTF8: "1"  # avoids an encoding issue in unsloth-zoo
+
+setup: |
+  sudo apt-get update && sudo apt-get install -y python3.12-dev  # needed by torch inductor
+  export PATH="$HOME/.local/bin:$PATH"  # make sure uv is on PATH
+  uv venv --python 3.12 ~/art-venv
+  source ~/art-venv/bin/activate
+  # --torch-backend matches CUDA wheels; ninja is needed by flashinfer
+  uv pip install --torch-backend=auto "openpipe-art[backend]" ninja
+
+run: |
+  source ~/art-venv/bin/activate
+  python train.py
+```
+
+Your training script uses `LocalBackend` exactly as it would on any other machine:
+
+```python
+from art.local import LocalBackend
+
+backend = LocalBackend(path="./.art")
+```
+
+## Launch
+
+```bash
+sky launch -c art art.yaml
+```
+
+SkyPilot provisions the first available of the listed GPUs across your enabled infrastructure, syncs your working directory, and runs the script, streaming its output. On the first rollout, ART bootstraps a separate vLLM runtime environment, so expect a few quiet minutes in the logs before training output appears. From there:
+
+```bash
+sky logs art        # reattach to output (Ctrl-C detaches without killing the job)
+ssh art             # drop into the machine, e.g. to run in tmux
+sky down art        # tear it down when finished
+```
+
+`sky down` deletes the cluster's disk. With the `path="./.art"` above, checkpoints land in `.art/` inside the synced directory, so copy anything you want to keep first (`rsync -Pavz art:sky_workdir/.art ./`) or mount a bucket with [`file_mounts`](https://docs.skypilot.co/en/latest/reference/yaml-spec.html).
+
+To reach the vLLM or ART server from outside the cluster, add `ports: [7999, 8000]` under `resources` and get the URL with `sky status --endpoints art`.
+
+For iterating, keep the cluster up and rerun with `sky exec art art.yaml` after local edits; only the `run` section executes again.
+
+Environment variables like `WANDB_API_KEY` can be passed from your shell with `sky launch ... --secret WANDB_API_KEY`.
+
+## Further reading
+
+- [SkyPilot docs](https://docs.skypilot.co/)
+- [Task YAML reference](https://docs.skypilot.co/en/latest/reference/yaml-spec.html)
+- [Managed jobs](https://docs.skypilot.co/en/latest/examples/managed-jobs.html) for long-running training with automatic recovery
