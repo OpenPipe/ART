@@ -234,7 +234,56 @@ def test_literal_content_is_not_inferred_from_source_thinking_mode(case: str) ->
     if case == "visible_only":
         cast(dict[str, Any], history.messages[-1]).pop("reasoning")
     original = history.model_dump(mode="python")
-    _outcome(history, tokenizer, chat_template=_RENDER_OVERRIDE)
+    tokenized = _tokenize._tokenize_chat_view(
+        history,
+        base_model=None,
+        tokenizer=tokenizer,
+        chat_template=None,
+        chat_template_kwargs=None,
+        _projection_matches=_tokenize._history_render_state(history).projection_matches,
+        _recorded_boundaries=False,
+    )
+    # Independent public transcript and source-field oracles, not a second run
+    # with an already-inert workaround disabled.
+    expected = (
+        "<|im_start|>user\nPublic query.<|im_end|>\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n" + _LITERAL
+    )
+    assert tokenizer.rendered[0] == expected + "<|im_end|>\n"
+    structured = case in {"structured", "alias"}
+    assert tokenizer.decode(tokenized.tokens) == expected + (
+        "" if structured else "<|im_end|>\n"
+    )
+    assert tokenizer.calls[0][-1] == {
+        "role": "assistant",
+        "content": _LITERAL,
+        **({"reasoning": "explicit reasoning"} if structured else {}),
+    }
+    sampled = [
+        i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED
+    ]
+    expected_sampled = "" if case in {"no_source", "request_source"} else _LITERAL
+    assert tokenizer.decode([tokenized.tokens[i] for i in sampled]) == expected_sampled
+    assert [tokenized.logprobs[i] for i in sampled] == [-0.5] * len(expected_sampled)
+    assert history.model_dump(mode="python") == original
+    tokenizer.calls.clear()
+    tokenizer.rendered.clear()
+    assert _outcome(history, tokenizer, chat_template=_RENDER_OVERRIDE) == (
+        (
+            ValueError,
+            "Could not locate a sampled history message in the rendered history",
+        )
+        if structured
+        else (
+            tokenized.tokens,
+            # The override does not certify the recorded prompt as exact.
+            [tr.TokenFlag(0)] * (len(expected) - len(_LITERAL))
+            + tokenized.flags[len(expected) - len(_LITERAL) :]
+            if case == "visible_only"
+            else tokenized.flags,
+            [None if x != x else x for x in tokenized.logprobs],
+        )
+    )
     # Exercise rendering explicitly even when complete native output can bypass
     # it. Plain content stays literal independently of recorded/current thinking mode
     # and whether the message has complete native token metadata. Structured
@@ -361,6 +410,18 @@ class _NewlineRunTokenizer(_TemplateTokenizer):
 def test_literal_next_turn_preserves_preceding_length_stop_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _check_literal_next_turn_boundary(monkeypatch, recorded=True)
+
+
+def test_literal_next_turn_renderer_preserves_preceding_length_stop_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _check_literal_next_turn_boundary(monkeypatch, recorded=False)
+
+
+def _check_literal_next_turn_boundary(
+    monkeypatch: pytest.MonkeyPatch, *, recorded: bool
+) -> None:
     tokenizer = _NewlineRunTokenizer()
     messages = [
         {"role": "user", "content": "first"},
@@ -423,24 +484,50 @@ def test_literal_next_turn_preserves_preceding_length_stop_boundary(
             observed.append((boundary, result))
         return result
 
+    def tokenize() -> tr.TokenizedHistory:
+        if recorded:
+            return history.tokenize(tokenizer=tokenizer)
+        # Isolate the existing renderer stage from the new default native policy.
+        return _tokenize._tokenize_chat_view(
+            history,
+            base_model=None,
+            tokenizer=tokenizer,
+            chat_template=None,
+            chat_template_kwargs=None,
+            _projection_matches=True,
+            _recorded_boundaries=False,
+        )
+
     monkeypatch.setattr(_tokenize, "_tokenize_exact_projected_chat_history", observe)
     with monkeypatch.context() as patch:
         patch.setattr(
             _tokenize, "chat_template_with_preserved_thinking", lambda value: value
         )
-        _outcome(history, tokenizer)
+        try:
+            tokenize()
+        except ValueError:
+            pass
     boundary, old_exact = observed[0]
-    # The final recorded body no longer needs a reconstructed terminal tail.
-    # Disabling literal normalization cannot invalidate the proved earlier gap.
-    assert old_exact is not None
-    assert list(boundary.tail + boundary.following) == native_boundary
+    if recorded:
+        # The final recorded body no longer needs a reconstructed terminal tail.
+        # Disabling literal normalization cannot invalidate the proved earlier gap.
+        assert old_exact is not None
+        assert list(boundary.tail + boundary.following) == native_boundary
+    else:
+        stored = list(boundary.tail + boundary.following)
+        assert old_exact is None
+        assert len(native_boundary) - len(stored) == 2
+        assert stored[:-1] == native_boundary[:-3]
+        assert tokenizer.decode(stored[-1:]) == "\n"
+        assert tokenizer.decode(native_boundary[-3:]) == "\n\n</think>\n\n"
     observed.clear()
 
-    value = history.tokenize(tokenizer=tokenizer)
+    value = tokenize()
     fixed_boundary, fixed_exact = observed[0]
     assert fixed_exact is value
-    assert value.tokens == old_exact.tokens
-    assert value.flags == old_exact.flags
+    if old_exact is not None:
+        assert value.tokens == old_exact.tokens
+        assert value.flags == old_exact.flags
     assert list(fixed_boundary.tail + fixed_boundary.following) == native_boundary
     assert (
         value.tokens[: len(last["prompt_token_ids"]) + len(last["token_ids"])]

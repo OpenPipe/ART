@@ -141,7 +141,7 @@ def _install(logger: _Logger) -> None:
     # gdn.layout imported the function by name; rebind it to the logged one.
     gdn_layout.all_to_all_single = dist.all_to_all_single
 
-    original_forward = TrainerRank.dp_rank_forward
+    original_forward = TrainerRank.forward
 
     @functools.wraps(original_forward)
     def logged_forward(self, *args, **kwargs):
@@ -166,7 +166,7 @@ def _install(logger: _Logger) -> None:
         )
         return outputs
 
-    TrainerRank.dp_rank_forward = logged_forward  # type: ignore[method-assign]
+    TrainerRank.forward = logged_forward  # type: ignore[method-assign]
 
 
 def _start_watchdog(logger: _Logger, log_dir: Path, stall_seconds: float) -> None:

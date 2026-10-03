@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+from dataclasses import replace
 from enum import Enum
 import sys
 from types import SimpleNamespace
@@ -17,7 +19,7 @@ from art.megatron.routed_experts import (
     use_routes,
     validate_routes,
 )
-from art.trainer_rank import ForwardInput, TrainerRank
+from art.trainer_rank import ForwardInput, ForwardOptions, ForwardOutput, TrainerRank
 from art.trainer_rank._impl import _ForwardItem
 
 
@@ -67,8 +69,56 @@ def test_forward_routes_align_with_inputs_without_shift_and_group_separately():
     normal = ForwardInput(input_tokens=tokens, hidden_states=True)
     item = rank._forward_item(replay)
     assert torch.equal(item.routed_experts, routes)
-    groups = rank._group_active_request_indices([replay, normal, replay])
-    assert [indices for _key, indices in groups] == [(0, 2), (1,)]
+    strict = replace(replay, options=ForwardOptions(max_gradient_staleness=0))
+    groups = rank._group_active_request_indices([replay, normal, replay, strict])
+    assert [indices for _key, indices in groups] == [(0, 2), (1,), (3,)]
+
+
+@pytest.mark.parametrize("retention", ["gpu", "cpu", "replay"])
+def test_cached_forward_and_replay_preserve_owned_routes(monkeypatch, retention):
+    from trainer_rank_test_support import checkpoint_runtime
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    rank = TrainerRank(checkpoint_runtime(model))
+    binding, seen = router(), []
+    rank._routing_bindings = [(binding, 0)]
+    monkeypatch.setattr(rank, "_resolve_slot_ref", lambda *_a, **_kw: None)
+    lora = SimpleNamespace(use_lora_slot=lambda _slot, **_kwargs: nullcontext())
+    monkeypatch.setitem(sys.modules, "art.megatron.lora", lora)
+    monkeypatch.setattr(
+        rank, "_topology", lambda: SimpleNamespace(dp=1, tp=1, cp=1, pp=1)
+    )
+    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
+    monkeypatch.setattr(rank, "_configure_hybridep", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        rank,
+        "_prepare_packed_forward",
+        lambda _: SimpleNamespace(token_uids=None, attention_state=None),
+    )
+
+    def forward(items, prepared):
+        context = CURRENT_ROUTES.get()
+        assert context is not None
+        routes = context.targets[id(binding)]["attention"].flatten()
+        seen.append(routes.tolist())
+        return [ForwardOutput(None, None, None, model.weight.sum() * routes.float())]
+
+    monkeypatch.setattr(rank, "_forward_packed", forward)
+    routes = torch.tensor([[[1]], [[2]]])
+    output = rank.forward(
+        ForwardInput(
+            input_tokens=torch.tensor([1, 2]),
+            routed_experts=routes,
+            hidden_states=True,
+            options=ForwardOptions(backward_state=retention),
+        )
+    )
+    assert CURRENT_ROUTES.get() is None
+    routes.fill_(3)
+    rank.backward(output.hidden_states.sum())
+    assert seen == [[1, 2]] * (2 if retention == "replay" else 1)
+    torch.testing.assert_close(model.weight.grad, torch.tensor([[3.0]]))
+    assert CURRENT_ROUTES.get() is None and not rank._forward_graph_cache().handles()
 
 
 def test_prefix_routes_use_reference_sequence_and_cp_padding_is_explicit():
