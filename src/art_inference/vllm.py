@@ -14,8 +14,11 @@ import json
 from types import MethodType
 from typing import Any
 
+from pydantic import ValidationError
+
 from .append_only import (
     aligned_values,
+    chat_prefix_scope,
     chat_response_prefixes,
     merge_chat_delta,
     openai_tool_arguments,
@@ -291,9 +294,11 @@ def patch_history(importer=importlib.import_module) -> None:
                 getattr(request, "chat_template_kwargs", None),
                 headers.get("authorization", ""),
             ]
-            scope = hashlib.sha256(
-                json.dumps(material, sort_keys=True).encode()
-            ).hexdigest()
+            scope = chat_prefix_scope(
+                hashlib.sha256(
+                    json.dumps(material, sort_keys=True).encode()
+                ).hexdigest()
+            )
             turn = _Turn(
                 scope,
                 tokenizer,
@@ -351,13 +356,21 @@ def patch_history(importer=importlib.import_module) -> None:
                 tools = responses_utils.construct_tool_dicts(
                     request.tools, request.tool_choice
                 )
-                view = protocol.ChatCompletionRequest(
+                view_payload = dict(
                     model=request.model,
+                    parallel_tool_calls=getattr(request, "parallel_tool_calls", None)
+                    is not False,
+                    tools=tools or None,
                     messages=[
                         openai_tool_arguments(message) for message in conversation
                     ],
                     chat_template_kwargs=self._effective_chat_template_kwargs(request),
                 )
+                try:
+                    view = protocol.ChatCompletionRequest(**view_payload)
+                except ValidationError:
+                    # Responses built-ins may have no valid Chat Completions view.
+                    return
 
                 async def render(value):
                     online = getattr(self, "online_renderer", None)

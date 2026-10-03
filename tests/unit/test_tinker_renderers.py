@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
 from tinker import EncodedTextChunk, ModelInput
 from tinker_cookbook import renderers
 from tinker_cookbook.tokenizer_utils import Tokenizer
@@ -101,6 +102,93 @@ def test_tinker_normalizes_tool_arguments_for_mapping_templates():
         2,
     ]
     assert message["tool_calls"][0]["function"]["arguments"] == '{"x": 1}'
+
+
+@pytest.mark.parametrize("parallel", [False, True, None])
+def test_tinker_serial_projection_does_not_certify_hidden_actions(
+    parallel, monkeypatch
+):
+    from art.tinker.server import OpenAICompatibleTinkerServerWorker
+
+    class Tokenizer:
+        def encode(self, text, **kwargs):
+            return list(text.encode())
+
+        def decode(self, tokens, **kwargs):
+            return bytes([tokens] if isinstance(tokens, int) else tokens).decode()
+
+    tokenizer = Tokenizer()
+    sampled = tokenizer.encode("\nthought#firstsecondEND")
+    logprobs = [-0.25] * len(sampled)
+    message = {
+        "role": "assistant",
+        "content": "",
+        "reasoning_content": "thought",
+        "tool_calls": [
+            {
+                "id": "first",
+                "type": "function",
+                "function": {"name": "first", "arguments": "{}"},
+            }
+        ],
+    }
+    renderer = SimpleNamespace(
+        tokenizer=tokenizer,
+        parse_response=lambda tokens: (message, True),
+        to_openai_message=lambda value: value,
+    )
+    worker = OpenAICompatibleTinkerServerWorker(
+        _renderers={"model": cast(Any, renderer)}
+    )
+
+    async def render(base_model, messages, tools, **kwargs):
+        assistant = messages[-1]
+        return tokenizer.encode(
+            "prompt:thought#"
+            + "".join(
+                call["function"]["name"] for call in assistant.get("tool_calls", [])
+            )
+            + "END"
+        )
+
+    monkeypatch.setattr(worker, "prompt_tokens", render)
+    response = SimpleNamespace(
+        sequences=[
+            SimpleNamespace(tokens=sampled, logprobs=logprobs, stop_reason="stop")
+        ]
+    )
+    result, entries = asyncio.run(
+        worker.chat_completion_and_prefixes(
+            "model",
+            cast(Any, response),
+            "model",
+            tokenizer.encode("prompt:"),
+            tokenizer.encode("prompt:"),
+            [],
+            None,
+            parallel_tool_calls=parallel,
+        )
+    )
+    canonical = tokenizer.encode("prompt:thought#firstEND")
+    assert any(rendered == canonical for rendered, _, _ in entries) == (
+        parallel is not False
+    )
+    if parallel is False:
+        normalized = [raw for rendered, raw, _ in entries if rendered != raw]
+        assert normalized
+        assert all(b"first" not in bytes(raw) for raw in normalized)
+    # Exact raw-to-raw observations remain safe, including every sampled call.
+    assert any(
+        rendered == raw == tokenizer.encode("prompt:") + sampled
+        for rendered, raw, _ in entries
+    )
+    assert result.usage is not None and result.usage.completion_tokens == len(sampled)
+    result_logprobs = result.choices[0].logprobs
+    assert result_logprobs is not None and result_logprobs.content is not None
+    assert [item.logprob for item in result_logprobs.content] == logprobs
+    assert [item.token for item in result_logprobs.content] == [
+        f"token_id:{token}" for token in sampled
+    ]
 
 
 def test_qwen3_5_generation_prompt_matches_hf_suffixes() -> None:

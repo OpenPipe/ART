@@ -25,6 +25,7 @@ from art.trainer_rank._impl import (
     _CheckpointSlot,
     _FlatForwardPlan,
     _flatten,
+    _memory_error,
     _MemoryCheck,
     _MemoryProfile,
 )
@@ -981,6 +982,32 @@ def test_forward_raises_before_expected_oom_with_actionable_context(
     assert exc_info.value.predicted_peak_bytes >= 0
     assert exc_info.value.usable_limit_bytes >= 0
     assert "smaller" in exc_info.value.suggestion
+
+
+def test_memory_error_reports_rank_local_pair_when_known() -> None:
+    def message(check: _MemoryCheck) -> str:
+        return str(
+            _memory_error(
+                context="dp_rank_forward",
+                message="m",
+                packed_tokens=1,
+                logical_tokens=1,
+                check=check,
+            )
+        )
+
+    assert "rank_required_gb=" not in message(_MemoryCheck(10, 1, False))
+    check = _MemoryCheck(
+        10,
+        1,
+        False,
+        local_required_bytes=3 * 1024**3,
+        local_available_bytes=2 * 1024**3,
+    )
+    assert (
+        "usable_limit_gb=0.000. rank_required_gb=3.000 rank_available_gb=2.000 Use"
+        in message(check)
+    )
 
 
 def test_flatten_rejects_dicts_to_avoid_silent_top_level_shape_changes() -> None:

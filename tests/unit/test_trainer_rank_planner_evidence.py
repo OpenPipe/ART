@@ -117,7 +117,7 @@ def test_local_and_reduced_samples_remain_distinct(scalar, monkeypatch):
 
     def reduce(value, *, op, group):
         calls.append((op, group))
-        value.t.data[value.i] = 150 if op == "MAX" else 7
+        value.t.data[value.i] = 150 if op == "MAX" else [7, 0]
 
     dist.all_reduce = reduce
     monkeypatch.setattr(tr, "dist", dist)
@@ -585,7 +585,7 @@ def test_refresh_preserves_local_estimate_and_separate_reduced_operand(
 
     def reduce(value, *, op, group):
         reductions.append((op, group))
-        value.t.data[value.i] = next(required) if op == "MAX" else 7
+        value.t.data[value.i] = next(required) if op == "MAX" else [7, 0]
 
     dist.all_reduce = reduce
     monkeypatch.setattr(tr, "dist", dist)
@@ -597,9 +597,7 @@ def test_refresh_preserves_local_estimate_and_separate_reduced_operand(
     assert (
         first.sample.local_required_bytes == selected.sample.local_required_bytes == 80
     )
-    assert (
-        selected.sample.required_operand_bytes == first.estimated_required_bytes == 150
-    )
+    assert selected.sample.required_operand_bytes == first.local_required_bytes == 80
     assert (
         selected.sample.reduced_required_bytes
         == selected.estimated_required_bytes
