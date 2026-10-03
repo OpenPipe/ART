@@ -7,11 +7,11 @@ other shapes keep today's pricing.
 """
 
 from dataclasses import replace
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import pytest
 import torch
+from trainer_rank_test_support import fake_rank, recompute_model
 
 from art.trainer_rank import TrainerRank
 from art.trainer_rank._impl import _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD
@@ -29,44 +29,8 @@ SEGMENT = (4 * 12 * 128 * 128 + 2 * (2 * 4 * 128 + 12 * 128) * 3) * 2
 def tp_rank(layers=LAYERS, *, ffn=F, topology=TP4, sequence_parallel=True, **config):
     from megatron.core.transformer.transformer_block import TransformerBlock
 
-    block = TransformerBlock.__new__(TransformerBlock)
-    torch.nn.Module.__init__(block)
-    block.config = SimpleNamespace(
-        hidden_size=H,
-        num_layers=layers,
-        padded_vocab_size=32,
-        params_dtype=torch.bfloat16,
-        recompute_granularity="full",
-        recompute_method="uniform",
-        recompute_num_layers=1,
-        distribute_saved_activations=False,
-        sequence_parallel=sequence_parallel,
-        fp32_residual_connection=False,
-        cpu_offloading=False,
-        cuda_graph_impl="none",
-        fp8=None,
-        fp4=None,
-        **config,
-    )
-    block.layers = torch.nn.ModuleList(
-        [torch.nn.Linear(1, 1).bfloat16() for _ in range(layers)]
-    )
-    block.num_layers_per_pipeline_rank = layers
-    model: Any = torch.nn.Module()
-    model.config = block.config
-    model.decoder = block
-    model._preprocess = lambda: None
-    r: Any = TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[model],
-                optimizer=None,
-                provider=SimpleNamespace(hidden_size=H, num_layers=layers),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
-    )
+    model = recompute_model(TransformerBlock, H, layers, sequence_parallel, **config)
+    r: Any = fake_rank(TrainerRank, [model], hidden_size=H, num_layers=layers)
     # Qwen3.8-27B: gated attention every fourth layer, GDN otherwise.
     r._geometry = replace(
         r._geometry,
@@ -140,42 +104,26 @@ def test_rows_are_sharded_with_ceiling_and_only_gradient_groups_save_them():
 
 
 @pytest.mark.parametrize(
-    "case",
+    "case,kwargs",
     [
-        "tp2",
-        "tp8",
-        "cp2",
-        "pp2",
-        "no_sequence_parallel",
-        "sequence_parallel_at_tp1",
-        "selective_recompute",
-        "moe",
-        "moe_geometry",
-        "replicated_qkv",
-        "missing_attention_geometry",
-        "missing_conv_kernel",
-        "shallow",
-        "wide_ffn",
+        ("tp2", dict(topology=(1, 2, 1, 1))),
+        ("tp8", dict(topology=(1, 8, 1, 1))),
+        ("cp2", dict(topology=(1, 4, 2, 1))),
+        ("pp2", dict(topology=(1, 4, 1, 2))),
+        ("no_sequence_parallel", dict(sequence_parallel=False)),
+        ("sequence_parallel_at_tp1", dict(topology=(1, 1, 1, 1))),
+        ("selective_recompute", dict()),
+        ("moe", dict()),
+        ("moe_geometry", dict()),
+        ("replicated_qkv", dict()),
+        ("missing_attention_geometry", dict()),
+        ("missing_conv_kernel", dict()),
+        ("shallow", dict(layers=48)),
+        ("wide_ffn", dict(ffn=4 * F)),
     ],
 )
-def test_unproven_shapes_keep_todays_pricing(case):
-    shapes = {
-        "tp2": dict(topology=(1, 2, 1, 1)),
-        "tp8": dict(topology=(1, 8, 1, 1)),
-        "cp2": dict(topology=(1, 4, 2, 1)),
-        "pp2": dict(topology=(1, 4, 1, 2)),
-        "no_sequence_parallel": dict(sequence_parallel=False),
-        "sequence_parallel_at_tp1": dict(topology=(1, 1, 1, 1)),
-        "selective_recompute": dict(),
-        "moe": dict(),
-        "moe_geometry": dict(),
-        "replicated_qkv": dict(),
-        "missing_attention_geometry": dict(),
-        "missing_conv_kernel": dict(),
-        "shallow": dict(layers=48),
-        "wide_ffn": dict(ffn=4 * F),
-    }
-    r = tp_rank(**shapes[case])
+def test_unproven_shapes_keep_todays_pricing(case, kwargs):
+    r = tp_rank(**kwargs)
     if case == "selective_recompute":
         r.runtime.model[0].decoder.config.recompute_granularity = "selective"
     if case == "moe":

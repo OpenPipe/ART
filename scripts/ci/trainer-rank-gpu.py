@@ -306,7 +306,7 @@ def finish_child(process):
         time.sleep(0.01)
 
 
-def run_child(command, timeout, output):
+def run_child(command, timeout, output, *, stdout=None):
     if timeout <= 0:
         raise TimeoutError("CI remote-result deadline reached")
     with output.open("ab") as stream:
@@ -329,7 +329,10 @@ def run_child(command, timeout, output):
             if interruption is not None:
                 raise interruption
             process = subprocess.Popen(
-                command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
+                command,
+                stdout=stream if stdout is None else stdout,
+                stderr=subprocess.STDOUT if stdout is None else stream,
+                start_new_session=True,
             )
             original = None
             try:
