@@ -1456,7 +1456,9 @@ def compact_memory[T](value: T) -> T:
 
     Strings directly held by immutable containers, mixed-key mappings, or
     sets stay in place; their supported mutable descendants are still compacted.
-    Container subclasses and other unsupported objects remain opaque.
+    Container subclasses and other unsupported objects remain opaque. Graphs
+    containing hashable models or opaque hashed members are left unmodified,
+    including outside aliases to their nested state.
     """
 
     _intern_string_graph(value)

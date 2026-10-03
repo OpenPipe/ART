@@ -1,7 +1,7 @@
 import pickle
 
-import pytest
 from pydantic import BaseModel, ConfigDict
+import pytest
 
 from art.trajectories import Trajectory, compact_memory
 
@@ -112,7 +112,7 @@ def test_mixed_mapping_never_rehashes_opaque_keys_and_visits_mutable_values():
 
     assert list(value) == before
     assert member.calls == 1
-    assert child[0] is canonical
+    assert child[0] == canonical and child[0] is not canonical
     assert value["direct"] == canonical and value["direct"] is not canonical
     assert trajectory.metadata["first"] is trajectory.metadata["alias"] is value
 
@@ -188,6 +188,7 @@ def test_hashable_model_descendants_preserve_member_aliases(kind, use_pickle):
     for graph in (trajectory, result):
         actual = graph.metadata["member"]
         assert next(iter(graph.metadata["values"])) is actual
-        assert actual.label is graph.metadata["seed"]
+        assert actual.label == graph.metadata["seed"]
+        assert actual.label is not graph.metadata["seed"]
         assert hash(actual) == before_hash
     assert next(iter(values)) is member

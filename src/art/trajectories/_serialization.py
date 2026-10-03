@@ -6,6 +6,7 @@ from dataclasses import fields, is_dataclass
 import math
 import threading
 from typing import Any, Literal, SupportsIndex, cast
+import weakref
 
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
@@ -17,6 +18,9 @@ from ..openai import ART_MOE_ROUTING_METADATA_KEY
 
 type _StringPool = dict[str, str]
 _PICKLE_STATE = threading.local()
+_OPAQUE_PICKLE_MODELS: weakref.WeakValueDictionary[int, _StringInterningModel] = (
+    weakref.WeakValueDictionary()
+)
 
 
 @contextmanager
@@ -40,8 +44,10 @@ class _StringInterningModel(BaseModel):
     __slots__ = ("_art_pickle_strings_interned",)
 
     def __reduce_ex__(self, protocol: SupportsIndex, /) -> str | tuple[Any, ...]:
-        if not getattr(_PICKLE_STATE, "skip_string_interning", False) and not getattr(
-            self, "_art_pickle_strings_interned", False
+        if (
+            not getattr(_PICKLE_STATE, "skip_string_interning", False)
+            and not getattr(self, "_art_pickle_strings_interned", False)
+            and _OPAQUE_PICKLE_MODELS.get(id(self)) is not self
         ):
             _intern_strings(self)
         return super().__reduce_ex__(protocol)
@@ -53,7 +59,77 @@ class _StringInterningModel(BaseModel):
 def _intern_strings(value: object, pool: _StringPool | None = None) -> None:
     """Share equal strings inside supported model and built-in container graphs."""
 
-    _intern_value(value, {} if pool is None else pool, {})
+    # Discover hash-sensitive state before changing any alias, including aliases
+    # visited before a set member or dictionary key. Arbitrary hashes can depend
+    # on nested mutable state, so this fallback protects the whole input graph.
+    pending = [(value, False)]
+    seen: dict[tuple[int, bool], object] = {}
+    numeric_lists: dict[int, object] = {}
+    models: list[_StringInterningModel] = []
+    opaque = False
+    while pending:
+        item, hashed = pending.pop()
+        kind = type(item)
+        if (
+            item is None
+            or kind is str
+            or kind is bytes
+            or kind is bool
+            or kind is int
+            or kind is float
+            or kind is complex
+        ):
+            continue
+        if hashed and kind is not tuple and kind is not frozenset:
+            opaque = True
+        item_id = id(item)
+        visit = (item_id, hashed)
+        if visit in seen:
+            continue
+        seen[visit] = item
+        if isinstance(item, BaseModel):
+            opaque |= kind.__hash__ is not None
+            if isinstance(item, _StringInterningModel):
+                models.append(item)
+            pending.extend((child, False) for child in item.__dict__.values())
+            for extra in (item.__pydantic_extra__, item.__pydantic_private__):
+                if extra is not None:
+                    pending.append((extra, False))
+        elif isinstance(item, dict):
+            # Base methods read subclass storage without invoking user iterators.
+            pending.extend((key, True) for key in dict.keys(item))
+            pending.extend((child, False) for child in dict.values(item))
+        elif isinstance(item, (list, tuple, set, frozenset)):
+            if kind is list and all(
+                child is None
+                or type(child) is bool
+                or type(child) is float
+                or type(child) is int
+                for child in item
+            ):
+                numeric_lists[item_id] = item
+            else:
+                base = next(
+                    cls
+                    for cls in (list, tuple, set, frozenset)
+                    if isinstance(item, cls)
+                )
+                child_hashed = hashed or base in (set, frozenset)
+                pending.extend(
+                    (child, child_hashed) for child in base.__iter__(cast(Any, item))
+                )
+        elif kind.__module__.startswith("art.trajectories") and is_dataclass(item):
+            opaque |= kind.__hash__ is not None
+            pending.extend((getattr(item, field.name), False) for field in fields(item))
+    if opaque:
+        # Nested ART models otherwise restart interning from their own pickle
+        # reducers, after the enclosing hash-sensitive graph has been examined.
+        # Keep this bookkeeping outside model state: even our private flag may
+        # participate in a custom hash. Integer keys never hash the model.
+        for model in models:
+            _OPAQUE_PICKLE_MODELS[id(model)] = model
+        return
+    _intern_value(value, {} if pool is None else pool, numeric_lists)
 
 
 def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> object:
@@ -63,12 +139,6 @@ def _intern_value(value: object, pool: _StringPool, memo: dict[int, object]) -> 
         value, (bytes, bytearray, memoryview, bool, int, float, complex)
     ):
         return value
-    if type(value) is list and all(
-        item is None or type(item) is bool or type(item) is float or type(item) is int
-        for item in value
-    ):
-        return value
-
     value_id = id(value)
     if value_id in memo:
         return memo[value_id]
