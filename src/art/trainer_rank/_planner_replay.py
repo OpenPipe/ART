@@ -38,6 +38,7 @@ _REFUSALS = frozenset(
         "runtime_segment_inventory_over_limit",
         "head_positions_unavailable",
         "head_statistics_fallback_unsupported",
+        "head_logits_statistics_unsupported",
         "runtime_facts_over_limit",
         "runtime_stage_inventory_over_limit",
         "runtime_request_inventory_over_limit",
@@ -224,8 +225,18 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             else 0
         )
         if projected and head_statistics_fallback(rank, requests, positions):
-            # The frozen head facts price only the three-buffer path.
+            # The frozen head facts price only the kernel path at TP > 1.
             raise ValueError("head_statistics_fallback_unsupported")
+        if (
+            projected
+            and rank._topology_key()[1] > 1
+            and any(r.logits for r in requests)
+            and any(
+                r.target_tokens is not None or r.top_k is not None for r in requests
+            )
+        ):
+            # Facts record statistics, not requested logits beside them.
+            raise ValueError("head_logits_statistics_unsupported")
         backwards = (
             target_backward
             and group.grad_enabled
@@ -268,6 +279,9 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
                 "head_rows": projected,
                 "head_target_rows": target_rows,
                 "adapter": adapter,
+                "head_statistics": any(
+                    r.target_tokens is not None or r.top_k is not None for r in requests
+                ),
                 "gdn": None
                 if model is None
                 else {
@@ -290,7 +304,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             }
         )
     facts = {
-        "version": 2,
+        "version": 3,
         "checkpoint_layers": _memory._checkpoint_layers(
             rank, rank._plan_group_rows(plan)
         ),
@@ -342,7 +356,7 @@ def validate(facts: Any) -> None:
             "groups",
         },
     )
-    if type(facts["version"]) is not int or facts["version"] != 2:
+    if type(facts["version"]) is not int or facts["version"] != 3:
         raise ValueError("unsupported runtime facts version")
     for key in (
         "checkpoint_layers",
@@ -372,6 +386,7 @@ def validate(facts: Any) -> None:
                 "head_rows",
                 "head_target_rows",
                 "adapter",
+                "head_statistics",
                 "gdn",
             },
         )
@@ -379,6 +394,7 @@ def validate(facts: Any) -> None:
             integer(group[key])
         if (
             type(group["grad"]) is not bool
+            or type(group["head_statistics"]) is not bool
             or type(group["slot"]) is not str
             or len(group["slot"]) > 4096
         ):
@@ -613,6 +629,10 @@ class ReplayRank(_impl.TrainerRank):
         )
         if (projected, target_rows) != (group["head_rows"], group["head_target_rows"]):
             raise ValueError("head row facts disagree with selected requests/layout")
+        if group["head_statistics"] != any(
+            r.target_tokens is not None or r.top_k is not None for r in requests
+        ):
+            raise ValueError("head statistics facts disagree with selected requests")
 
     def _moe_workspace_bytes(
         self, rows: int, *, checkpoint_grad: bool = False, slot_ref: Any = None
@@ -657,7 +677,9 @@ class ReplayRank(_impl.TrainerRank):
                 facts["head_vocabulary"],
                 g["head_rows"],
                 g["head_target_rows"],
-                self._topology_key()[1],
+                target_backward=facts["head_target_backward"],
+                statistics=g["head_statistics"],
+                tp=self._topology_key()[1],
             )
             for g in groups
         )

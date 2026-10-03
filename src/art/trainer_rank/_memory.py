@@ -339,60 +339,46 @@ def _group_head_workspace_bytes(
     positions: Sequence[torch.Tensor] | None = None,
     lower_bound: bool = False,
 ) -> int:
-    """One logits buffer, or logits + both dense target-backward gradients.
+    """Partial dense head component: eager statistics or logits copies.
 
-    The supported head path overlaps indexing and statistics gradients
-    with recomputed logits; cold library workspaces remain outside this
-    component. Pair each group's mode with its own projected rows.
+    Capacity reserves the eager path even when optional Triton may succeed.
+    Its BF16 logits, FP32 conversion, subtraction and exp overlap. This is
+    not a bound for row vectors, inter-chunk liveness or library workspaces.
+    Rejection lower bounds retain only the unconditional dense components.
+    TP > 1 heads (priced with the explicit TP x SP floor) instead follow each
+    chunk's statistics path: ``_tp_head_workspace_bytes``.
     """
     dense = self._head_workspace_bytes(rows)
-    fallback = extra = 0
     if dense and self._topology_key()[1] > 1:
-        # A chunk whose statistics kernel fails after an attempt runs the
-        # bounded eager statistics: the kernel path's buffers plus this.
-        extra = _eager_stats_extra_bytes(_head_vocabulary(self), rows)
-    if (
-        dense
-        and self._topology_key()[1] > 1
-        and any(
-            request.target_tokens is not None or request.top_k is not None
-            for request in requests
+        return _tp_head_workspace_bytes(
+            self,
+            rows,
+            requests,
+            grad_enabled=grad_enabled,
+            positions=positions,
+            lower_bound=lower_bound,
         )
+    needs_statistics = any(
+        request.target_tokens is not None or request.top_k is not None
+        for request in requests
+    )
+    if not dense or (
+        not needs_statistics and (lower_bound or not any(r.logits for r in requests))
     ):
-        # TP > 1 (priced with the explicit floor): each chunk's statistics
-        # run the Triton kernel, or where ``_try_triton_stats`` declines, the
-        # eager FP32 fallback (``_vocab_parallel_log_z``): BF16 logits, their
-        # FP32 copy, the shifted logits and their exponentials, about seven
-        # BF16 buffers. TP1 keeps its three-buffer charge (inherited).
-        low = self._head_projection_rows(
-            requests, positions=positions, lower_bound=True, uncapped=True
-        )
-        if positions is not None:
-            # The selected layout's packed union: every chunk exactly.
-            fallback = _head_fallback_bytes(self, low, low)
-        elif lower_bound:
-            # A rejection bound monotone in rows: chunks may all run the
-            # kernel unless it cannot run at all.
-            fallback = (
-                0
-                if _impl._triton_head_stats_available(self)
-                else 7 * self._head_workspace_bytes(low)
-            )
-        else:
-            # An acceptance bound: any projected count the union can take.
-            high = self._head_projection_rows(
-                requests, positions=positions, uncapped=True
-            )
-            fallback = _head_fallback_bytes(self, low, high)
-    if (
-        not dense
-        or not grad_enabled
-        or not any(request.target_tokens is not None for request in requests)
-    ):
-        return max(dense + extra, fallback)
+        return dense
     if _head_target_backward(self):
+        if not lower_bound:
+            # need_log_z is group-wide, including logits-only chunks and
+            # chunks overlapping ignored labels. A short final chunk can
+            # also take the eager path; optional success is not guaranteed.
+            # Without statistics, local logits and both indexed copies
+            # overlap. Requested output storage is charged separately.
+            return (7 if needs_statistics else 3) * dense
+        if not grad_enabled or not any(
+            request.target_tokens is not None for request in requests
+        ):
+            return dense
         # IndexBackward's dense result overlaps saved logits and grad_logits.
-        # The FP32 fallback already exceeds this three-buffer component.
         target_dense = (
             self._head_workspace_bytes(
                 self._head_target_chunk_rows(
@@ -402,8 +388,76 @@ def _group_head_workspace_bytes(
             if any(request.logits or request.top_k is not None for request in requests)
             else dense
         )
-        return max(dense + extra, 3 * target_dense + extra, fallback)
-    return max(dense + extra, fallback)
+        return max(dense, 3 * target_dense)
+    return dense
+
+
+def _tp_head_workspace_bytes(
+    self: TrainerRank,
+    rows: int,
+    requests: Sequence[AnyForwardInput],
+    *,
+    grad_enabled: bool,
+    positions: Sequence[torch.Tensor] | None = None,
+    lower_bound: bool = False,
+) -> int:
+    """The TP > 1 head component, per chunk statistics path (#1068's model at TP1).
+
+    The eager FP32 statistics keep #1068's seven BF16 buffers. Chunks whose
+    kernel is attempted run it, or after a failure the bounded eager
+    statistics (``_impl._EagerLocalStats``): the kernel path's buffers plus
+    ``_eager_stats_extra_bytes``. Requested logits keep #1068's local logits
+    plus both indexed copies, each gathered to the full vocabulary here.
+    """
+    dense = self._head_workspace_bytes(rows)
+    if not _head_target_backward(self):
+        return dense
+    tp = self._topology_key()[1]
+    needs_statistics = any(
+        request.target_tokens is not None or request.top_k is not None
+        for request in requests
+    )
+    if not needs_statistics:
+        logits = any(request.logits for request in requests)
+        return dense if lower_bound or not logits else (1 + 2 * tp) * dense
+    kernel = dense
+    if grad_enabled and any(request.target_tokens is not None for request in requests):
+        # IndexBackward's dense result overlaps saved logits and grad_logits.
+        target_dense = (
+            self._head_workspace_bytes(
+                self._head_target_chunk_rows(
+                    requests, positions=positions, lower_bound=lower_bound
+                )
+            )
+            if any(request.logits or request.top_k is not None for request in requests)
+            else dense
+        )
+        kernel = max(dense, 3 * target_dense)
+    low = self._head_projection_rows(
+        requests, positions=positions, lower_bound=True, uncapped=True
+    )
+    if lower_bound:
+        # A rejection bound monotone in rows: only unconditional components,
+        # and the eager statistics only when no kernel can run at all.
+        return max(
+            kernel,
+            0
+            if _impl._triton_head_stats_available(self)
+            else 7 * self._head_workspace_bytes(low),
+        )
+    if positions is not None:
+        # The selected layout's packed union: every chunk exactly.
+        fallback = _head_fallback_bytes(self, low, low)
+    else:
+        # An acceptance bound: any projected count the union can take.
+        high = self._head_projection_rows(requests, positions=positions, uncapped=True)
+        fallback = _head_fallback_bytes(self, low, high)
+    logits = (1 + 2 * tp) * dense if any(request.logits for request in requests) else 0
+    return max(
+        kernel + _eager_stats_extra_bytes(_head_vocabulary(self), rows),
+        fallback,
+        logits,
+    )
 
 
 def _eager_stats_extra_bytes(vocabulary: int, rows: int) -> int:
@@ -415,13 +469,31 @@ def _eager_stats_extra_bytes(vocabulary: int, rows: int) -> int:
     return 4 * vocabulary * step + 16 * rows
 
 
-def _frozen_head_bytes(vocabulary: int, rows: int, target_rows: int, tp: int) -> int:
-    """Replay's head charge from frozen facts (kernel-path waves only; capture
-    declines the eager fallback): as ``_group_head_workspace_bytes``."""
+def _frozen_head_bytes(
+    vocabulary: int,
+    rows: int,
+    target_rows: int,
+    *,
+    target_backward: bool,
+    statistics: bool,
+    tp: int,
+) -> int:
+    """Replay's head charge from frozen facts, as live admission prices it.
+
+    TP1 is #1068's capacity charge. TP > 1 prices the kernel path plus the
+    bounded statistics' increment, or the gathered logits copies: capture
+    declines TP > 1 waves with an eager chunk or with logits beside statistics.
+    """
+    dense = _dense_head_bytes(vocabulary, rows)
+    if not target_backward:
+        return dense
+    if tp == 1:
+        return dense * (7 if statistics else 3)
+    if not statistics:
+        return (1 + 2 * tp) * dense
     return max(
-        _dense_head_bytes(vocabulary, rows),
-        3 * _dense_head_bytes(vocabulary, target_rows),
-    ) + (_eager_stats_extra_bytes(vocabulary, rows) if tp > 1 and rows else 0)
+        dense, 3 * _dense_head_bytes(vocabulary, target_rows)
+    ) + _eager_stats_extra_bytes(vocabulary, rows)
 
 
 def _head_fallback_bytes(self: TrainerRank, low: int, high: int) -> int:
@@ -1562,6 +1634,32 @@ def _estimate_required_memory_bytes_from_values(
     static_compute = (
         packed_tokens * self._hidden_size * self._param_dtype_size * activation_factor
     )
+    no_grad_stage = 0
+    if (
+        not self._geometry.moe_experts
+        and self._geometry.ffn_hidden_size
+        and self._dense_fc1_adapted
+        and signature.topology[1:3] == (1, 1)
+    ):
+        # A dense no-grad layer peaks at its FC1 stage (the base GEMM output,
+        # the adapter output and their sum: 6F, or the SwiGLU live set if
+        # wider) beside the residual pair, embedding and norm output (4H), per
+        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. At CP1 every packed
+        # row is local, which the per-packed-token floor above prices at only
+        # 16H. Groups run one after another, so the largest no-grad group
+        # bounds it.
+        rows = max(
+            (n for n, grad in group_rows if not grad),
+            default=0 if signature.grad_enabled else packed_tokens,
+        )
+        no_grad_stage = (
+            rows
+            * self._param_dtype_size
+            * (
+                max(6, self._mlp_activation_factor) * self._geometry.ffn_hidden_size
+                + 4 * self._hidden_size
+            )
+        )
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry
         hidden = self._hidden_size
@@ -1672,6 +1770,9 @@ def _estimate_required_memory_bytes_from_values(
         max(retained, checkpoint_floor[0])
         + max(workspace, head_workspace_bytes, checkpoint_floor[1])
         + backward,
+        # A no-grad group's forward stage, beside any gradient groups'
+        # boundaries but not the backward's input gradient.
+        max(retained, checkpoint_floor[0]) + no_grad_stage,
     )
     if signature.topology[2] > 1:
         # Local head results coexist with full CP outputs during gathering.

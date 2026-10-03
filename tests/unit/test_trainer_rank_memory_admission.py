@@ -223,6 +223,34 @@ def test_cpu_shortage_is_not_overwritten_by_fresh_gpu_check(
     assert "CPU retained" in str(refusal.error("test"))
 
 
+@pytest.mark.parametrize("cpu_available", [0, 1_000_000])
+def test_ep_oversized_preserves_graph_host_budget(rank, monkeypatch, cpu_available):
+    rank._allow_oversized_batches = True
+    monkeypatch.setattr(rank, "_expert_parallel_active", lambda: True)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 1)
+    monkeypatch.setattr(rank, "_available_cpu_memory_bytes", lambda: cpu_available)
+    monkeypatch.setattr(
+        rank, "_admit_split_rung", lambda *a, **k: pytest.fail("EP split attempted")
+    )
+    requests = _requests(ForwardOptions(backward_state="gpu", output_device="model"))[
+        :2
+    ]
+    if not cpu_available:
+        with pytest.raises(
+            _impl.TrainerRankMemoryError, match="per-rank CPU headroom=0"
+        ):
+            rank._plan_admissible_forward(
+                requests, checkpoint=_impl.Unset, context="test"
+            )
+    else:
+        plan, check = rank._plan_admissible_forward(
+            requests, checkpoint=_impl.Unset, context="test"
+        )
+        assert plan.request_count == 2 and plan.subforward_count == 1
+        assert not check.fits and check.cpu_fits
+        assert all(group.memory_placement is not None for group in plan.groups)
+
+
 def test_retained_weight_versions_stay_in_gpu_budget_even_for_replay(rank, monkeypatch):
     monkeypatch.setattr(
         rank, "_lora_version_capture_bytes", lambda *args: 200, raising=False
@@ -248,6 +276,66 @@ def test_gradient_transaction_reserves_one_aggregate_per_slot_across_children(
     _, check = rank._admit_graph_memory(split)
     assert check.estimated_required_bytes == 160
     assert check.fits
+
+
+@pytest.mark.parametrize(
+    "adapter_gradient, corrections, workspace",
+    [(0, None, 120), (15, None, 105), (40, None, 100), (40, "always", 200)],
+)
+def test_staging_reserve_holds_the_walks_priced_adapter_gradients(
+    rank, monkeypatch, adapter_gradient, corrections, workspace
+):
+    # The walk's pending adapter gradients (#1002) are a subset of the staged
+    # aggregate in the 3x reserve, at most one share of distinct targets. A
+    # no-grad correction forward allocates none of them: no credit.
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 1 << 40)
+    monkeypatch.setattr(rank, "_lora_gradient_staging_bytes", lambda _ref: 60)
+    monkeypatch.setattr(rank, "_pending_adapter_gradient_bytes", lambda _refs: (20,))
+    monkeypatch.setattr(rank, "_lora_version_capture_bytes", lambda *_args: 0)
+    monkeypatch.setattr(
+        rank,
+        "_plan_cost",
+        lambda plan: _impl._SubforwardCost(
+            200, 80, checkpoint_adapter_gradient=adapter_gradient
+        ),
+    )
+    options = (
+        ForwardOptions(
+            stale_gradient_corrections=(
+                ImportanceSamplingGradientCorrection(policy=corrections),
+            )
+        )
+        if corrections
+        else None
+    )
+    ref = rank._slot_ref("student")
+    plans = [rank._plan_flat_forward([r]) for r in _requests(options)[:2]]
+    plans = [replace(p, groups=(replace(p.groups[0], slot_ref=ref),)) for p in plans]
+    _, check = rank._admit_graph_memory(plans[0])
+    assert check.estimated_required_bytes == 80 + 10 + 60 + workspace
+    split = _impl._SplitForwardPlan(tuple(plans), ((0,), (1,)), 2)
+    _, check = rank._admit_graph_memory(split)
+    assert check.estimated_required_bytes == 2 * (80 + 10) + 60 + workspace
+
+
+@pytest.mark.parametrize("staleness, captures", [((2, 2), 1), ((1, 2), 2)])
+def test_split_children_share_one_weight_capture_per_staleness(
+    rank, monkeypatch, staleness, captures
+):
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 1 << 40)
+    monkeypatch.setattr(rank, "_lora_gradient_staging_bytes", lambda _ref: 0)
+    monkeypatch.setattr(rank, "_lora_version_capture_bytes", lambda *_args: 40)
+    ref = rank._slot_ref("student")
+    plans = [
+        rank._plan_flat_forward(
+            [replace(request, options=ForwardOptions(max_gradient_staleness=value))]
+        )
+        for request, value in zip(_requests()[:2], staleness, strict=True)
+    ]
+    plans = [replace(p, groups=(replace(p.groups[0], slot_ref=ref),)) for p in plans]
+    split = _impl._SplitForwardPlan(tuple(plans), ((0,), (1,)), 2)
+    _, check = rank._admit_graph_memory(split)
+    assert check.estimated_required_bytes == 2 * (80 + 10) + 40 * captures + 20
 
 
 def test_prior_larger_replay_workspace_survives_new_small_root_admission(rank):

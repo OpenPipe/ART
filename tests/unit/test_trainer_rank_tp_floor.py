@@ -751,12 +751,49 @@ def test_replay_prices_the_tp2_head_stage_as_live_admission(monkeypatch):
     from art.trainer_rank import _memory
 
     r = _cuda_head(monkeypatch)  # kernel path: capture declines the fallback
-    for rows, grad in ((512, True), (512, False), (300, True)):
-        requests = _labelled(rows)
+    logits = [
+        SimpleNamespace(
+            input_tokens=torch.zeros(512, dtype=torch.long),
+            target_tokens=None,
+            logits=True,
+            top_k=None,
+        )
+    ]
+    for rows, grad, requests in (
+        (512, True, _labelled(512)),
+        (512, False, _labelled(512)),
+        (300, True, _labelled(300)),
+        (512, False, logits),
+    ):
         live = r._group_head_workspace_bytes(rows, requests, grad_enabled=grad)
+        statistics = requests[0].target_tokens is not None
         # Capture's target rows: the projection, for target-only backward.
-        target_rows = rows if grad else 0
-        assert _memory._frozen_head_bytes(124_160, rows, target_rows, 2) == live
+        target_rows = rows if grad and statistics else 0
+        frozen = _memory._frozen_head_bytes(
+            124_160,
+            rows,
+            target_rows,
+            target_backward=True,
+            statistics=statistics,
+            tp=2,
+        )
+        assert frozen == live
+    # The kernel path, not #1068's TP1 eager reservation, prices a TP2 chunk;
+    # requested logits keep its local logits plus both copies, each gathered
+    # to the full vocabulary (1 + 2 TP buffers).
+    dense = r._head_workspace_bytes(512)
+    assert r._group_head_workspace_bytes(512, _labelled(512), grad_enabled=True) == (
+        3 * dense + BOUNDED
+    )
+    assert r._group_head_workspace_bytes(512, logits, grad_enabled=False) == 5 * dense
+    # TP1 replay is #1068's capacity charge.
+    for statistics, units in ((True, 7), (False, 3)):
+        assert (
+            _memory._frozen_head_bytes(
+                1_000, 512, 0, target_backward=True, statistics=statistics, tp=1
+            )
+            == units * 512 * 1_000 * 2
+        )
 
 
 def test_replay_declines_tp_sp_adapter_estimates_without_ranks():
