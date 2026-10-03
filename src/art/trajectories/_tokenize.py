@@ -559,6 +559,7 @@ def _translate_token_mask(
     mask: Sequence[bool],
     *,
     tokenizer: Tokenizer | None = None,
+    _opcodes: list[tuple[str, int, int, int, int]] | None = None,
 ) -> list[bool]:
     """Translate a token mask across a prefix replacement without guessing."""
 
@@ -569,9 +570,12 @@ def _translate_token_mask(
     translated = [False] * len(target)
     mapped = [False] * len(source)
     decode = getattr(tokenizer, "decode", None)
-    for tag, start, end, target_start, target_end in SequenceMatcher(
-        None, source, target, autojunk=False
-    ).get_opcodes():
+    opcodes = (
+        _opcodes or SequenceMatcher(None, source, target, autojunk=False).get_opcodes()
+    )
+    if _opcodes is not None and not _opcodes:
+        _opcodes.extend(opcodes)
+    for tag, start, end, target_start, target_end in opcodes:
         if tag == "equal":
             translated[target_start:target_end] = mask[start:end]
             mapped[start:end] = [True] * (end - start)
@@ -5927,23 +5931,33 @@ class _ChatViewTokenizer:
             self.canonical_assistant_mask,
             self.direct_bounds or None,
         )
+        # All four masks translate the same token sequences in this history.
+        mask_opcodes: list[tuple[str, int, int, int, int]] = []
         self.assistant_mask = _translate_token_mask(
             self.canonical_rendered,
             self.rendered,
             self.canonical_assistant_mask,
             tokenizer=self.tokenizer,
+            _opcodes=mask_opcodes,
         )
         self.output_mask = _translate_token_mask(
             self.canonical_rendered,
             self.rendered,
             canonical_output_mask,
             tokenizer=self.tokenizer,
+            _opcodes=mask_opcodes,
         )
         self.stop_mask = _translate_token_mask(
-            self.canonical_rendered, self.rendered, self.canonical_stop_mask
+            self.canonical_rendered,
+            self.rendered,
+            self.canonical_stop_mask,
+            _opcodes=mask_opcodes,
         )
         self.length_stop_mask = _translate_token_mask(
-            self.canonical_rendered, self.rendered, canonical_length_stop_mask
+            self.canonical_rendered,
+            self.rendered,
+            canonical_length_stop_mask,
+            _opcodes=mask_opcodes,
         )
 
     def _prepare_span_search(self) -> None:
