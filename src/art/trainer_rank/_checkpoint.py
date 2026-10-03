@@ -504,7 +504,7 @@ def _validate_manifest(
 
 
 def _load_custom_payload(
-    root: Path, manifest: CheckpointManifest
+    root: Path, manifest: CheckpointManifest, *, forward_only: bool = False
 ) -> PreparedCustomPayload | None:
     custom = manifest.get("custom_tensors", {})
     if not custom:
@@ -538,6 +538,8 @@ def _load_custom_payload(
                 "Checkpoint has custom optimizer state without an optimizer"
             )
         return PreparedCustomPayload(deepcopy(custom), tensors, {})
+    if forward_only:
+        return PreparedCustomPayload(deepcopy(custom), tensors, {})
     optimizer = {
         key: value.detach().cpu().clone()
         for key, value in load(optimizer_file, device="cpu").items()
@@ -558,7 +560,10 @@ def _load_custom_payload(
 
 
 def prepare_checkpoint(
-    path: str, *, artifact_entries: Iterable[str] | None = None
+    path: str,
+    *,
+    artifact_entries: Iterable[str] | None = None,
+    forward_only: bool = False,
 ) -> PreparedCheckpoint:
     root = Path(path).resolve(strict=True)
     if not root.is_dir():
@@ -616,7 +621,9 @@ def prepare_checkpoint(
                     f"{file_actual} != {manifest['files'][relative]}"
                 )
         custom = (
-            _load_custom_payload(root, manifest) if artifact_entries is None else None
+            _load_custom_payload(root, manifest, forward_only=forward_only)
+            if artifact_entries is None
+            else None
         )
     else:
         if artifact_entries is not None:
@@ -1845,7 +1852,9 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
     return True
 
 
-def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
+def discard_snapshot_checkpoint(
+    trainer: TrainerRank, checkpoint: str, *, allow_missing: bool = False
+) -> None:
     """Collectively discard a forward-only resident checkpoint snapshot."""
     group = _ensure_group(trainer)
     slot = trainer._checkpoint_slots.get(checkpoint)
@@ -1854,17 +1863,18 @@ def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
         and trainer._default_slot_ref.name == checkpoint
     ) or any(ref.name == checkpoint for ref in trainer._slot_stack)
     state = (slot is not None, False if slot is None else slot.snapshot, active)
-    if any(value != state for value in _gather(state, group)):
+    states = _gather(state, group)
+    if not allow_missing and any(value != state for value in states):
         raise trainer._slot_state_error(
             "Checkpoint snapshot state differs across ranks"
         )
-    if slot is None:
+    if not any(present for present, _snapshot, _active in states):
         return
-    if not slot.snapshot:
+    if any(present and not snapshot for present, snapshot, _active in states):
         raise trainer._slot_state_error(
             f"Checkpoint {checkpoint!r} is not a forward-only snapshot"
         )
-    if active:
+    if any(selected for _present, _snapshot, selected in states):
         raise trainer._slot_state_error(
             f"Cannot discard selected checkpoint snapshot {checkpoint!r}"
         )
@@ -1873,18 +1883,25 @@ def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
             f"Cannot discard checkpoint snapshot {checkpoint!r} with live outputs"
         )
     model_snapshot = _slot_snapshot(trainer)
+    error: BaseException | None = None
     try:
-        ref = trainer._slot_ref(checkpoint)
-        for chunk in trainer.runtime.model:
-            for module in chunk.modules():
-                discard = getattr(module, "_discard_lora_slot", None)
-                if callable(discard):
-                    discard(ref)
-        trainer._checkpoint_slots.pop(checkpoint)
-        trainer._prune_slot_graphs(ref)
+        if slot is not None:
+            ref = trainer._slot_ref(checkpoint)
+            for chunk in trainer.runtime.model:
+                for module in chunk.modules():
+                    discard = getattr(module, "_discard_lora_slot", None)
+                    if callable(discard):
+                        discard(ref)
+            trainer._checkpoint_slots.pop(checkpoint)
+            trainer._prune_slot_graphs(ref)
+    except BaseException as exc:
+        error = exc
+    try:
+        raise_distributed(error, "discard checkpoint snapshot", group)
     except BaseException:
         _restore_slots(model_snapshot)
-        trainer._checkpoint_slots[checkpoint] = slot
+        if slot is not None:
+            trainer._checkpoint_slots[checkpoint] = slot
         raise
 
 
