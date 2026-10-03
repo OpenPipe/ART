@@ -236,6 +236,101 @@ def test_spool_symlink_refuses(tmp_path):
     assert not list(target.iterdir())
 
 
+@pytest.mark.parametrize("adapted", [True, False, None])
+def test_replay_prices_the_recorded_dense_fc1_floor(adapted, tmp_path):
+    # A dense CP1 no-grad estimate: rows x (6F + 4H) x 2 with F 32, H 8 is
+    # 1,792 B for 4 rows, above 5H x 2 per packed token (320 B). Reports from
+    # before the floor (no recorded fact, None) replay without it.
+    rank_fields: dict[str, Any] = {
+        "num_layers": 4,
+        "hidden_size": 8,
+        "param_dtype_size": 2,
+        "recompute_granularity": "full",
+        "one_layer_recompute": True,
+        "sequence_parallel": False,
+        "attention_output_gate": False,
+        "mlp_activation_factor": 3,
+        "gdn_layers": 0,
+        "checkpointed_moe_layers": 0,
+        "recompute_modules": [],
+        "moe_output_bytes_per_token": 0,
+        "moe_forward_stages": [],
+        "geometry": {
+            "hidden_size": 8,
+            "ffn_hidden_size": 32,
+            "num_attention_heads": 2,
+            "num_query_groups": 2,
+            "kv_channels": 4,
+        },
+        "topology": [1, 1, 1, 1],
+    }
+    if adapted is not None:
+        rank_fields["dense_fc1_adapted"] = adapted
+    required = int((1792 if adapted else 320) * 1.1)
+    estimate = {
+        "signature": {
+            "topology": [1, 1, 1, 1],
+            "planner_coefficients": [2, None],
+            "slot_group_count": 1,
+            "request_mix": ["target:single"],
+            "grad_enabled": False,
+            "grad_modes": [False],
+            "slot_shapes": [],
+        },
+        "profile": None,
+        "arguments": {
+            "packed_tokens": 4,
+            "output_bytes": 0,
+            "logical_tokens": 4,
+            "gdn_segments": 0,
+            "retained_tokens": 4,
+            "group_rows": [],
+        },
+        "expected_required_bytes": required,
+        "retained_bytes": required,
+        "cost_components": {
+            "required": required,
+            "retained": required,
+            "checkpoint_retained": 0,
+            "checkpoint_workspace": 0,
+            "checkpoint_input_gradient": 0,
+            "checkpoint_peak_increment": 0,
+            "hybridep_growth": 0,
+            "checkpoint_adapter_gradient": 0,
+            "checkpoint_adapter_gradient_slots": "",
+        },
+    }
+    payload = {
+        "memory_replay": {"rank": rank_fields, "estimates": [estimate]},
+        "split_memory_floor_bytes": 0,
+        "local_admission_peak_bytes": required,
+        "reduced_admission_peak_bytes": required,
+        "safety_factor": 1.1,
+        "layouts": [],
+    }
+    path = report(
+        tmp_path,
+        predicted_peak_bytes=required,
+        observed_peak_bytes=2 * required,
+        admission_peak_bytes=required,
+        replay_factory=lambda: payload,
+    )
+    result = reports.replay(reports.validate_report(path.read_bytes()))
+    assert result["estimates"] == [
+        {"required_bytes": required, "retained_bytes": required, "matches": True}
+    ]
+    rank_fields["dense_fc1_adapted"] = 1
+    path = report(
+        tmp_path,
+        predicted_peak_bytes=required,
+        observed_peak_bytes=2 * required,
+        admission_peak_bytes=required,
+        replay_factory=lambda: payload,
+    )
+    with pytest.raises(ValueError, match="FC1 adapter fact"):
+        reports.replay(reports.validate_report(path.read_bytes()))
+
+
 def test_replay_reruns_real_memory_estimator_and_prefix_layout(tmp_path):
     from art.trainer_rank._prefix_tree_planner import (
         build_canonical_prefix_tree,
@@ -475,6 +570,7 @@ def test_actual_emitted_split_recomputes_frozen_runtime_facts(
     assert original["incomplete_reasons"] == []
     snapshot = original["replay"]
     assert snapshot["memory_replay"]["rank"]["moe_forward_stages"] == []
+    assert snapshot["memory_replay"]["rank"]["dense_fc1_adapted"] is False
     assert len(snapshot["layouts"]) == 2
     assert snapshot["local_admission_peak_bytes"] == local
     assert snapshot["reduced_admission_peak_bytes"] == local + 123
