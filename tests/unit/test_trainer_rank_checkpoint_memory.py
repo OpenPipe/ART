@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 import torch
@@ -593,3 +594,215 @@ def test_te_workspaces_are_growth_until_allocated(monkeypatch):
     assert r._te_workspace_growth_bytes() == _TE_CUBLAS_WORKSPACE_BYTES
     entries[0] = 2
     assert r._te_workspace_growth_bytes() == 0
+
+
+def dense_rank():
+    """Qwen3.8-27B's dense shape: H 5120, F 17408, 64 layers, fused SwiGLU."""
+    r = rank()
+    config = r.runtime.model[0].config
+    config.hidden_size, config.num_layers = 5120, 64
+    config.ffn_hidden_size, config.bias_activation_fusion = 17408, True
+    decoder = r.runtime.model[0].decoder
+    decoder.layers = torch.nn.ModuleList(
+        [torch.nn.Linear(1, 1).bfloat16() for _ in range(64)]
+    )
+    decoder.num_layers_per_pipeline_rank = 64
+    r.runtime.provider = SimpleNamespace(
+        hidden_size=5120, num_layers=64, ffn_hidden_size=17408
+    )
+    dense = TrainerRank(r.runtime)
+    assert dense._geometry.ffn_hidden_size == 17408
+    assert not dense._geometry.moe_experts and dense._mlp_activation_factor == 3
+    # These stand-in layers have no MLP; the traced model wraps every FC1.
+    assert dense._dense_fc1_adapted is False
+    dense._dense_fc1_adapted = True
+    return dense
+
+
+# Qwen3.8-27B TP1/CP1 no-grad target-only waves (random init, ART a68fa500,
+# 2026-09-29): a cold first wave peaked at 260,789 B per row, warm waves at
+# 250,181-250,507; the floor they share is (6F + 4H) x 2 = 249,856.
+_DENSE_NO_GRAD_ROW = (6 * 17408 + 4 * 5120) * 2
+_COLD_NO_GRAD_ROW = 260_789
+
+
+def no_grad_wave(r, n):
+    return r._estimate_flat_forward(
+        [
+            ForwardInput(
+                input_tokens=torch.arange(n),
+                target_tokens=torch.arange(n),
+                no_grad=True,
+            )
+        ],
+        checkpoint=None,
+    )
+
+
+def estimate(r, signature, groups, packed, logical=None):
+    return r._estimate_required_memory_bytes_from_values(
+        packed_tokens=packed,
+        output_bytes=0,
+        signature=signature,
+        logical_tokens=logical,
+        group_rows=groups,
+    )
+
+
+@pytest.mark.parametrize("n", [7268, 144228])
+def test_cp1_dense_no_grad_floor_covers_each_row(n):
+    r = dense_rank()
+    values = no_grad_wave(r, n)
+    _, _, signature, groups, _ = values
+    assert not signature.grad_enabled and signature.topology == (1, 1, 1, 1)
+    assert groups == ((n, False),)
+    # The 16H per packed token floor admitted 180 KB per row, below the cold
+    # peak; the per-row floor, itself below the warm peaks, admits it with the
+    # usual 1.1 factor.
+    assert estimate(r, signature, groups, n) == int(n * _DENSE_NO_GRAD_ROW * 1.1)
+    assert price(r, values).required >= n * _COLD_NO_GRAD_ROW
+
+
+def test_cp1_dense_no_grad_floor_bounds_profiles():
+    r = dense_rank()
+    _, _, signature, groups, _ = no_grad_wave(r, 7268)
+    floor = estimate(r, signature, groups, 7268)
+    r._memory_profiles[signature] = _MemoryProfile(100_000, 7268)
+    assert estimate(r, signature, groups, 7268) == floor
+    r._memory_profiles[signature] = _MemoryProfile(480_869, 7268)
+    assert estimate(r, signature, groups, 7268) > floor
+
+
+def test_cp1_dense_no_grad_floor_prices_physical_rows_of_the_largest_group():
+    r = dense_rank()
+    _, _, signature, _, _ = no_grad_wave(r, 64)
+    # Shared prefixes add logical rows, not physical ones: beside a low
+    # profile, which does grow with logical rows, the floor stays put.
+    r._memory_profiles[signature] = _MemoryProfile(1_000, 144228)
+    single = estimate(r, signature, ((144228, False),), 144228)
+    assert single == int(144228 * _DENSE_NO_GRAD_ROW * 1.1)
+    assert estimate(r, signature, ((144228, False),), 144228, 1_500_000) == single
+    del r._memory_profiles[signature]
+    # Groups run one after another: the largest group's rows bound the stage,
+    # and the per-packed-token floor still applies to their sum.
+    groups = ((100_000, False), (44_228, False))
+    assert estimate(r, signature, groups, 144228) == int(
+        max(144228 * 5120 * 2 * 16, 100_000 * _DENSE_NO_GRAD_ROW) * 1.1
+    )
+
+
+@pytest.mark.parametrize("case", ["cp2", "tp2", "gradient", "moe", "unwrapped_fc1"])
+def test_dense_no_grad_floor_leaves_other_pricing(case):
+    r = dense_rank()
+    _, _, signature, _, _ = no_grad_wave(r, 64)
+    groups = ((144228, False),)
+    if case == "cp2":
+        signature = replace(signature, topology=(1, 1, 2, 1))
+    elif case == "tp2":
+        signature = replace(signature, topology=(1, 2, 1, 1))
+    elif case == "gradient":
+        signature = replace(signature, grad_enabled=True, grad_modes=(True,))
+        groups = ((144228, True),)
+    elif case == "moe":
+        r._geometry = replace(r._geometry, moe_experts=8)
+    else:
+        # Attention-only adapters leave FC1 unwrapped: no adapter output or sum.
+        r._dense_fc1_adapted = False
+    priced = estimate(r, signature, groups, 144228)
+    r._geometry = replace(r._geometry, ffn_hidden_size=0)
+    assert estimate(r, signature, groups, 144228) == priced
+    if case in ("cp2", "unwrapped_fc1"):
+        # CP2 ranks hold part of the packed rows and are left to the existing
+        # floors (and #986's traced CP2 stage), as is an unwrapped FC1.
+        assert priced == int(144228 * 5120 * 2 * 16 * 1.1)
+
+
+@pytest.mark.parametrize("factor,stage", [(3, 6), (5, 6), (7, 7)])
+def test_cp1_dense_no_grad_stage_takes_the_wider_swiglu_live_set(factor, stage):
+    r = dense_rank()
+    r._mlp_activation_factor = factor
+    _, _, signature, groups, _ = no_grad_wave(r, 4096)
+    assert estimate(r, signature, groups, 4096) == int(
+        4096 * (stage * 17408 + 4 * 5120) * 2 * 1.1
+    )
+
+
+@pytest.mark.parametrize("gradient_first", [False, True])
+def test_dense_mixed_plan_keeps_the_no_grad_stage(gradient_first):
+    r = dense_rank()
+    gradient, reference = requests(1, 10_000)
+    req = [gradient, reference] if gradient_first else [reference, gradient]
+    reference_cost = r._plan_cost(r._plan_flat_forward([reference])).required
+    assert reference_cost >= int(10_000 * _DENSE_NO_GRAD_ROW * 1.1)
+    mixed = r._plan_flat_forward(req)
+    mixed_cost = r._plan_cost(mixed).required
+    # One gradient row cannot make the no-grad group's stage cheaper.
+    assert mixed_cost >= reference_cost
+    assert r._memory_check(mixed).estimated_required_bytes == mixed_cost
+    assert (
+        r._split_chunk_lower_cost(
+            req, tuple(x.input_tokens for x in req), checkpoint=Unset
+        ).required
+        == mixed_cost
+    )
+
+
+def test_dense_fc1_adapted_needs_every_layer_wrapped():
+    from art.megatron.lora import SharedExpertsLinearFC1LoRA
+    from art.trainer_rank._impl import _dense_fc1_adapted
+
+    wrapped = SharedExpertsLinearFC1LoRA.__new__(SharedExpertsLinearFC1LoRA)
+    wrapped.__dict__["non_gated"] = False
+    non_gated = SharedExpertsLinearFC1LoRA.__new__(SharedExpertsLinearFC1LoRA)
+    non_gated.__dict__["non_gated"] = True
+
+    def model(*fc1s: object) -> Any:
+        layers = [SimpleNamespace(mlp=SimpleNamespace(linear_fc1=f)) for f in fc1s]
+        return SimpleNamespace(
+            _preprocess=lambda: None, decoder=SimpleNamespace(layers=layers)
+        )
+
+    assert _dense_fc1_adapted(model(wrapped, wrapped)) is True
+    assert _dense_fc1_adapted(model(wrapped, torch.nn.Linear(1, 1))) is False
+    # A non-gated FC1 outputs F, not 2F: not the traced stage.
+    assert _dense_fc1_adapted(model(non_gated, non_gated)) is False
+    assert _dense_fc1_adapted(model()) is False
+    assert _dense_fc1_adapted(cast(Any, SimpleNamespace())) is False
+
+
+@pytest.mark.parametrize("pending_per_layer", [20_000, 2_000_000])
+@pytest.mark.parametrize("profiled", [False, True])
+def test_dense_no_grad_stage_and_pending_backward_are_separate_peaks(
+    monkeypatch, pending_per_layer, profiled
+):
+    from art.megatron.lora import LoRASlotRef
+    from art.trainer_rank._impl import _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD
+
+    r = dense_rank()
+    plan = r._plan_flat_forward(requests(1, 400))
+    if profiled:
+        r._memory_profiles[plan.signature] = _MemoryProfile(1, 401)
+    monkeypatch.setattr(
+        r,
+        "_pending_adapter_gradient_bytes",
+        lambda refs: (pending_per_layer,) * 64 + (0,) if tuple(refs) else (),
+    )
+    # The first-layer backward holds all pending gradients and one boundary;
+    # the existing floor already holds all 64 boundaries. A larger external
+    # retained floor must remain beside whichever of the two stages peaks.
+    retained = 64 * 5120 * 2
+    adapter_extra = 64 * pending_per_layer - 63 * 5120 * 2
+    backward = retained + adapter_extra + (0 if profiled else COLD)
+    no_grad_stage = 400 * _DENSE_NO_GRAD_ROW
+    actual = r._estimate_required_memory_bytes_from_values(
+        packed_tokens=401,
+        output_bytes=0,
+        signature=plan.signature,
+        group_rows=((1, True), (400, False)),
+        slot_refs=(LoRASlotRef("checkpoint", "policy"), None),
+        checkpoint_memory=(retained, 0),
+        checkpoint_floor=(1_000_000, 0),
+    )
+    assert actual == int((1_000_000 + max(backward, no_grad_stage)) * 1.1)
+    assert (backward > no_grad_stage) == (pending_per_layer == 2_000_000)
+    assert actual < int((1_000_000 + backward + no_grad_stage) * 1.1)
