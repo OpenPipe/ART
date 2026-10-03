@@ -13,7 +13,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
@@ -1344,6 +1344,27 @@ def _moe_layer_count(model: torch.nn.Module) -> int:
     return sum(isinstance(module, BaseMoELayer) for module in model.modules())
 
 
+def _dense_fc1_adapted(model: torch.nn.Module) -> bool:
+    """Whether every decoder layer's MLP FC1 is ART's gated LoRA wrapper, which
+    keeps a 2F adapter output and the sum beside the 2F base output, even for
+    inactive slots."""
+
+    try:
+        from art.megatron.lora import SharedExpertsLinearFC1LoRA
+
+        layers = _language_model(model).decoder.layers
+    except (AttributeError, ImportError, RuntimeError):
+        return False
+    fc1s = [
+        getattr(getattr(layer, "mlp", None), "linear_fc1", None) for layer in layers
+    ]
+    return len(fc1s) > 0 and all(
+        type(fc1) is SharedExpertsLinearFC1LoRA
+        and getattr(fc1, "non_gated", True) is False
+        for fc1 in fc1s
+    )
+
+
 def _expert_parallel_shape(provider: object) -> tuple[int, int]:
     """(EP, ETP) of the initialized runtime, else the provider's configuration."""
 
@@ -2181,6 +2202,7 @@ class TrainerRank:
         }
         spec = getattr(runtime, "model_support_spec", None)
         self._moe_layers = _moe_layer_count(runtime.model[0])
+        self._dense_fc1_adapted = _dense_fc1_adapted(runtime.model[0])
         self._checkpointed_moe_layers = sum(
             getattr(module, "moe_layer_recompute", False) is True
             for module in runtime.model[0].modules()
@@ -2285,6 +2307,13 @@ class TrainerRank:
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
         self._snapshot_checkpoint_names: set[str] = set()
+        self._checkpoint_sources: dict[
+            str,
+            tuple[str, Callable[[], AbstractContextManager[PreparedCheckpoint]], bool],
+        ] = {}
+        self._checkpoint_snapshot_lru: OrderedDict[str, None] = OrderedDict()
+        self._checkpoint_snapshot_cache_size = 2
+        self._checkpoint_slot_writes: dict[str, int] = {}
         self._prepared_lora_exports: dict[str, tuple[str, _VllmLoraPublishInputs]] = {}
         self._checkpoint_prefetches: dict[str, Future[PreparedCheckpoint]] = {}
         self._checkpoint_prefetch_sources: dict[str, str] = {}
@@ -2749,8 +2778,8 @@ class TrainerRank:
 
     @staticmethod
     async def _await_checkpoint_prefetch(
-        future: Future[PreparedCheckpoint],
-    ) -> PreparedCheckpoint:
+        future: Future[T],
+    ) -> T:
         return await asyncio.shield(asyncio.wrap_future(future))
 
     def snapshot_checkpoint(self, source: str, destination: str) -> bool:
@@ -4587,7 +4616,7 @@ class TrainerRank:
     ]:
         """Use existing aggregate profiles when all physical groups share policy."""
         flats = plan.subforwards if isinstance(plan, _SplitForwardPlan) else (plan,)
-        staged_slots = set()
+        staged_slots, captured = set(), set()
         for flat_index, flat in enumerate(flats):
             policies = [
                 _resolved_request_policy(g.items[0].request.options)
@@ -4661,20 +4690,30 @@ class TrainerRank:
                     )
                     retained = max(retained, residual)
                 version_bytes = getattr(self, "_lora_version_capture_bytes", None)
-                persistent = (
-                    sum(
-                        version_bytes(group.slot_ref, policy.max_gradient_staleness)
-                        for group in groups
-                        if group.grad_enabled
-                    )
-                    if version_bytes is not None
-                    else 0
-                )
-                staging = 0
+                persistent = staging = 0
                 for group in groups:
+                    # Later children and groups reuse the first one's live capture.
+                    key = (group.slot_ref, policy.max_gradient_staleness)
+                    if group.grad_enabled and version_bytes and key not in captured:
+                        captured.add(key)
+                        persistent += version_bytes(*key)
                     if group.grad_enabled and group.slot_ref not in staged_slots:
                         staged_slots.add(group.slot_ref)
                         staging += self._lora_gradient_staging_bytes(group.slot_ref)
+                credit = cost.checkpoint_adapter_gradient
+                if credit:
+                    # The walk repeats a slot's inventory per gradient group
+                    # (e.g. routed and unrouted); one batch stages each target once.
+                    credit = min(
+                        credit,
+                        sum(
+                            self._pending_adapter_gradient_bytes(
+                                g.slot_ref
+                                for g in groups
+                                if g.grad_enabled and g.slot_ref is not None
+                            )
+                        ),
+                    )
                 yield (
                     flat_index,
                     indices,
@@ -4693,6 +4732,7 @@ class TrainerRank:
                         backward_required=any(group.grad_enabled for group in groups),
                         persistent_bytes=persistent,
                         gradient_staging_bytes=staging,
+                        staged_gradient_bytes=credit,
                         replay_seconds=max(timings) if len(timings) >= 2 else None,
                         correction_workspace_bytes=cost.required
                         if any(
@@ -6354,6 +6394,10 @@ class TrainerRank:
     _resolve_custom_checkpoint = _slots._resolve_custom_checkpoint
     prefetch_checkpoints = _slots.prefetch_checkpoints
     _register_checkpoint_prefetch = _slots._register_checkpoint_prefetch
+    _register_checkpoint_source = _slots._register_checkpoint_source
+    _checkpoint_slot_write = _slots._checkpoint_slot_write
+    _checkpoint_snapshot_state = _slots._checkpoint_snapshot_state
+    _trim_checkpoint_snapshots = _slots._trim_checkpoint_snapshots
     _checkpoint_prefetch_waiter = _slots._checkpoint_prefetch_waiter
     _prefetched_checkpoint = _slots._prefetched_checkpoint
     _load_registered_checkpoint = _slots._load_registered_checkpoint
