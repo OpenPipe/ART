@@ -470,3 +470,48 @@ def test_non_delivery_iterator_closure_keeps_head_publication(monkeypatch, endin
     _view(_Executor(rank, "zero")).backward(output.hidden_states.sum())
     assert rank.weight.grad.item() == 3
     assert not executor.state.graphs and not rank.cache.handles()
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_oversized_iterator_output_copy_preserves_backward_and_failure_cleanup(
+    monkeypatch, failure
+):
+    rank: Any = _CachedRank()
+    rank._allow_oversized_batches = True
+    rank._available_memory_bytes = lambda: 0
+    executor = _Executor(rank, "zero")
+    packet = executor._packet
+    targets = set()
+
+    def capture(*args):
+        output = packet(*args)
+        targets.update(id(tensor) for tensor in output.packet.tensors)
+        return replace(output, cpu=(False,) * len(output.cpu))
+
+    monkeypatch.setattr(executor, "_packet", capture)
+    error = torch.OutOfMemoryError("injected actual model-device copy OOM")
+    original_to = torch.Tensor.to
+
+    def copy(tensor, *args, **kwargs):
+        if failure and id(tensor) in targets:
+            raise error
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", copy)
+    view = _view(executor)
+    iterator = view.forward_batches([_input(3)])
+    if failure:
+        with pytest.raises(torch.OutOfMemoryError) as caught:
+            next(iterator)
+        assert caught.value is error
+    else:
+        batch = next(iterator)
+        assert batch.outputs[0].hidden_states.item() == 6
+        view.backward(batch.outputs[0].hidden_states.sum())
+        assert rank.weight.grad is not None
+        assert rank.weight.grad.item() == 3
+        with pytest.raises(StopIteration):
+            next(iterator)
+    assert rank.closed == 1
+    assert not executor.iterators and not executor.state.graphs
+    assert not rank.cache.handles()

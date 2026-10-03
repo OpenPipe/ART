@@ -40,6 +40,21 @@ def test_aggregate_outputs_fresh_headroom_accounts_previous_waves():
     assert choose_output_placements(outputs, gpu_available_bytes=20) == ("cpu", "model")
 
 
+def test_oversized_outputs_preserve_explicit_cpu_and_conservative_auto():
+    assert choose_output_placements(
+        [(60, "auto"), (120, "model"), (100, "cpu")],
+        gpu_available_bytes=100,
+        allow_oversized=True,
+    ) == ("cpu", "model", "cpu")
+
+
+def test_oversized_outputs_still_validate_costs_and_devices():
+    with pytest.raises(ValueError):
+        choose_output_placements(
+            [(-1, "model")], gpu_available_bytes=0, allow_oversized=True
+        )
+
+
 def test_staged_gradients_accumulate_across_children_beside_restore_workspace():
     placement = placement_cost(
         [ForwardMemoryCost(100, 80, 10, gradient_staging_bytes=30)] * 3,
