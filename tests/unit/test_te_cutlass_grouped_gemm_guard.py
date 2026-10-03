@@ -139,11 +139,12 @@ def test_calls_with_rows_reach_te(te_gemm) -> None:
     ]
 
 
-def test_fallback_refusal_is_unchanged(te_gemm, monkeypatch) -> None:
+@pytest.mark.parametrize("m_splits", [[0, 3, 0, 2], [0] * EXPERTS])
+def test_fallback_refusal_is_unchanged(te_gemm, monkeypatch, m_splits) -> None:
     monkeypatch.setattr(
         guard, "_te_cutlass_grouped_gemm_fallback_reason", lambda **_: "test reason"
     )
 
     with pytest.raises(RuntimeError, match="fallback path: test reason"):
-        _run([0, 3, 0, 2])
+        _run(m_splits)
     assert te_gemm == []
