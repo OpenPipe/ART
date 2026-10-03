@@ -813,6 +813,7 @@ def _snapshot_planning_telemetry(
     routed_share = getattr(self, "_last_routed_share", None)
     self._last_routed_share = None
     self._last_forward_telemetry_snapshot = {
+        **self._packing_fingerprints(plan),
         "planning_ms": self._planning_seconds_accum * 1_000.0,
         "speculative_planning_ms": speculative_seconds * 1_000.0,
         "selected_max_depth": plan.selected_max_depth,
@@ -1577,6 +1578,13 @@ def _plan_flat_forward(
                     request_indices=tuple(group_indices),
                     items=items,
                     packed=packed,
+                    input_row_fingerprints=tuple(
+                        zip(
+                            tree.sequence_lengths,
+                            tree.row_fingerprints,
+                            strict=True,
+                        )
+                    ),
                     layout=layout
                     if getattr(
                         getattr(self, "_planner_reporter", None),

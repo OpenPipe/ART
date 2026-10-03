@@ -17,6 +17,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
+import hashlib
 import json
 import logging
 import math
@@ -71,6 +72,7 @@ from art.trainer_rank._prefix_tree_materializer import (  # noqa: F401  # read a
 from art.trainer_rank._prefix_tree_planner import (
     CanonicalPrefixTree,
     PrefixTreeLayout,
+    canonical_token_rows_fingerprint,
 )
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 
@@ -655,6 +657,14 @@ class _MemoryCheck:
     decision: dict[str, Any] | None = dataclass_field(
         default=None, compare=False, repr=False
     )
+    # Extrema above are diagnostics; fits is the conjunction of local fits.
+    # Keep each local producer through refreshes of different DP items.
+    local_required_bytes: int | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
+    local_available_bytes: int | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
 
 
 @dataclass(frozen=True)
@@ -1025,6 +1035,7 @@ class _ForwardGroupPlan:
     items: tuple[_ForwardItem, ...]
     packed: PrefixTreePack
     layout: PrefixTreeLayout | None = None
+    input_row_fingerprints: tuple[tuple[int, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1160,13 +1171,21 @@ def _memory_error(
     logical_tokens: int,
     check: _MemoryCheck,
 ) -> TrainerRankMemoryError:
+    # Peak and limit are group extrema (largest demand, smallest budget) that may
+    # come from different ranks; the rank_* pair is this rank's own comparison.
+    local = (
+        ""
+        if check.local_required_bytes is None or check.local_available_bytes is None
+        else f"rank_required_gb={check.local_required_bytes / 1024**3:.3f} "
+        f"rank_available_gb={check.local_available_bytes / 1024**3:.3f} "
+    )
     return TrainerRankMemoryError(
         f"{context}: {message}. "
         f"packed_tokens={packed_tokens} "
         f"logical_tokens={logical_tokens} "
         f"predicted_peak_gb={check.estimated_required_bytes / 1024**3:.3f} "
         f"usable_limit_gb={check.available_bytes / 1024**3:.3f}. "
-        f"{_MEMORY_ERROR_SUGGESTION}",
+        f"{local}{_MEMORY_ERROR_SUGGESTION}",
         predicted_peak_bytes=check.estimated_required_bytes,
         usable_limit_bytes=check.available_bytes,
         suggestion=_MEMORY_ERROR_SUGGESTION,
@@ -3303,6 +3322,16 @@ class TrainerRank:
         check that refused it. ``routed_share`` is the micro-batch's worst
         observed expert-parallel routed share over its balanced rows, when
         every rank observed the same checkpoint, and otherwise None.
+
+        ``packing_plan_sha256`` commits to ordered local prefix-pack geometry
+        and TP padding, before CP dispatch. ``subforward_packing_plan_sha256``
+        lists the child commitments in execution order, with
+        ``subforward_request_indices`` supplying the outer mapping. These are
+        not unique event IDs: identical child geometries share a digest.
+        ``input_tokens_sha256`` recomposes existing row hashes in original flat
+        request order, independent of packing; it is unavailable if any request
+        was inactive. These are planning-time commitments, not model/target
+        label/caller loss-mask fingerprints or evidence of completed execution.
         """
 
         if self._last_forward_telemetry_snapshot is None:
@@ -3693,6 +3722,7 @@ class TrainerRank:
     def _telemetry_signature(cls, plan: _AnyForwardPlan) -> dict[str, object]:
         return {
             **cls._telemetry_plan_signature(plan),
+            **cls._packing_fingerprints(plan),
             "request_count": plan.request_count,
             "packed_tokens": plan.packed_tokens,
             "logical_tokens": plan.logical_tokens,
@@ -3702,6 +3732,84 @@ class TrainerRank:
             "group_segment_counts": tuple(
                 len(group.packed.segments) for group in plan.groups
             ),
+        }
+
+    @staticmethod
+    def _packing_fingerprints(plan: _AnyForwardPlan) -> dict[str, object]:
+        """Host metadata only: never copy/read tensor values or query CUDA.
+
+        Geometry excludes content, checkpoint names and later CP kernel plans.
+        Input hashes reuse canonical little-endian int64 row commitments; no
+        additional token hashing is done, including for rejected candidates.
+        Keep this high-cardinality evidence outside compile-plan deduplication.
+        """
+
+        def digest(value: object) -> str:
+            return hashlib.sha256(
+                json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest()
+
+        split = isinstance(plan, _SplitForwardPlan)
+        children = plan.subforwards if split else (plan,)
+        mappings = (
+            plan.request_indices if split else (tuple(range(plan.request_count)),)
+        )
+        rows: list[tuple[int, str] | None] = [None] * plan.request_count
+        fingerprints = []
+        for child, mapping in zip(children, mappings, strict=True):
+            groups = []
+            tp = child.signature.topology[1]
+            for group in child.groups:
+                length = int(group.packed.tokens.numel())
+                groups.append(
+                    (
+                        group.request_indices,
+                        group.grad_enabled,
+                        length,
+                        ((length + tp - 1) // tp) * tp,
+                        tuple(
+                            (
+                                segment.sequence_indices,
+                                segment.start,
+                                segment.end,
+                                segment.packed_start,
+                                segment.group_id,
+                                segment.parent_id,
+                            )
+                            for segment in group.packed.segments
+                        ),
+                    )
+                )
+                for index, row in zip(
+                    group.request_indices, group.input_row_fingerprints, strict=False
+                ):
+                    rows[mapping[index]] = row
+            fingerprints.append(
+                digest(
+                    (
+                        "art.prefix-pack/v1",
+                        child.signature.topology,
+                        child.request_count,
+                        groups,
+                    )
+                )
+            )
+        complete_rows = tuple(row for row in rows if row is not None)
+        return {
+            "packing_fingerprint_schema": "art.prefix-pack/v1",
+            "packing_plan_sha256": digest(
+                (
+                    "art.prefix-pack-split/v1",
+                    plan.request_count,
+                    tuple(zip(mappings, fingerprints, strict=True)),
+                )
+            )
+            if split
+            else fingerprints[0],
+            "subforward_packing_plan_sha256": tuple(fingerprints),
+            "input_tokens_sha256": canonical_token_rows_fingerprint(complete_rows)
+            if len(complete_rows) == plan.request_count
+            else None,
         }
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
