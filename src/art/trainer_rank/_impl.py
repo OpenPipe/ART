@@ -3269,8 +3269,12 @@ class TrainerRank:
         *,
         positions: Sequence[torch.Tensor] | None = None,
         lower_bound: bool = False,
+        uncapped: bool = False,
     ) -> int:
         """Per-group logical bounds or exact packed union; no device-label read.
+
+        Capped at one head chunk unless ``uncapped`` (every projected row, for
+        pricing each chunk's statistics path).
 
         A single sequence's valid rows cannot alias each other. Across requests
         they may share: max is a lower bound, sum an upper bound. Ignore labels
@@ -3308,14 +3312,14 @@ class TrainerRank:
                     row = row.index_select(0, offsets)
                 for position in row.tolist():
                     projected.add(int(position))
-                    if len(projected) >= _HEAD_CHUNK_TOKENS:
+                    if len(projected) >= _HEAD_CHUNK_TOKENS and not uncapped:
                         return _HEAD_CHUNK_TOKENS
-        return min(
-            _HEAD_CHUNK_TOKENS,
+        rows = (
             (max(counts, default=0) if lower_bound else sum(counts))
             if positions is None
-            else len(projected),
+            else len(projected)
         )
+        return rows if uncapped else min(_HEAD_CHUNK_TOKENS, rows)
 
     def _head_target_chunk_rows(
         self,
@@ -5736,6 +5740,12 @@ class TrainerRank:
                 )
                 log_z = global_max + torch.log(global_sum)
             else:
+                if _triton_stats_enabled(
+                    local_logits.is_cuda, int(local_logits.shape[0])
+                ):
+                    # An attempted kernel failed: admission prices the eager
+                    # fallback from now on (_triton_head_stats).
+                    self._triton_head_stats_failed = True
                 log_z = _vocab_parallel_log_z(local_logits)
 
             if topk_stats is not None:
@@ -6839,14 +6849,19 @@ def _triton_stats_importable() -> bool:
     return True
 
 
-def _triton_head_stats(device: torch.device, rows: int) -> bool:
+def _triton_head_stats(rank: Any, rows: int) -> bool:
     """The head statistics path a ``rows`` chunk takes, for admission.
 
-    The forward also falls back on a kernel error, unless
-    ART_TRAINER_RANK_TRITON_TOPK=strict makes that error fatal.
+    Mirrors ``_try_triton_stats``'s attempt predicate plus kernel
+    importability. A kernel that imports but fails at run time falls back
+    (unless ART_TRAINER_RANK_TRITON_TOPK=strict makes that fatal); the first
+    such wave was priced for the kernel, and ``_local_head_stats`` then marks
+    the rank so later admissions price the fallback.
     """
-    return _triton_stats_enabled(device.type == "cuda", rows) and (
-        _triton_stats_importable()
+    return (
+        _triton_stats_enabled(rank.device.type == "cuda", rows)
+        and not getattr(rank, "_triton_head_stats_failed", False)
+        and _triton_stats_importable()
     )
 
 

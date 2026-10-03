@@ -223,22 +223,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             if vocabulary
             else 0
         )
-        if (
-            projected
-            and rank._topology_key()[1] > 1
-            and any(
-                r.target_tokens is not None or r.top_k is not None for r in requests
-            )
-            and any(
-                rows and not _impl._triton_head_stats(rank.device, rows)
-                for rows in (
-                    min(projected, _impl._HEAD_CHUNK_TOKENS),
-                    projected % _impl._HEAD_CHUNK_TOKENS
-                    if projected > _impl._HEAD_CHUNK_TOKENS
-                    else 0,
-                )
-            )
-        ):
+        if projected and head_statistics_fallback(rank, requests, positions):
             # The frozen head facts price only the three-buffer path.
             raise ValueError("head_statistics_fallback_unsupported")
         backwards = (
@@ -318,6 +303,20 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     # primitives before bounded JSON encoding; never retain model/slot objects.
     validate(facts)
     return facts
+
+
+def head_statistics_fallback(rank: Any, requests: Any, positions: Any) -> bool:
+    """Whether any TP > 1 head chunk of these requests runs eager statistics."""
+    return (
+        rank._topology_key()[1] > 1
+        and any(r.target_tokens is not None or r.top_k is not None for r in requests)
+        and any(
+            not _impl._triton_head_stats(rank, chunk)
+            for chunk in _memory._head_chunk_sizes(
+                rank._head_projection_rows(requests, positions=positions, uncapped=True)
+            )
+        )
+    )
 
 
 def validate(facts: Any) -> None:

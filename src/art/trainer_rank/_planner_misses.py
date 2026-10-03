@@ -651,6 +651,22 @@ _RANK_FIELDS = frozenset(
 _OPTIONAL_RANK_FIELDS = frozenset({"mixer_top_gaps", "lora_modules_per_layer"})
 
 
+def _adapter_ranks_unavailable(
+    topology: tuple[int, ...], facts: dict[str, Any], signature: Any
+) -> bool:
+    """A TP x SP floor estimate trains a named adapter whose ranks (the LoRA
+    intermediates' price) were not recorded, as in reports from before
+    sequence-parallel signatures carried slot shapes."""
+    return (
+        topology[1] > 1
+        and bool(facts["checkpoint_layers"])
+        and any(
+            group["grad"] and group["adapter"] is not None for group in facts["groups"]
+        )
+        and not any(grad for grad, _ in signature.slot_shapes)
+    )
+
+
 def _signature_values(values: dict[str, Any]) -> dict[str, Any]:
     values = dict(values)
     for name in ("topology", "planner_coefficients", "request_mix", "grad_modes"):
@@ -867,6 +883,10 @@ def replay(
                 request_cursor += count
                 group_cursor += 1
         key = _impl._MemorySignature(**_signature_values(item["signature"]))
+        if grouped and _adapter_ranks_unavailable(
+            rank._topology_key(), item["runtime_facts"], key
+        ):
+            raise ValueError("incomplete replay: TP x SP adapter ranks unavailable")
         rank._memory_profiles = (
             {key: _impl._MemoryProfile(**item["profile"])}
             if item["profile"] is not None

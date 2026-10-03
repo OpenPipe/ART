@@ -360,13 +360,18 @@ def _group_head_workspace_bytes(
         # eager FP32 fallback (``_vocab_parallel_log_z``): BF16 logits, their
         # FP32 copy, the shifted logits and their exponentials, about seven
         # BF16 buffers. TP1 keeps its three-buffer charge (inherited).
-        chunk = _impl._HEAD_CHUNK_TOKENS
-        chunks = (min(rows, chunk), rows % chunk if rows > chunk else 0)
         fallback = 7 * max(
             (
-                self._head_workspace_bytes(rows)
-                for rows in chunks
-                if rows and not _impl._triton_head_stats(self.device, rows)
+                self._head_workspace_bytes(chunk)
+                for chunk in _head_chunk_sizes(
+                    self._head_projection_rows(
+                        requests,
+                        positions=positions,
+                        lower_bound=lower_bound,
+                        uncapped=True,
+                    )
+                )
+                if not _impl._triton_head_stats(self, chunk)
             ),
             default=0,
         )
@@ -390,6 +395,14 @@ def _group_head_workspace_bytes(
         )
         return max(dense, 3 * target_dense, fallback)
     return max(dense, fallback)
+
+
+def _head_chunk_sizes(rows: int) -> tuple[int, ...]:
+    """The distinct chunk sizes the head runs over ``rows`` projected rows."""
+    chunk = _impl._HEAD_CHUNK_TOKENS
+    return tuple(
+        size for size in (min(rows, chunk), rows % chunk * (rows > chunk)) if size
+    )
 
 
 def _plan_head_workspace_bytes(self: TrainerRank, plan: _impl._FlatForwardPlan) -> int:

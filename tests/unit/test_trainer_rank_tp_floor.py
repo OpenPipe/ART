@@ -439,29 +439,129 @@ def test_the_tp2_head_stage_is_priced_with_the_floor():
     assert cost.checkpoint_workspace == head + COLD
 
 
+def _labelled(rows):
+    """One CPU request whose ``rows`` positions are all labelled targets."""
+    tokens = torch.zeros(rows, dtype=torch.long)
+    return [
+        SimpleNamespace(
+            input_tokens=tokens, target_tokens=tokens, logits=False, top_k=None
+        )
+    ]
+
+
+def _head_stage(r, requests):
+    """The head charge as planned: the capped projection, then each chunk."""
+    rows = r._head_projection_rows(requests)
+    return r._group_head_workspace_bytes(rows, requests, grad_enabled=True)
+
+
 def test_the_tp2_head_stage_follows_the_statistics_path(monkeypatch):
     from art.trainer_rank import _impl, _memory
 
     r = _with_head(tp_rank(topology=TP2), 248_320, 2)
     monkeypatch.setattr(_memory, "_head_target_backward", lambda rank: True)
-    targets = [SimpleNamespace(target_tokens=1, logits=False, top_k=None)]
     dense = r._head_workspace_bytes(512)
-
-    def head():
-        return r._group_head_workspace_bytes(512, targets, grad_enabled=True)
-
     # The same predicate as _try_triton_stats: a CPU device, the
     # ART_TRAINER_RANK_TRITON_TOPK switch and short chunks take the eager
     # FP32 fallback, about seven BF16 buffers.
-    assert head() == 7 * dense
-    monkeypatch.setattr(_impl, "_triton_head_stats", lambda device, rows: True)
-    assert head() == 3 * dense
+    assert _head_stage(r, _labelled(512)) == 7 * dense
+    monkeypatch.setattr(_impl, "_triton_head_stats", lambda rank, rows: True)
+    assert _head_stage(r, _labelled(512)) == 3 * dense
     monkeypatch.setenv("ART_TRAINER_RANK_TRITON_TOPK", "0")
     assert not _impl._triton_stats_enabled(True, 512)
     monkeypatch.delenv("ART_TRAINER_RANK_TRITON_TOPK")
     assert _impl._triton_stats_enabled(True, 64)
     assert not _impl._triton_stats_enabled(True, 63)
     assert not _impl._triton_stats_enabled(False, 512)
+
+
+@pytest.mark.parametrize(
+    ("rows", "minimum", "expected", "eager"),
+    [
+        # Sol: a 511-row eager tail behind a 512-row Triton chunk.
+        (1_023, "512", 7 * 511 * 124_160 * 2, True),  # 888,240,640 bytes
+        # Schulman: an 812-row wave's 300-row eager tail.
+        (812, "512", 7 * 300 * 124_160 * 2, True),  # 521,472,000 bytes
+        # The default threshold (64): every chunk runs Triton.
+        (1_023, None, 3 * 512 * 124_160 * 2, False),  # 381,419,520 bytes
+        # A 40-row default tail falls back, below the full chunk's charge.
+        (552, None, 3 * 512 * 124_160 * 2, True),
+    ],
+)
+def test_every_head_chunk_is_priced_for_its_own_statistics_path(
+    monkeypatch, rows, minimum, expected, eager
+):
+    from art.trainer_rank import _impl, _memory
+
+    r = _with_head(tp_rank(topology=TP2), 248_320, 2)
+    r.device = torch.device("cuda", 0)  # a CUDA rank whose kernels import
+    monkeypatch.setattr(_impl, "_triton_stats_importable", lambda: True)
+    monkeypatch.setattr(_memory, "_head_target_backward", lambda rank: True)
+    if minimum is None:
+        monkeypatch.delenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", raising=False)
+    else:
+        monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", minimum)
+    # The planner's projection is capped at one chunk; the tail is not.
+    assert r._head_projection_rows(_labelled(rows)) == 512
+    assert _head_stage(r, _labelled(rows)) == expected
+    # Replay capture refuses exactly the waves with an eager chunk.
+    from art.trainer_rank._planner_replay import head_statistics_fallback
+
+    assert head_statistics_fallback(r, _labelled(rows), None) == eager
+
+
+def test_an_observed_kernel_failure_prices_the_fallback_from_then_on(monkeypatch):
+    from art.trainer_rank import _impl, _memory
+
+    r = _with_head(tp_rank(topology=TP2), 248_320, 2)
+    r.device = torch.device("cuda", 0)  # a CUDA rank whose kernels import
+    monkeypatch.setattr(_impl, "_triton_stats_importable", lambda: True)
+    monkeypatch.setattr(_memory, "_head_target_backward", lambda rank: True)
+    dense = r._head_workspace_bytes(512)
+    assert dense > 0
+    logits = torch.zeros(512, 8)
+    stats = (torch.zeros(512), torch.ones(512))
+
+    def statistics(*, top_k, logsumexp, max_top_k):
+        """Run the head statistics with the given kernel outcomes."""
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                TrainerRank, "_local_logits_from_hidden_rows", lambda *a, **k: logits
+            )
+            # The chunk is attempted (as on CUDA) and the kernels return these.
+            patch.setattr(_impl, "_triton_stats_enabled", lambda cuda, rows: True)
+            patch.setattr(_impl, "_try_triton_local_topk_stats", lambda *a, **k: top_k)
+            patch.setattr(_impl, "_try_triton_stats", lambda *a, **k: logsumexp)
+            patch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+            patch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+            patch.setattr(_impl, "_vocab_parallel_log_z", lambda t: t[:, 0].float())
+            r._local_head_stats(
+                None, logits, output_weight=None, need_log_z=True, max_top_k=max_top_k
+            )
+
+    # A fused top-k failure recovered by the Triton logsumexp: no fallback.
+    statistics(top_k=None, logsumexp=stats, max_top_k=4)
+    assert not getattr(r, "_triton_head_stats_failed", False)
+    assert _head_stage(r, _labelled(512)) == 3 * dense
+    # An attempted kernel that fails takes the eager fallback, and the rank
+    # remembers it (the failing wave itself was priced for the kernel): later
+    # admissions price seven buffers.
+    statistics(top_k=None, logsumexp=None, max_top_k=0)
+    assert r._triton_head_stats_failed
+    assert _head_stage(r, _labelled(512)) == 7 * dense
+
+
+def test_replay_declines_tp_sp_adapter_estimates_without_ranks():
+    from art.trainer_rank._planner_misses import _adapter_ranks_unavailable
+
+    facts = {"checkpoint_layers": 64, "groups": [{"grad": True, "adapter": {}}]}
+    bare = signature(TP2)
+    ranked = signature(TP2, rank=4)
+    assert _adapter_ranks_unavailable(TP2, facts, bare)
+    assert not _adapter_ranks_unavailable(TP2, facts, ranked)
+    assert not _adapter_ranks_unavailable((1, 1, 1, 1), facts, bare)
+    base = {"checkpoint_layers": 64, "groups": [{"grad": True, "adapter": None}]}
+    assert not _adapter_ranks_unavailable(TP2, base, bare)
 
 
 def test_a_tp2_wide_ffn_is_priced_by_its_fc1_stage():
