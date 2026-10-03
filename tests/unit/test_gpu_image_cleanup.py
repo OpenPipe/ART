@@ -261,11 +261,28 @@ def test_resource_version_is_opaque(api, tmp_path):
     assert result["observed"][0]["resourceVersion"] == "opaque:version"
 
 
-def test_workflow_cleanup_is_always_bounded_and_uploaded():
+def test_workflow_cleanup_is_always_bounded_and_uploaded(tmp_path):
     workflow = yaml.safe_load(
         (ROOT / ".github/workflows/build-gpu-image.yml").read_text()
     )
-    steps = workflow["jobs"]["build-gpu-image"]["steps"]
+    job = workflow["jobs"]["build-gpu-image"]
+    assert "GPU_IMAGE_CLEANUP_ROOT" not in job["env"]
+    steps = job["steps"]
+    runner_temp = tmp_path / "runner temp"
+    github_env = tmp_path / "github-env"
+    subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", steps[0]["run"]],
+        check=True,
+        env={
+            **os.environ,
+            "RUNNER_TEMP": str(runner_temp),
+            "GITHUB_ENV": str(github_env),
+        },
+    )
+    assert (
+        github_env.read_text()
+        == f"GPU_IMAGE_CLEANUP_ROOT={runner_temp}/art-image-cleanup\n"
+    )
     fallback = next(
         step
         for step in steps
@@ -275,6 +292,32 @@ def test_workflow_cleanup_is_always_bounded_and_uploaded():
     assert "--kinds pod service" in fallback["run"]
     assert "--namespace-from-context" in fallback["run"]
     assert "|| true" not in fallback["run"]
+    receipts_log = tmp_path / "receipts"
+    python = tmp_path / "python3"
+    python.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "with open(os.environ['RECEIPTS_LOG'], 'a') as output:\n"
+        "    output.write(sys.argv[sys.argv.index('--receipt') + 1] + '\\n')\n"
+    )
+    python.chmod(0o755)
+    cleanup_root = github_env.read_text().strip().split("=", 1)[1]
+    subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", fallback["run"]],
+        check=True,
+        env={
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "GPU_IMAGE_CLEANUP_ROOT": cleanup_root,
+            "PREWARM_RUN_UID": "123-1",
+            "PREWARM_INFRAS": "k8s/one,kubernetes/two",
+            "RECEIPTS_LOG": str(receipts_log),
+        },
+    )
+    assert receipts_log.read_text().splitlines() == [
+        f"{cleanup_root}/{name}.json"
+        for name in ("builder", "smoke", "prewarm-one", "prewarm-two")
+    ]
     upload = next(
         step for step in steps if step.get("uses") == "actions/upload-artifact@v4"
     )
@@ -282,10 +325,13 @@ def test_workflow_cleanup_is_always_bounded_and_uploaded():
         upload["if"] == "${{ always() }}"
         and upload["with"]["if-no-files-found"] == "error"
     )
+    assert upload["with"]["path"] == "${{ env.GPU_IMAGE_CLEANUP_ROOT }}"
     source = (ROOT / "scripts/build-gpu-image.sh").read_text()
+    assert 'cleanup_root="${GPU_IMAGE_CLEANUP_ROOT:-' in source
     assert 'art.openpipe/build-run: "${prewarm_run_uid}"' in source
     assert '"${kubectl_cmd[@]}" create -n "${buildkit_namespace}"' in source
     smoke = next(step for step in steps if step.get("id") == "smoke")["run"]
+    assert '"${GPU_IMAGE_CLEANUP_ROOT}/smoke-down.json"' in smoke
     assert "kubernetes.custom_metadata.labels=" in smoke
     assert "skypilot-cluster=${cluster}" not in smoke
     assert "timeout --signal=TERM --kill-after=5s 60s" in smoke
