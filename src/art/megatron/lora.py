@@ -26,6 +26,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.mappings import (
+    copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
@@ -421,17 +422,34 @@ def _compile_disabled_collective(function: _F) -> _F:
 _gather_lora_sequence_parallel_region = _compile_disabled_collective(
     gather_from_sequence_parallel_region
 )
+_copy_lora_tensor_model_parallel_region = _compile_disabled_collective(
+    copy_to_tensor_model_parallel_region
+)
 
 
-def _column_parallel_lora_input(x: torch.Tensor, linear: Any) -> torch.Tensor:
+def _column_parallel_lora_input(
+    x: torch.Tensor, linear: Any, *, returned_norm: bool = False
+) -> torch.Tensor:
     if _linear_disables_tensor_parallel_comm(linear):
         return x
-    if (
-        bool(getattr(linear, "sequence_parallel", False))
-        and int(getattr(linear, "tp_size", 1)) > 1
-    ):
+    tp_size = int(getattr(linear, "tp_size", 1))
+    if tp_size <= 1:
+        return x
+    group = getattr(linear, "tp_group", None) if returned_norm else None
+    if returned_norm and (group is None or group.size() != tp_size):
+        raise RuntimeError(
+            "Returned-norm LoRA requires the linear's initialized TP group"
+        )
+    if bool(getattr(linear, "sequence_parallel", False)):
         # Torch 2.11 compiled autograd drops the gather's input-gradient edge.
+        if returned_norm:
+            return _gather_lora_sequence_parallel_region(
+                x, group=group, tensor_parallel_output_grad=True
+            )
         return _gather_lora_sequence_parallel_region(x)
+    if returned_norm:
+        # TE reduces the base cotangent before adding the returned-norm cotangent.
+        return _copy_lora_tensor_model_parallel_region(x, group=group)
     return x
 
 
@@ -1443,7 +1461,7 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         super().__init__()
         self.provider = provider
         linear_qkv.return_layernorm_output = True
-        linear_qkv.return_layernorm_output_gathered = linear_qkv.tp_size > 1
+        linear_qkv.return_layernorm_output_gathered = False
         self.linear_qkv = linear_qkv
         assert self.provider.kv_channels is not None
         assert self.provider.num_query_groups is not None
@@ -1612,6 +1630,9 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         assert isinstance(linear_output, torch.Tensor)
         assert isinstance(layernorm_output, torch.Tensor)
         assert isinstance(bias, (torch.Tensor, type(None)))
+        layernorm_output = _column_parallel_lora_input(
+            layernorm_output, self.linear_qkv, returned_norm=True
+        )
 
         query_and_gate = self._qkv_lora_output(
             self.q_proj_lora,
@@ -1670,8 +1691,8 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
     ) -> None:
         super().__init__()
         in_proj.return_layernorm_output = True
-        # TP1 returns a local norm tensor; TE must consume its cotangent.
-        in_proj.return_layernorm_output_gathered = in_proj.tp_size > 1
+        # TE must consume the local returned-norm cotangent in every TP layout.
+        in_proj.return_layernorm_output_gathered = False
         self.in_proj = in_proj
         self.num_value_heads_per_partition = (
             gated_delta_net.num_value_heads // ps.get_tensor_model_parallel_world_size()
@@ -1714,6 +1735,9 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         assert isinstance(linear_output, torch.Tensor)
         assert isinstance(layernorm_output, torch.Tensor)
         assert isinstance(bias, (torch.Tensor, type(None)))
+        layernorm_output = _column_parallel_lora_input(
+            layernorm_output, self.in_proj, returned_norm=True
+        )
 
         qkv = self.qkv_lora(layernorm_output)
         z = self.z_lora(layernorm_output)
@@ -1762,7 +1786,7 @@ class ComponentwiseColumnParallelLinearLoRA(torch.nn.Module):
             )
         if isinstance(in_proj, TELayerNormColumnParallelLinear):
             in_proj.return_layernorm_output = True
-            in_proj.return_layernorm_output_gathered = in_proj.tp_size > 1
+            in_proj.return_layernorm_output_gathered = False
         self.in_proj = in_proj
         self.lora = _parallel_lora(
             adapter_model_prefix=adapter_model_prefix,
@@ -1782,6 +1806,9 @@ class ComponentwiseColumnParallelLinearLoRA(torch.nn.Module):
         base_output, bias = self.in_proj(x)
         if isinstance(base_output, tuple):
             base, lora_input = base_output
+            lora_input = _column_parallel_lora_input(
+                lora_input, self.in_proj, returned_norm=True
+            )
         else:
             base = base_output
             lora_input = _column_parallel_lora_input(x, self.in_proj)
@@ -1942,7 +1969,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         super().__init__()
         if isinstance(linear_fc1, TELayerNormColumnParallelLinear):
             linear_fc1.return_layernorm_output = True
-            linear_fc1.return_layernorm_output_gathered = linear_fc1.tp_size > 1
+            linear_fc1.return_layernorm_output_gathered = False
         self.linear_fc1 = linear_fc1
         self.out_features = int(linear_fc1.weight.shape[0])
         self.non_gated = bool(non_gated)
@@ -1984,6 +2011,9 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
         base_output, bias_out = self.linear_fc1(x)
         if isinstance(base_output, tuple):
             base_out, lora_input = base_output
+            lora_input = _column_parallel_lora_input(
+                lora_input, self.linear_fc1, returned_norm=True
+            )
         else:
             base_out = base_output
             lora_input = _column_parallel_lora_input(x, self.linear_fc1)
