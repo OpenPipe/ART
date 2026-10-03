@@ -199,6 +199,7 @@ def test_required_max_then_available_and_local_fit_min_keep_group(
         60,
         False,
     )
+    assert (check.local_required_bytes, check.local_available_bytes) == (required, 70)
 
 
 def test_oom_preserves_admission_and_original_cause_after_free_changes(
