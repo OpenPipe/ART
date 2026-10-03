@@ -286,6 +286,27 @@ def _rank_and_device() -> tuple[int, torch.device]:
     )
 
 
+def _validate_vllm_lora_publish_runtime(
+    rank: int, world_size: int
+) -> tuple[int, torch.device]:
+    actual_rank, device = _rank_and_device()
+    if _distributed_ready():
+        actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
+        if actual_rank != rank or actual_world_size != world_size:
+            raise RuntimeError(
+                "LoRA publisher rank/world-size mismatch: "
+                f"runtime=({rank}, {world_size}) distributed=({actual_rank}, {actual_world_size})"
+            )
+    else:
+        if rank != 0 or world_size != 1:
+            raise RuntimeError(
+                "Non-distributed LoRA publish requires rank=0 and world_size=1, "
+                f"got rank={rank} world_size={world_size}"
+            )
+        rank = 0
+    return rank, device
+
+
 def _metadata_by_owner_dtype(
     metadata: Sequence[Any],
 ) -> dict[tuple[int, str], list[Any]]:
@@ -647,21 +668,7 @@ def _build_merged_lora_tensors_from_model(
     world_size: int,
     slot_ref: LoRASlotRef | None = None,
 ) -> dict[str, torch.Tensor] | None:
-    actual_rank, device = _rank_and_device()
-    if _distributed_ready():
-        actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
-        if actual_rank != rank or actual_world_size != world_size:
-            raise RuntimeError(
-                "LoRA publisher rank/world-size mismatch: "
-                f"runtime=({rank}, {world_size}) distributed=({actual_rank}, {actual_world_size})"
-            )
-    else:
-        if rank != 0 or world_size != 1:
-            raise RuntimeError(
-                "Non-distributed LoRA publish requires rank=0 and world_size=1, "
-                f"got rank={rank} world_size={world_size}"
-            )
-        rank = 0
+    rank, device = _validate_vllm_lora_publish_runtime(rank, world_size)
     packed_expert_groups = tuple(handler.expert_packed_lora_groups())
     local_tensors, local_metadata = collect_local_lora_entries(
         model,
