@@ -1607,6 +1607,10 @@ def test_trainer_rank_publishes_named_checkpoint_slot_without_mutating_base(
     trainer._skipped_forward_waves = {}
     trainer._snapshot_checkpoint_names = set()
     trainer._checkpoint_prefetch_sources = {}
+    trainer._checkpoint_sources = {}
+    trainer._checkpoint_slot_writes = {}
+    trainer._checkpoint_snapshot_lru = {}
+    trainer._checkpoint_snapshot_cache_size = 2
     trainer._checkpoint_prefetch_lock = threading.Lock()
     trainer._checkpoint_mutation_lock = threading.RLock()
     config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
@@ -1648,6 +1652,10 @@ def test_prepared_lora_export_is_immutable_and_abortable(tmp_path: Path):
     trainer._skipped_forward_waves = {}
     trainer._snapshot_checkpoint_names = set()
     trainer._checkpoint_prefetch_sources = {}
+    trainer._checkpoint_sources = {}
+    trainer._checkpoint_slot_writes = {}
+    trainer._checkpoint_snapshot_lru = {}
+    trainer._checkpoint_snapshot_cache_size = 2
     trainer._checkpoint_prefetch_lock = threading.Lock()
     trainer._checkpoint_mutation_lock = threading.RLock()
     config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)
