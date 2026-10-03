@@ -433,6 +433,80 @@ def context_parallel_rank_model_token_counts(
     )
 
 
+def context_parallel_rank_layouts(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+    build_gdn_execution_spec: bool,
+    gdn_planner_config: Any | None = None,
+) -> tuple[
+    tuple[int, ...],
+    tuple[int, ...] | None,
+    tuple[int, ...] | None,
+    tuple[RankRuntimePlan, ...],
+]:
+    """Each CP rank's attention rows, GDN rows, GDN states and attention plan.
+
+    Uses the cached planning bundle and per-rank runtime plans that execution
+    builds, so a memory estimate sees the layouts the ranks will run. A
+    rank's GDN states bound what its GDN layer can hold at once: an initial
+    and a final state per executed segment (its own and every chained one)
+    and each parent state imported from another rank, as the executor's
+    state exchange (``_build_tree_state_exchanges_by_depth``) imports them.
+    """
+    planning_key, bundle, _group_ids_cpu, _parent_ids_cpu = (
+        _get_or_build_planning_bundle(
+            group_ids=group_ids,
+            parent_ids=parent_ids,
+            topology=topology,
+            config=config,
+            original_seq_len=original_seq_len,
+            build_gdn_execution_spec=build_gdn_execution_spec,
+        )
+    )
+    attention = tuple(bundle.token_layout_index.token_counts_by_rank)
+    gdn = states = None
+    if build_gdn_execution_spec:
+        decision = _plan_gdn_global_execution(
+            planning_key=planning_key,
+            bundle=bundle,
+            topology=topology,
+            gdn_planner_config=gdn_planner_config,
+        )
+        gdn = tuple(decision.gdn_token_counts_by_rank)
+        assert bundle.gdn_execution_spec is not None  # the decision needs it
+        owner, chained = decision.owner_by_node, decision.chained_nodes
+        imported: list[set[int]] = [set() for _ in gdn]
+        parents = bundle.gdn_execution_spec.tree_parent_indices
+        for child, parent in enumerate(parents):
+            if parent < 0 or chained[parent]:
+                continue
+            for rank in range(len(gdn)) if chained[child] else (owner[child],):
+                if rank != owner[parent]:
+                    imported[rank].add(parent)
+        chains = sum(map(len, decision.chain_segments_by_depth))
+        states = tuple(
+            2 * (chains + sum(map(len, depths))) + len(received)
+            for depths, received in zip(
+                decision.segments_by_rank_depth, imported, strict=True
+            )
+        )
+    plans = tuple(
+        _get_or_build_bundle_rank_plan(
+            planning_key=planning_key,
+            bundle=bundle,
+            original_seq_len=original_seq_len,
+            target_rank=rank,
+            block_size=config.block_size,
+        )
+        for rank in range(len(attention))
+    )
+    return attention, gdn, states, plans
+
+
 def _normalized_chunk_size(
     *,
     valid_tokens: int,

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import nullcontext
+import gc
 import hashlib
 import math
 from types import MethodType
@@ -27,7 +28,12 @@ if TYPE_CHECKING:
     import torch.distributed as dist
 
     from art.megatron.lora import LoRASlotRef
-    from art.trainer_rank._impl import AdapterSelection, AnyForwardInput, TrainerRank
+    from art.trainer_rank._impl import (
+        AdapterSelection,
+        AnyForwardInput,
+        TrainerRank,
+        _GroupLayout,
+    )
 
 
 def _split_required_memory(costs: Sequence[_impl._SubforwardCost]) -> int:
@@ -992,6 +998,301 @@ def _checkpoint_input_gradient_bytes(
     return -(-rows // tp) * self._hidden_size * self._param_dtype_size
 
 
+def _dense_mlp_widths(
+    self: TrainerRank, slot_refs: Sequence["LoRASlotRef | None"] | None = None
+) -> tuple[int, int]:
+    """The covered dense (gradient stage, no-grad transient) per row, or 0s.
+
+    Only at TP1/CP2/PP1, where it was traced, and only where the checkpoint
+    floor prices the decoder (``_checkpoint_layers``). Named slots are
+    rechecked: their adapters must stay within the priced rank.
+    """
+    stage = getattr(self, "_dense_recompute_bytes_per_token", 0)
+    no_grad = getattr(self, "_dense_no_grad_bytes_per_token", 0)
+    if (
+        type(stage) is not int
+        or type(no_grad) is not int
+        or stage <= 0
+        or no_grad <= 0
+        or self._topology_key()[1:] != (1, 2, 1)
+        or not _checkpoint_layers(self, ((1, True),))
+    ):
+        return 0, 0
+    for ref in slot_refs or ():
+        if ref is None or ref.name is None:
+            continue
+        slot = _impl._dense_mlp_recompute_bytes_per_token(
+            self.runtime.model, ref, hidden_size=self._hidden_size
+        )
+        if not all(slot):
+            return 0, 0
+        stage, no_grad = max(stage, slot[0]), max(no_grad, slot[1])
+    return stage, no_grad
+
+
+def _dense_mixer_widths(self: TrainerRank) -> dict[str, int]:
+    """A covered dense CP2 model's recomputed mixer bytes per row, by layer type.
+
+    Beside the CP executor's retained records, an attention layer keeps its
+    input norm output and five query- and five KV-width tensors (Qwen3.8-27B
+    CP2 traces: 78.1 and 79.9 KB per row on the two ranks, 81.9 KB priced).
+    A GDN layer keeps its input and norm outputs, the projected q/k/v, their
+    l2norm outputs expanded to the value heads, five more value-width
+    tensors, the chunk decay matrix and the CP exchange's value-width output
+    (Qwen3.6-35B-A3B CP2 traces: 88 KB measured, 94 KB priced).
+    """
+    geometry = self._geometry
+    hidden = self._hidden_size
+    widths: dict[str, int] = {}
+    if self._gdn_layers < self._num_layers:
+        q = geometry.num_attention_heads * geometry.kv_channels or hidden
+        kv = geometry.num_query_groups * geometry.kv_channels or hidden
+        widths["attention"] = hidden + 5 * q + 5 * kv
+    if self._gdn_layers:
+        value = geometry.gdn_value_heads * geometry.gdn_value_head_dim
+        widths["gdn"] = (
+            2 * hidden
+            + 2 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
+            + 2 * geometry.gdn_value_heads * geometry.gdn_key_head_dim
+            + 7 * value
+            + 64 * geometry.gdn_value_heads
+        )
+    return {kind: width * self._param_dtype_size for kind, width in widths.items()}
+
+
+def _dense_layout_floors(
+    self: TrainerRank,
+    group_rows: tuple[tuple[int, bool], ...],
+    slot_refs: tuple["LoRASlotRef | None", ...] | None,
+    layouts: tuple[_GroupLayout, ...] | None,
+) -> tuple[tuple[int, int], ...] | None:
+    """Each CP rank's (boundaries, workspace) for a covered dense model, or None.
+
+    All groups gradient or all no-grad, on every rank's own layouts. A saved
+    layer input arrives in the GDN layout when the layer follows a GDN layer
+    in its island, else in the attention layout. A recomputed attention
+    layer keeps its mixer width on its attention rows plus the executor's
+    retained records, a GDN layer its width on its GDN rows; either keeps
+    its residual, pre-MLP norm output and MLP stage on those rows. A no-grad
+    layer holds its stage on its rows. A GDN layer also holds the rank's
+    recurrent states (``_GroupLayout.gdn_states``, half a
+    ``_gdn_segment_layer_bytes`` each).
+    """
+    refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
+    if layouts is None or len({grad for _, grad in group_rows}) != 1:
+        return None
+    stage, no_grad = self._dense_mlp_widths(refs)
+    if not stage:
+        return None
+    gradient = group_rows[0][1]
+    hidden = self._hidden_size * 2
+    inputs = self._layer_gdn_inputs()
+    gdn_inputs = sum(inputs)
+    attention_inputs = len(inputs) - gdn_inputs
+    widths = self._dense_mixer_widths()
+    floors: list[tuple[int, int]] = []
+    for rank in range(len(layouts[0].attention_rows)):
+        retained = workspace = 0
+        for layout in layouts:
+            attention = max(1, layout.attention_rows[rank])
+            gdn = (
+                attention if layout.gdn_rows is None else max(1, layout.gdn_rows[rank])
+            )
+            states = layout.gdn_states[rank] if layout.gdn_states else 0
+            if gradient:
+                retained += hidden * (attention_inputs * attention + gdn_inputs * gdn)
+            for kind, rows, extra in (
+                ("attention", attention, layout.attention_retained[rank] * gradient),
+                ("gdn", gdn, math.ceil(states * self._gdn_segment_layer_bytes() / 2)),
+            ):
+                if kind in widths:
+                    per_row = widths[kind] + 2 * hidden + stage if gradient else no_grad
+                    workspace = max(workspace, rows * per_row + extra)
+        floors.append((retained, workspace))
+    return tuple(floors)
+
+
+def _dense_adapter_gradient_extra(
+    self: TrainerRank,
+    floor: tuple[int, int],
+    floors: tuple[tuple[int, int], ...],
+    group_rows: tuple[tuple[int, bool], ...],
+    slot_refs: tuple["LoRASlotRef | None", ...] | None,
+    layouts: tuple[_GroupLayout, ...] | None,
+) -> int:
+    """Adapter gradients at the recompute peak beyond ``floor`` on CP layouts.
+
+    ``floor`` is ``_checkpoint_memory_floor``'s (boundaries, workspace) and
+    ``floors`` each rank's (``_dense_layout_floors``). Each rank releases
+    its own boundaries as backward proceeds (``_layout_layer_boundaries``):
+    a rank with fewer rows releases less, so its extra is larger, but its own
+    floor is smaller by what it never saved. Pair each rank's extra with its
+    own boundaries plus the larger of its workspace and the floor's.
+    """
+    assert layouts is not None
+    slots = [
+        slot for slot, _ in self._checkpoint_gradient_groups(group_rows, slot_refs)
+    ]
+    extras = [
+        self._checkpoint_adapter_gradient_bytes(tuple(zip(slots, rank, strict=True)))
+        for rank in self._layout_layer_boundaries(layouts)
+    ]
+    if not any(extras):
+        return 0
+    retained, workspace = floor
+    return max(
+        0,
+        max(
+            rank_retained + max(rank_workspace, workspace) + extra
+            for (rank_retained, rank_workspace), extra in zip(
+                floors, extras, strict=True
+            )
+        )
+        - retained
+        - workspace,
+    )
+
+
+def _layer_gdn_inputs(self: TrainerRank) -> tuple[bool, ...]:
+    """Per decoder layer, whether its saved input arrives in the GDN layout.
+
+    It does when the layer follows a GDN layer in its island
+    (``_art_gdn_island_boundary``); otherwise it is in the attention layout.
+    """
+    decoder = _impl._language_model(self.runtime.model[0]).decoder
+    return tuple(
+        getattr(getattr(layer, "_art_gdn_island_boundary", None), "input_layout", "")
+        == "gdn"
+        for layer in decoder.layers
+    )
+
+
+def _layout_layer_boundaries(
+    self: TrainerRank, layouts: tuple[_GroupLayout, ...]
+) -> tuple[tuple[tuple[int, ...], ...], ...]:
+    """Each CP rank's saved-boundary bytes per group and decoder layer.
+
+    As ``_dense_layout_floors`` prices them: a layer saves its
+    input in the GDN layout when it follows a GDN layer in its island and in
+    the attention layout otherwise, on that rank's rows of the group.
+    """
+    gdn_inputs = self._layer_gdn_inputs()
+    hidden = self._hidden_size * 2
+    ranks = []
+    for rank in range(len(layouts[0].attention_rows)):
+        groups = []
+        for layout in layouts:
+            attention = max(1, layout.attention_rows[rank])
+            gdn = (
+                attention if layout.gdn_rows is None else max(1, layout.gdn_rows[rank])
+            )
+            groups.append(
+                tuple(hidden * (gdn if is_gdn else attention) for is_gdn in gdn_inputs)
+            )
+        ranks.append(tuple(groups))
+    return tuple(ranks)
+
+
+def _layout_pricing_supported(
+    self: TrainerRank, topology: tuple[int, int, int, int]
+) -> bool:
+    """Whether layout-aware pricing models this runtime and plan shape.
+
+    Only for a covered dense model (``_dense_mlp_widths``); other models keep
+    the busiest-rank pricing.
+    """
+    _dp, tp, cp, pp = topology
+    if (tp, cp, pp) != (1, 2, 1):
+        return False
+    if not self._dense_mlp_widths()[0]:
+        return False
+    geometry = self._geometry
+    if not geometry.num_attention_heads or not geometry.kv_channels:
+        return False
+    if len(self.runtime.model) != 1:
+        return False
+    try:
+        decoder = _impl._language_model(self.runtime.model[0]).decoder
+        from art.megatron.context_parallel.core_attention import (
+            ArtContextParallelCoreAttention,
+        )
+    except (AttributeError, RuntimeError, ModuleNotFoundError):
+        return False
+    layers = getattr(decoder, "layers", None)
+    if layers is None:
+        return False
+    for layer in layers:
+        boundary = getattr(layer, "_art_gdn_island_boundary", None)
+        if boundary is not None and boundary.is_gdn:
+            continue
+        if self._gdn_layers and boundary is None:
+            return False
+        core = getattr(getattr(layer, "self_attention", None), "core_attention", None)
+        if (
+            type(core) is not ArtContextParallelCoreAttention
+            or getattr(core, "softmax_offset", None) is not None
+        ):
+            return False
+    return True
+
+
+def _minimum_layouts(
+    self: TrainerRank, physical_rows: Sequence[int], cp: int
+) -> tuple[_GroupLayout, ...]:
+    """Even-share layouts keeping the least attention state: a lower bound.
+
+    Every rank's total grows with its own rows, and every rank keeps at
+    least an aligned local stage's state per row (each row attends to
+    itself), so the largest rank's total is at least the total at the mean
+    rows. The mean is at least the floor of an even share, which is why
+    this rounds down; rounding up can exceed a split's exact cost.
+    """
+    from art.megatron.context_parallel.executor import (
+        minimum_retained_bytes_per_row,
+    )
+
+    geometry = self._geometry
+    per_row = minimum_retained_bytes_per_row(
+        q_heads=int(geometry.num_attention_heads),
+        kv_heads=int(geometry.num_query_groups),
+        head_dim=int(geometry.kv_channels),
+        value_head_dim=int(geometry.kv_channels),
+        element_size=self._param_dtype_size,
+    )
+    return tuple(
+        _impl._GroupLayout(
+            attention_rows=(rows // cp,) * cp,
+            gdn_rows=(rows // cp,) * cp if self._gdn_layers else None,
+            attention_retained=(rows // cp * per_row,) * cp,
+        )
+        for rows in physical_rows
+    )
+
+
+def _te_workspace_growth_bytes(self: TrainerRank) -> int:
+    """Transformer Engine's cuBLAS workspaces, until this device has its own.
+
+    TE caches a workspace per (device, overlap, grouped GEMM) for the
+    process. A covered dense model runs ordinary GEMMs only, so this
+    device's ordinary entry marks it warm; an unreadable cache counts as
+    cold. A cold call allocates only that one, but about 130 MB of other
+    first-use buffers beside it (Qwen3.8-27B CP2: 164 MB in all), which the
+    full allowance covers.
+    """
+    try:
+        from transformer_engine.pytorch.cpp_extensions import gemm
+    except ImportError:
+        return _impl._TE_CUBLAS_WORKSPACE_BYTES
+    # functools.lru_cache keeps its entries in a dict its wrapper references.
+    key = (self.device.index, False, False)
+    if any(
+        type(entries) is dict and key in entries
+        for entries in gc.get_referents(gemm.get_cublas_workspace)
+    ):
+        return 0
+    return _impl._TE_CUBLAS_WORKSPACE_BYTES
+
+
 def _gradient_slots(
     group_rows: Sequence[tuple[int, bool]],
     slot_refs: Sequence[LoRASlotRef | None] | None,
@@ -1681,31 +1982,42 @@ def _estimate_required_memory_bytes_from_values(
         packed_tokens * self._hidden_size * self._param_dtype_size * activation_factor
     )
     no_grad_stage = 0
-    if (
+    # A covered dense CP2 rank's no-grad width (_dense_mlp_widths).
+    _dense_stage, covered = (
+        self._dense_mlp_widths(slot_refs)
+        if not signature.grad_enabled
+        and group_rows
+        and self._layout_pricing_supported(signature.topology)
+        else (0, 0)
+    )
+    if covered or (
         not self._geometry.moe_experts
         and self._geometry.ffn_hidden_size
         and self._dense_fc1_adapted
         and signature.topology[1:3] == (1, 1)
     ):
-        # A dense no-grad layer peaks at its FC1 stage (the base GEMM output,
-        # the adapter output and their sum: 6F, or the SwiGLU live set if
-        # wider) beside the residual pair, embedding and norm output (4H), per
-        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. At CP1 every packed
-        # row is local, which the per-packed-token floor above prices at only
-        # 16H. Groups run one after another, so the largest no-grad group
-        # bounds it.
+        # A dense no-grad layer peaks at its FC1 stage beside the residual
+        # pair, embedding and norm output (_dense_no_grad_row_elements). At
+        # CP1 every packed row is local, which the per-packed-token floor
+        # above prices at only 16H. A covered CP2 rank holds only its share,
+        # which that floor over-prices (Qwen3.8-27B: +5.7% for one group), so
+        # there the stage, at its CP2 width, replaces it. Groups run one
+        # after another, so the largest no-grad group bounds it.
         rows = max(
             (n for n, grad in group_rows if not grad),
             default=0 if signature.grad_enabled else packed_tokens,
         )
-        no_grad_stage = (
-            rows
-            * self._param_dtype_size
-            * (
-                max(6, self._mlp_activation_factor) * self._geometry.ffn_hidden_size
-                + 4 * self._hidden_size
+        no_grad_stage = rows * (
+            covered
+            or self._param_dtype_size
+            * _impl._dense_no_grad_row_elements(
+                self._geometry.ffn_hidden_size,
+                self._hidden_size,
+                self._mlp_activation_factor,
             )
         )
+        if covered:
+            static_compute = no_grad_stage
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry
         hidden = self._hidden_size
@@ -1820,6 +2132,9 @@ def _estimate_required_memory_bytes_from_values(
         # boundaries but not the backward's input gradient.
         max(retained, checkpoint_floor[0]) + no_grad_stage,
     )
+    if covered:
+        # TE's cuBLAS workspace persists beside whichever stage peaks.
+        static_compute += self._te_workspace_growth_bytes()
     if signature.topology[2] > 1:
         # Local head results coexist with full CP outputs during gathering.
         # Uneven rank plans can assign all of an item's rows to one rank.
