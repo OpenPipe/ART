@@ -490,6 +490,25 @@ def test_real_worker_round_trip_with_fake_sdk(tmp_path, infra):
     """Exercise the actual direct Python parent/worker JSON transport, without Sky."""
     (tmp_path / "sitecustomize.py").write_text("""
 from importlib.machinery import SourceFileLoader
+import os
+from pathlib import Path
+import socket
+import sys
+from types import SimpleNamespace as NS
+def deny_network(*args, **kwargs): raise AssertionError("Fake SDK worker must stay offline")
+socket.socket.connect = socket.socket.connect_ex = socket.getaddrinfo = deny_network
+def census(kind, namespace, **kwargs):
+    assert namespace == "default" and "sky" not in sys.modules
+    with Path(os.environ["FAKE_CENSUS"]).open("a") as stream:
+        stream.write(kind + "\\n")
+    return NS(items=[])
+sys.modules["kubernetes"] = NS(
+    client=NS(CoreV1Api=lambda _: NS(
+        list_namespaced_pod=lambda *a, **kw: census("pod", *a, **kw),
+        list_namespaced_service=lambda *a, **kw: census("service", *a, **kw),
+    )),
+    config=NS(new_client_from_config=lambda **kw: NS(close=lambda: None)),
+)
 exec_module = SourceFileLoader.exec_module
 def offline_service(loader, module):
     exec_module(loader, module)
@@ -500,20 +519,10 @@ SourceFileLoader.exec_module = offline_service
 """)
     (tmp_path / "sky.py").write_text("""
 import os
-import socket
 import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
-def deny_network(*args, **kwargs): raise AssertionError("Fake SDK worker must stay offline")
-socket.socket.connect = socket.getaddrinfo = deny_network
 sys.modules["sky.provision.kubernetes"] = NS(utils=NS(get_namespace=lambda **_: "default"))
-sys.modules["kubernetes"] = NS(
-    client=NS(CoreV1Api=lambda _: NS(
-        list_namespaced_pod=lambda *a, **kw: NS(items=[]),
-        list_namespaced_service=lambda *a, **kw: NS(items=[]),
-    )),
-    config=NS(new_client_from_config=lambda **kw: NS(close=lambda: None)),
-)
 class Task:
     @classmethod
     def from_yaml(cls, path): return cls()
@@ -545,10 +554,17 @@ def tail_logs(cluster, *, job_id, follow):
     head = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=repo, text=True
     ).strip()
+    kubeconfig = tmp_path / "empty-kubeconfig.yaml"
+    kubeconfig.write_text(
+        "apiVersion: v1\nkind: Config\nclusters: []\ncontexts: []\nusers: []\n"
+    )
+    census = tmp_path / "census"
     env = {
         **os.environ,
         "PYTHONPATH": str(tmp_path),
+        "KUBECONFIG": str(kubeconfig),
         "FAKE_CLUSTER": str(tmp_path / "cluster"),
+        "FAKE_CENSUS": str(census),
         "GITHUB_RUN_ID": "42",
         "GITHUB_RUN_ATTEMPT": "2",
         "GITHUB_REPOSITORY": "OpenPipe/ART",
@@ -570,6 +586,7 @@ def tail_logs(cluster, *, job_id, follow):
     assert json.loads((root / "result.json").read_text())["job_id"] == 17
     assert json.loads((root / "result.json").read_text())["infra"] == infra
     assert json.loads((root / "resources.json").read_text())["remaining"] == []
+    assert census.read_text().splitlines() == ["pod", "service"]
     assert "fake complete log" in (root / "logs.log").read_text()
 
 
