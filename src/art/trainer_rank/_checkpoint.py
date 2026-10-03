@@ -542,7 +542,7 @@ def _validate_manifest(
 
 
 def _load_custom_payload(
-    root: Path, manifest: CheckpointManifest
+    root: Path, manifest: CheckpointManifest, *, forward_only: bool = False
 ) -> PreparedCustomPayload | None:
     custom = manifest.get("custom_tensors", {})
     if not custom:
@@ -576,6 +576,8 @@ def _load_custom_payload(
                 "Checkpoint has custom optimizer state without an optimizer"
             )
         return PreparedCustomPayload(deepcopy(custom), tensors, {})
+    if forward_only:
+        return PreparedCustomPayload(deepcopy(custom), tensors, {})
     optimizer = {
         key: value.detach().cpu().clone()
         for key, value in load(optimizer_file, device="cpu").items()
@@ -596,7 +598,10 @@ def _load_custom_payload(
 
 
 def prepare_checkpoint(
-    path: str, *, artifact_entries: Iterable[str] | None = None
+    path: str,
+    *,
+    artifact_entries: Iterable[str] | None = None,
+    forward_only: bool = False,
 ) -> PreparedCheckpoint:
     root = Path(path).resolve(strict=True)
     if not root.is_dir():
@@ -654,7 +659,9 @@ def prepare_checkpoint(
                     f"{file_actual} != {manifest['files'][relative]}"
                 )
         custom = (
-            _load_custom_payload(root, manifest) if artifact_entries is None else None
+            _load_custom_payload(root, manifest, forward_only=forward_only)
+            if artifact_entries is None
+            else None
         )
     else:
         if artifact_entries is not None:
@@ -1931,6 +1938,19 @@ def _reserve_generation(trainer: TrainerRank, group: dist.ProcessGroup | None) -
 
 
 def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> bool:
+    group = _ensure_group(trainer)
+    with ExitStack() as publication:
+        _phase(
+            lambda: publication.enter_context(
+                trainer._checkpoint_slot_write(destination)
+            ),
+            "reserve checkpoint snapshot",
+            group,
+        )
+        return _snapshot_checkpoint(trainer, source, destination)
+
+
+def _snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> bool:
     """Clone one loaded checkpoint into a forward-only resident slot."""
     from art.trainer_rank._impl import (
         _CheckpointSlot,
@@ -2040,7 +2060,26 @@ def snapshot_checkpoint(trainer: TrainerRank, source: str, destination: str) -> 
     return True
 
 
-def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
+def discard_snapshot_checkpoint(
+    trainer: TrainerRank, checkpoint: str, *, allow_missing: bool = False
+) -> None:
+    from art.trainer_rank._impl import Unset
+
+    group = _ensure_group(trainer)
+    with ExitStack() as publication:
+        _phase(
+            lambda: publication.enter_context(
+                trainer._checkpoint_slot_write(checkpoint, Unset)
+            ),
+            "reserve checkpoint discard",
+            group,
+        )
+        _discard_snapshot_checkpoint(trainer, checkpoint, allow_missing=allow_missing)
+
+
+def _discard_snapshot_checkpoint(
+    trainer: TrainerRank, checkpoint: str, *, allow_missing: bool = False
+) -> None:
     """Collectively discard a forward-only resident checkpoint snapshot."""
     group = _ensure_group(trainer)
     slot = trainer._checkpoint_slots.get(checkpoint)
@@ -2055,17 +2094,21 @@ def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
         None if slot is None else slot.route_epoch,
         active,
     )
-    if any(value != state for value in _gather(state, group)):
+    gathered = _gather(state, group)
+    if not allow_missing and any(value != state for value in gathered):
         raise trainer._slot_state_error(
             "Checkpoint snapshot state differs across ranks"
         )
-    if slot is None:
+    states = [
+        (present, snapshot, selected) for _, present, snapshot, _, selected in gathered
+    ]
+    if not any(present for present, _snapshot, _active in states):
         return
-    if not slot.snapshot:
+    if any(present and not snapshot for present, snapshot, _active in states):
         raise trainer._slot_state_error(
             f"Checkpoint {checkpoint!r} is not a forward-only snapshot"
         )
-    if active:
+    if any(selected for _present, _snapshot, selected in states):
         raise trainer._slot_state_error(
             f"Cannot discard selected checkpoint snapshot {checkpoint!r}"
         )
@@ -2074,20 +2117,28 @@ def discard_snapshot_checkpoint(trainer: TrainerRank, checkpoint: str) -> None:
             f"Cannot discard checkpoint snapshot {checkpoint!r} with live outputs"
         )
     model_snapshot = _slot_snapshot(trainer)
+    error: BaseException | None = None
     try:
-        ref = trainer._slot_ref(checkpoint)
-        for chunk in trainer.runtime.model:
-            for module in chunk.modules():
-                discard = getattr(module, "_discard_lora_slot", None)
-                if callable(discard):
-                    discard(ref)
-        trainer._checkpoint_slots.pop(checkpoint)
-        trainer._prune_slot_graphs(ref)
+        if slot is not None:
+            ref = trainer._slot_ref(checkpoint)
+            for chunk in trainer.runtime.model:
+                for module in chunk.modules():
+                    discard = getattr(module, "_discard_lora_slot", None)
+                    if callable(discard):
+                        discard(ref)
+            trainer._checkpoint_slots.pop(checkpoint)
+            trainer._prune_slot_graphs(ref)
+    except BaseException as exc:
+        error = exc
+    try:
+        raise_distributed(error, "discard checkpoint snapshot", group)
     except BaseException:
         _restore_slots(model_snapshot)
-        trainer._checkpoint_slots[checkpoint] = slot
+        if slot is not None:
+            trainer._checkpoint_slots[checkpoint] = slot
         raise
-    trainer._forget_route_epoch(slot)
+    if slot is not None:
+        trainer._forget_route_epoch(slot)
 
 
 def _commit_slot(trainer: TrainerRank, source: str, destination: str) -> None:
@@ -2220,6 +2271,26 @@ def _validate_base_model(
 
 
 def load_checkpoint(
+    trainer: TrainerRank,
+    source: PreparedCheckpoint,
+    name: str,
+    *,
+    forward_only: bool = False,
+    _source_owner: object = None,
+) -> None:
+    group = _ensure_group(trainer)
+    with ExitStack() as publication:
+        _phase(
+            lambda: publication.enter_context(
+                trainer._checkpoint_slot_write(name, _source_owner)
+            ),
+            "reserve checkpoint load",
+            group,
+        )
+        _load_checkpoint(trainer, source, name, forward_only=forward_only)
+
+
+def _load_checkpoint(
     trainer: TrainerRank,
     source: PreparedCheckpoint,
     name: str,
