@@ -6,7 +6,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import Future
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import importlib
 import json
@@ -108,6 +108,17 @@ class _LocalShard:
 
 
 @dataclass(frozen=True)
+class _LoraSnapshot:
+    prefix: str
+    suffix: str
+    expert_ids: tuple[int | None, ...] | None
+    owner_rank: int
+    manifest: dict[str, object]
+    tensors: dict[str, torch.Tensor]
+    step: float | None
+
+
+@dataclass(frozen=True)
 class _PreparedSave:
     sequence: int
     snapshot: Path
@@ -117,7 +128,7 @@ class _PreparedSave:
     shards: tuple[_LocalShard, ...]
     optimizer: OptimizerConfig | None
     custom_tensors: dict[str, CustomTensorRecord] = field(default_factory=dict)
-    writer: Future[None] | None = None
+    writer: Future[tuple[_LocalShard, ...] | None] | None = None
 
 
 class _SnapshotSpill:
@@ -126,16 +137,24 @@ class _SnapshotSpill:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.pending: deque[
-            tuple[Path, dict[str, dict[str, torch.Tensor]], Future[None]]
+            tuple[
+                Path,
+                dict[str, dict[str, torch.Tensor]],
+                tuple[_LoraSnapshot, ...],
+                Future[tuple[_LocalShard, ...] | None],
+            ]
         ] = deque()
         self.thread: threading.Thread | None = None
 
     def submit(
-        self, snapshot: Path, payloads: dict[str, dict[str, torch.Tensor]]
-    ) -> Future[None]:
-        result: Future[None] = Future()
+        self,
+        snapshot: Path,
+        payloads: dict[str, dict[str, torch.Tensor]],
+        captured: tuple[_LoraSnapshot, ...] = (),
+    ) -> Future[tuple[_LocalShard, ...] | None]:
+        result: Future[tuple[_LocalShard, ...] | None] = Future()
         with self.lock:
-            self.pending.append((snapshot, payloads, result))
+            self.pending.append((snapshot, payloads, captured, result))
             if self.thread is None:
                 self.thread = threading.Thread(
                     target=self._run, name="checkpoint-snapshot"
@@ -154,10 +173,14 @@ class _SnapshotSpill:
                 if not self.pending:
                     self.thread = None
                     return
-                snapshot, payloads, result = self.pending.popleft()
+                snapshot, payloads, captured, result = self.pending.popleft()
             error: BaseException | None = None
             tensors: dict[str, torch.Tensor] | None = None
+            shards = None
             try:
+                if captured:
+                    shards = _expand_local_state(captured, payloads)
+                captured = ()
                 save = importlib.import_module("safetensors.torch").save_file
                 for relative, tensors in payloads.items():
                     path = snapshot / relative
@@ -188,12 +211,13 @@ class _SnapshotSpill:
             finally:
                 payloads.clear()
                 tensors = None
+                captured = ()
             if error is None:
-                result.set_result(None)
+                result.set_result(shards)
             else:
                 result.set_exception(error)
             # Do not retain the previous save while the next one writes.
-            del snapshot, payloads, result, error
+            del snapshot, payloads, captured, shards, result, error
 
 
 @dataclass(frozen=True)
@@ -833,16 +857,12 @@ def _custom_snapshot(
             assert dynamic is not None
             state = dynamic.optimizer.state.get(master, {})
             optimizer[f"master/{key}"] = master.detach().to("cpu", copy=True)
-            optimizer[f"exp_avg/{key}"] = (
-                cast(torch.Tensor, state.get("exp_avg", torch.zeros_like(master)))
-                .detach()
-                .to("cpu", copy=True)
-            )
-            optimizer[f"exp_avg_sq/{key}"] = (
-                cast(torch.Tensor, state.get("exp_avg_sq", torch.zeros_like(master)))
-                .detach()
-                .to("cpu", copy=True)
-            )
+            for component in ("exp_avg", "exp_avg_sq"):
+                optimizer[f"{component}/{key}"] = (
+                    cast(torch.Tensor, state[component]).detach().to("cpu", copy=True)
+                    if component in state
+                    else torch.zeros_like(optimizer[f"master/{key}"])
+                )
             optimizer[f"step/{key}"] = torch.tensor(float(state.get("step", 0.0)))
 
     if dynamic is not None:
@@ -869,17 +889,13 @@ def _local_state(
     name: str,
     files: dict[str, dict[str, torch.Tensor]],
 ) -> tuple[
-    tuple[_LocalShard, ...],
+    tuple[_LoraSnapshot, ...],
     OptimizerConfig | None,
     dict[str, CustomTensorRecord],
 ]:
     from art.megatron.lora import LoRA
-    from art.megatron.weights.lora_publish import collect_local_lora_entries
 
     ref = trainer._slot_ref(name)
-    tensors, metadata = collect_local_lora_entries(
-        trainer.runtime.model, {}, owner_rank=_rank(), slot_ref=ref
-    )
     dynamic = trainer._checkpoint_slots[name].optimizer
     optimizer = None if dynamic is None else _optimizer_config(dynamic)
     masters = (
@@ -894,50 +910,101 @@ def _local_state(
             )
         }
     )
-    by_key = {item.key: item for item in metadata}
-    payloads: dict[str, dict[str, torch.Tensor]] = {}
-    metadata_by_block: dict[str, list[LoraShardMeta]] = {}
-    for item in metadata:
-        payloads.setdefault(item.block, {})[f"lora/{item.key}"] = (
-            tensors[item.key].detach().to("cpu", copy=True)
-        )
-        metadata_by_block.setdefault(item.block, []).append(item)
-    if dynamic is not None:
-        for chunk in trainer.runtime.model:
-            for module in chunk.modules():
-                if not isinstance(module, LoRA):
+    captured = []
+    for chunk in trainer.runtime.model:
+        for module in chunk.modules():
+            if not isinstance(module, LoRA):
+                continue
+            expert_ids = tuple(module.expert_ids) if module.is_expert else None
+            if expert_ids is not None and all(e is None for e in expert_ids):
+                continue
+            for suffix, param in module._lora_params(ref):
+                if not module._should_export_parameter(param):
                     continue
-                for key, param, expert in module._export_items(ref):
-                    item = by_key.get(key)
-                    if item is None:
-                        continue
+                # Snapshot physical storage once. Expert key expansion, tensor
+                # views, metadata and serialization use only these CPU copies.
+                tensors = {"lora": param.detach().to("cpu", copy=True)}
+                step = None
+                if dynamic is not None:
                     master = masters[id(param)]
                     state = dynamic.optimizer.state.get(master, {})
-                    values = (
-                        master,
-                        cast(torch.Tensor | None, state.get("exp_avg")),
-                        cast(torch.Tensor | None, state.get("exp_avg_sq")),
+                    tensors["master"] = master.detach().to(
+                        device="cpu", dtype=torch.float32, copy=True
                     )
-                    for component, value in zip(
-                        ("master", "exp_avg", "exp_avg_sq"), values, strict=True
-                    ):
-                        value = torch.zeros_like(master) if value is None else value
-                        local = value if expert is None else value[expert]
-                        payloads[item.block][f"{component}/{key}"] = (
-                            local.T.detach().to(
+                    for component in ("exp_avg", "exp_avg_sq"):
+                        value = cast(torch.Tensor | None, state.get(component))
+                        tensors[component] = (
+                            torch.zeros_like(tensors["master"])
+                            if value is None
+                            else value.detach().to(
                                 device="cpu", dtype=torch.float32, copy=True
                             )
                         )
-                    step = state.get("step", 0.0)
-                    payloads[item.block][f"step/{key}"] = torch.tensor(float(step))
-    records: list[_LocalShard] = []
+                    step = float(state.get("step", 0.0))
+                captured.append(
+                    _LoraSnapshot(
+                        module.adapter_model_prefix,
+                        suffix,
+                        expert_ids,
+                        _rank(),
+                        deepcopy(module._manifest_for_param(param)),
+                        tensors,
+                        step,
+                    )
+                )
+    return tuple(captured), optimizer, _custom_snapshot(trainer, name, files)
+
+
+def _expand_local_state(
+    captured: tuple[_LoraSnapshot, ...],
+    files: dict[str, dict[str, torch.Tensor]],
+) -> tuple[_LocalShard, ...]:
+    from art.megatron.lora import LoraShardMeta, _block_for_key, _dtype_name
+
+    payloads: dict[str, dict[str, torch.Tensor]] = {}
+    metadata_by_block: dict[str, dict[str, LoraShardMeta]] = {}
+    for snapshot in captured:
+        experts = (
+            ((None, None),)
+            if snapshot.expert_ids is None
+            else tuple(
+                (index, expert)
+                for index, expert in enumerate(snapshot.expert_ids)
+                if expert is not None
+            )
+        )
+        for index, expert in experts:
+            prefix = (
+                snapshot.prefix
+                if index is None
+                else snapshot.prefix.format(expert=expert)
+            )
+            key = f"{prefix}.{snapshot.suffix}"
+            block = _block_for_key(key)
+            payload = payloads.setdefault(block, {})
+            for component, value in snapshot.tensors.items():
+                payload[f"{component}/{key}"] = (
+                    value if index is None else value[index]
+                ).T
+            value = payload[f"lora/{key}"]
+            metadata_by_block.setdefault(block, {})[key] = LoraShardMeta(
+                key,
+                snapshot.owner_rank,
+                tuple(value.shape),
+                _dtype_name(value.dtype),
+                deepcopy(snapshot.manifest),
+                block,
+            )
+            if snapshot.step is not None:
+                payload[f"step/{key}"] = torch.tensor(snapshot.step)
+    records = []
     for index, block in enumerate(sorted(payloads)):
         relative = f"block-{index:06d}.safetensors"
         files[relative] = payloads[block]
         records.extend(
-            _LocalShard(deepcopy(item), relative) for item in metadata_by_block[block]
+            _LocalShard(item, relative) for item in metadata_by_block[block].values()
         )
-    return tuple(records), optimizer, _custom_snapshot(trainer, name, files)
+    return tuple(records)
 
 
 def prepare_checkpoint_save(
@@ -985,7 +1052,7 @@ def prepare_checkpoint_save(
             f".{destination.name}.snapshot-r{_rank()}-{uuid.uuid4().hex}"
         )
         error: BaseException | None = None
-        shards: tuple[_LocalShard, ...] | None = None
+        captured: tuple[_LoraSnapshot, ...] = ()
         optimizer: OptimizerConfig | None = None
         custom_tensors: dict[str, CustomTensorRecord] = {}
         payloads: dict[str, dict[str, torch.Tensor]] = {}
@@ -1005,7 +1072,7 @@ def prepare_checkpoint_save(
                 reservation.mkdir(parents=True)
                 reservation_created = True
             snapshot.mkdir(parents=True)
-            shards, optimizer, custom_tensors = _local_state(
+            captured, optimizer, custom_tensors = _local_state(
                 trainer, checkpoint_name, payloads
             )
         except BaseException as exc:
@@ -1018,6 +1085,7 @@ def prepare_checkpoint_save(
                 )
 
         except BaseException as failure:
+            captured = ()
             payloads.clear()
             cleanup = _cleanup_paths(
                 [snapshot, *([reservation] if reservation_created else [])]
@@ -1041,33 +1109,33 @@ def prepare_checkpoint_save(
         # Starting the CPU writer is part of persistence, not capture. Retain a
         # local start failure for collective finish/abort rather than waiting on
         # another rank's disk while still in the ordered capture call.
-        def start_writer() -> Future[None] | BaseException:
+        def start_writer() -> Future[tuple[_LocalShard, ...] | None] | BaseException:
             try:
                 spill = getattr(trainer, "_checkpoint_snapshot_spill", None)
                 if spill is None:
                     spill = _SnapshotSpill()
                     trainer._checkpoint_snapshot_spill = spill
-                return spill.submit(snapshot, payloads)
+                return spill.submit(snapshot, payloads, captured)
             except BaseException as failure:
                 payloads.clear()
                 return failure
 
         started = start_writer()
+        captured = ()
         if isinstance(started, BaseException):
             # The completed start frames no longer own captured tensors.
             traceback.clear_frames(started.__traceback__)
-            writer: Future[None] = Future()
+            writer: Future[tuple[_LocalShard, ...] | None] = Future()
             writer.set_exception(started)
         else:
             writer = started
-        assert shards is not None
         prepared = _PreparedSave(
             sequence,
             snapshot,
             reservation,
             destination,
             dict(config),
-            shards,
+            (),
             optimizer,
             custom_tensors,
             writer,
@@ -1512,7 +1580,7 @@ def _finalize_checkpoint_save(
                     assert prepared is not None
                     # Abort discards the snapshot: acknowledge its joined cleanup,
                     # even if writing failed. Finish still reports that failure.
-                    _phase(
+                    shards = _phase(
                         lambda: (
                             (
                                 prepared.writer.result()
@@ -1526,6 +1594,9 @@ def _finalize_checkpoint_save(
                         group,
                     )
                     if action == "finish":
+                        if shards is not None:
+                            assert isinstance(shards, tuple)
+                            prepared = replace(prepared, shards=shards)
                         _finish(trainer, prepared)
                 except BaseException as exc:
                     error = exc

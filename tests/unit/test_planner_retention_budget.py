@@ -55,7 +55,8 @@ def test_reclamation_never_refunds_cumulative_budget(tmp_path, caplog):
     assert not reporter.spool_dir.exists()
     assert ledger(bound)["charges"] == original["charges"]
     assert ledger(bound)["omitted"] == 1
-    assert ledger(bound)["omitted_bytes"] > 0
+    assert ledger(bound)["omitted_bytes"] == 0
+    assert ledger(bound)["omitted_unmeasured"] == 1
     # Retransmission of the same captured bytes spends nothing new, even if
     # recreating a previously reclaimed source copy for the original report.
     assert (
@@ -156,7 +157,11 @@ def test_exhausted_allowance_has_no_fallback(tmp_path, bound_values, caplog):
     assert not reporter.spool_dir.exists()
     assert not list(bound.spool_dir.glob("[0-9a-f]*.json"))
     assert ledger(bound)["omitted"] == 1
-    assert ledger(bound)["omitted_bytes"] > 0
+    if bound.max_bytes == 0 or bound.max_reports == 0:
+        assert ledger(bound)["omitted_bytes"] == 0
+        assert ledger(bound)["omitted_unmeasured"] == 1
+    else:
+        assert ledger(bound)["omitted_bytes"] > 0
 
 
 def test_unaccounted_spool_and_corrupt_ledger_refuse(tmp_path, caplog):

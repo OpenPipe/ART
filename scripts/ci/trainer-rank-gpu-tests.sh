@@ -12,6 +12,7 @@ test -x "${runtime_python}"
   tests/unit/test_trainer_rank_head_recompute.py \
   tests/unit/test_trainer_rank_custom_tensors.py \
   tests/integration/megatron/cp_attn/test_attention_packed_vs_flattened.py \
+  tests/integration/megatron/gdn_shared_prefix/test_gdn_conv_gelu.py \
   'tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_packed_correctness.py::test_gdn_cp_packed_sibling_order_matches_cp1_oracle[2]' \
   'tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_packed_correctness.py::test_gdn_cp_tree_chain_matches_cp1_oracle[2]' \
   'tests/integration/megatron/gdn_shared_prefix/test_gdn_cp_packed_correctness.py::test_gdn_cp_tree_trainability_updates_parameters[2]' \

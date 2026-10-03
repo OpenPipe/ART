@@ -208,12 +208,19 @@ def _init_choice(chunk_choice: ChatCompletionChunkChoice) -> Choice:
 
 def finalize_chat_completion(chat_completion: ChatCompletion) -> ChatCompletion:
     attach_dynamo_token_metadata(chat_completion)
-    prompt_token_ids = (chat_completion.model_extra or {}).get("prompt_token_ids")
-    if prompt_token_ids is not None:
-        for choice in chat_completion.choices:
-            cast(dict[str, Any], choice.model_extra)["prompt_token_ids"] = (
-                prompt_token_ids
-            )
+    for key in (
+        "prompt_token_ids",
+        "prompt_routed_experts",
+        "logprobs_mode",
+        "compact_prompt_logprobs",
+        "compact_prompt_top_logprobs",
+    ):
+        value = (chat_completion.model_extra or {}).get(key)
+        if value is not None:
+            for choice in chat_completion.choices:
+                extra = cast(dict[str, Any], choice.model_extra)
+                if key == "prompt_token_ids" or extra.get(key) is None:
+                    extra[key] = value
     return chat_completion
 
 
@@ -221,6 +228,11 @@ def update_chat_completion(
     chat_completion: ChatCompletion, chunk: ChatCompletionChunk
 ) -> None:
     chat_completion_extra = cast(dict[str, Any], chat_completion.model_extra)
+    mode = getattr(chunk, "logprobs_mode", None)
+    if mode is not None:
+        if chat_completion_extra.get("logprobs_mode", mode) != mode:
+            raise ValueError("logprobs_mode changed within a completion stream")
+        chat_completion_extra["logprobs_mode"] = mode
     nvext = (chunk.model_extra or {}).get("nvext")
     if isinstance(nvext, dict) and "engine_data" in nvext:
         # Dynamo sends a complete snapshot in the final (possibly choice-less)
@@ -232,6 +244,17 @@ def update_chat_completion(
     prompt_token_ids = getattr(chunk, "prompt_token_ids", None)
     if prompt_token_ids is not None:
         chat_completion_extra["prompt_token_ids"] = prompt_token_ids
+    prompt_routes = getattr(chunk, "prompt_routed_experts", None)
+    if prompt_routes is not None:
+        chat_completion_extra["prompt_routed_experts"] = prompt_routes
+    for key in (
+        "prompt_logprobs",
+        "compact_prompt_logprobs",
+        "compact_prompt_top_logprobs",
+    ):
+        value = getattr(chunk, key, None)
+        if value is not None:
+            chat_completion_extra[key] = value
     completion_prompt_token_ids = chat_completion_extra.get("prompt_token_ids")
     choices = {choice.index: choice for choice in chat_completion.choices}
     if completion_prompt_token_ids is not None:
@@ -246,14 +269,33 @@ def update_chat_completion(
             choices[choice.index] = choice
             chat_completion.choices.append(choice)
         choice_extra = cast(dict[str, Any], choice.model_extra)
+        mode = getattr(chunk_choice, "logprobs_mode", None)
+        if mode is not None:
+            if choice_extra.get("logprobs_mode", mode) != mode:
+                raise ValueError("logprobs_mode changed within a choice stream")
+            choice_extra["logprobs_mode"] = mode
         if completion_prompt_token_ids is not None:
             choice_extra["prompt_token_ids"] = completion_prompt_token_ids
+        prompt_routes = getattr(chunk_choice, "prompt_routed_experts", None)
+        if prompt_routes is not None:
+            choice_extra["prompt_routed_experts"] = prompt_routes
         token_ids = getattr(chunk_choice, "token_ids", None)
         if token_ids:
             choice_extra["token_ids"] = [
                 *choice_extra.get("token_ids", []),
                 *token_ids,
             ]
+        for key in ("compact_logprobs", "routed_experts"):
+            values = getattr(chunk_choice, key, None)
+            if values is not None:
+                choice_extra.setdefault(key, []).extend(values)
+        top = getattr(chunk_choice, "compact_top_logprobs", None)
+        if top is not None:
+            target = choice_extra.setdefault(
+                "compact_top_logprobs", {"token_ids": [], "logprobs": []}
+            )
+            for key in ("token_ids", "logprobs"):
+                target[key].extend(top[key])
         for span_key in (PROMPT_POLICY_TOKEN_SPANS_KEY, POLICY_TOKEN_SPANS_KEY):
             spans = getattr(chunk_choice, span_key, None)
             if spans is not None:

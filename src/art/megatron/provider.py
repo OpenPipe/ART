@@ -676,14 +676,14 @@ def _build_provider_bundle(
         bridge = AutoBridge.from_hf_pretrained(
             model,
             dtype=torch_dtype,
-            trust_remote_code=True,
+            trust_remote_code=handler.trust_remote_code,
         )
     else:
         bridge = AutoBridge.from_hf_config(
             AutoConfig.from_pretrained(
                 model,
                 dtype=torch_dtype,
-                trust_remote_code=True,
+                trust_remote_code=handler.trust_remote_code,
             )
         )
     provider = (
