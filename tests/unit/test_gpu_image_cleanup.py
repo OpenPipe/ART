@@ -329,7 +329,7 @@ def test_workflow_cleanup_is_always_bounded_and_uploaded(tmp_path):
     source = (ROOT / "scripts/build-gpu-image.sh").read_text()
     assert 'cleanup_root="${GPU_IMAGE_CLEANUP_ROOT:-' in source
     assert 'art.openpipe/build-run: "${prewarm_run_uid}"' in source
-    assert '"${kubectl_cmd[@]}" create -n "${buildkit_namespace}"' in source
+    assert 'build_kubectl create -n "${buildkit_namespace}"' in source
     smoke = next(step for step in steps if step.get("id") == "smoke")["run"]
     assert '"${GPU_IMAGE_CLEANUP_ROOT}/smoke-down.json"' in smoke
     assert "kubernetes.custom_metadata.labels=" in smoke
