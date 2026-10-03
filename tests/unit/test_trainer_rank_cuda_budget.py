@@ -166,7 +166,7 @@ def test_cpu_budget_avoids_all_new_cuda_api_calls(budget, monkeypatch):
 
 @pytest.mark.parametrize("sync_across_dp", [False, True])
 @pytest.mark.parametrize("required", [0, 130])
-def test_required_max_then_available_min_collectives_unchanged(
+def test_required_max_then_available_and_local_fit_min_keep_group(
     budget, monkeypatch, sync_across_dp, required
 ):
     rank, _ = budget
@@ -181,21 +181,25 @@ def test_required_max_then_available_min_collectives_unchanged(
     calls = []
 
     def reduce(value, op, group):
-        calls.append((float(value.item()), op, group))
-        value.fill_(150 if op == _impl.dist.ReduceOp.MAX else 60)
+        calls.append((value.tolist(), op, group))
+        if op == _impl.dist.ReduceOp.MAX:
+            value.fill_(150)
+        else:
+            value.copy_(tensor([60, 0]))
 
     monkeypatch.setattr(_impl.dist, "all_reduce", reduce)
     check = rank._memory_check_required(required, sync_across_dp=sync_across_dp)
     expected_group = None if sync_across_dp else group
     assert calls == [
         (required, _impl.dist.ReduceOp.MAX, expected_group),
-        (70, _impl.dist.ReduceOp.MIN, expected_group),
+        ([70, float(70 >= required)], _impl.dist.ReduceOp.MIN, expected_group),
     ]
     assert (check.estimated_required_bytes, check.available_bytes, check.fits) == (
         150,
         60,
         False,
     )
+    assert (check.local_required_bytes, check.local_available_bytes) == (required, 70)
 
 
 def test_oom_preserves_admission_and_original_cause_after_free_changes(
@@ -261,7 +265,7 @@ def test_admission_failure_sentinel_stops_healthy_peers(
         monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (200, 1000))
 
     def reduce(value, op, group):
-        events.append((op, float(value.item())))
+        events.append((op, float(value.reshape(-1)[0].item())))
         value.fill_(150 if op == _impl.dist.ReduceOp.MAX else -1)
 
     monkeypatch.setattr(_impl.dist, "all_reduce", reduce)
@@ -381,7 +385,7 @@ def test_final_selection_uses_pure_fresh_budget_and_original_demand(
     assert calls == (
         [
             (_impl.dist.ReduceOp.MAX, 192, None),
-            (_impl.dist.ReduceOp.MIN, available, None),
+            (_impl.dist.ReduceOp.MIN, [available, float(available >= 192)], None),
         ]
         * (2 if available < 192 else 1)
         # Only the final refusal enters the option/selected-wave agreement.
@@ -422,6 +426,8 @@ def test_available_sample_follows_required_collective(budget, monkeypatch):
         if op == _impl.dist.ReduceOp.MAX:
             value.fill_(60)
             free[0] = 50
+        else:
+            value[1] = 0  # The peer that requires 60 cannot fit.
 
     monkeypatch.setattr(_impl.dist, "all_reduce", reduce)
     check = rank._memory_check_required(0, sync_across_dp=True)

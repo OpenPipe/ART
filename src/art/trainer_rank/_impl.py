@@ -631,6 +631,14 @@ class _MemoryCheck:
     decision: dict[str, Any] | None = dataclass_field(
         default=None, compare=False, repr=False
     )
+    # Extrema above are diagnostics; fits is the conjunction of local fits.
+    # Keep each local producer through refreshes of different DP items.
+    local_required_bytes: int | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
+    local_available_bytes: int | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
 
 
 @dataclass(frozen=True)
@@ -1122,13 +1130,21 @@ def _memory_error(
     logical_tokens: int,
     check: _MemoryCheck,
 ) -> TrainerRankMemoryError:
+    # Peak and limit are group extrema (largest demand, smallest budget) that may
+    # come from different ranks; the rank_* pair is this rank's own comparison.
+    local = (
+        ""
+        if check.local_required_bytes is None or check.local_available_bytes is None
+        else f"rank_required_gb={check.local_required_bytes / 1024**3:.3f} "
+        f"rank_available_gb={check.local_available_bytes / 1024**3:.3f} "
+    )
     return TrainerRankMemoryError(
         f"{context}: {message}. "
         f"packed_tokens={packed_tokens} "
         f"logical_tokens={logical_tokens} "
         f"predicted_peak_gb={check.estimated_required_bytes / 1024**3:.3f} "
         f"usable_limit_gb={check.available_bytes / 1024**3:.3f}. "
-        f"{_MEMORY_ERROR_SUGGESTION}",
+        f"{local}{_MEMORY_ERROR_SUGGESTION}",
         predicted_peak_bytes=check.estimated_required_bytes,
         usable_limit_bytes=check.available_bytes,
         suggestion=_MEMORY_ERROR_SUGGESTION,
