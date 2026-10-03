@@ -503,7 +503,6 @@ def _split_chunk_lower_cost(
                 # admission cost.
                 retained_tokens=(packed_tokens + signature.topology[2] - 1)
                 // signature.topology[2],
-                lower_bound=True,
             )
             for traced in _impl._traced_states(head_traced)
         ),

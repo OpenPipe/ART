@@ -14,13 +14,12 @@ from test_trainer_rank_moe_memory import _rank as _moe_rank
 from test_trainer_rank_moe_memory import layer  # noqa: F401
 import torch
 
-from art.trainer_rank import ForwardInput, _impl
+from art.trainer_rank import _impl
 from art.trainer_rank._impl import (
     _COLD_RECOMPUTE_TRANSIENT_BYTES as COLD,
 )
 from art.trainer_rank._impl import (
     _TE_CUBLAS_WORKSPACE_BYTES,
-    Unset,
     _dense_mlp_recompute_bytes_per_token,
     _GroupLayout,
     _MemorySignature,
@@ -32,8 +31,9 @@ CP2 = (1, 1, 2, 1)
 # (3.25H of norms with the residual, norm output and input gradient), plus
 # the adapters' rank-wide intermediates.
 STAGE = (7 * FFN + HIDDEN // 4 + 6 * RANK) * 2
-# Three 2F FC1 tensors, residual/norm/CP-gather rows, rank intermediates.
-NO_GRAD = (6 * FFN + 6 * HIDDEN + 6 * RANK) * 2
+# Three 2F FC1 tensors beside 4.25H of residual pair, embedding and norm
+# output (the CP1 floor's 6F + 4H form), rank intermediates.
+NO_GRAD = (6 * FFN + 4 * HIDDEN + HIDDEN // 4 + 6 * RANK) * 2
 
 
 def _module(cls):
@@ -508,23 +508,17 @@ def _no_grad_required(r, group_rows, *, topology=CP2, packed=40_000):
 
 def test_no_grad_groups_price_the_largest_groups_own_rows():
     dense, plain = _at_cp2(_dense_rank()), _at_cp2(_dense_rank(0, 0))
-    # Today's floor: H bytes per packed token times the layer-count factor.
-    per_token = HIDDEN * 2 * min(16, LAYERS // 4 + 4)
     te = dense._te_workspace_growth_bytes()
-    # One group: today's per-packed-token floor, unchanged.
-    assert _no_grad_required(dense, (12_000,)) == _no_grad_required(plain, (12_000,))
-    for groups, packed in (((12_000, 8_000), 40_000), ((58_240, 29_120), 119_119)):
-        largest = max(groups)
+    for groups, packed in (
+        ((12_000,), 40_000),
+        ((12_000, 8_000), 40_000),
+        ((58_240, 29_120), 119_119),
+    ):
         # The largest group's own physical rows at the traced width (with
-        # TE's workspace growth), and at least its share of today's
-        # per-packed-token floor.
-        expected = max(
-            largest * NO_GRAD + te, -(-packed * per_token * largest // sum(groups))
-        )
-        assert _no_grad_required(dense, groups, packed=packed) == int(expected * 1.1)
-        assert _no_grad_required(dense, groups, packed=packed) < _no_grad_required(
-            plain, groups, packed=packed
-        )
+        # TE's workspace growth), in place of the per-packed-token floor.
+        expected = int((max(groups) * NO_GRAD + te) * 1.1)
+        assert _no_grad_required(dense, groups, packed=packed) == expected
+        assert expected < _no_grad_required(plain, groups, packed=packed)
     # A narrow structural width never drops below the rows' traced need.
     wide = _at_cp2(_dense_rank(STAGE, 10**6))
     assert _no_grad_required(wide, (12_000, 8_000)) == int((12_000 * 10**6 + te) * 1.1)
@@ -624,7 +618,7 @@ def test_every_adapter_the_layer_runs_is_priced_beside_arts_norm_wrapper():
     ranks = 2 * (3 * RANK + 32)
     assert _dense_mlp_recompute_bytes_per_token([_dense_model(layers)]) == (
         (7 * FFN + HIDDEN // 4 + ranks) * 2,
-        (6 * FFN + 6 * HIDDEN + ranks) * 2,
+        (6 * FFN + 4 * HIDDEN + HIDDEN // 4 + ranks) * 2,
     )
 
 
@@ -655,7 +649,7 @@ def test_named_slots_are_read_through_the_lookup_execution_uses():
         load(adapter, 16)
     widths = (
         (7 * FFN + HIDDEN // 4 + 2 * 3 * 16) * 2,
-        (6 * FFN + 6 * HIDDEN + 2 * 3 * 16) * 2,
+        (6 * FFN + 4 * HIDDEN + HIDDEN // 4 + 2 * 3 * 16) * 2,
     )
     assert _dense_mlp_recompute_bytes_per_token([model], policy) == widths
     # A slot without an adapter on one module runs the base output there.
@@ -663,7 +657,7 @@ def test_named_slots_are_read_through_the_lookup_execution_uses():
         layer.mlp.linear_fc1.up_lora._slot_keys = {}
     assert _dense_mlp_recompute_bytes_per_token([model], policy) == (
         (7 * FFN + HIDDEN // 4 + 2 * 2 * 16) * 2,
-        (6 * FFN + 6 * HIDDEN + 2 * 2 * 16) * 2,
+        (6 * FFN + 4 * HIDDEN + HIDDEN // 4 + 2 * 2 * 16) * 2,
     )
     load(adapters[0], 300)  # Loaded wider than the priced rank.
     assert _dense_mlp_recompute_bytes_per_token([model], policy) == (0, 0)
@@ -686,42 +680,22 @@ def test_dense_widths_need_the_checkpoint_floors_decoder(case):
     assert _no_grad_required(r, (12_000, 8_000)) == discounted
 
 
-def test_the_split_lower_bound_never_exceeds_the_exact_no_grad_price(monkeypatch):
+def test_a_no_grad_price_follows_only_the_largest_groups_rows():
+    """Split lower bounds price optimistic rows: another group's rows must
+    never lower the exact price."""
     r = _at_cp2(_dense_rank())
     signature = _MemorySignature(CP2, (1, None), 2, (), False, (False, False))
 
-    def required(rows, lower_bound):
+    def required(rows):
         return r._subforward_cost(
             packed_tokens=20_480,
             output_bytes=0,
             signature=signature,
             logical_tokens=20_480,
             group_rows=tuple((n, False) for n in rows),
-            lower_bound=lower_bound,
         ).required
 
-    # Even shares bound the busiest rank's rows from below, but the largest
-    # group's share of today's floor falls as the other group's rows grow.
-    assert required((8192, 2048), False) > required((8192, 4096), False)
-    assert required((8192, 2048), True) <= required((8192, 4096), False)
-    # The split planner prices its optimistic rows in that mode.
-    modes = []
-    exact = r._subforward_cost
-    monkeypatch.setattr(
-        r,
-        "_subforward_cost",
-        lambda **kwargs: modes.append(kwargs.get("lower_bound")) or exact(**kwargs),
-    )
-    chunk = [
-        ForwardInput(
-            input_tokens=torch.arange(64), target_tokens=torch.arange(64), no_grad=True
-        )
-        for _ in range(2)
-    ]
-    r._split_chunk_lower_cost(
-        chunk, tuple(q.input_tokens for q in chunk), checkpoint=Unset
-    )
-    assert modes == [True]
+    assert required((8192, 2048)) == required((8192, 4096)) < required((8192, 8193))
 
 
 def test_covered_dense_plans_are_never_marked_staged(monkeypatch):

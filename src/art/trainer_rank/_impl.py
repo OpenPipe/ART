@@ -1804,8 +1804,9 @@ def _dense_mlp_recompute_bytes_per_token(
       priced. Beside it the attention's q/k norm outputs and statistics
       (0.21H measured) are priced as H/4: with the residual, norm output and
       input gradient priced elsewhere, a layer's norms are 3.25H.
-    - A no-grad layer holds its three 2F FC1 tensors, residual, norm and CP
-      gather rows: 263 KB per row measured, priced as 6F + 6H.
+    - A no-grad layer holds its three 2F FC1 tensors beside the residual
+      pair, embedding and norm output (4H, the CP1 no-grad floor's form):
+      6F + 4.04H measured, priced as 6F + 4.25H.
 
     Both add the rank intermediates of every adapter in the layer. Every
     decoder layer, all it runs and ``slot_ref``'s adapters must match the
@@ -1995,7 +1996,7 @@ def _dense_mlp_recompute_bytes_per_token(
     # product and gradient.
     adapters = 2 * rank
     return (7 * width + hidden // 4 + adapters) * 2, (
-        6 * width + 6 * hidden + adapters
+        6 * width + 4 * hidden + hidden // 4 + adapters
     ) * 2
 
 
@@ -3775,9 +3776,7 @@ class TrainerRank:
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
-        lower_bound: bool = False,
     ) -> _SubforwardCost:
-        """``lower_bound`` prices optimistic rows from below (split pruning)."""
         checkpoint_memory = self._checkpoint_memory_floor(
             group_rows,
             slot_refs,
@@ -3800,7 +3799,6 @@ class TrainerRank:
             retained_tokens=retained_tokens,
             include_checkpoint_input_gradient=False,
             checkpoint_memory=checkpoint_memory,
-            lower_bound=lower_bound,
         )
         checkpoint_retained, checkpoint_workspace = checkpoint_memory
         retained = self._retained_memory_bytes(

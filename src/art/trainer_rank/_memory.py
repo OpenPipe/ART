@@ -2142,7 +2142,6 @@ def _estimate_required_memory_bytes_from_values(
     retained_tokens: int | None = None,
     include_checkpoint_input_gradient: bool = True,
     checkpoint_memory: tuple[int, int] | None = None,
-    lower_bound: bool = False,
 ) -> int:
     if packed_tokens <= 0:
         return output_bytes
@@ -2153,27 +2152,15 @@ def _estimate_required_memory_bytes_from_values(
     )
     _dense_stage, no_grad = (
         self._dense_mlp_widths(slot_refs)
-        if not signature.grad_enabled
-        and signature.topology[2] == 2
-        and len(group_rows) > 1
+        if not signature.grad_enabled and signature.topology[2] == 2 and group_rows
         else (0, 0)
     )
     if no_grad:
         # No-grad groups run one after another and keep only their outputs
         # (charged below): price the largest group's own physical rows at
-        # the traced width. The per-packed-token floor is kept only as that
-        # group's share, which it matched for one group on Qwen3.8-27B.
-        # That share falls as another group's rows grow, so a lower bound
-        # on optimistic rows keeps only the largest group's own rows.
-        rows = [rows for rows, _ in group_rows]
-        static_compute = (
-            max(rows) * no_grad
-            if lower_bound
-            else max(
-                max(rows) * no_grad,
-                -(-static_compute * max(rows) // max(1, sum(rows))),
-            )
-        )
+        # the traced width, not the per-packed-token floor, which a CP2
+        # rank's rows stay well under (Qwen3.8-27B: +5.7% for one group).
+        static_compute = max(rows for rows, _ in group_rows) * no_grad
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry
         hidden = self._hidden_size
