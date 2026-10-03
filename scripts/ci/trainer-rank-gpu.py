@@ -7,6 +7,7 @@ deadline bounds the client wait, not provider creation. The owned API cgroup
 must be retired before the final retained-UID reconciliation.
 """
 
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,12 @@ import sys
 import time
 import uuid
 
-import trainer_rank_api as api_service
+spec = importlib.util.spec_from_file_location(
+    "trainer_rank_api", Path(__file__).with_name("trainer_rank_api.py")
+)
+assert spec is not None and spec.loader is not None
+api_service = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(api_service)
 
 NONTERMINAL = {"INIT", "PENDING", "SETTING_UP", "RUNNING"}
 INFRAS = {"k8s/cks-wb3", "k8s/ext-collab2"}

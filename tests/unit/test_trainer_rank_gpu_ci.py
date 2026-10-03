@@ -15,11 +15,47 @@ from unittest.mock import Mock, create_autospec
 import pytest
 
 SCRIPT = Path(__file__).parents[2] / "scripts/ci/trainer-rank-gpu.py"
-sys.path.insert(0, str(SCRIPT.parent))
 spec = importlib.util.spec_from_file_location("trainer_rank_gpu_ci", SCRIPT)
 assert spec is not None and spec.loader is not None
 ci = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ci)
+
+
+@pytest.mark.parametrize("name", ["trainer-rank-gpu.py", "gpu-image-cleanup.py"])
+def test_file_import_resolves_sibling_without_search_path(tmp_path, name):
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-S",
+            "-c",
+            """
+import importlib.util
+from pathlib import Path
+import sys
+
+script = Path(sys.argv[1]).resolve()
+before = sys.path.copy()
+assert str(script.parent) not in sys.path
+assert "trainer_rank_api" not in sys.modules
+spec = importlib.util.spec_from_file_location("isolated_ci_script", script)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+driver = module.gpu_ci if script.name == "gpu-image-cleanup.py" else module
+assert Path(driver.api_service.__file__).resolve() == script.with_name("trainer_rank_api.py")
+assert callable(driver.run_child)
+assert sys.path == before
+assert "sky" not in sys.modules
+""",
+            str(SCRIPT.with_name(name)),
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -452,12 +488,15 @@ def test_main_rejects_invalid_scope_before_launch(tmp_path, monkeypatch, key, va
 @pytest.mark.parametrize("infra", ["k8s/cks-wb3", "k8s/ext-collab2"])
 def test_real_worker_round_trip_with_fake_sdk(tmp_path, infra):
     """Exercise the actual direct Python parent/worker JSON transport, without Sky."""
-    (tmp_path / "sitecustomize.py").write_text(f"""
-import sys
-sys.path.insert(0, {str(SCRIPT.parent)!r})
-import trainer_rank_api
-trainer_rank_api.start = lambda *a, **kw: None
-trainer_rank_api.client_environment = lambda *a, **kw: None
+    (tmp_path / "sitecustomize.py").write_text("""
+from importlib.machinery import SourceFileLoader
+exec_module = SourceFileLoader.exec_module
+def offline_service(loader, module):
+    exec_module(loader, module)
+    if module.__name__ == "trainer_rank_api":
+        module.start = lambda *a, **kw: None
+        module.client_environment = lambda *a, **kw: None
+SourceFileLoader.exec_module = offline_service
 """)
     (tmp_path / "sky.py").write_text("""
 import os
