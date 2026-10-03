@@ -39,6 +39,9 @@ elif 'wait' in args:
     if mode == 'wait_hang': time.sleep(60)
     if mode == 'wait_ignores_term':
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        # Signal the owned GNU timeout only after this child can ignore TERM.
+        # Its real --kill-after timer must then escalate to KILL.
+        os.kill(os.getppid(), signal.SIGTERM)
         time.sleep(60)
 elif 'cp' in args:
     if args[-2].endswith(':/tmp/art-build.log'):
@@ -161,13 +164,50 @@ def test_builder_refuses_invalid_lifetime_before_provider_effects(builder, secon
         ("pending", 124),
         ("wait_hang", 124),
         ("log_hang", 124),
-        ("wait_ignores_term", 137),
     ],
 )
 def test_builder_deadline_reaches_owned_cleanup_without_exit_file(builder, mode, code):
     root, run = builder
     result = run(BUILDKIT_TIMEOUT_SECONDS="1", FAKE_BUILD_MODE=mode)
     assert result.returncode == code, result.stderr
+    assert not (root / "pod.json").exists()
+    assert (
+        json.loads((root / "cleanup/trap-builder.json").read_text())["outcome"]
+        == "ABSENT"
+    )
+
+
+def test_builder_kills_ready_term_ignoring_wait_and_cleans_up(builder):
+    root, run = builder
+    # Leave setup its ordinary budget; the ready child triggers escalation.
+    result = run(FAKE_BUILD_MODE="wait_ignores_term")
+    assert result.returncode == 137, result.stderr
+    assert any(
+        "wait" in json.loads(line)
+        for line in (root / "calls.jsonl").read_text().splitlines()
+    )
+    assert not (root / "pod.json").exists()
+    assert (
+        json.loads((root / "cleanup/trap-builder.json").read_text())["outcome"]
+        == "ABSENT"
+    )
+
+
+def test_builder_expired_after_create_never_enters_wait(builder):
+    root, run = builder
+    clock = root / "clock.sh"
+    # Model descheduling after create, at the actual shell's next call boundary.
+    clock.write_text(
+        'trap \'if [[ $BASH_COMMAND == "build_kubectl wait "* ]]; '
+        "then SECONDS=$build_deadline; fi' DEBUG\n"
+    )
+    result = run(BASH_ENV=str(clock), FAKE_BUILD_MODE="wait_ignores_term")
+    assert result.returncode == 124, result.stderr
+    calls = [
+        json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()
+    ]
+    assert any("create" in call for call in calls)
+    assert not any("wait" in call for call in calls)
     assert not (root / "pod.json").exists()
     assert (
         json.loads((root / "cleanup/trap-builder.json").read_text())["outcome"]
