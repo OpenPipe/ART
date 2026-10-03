@@ -100,9 +100,16 @@ def _dense_layer(gdn: bool = False) -> Any:
     fc2.row_parallel_lora = row
     mlp.linear_fc1 = fc1
     mlp.linear_fc2 = fc2
+    from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+    from megatron.core.transformer.identity_op import IdentityFuncOp
+
     layer = _module(TransformerLayer)
     layer.self_attention = _module(GatedDeltaNet if gdn else SelfAttention)
     layer.mlp = mlp
+    # The stock spec's bias-dropout-add factories and grad context.
+    layer.self_attn_bda = layer.mlp_bda = get_bias_dropout_add
+    layer.bias_dropout_add_exec_handler = torch.enable_grad
+    layer.cross_attn_bda = _module(IdentityFuncOp)
     return layer
 
 
@@ -226,6 +233,10 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "final_norm_hook",
         "final_norm_class_forward",
         "final_norm_override",
+        "custom_mlp_bda",
+        "custom_self_attn_bda",
+        "custom_cross_attn_bda",
+        "custom_bda_handler",
         "chunks",
     ],
 )
@@ -380,6 +391,18 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
         ),
         "final_norm_override": final_norm(
             lambda norm: setattr(norm, "forward", MethodType(lambda s, x: x, norm))
+        ),
+        "custom_mlp_bda": lambda: setattr(layer, "mlp_bda", lambda *a: None),
+        "custom_self_attn_bda": lambda: setattr(
+            gdn_layer, "self_attn_bda", functools.partial(lambda *a: None)
+        ),
+        # A function in place of the cross-attention BDA module.
+        "custom_cross_attn_bda": lambda: (
+            delattr(layer, "cross_attn_bda"),
+            setattr(layer, "cross_attn_bda", lambda *a: None),
+        ),
+        "custom_bda_handler": lambda: setattr(
+            layer, "bias_dropout_add_exec_handler", torch.no_grad
         ),
         "chunks": lambda: None,
     }

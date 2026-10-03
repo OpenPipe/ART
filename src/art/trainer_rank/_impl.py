@@ -1846,8 +1846,10 @@ def _dense_mlp_recompute_bytes_per_token(
             TELayerNormColumnParallelLinear,
             TERowParallelLinear,
         )
+        from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
         from megatron.core.transformer.attention import SelfAttention
+        from megatron.core.transformer.identity_op import IdentityFuncOp
         from megatron.core.transformer.mlp import MLP
         from megatron.core.transformer.transformer_block import TransformerBlock
         from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -1970,6 +1972,13 @@ def _dense_mlp_recompute_bytes_per_token(
             or not plain(
                 layer, _gdn_island_layer_forward, "_art_gdn_island_physical_forward"
             )
+            # Executed callables the layer holds as plain attributes: the traced
+            # spec's bias-dropout-add factory and grad context (its cross
+            # attention's is a module, walked below).
+            or vars(layer).get("self_attn_bda") is not get_bias_dropout_add
+            or vars(layer).get("mlp_bda") is not get_bias_dropout_add
+            or vars(layer).get("bias_dropout_add_exec_handler") is not torch.enable_grad
+            or type(getattr(layer, "cross_attn_bda", None)) is not IdentityFuncOp
             or type(mixer) not in mixers
             or not plain(mixer, _prefix_tree_forward, "_art_physical_forward")
             or any(type(site) is not cls for site, cls in sites)
