@@ -2,7 +2,9 @@
 
 SkyPilot returns an actual job ID from launch. Each SDK operation runs in a
 bounded child; only that job's SUCCEEDED status passes. An always-run workflow
-step cancels pending admission and verifies cleanup of owned resources.
+step requests cancellation and checks retained resource UIDs. The admission
+deadline bounds the client wait, not provider creation. Successful API shutdown
+does not prove creator retirement; cleanup receipts keep that state UNKNOWN.
 """
 
 import json
@@ -55,7 +57,12 @@ def launch_task(root, owner):
     )
     write_json(
         root / "cleanup.json",
-        {**owner, "confirmed": False, "physical_absence": "UNKNOWN"},
+        {
+            **owner,
+            "operations_succeeded": False,
+            "physical_absence": "UNKNOWN",
+            "creator_quiescence": "UNKNOWN",
+        },
     )
     task = sky.Task.from_yaml("scripts/ci/trainer-rank-gpu.sky.yaml")
     task.set_resources_override(
@@ -228,8 +235,8 @@ def worker(root, operation):
         return
     if operation == "stop_api":
         # This workflow owns the entire ephemeral runner and its local API.
-        # Stop its workers before the final physical census, including when a
-        # cancelled launch has not yet unwound. Never stop a developer's API.
+        # Best-effort shutdown: the SDK snapshots descendants before killing
+        # the parent, so an absent API process does not prove creator retirement.
         if (
             os.environ.get("GITHUB_ACTIONS") != "true"
             or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
@@ -432,8 +439,8 @@ def supervise(root, owner, timeout=35 * 60, poll_seconds=10):
         if job is None and (root / "request.json").exists():
             operations = ["cancel_request"]
         if not terminal and (root / "allocation.json").exists():
-            # Cancellation may remove pending Pods before cleanup can observe them.
-            operations.insert(0, "resources")
+            # Request cancellation before diagnostics can prolong capacity wait.
+            operations.insert(1, "resources")
         outcomes = {}
         for operation in operations:
             try:
@@ -475,6 +482,7 @@ def admit(root):
         label=uuid.uuid4().hex,
         admitted_at=now,
         admission_deadline=admission_deadline,
+        admission_deadline_scope="client_launch_wait",
         work_deadline=now + 35 * 60,
         cleanup_deadline=now + 40 * 60,
     )
@@ -484,7 +492,10 @@ def admit(root):
             root / "result.json",
             {**owner, "status": "NOT_RUN", "reason": "admission_expired"},
         )
-        print("::error::GPU validation did not run: its queue admission expired.")
+        print(
+            "::error::GPU validation did not run: its admission window expired. "
+            "Rerun all workflow jobs for a fresh window."
+        )
         return 104
     return 0
 
@@ -511,9 +522,9 @@ def cleanup(root):
             outcomes[operation] = {"success": True}
         except BaseException as error:
             outcomes[operation] = {"success": False, "error": repr(error)}
-    confirmed = all(outcome["success"] for outcome in outcomes.values())
+    operations_succeeded = all(outcome["success"] for outcome in outcomes.values())
     physical_absence = "UNKNOWN"
-    if outcomes["stop_api"]["success"] and outcomes["remove_resources"]["success"]:
+    if outcomes["remove_resources"]["success"]:
         try:
             evidence = read_bound(root, "resources-cleanup.json", owner)
             if (
@@ -528,13 +539,14 @@ def cleanup(root):
         root / "cleanup.json",
         {
             **owner,
-            "confirmed": confirmed,
+            "operations_succeeded": operations_succeeded,
             "physical_absence": physical_absence,
             "physical_absence_scope": "retained Pod and Service UIDs",
+            "creator_quiescence": "UNKNOWN",
             "operations": outcomes,
         },
     )
-    return 0 if confirmed else 105
+    return 0 if operations_succeeded else 105
 
 
 def main(root):

@@ -34,7 +34,8 @@ jobs:
       admission_deadline: ${{ steps.admission.outputs.deadline }}
     steps:
       - id: admission
-        name: Bound GPU queue admission
+        name: Bound GPU client admission wait
+        # Preserve this classification's cutoff; rerun all jobs for a fresh window.
         run: echo "deadline=$(( $(date +%s) + 1800 ))" >> "${GITHUB_OUTPUT}"
 
       - uses: actions/checkout@v4

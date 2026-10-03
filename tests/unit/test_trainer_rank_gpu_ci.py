@@ -44,6 +44,8 @@ def sky(monkeypatch):
         Task=NS(from_yaml=Mock(return_value=task)),
         launch=Mock(return_value="request-17"),
         get=Mock(),
+        status=Mock(return_value="cluster-status-request"),
+        down=Mock(return_value="down-request"),
         job_status=Mock(return_value="status-request"),
         cancel=Mock(return_value="cancel-request"),
         api_cancel=Mock(return_value="api-cancel-request"),
@@ -71,7 +73,8 @@ def test_submit_once_records_request_before_wait_and_actual_job(
     def launch(*args, **kwargs):
         receipt = ci.read_bound(tmp_path, "cleanup.json", owner)
         assert receipt["physical_absence"] == "UNKNOWN"
-        assert receipt["confirmed"] is False
+        assert receipt["operations_succeeded"] is False
+        assert receipt["creator_quiescence"] == "UNKNOWN"
         return "request-17"
 
     sky.launch.side_effect = launch
@@ -148,6 +151,25 @@ def test_cancel_and_logs_use_exact_job_and_never_follow(tmp_path, owner, sky):
         ci.worker(tmp_path, "logs")
     assert outcome.value.code == 0
     sky.tail_logs.assert_called_once_with(owner["cluster"], job_id=17, follow=False)
+
+
+@pytest.mark.parametrize("present", [False, True])
+def test_down_checks_exact_cluster_before_teardown(tmp_path, owner, sky, present):
+    sky.get.side_effect = [[{"name": owner["cluster"]}] if present else [], None]
+    ci.worker(tmp_path, "down")
+    sky.status.assert_called_once_with([owner["cluster"]])
+    if present:
+        sky.down.assert_called_once_with(owner["cluster"])
+        assert sky.get.call_args.args == ("down-request",)
+    else:
+        sky.down.assert_not_called()
+
+
+def test_down_rejects_foreign_cluster_before_teardown(tmp_path, owner, sky):
+    sky.get.return_value = [{"name": owner["cluster"]}, {"name": "peer"}]
+    with pytest.raises(ValueError, match="different cluster"):
+        ci.worker(tmp_path, "down")
+    sky.down.assert_not_called()
 
 
 def scenario(monkeypatch, root, owner, statuses, *, failures=None):
@@ -679,7 +701,10 @@ def test_admission_expiring_during_setup_does_not_launch(tmp_path, monkeypatch):
 def test_worker_does_not_submit_after_cutoff(
     tmp_path, owner, sky, monkeypatch, deadline
 ):
-    monkeypatch.setattr(ci.time, "time", lambda: owner[deadline])
+    owner.update(admission_deadline=200, work_deadline=200)
+    owner[deadline] = 100
+    ci.write_json(tmp_path / "owner.json", owner)
+    monkeypatch.setattr(ci.time, "time", lambda: 100)
     with pytest.raises(TimeoutError, match="launch deadline"):
         ci.worker(tmp_path, "launch")
     sky.launch.assert_not_called()
@@ -737,7 +762,8 @@ def test_cleanup_is_finite_and_reports_unknown_cancel(tmp_path, owner, monkeypat
         ("remove_resources", 1),
     ]
     receipt = ci.read_bound(tmp_path, "cleanup.json", owner)
-    assert receipt["confirmed"] is False
+    assert receipt["operations_succeeded"] is False
+    assert receipt["creator_quiescence"] == "UNKNOWN"
     assert receipt["operations"]["remove_resources"]["success"] is True
 
 
@@ -874,18 +900,31 @@ def test_initial_identity_failure_preserves_job_result(tmp_path, owner, monkeypa
     assert ci.supervise(tmp_path, owner, poll_seconds=0) == 0
 
 
-def test_interrupted_provisioning_captures_ids_before_cancelling(
+def test_interrupted_provisioning_cancels_before_diagnostics(
     tmp_path, owner, monkeypatch
 ):
     ci.write_json(tmp_path / "allocation.json", {**owner, "namespace": "ci"})
     ci.write_json(tmp_path / "launch-attempt.json", owner)
     ci.write_json(tmp_path / "request.json", {**owner, "request_id": "request-17"})
-    calls = scenario(
-        monkeypatch, tmp_path, owner, [], failures={"launch": TimeoutError("launch")}
-    )
+    calls, late_jobs = [], []
+    cancelled = False
+
+    def run(root, operation, timeout):
+        nonlocal cancelled
+        calls.append(operation)
+        if operation == "launch":
+            raise TimeoutError("client launch wait expired")
+        if operation == "cancel_request":
+            cancelled = True
+        if operation == "resources" and not cancelled:
+            # Capacity can become available while the diagnostic call is waiting.
+            late_jobs.append("submitted after client timeout")
+
+    monkeypatch.setattr(ci, "run_worker", run)
     with pytest.raises(TimeoutError):
         ci.supervise(tmp_path, owner)
-    assert calls == ["launch", "resources", "cancel_request"]
+    assert late_jobs == []
+    assert calls == ["launch", "cancel_request", "resources"]
 
 
 @pytest.fixture
@@ -987,7 +1026,7 @@ def test_empty_resource_history_is_unknown(tmp_path, owner, kube_receipts):
 
 @pytest.mark.parametrize("stop_api", [True, False])
 @pytest.mark.parametrize("receipt", [True, False])
-def test_cleanup_absence_requires_stopped_creator_and_uid_receipt(
+def test_cleanup_distinguishes_uid_absence_from_unknown_creator_lifetime(
     tmp_path, owner, monkeypatch, stop_api, receipt
 ):
     ci.write_json(tmp_path / "launch-attempt.json", owner)
@@ -1004,10 +1043,12 @@ def test_cleanup_absence_requires_stopped_creator_and_uid_receipt(
 
     def run(root, operation, timeout):
         if operation == "stop_api" and not stop_api:
-            raise TimeoutError("creator still running")
+            raise TimeoutError("API stop failed")
 
     monkeypatch.setattr(ci, "run_worker", run)
     assert ci.cleanup(tmp_path) == (0 if stop_api else 105)
-    assert ci.read_bound(tmp_path, "cleanup.json", owner)["physical_absence"] == (
-        "ABSENT" if stop_api and receipt else "UNKNOWN"
-    )
+    result = ci.read_bound(tmp_path, "cleanup.json", owner)
+    assert result["operations_succeeded"] is stop_api
+    assert result["creator_quiescence"] == "UNKNOWN"
+    assert result["physical_absence"] == ("ABSENT" if receipt else "UNKNOWN")
+    assert result["physical_absence_scope"] == "retained Pod and Service UIDs"
