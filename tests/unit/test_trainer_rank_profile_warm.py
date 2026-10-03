@@ -78,7 +78,7 @@ def test_the_first_plans_one_time_costs_do_not_price_later_waves():
 
 
 def test_forward_only_observations_never_set_the_warm_fit():
-    """Split children and dp_rank_forward observe forward only; a flat wave's
+    """Split children and forward observe forward only; a flat wave's
     caller phase also includes its backward."""
     r = rank()
     first, larger = _plans(r)
@@ -261,7 +261,7 @@ def test_split_children_never_set_the_warm_fit(monkeypatch):
     monkeypatch.setattr(r, "_run_flat_plan_with_memory_tracking", run)
     _packed_budget(monkeypatch, r, 20)
     items = [[_request(0)], [_request(m) for m in range(1, 5)], [_request(5)]]
-    batches = r.forward_micro_batches(items)
+    batches = r.forward_batches(items)
     next(batches)
     assert next(batches).stats.subforward_count > 1
     (signature,) = r._memory_profiles
@@ -319,7 +319,7 @@ def test_a_width_accepted_on_the_no_sharing_bound_never_executes_above_it(
             None,
         ),
     )
-    (batch,) = list(r.forward_micro_batches(items))
+    (batch,) = list(r.forward_batches(items))
     # Accepted on the no-sharing bound, which priced more tokens than ran.
     assert batch.stats.packed_tokens == plan.packed_tokens
     assert batch.stats.estimated_required_bytes > own
@@ -413,7 +413,7 @@ def test_a_nested_forward_during_the_yield_cannot_fit_the_warm_profile(monkeypat
     monkeypatch.setattr(r, "_run_flat_plan_with_memory_tracking", run)
     _packed_budget(monkeypatch, r, 10)
     items = [[_request(m)] for m in range(3)]
-    batches = r.forward_micro_batches(items)
+    batches = r.forward_batches(items)
     for index, batch in enumerate(batches):
         (signature,) = r._memory_profiles
         state["peak"] += 200 * batch.stats.packed_tokens  # the caller's backward

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 import os
 from pathlib import Path
@@ -122,11 +122,7 @@ def test_dynamic_lora_slots_capture_recompute_context_and_step_independently() -
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
 def test_trainer_rank_custom_objects_train_and_become_stale_on_cuda() -> None:
-    with _single_rank_model_parallel():
-        device = torch.device("cuda")
-        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
-        trainer = _trainer_for(lora, device)
-        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=1))
+    with _lora_checkpoint() as (device, _lora, trainer):
         head = trainer.module(
             "value_head", lambda: _CudaValueHead(4).to(device), checkpoint="A"
         )
@@ -140,7 +136,7 @@ def test_trainer_rank_custom_objects_train_and_become_stale_on_cuda() -> None:
         output = head.score(torch.randn(3, 4, device=device))["value"] * gain + running
         with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
             trainer._guard_slot_can_load(trainer._slot_ref("A"))
-        output.sum().backward()
+        trainer.backward(output.sum())
         before = tuple(param.detach().clone() for param in head.parameters()) + (
             gain.detach().clone(),
         )
@@ -270,7 +266,8 @@ def _custom_parameter_reduction_worker(
             checkpoint="A",
         )
         torch.testing.assert_close(parameter, torch.tensor(1.0, device=device))
-        (parameter * float(rank + 1)).backward()
+        trainer.backward(parameter * float(rank + 1))
+        assert parameter.grad is not None
         (reduced,) = trainer._reduce_dynamic_grads((parameter,), scale_grads=1.0)
         expected = {"dp": 3.0, "tp": 1.5, "cp": 1.5, "tp_cp": 2.5}[topology]
         torch.testing.assert_close(reduced, torch.tensor(expected, device=device))
@@ -594,6 +591,8 @@ def _optimizer_state(trainer: TrainerRank, name: str) -> LocalOptimizerState:
 
 
 def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
+    from art.trainer_rank._rng import TrainerRNG
+
     trainer = TrainerRank.__new__(TrainerRank)
     trainer.runtime = SimpleNamespace(
         model=[lora],
@@ -601,6 +600,7 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
         model_support_handler=_IdentityModelSupportHandler(),
     )
     trainer.device = device
+    trainer._rng = TrainerRNG(device)
     trainer._slot_stack = []
     trainer._default_slot_ref = None
     trainer._skipped_forward_waves = {}
@@ -635,6 +635,21 @@ class _IdentityModelSupportHandler:
     ) -> dict[str, torch.Tensor]:
         del model_chunks
         return state
+
+
+@contextmanager
+def _lora_checkpoint(
+    seed: int = 1, *, rng_seed: int | None = None
+) -> Iterator[tuple[torch.device, LoRA, TrainerRank]]:
+    """Construct a dense LoRA checkpoint in a fresh single-rank context."""
+    with _single_rank_model_parallel():
+        if rng_seed is not None:
+            torch.manual_seed(rng_seed)
+        device = torch.device("cuda")
+        lora = LoRA("dense", 4, 5, 2, 32, torch.float32, device)
+        trainer = _trainer_for(lora, device)
+        _install_checkpoint(trainer, "A", _adapter("dense", rank=2, seed=seed))
+        yield device, lora, trainer
 
 
 @contextmanager

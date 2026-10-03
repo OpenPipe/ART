@@ -8,6 +8,7 @@ import pytest
 from test_trainer_rank_moe_memory import _enclosing_moe
 from test_trainer_rank_moe_memory import layer as layer
 import torch
+from trainer_rank_test_support import fake_rank, recompute_model
 
 from art.megatron.prefix_tree_packing import prefix_tree_pack
 from art.trainer_rank import ForwardInput, TrainerRank
@@ -30,27 +31,7 @@ def rank_with_moe(moe_layer, *, install_hooks=False):
     from art.megatron.gdn.operator import _prefix_tree_forward
     from art.megatron.lora import LoRA, SelfAttentionLinearProjLoRA
 
-    decoder = module(TransformerBlock)
-    decoder.config = SimpleNamespace(
-        hidden_size=2048,
-        num_layers=40,
-        padded_vocab_size=32,
-        params_dtype=torch.bfloat16,
-        recompute_granularity="full",
-        recompute_method="uniform",
-        recompute_num_layers=1,
-        distribute_saved_activations=False,
-        sequence_parallel=False,
-        fp32_residual_connection=False,
-        cpu_offloading=False,
-        cuda_graph_impl="none",
-        fp8=None,
-        fp4=None,
-    )
-    decoder.layers = torch.nn.ModuleList(
-        [torch.nn.Linear(1, 1).bfloat16() for _ in range(40)]
-    )
-    decoder.num_layers_per_pipeline_rank = 40
+    model = recompute_model(TransformerBlock, 2048, 40, False)
     layer = torch.nn.Module()
     layer.mlp = moe_layer
     gd = module(GatedDeltaNet)
@@ -76,26 +57,12 @@ def rank_with_moe(moe_layer, *, install_hooks=False):
         torch.empty(1, 2048, dtype=torch.bfloat16)
     )
     layer.self_attention = gd
-    decoder.layers[38] = layer
-    model: Any = torch.nn.Module()
-    model.config = decoder.config
-    model.decoder = decoder
-    model._preprocess = lambda: None
+    model.decoder.layers[38] = layer
     if install_hooks:
         from art.megatron.gdn.operator import install_gdn_island_hooks
 
         install_gdn_island_hooks([model])
-    r: Any = TrainerRank(
-        cast(
-            Any,
-            SimpleNamespace(
-                model=[model],
-                optimizer=None,
-                provider=SimpleNamespace(hidden_size=2048, num_layers=40),
-                model_support_handler=SimpleNamespace(build_gdn_execution_spec=False),
-            ),
-        )
-    )
+    r: Any = fake_rank(TrainerRank, [model], hidden_size=2048, num_layers=40)
     r._dp_rank_and_size = lambda: (0, 1)  # Uninitialized MCore has no CPU DP group.
     return r, gd
 

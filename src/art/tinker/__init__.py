@@ -22,3 +22,7 @@ def __getattr__(name: str) -> Any:
     value = getattr(import_module(_EXPORTS[name], __name__), name)
     globals()[name] = value
     return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
