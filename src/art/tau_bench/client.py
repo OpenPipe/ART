@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 import logging
 import math
 import os
-from typing import Any, AsyncGenerator, Literal, cast
+from typing import Any, AsyncGenerator, AsyncIterator, Literal, cast
 import uuid
 
 import httpx
@@ -47,13 +47,34 @@ def _shard_limit(total: int | None, shards: int, index: int) -> int | None:
 
 class _CapacityReleaseStream(httpx.AsyncByteStream):
     def __init__(
-        self, stream: httpx.AsyncByteStream, capacity: asyncio.Semaphore
+        self,
+        stream: httpx.AsyncByteStream,
+        capacity: asyncio.Semaphore | None,
+        observation: dict[str, int] | None = None,
     ) -> None:
+        self._observation: dict[str, int] | None = None
         self._stream = stream
         self._capacity = capacity
         self._closed = False
+        if observation is not None:
+            observation["body_wrappers"] += 1
+            self._observation = observation
 
-    async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+    def __del__(self) -> None:
+        if self._observation is not None:
+            self._observation["body_wrappers"] -= 1
+            if not self._closed:
+                self._observation["body_open"] -= 1
+                self._observation["body_abandoned"] += 1
+        # Observation retirement must not close a body or release its permit.
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        # Unlimited observation must preserve the original iterator protocol.
+        if self._capacity is None:
+            return self._stream.__aiter__()
+        return self._iterate_and_release()
+
+    async def _iterate_and_release(self) -> AsyncGenerator[bytes, None]:
         try:
             async for chunk in self._stream:
                 yield chunk
@@ -66,8 +87,18 @@ class _CapacityReleaseStream(httpx.AsyncByteStream):
         self._closed = True
         try:
             await self._stream.aclose()
+        except BaseException:
+            if self._observation is not None:
+                self._observation["body_close_errors"] += 1
+            raise
         finally:
-            self._capacity.release()
+            if self._capacity is not None:
+                self._capacity.release()
+                if self._observation is not None:
+                    self._observation["permit_held"] -= 1
+            if self._observation is not None:
+                self._observation["body_open"] -= 1
+                self._observation["body_closed"] += 1
 
 
 class _ShardedAsyncHTTPTransport(httpx.AsyncBaseTransport):
@@ -104,30 +135,89 @@ class _ShardedAsyncHTTPTransport(httpx.AsyncBaseTransport):
             for index in range(shard_count)
         )
         self._next = 0
+        self._diagnostics: dict[str, int] | None = None
+        self._connection_limit = max_connections
+
+    def _observe_transport(self) -> None:
+        # Opt-in diagnostics: fixed scalar storage, no requests, tasks or payloads.
+        if self._diagnostics is None:
+            self._diagnostics = dict(
+                permit_waiting=0,
+                permit_held=0,
+                body_close_errors=0,
+                body_omitted=0,
+                transport_pending=0,
+                headers=0,
+                body_open=0,
+                body_closed=0,
+                body_wrappers=0,
+                body_abandoned=0,
+            )
+
+    def _transport_snapshot(self) -> dict[str, Any]:
+        return dict(
+            schema=1,
+            limit=self._connection_limit,
+            body_observation_limit=None if self._capacity is not None else 64,
+            **(
+                (self._diagnostics or {})
+                | {
+                    "permit_held": None
+                    if self._capacity is None
+                    else (self._diagnostics or {}).get("permit_held", 0)
+                }
+            ),
+            pool_wait="unknown",
+            downstream_wait="unknown",
+            coverage="Cumulative across recorder lifetimes since transport activation. Requests entered before activation are excluded even if still pending/holding a permit. Pending includes pool/connect/write/headers. Unlimited added wrappers are bounded through object retirement. Abandonment does not close bodies/release permits; no server receipt or task await-chain evidence.",
+        )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         capacity = self._capacity
+        observation = self._diagnostics
         if capacity is not None:
             pool_timeout = request.extensions.get("timeout", {}).get("pool")
+            if observation is not None:
+                observation["permit_waiting"] += 1
             try:
                 async with asyncio.timeout(pool_timeout):
                     await capacity.acquire()
+                    if observation is not None:
+                        observation["permit_held"] += 1
             except TimeoutError:
                 raise httpx.PoolTimeout(
                     "Timed out waiting for an available connection slot",
                     request=request,
                 ) from None
+            finally:
+                if observation is not None:
+                    observation["permit_waiting"] -= 1
         transport = self.transports[self._next]
         self._next = (self._next + 1) % len(self.transports)
+        if observation is not None:
+            observation["transport_pending"] += 1
         try:
             response = await transport.handle_async_request(request)
         except BaseException:
             if capacity is not None:
                 capacity.release()
+                if observation is not None:
+                    observation["permit_held"] -= 1
             raise
-        if capacity is not None:
+        finally:
+            if observation is not None:
+                observation["transport_pending"] -= 1
+        body_observation = observation
+        if observation is not None:
+            observation["headers"] += 1
+            if capacity is None and observation["body_wrappers"] >= 64:
+                observation["body_omitted"] += 1
+                body_observation = None
+            else:
+                observation["body_open"] += 1
+        if capacity is not None or body_observation is not None:
             response.stream = _CapacityReleaseStream(
-                cast(httpx.AsyncByteStream, response.stream), capacity
+                cast(httpx.AsyncByteStream, response.stream), capacity, body_observation
             )
         return response
 
