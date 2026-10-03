@@ -212,6 +212,8 @@ def test_traced_dense_mlp_prices_its_stage_and_no_grad_transient():
         "active_selector",
         "child_class_forward",
         "helper_override",
+        "helper_partial",
+        "helper_callable",
         "chunks",
     ],
 )
@@ -343,6 +345,12 @@ def test_anything_but_the_traced_execution_keeps_the_allowance(change):
             lambda child: setattr(child, "__class__", Norm)
         ),
         "helper_override": lambda: setattr(layer, "_forward_mlp", custom),
+        "helper_partial": lambda: setattr(
+            layer, "_forward_mlp", functools.partial(lambda *a: None)
+        ),
+        "helper_callable": lambda: setattr(
+            layer, "_forward_mlp", type("Helper", (), {"__call__": lambda *a: None})()
+        ),
         "chunks": lambda: None,
     }
     edits[change]()

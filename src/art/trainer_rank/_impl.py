@@ -29,7 +29,7 @@ import struct
 import threading
 import time
 import traceback
-from types import FunctionType, MethodType, TracebackType
+from types import MethodType, TracebackType
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -1869,7 +1869,7 @@ def _dense_mlp_recompute_bytes_per_token(
 
     def plain(module: Any, wrapper: Any = None, delegate: str = "") -> bool:
         """No hooks, a class forward from the traced packages, no instance
-        override of a class method (an executed helper such as
+        callable shadowing a class callable (an executed helper such as
         ``_forward_mlp``), and no forward but the class's or ART's traced
         wrapper, which must still call the class's own forward."""
         forward = vars(module).get("forward")
@@ -1878,9 +1878,9 @@ def _dense_mlp_recompute_bytes_per_token(
             or module._forward_pre_hooks
             or not type(module).forward.__module__.startswith(_TRACED_PACKAGES)
             or any(
-                name != "forward"
-                and isinstance(value, (FunctionType, MethodType))
-                and isinstance(getattr(type(module), name, None), FunctionType)
+                name not in ("forward", delegate)
+                and callable(value)
+                and callable(getattr(type(module), name, None))
                 for name, value in vars(module).items()
             )
         ):
