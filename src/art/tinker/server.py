@@ -38,7 +38,9 @@ from art.token_prefix import TokenPrefixStore
 from art.tokenizer import get_tokenizer
 from art.types import Message, Tools
 from art.utils.append_only import (
+    chat_prefix_eligible,
     chat_prefix_observations,
+    chat_prefix_scope,
     has_renderable_tool_arguments,
     output_prefix_observations,
     preserves_history,
@@ -439,9 +441,11 @@ class OpenAICompatibleTinkerServer:
             samplable_model = await tenant.get_samplable_model(body["model"])
             template_kwargs = cast(dict[str, Any], body).get("chat_template_kwargs")
             preserve = preserves_history(template_kwargs)
-            scope = json.dumps(
-                [id(tenant), samplable_model.base_model, template_kwargs],
-                sort_keys=True,
+            scope = chat_prefix_scope(
+                json.dumps(
+                    [id(tenant), samplable_model.base_model, template_kwargs],
+                    sort_keys=True,
+                )
             )
             rendered_prompt_tokens = await worker.prompt_tokens(
                 base_model=samplable_model.base_model,
@@ -493,6 +497,7 @@ class OpenAICompatibleTinkerServer:
             ) = await worker.chat_completion_and_prefixes(
                 base_model=samplable_model.base_model,
                 sample_response=sample_response,
+                parallel_tool_calls=body.get("parallel_tool_calls"),
                 model_name=body["model"],
                 prompt_tokens=prompt_tokens,
                 rendered_prompt=rendered_prompt_tokens,
@@ -707,6 +712,7 @@ class OpenAICompatibleTinkerServerWorker:
         messages: list[ChatCompletionMessageParam],
         tools: list[ChatCompletionToolUnionParam] | None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        parallel_tool_calls: bool | None = None,
     ) -> tuple[ChatCompletion, list[tuple[list[int], list[int], tuple[Any, ...]]]]:
         renderer = self._get_renderer(base_model)
         choices: list[Choice] = []
@@ -757,7 +763,10 @@ class OpenAICompatibleTinkerServerWorker:
                         )
                         if reasoning
                         else None,
-                        complete=sequence.stop_reason == "stop",
+                        complete=sequence.stop_reason == "stop"
+                        and chat_prefix_eligible(
+                            parallel_tool_calls, tools, openai_message
+                        ),
                     )
                 )
             tool_calls = (
