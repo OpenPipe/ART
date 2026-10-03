@@ -991,6 +991,7 @@ class _RankView:
                 costs,
                 gpu_available_bytes=available,
                 required_available_bytes=required_available,
+                allow_oversized=getattr(rank, "_allow_oversized_batches", False),
             )
         )
         result = []
