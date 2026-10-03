@@ -1,6 +1,7 @@
 """CPU commitments distinguish real packing changes without reading GPU values."""
 
 from dataclasses import replace
+import hashlib
 import json
 import threading
 from types import SimpleNamespace
@@ -59,6 +60,112 @@ def plan(rows, groups=None, *, tp=1):
 
 def fingerprints(value):
     return TrainerRank._packing_fingerprints(value)
+
+
+def _golden_digest(payload):
+    return hashlib.sha256(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+
+
+def _flat_golden_digest(tp, padded_tokens):
+    # Literal geometry for rows of lengths 3 and 2; do not derive the oracle
+    # from plan metadata or the production fingerprint implementation.
+    return _golden_digest(
+        (
+            "art.prefix-pack/v1",
+            (1, tp, 1, 1),
+            2,
+            (
+                (
+                    (0, 1),
+                    False,
+                    5,
+                    padded_tokens,
+                    (((0,), 0, 3, 0, 1, 1), ((1,), 0, 2, 3, 2, 2)),
+                ),
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("tp", "padded_tokens", "golden"),
+    (
+        (1, 5, "818fce443b1d8e52151f98483ac87b7d941f87d8bc874949930b0ac41b040d6d"),
+        (2, 6, "5380518577fc6e1cf9d17b6624aefee7321cac3b69f8dcdef8f632a439a8e7f0"),
+        (4, 8, "3f88443236fb1d924c0537154d1af301e3eb50495af81cbf910bc70c053b768b"),
+    ),
+)
+def test_flat_packing_fingerprint_golden_digest(tp, padded_tokens, golden):
+    expected = _flat_golden_digest(tp, padded_tokens)
+    assert expected == golden
+    actual = fingerprints(plan(((10001, 2, 3), (10002, 4)), tp=tp))
+    assert actual["packing_fingerprint_schema"] == "art.prefix-pack/v1"
+    assert actual["packing_plan_sha256"] == expected
+    assert actual["subforward_packing_plan_sha256"] == (expected,)
+    if padded_tokens != 5:
+        # Keep topology and raw length fixed: the padded length itself matters.
+        assert actual["packing_plan_sha256"] != _flat_golden_digest(tp, 5)
+
+
+def test_split_packing_fingerprint_golden_digest():
+    children = (
+        plan(((10001, 2, 3), (10002, 4)), tp=2),
+        plan(((10003, 5, 6),), tp=2),
+    )
+    mappings = ((2, 0), (1,))
+    child_digests = (
+        _flat_golden_digest(2, 6),
+        _golden_digest(
+            (
+                "art.prefix-pack/v1",
+                (1, 2, 1, 1),
+                1,
+                (((0,), False, 3, 4, (((0,), 0, 3, 0, 1, 1),)),),
+            )
+        ),
+    )
+    expected = _golden_digest(
+        (
+            "art.prefix-pack-split/v1",
+            3,
+            tuple(zip(mappings, child_digests, strict=True)),
+        )
+    )
+    assert (
+        expected == "7ca6236996a91feeacd5accff5c7fe231b697396b92bfb061383ec4fabe9334b"
+    )
+    selected = _SplitForwardPlan(children, mappings, 3)
+    actual = fingerprints(selected)
+    assert actual["packing_fingerprint_schema"] == "art.prefix-pack/v1"
+    assert actual["packing_plan_sha256"] == expected
+    assert actual["subforward_packing_plan_sha256"] == child_digests
+    assert (
+        fingerprints(replace(selected, request_count=4))["packing_plan_sha256"]
+        != actual["packing_plan_sha256"]
+    )
+
+
+@pytest.mark.parametrize("field", ("grad_enabled", "request_count", "packed_start"))
+def test_packing_fingerprint_discriminates_individual_fields(field):
+    selected = plan(((10001, 2, 3), (10002, 4)), tp=2)
+    group = selected.groups[0]
+    # Vary only the named metadata field to isolate its hash contribution.
+    if field == "grad_enabled":
+        changed = replace(selected, groups=(replace(group, grad_enabled=True),))
+    elif field == "request_count":
+        changed = replace(selected, request_count=3)
+    else:
+        first, second = group.packed.segments
+        packed = replace(
+            group.packed, segments=(first, replace(second, packed_start=4))
+        )
+        changed = replace(selected, groups=(replace(group, packed=packed),))
+    assert (
+        fingerprints(changed)["packing_plan_sha256"]
+        != fingerprints(selected)["packing_plan_sha256"]
+    )
 
 
 def test_same_aggregate_geometry_different_boundaries_and_membership():
