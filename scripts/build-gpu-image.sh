@@ -20,6 +20,8 @@ Options:
   --prewarm-timeout DUR  Timeout for the prewarm DaemonSet rollout (default: 30m)
   --tag TAG              Image tag to publish (default: latest)
   --help                 Show this help
+
+BUILDKIT_TIMEOUT_SECONDS shortens the builder's 21600-second lifetime (maximum).
 EOF
 }
 
@@ -35,6 +37,7 @@ docker_config_path="${DOCKER_CONFIG_PATH:-${HOME}/.docker/config.json}"
 buildkit_image="${BUILDKIT_IMAGE:-moby/buildkit:v0.29.0-rootless}"
 buildkit_namespace="${KUBECTL_NAMESPACE:-default}"
 buildkit_wait_timeout="${BUILDKIT_WAIT_TIMEOUT:-300s}"
+buildkit_timeout="${BUILDKIT_TIMEOUT_SECONDS:-21600}"
 no_cache="${NO_CACHE:-false}"
 prewarm_modal="${PREWARM_MODAL:-auto}"
 prewarm_nodes="${PREWARM_NODES:-true}"
@@ -138,6 +141,12 @@ if [[ "${prewarm_nodes_only}" == "true" ]]; then
   fi
   prewarm_modal=false
   prewarm_nodes=true
+fi
+
+# Match the workflow's 360-minute duration; direct callers may only shorten it.
+if [[ ! "${buildkit_timeout}" =~ ^[1-9][0-9]{0,4}$ ]] || (( buildkit_timeout > 21600 )); then
+  echo "BUILDKIT_TIMEOUT_SECONDS must be an integer from 1 to 21600" >&2
+  exit 1
 fi
 
 case "${prewarm_modal}" in
@@ -352,6 +361,18 @@ trap cleanup EXIT
 printf '%s' "${registry_auth_json_b64}" | base64 -d > "${registry_auth_json_path}"
 
 if [[ "${prewarm_nodes_only}" != "true" ]]; then
+build_deadline=$((SECONDS + buildkit_timeout))
+build_command() {
+  local remaining=$((build_deadline - SECONDS))
+  if (( remaining <= 0 )); then
+    echo "BuildKit deadline expired" >&2
+    return 124
+  fi
+  timeout --kill-after=5s "${remaining}s" "$@"
+}
+build_kubectl() {
+  build_command "${build_kubectl_cmd[@]}" "$@"
+}
 context_dir="$(mktemp -d "${TMPDIR:-/tmp}/art-gpu-build-context.XXXXXX")"
 buildkit_manifest_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-buildkit.XXXXXX")"
 build_command_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-build-command.XXXXXX")"
@@ -393,9 +414,17 @@ metadata:
     container.apparmor.security.beta.kubernetes.io/buildkitd: unconfined
 spec:
   restartPolicy: Never
+  activeDeadlineSeconds: ${buildkit_timeout}
   containers:
     - name: buildkitd
       image: ${buildkit_image}
+      # Rounded above one build sample: 1.02 CPU, 61.5 GB memory incl. cache,
+      # and 70.2 GB disk. Requests are not limits or a guarantee about peaks.
+      resources:
+        requests:
+          cpu: "2"
+          memory: "64Gi"
+          ephemeral-storage: "80Gi"
       args:
         - --oci-worker-no-process-sandbox
       readinessProbe:
@@ -416,15 +445,15 @@ spec:
       emptyDir: {}
 EOF
 
-"${kubectl_cmd[@]}" create -n "${buildkit_namespace}" -f "${buildkit_manifest_path}"
-"${kubectl_cmd[@]}" wait -n "${buildkit_namespace}" \
+build_kubectl create -n "${buildkit_namespace}" -f "${buildkit_manifest_path}"
+build_kubectl wait -n "${buildkit_namespace}" \
   --for=condition=Ready "pod/${cluster_name}" \
   --timeout="${buildkit_wait_timeout}"
-"${kubectl_cmd[@]}" exec -n "${buildkit_namespace}" "${cluster_name}" -- sh -lc \
+build_kubectl exec -n "${buildkit_namespace}" "${cluster_name}" -- sh -lc \
   'mkdir -p /home/user/.docker /tmp/build-context'
-"${kubectl_cmd[@]}" cp "${registry_auth_json_path}" \
+build_kubectl cp "${registry_auth_json_path}" \
   "${buildkit_namespace}/${cluster_name}:/home/user/.docker/config.json"
-"${kubectl_cmd[@]}" cp "${context_dir}/." \
+build_kubectl cp "${context_dir}/." \
   "${buildkit_namespace}/${cluster_name}:/tmp/build-context"
 
 cat > "${build_command_path}" <<EOF
@@ -442,10 +471,10 @@ buildctl build \
 EOF
 
 sync_build_log() {
-  if "${kubectl_cmd[@]}" cp \
+  if build_kubectl cp \
     "${buildkit_namespace}/${cluster_name}:/tmp/art-build.log" \
     "${build_log_snapshot_path}" >/dev/null 2>&1; then
-    uv run --no-project python - "${build_log_snapshot_path}" "${build_log_offset_path}" <<'PY'
+    build_command uv run --no-project python - "${build_log_snapshot_path}" "${build_log_offset_path}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -461,28 +490,37 @@ PY
   fi
 }
 
-"${kubectl_cmd[@]}" cp "${build_command_path}" \
+build_kubectl cp "${build_command_path}" \
   "${buildkit_namespace}/${cluster_name}:/tmp/art-build.sh"
-"${kubectl_cmd[@]}" exec -n "${buildkit_namespace}" "${cluster_name}" -- sh -lc '
+build_kubectl exec -n "${buildkit_namespace}" "${cluster_name}" -- sh -lc '
   chmod +x /tmp/art-build.sh
   rm -f /tmp/art-build.log /tmp/art-build.exit
   nohup sh -c '"'"'/tmp/art-build.sh >/tmp/art-build.log 2>&1; printf "%s\n" "$?" >/tmp/art-build.exit'"'"' >/tmp/art-build.nohup 2>&1 &
 '
 
 while true; do
+  if (( SECONDS >= build_deadline )); then
+    echo "BuildKit deadline expired before its exit receipt" >&2
+    exit 124
+  fi
   sync_build_log
   build_exit_code="$(
-    "${kubectl_cmd[@]}" exec -n "${buildkit_namespace}" "${cluster_name}" -- sh -lc \
+    build_kubectl exec -n "${buildkit_namespace}" "${cluster_name}" -- sh -lc \
       'if [ -f /tmp/art-build.exit ]; then sed -n 1p /tmp/art-build.exit; fi' 2>/dev/null || true
   )"
   if [[ -n "${build_exit_code}" ]]; then
-    sync_build_log
+    sync_build_log || {
+      log_exit_code=$?
+      if [[ "${build_exit_code}" != "0" ]]; then exit "${build_exit_code}"; fi
+      exit "${log_exit_code}"
+    }
     if [[ "${build_exit_code}" != "0" ]]; then
       exit "${build_exit_code}"
     fi
     break
   fi
-  sleep 10
+  remaining=$((build_deadline - SECONDS))
+  if (( remaining > 0 )); then sleep "$((remaining < 10 ? remaining : 10))"; fi
 done
 
 echo
@@ -493,7 +531,7 @@ if [[ "${pull_image_repo}" != "${image_repo}" ]]; then
   echo "  ${pull_image_repo}:${image_tag}"
 fi
 image_digest="$(
-  uv run --no-project python - "${build_log_snapshot_path}" "${image_repo}" "${image_tag}" <<'PY'
+  build_command uv run --no-project python - "${build_log_snapshot_path}" "${image_repo}" "${image_tag}" <<'PY'
 import re
 import sys
 from pathlib import Path
