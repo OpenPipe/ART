@@ -12,6 +12,7 @@ import pytest
 
 SCRIPT = Path(__file__).parents[2] / "scripts/ci/trainer_rank_api.py"
 spec = importlib.util.spec_from_file_location("api_enclosure", SCRIPT)
+assert spec is not None and spec.loader is not None
 api = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(api)
 

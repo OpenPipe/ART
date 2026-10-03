@@ -84,11 +84,12 @@ def resources(root, owner, *, delete):
 
     allocation = read_bound(root, "allocation.json", owner)
     namespace = allocation["namespace"]
-    retained = (
-        read_bound(root, "resources.json", allocation)["observed"]
-        if (root / "resources.json").exists()
-        else []
-    )
+    retained = []
+    for filename in ("resources.json", "resources-cleanup.json"):
+        if (root / filename).exists():
+            for identity in read_bound(root, filename, allocation)["observed"]:
+                if identity not in retained:
+                    retained.append(identity)
     target = root / ("resources-cleanup.json" if delete else "resources.json")
     receipt = {
         **allocation,
@@ -122,11 +123,16 @@ def resources(root, owner, *, delete):
                         "uid": metadata.uid,
                         "cloud_name": metadata.labels.get("skypilot-cluster-name"),
                     }
-                    found.append(identity)
                     if identity not in retained:
                         retained.append(identity)
                         # Retain each UID even if the next resource query fails.
                         write_json(target, receipt)
+                    if delete:
+                        version = getattr(metadata, "resource_version", None)
+                        if not isinstance(version, str) or not version:
+                            raise ValueError("Kubernetes resource version is missing")
+                        identity = {**identity, "resource_version": version}
+                    found.append(identity)
             receipt["remaining"] = found
             write_json(target, receipt)
             if delete and not found:
@@ -158,12 +164,17 @@ def resources(root, owner, *, delete):
                         item["name"],
                         namespace,
                         body=client.V1DeleteOptions(
-                            preconditions=client.V1Preconditions(uid=item["uid"])
+                            preconditions=client.V1Preconditions(
+                                uid=item["uid"],
+                                resource_version=item["resource_version"],
+                            )
                         ),
                         _request_timeout=(3, 10),
                     )
                 except client.ApiException as error:
-                    if error.status != 404:
+                    # A changed version (including a relabelled same UID) must
+                    # be observed under the nonce selector again before delete.
+                    if error.status not in {404, 409}:
                         raise
             time.sleep(1)
     finally:
@@ -184,7 +195,9 @@ def worker(root, operation):
     import sky
 
     if operation == "check":
-        sky.get(sky.check(clouds=["kubernetes"]))
+        from sky.client import sdk
+
+        sky.get(sdk.check(infra_list=("kubernetes",), verbose=False))
         return
     cluster = owner["cluster"]
     if operation == "launch":

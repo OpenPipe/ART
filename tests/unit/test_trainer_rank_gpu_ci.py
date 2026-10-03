@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 
@@ -47,6 +47,9 @@ def owner(tmp_path):
 
 @pytest.fixture
 def sky(monkeypatch):
+    def check(infra_list, verbose, workspace=None):
+        return "check-request"
+
     task = Mock()
     api = NS(
         Task=NS(from_yaml=Mock(return_value=task)),
@@ -62,6 +65,11 @@ def sky(monkeypatch):
         tail_logs=Mock(return_value=0),
     )
     monkeypatch.setitem(sys.modules, "sky", api)
+    monkeypatch.setitem(
+        sys.modules,
+        "sky.client",
+        NS(sdk=NS(check=create_autospec(check, side_effect=check))),
+    )
     monkeypatch.setitem(
         sys.modules,
         "sky.provision.kubernetes",
@@ -479,7 +487,13 @@ def get(value):
     if value == "launch-request":
         return 17, NS(cluster_name=Path(os.environ["FAKE_CLUSTER"]).read_text())
     return value
-def check(**kwargs): return "checked"
+class SDK:
+    @staticmethod
+    def check(infra_list, verbose, workspace=None):
+        assert infra_list == ("kubernetes",)
+        assert verbose is False and workspace is None
+        return "checked"
+sys.modules["sky.client"] = NS(sdk=SDK)
 def job_status(cluster, *, job_ids):
     assert job_ids == [17]
     return {17:NS(value="SUCCEEDED")}
@@ -820,6 +834,7 @@ def test_cleanup_resources_records_uids_and_confines_deletion(
         metadata=NS(
             name="pod",
             uid="original-uid",
+            resource_version="opaque:version-1",
             namespace="ci",
             labels={ci.LABEL: "peer" if foreign else owner["label"]},
         )
@@ -950,6 +965,7 @@ def kube_receipts(tmp_path, owner, monkeypatch):
         metadata=NS(
             name="physical-head",
             uid="original-uid",
+            resource_version="opaque:version-1",
             namespace="ci",
             labels={
                 ci.LABEL: owner["label"],
@@ -1154,3 +1170,162 @@ def test_unsupported_enclosure_blocks_sky_check_and_submission(
         ci.main(tmp_path)
     run.assert_not_called()
     assert not (tmp_path / "launch-attempt.json").exists()
+
+
+def test_check_uses_pinned_sdk_signature(tmp_path, owner, sky):
+    ci.worker(tmp_path, "check")
+    assert not hasattr(sky, "check")  # The pinned package does not export sdk.check.
+    sys.modules["sky.client"].sdk.check.assert_called_once_with(
+        infra_list=("kubernetes",), verbose=False
+    )
+    sky.get.assert_called_once_with("check-request")
+    sky.launch.assert_not_called()
+
+
+def test_failed_sky_check_prevents_launch(tmp_path, owner, monkeypatch):
+    run = Mock(side_effect=subprocess.CalledProcessError(1, "check"))
+    supervise = Mock()
+    monkeypatch.setattr(ci, "run_worker", run)
+    monkeypatch.setattr(ci, "supervise", supervise)
+    with pytest.raises(subprocess.CalledProcessError):
+        ci.main(tmp_path)
+    assert run.call_args.args[1] == "check"
+    supervise.assert_not_called()
+    assert not (tmp_path / "launch-attempt.json").exists()
+
+
+@pytest.mark.parametrize("state", ["relabelled", "absent", "replaced"])
+def test_failed_cleanup_uids_survive_retry(tmp_path, owner, kube_receipts, state):
+    api, pod, error = kube_receipts
+    initial = {
+        "kind": "pod",
+        "name": "earlier-pod",
+        "uid": "earlier-uid",
+        "cloud_name": None,
+    }
+    ci.write_json(
+        tmp_path / "resources.json", {**owner, "namespace": "ci", "observed": [initial]}
+    )
+    api.list_namespaced_service.side_effect = OSError("interrupted census")
+    with pytest.raises(OSError, match="interrupted census"):
+        ci.worker(tmp_path, "remove_resources")
+    # This later UID only exists in the failed cleanup receipt. It no longer
+    # appears under the nonce label on retry, so an exact name/UID read is needed.
+    api.list_namespaced_service.side_effect = None
+    api.list_namespaced_pod.return_value = NS(items=[])
+
+    def read(name, namespace, **kwargs):
+        if name == initial["name"] or state == "absent":
+            raise error(404)
+        assert name == pod.metadata.name
+        return NS(
+            metadata=NS(
+                name=name,
+                namespace=namespace,
+                uid=pod.metadata.uid if state == "relabelled" else "new-uid",
+            )
+        )
+
+    api.read_namespaced_pod.side_effect = read
+    if state == "relabelled":
+        with pytest.raises(ValueError, match="absence is unproven"):
+            ci.worker(tmp_path, "remove_resources")
+    else:
+        ci.worker(tmp_path, "remove_resources")
+    receipt = ci.read_bound(tmp_path, "resources-cleanup.json", owner)
+    assert {item["uid"] for item in receipt["observed"]} == {
+        "earlier-uid",
+        pod.metadata.uid,
+    }
+    assert receipt["exact_uid_absence"] == (
+        "UNKNOWN" if state == "relabelled" else "ABSENT"
+    )
+    assert {call.args[0] for call in api.read_namespaced_pod.call_args_list} == {
+        initial["name"],
+        pod.metadata.name,
+    }
+    api.delete_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.parametrize("relabel", [False, True])
+def test_delete_recensuses_version_conflict_and_preserves_relabelled_uid(
+    tmp_path, owner, kube_receipts, monkeypatch, relabel
+):
+    api, pod, error = kube_receipts
+    state = {"present": True, "changed": False}
+    deleted = []
+    api.list_namespaced_pod.side_effect = lambda *a, **k: NS(
+        items=[pod]
+        if state["present"] and pod.metadata.labels[ci.LABEL] == owner["label"]
+        else []
+    )
+
+    def services(*args, **kwargs):
+        if not state["changed"]:
+            state["changed"] = True
+            pod.metadata.resource_version = "opaque:version-2"
+            if relabel:
+                pod.metadata.labels[ci.LABEL] = "peer"
+        return NS(items=[])
+
+    api.list_namespaced_service.side_effect = services
+
+    def delete(name, namespace, *, body, **kwargs):
+        assert body.preconditions.uid == pod.metadata.uid
+        version = getattr(body.preconditions, "resource_version", None)
+        if version is not None and version != pod.metadata.resource_version:
+            raise error(409)
+        deleted.append(pod.metadata.labels[ci.LABEL])
+        state["present"] = False
+
+    api.delete_namespaced_pod.side_effect = delete
+
+    def read(*args, **kwargs):
+        if not state["present"]:
+            raise error(404)
+        return pod
+
+    api.read_namespaced_pod.side_effect = read
+    monkeypatch.setattr(ci.time, "sleep", lambda _: None)
+    try:
+        ci.worker(tmp_path, "remove_resources")
+    except ValueError:
+        assert relabel
+    if relabel:
+        assert deleted == [], "same UID was deleted after its ownership label changed"
+        assert state["present"]
+    else:
+        assert deleted == [owner["label"]]
+        assert (
+            api.delete_namespaced_pod.call_count == 2
+        )  # Conflict, then fresh version.
+    assert api.list_namespaced_pod.call_count >= 2
+
+
+@pytest.mark.parametrize("version", [None, "", 7])
+def test_cleanup_requires_opaque_nonempty_resource_version(
+    tmp_path, owner, kube_receipts, version
+):
+    api, pod, _ = kube_receipts
+    pod.metadata.resource_version = version
+    with pytest.raises(ValueError, match="version is missing"):
+        ci.worker(tmp_path, "remove_resources")
+    api.delete_namespaced_pod.assert_not_called()
+    # Losing a deletion precondition must not erase the already observed UID.
+    receipt = ci.read_bound(tmp_path, "resources-cleanup.json", owner)
+    assert receipt["observed"][0]["uid"] == pod.metadata.uid
+    assert receipt["exact_uid_absence"] == "UNKNOWN"
+
+
+def test_cleanup_rejects_foreign_retained_history_before_census(
+    tmp_path, owner, kube_receipts
+):
+    api, _, _ = kube_receipts
+    ci.write_json(
+        tmp_path / "resources-cleanup.json",
+        {**owner, "namespace": "peer", "observed": []},
+    )
+    with pytest.raises(ValueError, match="Wrong CI identity"):
+        ci.worker(tmp_path, "remove_resources")
+    api.list_namespaced_pod.assert_not_called()
+    api.delete_namespaced_pod.assert_not_called()
