@@ -346,7 +346,11 @@ def _group_head_workspace_bytes(
     component. Pair each group's mode with its own projected rows.
     """
     dense = self._head_workspace_bytes(rows)
-    fallback = 0
+    fallback = extra = 0
+    if dense and self._topology_key()[1] > 1:
+        # A chunk whose statistics kernel fails after an attempt runs the
+        # bounded eager statistics: the kernel path's buffers plus this.
+        extra = _eager_stats_extra_bytes(_head_vocabulary(self), rows)
     if (
         dense
         and self._topology_key()[1] > 1
@@ -385,7 +389,7 @@ def _group_head_workspace_bytes(
         or not grad_enabled
         or not any(request.target_tokens is not None for request in requests)
     ):
-        return max(dense, fallback)
+        return max(dense + extra, fallback)
     if _head_target_backward(self):
         # IndexBackward's dense result overlaps saved logits and grad_logits.
         # The FP32 fallback already exceeds this three-buffer component.
@@ -398,8 +402,26 @@ def _group_head_workspace_bytes(
             if any(request.logits or request.top_k is not None for request in requests)
             else dense
         )
-        return max(dense, 3 * target_dense, fallback)
-    return max(dense, fallback)
+        return max(dense + extra, 3 * target_dense + extra, fallback)
+    return max(dense + extra, fallback)
+
+
+def _eager_stats_extra_bytes(vocabulary: int, rows: int) -> int:
+    """The bounded eager statistics' live increment over the kernel path for a
+    ``rows`` x ``vocabulary`` head chunk (``_impl._EagerLocalStats``): one FP32
+    row sub-chunk, plus per-row FP32 maxima, sums and their gradient."""
+    rows = min(rows, _impl._HEAD_CHUNK_TOKENS)
+    step = -(-rows // _impl._EAGER_STATS_SUBCHUNKS)
+    return 4 * vocabulary * step + 16 * rows
+
+
+def _frozen_head_bytes(vocabulary: int, rows: int, target_rows: int, tp: int) -> int:
+    """Replay's head charge from frozen facts (kernel-path waves only; capture
+    declines the eager fallback): as ``_group_head_workspace_bytes``."""
+    return max(
+        _dense_head_bytes(vocabulary, rows),
+        3 * _dense_head_bytes(vocabulary, target_rows),
+    ) + (_eager_stats_extra_bytes(vocabulary, rows) if tp > 1 and rows else 0)
 
 
 def _head_fallback_bytes(self: TrainerRank, low: int, high: int) -> int:

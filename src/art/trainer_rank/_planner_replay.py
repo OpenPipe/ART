@@ -653,12 +653,11 @@ class ReplayRank(_impl.TrainerRank):
         if arguments.get("hybridep_growth_bytes", 0):
             raise ValueError("hybridep_runtime_facts_unsupported")
         head = max(
-            max(
-                _memory._dense_head_bytes(facts["head_vocabulary"], g["head_rows"]),
-                3
-                * _memory._dense_head_bytes(
-                    facts["head_vocabulary"], g["head_target_rows"]
-                ),
+            _memory._frozen_head_bytes(
+                facts["head_vocabulary"],
+                g["head_rows"],
+                g["head_target_rows"],
+                self._topology_key()[1],
             )
             for g in groups
         )

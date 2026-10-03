@@ -439,6 +439,11 @@ def test_the_tp2_head_stage_is_priced_with_the_floor():
     assert cost.checkpoint_workspace == head + COLD
 
 
+# The bounded eager statistics' increment for a 512-row, 124,160-entry chunk:
+# one 8-row FP32 sub-chunk plus per-row statistics (3,981,312 bytes).
+BOUNDED = 4 * 124_160 * 8 + 16 * 512
+
+
 def _labelled(rows):
     """One CPU request whose ``rows`` positions are all labelled targets."""
     tokens = torch.zeros(rows, dtype=torch.long)
@@ -466,7 +471,8 @@ def test_the_tp2_head_stage_follows_the_statistics_path(monkeypatch):
     # FP32 fallback, about seven BF16 buffers.
     assert _head_stage(r, _labelled(512)) == 7 * dense
     monkeypatch.setattr(_impl, "_triton_head_stats", lambda rank, rows, vocab: True)
-    assert _head_stage(r, _labelled(512)) == 3 * dense
+    # The kernel path, plus the bounded fallback's increment should it fail.
+    assert _head_stage(r, _labelled(512)) == 3 * dense + BOUNDED
     monkeypatch.setenv("ART_TRAINER_RANK_TRITON_TOPK", "0")
     assert not _impl._triton_stats_enabled(True, 512)
     monkeypatch.delenv("ART_TRAINER_RANK_TRITON_TOPK")
@@ -482,10 +488,11 @@ def test_the_tp2_head_stage_follows_the_statistics_path(monkeypatch):
         (1_023, "512", 7 * 511 * 124_160 * 2, True),  # 888,240,640 bytes
         # Schulman: an 812-row wave's 300-row eager tail.
         (812, "512", 7 * 300 * 124_160 * 2, True),  # 521,472,000 bytes
-        # The default threshold (64): every chunk runs Triton.
-        (1_023, None, 3 * 512 * 124_160 * 2, False),  # 381,419,520 bytes
+        # The default threshold (64): every chunk runs Triton (381,419,520
+        # bytes), or the bounded statistics should a kernel fail.
+        (1_023, None, 3 * 512 * 124_160 * 2 + BOUNDED, False),
         # A 40-row default tail falls back, below the full chunk's charge.
-        (552, None, 3 * 512 * 124_160 * 2, True),
+        (552, None, 3 * 512 * 124_160 * 2 + BOUNDED, True),
     ],
 )
 def test_every_head_chunk_is_priced_for_its_own_statistics_path(
@@ -532,7 +539,11 @@ def _positioned(*positions):
     [
         # Sol: two 812-row requests sharing 600 positions, a 1,024-row union
         # of two kernel chunks; one request alone has a 300-row eager tail.
-        (range(812), [*range(600), *range(812, 1024)], 3 * 512 * 124_160 * 2),
+        (
+            range(812),
+            [*range(600), *range(812, 1024)],
+            3 * 512 * 124_160 * 2 + BOUNDED,
+        ),
         # Two 512-row requests sharing 212 positions: their no-sharing sum is
         # two kernel chunks, but the 812-row union has a 300-row eager tail.
         (range(512), [*range(212), *range(512, 812)], 7 * 300 * 124_160 * 2),
@@ -563,7 +574,7 @@ def test_head_bounds_envelope_every_possible_projected_union(
 
 
 def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
-    from art.trainer_rank import _impl
+    from art.trainer_rank import _impl, _memory
 
     r = _cuda_head(monkeypatch, vocabulary=16)  # an 8-entry vocabulary shard
 
@@ -593,7 +604,12 @@ def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
             )
 
     def priced(rows):
-        return _head_stage(r, _labelled(rows)) // r._head_workspace_bytes(rows)
+        """The head charge in chunk buffers, less the bounded increment."""
+        charge = _head_stage(r, _labelled(rows))
+        if charge >= 7 * r._head_workspace_bytes(rows):
+            return 7
+        bounded = _memory._eager_stats_extra_bytes(8, rows)
+        return (charge - bounded) // r._head_workspace_bytes(rows)
 
     # A fused top-k failure recovered by the Triton logsumexp: no fallback.
     statistics(512, top_k=False, logsumexp=True, max_top_k=4)
@@ -678,6 +694,16 @@ def test_a_failed_kernel_falls_back_within_the_kernel_buffers(monkeypatch):
     with _LiveBytes() as backward:
         (gradient,) = torch.autograd.grad((log_z * weights).sum(), logits)
     assert backward.peak <= buffer + buffer / 16
+    # The priced TP2 head charge for this chunk shape (1,000-entry shard)
+    # covers the measured live set on both paths: forward, the logits plus
+    # the forward increment; backward, the logits, the target gather's dense
+    # gradient and the backward increment.
+    r = _cuda_head(monkeypatch, vocabulary=2_000)
+    targets = _labelled(512)
+    trained = r._group_head_workspace_bytes(512, targets, grad_enabled=True)
+    assert trained >= buffer + buffer + backward.peak
+    inference = r._group_head_workspace_bytes(512, targets, grad_enabled=False)
+    assert inference >= buffer + forward.peak
     # The unchunked FP32 fallback, for contrast: about six buffers in forward.
     with _LiveBytes() as unchunked:
         reference = _impl._vocab_parallel_log_z(logits)
@@ -719,6 +745,18 @@ def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failur
     assert torch.equal(top_k[0], torch.topk(logits.float(), 4, dim=-1).values)
     # The shape is recorded for later admissions and replay.
     assert (512, 1_000) in r._triton_head_stats_failures
+
+
+def test_replay_prices_the_tp2_head_stage_as_live_admission(monkeypatch):
+    from art.trainer_rank import _memory
+
+    r = _cuda_head(monkeypatch)  # kernel path: capture declines the fallback
+    for rows, grad in ((512, True), (512, False), (300, True)):
+        requests = _labelled(rows)
+        live = r._group_head_workspace_bytes(rows, requests, grad_enabled=grad)
+        # Capture's target rows: the projection, for target-only backward.
+        target_rows = rows if grad else 0
+        assert _memory._frozen_head_bytes(124_160, rows, target_rows, 2) == live
 
 
 def test_replay_declines_tp_sp_adapter_estimates_without_ranks():
