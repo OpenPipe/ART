@@ -5730,11 +5730,22 @@ class TrainerRank:
                 if topk_stats is None
                 else None
             )
-            stats = topk_stats if topk_stats is not None else logsumexp_stats
             shape = (int(local_logits.shape[0]), int(local_logits.shape[1]))
-            if stats is not None:
+            if topk_stats is not None or logsumexp_stats is not None:
                 # A kernel ran at this chunk shape: admission may price it.
                 getattr(self, "_triton_head_stats_failures", set()).discard(shape)
+            elif _triton_stats_enabled(local_logits.is_cuda, shape[0]):
+                # An attempted kernel failed at this chunk shape. Admission
+                # priced the kernel's buffers, so compute the same statistics
+                # eagerly within them; later admissions price the shape for
+                # the eager fallback (_triton_head_stats) until a kernel
+                # succeeds at it again.
+                if not hasattr(self, "_triton_head_stats_failures"):
+                    self._triton_head_stats_failures = set()
+                self._triton_head_stats_failures.add(shape)
+                logsumexp_stats = _eager_local_logsumexp_stats(local_logits)
+            stats = topk_stats if topk_stats is not None else logsumexp_stats
+            if stats is not None:
                 local_max, local_sum = stats[:2]
                 local_max = local_max.detach()
                 global_max = _all_reduce_tensor_parallel_max(local_max)
@@ -5743,13 +5754,8 @@ class TrainerRank:
                 )
                 log_z = global_max + torch.log(global_sum)
             else:
-                if _triton_stats_enabled(local_logits.is_cuda, shape[0]):
-                    # An attempted kernel failed at this chunk shape: admission
-                    # prices it for the eager fallback (_triton_head_stats)
-                    # until a kernel succeeds at that shape again.
-                    if not hasattr(self, "_triton_head_stats_failures"):
-                        self._triton_head_stats_failures = set()
-                    self._triton_head_stats_failures.add(shape)
+                # No kernel attempted (non-CUDA, disabled, short chunk):
+                # admission prices this FP32 fallback's seven buffers.
                 log_z = _vocab_parallel_log_z(local_logits)
 
             if topk_stats is not None:
@@ -6934,6 +6940,62 @@ def _vocab_parallel_topk_from_local(
         logprobs=top_values - log_z.unsqueeze(1),
         tokens=tokens.gather(1, top_offsets),
     )
+
+
+# Row sub-chunks per head chunk for the bounded eager statistics: one FP32
+# sub-chunk is 1/32 of a BF16 chunk buffer.
+_EAGER_STATS_SUBCHUNKS = 64
+
+
+class _EagerLocalStats(torch.autograd.Function):
+    """The statistics kernel's (local max, local sum) contract, computed eagerly.
+
+    Row sub-chunks keep one FP32 sub-chunk beside the BF16 logits in forward,
+    and beside the logits and their BF16 gradient in backward: the kernel
+    path's buffers (topk._LocalStatsFunction) plus 1/32 of one, instead of
+    the unchunked fallback's seven. Rows are independent, so sub-chunking
+    changes no per-row value.
+    """
+
+    @staticmethod
+    def forward(ctx: Any, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = int(logits.shape[0])
+        step = max(1, -(-rows // _EAGER_STATS_SUBCHUNKS))
+        local_max = logits.max(dim=-1).values.float()
+        local_sum = torch.empty_like(local_max)
+        for start in range(0, rows, step):
+            block = logits[start : start + step].float()
+            block.sub_(local_max[start : start + step, None]).exp_()
+            local_sum[start : start + step] = block.sum(dim=-1)
+            del block
+        ctx.save_for_backward(logits, local_max)
+        ctx.step = step
+        return local_max, local_sum
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        # As the kernel: the local max is a detached shift; only the sum
+        # carries a gradient, exp(logits - local max) per row.
+        _grad_local_max, grad_local_sum = grad_outputs
+        logits, local_max = ctx.saved_tensors
+        grad = torch.empty_like(logits)
+        if grad_local_sum is None:
+            return grad.zero_()
+        rows, step = int(logits.shape[0]), int(ctx.step)
+        for start in range(0, rows, step):
+            block = logits[start : start + step].float()
+            block.sub_(local_max[start : start + step, None]).exp_()
+            block.mul_(grad_local_sum[start : start + step, None])
+            grad[start : start + step] = block
+            del block
+        return grad
+
+
+def _eager_local_logsumexp_stats(
+    local_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    stats = _EagerLocalStats.apply(local_logits)
+    return cast(tuple[torch.Tensor, torch.Tensor], stats)
 
 
 def _vocab_parallel_log_z(local_logits: torch.Tensor) -> torch.Tensor:

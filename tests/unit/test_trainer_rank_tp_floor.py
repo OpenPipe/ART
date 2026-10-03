@@ -610,6 +610,117 @@ def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
     assert priced(64) == 3
 
 
+class _LiveBytes:
+    """Peak bytes of new CPU tensor storage created inside the context."""
+
+    def __enter__(self):
+        import weakref
+
+        from torch.utils._python_dispatch import TorchDispatchMode
+        from torch.utils._pytree import tree_leaves
+
+        owner = self
+        self.current = self.peak = 0
+        live: set[int] = set()
+
+        def free(pointer, size):
+            live.discard(pointer)
+            owner.current -= size
+
+        class Mode(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                out = func(*args, **(kwargs or {}))
+                inputs = {
+                    t.untyped_storage().data_ptr()
+                    for t in tree_leaves((args, kwargs))
+                    if isinstance(t, torch.Tensor)
+                }
+                for t in tree_leaves(out):
+                    if not isinstance(t, torch.Tensor):
+                        continue
+                    pointer = t.untyped_storage().data_ptr()
+                    size = t.untyped_storage().nbytes()
+                    # Views and in-place results reuse an input's storage.
+                    if not size or pointer in inputs or pointer in live:
+                        continue
+                    live.add(pointer)
+                    owner.current += size
+                    owner.peak = max(owner.peak, owner.current)
+                    weakref.finalize(t, free, pointer, size)
+                return out
+
+        self._mode = Mode()
+        self._mode.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        self._mode.__exit__(*exc)
+
+
+def test_a_failed_kernel_falls_back_within_the_kernel_buffers(monkeypatch):
+    """Admission priced the statistics kernel (three BF16 chunk buffers at the
+    head stage: logits, their gradient and the target gather's dense
+    gradient). The bounded eager statistics add one FP32 row sub-chunk to
+    the logits in forward, and to the logits and their gradient in backward;
+    the unchunked fallback adds six buffers in forward."""
+    from art.trainer_rank import _impl
+
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+    torch.manual_seed(0)
+    logits = torch.randn(512, 1_000, dtype=torch.bfloat16, requires_grad=True)
+    buffer = 512 * 1_000 * 2  # one BF16 chunk buffer (D)
+    with _LiveBytes() as forward:
+        local_max, local_sum = _impl._eager_local_logsumexp_stats(logits)
+        log_z = local_max.detach() + torch.log(local_sum)
+    assert forward.peak <= buffer / 16
+    weights = torch.randn(512)
+    with _LiveBytes() as backward:
+        (gradient,) = torch.autograd.grad((log_z * weights).sum(), logits)
+    assert backward.peak <= buffer + buffer / 16
+    # The unchunked FP32 fallback, for contrast: about six buffers in forward.
+    with _LiveBytes() as unchunked:
+        reference = _impl._vocab_parallel_log_z(logits)
+    assert unchunked.peak >= 4 * buffer
+    # Rows are independent: the same values and gradients.
+    (expected,) = torch.autograd.grad((reference * weights).sum(), logits)
+    assert torch.equal(log_z, reference)
+    assert torch.allclose(gradient.float(), expected.float(), rtol=1e-2, atol=1e-6)
+
+
+def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failure(
+    monkeypatch,
+):
+    from art.trainer_rank import _impl
+
+    torch.manual_seed(1)
+    r = _cuda_head(monkeypatch, vocabulary=2_000)
+    logits = torch.randn(512, 1_000, dtype=torch.bfloat16)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+    reference = _impl._vocab_parallel_log_z(logits)
+    monkeypatch.setattr(
+        TrainerRank, "_local_logits_from_hidden_rows", lambda *a, **k: logits
+    )
+    # An attempted kernel (as on CUDA) that fails, fused top-k and logsumexp.
+    monkeypatch.setattr(_impl, "_triton_stats_enabled", lambda cuda, rows: True)
+    monkeypatch.setattr(_impl, "_try_triton_local_topk_stats", lambda *a, **k: None)
+    monkeypatch.setattr(_impl, "_try_triton_stats", lambda *a, **k: None)
+
+    def unchunked(_logits):
+        raise AssertionError("the unchunked FP32 fallback ran after an attempt")
+
+    monkeypatch.setattr(_impl, "_vocab_parallel_log_z", unchunked)
+    _, log_z, top_k = r._local_head_stats(
+        None, logits, output_weight=None, need_log_z=True, max_top_k=4
+    )
+    assert torch.equal(log_z, reference)
+    assert top_k is not None
+    assert torch.equal(top_k[0], torch.topk(logits.float(), 4, dim=-1).values)
+    # The shape is recorded for later admissions and replay.
+    assert (512, 1_000) in r._triton_head_stats_failures
+
+
 def test_replay_declines_tp_sp_adapter_estimates_without_ranks():
     from art.trainer_rank._planner_misses import _adapter_ranks_unavailable
 
