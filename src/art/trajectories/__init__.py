@@ -1452,7 +1452,16 @@ _CompactValidated: TypeAlias = Union[CompactDumpable, list[CompactDumpable]]
 
 
 def compact_memory[T](value: T) -> T:
-    """Deduplicate equal strings in a supported object graph in place."""
+    """Explicitly share strings in a caller-owned graph, returning the same object.
+
+    This mutates supported models and builtin containers. Call only when aliases
+    outside this graph do not depend on string identity or mutable hash state.
+    Reachable hashable models and opaque hashed members conservatively leave the
+    whole graph unchanged. Unsupported objects and container subclasses are opaque;
+    arbitrary hidden hash dependencies cannot be discovered without user callbacks.
+    Immutable container identities, cycles, dictionary order and values are retained.
+    ART does not call this function automatically during pickle.
+    """
 
     _intern_string_graph(value)
     return value
