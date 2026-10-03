@@ -362,13 +362,16 @@ printf '%s' "${registry_auth_json_b64}" | base64 -d > "${registry_auth_json_path
 
 if [[ "${prewarm_nodes_only}" != "true" ]]; then
 build_deadline=$((SECONDS + buildkit_timeout))
-build_kubectl() {
+build_command() {
   local remaining=$((build_deadline - SECONDS))
   if (( remaining <= 0 )); then
     echo "BuildKit deadline expired" >&2
     return 124
   fi
-  timeout --kill-after=5s "${remaining}s" "${build_kubectl_cmd[@]}" "$@"
+  timeout --kill-after=5s "${remaining}s" "$@"
+}
+build_kubectl() {
+  build_command "${build_kubectl_cmd[@]}" "$@"
 }
 context_dir="$(mktemp -d "${TMPDIR:-/tmp}/art-gpu-build-context.XXXXXX")"
 buildkit_manifest_path="$(mktemp "${TMPDIR:-/tmp}/art-gpu-buildkit.XXXXXX")"
@@ -471,7 +474,7 @@ sync_build_log() {
   if build_kubectl cp \
     "${buildkit_namespace}/${cluster_name}:/tmp/art-build.log" \
     "${build_log_snapshot_path}" >/dev/null 2>&1; then
-    uv run --no-project python - "${build_log_snapshot_path}" "${build_log_offset_path}" <<'PY'
+    build_command uv run --no-project python - "${build_log_snapshot_path}" "${build_log_offset_path}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -506,7 +509,11 @@ while true; do
       'if [ -f /tmp/art-build.exit ]; then sed -n 1p /tmp/art-build.exit; fi' 2>/dev/null || true
   )"
   if [[ -n "${build_exit_code}" ]]; then
-    sync_build_log
+    sync_build_log || {
+      log_exit_code=$?
+      if [[ "${build_exit_code}" != "0" ]]; then exit "${build_exit_code}"; fi
+      exit "${log_exit_code}"
+    }
     if [[ "${build_exit_code}" != "0" ]]; then
       exit "${build_exit_code}"
     fi

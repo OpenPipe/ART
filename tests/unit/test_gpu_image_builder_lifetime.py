@@ -46,8 +46,8 @@ elif 'cp' in args:
         pathlib.Path(args[-1]).write_text('#1 pushing manifest for registry.invalid/art:latest@sha256:'+'a'*64+' 0.1s done\n')
 elif 'exec' in args:
     if '/tmp/art-build.exit' in args[-1] and args[-1].startswith('if '):
-        if mode == 'success': print('0')
-        elif mode == 'failed': print('42')
+        if mode in ('success', 'processor_hang', 'final_processor_hang'): print('0')
+        elif mode in ('failed', 'failed_final_processor_hang'): print('42')
         elif mode != 'pending': raise AssertionError(mode)
 elif 'get' in args:
     selector = args[args.index('-l')+1]
@@ -63,7 +63,21 @@ else:
     )
     kubectl.chmod(0o755)
     uv = bin_dir / "uv"
-    uv.write_text(f'#!/bin/sh\nshift 3\nexec {sys.executable} "$@"\n')
+    uv.write_text(
+        f"#!{sys.executable}\n"
+        + r"""
+import os, pathlib, sys, time
+root = pathlib.Path(os.environ['FAKE_BUILD_ROOT'])
+if len(sys.argv) > 6 and 'art-gpu-build-log.' in sys.argv[5]:
+    counter = root/'processor-calls'
+    count = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(count))
+    mode = os.environ.get('FAKE_BUILD_MODE')
+    if mode == 'processor_hang' or (mode in ('final_processor_hang', 'failed_final_processor_hang') and count == 2):
+        time.sleep(60)
+os.execv(sys.executable, [sys.executable, *sys.argv[4:]])
+"""
+    )
     uv.chmod(0o755)
     for name in ("gh", "curl", "docker", "sky"):
         deny = bin_dir / name
@@ -166,3 +180,25 @@ def test_builder_preserves_build_failure_and_cleanup(builder):
     result = run(FAKE_BUILD_MODE="failed")
     assert result.returncode == 42, result.stderr
     assert not (root / "pod.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mode,code,calls",
+    [
+        ("processor_hang", 124, 1),
+        ("final_processor_hang", 124, 2),
+        ("failed_final_processor_hang", 42, 2),
+    ],
+)
+def test_builder_bounds_log_processor_and_preserves_known_failure(
+    builder, mode, code, calls
+):
+    root, run = builder
+    result = run(BUILDKIT_TIMEOUT_SECONDS="3", FAKE_BUILD_MODE=mode)
+    assert result.returncode == code, result.stderr
+    assert int((root / "processor-calls").read_text()) == calls
+    assert not (root / "pod.json").exists()
+    assert (
+        json.loads((root / "cleanup/trap-builder.json").read_text())["outcome"]
+        == "ABSENT"
+    )
