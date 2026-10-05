@@ -1447,12 +1447,6 @@ wheels = [
 ]
 
 [[package]]
-name = "datrie"
-version = "0.8.3"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/51/0b/c0f53a14317b304e2e93b29a831b0c83306caae9af7f0e2e037d17c4f63f/datrie-0.8.3.tar.gz", hash = "sha256:ea021ad4c8a8bf14e08a71c7872a622aa399a510f981296825091c7ca0436e80", size = 499040, upload-time = "2025-08-28T12:37:23.227Z" }
-
-[[package]]
 name = "debugpy"
 version = "1.8.20"
 source = { registry = "https://pypi.org/simple" }
@@ -4457,7 +4451,6 @@ tensors = [
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-12-openpipe-art-backend-cu130' or extra == 'extra-12-openpipe-art-distributed-cu130' or extra == 'extra-12-openpipe-art-megatron-cu130' or (extra == 'extra-12-openpipe-art-backend' and extra == 'extra-12-openpipe-art-megatron') or (extra == 'extra-12-openpipe-art-megatron' and extra == 'extra-12-openpipe-art-tinker') or (extra != 'extra-12-openpipe-art-backend' and extra != 'extra-12-openpipe-art-distributed' and extra != 'extra-12-openpipe-art-megatron' and extra != 'extra-12-openpipe-art-tinker')" },
 ]
 tinker = [
-    { name = "datrie" },
     { name = "fastapi" },
     { name = "huggingface-hub" },
     { name = "numpy" },
@@ -4507,7 +4500,6 @@ requires-dist = [
     { name = "bitsandbytes", marker = "extra == 'backend'", specifier = ">=0.45.2,!=0.50.0" },
     { name = "bitsandbytes", marker = "extra == 'backend-cu130'", specifier = ">=0.45.2,!=0.50.0" },
     { name = "cloudpickle", specifier = ">=3.1.1" },
-    { name = "datrie", marker = "extra == 'tinker'", specifier = ">=0.8.3" },
     { name = "duckdb", marker = "extra == 'backend'", specifier = ">=1.0.0" },
     { name = "duckdb", marker = "extra == 'backend-cu130'", specifier = ">=1.0.0" },
     { name = "fastapi", marker = "extra == 'tinker'", specifier = ">=0.128.0" },
