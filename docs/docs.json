@@ -76,7 +76,8 @@
         "group": "Integrations",
         "pages": [
           "integrations/langgraph-integration",
-          "integrations/openenv-integration"
+          "integrations/openenv-integration",
+          "integrations/skypilot-integration"
         ]
       },
       {
