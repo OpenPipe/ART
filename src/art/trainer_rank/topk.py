@@ -6,8 +6,16 @@ import torch
 import triton
 import triton.language as tl
 
-type LocalTopKStats = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-type LocalLogSumExpStats = tuple[torch.Tensor, torch.Tensor]
+# (local max, local sum, top-k values, top-k tokens)
+type _KernelStats = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+# (local max, local sum, top-k values, top-k tokens, target logits)
+type LocalTopKStats = tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]
+# (local max, local sum, target logits)
+type LocalLogSumExpStats = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+# (rows, local columns): -1 marks a target this vocabulary shard does not own.
+type LocalTargets = tuple[torch.Tensor, torch.Tensor]
 
 
 @triton.jit
@@ -125,6 +133,9 @@ def _stats_backward_kernel(
     tokens_ptr,
     grad_sum_ptr,
     grad_values_ptr,
+    target_offsets_ptr,
+    target_tokens_ptr,
+    target_grads_ptr,
     grad_logits_ptr,
     stride_row: tl.constexpr,
     vocab_size: tl.constexpr,
@@ -149,22 +160,44 @@ def _stats_backward_kernel(
         value_grad = tl.load(grad_values_ptr + row * k + slot).to(tl.float32)
         grad += tl.where(offsets == token, value_grad, 0.0)
 
+    # Gathered target logits, grouped by row: their gradients join the softmax
+    # gradient in FP32, before the single store in the logits' dtype.
+    target_start = tl.load(target_offsets_ptr + row)
+    target_end = tl.load(target_offsets_ptr + row + 1)
+    for index in range(target_start, target_end):
+        token = tl.load(target_tokens_ptr + index)
+        target_grad = tl.load(target_grads_ptr + index)
+        grad += tl.where(offsets == token, target_grad, 0.0)
+
     tl.store(grad_logits_ptr + row * stride_row + offsets, grad, mask=mask)
 
 
 class _LocalStatsFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, local_logits: torch.Tensor, k: int):
+    def forward(
+        ctx,
+        local_logits: torch.Tensor,
+        k: int,
+        target_rows: torch.Tensor,
+        target_columns: torch.Tensor,
+    ):
         local_max, local_sum, values, tokens = _local_stats_forward(local_logits, k=k)
-        ctx.save_for_backward(local_logits, local_max, tokens)
+        target_logits = _gather_target_logits(
+            local_logits, (target_rows, target_columns)
+        )
+        ctx.save_for_backward(
+            local_logits, local_max, tokens, target_rows, target_columns
+        )
         ctx.k = k
-        return local_max, local_sum, values, tokens
+        return local_max, local_sum, values, tokens, target_logits
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
-        grad_local_max, grad_local_sum, grad_values, grad_tokens = grad_outputs
+        grad_local_max, grad_local_sum, grad_values, grad_tokens, grad_targets = (
+            grad_outputs
+        )
         del grad_local_max, grad_tokens
-        logits, local_max, tokens = ctx.saved_tensors
+        logits, local_max, tokens, target_rows, target_columns = ctx.saved_tensors
         k = int(ctx.k)
         rows = int(logits.shape[0])
         vocab_size = int(logits.shape[1])
@@ -179,6 +212,22 @@ class _LocalStatsFunction(torch.autograd.Function):
                 device=logits.device,
                 dtype=torch.float32,
             )
+        if grad_targets is None:
+            grad_targets = torch.zeros(
+                target_rows.shape, device=logits.device, dtype=torch.float32
+            )
+        # Group the targets by row (CSR): row r's are [offsets[r], offsets[r + 1]).
+        order = torch.argsort(target_rows, stable=True)
+        target_offsets = torch.searchsorted(
+            target_rows[order],
+            torch.arange(rows + 1, device=logits.device, dtype=target_rows.dtype),
+        )
+        target_tokens = target_columns[order]
+        target_grads = grad_targets[order].float()
+        if not int(order.numel()):
+            # The kernel loads no target, but its pointers must be allocated.
+            target_tokens = target_tokens.new_full((1,), -1)
+            target_grads = target_grads.new_zeros((1,))
 
         grad_logits = torch.empty_like(logits)
         _stats_backward_kernel[(rows, n_blocks)](
@@ -187,6 +236,9 @@ class _LocalStatsFunction(torch.autograd.Function):
             tokens,
             grad_local_sum.contiguous(),
             grad_values.contiguous(),
+            target_offsets,
+            target_tokens,
+            target_grads,
             grad_logits,
             logits.stride(0),
             vocab_size=vocab_size,  # ty: ignore[invalid-argument-type]
@@ -194,7 +246,18 @@ class _LocalStatsFunction(torch.autograd.Function):
             block_v=block_v,  # ty: ignore[invalid-argument-type]
             num_warps=8,  # ty: ignore[unknown-argument]
         )
-        return grad_logits, None
+        return grad_logits, None, None, None
+
+
+def _gather_target_logits(logits: torch.Tensor, targets: LocalTargets) -> torch.Tensor:
+    rows, columns = targets
+    values = logits[rows, columns.clamp(min=0)].float()
+    return values.masked_fill(columns < 0, 0.0)
+
+
+def _no_targets(logits: torch.Tensor) -> LocalTargets:
+    empty = torch.empty(0, dtype=torch.long, device=logits.device)
+    return empty, empty
 
 
 def _check_local_logits(local_logits: torch.Tensor) -> torch.Tensor:
@@ -207,7 +270,7 @@ def _check_local_logits(local_logits: torch.Tensor) -> torch.Tensor:
     return local_logits.contiguous()
 
 
-def _local_stats_forward(local_logits: torch.Tensor, *, k: int) -> LocalTopKStats:
+def _local_stats_forward(local_logits: torch.Tensor, *, k: int) -> _KernelStats:
     logits = _check_local_logits(local_logits)
     if k < 0 or k > int(local_logits.shape[1]):
         raise ValueError(
@@ -267,17 +330,32 @@ def _local_stats_forward(local_logits: torch.Tensor, *, k: int) -> LocalTopKStat
     return local_max, local_sum, values, tokens
 
 
-def local_topk_stats(local_logits: torch.Tensor, *, k: int) -> LocalTopKStats:
+def local_topk_stats(
+    local_logits: torch.Tensor,
+    *,
+    k: int,
+    targets: LocalTargets | None = None,
+) -> LocalTopKStats:
+    """Local softmax statistics, top-k and FP32 target logits for ``[rows, vocab]``.
+
+    A target logit's gradient is added to the softmax gradient in FP32 inside
+    the backward, so the logits receive one gradient store.
+    """
     logits = local_logits.contiguous()
+    if targets is None:
+        targets = _no_targets(logits)
     if not logits.requires_grad:
-        return _local_stats_forward(logits, k=k)
-    return _LocalStatsFunction.apply(logits, k)
+        stats = _local_stats_forward(logits, k=k)
+        return *stats, _gather_target_logits(logits, targets)
+    return _LocalStatsFunction.apply(logits, k, *targets)
 
 
-def local_logsumexp_stats(local_logits: torch.Tensor) -> LocalLogSumExpStats:
-    logits = local_logits.contiguous()
-    if not logits.requires_grad:
-        local_max, local_sum, _, _ = _local_stats_forward(logits, k=0)
-        return local_max, local_sum
-    local_max, local_sum, _, _ = _LocalStatsFunction.apply(logits, 0)
-    return local_max, local_sum
+def local_logsumexp_stats(
+    local_logits: torch.Tensor,
+    *,
+    targets: LocalTargets | None = None,
+) -> LocalLogSumExpStats:
+    local_max, local_sum, _, _, target_logits = local_topk_stats(
+        local_logits, k=0, targets=targets
+    )
+    return local_max, local_sum, target_logits

@@ -47,7 +47,7 @@ def test_ignored_cross_request_overlap_and_validity_have_separate_roles(extra):
 
 
 @pytest.mark.parametrize("extra", [{"logits": True}, {"top_k": 2}])
-def test_actual_ignored_mixed_backward_keeps_zero_dense_index_graph(monkeypatch, extra):
+def test_actual_ignored_mixed_backward_keeps_zero_target_gradients(monkeypatch, extra):
     monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", 4)
     monkeypatch.setattr(_impl, "_language_model", lambda model: model)
     monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda x: x)
@@ -63,35 +63,22 @@ def test_actual_ignored_mixed_backward_keeps_zero_dense_index_graph(monkeypatch,
             values[:, :k] - log_z[:, None], tokens[:, :k]
         ),
     )
-    original = _impl._vocab_parallel_target_logprobs
-    dense_backward = []
+    original = _impl._target_logprobs
+    target_backward = []
     normalizer_backward = []
 
-    def target_path(logits, labels, log_z, *, row_offsets):
+    def target_path(target_logits, labels, log_z):
         assert (labels == -100).all()
-        log_z.register_hook(
-            lambda grad: normalizer_backward.append(
-                (tuple(grad.shape), bool((grad == 0).all()))
+        for tensor, record in (
+            (target_logits, target_backward),
+            (log_z, normalizer_backward),
+        ):
+            tensor.register_hook(
+                lambda grad, record=record: record.append(bool((grad == 0).all()))
             )
-        )
-        output = original(logits, labels, log_z, row_offsets=row_offsets)
-        queue = [output.grad_fn]
-        seen = set()
-        while queue:
-            node = queue.pop()
-            if node is None or node in seen:
-                continue
-            seen.add(node)
-            if type(node).__name__.startswith("IndexBackward"):
-                node.register_hook(
-                    lambda inputs, outputs: dense_backward.append(
-                        (tuple(inputs[0].shape), bool((inputs[0] == 0).all()))
-                    )
-                )
-            queue.extend(next_node for next_node, _ in node.next_functions)
-        return output
+        return original(target_logits, labels, log_z)
 
-    monkeypatch.setattr(_impl, "_vocab_parallel_target_logprobs", target_path)
+    monkeypatch.setattr(_impl, "_target_logprobs", target_path)
     generator = torch.Generator().manual_seed(79)
     hidden = torch.randn(8, 5, generator=generator, requires_grad=True)
     weight = torch.randn(17, 5, generator=generator)
@@ -127,7 +114,6 @@ def test_actual_ignored_mixed_backward_keeps_zero_dense_index_graph(monkeypatch,
     assert model.output_layer.weight.grad is not None and bool(
         (model.output_layer.weight.grad == 0).all()
     )
-    assert dense_backward and all(
-        shape == (4, 17) and zero for shape, zero in dense_backward
-    )
-    assert normalizer_backward and all(zero for _, zero in normalizer_backward)
+    # Both chunks' ignored targets run the target backward, with zeros.
+    assert target_backward == [True, True]
+    assert normalizer_backward == [True, True]

@@ -169,7 +169,7 @@ def test_eager_exp_boundary_has_four_distinct_cpu_dense_storages(
     monkeypatch.setattr(torch.Tensor, "float", as_float)
     monkeypatch.setattr(torch, "exp", exp)
     with torch.set_grad_enabled(grad):
-        actual = _impl._vocab_parallel_log_z(logits)
+        actual, _ = _impl._vocab_parallel_log_z(logits)
     assert observed == [7 * rows * 17 * 2]
     torch.testing.assert_close(actual, torch.logsumexp(original_float(logits), dim=-1))
     if grad:
@@ -187,9 +187,9 @@ def test_group_stats_cover_logits_chunks_before_short_target_tail(
     original = _impl._vocab_parallel_log_z
     calls = []
 
-    def log_z(logits):
+    def log_z(logits, targets):
         calls.append(tuple(logits.shape))
-        return original(logits)
+        return original(logits, targets)
 
     monkeypatch.setattr(_impl, "_vocab_parallel_log_z", log_z)
     model = SimpleNamespace(

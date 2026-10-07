@@ -162,14 +162,15 @@ def test_actual_mixed_projection_preserves_target_outputs_and_backward(
             values[:, :k] - log_z[:, None], tokens[:, :k]
         ),
     )
-    original = _impl._vocab_parallel_target_logprobs
+    original = TrainerRank._local_head_stats
     calls = []
 
-    def target_path(logits, labels, log_z, *, row_offsets):
-        calls.append((tuple(logits.shape), labels.tolist(), row_offsets.tolist()))
-        return original(logits, labels, log_z, row_offsets=row_offsets)
+    def head_stats(self, model, hidden, *, targets=None, **kwargs):
+        if targets is not None:
+            calls.append((int(hidden.shape[0]), targets[0].unique().tolist()))
+        return original(self, model, hidden, targets=targets, **kwargs)
 
-    monkeypatch.setattr(_impl, "_vocab_parallel_target_logprobs", target_path)
+    monkeypatch.setattr(TrainerRank, "_local_head_stats", head_stats)
     generator = torch.Generator().manual_seed(97)
     hidden = torch.randn(13, 5, generator=generator, dtype=torch.float64)
     weights = torch.randn(17, 5, generator=generator, dtype=torch.float64)
@@ -226,5 +227,6 @@ def test_actual_mixed_projection_preserves_target_outputs_and_backward(
     after = run(True)
     for a, b in zip(after, before, strict=True):
         torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)
-    assert any(shape == (4, 17) and len(rows) < 4 for shape, _, rows in calls)
+    # A mixed 4-row chunk gathers the targets of fewer rows.
+    assert any(chunk == 4 and len(rows) < 4 for chunk, rows in calls)
     assert all(value.isfinite().all() and value.abs().sum() > 0 for value in after)

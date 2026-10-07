@@ -5659,15 +5659,37 @@ class TrainerRank:
             range(0, int(rows.numel()), _HEAD_CHUNK_TOKENS)
         ):
             chunk_rows = rows[start : start + _HEAD_CHUNK_TOKENS]
+            selections = []
+            for offsets, row_offsets, bounds in row_matches:
+                begin, finish = bounds[chunk_index : chunk_index + 2]
+                selections.append(
+                    (offsets[begin:finish], row_offsets[begin:finish] - start)
+                )
+            chunk_labels = [
+                labels.index_select(0, offsets)
+                if labels is not None
+                and item_logprobs is not None
+                and int(offsets.numel())
+                else None
+                for (offsets, _), labels, item_logprobs in zip(
+                    selections, label_rows, target_logprobs, strict=True
+                )
+            ]
             # Recompute vocabulary-sized intermediates one chunk at a time in
             # backward; chunking alone otherwise retains every chunk's logits.
-            local_logits, log_z, local_topk = self._checkpointed_head_stats(
-                model,
-                _select_positions(hidden_by_row, chunk_rows),
-                output_weight=output_weight,
-                need_log_z=need_log_z,
-                max_top_k=max_top_k,
+            local_logits, log_z, local_topk, target_logits = (
+                self._checkpointed_head_stats(
+                    model,
+                    _select_positions(hidden_by_row, chunk_rows),
+                    output_weight=output_weight,
+                    need_log_z=need_log_z,
+                    max_top_k=max_top_k,
+                    targets=_chunk_targets(selections, chunk_labels),
+                )
             )
+            if target_logits is not None:
+                target_logits = _all_reduce_tensor_parallel_sum(target_logits)
+            target_start = 0
             logit_start, logit_end = logit_bounds[chunk_index : chunk_index + 2]
             logit_chunk_offsets = logit_rows[logit_start:logit_end] - start
             chunk_logits: torch.Tensor | None = None
@@ -5680,10 +5702,7 @@ class TrainerRank:
                 ).squeeze(0)
 
             for index, item in enumerate(items):
-                offsets, row_offsets, bounds = row_matches[index]
-                begin, finish = bounds[chunk_index : chunk_index + 2]
-                offsets = offsets[begin:finish]
-                chunk_offsets = row_offsets[begin:finish] - start
+                offsets, chunk_offsets = selections[index]
                 if int(offsets.numel()) == 0:
                     continue
                 item_logits = logits[index]
@@ -5694,35 +5713,26 @@ class TrainerRank:
                         0,
                         torch.searchsorted(logit_chunk_offsets, chunk_offsets),
                     )
-                labels = label_rows[index]
+                labels = chunk_labels[index]
                 item_logprobs = target_logprobs[index]
                 if item_logprobs is not None and labels is not None:
-                    if log_z is None:
+                    if log_z is None or target_logits is None:
                         raise RuntimeError("target logprobs require logsumexp")
-                    selected_log_z = log_z.index_select(0, chunk_offsets)
-                    item_logprobs[offsets] = _vocab_parallel_target_logprobs(
-                        local_logits,
-                        labels.index_select(0, offsets),
-                        selected_log_z,
-                        row_offsets=chunk_offsets,
+                    target_end = target_start + int(labels.numel())
+                    item_logprobs[offsets] = _target_logprobs(
+                        target_logits[target_start:target_end],
+                        labels,
+                        log_z.index_select(0, chunk_offsets),
                     )
+                    target_start = target_end
                 k = item.request.top_k
                 if k is not None:
-                    if log_z is None:
+                    if log_z is None or local_topk is None:
                         raise RuntimeError("top_k requires logsumexp")
                     selected_log_z = log_z.index_select(0, chunk_offsets)
-                    if local_topk is not None:
-                        local_values, local_tokens = local_topk
-                        selected_values = local_values.index_select(0, chunk_offsets)
-                        selected_tokens = local_tokens.index_select(0, chunk_offsets)
-                    else:
-                        selected_logits = local_logits.index_select(0, chunk_offsets)
-                        selected_values, selected_tokens = torch.topk(
-                            selected_logits.float(),
-                            k=min(k, int(selected_logits.shape[1])),
-                            dim=-1,
-                        )
-                        del selected_logits
+                    local_values, local_tokens = local_topk
+                    selected_values = local_values.index_select(0, chunk_offsets)
+                    selected_tokens = local_tokens.index_select(0, chunk_offsets)
                     values = _vocab_parallel_topk_from_local(
                         selected_values,
                         selected_tokens,
@@ -5746,10 +5756,12 @@ class TrainerRank:
         output_weight: torch.Tensor | None,
         need_log_z: bool,
         max_top_k: int,
+        targets: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
         tuple[torch.Tensor, torch.Tensor] | None,
+        torch.Tensor | None,
     ]:
         """One chunk's head statistics under non-reentrant checkpointing.
 
@@ -5766,6 +5778,7 @@ class TrainerRank:
             output_weight=output_weight,
             need_log_z=need_log_z,
             max_top_k=max_top_k,
+            targets=targets,
             path=[],
             use_reentrant=False,
         )
@@ -5778,12 +5791,23 @@ class TrainerRank:
         output_weight: torch.Tensor | None,
         need_log_z: bool,
         max_top_k: int,
+        targets: tuple[torch.Tensor, torch.Tensor] | None = None,
         path: list[str] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
         tuple[torch.Tensor, torch.Tensor] | None,
+        torch.Tensor | None,
     ]:
+        """Local logits, log-normalizer, local top-k and FP32 target logits.
+
+        ``targets`` holds (chunk row, label) pairs. Every statistics path
+        gathers their logits, and any top-k values, inside its autograd
+        function: in backward their gradients join the softmax gradient in
+        FP32 before one store in the logits' dtype. Gathered separately, both
+        terms would round to BF16 first, and the target's ``p - 1`` would
+        cancel to zero once ``p`` rounds to one.
+        """
         local_logits = self._local_logits_from_hidden_rows(
             model,
             hidden,
@@ -5791,19 +5815,36 @@ class TrainerRank:
         )
         log_z: torch.Tensor | None = None
         local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
+        target_logits: torch.Tensor | None = None
         if need_log_z:
             # ``path`` holds the forward's statistics path; a checkpoint
             # recompute replays it rather than attempting the kernels again.
             recorded = path[0] if path else None
+            gathered = _local_targets(local_logits, targets)
             topk_stats = (
-                _try_triton_local_topk_stats(local_logits, k=max_top_k)
+                _try_triton_local_topk_stats(
+                    local_logits, k=max_top_k, targets=gathered
+                )
                 if recorded in (None, "topk")
                 else None
             )
+            topk_tokens: torch.Tensor | None = None
+            if topk_stats is None and max_top_k > 0:
+                # The fused kernel did not select the top-k: select tokens
+                # here and gather their values with the targets.
+                with torch.no_grad():
+                    topk_tokens = torch.topk(
+                        local_logits,
+                        k=min(max_top_k, int(local_logits.shape[1])),
+                        dim=-1,
+                    ).indices
+                gathered = _with_topk_targets(gathered, topk_tokens)
             logsumexp_stats = (
                 cast(
-                    tuple[torch.Tensor, torch.Tensor] | None,
-                    _try_triton_stats("local_logsumexp_stats", local_logits),
+                    tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+                    _try_triton_stats(
+                        "local_logsumexp_stats", local_logits, targets=gathered
+                    ),
                 )
                 if topk_stats is None and recorded in (None, "logsumexp")
                 else None
@@ -5822,7 +5863,9 @@ class TrainerRank:
                     if not hasattr(self, "_triton_head_stats_failures"):
                         self._triton_head_stats_failures = set()
                     self._triton_head_stats_failures.add(shape)
-                    logsumexp_stats = _eager_local_logsumexp_stats(local_logits)
+                    logsumexp_stats = _eager_local_logsumexp_stats(
+                        local_logits, gathered
+                    )
                     recorded = "bounded"
                 if path is not None:
                     path.append(
@@ -5836,7 +5879,7 @@ class TrainerRank:
                         )
                     )
             elif recorded == "bounded":
-                logsumexp_stats = _eager_local_logsumexp_stats(local_logits)
+                logsumexp_stats = _eager_local_logsumexp_stats(local_logits, gathered)
             elif recorded in ("topk", "logsumexp") and (
                 topk_stats is None and logsumexp_stats is None
             ):
@@ -5847,6 +5890,7 @@ class TrainerRank:
             stats = topk_stats if topk_stats is not None else logsumexp_stats
             if stats is not None:
                 local_max, local_sum = stats[:2]
+                gathered_logits = stats[-1]
                 local_max = local_max.detach()
                 global_max = _all_reduce_tensor_parallel_max(local_max)
                 global_sum = _all_reduce_tensor_parallel_sum(
@@ -5856,16 +5900,18 @@ class TrainerRank:
             else:
                 # No kernel attempted (non-CUDA, disabled, short chunk):
                 # admission prices this FP32 fallback's seven buffers.
-                log_z = _vocab_parallel_log_z(local_logits)
+                log_z, gathered_logits = _vocab_parallel_log_z(local_logits, gathered)
 
+            target_count = 0 if targets is None else int(targets[0].numel())
+            if targets is not None:
+                target_logits = gathered_logits[:target_count]
             if topk_stats is not None:
-                _, _, local_values, local_tokens = topk_stats
+                _, _, local_values, local_tokens, _ = topk_stats
                 local_topk = (local_values, local_tokens)
-            elif logsumexp_stats is not None and max_top_k > 0:
-                local_k = min(max_top_k, int(local_logits.shape[1]))
-                local_values, local_tokens = torch.topk(local_logits, k=local_k, dim=-1)
-                local_topk = (local_values.float(), local_tokens)
-        return local_logits, log_z, local_topk
+            elif topk_tokens is not None:
+                local_values = gathered_logits[target_count:]
+                local_topk = (local_values.reshape(topk_tokens.shape), topk_tokens)
+        return local_logits, log_z, local_topk, target_logits
 
     def _local_logits_from_hidden_rows(
         self,
@@ -6873,30 +6919,63 @@ def _validate_custom_optimizer_state(
         )
 
 
-def _vocab_parallel_target_logprobs(
+def _chunk_targets(
+    selections: Sequence[tuple[torch.Tensor, torch.Tensor]],
+    labels: Sequence[torch.Tensor | None],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """(chunk row, label) pairs of every item's labels on a head chunk.
+
+    Items follow in order, each row's labels (``labels.reshape(rows, -1)``)
+    in row-major order, so each item's target logits are one contiguous run.
+    """
+    pair_rows, pair_labels = [], []
+    for (_, chunk_offsets), item_labels in zip(selections, labels, strict=True):
+        if item_labels is None:
+            continue
+        flat = item_labels.reshape(int(item_labels.shape[0]), -1)
+        pair_rows.append(chunk_offsets.reshape(-1, 1).expand_as(flat).reshape(-1))
+        pair_labels.append(flat.reshape(-1))
+    if not pair_rows:
+        return None
+    return torch.cat(pair_rows), torch.cat(pair_labels)
+
+
+def _local_targets(
     local_logits: torch.Tensor,
+    targets: tuple[torch.Tensor, torch.Tensor] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(chunk row, local column) pairs; column -1 for an ignored (-100) label or
+    one in another tensor-parallel rank's vocabulary shard."""
+    if targets is None:
+        empty = torch.empty(0, dtype=torch.long, device=local_logits.device)
+        return empty, empty
+    rows, labels = targets
+    start, _ = _vocab_range(local_logits)
+    columns = labels - start
+    owned = (labels != -100) & (columns >= 0) & (columns < int(local_logits.shape[1]))
+    return rows, columns.masked_fill(~owned, -1)
+
+
+def _with_topk_targets(
+    targets: tuple[torch.Tensor, torch.Tensor],
+    tokens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``targets`` followed by every row's local top-k ``tokens``, row-major."""
+    rows = torch.arange(int(tokens.shape[0]), device=tokens.device)
+    return (
+        torch.cat((targets[0], rows.repeat_interleave(int(tokens.shape[1])))),
+        torch.cat((targets[1], tokens.reshape(-1))),
+    )
+
+
+def _target_logprobs(
+    target_logits: torch.Tensor,
     labels: torch.Tensor,
     log_z: torch.Tensor,
-    *,
-    row_offsets: torch.Tensor,
 ) -> torch.Tensor:
-    start, _ = _vocab_range(local_logits)
-    flat_labels = labels.reshape(int(labels.shape[0]), -1)
-    local_labels = flat_labels - start
-    owns_label = (
-        (flat_labels != -100)
-        & (local_labels >= 0)
-        & (local_labels < int(local_logits.shape[1]))
-    )
-    rows = row_offsets.reshape(-1, 1).expand_as(flat_labels)
-    target_logits = local_logits[
-        rows,
-        local_labels.clamp(0, int(local_logits.shape[1]) - 1),
-    ].float()
-    target_logits = target_logits.masked_fill(~owns_label, 0.0).reshape(labels.shape)
-    target_logits = _all_reduce_tensor_parallel_sum(target_logits)
+    target_logits = target_logits.reshape(labels.shape)
     log_z = log_z.reshape(int(log_z.shape[0]), *((1,) * (int(labels.ndim) - 1)))
-    return (target_logits.float() - log_z).masked_fill(labels == -100, 0.0)
+    return (target_logits - log_z).masked_fill(labels == -100, 0.0)
 
 
 def _anchor_disconnected_outputs(
@@ -6929,17 +7008,20 @@ def _try_triton_local_topk_stats(
     local_logits: torch.Tensor,
     *,
     k: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    targets: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     if k <= 0 or k > int(
         os.environ.get("ART_TRAINER_RANK_TRITON_FUSED_TOPK_MAX", "10")
     ):
         return None
     return cast(
-        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        | None,
         _try_triton_stats(
             "local_topk_stats",
             local_logits,
             k=min(k, int(local_logits.shape[1])),
+            targets=targets,
         ),
     )
 
@@ -7053,7 +7135,8 @@ _EAGER_STATS_SUBCHUNKS = 64
 
 
 class _EagerLocalStats(torch.autograd.Function):
-    """The statistics kernel's (local max, local sum) contract, computed eagerly.
+    """The statistics kernel's (local max, local sum, target logits) contract,
+    computed eagerly.
 
     The logits are processed in up to ``_EAGER_STATS_SUBCHUNKS`` row sub-chunks
     of ceil(rows / 64) rows each through one owned FP32 work buffer, beside
@@ -7066,7 +7149,12 @@ class _EagerLocalStats(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx: Any, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        ctx: Any,
+        logits: torch.Tensor,
+        target_rows: torch.Tensor,
+        target_columns: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         rows = int(logits.shape[0])
         step = max(1, -(-rows // _EAGER_STATS_SUBCHUNKS))
         local_max = logits.max(dim=-1).values.float()
@@ -7083,19 +7171,20 @@ class _EagerLocalStats(torch.autograd.Function):
             block.sub_(local_max[start:stop, None]).exp_()
             local_sum[start:stop] = block.sum(dim=-1)
         del work
-        ctx.save_for_backward(logits, local_max)
+        target_logits = _gather_target_logits(logits, target_rows, target_columns)
+        ctx.save_for_backward(logits, local_max, target_rows, target_columns)
         ctx.step = step
-        return local_max, local_sum
+        return local_max, local_sum, target_logits
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
-        # As the kernel: the local max is a detached shift; only the sum
-        # carries a gradient, exp(logits - local max) per row.
-        _grad_local_max, grad_local_sum = grad_outputs
-        logits, local_max = ctx.saved_tensors
+        # As the kernel: the local max is a detached shift; the sum carries
+        # exp(logits - local max) per row, each target logit its own gradient.
+        _grad_local_max, grad_local_sum, grad_targets = grad_outputs
+        logits, local_max, target_rows, target_columns = ctx.saved_tensors
         grad = torch.empty_like(logits)
-        if grad_local_sum is None:
-            return grad.zero_()
+        if grad_local_sum is None and grad_targets is None:
+            return grad.zero_(), None, None
         rows, step = int(logits.shape[0]), int(ctx.step)
         work = torch.empty(
             (min(step, rows), int(logits.shape[1])),
@@ -7105,28 +7194,111 @@ class _EagerLocalStats(torch.autograd.Function):
         for start in range(0, rows, step):
             stop = min(start + step, rows)
             block = work[: stop - start]
-            block.copy_(logits[start:stop])  # owned: the saved logits stay intact
-            block.sub_(local_max[start:stop, None]).exp_()
-            block.mul_(grad_local_sum[start:stop, None])
+            if grad_local_sum is None:
+                block.zero_()
+            else:
+                block.copy_(logits[start:stop])  # owned: the saved logits stay intact
+                block.sub_(local_max[start:stop, None]).exp_()
+                block.mul_(grad_local_sum[start:stop, None])
+            if grad_targets is not None:
+                _add_target_gradients(
+                    block, start, target_rows, target_columns, grad_targets
+                )
             grad[start:stop] = block
         del work
-        return grad
+        return grad, None, None
 
 
 def _eager_local_logsumexp_stats(
     local_logits: torch.Tensor,
+    targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if targets is None:
+        targets = _local_targets(local_logits, None)
+    stats = _EagerLocalStats.apply(local_logits, *targets)
+    return cast(tuple[torch.Tensor, torch.Tensor, torch.Tensor], stats)
+
+
+class _LocalExpSum(torch.autograd.Function):
+    """The unchunked FP32 fallback's (global max, local exp sum, target logits).
+
+    Forward keeps the fallback's FP32 copy, subtraction and exponential
+    (admission prices its seven buffers). Backward forms the sum's gradient,
+    exp(logits - global max) per row, in one owned FP32 buffer, adds each
+    target logit's gradient there and stores once in the logits' dtype.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        logits: torch.Tensor,
+        target_rows: torch.Tensor,
+        target_columns: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        values = logits.float()
+        global_max = _all_reduce_tensor_parallel_max(values.max(dim=-1).values)
+        local_sum = _local_vocab_exp_sum(values, global_max)
+        target_logits = _gather_target_logits(values, target_rows, target_columns)
+        ctx.save_for_backward(logits, global_max, target_rows, target_columns)
+        ctx.mark_non_differentiable(global_max)
+        return global_max, local_sum, target_logits
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        _grad_global_max, grad_local_sum, grad_targets = grad_outputs
+        logits, global_max, target_rows, target_columns = ctx.saved_tensors
+        grad = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
+        if grad_local_sum is None:
+            grad.zero_()
+        else:
+            grad.copy_(logits)  # owned: FP32 logits stay intact
+            grad.sub_(global_max[:, None]).exp_().mul_(grad_local_sum[:, None])
+        if grad_targets is not None:
+            _add_target_gradients(grad, 0, target_rows, target_columns, grad_targets)
+        return grad.to(logits.dtype), None, None
+
+
+def _vocab_parallel_log_z(
+    local_logits: torch.Tensor,
+    targets: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    stats = _EagerLocalStats.apply(local_logits)
-    return cast(tuple[torch.Tensor, torch.Tensor], stats)
-
-
-def _vocab_parallel_log_z(local_logits: torch.Tensor) -> torch.Tensor:
-    local_logits = local_logits.float()
-    local_max = local_logits.max(dim=-1).values.detach()
-    global_max = _all_reduce_tensor_parallel_max(local_max)
-    local_sum = _local_vocab_exp_sum(local_logits, global_max)
+    """The FP32 fallback's log-normalizer and FP32 target logits (``targets``
+    holds chunk rows and local columns, as ``_local_targets`` returns)."""
+    if targets is None:
+        targets = _local_targets(local_logits, None)
+    global_max, local_sum, target_logits = _LocalExpSum.apply(local_logits, *targets)
     global_sum = _all_reduce_tensor_parallel_sum(local_sum)
-    return global_max + torch.log(global_sum)
+    return global_max + torch.log(global_sum), target_logits
+
+
+def _gather_target_logits(
+    logits: torch.Tensor,
+    rows: torch.Tensor,
+    columns: torch.Tensor,
+) -> torch.Tensor:
+    values = logits[rows, columns.clamp(min=0)].float()
+    return values.masked_fill(columns < 0, 0.0)
+
+
+def _add_target_gradients(
+    block: torch.Tensor,
+    start: int,
+    rows: torch.Tensor,
+    columns: torch.Tensor,
+    gradients: torch.Tensor,
+) -> None:
+    """Accumulate target logits' gradients into ``block``, an FP32 gradient
+    of the logits rows from ``start``; other rows' and unowned (-1) targets
+    add nothing."""
+    if not int(rows.numel()):
+        return
+    local = rows - start
+    selected = (columns >= 0) & (local >= 0) & (local < int(block.shape[0]))
+    block.index_put_(
+        (local.clamp(0, int(block.shape[0]) - 1), columns.clamp(min=0)),
+        gradients.float().masked_fill(~selected, 0.0),
+        accumulate=True,
+    )
 
 
 def _local_vocab_exp_sum(

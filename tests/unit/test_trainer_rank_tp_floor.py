@@ -581,7 +581,10 @@ def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
     def statistics(rows, *, top_k, logsumexp, max_top_k=0):
         """Run one head chunk's statistics with the given kernel outcomes."""
         logits = torch.zeros(rows, 8)
-        stats = (torch.zeros(rows), torch.ones(rows))
+
+        def stats(*args, targets, **kwargs):
+            return torch.zeros(rows), torch.ones(rows), logits[targets].float()
+
         with monkeypatch.context() as patch:
             patch.setattr(
                 TrainerRank, "_local_logits_from_hidden_rows", lambda *a, **k: logits
@@ -591,14 +594,20 @@ def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
             patch.setattr(
                 _impl,
                 "_try_triton_local_topk_stats",
-                lambda *a, **k: stats if top_k else None,
+                lambda *a, **k: stats(*a, **k) if top_k else None,
             )
             patch.setattr(
-                _impl, "_try_triton_stats", lambda *a, **k: stats if logsumexp else None
+                _impl,
+                "_try_triton_stats",
+                lambda *a, **k: stats(*a, **k) if logsumexp else None,
             )
             patch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
             patch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
-            patch.setattr(_impl, "_vocab_parallel_log_z", lambda t: t[:, 0].float())
+            patch.setattr(
+                _impl,
+                "_vocab_parallel_log_z",
+                lambda t, targets: (t[:, 0].float(), t[targets].float()),
+            )
             r._local_head_stats(
                 None, logits, output_weight=None, need_log_z=True, max_top_k=max_top_k
             )
@@ -687,7 +696,7 @@ def test_a_failed_kernel_falls_back_within_the_kernel_buffers(monkeypatch):
     logits = torch.randn(512, 1_000, dtype=torch.bfloat16, requires_grad=True)
     buffer = 512 * 1_000 * 2  # one BF16 chunk buffer (D)
     with _LiveBytes() as forward:
-        local_max, local_sum = _impl._eager_local_logsumexp_stats(logits)
+        local_max, local_sum, _ = _impl._eager_local_logsumexp_stats(logits)
         log_z = local_max.detach() + torch.log(local_sum)
     assert forward.peak <= buffer / 16
     weights = torch.randn(512)
@@ -706,7 +715,7 @@ def test_a_failed_kernel_falls_back_within_the_kernel_buffers(monkeypatch):
     assert inference >= buffer + forward.peak
     # The unchunked FP32 fallback, for contrast: about six buffers in forward.
     with _LiveBytes() as unchunked:
-        reference = _impl._vocab_parallel_log_z(logits)
+        reference, _ = _impl._vocab_parallel_log_z(logits)
     assert unchunked.peak >= 4 * buffer
     # Rows are independent: the same values and gradients.
     (expected,) = torch.autograd.grad((reference * weights).sum(), logits)
@@ -724,13 +733,13 @@ def test_the_bounded_statistics_never_write_fp32_logits(monkeypatch):
     torch.manual_seed(2)
     logits = torch.randn(512, 1_000, dtype=torch.float32, requires_grad=True)
     original = logits.detach().clone()
-    local_max, local_sum = _impl._eager_local_logsumexp_stats(logits)
+    local_max, local_sum, _ = _impl._eager_local_logsumexp_stats(logits)
     log_z = local_max.detach() + torch.log(local_sum)
     assert torch.equal(logits.detach(), original)
     weights = torch.randn(512)
     (gradient,) = torch.autograd.grad((log_z * weights).sum(), logits)
     assert torch.equal(logits.detach(), original)
-    reference = _impl._vocab_parallel_log_z(logits)
+    reference, _ = _impl._vocab_parallel_log_z(logits)
     (expected,) = torch.autograd.grad((reference * weights).sum(), logits)
     assert torch.allclose(log_z, reference, rtol=1e-6, atol=1e-6)
     assert torch.allclose(gradient, expected, rtol=1e-5, atol=1e-7)
@@ -746,7 +755,7 @@ def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failur
     logits = torch.randn(512, 1_000, dtype=torch.bfloat16)
     monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
     monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
-    reference = _impl._vocab_parallel_log_z(logits)
+    reference, _ = _impl._vocab_parallel_log_z(logits)
     monkeypatch.setattr(
         TrainerRank, "_local_logits_from_hidden_rows", lambda *a, **k: logits
     )
@@ -755,11 +764,11 @@ def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failur
     monkeypatch.setattr(_impl, "_try_triton_local_topk_stats", lambda *a, **k: None)
     monkeypatch.setattr(_impl, "_try_triton_stats", lambda *a, **k: None)
 
-    def unchunked(_logits):
+    def unchunked(_logits, _targets):
         raise AssertionError("the unchunked FP32 fallback ran after an attempt")
 
     monkeypatch.setattr(_impl, "_vocab_parallel_log_z", unchunked)
-    _, log_z, top_k = r._local_head_stats(
+    _, log_z, top_k, _ = r._local_head_stats(
         None, logits, output_weight=None, need_log_z=True, max_top_k=4
     )
     assert torch.equal(log_z, reference)
@@ -847,19 +856,18 @@ class _ShapeChangingKernel(torch.autograd.Function):
     paths (as the real kernel's top-k tokens do)."""
 
     @staticmethod
-    def forward(ctx, logits):
+    def forward(ctx, logits, target_rows, target_columns):
         local_max = logits.max(dim=-1).values.float()
         local_sum = torch.exp(logits.float() - local_max[:, None]).sum(dim=-1)
         ctx.save_for_backward(logits, local_max, torch.empty(logits.shape[0], 0))
-        return local_max, local_sum
+        return local_max, local_sum, logits[target_rows, target_columns].float()
 
     @staticmethod
     def backward(ctx, *grad_outputs):
-        _grad_max, grad_sum = grad_outputs
+        _grad_max, grad_sum, _grad_targets = grad_outputs
         logits, local_max, _ = ctx.saved_tensors
-        return (torch.exp(logits.float() - local_max[:, None]) * grad_sum[:, None]).to(
-            logits.dtype
-        )
+        gradient = torch.exp(logits.float() - local_max[:, None]) * grad_sum[:, None]
+        return gradient.to(logits.dtype), None, None
 
 
 @pytest.mark.parametrize("forward_fails", [True, False])
@@ -887,11 +895,13 @@ def test_a_checkpoint_recompute_replays_the_forward_statistics_path(
         # The first attempt (the forward) fails or succeeds; later ones flip.
         attempts.append(name)
         succeeds = (len(attempts) > 1) == forward_fails
-        return _ShapeChangingKernel.apply(logits) if succeeds else None
+        if not succeeds:
+            return None
+        return _ShapeChangingKernel.apply(logits, *kwargs["targets"])
 
     monkeypatch.setattr(_impl, "_try_triton_stats", kernel)
     hidden = torch.randn(64, 16, requires_grad=True)
-    _, log_z, _ = r._checkpointed_head_stats(
+    _, log_z, _, _ = r._checkpointed_head_stats(
         None, hidden, output_weight=None, need_log_z=True, max_top_k=0
     )
     if forward_fails:
