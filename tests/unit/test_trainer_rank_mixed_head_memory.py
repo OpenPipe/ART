@@ -49,7 +49,7 @@ def test_sparse_target_prices_its_full_mixed_chunk_and_short_tail(extra):
         == 7 * dense
     )
     # Optional eager demand is not an unconditional rejection lower bound.
-    for positions, expected in ((full, 3 * dense), (tail, dense)):
+    for positions, expected in ((full, 2 * dense), (tail, dense)):
         assert (
             r._group_head_workspace_bytes(
                 512, req, grad_enabled=True, positions=positions, lower_bound=True

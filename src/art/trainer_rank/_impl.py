@@ -3359,11 +3359,12 @@ class TrainerRank:
     ) -> int:
         """Largest projected chunk reached by labelled rows, or row bounds.
 
-        Mixed outputs do not remove target backward. Its dense indexing result
-        spans the whole projected chunk, including rows requested only as logits
-        or top-k. Ignored labels still execute backward if another output
-        projects their rows. Without a layout, valid rows give a rejection lower
-        bound; possible overlap with any labelled request gives capacity.
+        Mixed outputs do not remove target backward. Its saved logits and
+        gradient span the whole projected chunk, including rows requested only
+        as logits or top-k. Ignored labels still execute backward if another
+        output projects their rows. Without a layout, valid rows give a
+        rejection lower bound; possible overlap with any labelled request gives
+        capacity.
         """
         targets = tuple(
             replace(request, logits=False, top_k=None) for request in requests
@@ -6372,7 +6373,7 @@ _PACKED_PRICED_MIXES = frozenset({"target:single", "inactive"})
 # copies, positions, row-match vectors, saved masks and the caller's loss saves
 # and backward transients. Each request's buffers are separate allocations
 # rounded up to 512 B blocks; on an H200, a fully shared one-token request's
-# head peaked at nine blocks plus 8 B (4,616 B). Callers whose head and loss
+# head peaked at eight blocks plus 22 B (4,118 B). Callers whose head and loss
 # memory peaks above this charge per token are unsupported.
 _PACKED_PRICED_LOGICAL_ROW_BYTES = 12 * 512
 # Shorter single-target requests keep the logical extrapolation, so each

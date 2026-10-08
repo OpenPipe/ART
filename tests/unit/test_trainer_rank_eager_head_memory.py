@@ -127,7 +127,7 @@ def test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound(
             r._group_head_workspace_bytes(
                 rows, req, grad_enabled=grad, lower_bound=True
             )
-            == (3 if grad else 1) * dense
+            == (2 if grad else 1) * dense
         )
 
 

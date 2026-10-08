@@ -342,7 +342,7 @@ def test_group_head_workspace_keeps_gradient_mode_with_its_rows(
             assert r._estimate_flat_forward(
                 requests, exact=exact, memory_minimal=minimal
             )[-1] == (
-                max(3 * gradient_rows, reference_rows) * 248320 * 2
+                max(2 * gradient_rows, reference_rows) * 248320 * 2
                 if minimal and not exact
                 else expected
             )
@@ -466,7 +466,7 @@ def test_gradient_shared_rows_price_same_union_in_exact_and_split_lower_cost():
     expected = 7 * 2 * 248320 * 2
     exact = r._estimate_flat_forward(requests, exact=True, memory_minimal=True)
     assert exact[-1] == r._plan_head_workspace_bytes(plan) == expected
-    assert r._estimate_flat_forward(requests, memory_minimal=True)[-1] == 3 * 248320 * 2
+    assert r._estimate_flat_forward(requests, memory_minimal=True)[-1] == 2 * 248320 * 2
     lower = r._split_chunk_lower_cost(
         requests, tuple(x.input_tokens for x in requests), checkpoint=Unset
     )
