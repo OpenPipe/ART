@@ -946,6 +946,10 @@ class _AllocatedBytes:
 
     From the profiler's allocation events, so a storage counts until it is
     freed, including tensors that only autograd or a checkpoint still holds.
+    The peak is the allocator's running total recorded with each event, which
+    the allocator orders under its lock: the events' timestamps interleave
+    gloo's worker threads with the caller's. ``timed_peak`` replays the events
+    by timestamp instead.
     """
 
     def __enter__(self):
@@ -965,12 +969,17 @@ class _AllocatedBytes:
         while nodes:
             node = nodes.pop()
             if isinstance(node.extra_fields, _ExtraFields_Allocation):
-                events.append((node.start_time_ns, node.extra_fields.alloc_size))
+                fields = node.extra_fields
+                events.append(
+                    (node.start_time_ns, fields.alloc_size, fields.total_allocated)
+                )
             nodes.extend(node.children)
-        current = self.peak = 0
-        for _, size in sorted(events):
+        current = self.timed_peak = 0
+        for _, size, _ in sorted(events):
             current += size
-            self.peak = max(self.peak, current)
+            self.timed_peak = max(self.timed_peak, current)
+        start = min((total - size for _, size, total in events), default=0)
+        self.peak = max((total for _, _, total in events), default=start) - start
 
 
 class _Projection(torch.autograd.Function):
@@ -1180,12 +1189,14 @@ def test_tensor_parallel_heads_fit_their_charge_without_a_spare_chunk(tmp_path):
     )
     # Checked here, not in the workers: a rank that fails mid-loop closes its
     # process group, and its peer then fails on the closed connection instead.
+    failures = []
     for rank in range(2):
         measured = json.loads((tmp_path / f"rank-{rank}.json").read_text())
         assert len(measured) == 10
-        for path, case, lower, peak, charged, dense in measured:
-            assert lower <= peak <= charged, (rank, path, case, peak - charged)
-            assert charged - peak < dense / 8, (rank, path, case, charged - peak)
+        for path, case, lower, peak, charged, dense, timed_peak in measured:
+            if not (lower <= peak <= charged and charged - peak < dense / 8):
+                failures.append((rank, path, case, lower, peak, charged, timed_peak))
+    assert not failures, "(rank, path, case, lower, peak, charged, timed peak)"
 
 
 class _GatherLastDim(torch.autograd.Function):
@@ -1254,12 +1265,13 @@ def _measured_tensor_parallel_worker(rank, rendezvous, output):
                         "megatron.core.tensor_parallel.gather_from_tensor_model_parallel_region",
                         lambda values, group=None: _GatherLastDim.apply(values, group),
                     )
+                    meter = _AllocatedBytes()
                     peak = _measured_head_peak(
                         monkeypatch,
                         requests,
                         path=path,
                         grad=True,
-                        meter=_AllocatedBytes,
+                        meter=lambda: meter,
                         stub_merge=False,
                     )
                     capacity, lower, dense, outputs = _head_charges(
@@ -1270,7 +1282,9 @@ def _measured_tensor_parallel_worker(rank, rendezvous, output):
                         kernel=path == "bounded",
                     )
                 charged = capacity + outputs + _host_rng_bytes(rows)
-                measured.append((path, case, lower, peak, charged, dense))
+                measured.append(
+                    (path, case, lower, peak, charged, dense, meter.timed_peak)
+                )
     (Path(output) / f"rank-{rank}.json").write_text(json.dumps(measured))
 
 
