@@ -5601,6 +5601,9 @@ class TrainerRank:
                 hidden_by_row,
                 row_tensor,
                 row_matches=local_row_matches,
+                distinct_rows=tuple(
+                    bool((row[1:] > row[:-1]).all()) for _, row, _ in cpu_matches
+                ),
                 logit_rows=logit_rows_cpu.to(device),
                 logit_bounds=_chunk_boundaries(
                     logit_rows_cpu,
@@ -5642,6 +5645,7 @@ class TrainerRank:
         rows: torch.Tensor,
         *,
         row_matches: Sequence[_RowMatch],
+        distinct_rows: Sequence[bool],
         logit_rows: torch.Tensor,
         logit_bounds: tuple[int, ...],
         output_weight: torch.Tensor | None,
@@ -5677,6 +5681,18 @@ class TrainerRank:
                     selections, label_rows, target_logprobs, strict=True
                 )
             ]
+            labelled = [
+                (labels, distinct)
+                for labels, distinct in zip(chunk_labels, distinct_rows, strict=True)
+                if labels is not None
+            ]
+            # One item's single labels on distinct rows: the targets' rows
+            # ascend, which the kernels' backward groups without sorting.
+            rows_ascending = (
+                len(labelled) == 1
+                and labelled[0][1]
+                and int(labelled[0][0].numel()) == int(labelled[0][0].shape[0])
+            )
             # Recompute vocabulary-sized intermediates one chunk at a time in
             # backward; chunking alone otherwise retains every chunk's logits.
             local_logits, log_z, local_topk, target_logits = (
@@ -5687,6 +5703,7 @@ class TrainerRank:
                     need_log_z=need_log_z,
                     max_top_k=max_top_k,
                     targets=_chunk_targets(selections, chunk_labels),
+                    rows_ascending=rows_ascending,
                 )
             )
             if target_logits is not None:
@@ -5761,6 +5778,7 @@ class TrainerRank:
         need_log_z: bool,
         max_top_k: int,
         targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rows_ascending: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -5783,6 +5801,7 @@ class TrainerRank:
             need_log_z=need_log_z,
             max_top_k=max_top_k,
             targets=targets,
+            rows_ascending=rows_ascending,
             path=[],
             use_reentrant=False,
         )
@@ -5796,6 +5815,7 @@ class TrainerRank:
         need_log_z: bool,
         max_top_k: int,
         targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rows_ascending: bool = False,
         path: list[str] | None = None,
     ) -> tuple[
         torch.Tensor,
@@ -5810,7 +5830,8 @@ class TrainerRank:
         function: in backward their gradients join the softmax gradient in
         FP32 before one store in the logits' dtype. Gathered separately, both
         terms would round to BF16 first, and the target's ``p - 1`` would
-        cancel to zero once ``p`` rounds to one.
+        cancel to zero once ``p`` rounds to one. ``rows_ascending`` promises
+        one target per row, in ascending rows.
         """
         local_logits = self._local_logits_from_hidden_rows(
             model,
@@ -5827,7 +5848,10 @@ class TrainerRank:
             gathered = _local_targets(local_logits, targets)
             topk_stats = (
                 _try_triton_local_topk_stats(
-                    local_logits, k=max_top_k, targets=gathered
+                    local_logits,
+                    k=max_top_k,
+                    targets=gathered,
+                    rows_ascending=rows_ascending,
                 )
                 if recorded in (None, "topk")
                 else None
@@ -5847,7 +5871,11 @@ class TrainerRank:
                 cast(
                     tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
                     _try_triton_stats(
-                        "local_logsumexp_stats", local_logits, targets=gathered
+                        "local_logsumexp_stats",
+                        local_logits,
+                        targets=gathered,
+                        # Appended top-k tokens revisit every row.
+                        rows_ascending=rows_ascending and topk_tokens is None,
                     ),
                 )
                 if topk_stats is None and recorded in (None, "logsumexp")
@@ -7013,6 +7041,7 @@ def _try_triton_local_topk_stats(
     *,
     k: int,
     targets: tuple[torch.Tensor, torch.Tensor],
+    rows_ascending: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     if k <= 0 or k > int(
         os.environ.get("ART_TRAINER_RANK_TRITON_FUSED_TOPK_MAX", "10")
@@ -7026,6 +7055,7 @@ def _try_triton_local_topk_stats(
             local_logits,
             k=min(k, int(local_logits.shape[1])),
             targets=targets,
+            rows_ascending=rows_ascending,
         ),
     )
 

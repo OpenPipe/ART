@@ -318,6 +318,77 @@ def test_triton_statistics_combine_target_gradients_in_fp32(monkeypatch, top_k):
     _assert_fp32_combined(hidden.grad.cpu(), reference, weights)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton needs CUDA")
+@pytest.mark.parametrize("k", [0, 4])
+def test_triton_ascending_targets_skip_the_sort_bitwise(k):
+    """One target per row on ascending rows (some rows absent, some targets
+    unowned, three vocabulary blocks): grouped without sorting, the logits'
+    gradient is bitwise the sorted grouping's."""
+    from art.trainer_rank import topk
+
+    generator = torch.Generator().manual_seed(13)
+    rows, vocab = 257, 9_000
+    logits = (torch.randn(rows, vocab, generator=generator) * 3).bfloat16().cuda()
+    target_rows = torch.arange(rows)[torch.rand(rows, generator=generator) < 0.8]
+    target_columns = torch.randint(0, vocab, target_rows.shape, generator=generator)
+    target_columns[::7] = -1
+    targets = (target_rows.cuda(), target_columns.cuda())
+    weights = [
+        torch.randn(shape, generator=generator).cuda()
+        for shape in ((rows,), (rows, k), target_rows.shape)
+    ]
+
+    def gradient(rows_ascending):
+        leaf = logits.clone().requires_grad_()
+        _, local_sum, values, _, target_logits = topk.local_topk_stats(
+            leaf, k=k, targets=targets, rows_ascending=rows_ascending
+        )
+        outputs = (local_sum, values, target_logits)
+        losses = [(w * o).sum() for w, o in zip(weights, outputs, strict=True)]
+        (grad,) = torch.autograd.grad(torch.stack(losses).sum(), leaf)
+        return grad
+
+    assert torch.equal(gradient(True), gradient(False))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton needs CUDA")
+@pytest.mark.parametrize(
+    ("layout", "top_k", "ascending"),
+    [
+        ("single", None, True),
+        ("single", 4, True),  # the fused kernel selects the top-k itself
+        ("single", 12, False),  # selected top-k tokens join the targets
+        ("multi", None, False),
+        ("shared", None, False),
+    ],
+)
+def test_the_head_skips_the_sort_only_for_ascending_targets(
+    monkeypatch, layout, top_k, ascending
+):
+    monkeypatch.delenv("ART_TRAINER_RANK_TRITON_TOPK", raising=False)
+    # Rows with only ignored labels project nowhere: a short last chunk.
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "1")
+    rows, vocab = 128, 5_000
+    logits, requests, positions, _ = _target_case(
+        layout, rows, vocab, seed=7, device="cuda"
+    )
+    requests[0] = ForwardInput(
+        input_tokens=requests[0].input_tokens,
+        target_tokens=requests[0].target_tokens,
+        top_k=top_k,
+    )
+    flags = []
+    original = _impl._try_triton_stats
+
+    def kernel(name, local_logits, **kwargs):
+        flags.append(kwargs["rows_ascending"])
+        return original(name, local_logits, **kwargs)
+
+    monkeypatch.setattr(_impl, "_try_triton_stats", kernel)
+    _run_head(monkeypatch, logits.cuda(), requests, positions, path="triton")
+    assert flags == [ascending] * 2
+
+
 def test_tensor_parallel_shards_add_only_owned_target_gradients(tmp_path):
     spawn_and_join(
         _tensor_parallel_worker,

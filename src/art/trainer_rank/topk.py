@@ -187,6 +187,7 @@ class _LocalStatsFunction(torch.autograd.Function):
         k: int,
         target_rows: torch.Tensor,
         target_columns: torch.Tensor,
+        rows_ascending: bool,
     ):
         local_max, local_sum, values, tokens = _local_stats_forward(local_logits, k=k)
         target_logits = gather_target_logits(local_logits, target_rows, target_columns)
@@ -194,6 +195,7 @@ class _LocalStatsFunction(torch.autograd.Function):
             local_logits, local_max, tokens, target_rows, target_columns
         )
         ctx.k = k
+        ctx.rows_ascending = rows_ascending
         return local_max, local_sum, values, tokens, target_logits
 
     @staticmethod
@@ -220,25 +222,24 @@ class _LocalStatsFunction(torch.autograd.Function):
         has_targets = grad_targets is not None and bool(target_rows.numel())
         if has_targets:
             # Group the targets by (row, vocab block) (CSR): group g = row *
-            # n_blocks + block holds [offsets[g], offsets[g + 1]). Unowned (-1)
-            # columns sort after the last group, so no program reads them.
-            groups = torch.where(
-                target_columns >= 0,
-                target_rows * n_blocks
-                + target_columns.div(block_v, rounding_mode="floor"),
-                rows * n_blocks,
+            # n_blocks + block holds [offsets[g], offsets[g + 1]). An unowned
+            # (-1) column joins its row's first block, where no offset matches.
+            groups = target_rows * n_blocks + target_columns.clamp(min=0).div(
+                block_v, rounding_mode="floor"
             )
-            order = torch.argsort(groups, stable=True)
+            target_tokens, target_grads = target_columns, grad_targets.float()
+            if not ctx.rows_ascending:
+                order = torch.argsort(groups, stable=True)
+                groups, target_tokens = groups[order], target_tokens[order]
+                target_grads = target_grads[order]
+                del order
             target_offsets = torch.searchsorted(
-                groups[order],
+                groups,
                 torch.arange(
                     rows * n_blocks + 1, device=logits.device, dtype=groups.dtype
                 ),
             )
             del groups
-            target_tokens = target_columns[order]
-            target_grads = grad_targets[order].float()
-            del order
         else:
             # The kernel loads no target, but its pointers must be allocated.
             target_offsets = target_tokens = local_max.new_empty((1,), dtype=torch.long)
@@ -263,7 +264,7 @@ class _LocalStatsFunction(torch.autograd.Function):
             has_targets=has_targets,  # ty: ignore[invalid-argument-type]
             num_warps=8,  # ty: ignore[unknown-argument]
         )
-        return grad_logits, None, None, None
+        return grad_logits, None, None, None, None
 
 
 def _no_targets(logits: torch.Tensor) -> LocalTargets:
@@ -346,11 +347,14 @@ def local_topk_stats(
     *,
     k: int,
     targets: LocalTargets | None = None,
+    rows_ascending: bool = False,
 ) -> LocalTopKStats:
     """Local softmax statistics, top-k and FP32 target logits for ``[rows, vocab]``.
 
     A target logit's gradient is added to the softmax gradient in FP32 inside
-    the backward, so the logits receive one gradient store.
+    the backward, so the logits receive one gradient store. ``rows_ascending``
+    promises strictly ascending target rows (one target per row), which the
+    backward then groups without sorting.
     """
     logits = local_logits.contiguous()
     if targets is None:
@@ -358,15 +362,16 @@ def local_topk_stats(
     if not logits.requires_grad:
         stats = _local_stats_forward(logits, k=k)
         return *stats, gather_target_logits(logits, *targets)
-    return _LocalStatsFunction.apply(logits, k, *targets)
+    return _LocalStatsFunction.apply(logits, k, *targets, rows_ascending)
 
 
 def local_logsumexp_stats(
     local_logits: torch.Tensor,
     *,
     targets: LocalTargets | None = None,
+    rows_ascending: bool = False,
 ) -> LocalLogSumExpStats:
     local_max, local_sum, _, _, target_logits = local_topk_stats(
-        local_logits, k=0, targets=targets
+        local_logits, k=0, targets=targets, rows_ascending=rows_ascending
     )
     return local_max, local_sum, target_logits
