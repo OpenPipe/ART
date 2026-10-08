@@ -205,6 +205,48 @@ def test_target_gradients_match_fp32_cross_entropy(monkeypatch, path, layout):
 
 
 @pytest.mark.parametrize("path", ["fallback", "bounded"])
+def test_target_gradients_reach_only_their_rows_across_sub_chunks(monkeypatch, path):
+    """133 rows: the bounded path's sub-chunks hold three rows, the last one.
+    Targets out of row order, repeated, and unowned (-1) match a float64
+    log-softmax to FP32 precision."""
+    from art.trainer_rank import _impl
+
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    generator = torch.Generator().manual_seed(11)
+    rows, vocab, count = 133, 300, 1_000
+    logits = torch.randn(rows, vocab, dtype=torch.float64, generator=generator) * 3
+    target_rows = torch.randint(0, rows, (count,), generator=generator)
+    target_columns = torch.randint(0, vocab, (count,), generator=generator)
+    target_columns[::5] = -1
+    target_rows[:20], target_columns[:20] = rows - 1, 7
+    weights = torch.randn(count, dtype=torch.float64, generator=generator)
+    stats = (
+        _impl._EagerLocalStats.apply if path == "bounded" else _impl._LocalExpSum.apply
+    )
+    assert -(-rows // _impl._EAGER_STATS_SUBCHUNKS) == 3
+
+    def gradient(log_probs):
+        leaf = logits.clone().requires_grad_()
+        values = log_probs(leaf)
+        (grad,) = torch.autograd.grad((weights * values).sum(), leaf)
+        return values.detach().double(), grad
+
+    def kernel(logits):
+        shift, local_sum, target_logits = stats(logits, target_rows, target_columns)
+        log_z = shift.detach() + local_sum.log()
+        return (target_logits - log_z[target_rows]).masked_fill(target_columns < 0, 0)
+
+    def reference(logits):
+        log_probs = logits.log_softmax(-1)[target_rows, target_columns.clamp(min=0)]
+        return log_probs.masked_fill(target_columns < 0, 0)
+
+    values, grad = gradient(kernel)
+    expected_values, expected = gradient(reference)
+    torch.testing.assert_close(values, expected_values, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(grad, expected, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("path", ["fallback", "bounded"])
 def test_topk_gradients_match_fp32_log_softmax(monkeypatch, path):
     logits, _ = _logits(ROWS, VOCAB, seed=5)
     request = ForwardInput(

@@ -85,6 +85,7 @@ from art.trainer_rank._prefix_tree_planner import (
     canonical_token_rows_fingerprint,
 )
 from art.trainer_rank._rng import TrainerRNG, caller_group
+from art.trainer_rank._targets import gather_target_logits
 from art.trainer_rank._telemetry import phase as _telemetry_phase
 from art.trainer_rank._versions import (
     CheckpointVersion,
@@ -5746,8 +5747,10 @@ class TrainerRank:
                         raise RuntimeError("top_k output was not allocated")
                     current.logprobs[offsets] = values.logprobs
                     current.tokens[offsets] = values.tokens
+                    del local_values, local_tokens, selected_values, selected_tokens
+                    del selected_log_z, values
             # Do not retain prior chunk buffers while the next stats RHS runs.
-            del local_logits, chunk_logits
+            del local_logits, chunk_logits, log_z, local_topk, target_logits
 
     def _checkpointed_head_stats(
         self,
@@ -7172,7 +7175,7 @@ class _EagerLocalStats(torch.autograd.Function):
             block.sub_(local_max[start:stop, None]).exp_()
             local_sum[start:stop] = block.sum(dim=-1)
         del work
-        target_logits = _gather_target_logits(logits, target_rows, target_columns)
+        target_logits = gather_target_logits(logits, target_rows, target_columns)
         ctx.save_for_backward(logits, local_max, target_rows, target_columns)
         ctx.step = step
         return local_max, local_sum, target_logits
@@ -7183,16 +7186,21 @@ class _EagerLocalStats(torch.autograd.Function):
         # exp(logits - local max) per row, each target logit its own gradient.
         _grad_local_max, grad_local_sum, grad_targets = grad_outputs
         logits, local_max, target_rows, target_columns = ctx.saved_tensors
-        grad = torch.empty_like(logits)
         if grad_local_sum is None and grad_targets is None:
-            return grad.zero_(), None, None
+            return torch.zeros_like(logits), None, None
         rows, step = int(logits.shape[0]), int(ctx.step)
+        # Grouped before the gradient exists: the grouping's sort workspace
+        # never coincides with it.
+        targets = _target_gradients_by_rows(
+            logits.shape, step, target_rows, target_columns, grad_targets
+        )
+        grad = torch.empty_like(logits)
         work = torch.empty(
             (min(step, rows), int(logits.shape[1])),
             dtype=torch.float32,
             device=logits.device,
         )
-        for start in range(0, rows, step):
+        for start, block_targets in zip(range(0, rows, step), targets, strict=True):
             stop = min(start + step, rows)
             block = work[: stop - start]
             if grad_local_sum is None:
@@ -7201,10 +7209,8 @@ class _EagerLocalStats(torch.autograd.Function):
                 block.copy_(logits[start:stop])  # owned: the saved logits stay intact
                 block.sub_(local_max[start:stop, None]).exp_()
                 block.mul_(grad_local_sum[start:stop, None])
-            if grad_targets is not None:
-                _add_target_gradients(
-                    block, start, target_rows, target_columns, grad_targets
-                )
+            if block_targets is not None:
+                block.view(-1).index_add_(0, *block_targets)
             grad[start:stop] = block
         del work
         return grad, None, None
@@ -7239,7 +7245,7 @@ class _LocalExpSum(torch.autograd.Function):
         values = logits.float()
         global_max = _all_reduce_tensor_parallel_max(values.max(dim=-1).values)
         local_sum = _local_vocab_exp_sum(values, global_max)
-        target_logits = _gather_target_logits(values, target_rows, target_columns)
+        target_logits = gather_target_logits(values, target_rows, target_columns)
         ctx.save_for_backward(logits, global_max, target_rows, target_columns)
         ctx.mark_non_differentiable(global_max)
         return global_max, local_sum, target_logits
@@ -7248,14 +7254,22 @@ class _LocalExpSum(torch.autograd.Function):
     def backward(ctx: Any, *grad_outputs: Any) -> Any:
         _grad_global_max, grad_local_sum, grad_targets = grad_outputs
         logits, global_max, target_rows, target_columns = ctx.saved_tensors
+        targets_by_rows = _target_gradients_by_rows(
+            logits.shape,
+            max(1, int(logits.shape[0])),
+            target_rows,
+            target_columns,
+            grad_targets,
+        )
         grad = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
         if grad_local_sum is None:
             grad.zero_()
         else:
             grad.copy_(logits)  # owned: FP32 logits stay intact
             grad.sub_(global_max[:, None]).exp_().mul_(grad_local_sum[:, None])
-        if grad_targets is not None:
-            _add_target_gradients(grad, 0, target_rows, target_columns, grad_targets)
+        for targets in targets_by_rows:
+            if targets is not None:
+                grad.view(-1).index_add_(0, *targets)
         return grad.to(logits.dtype), None, None
 
 
@@ -7272,33 +7286,43 @@ def _vocab_parallel_log_z(
     return global_max + torch.log(global_sum), target_logits
 
 
-def _gather_target_logits(
-    logits: torch.Tensor,
-    rows: torch.Tensor,
-    columns: torch.Tensor,
-) -> torch.Tensor:
-    values = logits[rows, columns.clamp(min=0)].float()
-    return values.masked_fill(columns < 0, 0.0)
+def _target_gradients_by_rows(
+    shape: torch.Size,
+    step: int,
+    target_rows: torch.Tensor,
+    target_columns: torch.Tensor,
+    gradients: torch.Tensor | None,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor] | None]:
+    """Each ``step``-row sub-chunk's owned targets of a ``shape`` gradient,
+    as (distinct flat offsets from the sub-chunk's start, FP32 gradients
+    summed per offset), or None when it has none.
 
-
-def _add_target_gradients(
-    block: torch.Tensor,
-    start: int,
-    rows: torch.Tensor,
-    columns: torch.Tensor,
-    gradients: torch.Tensor,
-) -> None:
-    """Accumulate target logits' gradients into ``block``, an FP32 gradient
-    of the logits rows from ``start``; other rows' and unowned (-1) targets
-    add nothing."""
-    if not int(rows.numel()):
-        return
-    local = rows - start
-    selected = (columns >= 0) & (local >= 0) & (local < int(block.shape[0]))
-    block.index_put_(
-        (local.clamp(0, int(block.shape[0]) - 1), columns.clamp(min=0)),
-        gradients.float().masked_fill(~selected, 0.0),
-        accumulate=True,
+    The targets are sorted and their repeats summed once, deterministically;
+    each sub-chunk's range is then one slice, and adding it touches each
+    element once. Unowned (-1) columns sort after the last row."""
+    rows, vocab = int(shape[0]), int(shape[1])
+    starts = range(0, rows, step)
+    if gradients is None or not int(target_rows.numel()):
+        return iter([None] * len(starts))
+    flat = torch.where(
+        target_columns >= 0, target_rows * vocab + target_columns, rows * vocab
+    )
+    offsets, inverse = torch.unique(flat, return_inverse=True)
+    del flat
+    summed = torch.zeros(offsets.shape, dtype=torch.float32, device=offsets.device)
+    summed.index_put_((inverse,), gradients.float(), accumulate=True)
+    del inverse
+    bounds = torch.searchsorted(
+        offsets,
+        torch.tensor(
+            [start * vocab for start in [*starts, rows]],
+            dtype=offsets.dtype,
+            device=offsets.device,
+        ),
+    ).tolist()
+    return (
+        (offsets[low:high] - start * vocab, summed[low:high]) if high > low else None
+        for start, low, high in zip(starts, bounds, bounds[1:])
     )
 
 

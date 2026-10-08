@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+from art.trainer_rank._targets import gather_target_logits
+
 # (local max, local sum, top-k values, top-k tokens)
 type _KernelStats = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 # (local max, local sum, top-k values, top-k tokens, target logits)
@@ -139,8 +141,10 @@ def _stats_backward_kernel(
     grad_logits_ptr,
     stride_row: tl.constexpr,
     vocab_size: tl.constexpr,
+    n_blocks: tl.constexpr,
     k: tl.constexpr,
     block_v: tl.constexpr,
+    has_targets: tl.constexpr,
 ):
     row = tl.program_id(0)
     block = tl.program_id(1)
@@ -160,14 +164,17 @@ def _stats_backward_kernel(
         value_grad = tl.load(grad_values_ptr + row * k + slot).to(tl.float32)
         grad += tl.where(offsets == token, value_grad, 0.0)
 
-    # Gathered target logits, grouped by row: their gradients join the softmax
-    # gradient in FP32, before the single store in the logits' dtype.
-    target_start = tl.load(target_offsets_ptr + row)
-    target_end = tl.load(target_offsets_ptr + row + 1)
-    for index in range(target_start, target_end):
-        token = tl.load(target_tokens_ptr + index)
-        target_grad = tl.load(target_grads_ptr + index)
-        grad += tl.where(offsets == token, target_grad, 0.0)
+    # Gathered target logits, grouped by (row, vocab block): their gradients
+    # join the softmax gradient in FP32, before the single store in the
+    # logits' dtype, and each program reads only its own block's targets.
+    if has_targets:
+        group = row * n_blocks + block
+        target_start = tl.load(target_offsets_ptr + group)
+        target_end = tl.load(target_offsets_ptr + group + 1)
+        for index in range(target_start, target_end):
+            token = tl.load(target_tokens_ptr + index)
+            target_grad = tl.load(target_grads_ptr + index)
+            grad += tl.where(offsets == token, target_grad, 0.0)
 
     tl.store(grad_logits_ptr + row * stride_row + offsets, grad, mask=mask)
 
@@ -182,9 +189,7 @@ class _LocalStatsFunction(torch.autograd.Function):
         target_columns: torch.Tensor,
     ):
         local_max, local_sum, values, tokens = _local_stats_forward(local_logits, k=k)
-        target_logits = _gather_target_logits(
-            local_logits, (target_rows, target_columns)
-        )
+        target_logits = gather_target_logits(local_logits, target_rows, target_columns)
         ctx.save_for_backward(
             local_logits, local_max, tokens, target_rows, target_columns
         )
@@ -212,22 +217,32 @@ class _LocalStatsFunction(torch.autograd.Function):
                 device=logits.device,
                 dtype=torch.float32,
             )
-        if grad_targets is None:
-            grad_targets = torch.zeros(
-                target_rows.shape, device=logits.device, dtype=torch.float32
+        has_targets = grad_targets is not None and bool(target_rows.numel())
+        if has_targets:
+            # Group the targets by (row, vocab block) (CSR): group g = row *
+            # n_blocks + block holds [offsets[g], offsets[g + 1]). Unowned (-1)
+            # columns sort after the last group, so no program reads them.
+            groups = torch.where(
+                target_columns >= 0,
+                target_rows * n_blocks
+                + target_columns.div(block_v, rounding_mode="floor"),
+                rows * n_blocks,
             )
-        # Group the targets by row (CSR): row r's are [offsets[r], offsets[r + 1]).
-        order = torch.argsort(target_rows, stable=True)
-        target_offsets = torch.searchsorted(
-            target_rows[order],
-            torch.arange(rows + 1, device=logits.device, dtype=target_rows.dtype),
-        )
-        target_tokens = target_columns[order]
-        target_grads = grad_targets[order].float()
-        if not int(order.numel()):
+            order = torch.argsort(groups, stable=True)
+            target_offsets = torch.searchsorted(
+                groups[order],
+                torch.arange(
+                    rows * n_blocks + 1, device=logits.device, dtype=groups.dtype
+                ),
+            )
+            del groups
+            target_tokens = target_columns[order]
+            target_grads = grad_targets[order].float()
+            del order
+        else:
             # The kernel loads no target, but its pointers must be allocated.
-            target_tokens = target_tokens.new_full((1,), -1)
-            target_grads = target_grads.new_zeros((1,))
+            target_offsets = target_tokens = local_max.new_empty((1,), dtype=torch.long)
+            target_grads = local_max.new_empty((1,))
 
         grad_logits = torch.empty_like(logits)
         _stats_backward_kernel[(rows, n_blocks)](
@@ -242,17 +257,13 @@ class _LocalStatsFunction(torch.autograd.Function):
             grad_logits,
             logits.stride(0),
             vocab_size=vocab_size,  # ty: ignore[invalid-argument-type]
+            n_blocks=n_blocks,  # ty: ignore[invalid-argument-type]
             k=k,  # ty: ignore[invalid-argument-type]
             block_v=block_v,  # ty: ignore[invalid-argument-type]
+            has_targets=has_targets,  # ty: ignore[invalid-argument-type]
             num_warps=8,  # ty: ignore[unknown-argument]
         )
         return grad_logits, None, None, None
-
-
-def _gather_target_logits(logits: torch.Tensor, targets: LocalTargets) -> torch.Tensor:
-    rows, columns = targets
-    values = logits[rows, columns.clamp(min=0)].float()
-    return values.masked_fill(columns < 0, 0.0)
 
 
 def _no_targets(logits: torch.Tensor) -> LocalTargets:
@@ -346,7 +357,7 @@ def local_topk_stats(
         targets = _no_targets(logits)
     if not logits.requires_grad:
         stats = _local_stats_forward(logits, k=k)
-        return *stats, _gather_target_logits(logits, targets)
+        return *stats, gather_target_logits(logits, *targets)
     return _LocalStatsFunction.apply(logits, k, *targets)
 
 
