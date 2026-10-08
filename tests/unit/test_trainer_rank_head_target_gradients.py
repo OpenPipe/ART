@@ -11,7 +11,12 @@ import pytest
 from test_trainer_rank_head_recompute import _patch_local_head
 import torch
 import torch.distributed as dist
-from trainer_rank_test_support import process_group, spawn_and_join
+from trainer_rank_test_support import (
+    AllReduceSum,
+    all_reduce_max,
+    process_group,
+    spawn_and_join,
+)
 
 from art.trainer_rank import ForwardInput, TrainerRank, _impl
 
@@ -72,9 +77,9 @@ def _run_head(monkeypatch, logits, requests, positions, *, path, tp_rank=None):
             "_vocab_range",
             lambda value: (tp_rank * local, (tp_rank + 1) * local),
         )
-        monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", _all_reduce_max)
+        monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", all_reduce_max)
         monkeypatch.setattr(
-            _impl, "_all_reduce_tensor_parallel_sum", _AllReduceSum.apply
+            _impl, "_all_reduce_tensor_parallel_sum", AllReduceSum.apply
         )
 
     def unexpected(*args, **kwargs):
@@ -311,26 +316,6 @@ def test_triton_statistics_combine_target_gradients_in_fp32(monkeypatch, top_k):
     assert hidden.grad is not None
     _, reference = _reference(logits, terms)
     _assert_fp32_combined(hidden.grad.cpu(), reference, weights)
-
-
-class _AllReduceSum(torch.autograd.Function):
-    """Megatron's reduce-from-tensor-parallel region: sum, identity backward."""
-
-    @staticmethod
-    def forward(ctx, tensor):
-        output = tensor.clone()
-        dist.all_reduce(output)
-        return output
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        return grad_outputs[0]
-
-
-def _all_reduce_max(tensor):
-    output = tensor.clone()
-    dist.all_reduce(output, op=dist.ReduceOp.MAX)
-    return output
 
 
 def test_tensor_parallel_shards_add_only_owned_target_gradients(tmp_path):

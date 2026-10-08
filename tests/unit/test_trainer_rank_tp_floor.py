@@ -11,12 +11,16 @@ keep today's pricing.
 """
 
 from dataclasses import replace
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
 from trainer_rank_test_support import (
+    AllReduceSum,
+    all_reduce_max,
     fake_rank,
     process_group,
     recompute_model,
@@ -1170,10 +1174,18 @@ def test_the_measured_head_fits_its_charge_without_a_spare_chunk(
 def test_tensor_parallel_heads_fit_their_charge_without_a_spare_chunk(tmp_path):
     spawn_and_join(
         _measured_tensor_parallel_worker,
-        (f"file://{tmp_path / 'tp'}",),
+        (f"file://{tmp_path / 'tp'}", str(tmp_path)),
         timeout=240,
         failure="tensor-parallel head memory workers did not finish",
     )
+    # Checked here, not in the workers: a rank that fails mid-loop closes its
+    # process group, and its peer then fails on the closed connection instead.
+    for rank in range(2):
+        measured = json.loads((tmp_path / f"rank-{rank}.json").read_text())
+        assert len(measured) == 10
+        for path, case, lower, peak, charged, dense in measured:
+            assert lower <= peak <= charged, (rank, path, case, peak - charged)
+            assert charged - peak < dense / 8, (rank, path, case, charged - peak)
 
 
 class _GatherLastDim(torch.autograd.Function):
@@ -1200,10 +1212,10 @@ class _GatherLastDim(torch.autograd.Function):
         return grad.chunk(world, dim=-1)[rank].contiguous(), None
 
 
-def _measured_tensor_parallel_worker(rank, rendezvous):
-    from test_trainer_rank_head_target_gradients import _all_reduce_max, _AllReduceSum
+def _measured_tensor_parallel_worker(rank, rendezvous, output):
     import torch.distributed as dist
 
+    measured = []
     with process_group(rank, rendezvous, world_size=2, timeout=200):
         for path in ("fallback", "bounded"):
             for case in (
@@ -1223,11 +1235,11 @@ def _measured_tensor_parallel_worker(rank, rendezvous):
                     )
                     monkeypatch.setattr(
                         "art.trainer_rank._impl._all_reduce_tensor_parallel_max",
-                        _all_reduce_max,
+                        all_reduce_max,
                     )
                     monkeypatch.setattr(
                         "art.trainer_rank._impl._all_reduce_tensor_parallel_sum",
-                        _AllReduceSum.apply,
+                        AllReduceSum.apply,
                     )
                     # The real top-k merge across both ranks' shards.
                     monkeypatch.setattr(
@@ -1258,8 +1270,8 @@ def _measured_tensor_parallel_worker(rank, rendezvous):
                         kernel=path == "bounded",
                     )
                 charged = capacity + outputs + _host_rng_bytes(rows)
-                assert lower <= peak <= charged, (path, case, peak - charged)
-                assert charged - peak < dense / 8, (path, case, charged - peak)
+                measured.append((path, case, lower, peak, charged, dense))
+    (Path(output) / f"rank-{rank}.json").write_text(json.dumps(measured))
 
 
 class _CudaAllocatedBytes:
