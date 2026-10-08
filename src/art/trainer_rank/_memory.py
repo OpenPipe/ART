@@ -471,6 +471,11 @@ _HEAD_LABEL_BYTES = 32
 # Per top-k entry of a gradient wave: the requested log-probs' gradient.
 _HEAD_TOP_K_GRADIENT_BYTES = 4
 # Per row of the running chunk: maxima, sums, log-normalizers, positions.
+# Not the Triton backward's (row, vocab block) target offsets, 16 B per
+# 4,096-entry block (about 500 B per row of a 124,160-entry shard): TP > 1
+# covers them with the bounded statistics' increment, charged even when the
+# kernel runs, and TP1 with the fallback's seven buffers. Trimming either
+# needs this term to price them.
 _HEAD_CHUNK_ROW_BYTES = 128
 
 
