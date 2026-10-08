@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 from test_trainer_rank_head_memory import rank as head_rank
-from test_trainer_rank_head_memory import request
+from test_trainer_rank_head_memory import request, targets
 from test_trainer_rank_pending_memory import layer as layer
 from test_trainer_rank_pending_memory import pending_rank as pending_rank
 from test_trainer_rank_split import _rank, _request
@@ -178,8 +178,11 @@ def test_eager_head_capacity_replays_output_modes(tmp_path, mode, grad, stock_sc
         items.append(request(65, grad=grad, ignored=True))
     rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
     plan = rank._plan_flat_forward(items, memory_minimal=True)
-    multiplier = 1 if not stock_scale else 7 if mode != "logits" else 3
-    assert rank._plan_head_workspace_bytes(plan) == multiplier * 65 * 248320 * 2
+    statistics = stock_scale and mode != "logits"
+    multiplier = 1 if not stock_scale else 7 if statistics else 3
+    assert rank._plan_head_workspace_bytes(plan) == multiplier * 65 * 248320 * 2 + (
+        targets(65, items, grad=grad) if statistics else 0
+    )
     report, _ = emitted(rank, plan, tmp_path)
     result = reports.replay(report)
     assert result["aggregate"]["matches"]

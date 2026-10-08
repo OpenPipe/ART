@@ -239,8 +239,9 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         ):
             # Facts record statistics, not requested logits beside them.
             raise ValueError("head_logits_statistics_unsupported")
-        # Version-4 facts keep the target rows as selection identity; the
-        # head charge no longer reads them.
+        # The head charge no longer reads the recorded target rows:
+        # head_target_rows stays only for version-4 compatibility and can go
+        # in version 5.
         backwards = (
             target_backward
             and group.grad_enabled
@@ -553,6 +554,9 @@ class ReplayRank(_impl.TrainerRank):
     """The real estimator with runtime metadata readers replaced by frozen facts."""
 
     _facts: dict[str, Any] | None = None
+    # Each verified group's statistics index vectors (_memory._head_target_bytes),
+    # in group order.
+    _head_targets: list[int]
 
     def _replay_slots(self, slot_refs: Any) -> Any:
         # Replay passes each group's index; map it to that group's frozen slot.
@@ -659,6 +663,9 @@ class ReplayRank(_impl.TrainerRank):
             r.target_tokens is not None or r.top_k is not None for r in requests
         ):
             raise ValueError("head statistics facts disagree with selected requests")
+        self._head_targets.append(
+            _memory._head_target_bytes(projected, requests, grad_enabled=group["grad"])
+        )
 
     def _moe_workspace_bytes(
         self, rows: int, *, checkpoint_grad: bool = False, slot_ref: Any = None
@@ -692,8 +699,11 @@ class ReplayRank(_impl.TrainerRank):
     def runtime_arguments(
         self, facts: Any, arguments: dict[str, Any]
     ) -> dict[str, Any]:
+        """The estimator's arguments from ``facts``, except the head charge:
+        ``verified_arguments`` adds it once every group's requests verify."""
         validate(facts)
         self._facts = facts
+        self._head_targets = []
         self._moe_checkpoint_grad_bytes_per_token = facts[
             "checkpoint_moe_bytes_per_token"
         ]
@@ -706,17 +716,6 @@ class ReplayRank(_impl.TrainerRank):
         dimensions = facts.get("hybridep")
         growth = _memory._hybridep_growth_from_dimensions(
             None if dimensions is None else tuple(dimensions)
-        )
-        head = max(
-            _memory._frozen_head_bytes(
-                facts["head_vocabulary"],
-                g["head_rows"],
-                target_backward=facts["head_target_backward"],
-                statistics=g["head_statistics"],
-                grad=g["grad"],
-                tp=self._topology_key()[1],
-            )
-            for g in groups
         )
         retained, workspace = 0, 0
         if any(g["grad"] for g in groups) and all(g["gdn"] is not None for g in groups):
@@ -741,6 +740,26 @@ class ReplayRank(_impl.TrainerRank):
             "hybridep_growth_bytes": growth,
             "group_rows": rows,
             "slot_refs": tuple(range(len(groups))),
-            "head_workspace_bytes": head,
             "checkpoint_floor": (retained, workspace),
         }
+
+    def verified_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """``arguments`` with the head charge, from the frozen facts and each
+        verified group's requests (their statistics' index vectors)."""
+        assert self._facts is not None
+        groups = self._facts["groups"]
+        if len(self._head_targets) != len(groups):
+            raise ValueError("runtime groups were not verified")
+        head = max(
+            _memory._frozen_head_bytes(
+                self._facts["head_vocabulary"],
+                g["head_rows"],
+                target_backward=self._facts["head_target_backward"],
+                statistics=g["head_statistics"],
+                grad=g["grad"],
+                tp=self._topology_key()[1],
+                targets=targets,
+            )
+            for g, targets in zip(groups, self._head_targets, strict=True)
+        )
+        return {**arguments, "head_workspace_bytes": head}

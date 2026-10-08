@@ -4,7 +4,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from test_trainer_rank_head_memory import rank, request
+from test_trainer_rank_head_memory import rank, request, targets
 from test_trainer_rank_head_recompute import _Head
 import torch
 
@@ -15,12 +15,10 @@ from art.trainer_rank import ForwardInput, TrainerRank, _impl
 def test_ignored_rows_reactivated_by_same_item_output_keep_backward_floor(extra):
     r = rank()
     item = replace(request(128, grad=True, ignored=True), **extra)
-    assert (
-        r._plan_head_workspace_bytes(r._plan_flat_forward([item]))
-        == 7 * 128 * 248320 * 2
-    )
-    assert r._estimate_flat_forward([item], exact=True)[-1] == 7 * 128 * 248320 * 2
-    assert r._estimate_flat_forward([item])[-1] == 7 * 128 * 248320 * 2
+    head = 7 * 128 * 248320 * 2 + targets(128, [item], grad=True)
+    assert r._plan_head_workspace_bytes(r._plan_flat_forward([item])) == head
+    assert r._estimate_flat_forward([item], exact=True)[-1] == head
+    assert r._estimate_flat_forward([item])[-1] == head
     assert r._head_target_chunk_rows([item], lower_bound=True) == 0
 
 

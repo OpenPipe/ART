@@ -122,7 +122,9 @@ def test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound(
     dense = rows * 248320 * 2
     for grad in (False, True):
         req = [request(rows, grad=grad)]
-        assert r._group_head_workspace_bytes(rows, req, grad_enabled=grad) == 7 * dense
+        assert r._group_head_workspace_bytes(
+            rows, req, grad_enabled=grad
+        ) == 7 * dense + _memory._head_target_bytes(rows, req, grad_enabled=grad)
         assert (
             r._group_head_workspace_bytes(
                 rows, req, grad_enabled=grad, lower_bound=True

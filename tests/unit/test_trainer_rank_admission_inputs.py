@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from test_trainer_rank_head_memory import rank as head_rank
 from test_trainer_rank_head_memory import request as head_request
+from test_trainer_rank_head_memory import targets
 from test_trainer_rank_pending_memory import layer, pending_rank
 from test_trainer_rank_recompute_memory import _hybrid_rank
 import torch
@@ -49,7 +50,9 @@ def test_shared_head_lower_and_plan_keep_all_keywords(monkeypatch):
         0,
         2 * (188416 + 4 * 2048 * 2),
     )
-    assert rank._plan_head_workspace_bytes(plan) == 7 * 2 * 248320 * 2
+    assert rank._plan_head_workspace_bytes(plan) == 7 * 2 * 248320 * 2 + targets(
+        2, requests, grad=False
+    )
     calls = record_prices(monkeypatch, rank)
     lower = rank._split_chunk_lower_cost(
         requests, tuple(item.input_tokens for item in requests), checkpoint=Unset
@@ -69,7 +72,8 @@ def test_shared_head_lower_and_plan_keep_all_keywords(monkeypatch):
         assert_plan_values(rank, plan, values)
     # All shape/floor inputs remain available together, even though the dense
     # head dominates this two-row source floor and sharing changes logical rows.
-    assert cost.required == int((plan.output_bytes + 7 * 2 * 248320 * 2) * 1.1)
+    head = 7 * 2 * 248320 * 2 + targets(2, requests, grad=False)
+    assert cost.required == int((plan.output_bytes + head) * 1.1)
 
 
 def test_cp_gdn_segments_groups_and_retained_tokens_reach_exact_search(monkeypatch):

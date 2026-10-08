@@ -4,7 +4,7 @@ from dataclasses import replace
 from types import MethodType, SimpleNamespace
 
 import pytest
-from test_trainer_rank_head_memory import rank, request
+from test_trainer_rank_head_memory import rank, request, targets
 from test_trainer_rank_head_recompute import _Head
 import torch
 
@@ -22,7 +22,9 @@ def test_adding_output_cannot_erase_existing_target_admission_floor(extra):
     after = r._plan_cost(plan).required
     print({"extra": extra, "before": before, "after": after})
     assert after >= before
-    assert r._plan_head_workspace_bytes(plan) == 7 * 129 * 248320 * 2
+    assert r._plan_head_workspace_bytes(plan) == 7 * 129 * 248320 * 2 + targets(
+        129, [target, added], grad=True
+    )
     r._available_memory_bytes = lambda: before - 1
     assert not r._memory_check(plan).fits
 
@@ -40,13 +42,14 @@ def test_sparse_target_prices_its_full_mixed_chunk_and_short_tail(extra):
     assert r._head_target_chunk_rows(req, lower_bound=True) == 1
     assert r._head_target_chunk_rows(req) == 512
     dense = 512 * 248320 * 2
+    capacity = 7 * dense + targets(512, req, grad=True)
     assert (
         r._group_head_workspace_bytes(512, req, grad_enabled=True, positions=full)
-        == 7 * dense
+        == capacity
     )
     assert (
         r._group_head_workspace_bytes(512, req, grad_enabled=True, positions=tail)
-        == 7 * dense
+        == capacity
     )
     # Optional eager demand is not an unconditional rejection lower bound.
     for positions, expected in ((full, 2 * dense), (tail, dense)):
@@ -88,10 +91,9 @@ def test_shared_multilabel_union_matches_actual_and_split_bounds(extra):
             ).required
             <= r._plan_cost(plan).required
         )
-    assert (
-        r._plan_head_workspace_bytes(r._plan_flat_forward(req, memory_minimal=True))
-        == 7 * 4 * 248320 * 2
-    )
+    assert r._plan_head_workspace_bytes(
+        r._plan_flat_forward(req, memory_minimal=True)
+    ) == 7 * 4 * 248320 * 2 + targets(4, req, grad=True)
 
 
 @pytest.mark.parametrize("extra", [{"logits": True}, {"top_k": 2}])
@@ -99,10 +101,14 @@ def test_ignored_device_labels_and_no_target_keep_distinct_guards(extra):
     r = rank()
     ignored = replace(request(128, grad=True, ignored=True), **extra)
     dense = 128 * 248320 * 2
-    assert r._plan_head_workspace_bytes(r._plan_flat_forward([ignored])) == 7 * dense
+    assert r._plan_head_workspace_bytes(
+        r._plan_flat_forward([ignored])
+    ) == 7 * dense + targets(128, [ignored], grad=True)
     no_target = replace(ignored, target_tokens=None)
     assert r._plan_head_workspace_bytes(r._plan_flat_forward([no_target])) == (
-        7 * dense if "top_k" in extra else 3 * dense
+        7 * dense + targets(128, [no_target], grad=True)
+        if "top_k" in extra
+        else 3 * dense
     )
     device = replace(
         ignored, target_tokens=torch.empty(128, device="meta", dtype=torch.long)
@@ -133,6 +139,8 @@ def test_mixed_path_prices_no_grad_but_preserves_source_scaling_guards(mutation)
         model.output_layer.register_forward_hook(lambda *args: None)
     multiplier = 0 if mutation == "head_hook" else 7 if mutation == "no_grad" else 1
     expected = multiplier * 128 * 248320 * 2
+    if mutation == "no_grad":
+        expected += targets(128, [item], grad=False)
     assert r._plan_head_workspace_bytes(r._plan_flat_forward([item])) == expected
 
 
