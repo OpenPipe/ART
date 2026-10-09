@@ -24,27 +24,24 @@ def choose_output_placements(
     outputs: Sequence[tuple[int, Literal["auto", "model", "cpu"]]],
     *,
     gpu_available_bytes: int,
-    allow_oversized: bool = False,
 ) -> tuple[OutputDevice, ...]:
     """Place already gathered CPU outputs before making any model-device copy.
 
     The caller admits the CPU receive/serialization buffers before gathering.
     Fresh GPU headroom excludes live storage and pending restore/staging reserves.
     Explicit model placement is reserved before optional model placement.
-    The oversized opt-in permits required model copies, not extra auto credit;
-    actual allocation failures remain the caller's responsibility.
     """
     if any(
         size < 0 or device not in ("auto", "model", "cpu") for size, device in outputs
     ):
         raise ValueError("Expected nonnegative output bytes and auto/model/cpu policy")
     required = sum(size for size, device in outputs if device == "model")
-    if required > max(0, gpu_available_bytes) and not allow_oversized:
+    if required > max(0, gpu_available_bytes):
         raise MemoryError(
             f"Gathered model-device outputs require {required} GPU bytes; "
             f"only {max(0, gpu_available_bytes)} bytes are available"
         )
-    remaining = max(0, gpu_available_bytes - required)
+    remaining = max(0, gpu_available_bytes) - required
     placements: list[OutputDevice] = []
     for size, device in outputs:
         if device == "auto":

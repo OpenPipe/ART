@@ -978,11 +978,7 @@ class _RankView:
         if hasattr(self._rank, "_pending_backward_memory"):
             available -= sum(self._rank._pending_backward_memory())
         placements = iter(
-            choose_output_placements(
-                costs,
-                gpu_available_bytes=available,
-                allow_oversized=getattr(self._rank, "_allow_oversized_batches", False),
-            )
+            choose_output_placements(costs, gpu_available_bytes=available)
         )
         result = []
         for output, _ in outputs:
