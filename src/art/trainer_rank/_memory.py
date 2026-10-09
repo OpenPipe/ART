@@ -347,8 +347,7 @@ def _group_head_workspace_bytes(
     not a bound for row vectors, inter-chunk liveness or library workspaces.
     Rejection lower bounds retain only the unconditional dense components.
     TP > 1 heads (priced with the explicit TP x SP floor) instead follow each
-    chunk's statistics path: ``_tp_head_workspace_bytes``. Statistics capacity
-    adds their index vectors (``_head_target_bytes``) on both.
+    chunk's statistics path: ``_tp_head_workspace_bytes``.
     """
     dense = self._head_workspace_bytes(rows)
     if dense and self._topology_key()[1] > 1:
@@ -375,17 +374,12 @@ def _group_head_workspace_bytes(
             # also take the eager path; optional success is not guaranteed.
             # Without statistics, local logits and both indexed copies
             # overlap. Requested output storage is charged separately.
-            if not needs_statistics:
-                return 3 * dense
-            return 7 * dense + _head_target_bytes(
-                rows, requests, grad_enabled=grad_enabled
-            )
+            return (7 if needs_statistics else 3) * dense
         if not grad_enabled or not any(
             request.target_tokens is not None for request in requests
         ):
             return dense
-        # Every statistics path's backward holds the labelled chunk's logits
-        # and their gradient.
+        # IndexBackward's dense result overlaps saved logits and grad_logits.
         target_dense = (
             self._head_workspace_bytes(
                 self._head_target_chunk_rows(
@@ -395,7 +389,7 @@ def _group_head_workspace_bytes(
             if any(request.logits or request.top_k is not None for request in requests)
             else dense
         )
-        return max(dense, 2 * target_dense)
+        return max(dense, 3 * target_dense)
     return dense
 
 
@@ -414,11 +408,10 @@ def _tp_head_workspace_bytes(
     kernel is attempted run it, or after a failure the bounded eager
     statistics (``_impl._EagerLocalStats``): the kernel path's buffers plus
     ``_eager_stats_extra_bytes``. A gradient wave's kernel path holds the
-    saved logits and the statistics gradient: target and top-k gradients
-    join it inside the statistics backward. Requested logits hold the local
-    logits, their indexed copy, the gather buffer and its concatenation
-    (Megatron's gather along the vocabulary): 2 + 2 TP. Statistics capacity
-    adds their index vectors: ``_head_target_bytes``.
+    saved logits and the statistics gradient, plus a dense gradient per
+    gathered output kind: the target gather's and top-k's scatter. Requested
+    logits hold the local logits, their indexed copy, the gather buffer and
+    its concatenation (Megatron's gather along the vocabulary): 2 + 2 TP.
     """
     dense = self._head_workspace_bytes(rows)
     if not _head_target_backward(self):
@@ -431,7 +424,25 @@ def _tp_head_workspace_bytes(
     if not needs_statistics:
         logits = any(request.logits for request in requests)
         return dense if lower_bound or not logits else (2 + 2 * tp) * dense
-    kernel = 2 * dense if grad_enabled else dense
+    kernel = dense
+    if grad_enabled:
+        # Saved logits and the statistics gradient, then each gathered
+        # output's dense gradient: top-k's scatter and the target gather's.
+        kernel = 2 * dense
+        if any(request.top_k is not None for request in requests):
+            kernel += dense
+        if any(request.target_tokens is not None for request in requests):
+            kernel += (
+                self._head_workspace_bytes(
+                    self._head_target_chunk_rows(
+                        requests, positions=positions, lower_bound=lower_bound
+                    )
+                )
+                if any(
+                    request.logits or request.top_k is not None for request in requests
+                )
+                else dense
+            )
     low = self._head_projection_rows(
         requests, positions=positions, lower_bound=True, uncapped=True
     )
@@ -456,50 +467,6 @@ def _tp_head_workspace_bytes(
         kernel + _eager_stats_extra_bytes(_head_vocabulary(self), rows),
         fallback,
         logits,
-    ) + _head_target_bytes(rows, requests, grad_enabled=grad_enabled)
-
-
-# The statistics' index vectors beside the head buffers, measured on CPU and
-# H200 at up to 1,000 targets per row. Per target (a label or top-k entry) in
-# the running chunk: its row and column, their grouping by row and FP32
-# gradient (32 B in the kernel paths' backward; the TP1 fallback's forward
-# holds 24 B beside the top-k selection).
-_HEAD_CHUNK_TARGET_BYTES = 36
-# Per label of the wave: the checkpointed (row, label) pairs, each chunk's
-# log-probs and their gradient (28 B).
-_HEAD_LABEL_BYTES = 32
-# Per top-k entry of a gradient wave: the requested log-probs' gradient.
-_HEAD_TOP_K_GRADIENT_BYTES = 4
-# Per row of the running chunk: maxima, sums, log-normalizers, positions.
-# Not the Triton backward's (row, vocab block) target offsets, 16 B per
-# 4,096-entry block (about 500 B per row of a 124,160-entry shard): TP > 1
-# covers them with the bounded statistics' increment, charged even when the
-# kernel runs, and TP1 with the fallback's seven buffers. Trimming either
-# needs this term to price them.
-_HEAD_CHUNK_ROW_BYTES = 128
-
-
-def _head_target_bytes(
-    rows: int, requests: Sequence[AnyForwardInput], *, grad_enabled: bool
-) -> int:
-    """The statistics' index vectors for ``rows`` projected head rows: per row
-    and target of the largest chunk, and per label and top-k entry retained
-    across chunks. Requested outputs are charged separately."""
-    chunk = min(rows, _impl._HEAD_CHUNK_TOKENS)
-    labels = width = top_k = 0
-    for request in requests:
-        tokens = int(request.input_tokens.numel())
-        if request.target_tokens is not None and tokens:
-            labels += int(request.target_tokens.numel())
-            width += -(-int(request.target_tokens.numel()) // tokens)
-        if request.top_k is not None:
-            top_k += tokens * int(request.top_k)
-            width += int(request.top_k)
-    return (
-        _HEAD_CHUNK_ROW_BYTES * chunk
-        + _HEAD_CHUNK_TARGET_BYTES * min(chunk * width, labels + top_k)
-        + _HEAD_LABEL_BYTES * labels
-        + (_HEAD_TOP_K_GRADIENT_BYTES * top_k if grad_enabled else 0)
     )
 
 
@@ -515,30 +482,35 @@ def _eager_stats_extra_bytes(vocabulary: int, rows: int) -> int:
 def _frozen_head_bytes(
     vocabulary: int,
     rows: int,
+    target_rows: int,
     *,
     target_backward: bool,
     statistics: bool,
     grad: bool,
     tp: int,
-    targets: int,
 ) -> int:
     """Replay's head charge from frozen facts, as live admission prices it.
 
     TP1 is #1068's capacity charge. TP > 1 is ``_tp_head_workspace_bytes``'s
     kernel path plus the bounded statistics' increment, or the gathered logits
-    copies. Capture declines TP > 1 waves with an eager chunk or with logits
-    beside statistics: the facts record neither. ``targets`` is
-    ``_head_target_bytes`` of the verified requests.
+    copies. Capture declines TP > 1 waves with an eager chunk, with logits
+    beside statistics, or with top-k beside targets in a gradient wave: the
+    facts record none of these. A gradient wave with statistics but no target
+    rows is therefore top-k only.
     """
     dense = _dense_head_bytes(vocabulary, rows)
-    if not dense or not target_backward:
+    if not target_backward:
         return dense
-    if not statistics:
-        return (3 if tp == 1 else 2 + 2 * tp) * dense
     if tp == 1:
-        return 7 * dense + targets
-    kernel = 2 * dense if grad else dense
-    return kernel + _eager_stats_extra_bytes(vocabulary, rows) + targets
+        return dense * (7 if statistics else 3)
+    if not statistics:
+        return (2 + 2 * tp) * dense
+    kernel = dense
+    if grad:
+        kernel = 2 * dense + (
+            _dense_head_bytes(vocabulary, target_rows) if target_rows else dense
+        )
+    return kernel + _eager_stats_extra_bytes(vocabulary, rows)
 
 
 def _head_fallback_bytes(self: TrainerRank, low: int, high: int) -> int:
@@ -1326,6 +1298,16 @@ def _estimate_flat_forward(
                     gdn_segments.append(len(layout.segments))
                 projected = upper
                 positions = None
+                mixed_targets = (
+                    grad_enabled
+                    and any(
+                        request.target_tokens is not None for request in head_requests
+                    )
+                    and any(
+                        request.logits or request.top_k is not None
+                        for request in head_requests
+                    )
+                )
                 # TP > 1 heads price each chunk's statistics path, so the
                 # exact count needs the packed union beyond one chunk too.
                 spread = (
@@ -1336,7 +1318,17 @@ def _estimate_flat_forward(
                     )
                     != self._head_projection_rows(head_requests, uncapped=True)
                 )
-                if lower != upper or spread:
+                if (
+                    lower != upper
+                    or spread
+                    or (
+                        mixed_targets
+                        and self._head_target_chunk_rows(
+                            head_requests, lower_bound=True
+                        )
+                        != self._head_target_chunk_rows(head_requests)
+                    )
+                ):
                     packed = _impl.materialize_prefix_tree_layout(
                         tuple(
                             request.input_tokens.reshape(-1).to(dtype=_impl.torch.long)

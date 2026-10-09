@@ -30,12 +30,10 @@ from art.trainer_rank._checkpoint import (  # noqa: E402
     _commit_slot,
 )
 from art.trainer_rank._impl import (  # noqa: E402
-    _all_reduce_tensor_parallel_sum,
     _CheckpointSlot,
     _distributed_grad_norm,
-    _local_targets,
-    _target_logprobs,
     _vocab_parallel_log_z,
+    _vocab_parallel_target_logprobs,
     _vocab_parallel_topk_from_local,
 )
 
@@ -306,11 +304,11 @@ def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
         local = _local_shard(full, rank, local_size)
         labels = torch.tensor([2, 5], device=device)
         rows = torch.arange(int(full.shape[0]), device=device)
-        log_z, target_logits = _vocab_parallel_log_z(
-            local, _local_targets(local, (rows, labels))
-        )
-        actual = _target_logprobs(
-            _all_reduce_tensor_parallel_sum(target_logits), labels, log_z
+        actual = _vocab_parallel_target_logprobs(
+            local,
+            labels,
+            _vocab_parallel_log_z(local),
+            row_offsets=rows,
         )
         (-actual.sum()).backward()
 
@@ -329,7 +327,7 @@ def _tp_head_backward_worker(rank: int, world: int, init_method: str) -> None:
             local_values,
             local_tokens,
             k=2,
-            log_z=_vocab_parallel_log_z(local)[0],
+            log_z=_vocab_parallel_log_z(local),
             vocab_start=rank * local_size,
         )
         (-actual_topk.logprobs.sum()).backward()

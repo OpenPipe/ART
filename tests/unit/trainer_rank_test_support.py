@@ -3,13 +3,9 @@
 from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import timedelta
-from functools import partial
 import json
-from pathlib import Path
 import sys
-import tempfile
 import time
-import traceback
 from types import ModuleType, SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
@@ -149,26 +145,6 @@ def process_group(rank, rendezvous, *, world_size=2, timeout=30, backend="gloo")
 gloo_group = process_group
 
 
-class AllReduceSum(torch.autograd.Function):
-    """Megatron's reduce-from-tensor-parallel region: sum, identity backward."""
-
-    @staticmethod
-    def forward(ctx, tensor):
-        output = tensor.clone()
-        dist.all_reduce(output)
-        return output
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        return grad_outputs[0]
-
-
-def all_reduce_max(tensor):
-    output = tensor.clone()
-    dist.all_reduce(output, op=dist.ReduceOp.MAX)
-    return output
-
-
 @contextmanager
 def megatron_topology(physical, *, dp_size, tp_size):
     """Install just the callback topology, with each real TP group created in order."""
@@ -201,43 +177,14 @@ def megatron_topology(physical, *, dp_size, tp_size):
         yield getattr(core, "parallel_state")
 
 
-def _traced_worker(worker, errors, rank, *args):
-    try:
-        worker(rank, *args)
-    except BaseException:
-        (Path(errors) / f"rank-{rank}.txt").write_text(traceback.format_exc())
-        raise
-
-
 def spawn_and_join(worker, args, *, timeout, failure, nprocs=2):
-    """Bound a collective test while preserving every worker's traceback.
-
-    A worker that fails tears down its process group, so its peers fail next
-    with only a closed connection: each rank's own traceback is attached.
-    """
-    with tempfile.TemporaryDirectory() as errors:
-        try:
-            _spawn_and_join(
-                partial(_traced_worker, worker, errors),
-                args,
-                timeout=timeout,
-                failure=failure,
-                nprocs=nprocs,
-            )
-        except BaseException as error:
-            for path in sorted(Path(errors).glob("rank-*.txt")):
-                error.add_note(f"{path.stem} traceback:\n{path.read_text()}")
-            raise
-
-
-def _spawn_and_join(worker, args, *, timeout, failure, nprocs):
+    """Bound a collective test while preserving spawned-worker tracebacks."""
     processes = mp.spawn(worker, args=args, nprocs=nprocs, join=False)
     error = None
     try:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            # Peers of a failed rank get time to record their own failure.
-            if processes.join(timeout=1, grace_period=10):
+            if processes.join(timeout=1):
                 return
         pytest.fail(failure)
     except BaseException as exc:

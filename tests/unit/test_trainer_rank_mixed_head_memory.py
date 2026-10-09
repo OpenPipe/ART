@@ -4,7 +4,7 @@ from dataclasses import replace
 from types import MethodType, SimpleNamespace
 
 import pytest
-from test_trainer_rank_head_memory import rank, request, targets
+from test_trainer_rank_head_memory import rank, request
 from test_trainer_rank_head_recompute import _Head
 import torch
 
@@ -22,9 +22,7 @@ def test_adding_output_cannot_erase_existing_target_admission_floor(extra):
     after = r._plan_cost(plan).required
     print({"extra": extra, "before": before, "after": after})
     assert after >= before
-    assert r._plan_head_workspace_bytes(plan) == 7 * 129 * 248320 * 2 + targets(
-        129, [target, added], grad=True
-    )
+    assert r._plan_head_workspace_bytes(plan) == 7 * 129 * 248320 * 2
     r._available_memory_bytes = lambda: before - 1
     assert not r._memory_check(plan).fits
 
@@ -42,17 +40,16 @@ def test_sparse_target_prices_its_full_mixed_chunk_and_short_tail(extra):
     assert r._head_target_chunk_rows(req, lower_bound=True) == 1
     assert r._head_target_chunk_rows(req) == 512
     dense = 512 * 248320 * 2
-    capacity = 7 * dense + targets(512, req, grad=True)
     assert (
         r._group_head_workspace_bytes(512, req, grad_enabled=True, positions=full)
-        == capacity
+        == 7 * dense
     )
     assert (
         r._group_head_workspace_bytes(512, req, grad_enabled=True, positions=tail)
-        == capacity
+        == 7 * dense
     )
     # Optional eager demand is not an unconditional rejection lower bound.
-    for positions, expected in ((full, 2 * dense), (tail, dense)):
+    for positions, expected in ((full, 3 * dense), (tail, dense)):
         assert (
             r._group_head_workspace_bytes(
                 512, req, grad_enabled=True, positions=positions, lower_bound=True
@@ -91,9 +88,10 @@ def test_shared_multilabel_union_matches_actual_and_split_bounds(extra):
             ).required
             <= r._plan_cost(plan).required
         )
-    assert r._plan_head_workspace_bytes(
-        r._plan_flat_forward(req, memory_minimal=True)
-    ) == 7 * 4 * 248320 * 2 + targets(4, req, grad=True)
+    assert (
+        r._plan_head_workspace_bytes(r._plan_flat_forward(req, memory_minimal=True))
+        == 7 * 4 * 248320 * 2
+    )
 
 
 @pytest.mark.parametrize("extra", [{"logits": True}, {"top_k": 2}])
@@ -101,14 +99,10 @@ def test_ignored_device_labels_and_no_target_keep_distinct_guards(extra):
     r = rank()
     ignored = replace(request(128, grad=True, ignored=True), **extra)
     dense = 128 * 248320 * 2
-    assert r._plan_head_workspace_bytes(
-        r._plan_flat_forward([ignored])
-    ) == 7 * dense + targets(128, [ignored], grad=True)
+    assert r._plan_head_workspace_bytes(r._plan_flat_forward([ignored])) == 7 * dense
     no_target = replace(ignored, target_tokens=None)
     assert r._plan_head_workspace_bytes(r._plan_flat_forward([no_target])) == (
-        7 * dense + targets(128, [no_target], grad=True)
-        if "top_k" in extra
-        else 3 * dense
+        7 * dense if "top_k" in extra else 3 * dense
     )
     device = replace(
         ignored, target_tokens=torch.empty(128, device="meta", dtype=torch.long)
@@ -139,8 +133,6 @@ def test_mixed_path_prices_no_grad_but_preserves_source_scaling_guards(mutation)
         model.output_layer.register_forward_hook(lambda *args: None)
     multiplier = 0 if mutation == "head_hook" else 7 if mutation == "no_grad" else 1
     expected = multiplier * 128 * 248320 * 2
-    if mutation == "no_grad":
-        expected += targets(128, [item], grad=False)
     assert r._plan_head_workspace_bytes(r._plan_flat_forward([item])) == expected
 
 
@@ -170,15 +162,14 @@ def test_actual_mixed_projection_preserves_target_outputs_and_backward(
             values[:, :k] - log_z[:, None], tokens[:, :k]
         ),
     )
-    original = TrainerRank._local_head_stats
+    original = _impl._vocab_parallel_target_logprobs
     calls = []
 
-    def head_stats(self, model, hidden, *, targets=None, **kwargs):
-        if targets is not None:
-            calls.append((int(hidden.shape[0]), targets[0].unique().tolist()))
-        return original(self, model, hidden, targets=targets, **kwargs)
+    def target_path(logits, labels, log_z, *, row_offsets):
+        calls.append((tuple(logits.shape), labels.tolist(), row_offsets.tolist()))
+        return original(logits, labels, log_z, row_offsets=row_offsets)
 
-    monkeypatch.setattr(TrainerRank, "_local_head_stats", head_stats)
+    monkeypatch.setattr(_impl, "_vocab_parallel_target_logprobs", target_path)
     generator = torch.Generator().manual_seed(97)
     hidden = torch.randn(13, 5, generator=generator, dtype=torch.float64)
     weights = torch.randn(17, 5, generator=generator, dtype=torch.float64)
@@ -235,6 +226,5 @@ def test_actual_mixed_projection_preserves_target_outputs_and_backward(
     after = run(True)
     for a, b in zip(after, before, strict=True):
         torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-7)
-    # A mixed 4-row chunk gathers the targets of fewer rows.
-    assert any(chunk == 4 and len(rows) < 4 for chunk, rows in calls)
+    assert any(shape == (4, 17) and len(rows) < 4 for shape, _, rows in calls)
     assert all(value.isfinite().all() and value.abs().sum() > 0 for value in after)

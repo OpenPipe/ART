@@ -122,14 +122,12 @@ def test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound(
     dense = rows * 248320 * 2
     for grad in (False, True):
         req = [request(rows, grad=grad)]
-        assert r._group_head_workspace_bytes(
-            rows, req, grad_enabled=grad
-        ) == 7 * dense + _memory._head_target_bytes(rows, req, grad_enabled=grad)
+        assert r._group_head_workspace_bytes(rows, req, grad_enabled=grad) == 7 * dense
         assert (
             r._group_head_workspace_bytes(
                 rows, req, grad_enabled=grad, lower_bound=True
             )
-            == (2 if grad else 1) * dense
+            == (3 if grad else 1) * dense
         )
 
 
@@ -171,7 +169,7 @@ def test_eager_exp_boundary_has_four_distinct_cpu_dense_storages(
     monkeypatch.setattr(torch.Tensor, "float", as_float)
     monkeypatch.setattr(torch, "exp", exp)
     with torch.set_grad_enabled(grad):
-        actual, _ = _impl._vocab_parallel_log_z(logits)
+        actual = _impl._vocab_parallel_log_z(logits)
     assert observed == [7 * rows * 17 * 2]
     torch.testing.assert_close(actual, torch.logsumexp(original_float(logits), dim=-1))
     if grad:
@@ -189,9 +187,9 @@ def test_group_stats_cover_logits_chunks_before_short_target_tail(
     original = _impl._vocab_parallel_log_z
     calls = []
 
-    def log_z(logits, targets):
+    def log_z(logits):
         calls.append(tuple(logits.shape))
-        return original(logits, targets)
+        return original(logits)
 
     monkeypatch.setattr(_impl, "_vocab_parallel_log_z", log_z)
     model = SimpleNamespace(

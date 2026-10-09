@@ -52,13 +52,6 @@ def rank():
     return r
 
 
-def targets(rows, requests, *, grad):
-    """The statistics' index vectors, priced beside the head buffers."""
-    from art.trainer_rank import _memory
-
-    return _memory._head_target_bytes(rows, requests, grad_enabled=grad)
-
-
 def request(rows=512, *, grad=False, hidden=False, ignored=False):
     return ForwardInput(
         input_tokens=torch.arange(rows),
@@ -85,7 +78,7 @@ def test_mixed_checkpoint_head_demand_survives_recovery(monkeypatch, fits_after)
     values = r._estimate_flat_forward(requests, exact=True)
     assert values[3] == ((8, True), (16, False))
     assert r._checkpoint_memory_floor(values[3])[0] == 8 * 40 * 2048 * 2
-    assert values[4] == 7 * 16 * 248320 * 2 + targets(16, requests[1:], grad=False)
+    assert values[4] == 7 * 16 * 248320 * 2
     _check_component_demand_recovery(monkeypatch, r, requests, fits_after=fits_after)
 
 
@@ -154,7 +147,7 @@ def test_outputs_retention_and_empirical_peak_are_counted_once():
     plan = r._plan_flat_forward([request(grad=True)])
     retained = 512 * 40 * 2048 * 2
     gradient = 512 * 40 * 2048 * 2
-    head = 7 * 512 * 248320 * 2 + targets(512, [request(grad=True)], grad=True)
+    head = 7 * 512 * 248320 * 2
     cost = r._plan_cost(plan)
     assert cost.retained == int((plan.output_bytes + retained + head) * 1.1)
     # Unprofiled: the first execution's transients beside the head workspace.
@@ -184,10 +177,9 @@ def test_ignored_targets_hidden_only_and_tiny_target_group():
     assert r._head_projection_rows([ignored, hidden]) == 0
     assert r._plan_head_workspace_bytes(r._plan_flat_forward([ignored, hidden])) == 0
     plan = r._plan_flat_forward([hidden, target])
-    head = 7 * 248320 * 2 + targets(1, [target], grad=True)
-    assert r._plan_head_workspace_bytes(plan) == head
-    assert r._estimate_flat_forward([hidden, target])[-1] == head
-    assert r._estimate_flat_forward([hidden, target], exact=True)[-1] == head
+    assert r._plan_head_workspace_bytes(plan) == 7 * 248320 * 2
+    assert r._estimate_flat_forward([hidden, target])[-1] == 7 * 248320 * 2
+    assert r._estimate_flat_forward([hidden, target], exact=True)[-1] == 7 * 248320 * 2
 
 
 def test_multilabel_row_validity_matches_projection():
@@ -197,9 +189,9 @@ def test_multilabel_row_validity_matches_projection():
         target_tokens=torch.tensor([[-100, -100], [-100, 2], [3, -100], [-100, -100]]),
     )
     assert r._head_projection_rows([item]) == 2
-    assert r._plan_head_workspace_bytes(
-        r._plan_flat_forward([item])
-    ) == 7 * 2 * 248320 * 2 + targets(2, [item], grad=False)
+    assert (
+        r._plan_head_workspace_bytes(r._plan_flat_forward([item])) == 7 * 2 * 248320 * 2
+    )
 
 
 def test_shared_rows_use_lower_upper_and_exact_layout_union():
@@ -211,8 +203,7 @@ def test_shared_rows_use_lower_upper_and_exact_layout_union():
     assert r._head_projection_rows(req) == 4
     exact = r._estimate_flat_forward(req, exact=True, memory_minimal=True)
     plan = r._plan_flat_forward(req, memory_minimal=True)
-    head = 7 * 2 * 248320 * 2 + targets(2, req, grad=False)
-    assert exact[-1] == r._plan_head_workspace_bytes(plan) == head
+    assert exact[-1] == r._plan_head_workspace_bytes(plan) == 7 * 2 * 248320 * 2
     lower = r._split_chunk_lower_cost(
         req, tuple(x.input_tokens for x in req), checkpoint=Unset
     )
@@ -330,8 +321,7 @@ def test_eager_statistics_refuses_budget_between_old_and_new_components(rows):
     gradient = rows * 40 * 2048 * 2
     dense = min(rows, 512) * 248320 * 2
     before = int((plan.output_bytes + retained + gradient + 3 * dense + COLD) * 1.1)
-    head = 7 * dense + targets(rows, [request(rows, grad=True)], grad=True)
-    expected = int((plan.output_bytes + retained + gradient + head + COLD) * 1.1)
+    expected = int((plan.output_bytes + retained + gradient + 7 * dense + COLD) * 1.1)
     r._available_memory_bytes = lambda: (before + expected) // 2
     check = r._memory_check(plan)
     assert check.estimated_required_bytes == expected
@@ -344,12 +334,7 @@ def test_group_head_workspace_keeps_gradient_mode_with_its_rows(
 ):
     r = rank()
     requests = [request(gradient_rows, grad=True), request(reference_rows)]
-    expected = max(
-        7 * gradient_rows * 248320 * 2
-        + targets(gradient_rows, requests[:1], grad=True),
-        7 * reference_rows * 248320 * 2
-        + targets(reference_rows, requests[1:], grad=False),
-    )
+    expected = 7 * max(gradient_rows, reference_rows) * 248320 * 2
     plan = r._plan_flat_forward(requests)
     assert r._plan_head_workspace_bytes(plan) == expected
     for exact in (False, True):
@@ -357,7 +342,7 @@ def test_group_head_workspace_keeps_gradient_mode_with_its_rows(
             assert r._estimate_flat_forward(
                 requests, exact=exact, memory_minimal=minimal
             )[-1] == (
-                max(2 * gradient_rows, reference_rows) * 248320 * 2
+                max(3 * gradient_rows, reference_rows) * 248320 * 2
                 if minimal and not exact
                 else expected
             )
@@ -381,9 +366,9 @@ def test_gradient_statistics_floor_requires_exact_effective_scaling(mutation):
         r._plan_head_workspace_bytes(r._plan_flat_forward(logits))
         == 3 * 128 * 248320 * 2
     )
-    assert r._plan_head_workspace_bytes(
-        r._plan_flat_forward(req)
-    ) == 7 * 128 * 248320 * 2 + targets(128, req, grad=True)
+    assert (
+        r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 7 * 128 * 248320 * 2
+    )
     if mutation == "custom":
         model._scale_logits = lambda logits: logits
     elif mutation == "other_model":
@@ -457,18 +442,19 @@ def test_no_grad_logits_shared_rows_keep_outputs_and_statistics_separate():
     )
     # Any labels enable statistics group-wide, including ignored labels.
     req.append(request(4, ignored=True))
-    assert r._plan_head_workspace_bytes(
-        r._plan_flat_forward(req, memory_minimal=True)
-    ) == 7 * dense + targets(4, req, grad=False)
+    assert (
+        r._plan_head_workspace_bytes(r._plan_flat_forward(req, memory_minimal=True))
+        == 7 * dense
+    )
 
 
 @pytest.mark.parametrize("extra", [{"logits": True}, {"top_k": 2}])
 def test_gradient_statistics_floor_survives_additional_output_modes(extra):
     r = rank()
     req = [replace(request(128, grad=True), **extra)]
-    assert r._plan_head_workspace_bytes(
-        r._plan_flat_forward(req)
-    ) == 7 * 128 * 248320 * 2 + targets(128, req, grad=True)
+    assert (
+        r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 7 * 128 * 248320 * 2
+    )
 
 
 def test_gradient_shared_rows_price_same_union_in_exact_and_split_lower_cost():
@@ -477,10 +463,10 @@ def test_gradient_shared_rows_price_same_union_in_exact_and_split_lower_cost():
     b = replace(a, target_tokens=torch.tensor([-100, 1]))
     requests = [a, a, b, b]
     plan = r._plan_flat_forward(requests, memory_minimal=True)
-    expected = 7 * 2 * 248320 * 2 + targets(2, requests, grad=True)
+    expected = 7 * 2 * 248320 * 2
     exact = r._estimate_flat_forward(requests, exact=True, memory_minimal=True)
     assert exact[-1] == r._plan_head_workspace_bytes(plan) == expected
-    assert r._estimate_flat_forward(requests, memory_minimal=True)[-1] == 2 * 248320 * 2
+    assert r._estimate_flat_forward(requests, memory_minimal=True)[-1] == 3 * 248320 * 2
     lower = r._split_chunk_lower_cost(
         requests, tuple(x.input_tokens for x in requests), checkpoint=Unset
     )
@@ -492,6 +478,4 @@ def test_later_sparse_loss_does_not_reduce_6330_projected_targets():
     item = request(6330, grad=True)
     plan = r._plan_flat_forward([item])
     assert item.target_tokens.numel() == 6330
-    assert r._plan_head_workspace_bytes(plan) == 7 * 512 * 248320 * 2 + targets(
-        6330, [item], grad=True
-    )
+    assert r._plan_head_workspace_bytes(plan) == 7 * 512 * 248320 * 2

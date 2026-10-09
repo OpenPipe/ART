@@ -4,7 +4,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from test_trainer_rank_head_memory import rank, request, targets
+from test_trainer_rank_head_memory import rank, request
 from test_trainer_rank_head_recompute import _Head
 import torch
 
@@ -15,10 +15,12 @@ from art.trainer_rank import ForwardInput, TrainerRank, _impl
 def test_ignored_rows_reactivated_by_same_item_output_keep_backward_floor(extra):
     r = rank()
     item = replace(request(128, grad=True, ignored=True), **extra)
-    head = 7 * 128 * 248320 * 2 + targets(128, [item], grad=True)
-    assert r._plan_head_workspace_bytes(r._plan_flat_forward([item])) == head
-    assert r._estimate_flat_forward([item], exact=True)[-1] == head
-    assert r._estimate_flat_forward([item])[-1] == head
+    assert (
+        r._plan_head_workspace_bytes(r._plan_flat_forward([item]))
+        == 7 * 128 * 248320 * 2
+    )
+    assert r._estimate_flat_forward([item], exact=True)[-1] == 7 * 128 * 248320 * 2
+    assert r._estimate_flat_forward([item])[-1] == 7 * 128 * 248320 * 2
     assert r._head_target_chunk_rows([item], lower_bound=True) == 0
 
 
@@ -45,7 +47,7 @@ def test_ignored_cross_request_overlap_and_validity_have_separate_roles(extra):
 
 
 @pytest.mark.parametrize("extra", [{"logits": True}, {"top_k": 2}])
-def test_actual_ignored_mixed_backward_keeps_zero_target_gradients(monkeypatch, extra):
+def test_actual_ignored_mixed_backward_keeps_zero_dense_index_graph(monkeypatch, extra):
     monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", 4)
     monkeypatch.setattr(_impl, "_language_model", lambda model: model)
     monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda x: x)
@@ -61,22 +63,35 @@ def test_actual_ignored_mixed_backward_keeps_zero_target_gradients(monkeypatch, 
             values[:, :k] - log_z[:, None], tokens[:, :k]
         ),
     )
-    original = _impl._target_logprobs
-    target_backward = []
+    original = _impl._vocab_parallel_target_logprobs
+    dense_backward = []
     normalizer_backward = []
 
-    def target_path(target_logits, labels, log_z):
+    def target_path(logits, labels, log_z, *, row_offsets):
         assert (labels == -100).all()
-        for tensor, record in (
-            (target_logits, target_backward),
-            (log_z, normalizer_backward),
-        ):
-            tensor.register_hook(
-                lambda grad, record=record: record.append(bool((grad == 0).all()))
+        log_z.register_hook(
+            lambda grad: normalizer_backward.append(
+                (tuple(grad.shape), bool((grad == 0).all()))
             )
-        return original(target_logits, labels, log_z)
+        )
+        output = original(logits, labels, log_z, row_offsets=row_offsets)
+        queue = [output.grad_fn]
+        seen = set()
+        while queue:
+            node = queue.pop()
+            if node is None or node in seen:
+                continue
+            seen.add(node)
+            if type(node).__name__.startswith("IndexBackward"):
+                node.register_hook(
+                    lambda inputs, outputs: dense_backward.append(
+                        (tuple(inputs[0].shape), bool((inputs[0] == 0).all()))
+                    )
+                )
+            queue.extend(next_node for next_node, _ in node.next_functions)
+        return output
 
-    monkeypatch.setattr(_impl, "_target_logprobs", target_path)
+    monkeypatch.setattr(_impl, "_vocab_parallel_target_logprobs", target_path)
     generator = torch.Generator().manual_seed(79)
     hidden = torch.randn(8, 5, generator=generator, requires_grad=True)
     weight = torch.randn(17, 5, generator=generator)
@@ -112,6 +127,7 @@ def test_actual_ignored_mixed_backward_keeps_zero_target_gradients(monkeypatch, 
     assert model.output_layer.weight.grad is not None and bool(
         (model.output_layer.weight.grad == 0).all()
     )
-    # Both chunks' ignored targets run the target backward, with zeros.
-    assert target_backward == [True, True]
-    assert normalizer_backward == [True, True]
+    assert dense_backward and all(
+        shape == (4, 17) and zero for shape, zero in dense_backward
+    )
+    assert normalizer_backward and all(zero for _, zero in normalizer_backward)
