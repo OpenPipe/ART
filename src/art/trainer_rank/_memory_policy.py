@@ -225,10 +225,6 @@ class ForwardMemoryCost:
     persistent_bytes: int = 0
     correction_workspace_bytes: int = 0
     gradient_staging_bytes: int = 0
-    # Pending adapter gradients the backward walk prices inside peak_bytes: a
-    # subset of the staged aggregate gradient_staging_bytes reserves. A no-grad
-    # correction forward allocates none, so its workspace gets no credit.
-    staged_gradient_bytes: int = 0
     replay_seconds: float | None = None
     cpu_resident_bytes: int = 0
 
@@ -241,7 +237,6 @@ class ForwardMemoryCost:
                 self.persistent_bytes,
                 self.correction_workspace_bytes,
                 self.gradient_staging_bytes,
-                self.staged_gradient_bytes,
                 self.cpu_resident_bytes,
             )
             < 0
@@ -296,11 +291,7 @@ def placement_cost(
             transient = cost.peak_bytes - physical_gpu
         gpu_retained += gpu + cost.persistent_bytes
         cpu_retained += cpu
-        workspace = max(
-            workspace,
-            transient - cost.staged_gradient_bytes,
-            cost.correction_workspace_bytes,
-        )
+        workspace = max(workspace, transient, cost.correction_workspace_bytes)
         staging += cost.gradient_staging_bytes
     return MemoryPlacement(
         backward_state,
