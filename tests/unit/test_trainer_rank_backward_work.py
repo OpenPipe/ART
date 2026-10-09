@@ -168,8 +168,6 @@ class TestBackwardWork(unittest.TestCase):
             "_release_cached_memory_for_backward",
             "_memory_error_with_reduction_note",
             "_execute_split_plan_with_memory_tracking",
-            "_forward_handoff",
-            "_discard_forward_graphs",
             "_begin_planner_observation",
         }
         selected = [
@@ -193,7 +191,6 @@ class TestBackwardWork(unittest.TestCase):
             dataclass_field=field,
             threading=threading,
             contextmanager=contextmanager,
-            caller_group=lambda: None,
             traceback=traceback,
             BackwardWork=self.module.BackwardWork,
             _backward_region=self.module.region,

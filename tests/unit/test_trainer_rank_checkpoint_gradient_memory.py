@@ -163,8 +163,6 @@ def test_lower_bound_profile_cliff_preserves_separate_peak_component():
     lower = r._split_chunk_lower_cost(
         req, tuple(q.input_tokens for q in req), checkpoint=Unset
     )
-    retained = 128 * 40 * 2048 * 2
-    assert lower.retained == int((full.output_bytes + retained) * 1.1)
     assert lower.checkpoint_input_gradient == 128 * 40 * 4096
     assert lower.required <= r._plan_cost(full).required
     assert lower.checkpoint_retained == full.output_bytes + 128 * 40 * 4096

@@ -1,5 +1,15 @@
 """TrainerRank checkpoint-slot bookkeeping: prefetch registry, slot
 loading and validation, the slot stack, and slot-graph liveness guards.
+
+These are ``TrainerRank`` method bodies moved out of ``_impl`` verbatim: each
+function takes the owning rank as ``self`` and ``TrainerRank`` binds them as
+methods, so ``self._x(...)`` dispatch and per-instance overrides keep working.
+
+Module globals the bodies used to read from ``_impl`` (``torch``, ``dist``,
+sibling helpers) are still resolved through ``_impl`` at call time, so tests
+that patch ``_impl.torch`` and friends keep intercepting them; only pure
+stdlib helpers are imported here directly. Referencing ``_impl`` as a module
+also lets the circular import resolve lazily.
 """
 
 from __future__ import annotations
@@ -34,7 +44,7 @@ def _resolve_custom_checkpoint(self: TrainerRank, checkpoint: AdapterSelection) 
         ref = self._slot_stack[-1] if self._slot_stack else self._default_slot_ref
         name = None if ref is None else ref.name
     else:
-        name = checkpoint
+        name = cast(str | None, checkpoint)
     if name is None:
         raise _impl.TrainerRankSlotStateError(
             "Custom checkpoint objects require a loaded named checkpoint"
@@ -46,7 +56,7 @@ def _resolve_custom_checkpoint(self: TrainerRank, checkpoint: AdapterSelection) 
 
 
 def prefetch_checkpoints(
-    self: _impl.TrainerRank, *checkpoints: str | _impl.MaterializedCheckpoint
+    self: TrainerRank, *checkpoints: str | MaterializedCheckpoint
 ) -> asyncio.Task[None]:
     futures = []
     for checkpoint in checkpoints:
@@ -172,7 +182,7 @@ def _ensure_checkpoint_slots(self: TrainerRank, checkpoints: Iterable[str]) -> N
 
 
 def load_checkpoint(
-    self: _impl.TrainerRank, checkpoint: str | _impl.MaterializedCheckpoint | None
+    self: TrainerRank, checkpoint: str | MaterializedCheckpoint | None
 ) -> None:
     self._guard_forward_collective("load_checkpoint")
     logical, source = self._checkpoint_source(checkpoint)
@@ -222,7 +232,7 @@ def _push_checkpoint_sync(
         self._slot_stack.append(self._slot_ref(logical_path))
 
 
-def pop_checkpoint(self: _impl.TrainerRank) -> None:
+def pop_checkpoint(self: TrainerRank) -> None:
     with self._checkpoint_mutation_lock:
         if not self._slot_stack:
             raise RuntimeError("No pushed checkpoint to pop")
@@ -401,7 +411,7 @@ def _resolve_slot_ref(
         request.checkpoint if request.checkpoint is not _impl.Unset else checkpoint
     )
     if selection is not _impl.Unset:
-        name = selection
+        name = cast(str | None, selection)
         if name is not None and name not in self._checkpoint_slots:
             raise _impl.TrainerRankSlotStateError(
                 f"Forward selects unloaded checkpoint {name!r}"
@@ -496,7 +506,7 @@ def _ensure_checkpoint_slots_for(
     checkpoint: AdapterSelection,
 ) -> None:
     self._ensure_checkpoint_slots(
-        selection
+        cast(str, selection)
         for request in requests
         if (
             request.target_tokens is not None
@@ -526,15 +536,15 @@ def _track_slot_graph_outputs(
     if not track_slot and not track_hybridep:
         return list(outputs)
 
-    marker: _impl.torch.Tensor | None = None
+    marker: torch.Tensor | None = None
 
-    def track(tensor: _impl.torch.Tensor | None) -> _impl.torch.Tensor | None:
+    def track(tensor: torch.Tensor | None) -> torch.Tensor | None:
         nonlocal marker
         if tensor is None or not tensor.requires_grad:
             return tensor
         if marker is None:
-            marker = _impl.torch.zeros((), dtype=_impl.torch.bool, device="cpu")
-        return _impl._track_slot_graph_tensor(tensor, marker)
+            marker = tensor.new_empty(0)
+        return cast(_impl.torch.Tensor, _impl._SlotGraphSentinel.apply(tensor, marker))
 
     tracked_outputs = [
         _impl.ForwardOutput(

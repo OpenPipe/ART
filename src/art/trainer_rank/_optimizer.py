@@ -1,6 +1,16 @@
 """TrainerRank dynamic (per-checkpoint) optimizer management: optim_step,
 its configuration guard, and dynamic optimizer creation, extension,
 restore, padding masks and step flags.
+
+These are ``TrainerRank`` method bodies moved out of ``_impl`` verbatim: each
+function takes the owning rank as ``self`` and ``TrainerRank`` binds them as
+methods, so ``self._x(...)`` dispatch and per-instance overrides keep working.
+
+Module globals the bodies used to read from ``_impl`` (``torch``, ``dist``,
+sibling helpers) are still resolved through ``_impl`` at call time, so tests
+that patch ``_impl.torch`` and friends keep intercepting them; only pure
+stdlib helpers are imported here directly. Referencing ``_impl`` as a module
+also lets the circular import resolve lazily.
 """
 
 from __future__ import annotations
@@ -81,27 +91,13 @@ def _extend_dynamic_optimizer(
 
 
 def optim_step(
-    self: _impl.TrainerRank,
+    self: TrainerRank,
     *,
-    params: _impl.AdamParams | Mapping[str, _impl.AdamParams],
+    params: AdamParams | Mapping[str, AdamParams],
     scale_grads: float | Mapping[str, float] = 1.0,
     checkpoints: Sequence[str] | None = None,
     on_live_graphs: Literal["allow", "error"] = "allow",
 ) -> dict[str, float]:
-    """Step checkpoint slots that have accumulated gradients.
-
-    A mapping assigns independent optimizer parameters to each checkpoint;
-    ``scale_grads`` may likewise map checkpoints to gradient scales. Mapping
-    keys select the checkpoints when ``checkpoints`` is omitted, and all
-    explicitly supplied checkpoint sets must match. Each checkpoint's gradient
-    norm is clipped independently. If any selected norm is nonfinite, no
-    selected checkpoint is updated.
-
-    Retained forwards use immutable checkpoint versions and may be consumed
-    after this step within their captured `max_gradient_staleness` policy.
-    Pass `on_live_graphs="error"` to additionally refuse updates while a
-    selected checkpoint still has a live forward graph on any rank.
-    """
     self._guard_forward_collective("optim_step")
     if on_live_graphs not in ("allow", "error"):
         raise ValueError(
@@ -173,15 +169,11 @@ def optim_step(
         "optim",
         {"checkpoint_count": len(selected_checkpoints)},
     ):
-        metrics = self._dynamic_optim_step(
+        return self._dynamic_optim_step(
             selected_checkpoints,
             params=params_by_checkpoint,
             scale_grads=scales_by_checkpoint,
         )
-        from ._heads import synchronize_head_buffers
-
-        synchronize_head_buffers(self, selected_checkpoints)
-        return metrics
 
 
 def _guard_optim_step_configuration(
@@ -243,16 +235,6 @@ def _dynamic_optim_step(
     params: Mapping[str, AdamParams],
     scale_grads: Mapping[str, float],
 ) -> dict[str, float]:
-    from ._checkpoint import raise_distributed
-
-    version_error: Exception | None = None
-    try:
-        self._version_state().validate_accumulated(checkpoint_names)
-    except Exception as exc:
-        version_error = exc
-    raise_distributed(
-        version_error, "validate gradient versions", self._checkpoint_group()
-    )
     self.runtime.model_support_handler.zero_internal_padding_grads(self.runtime.model)
     selected = []
     for name in checkpoint_names:
@@ -289,7 +271,6 @@ def _dynamic_optim_step(
             for param in self._checkpoint_slots[name].params:
                 param.grad = None
             self._prune_slot_graphs(self._slot_ref(name))
-        self._version_state().clear(checkpoint_names)
         return metrics
     previous = {
         name: (
@@ -342,7 +323,6 @@ def _dynamic_optim_step(
                 model.grad = None
         self._prune_slot_graphs(self._slot_ref(name))
         self._checkpoint_slots[name].revision += 1
-        self._version_state().clear((name,))
     return metrics
 
 

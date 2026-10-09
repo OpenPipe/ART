@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import timedelta
 import importlib
 from pathlib import Path
 import sys
@@ -8,7 +9,6 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from trainer_rank_test_support import gloo_group
 
 sys.path.insert(0, str(Path(__file__).parents[2] / "dev"))
 _compare_outputs = importlib.import_module("trainer_rank_check")._compare_outputs
@@ -87,7 +87,14 @@ def _all_ranks_checked_worker(
     world_size: int,
     init_method: str,
 ) -> None:
-    with gloo_group(rank, init_method, world_size=world_size):
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
 
         def check() -> None:
             if rank == 1:
@@ -96,3 +103,5 @@ def _all_ranks_checked_worker(
         with pytest.raises(AssertionError, match="injected rank-local failure"):
             all_ranks_checked("injected", check)
         dist.barrier()
+    finally:
+        dist.destroy_process_group()

@@ -19,6 +19,11 @@ _K = TypeVar("_K")
 
 
 @dataclass(frozen=True)
+class _PreparedLoraExport:
+    inputs: _VllmLoraPublishInputs
+
+
+@dataclass(frozen=True)
 class _VllmLoraPublishPlan:
     rank: int
     device: torch.device
@@ -101,7 +106,23 @@ def _validate_vllm_lora_publish_runtime(
 ) -> tuple[int, torch.device]:
     from art.megatron.weights import lora_publish
 
-    return lora_publish._validate_vllm_lora_publish_runtime(rank, world_size)
+    actual_rank, device = lora_publish._rank_and_device()
+    if lora_publish._distributed_ready():
+        actual_world_size = torch.distributed.get_world_size()  # type: ignore[possibly-missing-attribute]
+        if actual_rank != rank or actual_world_size != world_size:
+            raise RuntimeError(
+                "LoRA publisher rank/world-size mismatch: "
+                f"runtime=({rank}, {world_size}) "
+                f"distributed=({actual_rank}, {actual_world_size})"
+            )
+    else:
+        if rank != 0 or world_size != 1:
+            raise RuntimeError(
+                "Non-distributed LoRA publish requires rank=0 and world_size=1, "
+                f"got rank={rank} world_size={world_size}"
+            )
+        rank = 0
+    return rank, device
 
 
 def _prepare_vllm_lora_publish(
@@ -110,12 +131,18 @@ def _prepare_vllm_lora_publish(
     adapter_dtypes: dict[str, torch.dtype],
     handler: Any,
     adapter_config: dict[str, Any],
-    runtime: tuple[int, torch.device],
+    rank: int,
+    world_size: int,
     slot_ref: LoRASlotRef | None = None,
+    runtime: tuple[int, torch.device] | None = None,
 ) -> _VllmLoraPublishPlan:
     from art.megatron.weights import lora_publish
 
-    rank, device = runtime
+    rank, device = (
+        _validate_vllm_lora_publish_runtime(rank, world_size)
+        if runtime is None
+        else runtime
+    )
     packed_expert_groups = tuple(handler.expert_packed_lora_groups())
     local_tensors, local_metadata = lora_publish.collect_local_lora_entries(
         model,
@@ -134,12 +161,14 @@ def _prepare_vllm_lora_publish(
         packed_expert_groups=packed_expert_groups,
         slot_ref=slot_ref,
     )
+    all_packed_metadata = lora_publish._canonical_global_metadata(local_packed_metadata)
+    all_metadata = lora_publish._canonical_global_metadata(local_metadata)
     return _VllmLoraPublishPlan(
         rank=rank,
         device=device,
-        metadata=local_metadata,
+        metadata=all_metadata,
         local_tensors=local_tensors,
-        packed_expert_metadata=local_packed_metadata,
+        packed_expert_metadata=all_packed_metadata,
         local_packed_expert_tensors=local_packed_tensors,
         handler=handler,
         adapter_config=dict(adapter_config),
@@ -186,25 +215,6 @@ def _build_vllm_lora_tensors_from_inputs(
         packed_expert_metadata=inputs.packed_expert_metadata,
         packed_expert_tensors_by_owner_key=inputs.packed_expert_tensors_by_owner_key,
     )
-    interleaved_keys = frozenset(
-        meta.key
-        for meta in inputs.packed_expert_metadata
-        if meta.pack_layout == "interleaved_gate_up_rank_major_expert_cols"
-    )
-    if getattr(inputs.handler, "key", None) == "gpt_oss_moe" and interleaved_keys:
-        from art.megatron.model_support.handlers.gpt_oss import (
-            _gpt_oss_padding_sizes_from_adapter_config,
-        )
-
-        sizes = _gpt_oss_padding_sizes_from_adapter_config(inputs.adapter_config)
-        _, _, logical, internal = sizes
-        for key in interleaved_keys:
-            tensor = merged_tensors[key]
-            if tensor.ndim != 2 or tensor.shape[0] not in {
-                2 * logical,
-                2 * internal,
-            }:
-                raise ValueError("GPT-OSS packed gate/up LoRA has an invalid shape")
     return inputs.handler.to_vllm_lora_tensors(
         merged_tensors,
         adapter_config=inputs.adapter_config,
@@ -216,7 +226,7 @@ def _capture_lora_publish_inputs(
     checkpoint_name: str,
     adapter_config: dict[str, object],
     group: torch.distributed.ProcessGroup | None,
-) -> tuple[_VllmLoraPublishInputs | None, dict[str, float]]:
+) -> tuple[_PreparedLoraExport | None, dict[str, float]]:
     from art.trainer_rank import _checkpoint
 
     timings: dict[str, float] = {}
@@ -237,27 +247,12 @@ def _capture_lora_publish_inputs(
             adapter_dtypes={},
             handler=trainer.runtime.model_support_handler,
             adapter_config=adapter_config,
+            rank=trainer.runtime.rank,
+            world_size=trainer.runtime.world_size,
             slot_ref=trainer._slot_ref(checkpoint_name),
             runtime=runtime,
         ),
         "plan LoRA publish",
-        group,
-    )
-    # Every rank must finish local collection before metadata or tensor exchange.
-    from art.megatron.weights import lora_publish
-
-    packed_metadata = _checkpoint._phase(
-        lambda: lora_publish._canonical_global_metadata(plan.packed_expert_metadata),
-        "gather packed LoRA metadata",
-        group,
-    )
-    plan = _checkpoint._phase(
-        lambda: replace(
-            plan,
-            packed_expert_metadata=packed_metadata,
-            metadata=lora_publish._canonical_global_metadata(plan.metadata),
-        ),
-        "gather LoRA metadata",
         group,
     )
     timings["plan_collect"] = time.monotonic() - started
@@ -268,7 +263,7 @@ def _capture_lora_publish_inputs(
 
     started = time.monotonic()
 
-    def stage() -> _VllmLoraPublishInputs | None:
+    def stage() -> _PreparedLoraExport | None:
         if inputs is not None:
             stager = _PinnedCpuStager()
             staged = replace(
@@ -281,7 +276,7 @@ def _capture_lora_publish_inputs(
                 ),
             )
             stager.finish()
-            return staged
+            return _PreparedLoraExport(staged)
         return None
 
     prepared = _checkpoint._phase(stage, "stage LoRA publish tensors", group)
@@ -290,12 +285,14 @@ def _capture_lora_publish_inputs(
 
 
 def _save_lora_publish_inputs(
-    output_dir: str, prepared: _VllmLoraPublishInputs
+    output_dir: str, prepared: _PreparedLoraExport
 ) -> dict[str, float]:
     from art.megatron.model_support.lora_disk import save_vllm_lora_tensors
 
     started = time.monotonic()
-    vllm_tensors, published_config = _build_vllm_lora_tensors_from_inputs(prepared)
+    vllm_tensors, published_config = _build_vllm_lora_tensors_from_inputs(
+        prepared.inputs
+    )
     timings = {"convert": time.monotonic() - started}
     started = time.monotonic()
     save_vllm_lora_tensors(output_dir, vllm_tensors, published_config)
@@ -314,7 +311,7 @@ def prepare_lora_export(
 
     started = time.monotonic()
     group = _checkpoint._ensure_group(trainer)
-    snapshots: dict[str, tuple[str, _VllmLoraPublishInputs]] = getattr(
+    snapshots: dict[str, tuple[str, _PreparedLoraExport]] = getattr(
         trainer, "_prepared_lora_exports", {}
     )
     duplicate = (
@@ -363,7 +360,7 @@ def prepare_lora_export(
 def finish_lora_export(
     trainer: TrainerRank, export_id: str, output_dir: str, *, owner_id: str
 ) -> dict[str, float]:
-    snapshots: dict[str, tuple[str, _VllmLoraPublishInputs]] = getattr(
+    snapshots: dict[str, tuple[str, _PreparedLoraExport]] = getattr(
         trainer, "_prepared_lora_exports", {}
     )
     try:
@@ -377,7 +374,7 @@ def finish_lora_export(
 
 
 def abort_lora_export(trainer: TrainerRank, export_id: str, *, owner_id: str) -> None:
-    snapshots: dict[str, tuple[str, _VllmLoraPublishInputs]] = getattr(
+    snapshots: dict[str, tuple[str, _PreparedLoraExport]] = getattr(
         trainer, "_prepared_lora_exports", {}
     )
     if (prepared := snapshots.get(export_id)) is not None and prepared[0] == owner_id:

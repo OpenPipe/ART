@@ -130,7 +130,6 @@ def _split_memory_key(plan: _impl._SplitForwardPlan) -> bytes | None:
                     signature.request_mix,
                     signature.grad_enabled,
                     signature.grad_modes,
-                    signature.memory_placement,
                     signature.slot_shapes,
                     signature.short_requests,
                     p.packed_tokens,
@@ -604,9 +603,7 @@ def _checkpoint_memory_floor(
         and self._moe_memory_supported
     ):
         hybrid_rows = max(rows for rows, _ in group_rows)
-        if any(
-            _impl._graph_marker_is_live(ref) for ref in self._pending_hybridep_graphs
-        ):
+        if any(ref() is not None for ref in self._pending_hybridep_graphs):
             hybrid_rows = max(hybrid_rows, self._hybridep_rows_high_water)
     if hybrid_rows is not None:
         workspace = max(workspace, -(-hybrid_rows // 4) * 4 * self._hidden_size * 2)
@@ -1182,21 +1179,12 @@ def _refresh_memory_check(
     # Re-sample each rank against its own demand, not another DP rank's maximum.
     # Older synthetic checks may lack the local producer; keep their safe bound.
     with decision.refresh_of(check.sample) if decision is not None else nullcontext():
-        refreshed = self._memory_check_required(
+        return self._memory_check_required(
             check.estimated_required_bytes
             if check.local_required_bytes is None
             else check.local_required_bytes,
             sync_across_dp=sync_across_dp,
         )
-    return _impl.replace(
-        check,
-        estimated_required_bytes=refreshed.estimated_required_bytes,
-        available_bytes=refreshed.available_bytes,
-        fits=refreshed.fits and check.cpu_fits,
-        sample=refreshed.sample,
-        local_required_bytes=refreshed.local_required_bytes,
-        local_available_bytes=refreshed.local_available_bytes,
-    )
 
 
 def _memory_check_required(

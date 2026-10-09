@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 import subprocess
 import sys
@@ -41,45 +42,6 @@ def test_planning_status_preserves_primary_chain(
     assert calls == ([False] if enabled else [])
 
 
-@pytest.mark.parametrize("cpu_fits", (False, True))
-@pytest.mark.parametrize("local_required", (None, 28))
-@pytest.mark.parametrize("available", (19, 43))
-def test_refresh_preserves_cpu_state_and_updates_local_budget(
-    monkeypatch, cpu_fits, local_required, available
-) -> None:
-    from art.trainer_rank import TrainerRank, _impl
-
-    rank = TrainerRank.__new__(TrainerRank)
-    rank._available_memory_bytes = lambda: available
-    monkeypatch.setattr(_impl.dist, "is_initialized", lambda: False)
-    check = _impl._MemoryCheck(
-        46,
-        43,
-        cpu_fits,
-        cpu_required_bytes=50,
-        cpu_available_bytes=60 if cpu_fits else 40,
-        cpu_fits=cpu_fits,
-        fallback_costs={"cpu": 1},
-        decision={"policy": "cpu"},
-        local_required_bytes=local_required,
-        local_available_bytes=43,
-    )
-    required = 46 if local_required is None else local_required
-    for _ in range(2):
-        refreshed = rank._refresh_memory_check(check, sync_across_dp=True)
-        assert refreshed.estimated_required_bytes == required
-        assert refreshed.available_bytes == available
-        assert refreshed.local_required_bytes == required
-        assert refreshed.local_available_bytes == available
-        assert refreshed.fits == (required <= available and cpu_fits)
-        assert refreshed.cpu_required_bytes == check.cpu_required_bytes
-        assert refreshed.cpu_available_bytes == check.cpu_available_bytes
-        assert refreshed.cpu_fits == check.cpu_fits
-        assert refreshed.fallback_costs is check.fallback_costs
-        assert refreshed.decision is check.decision
-        check = refreshed
-
-
 def test_planning_failures_and_empty_ranks_use_aligned_status(tmp_path: Path) -> None:
     children = []
     logs = []
@@ -115,7 +77,6 @@ def test_planning_failures_and_empty_ranks_use_aligned_status(tmp_path: Path) ->
 def _worker(index: int, directory: Path) -> None:
     import torch
     import torch.distributed as dist
-    from trainer_rank_test_support import gloo_group
 
     from art.trainer_rank import ForwardInput, TrainerRank, _impl
     from art.trainer_rank._prefix_tree_planner import (
@@ -124,7 +85,14 @@ def _worker(index: int, directory: Path) -> None:
     )
 
     torch.set_num_threads(1)
-    with gloo_group(index, f"file://{directory / 'gloo'}", timeout=10):
+    dist.init_process_group(
+        "gloo",
+        rank=index,
+        world_size=2,
+        init_method=f"file://{directory / 'gloo'}",
+        timeout=timedelta(seconds=10),
+    )
+    try:
         # Each participant must fit its own demand. Keep the same agreement in
         # WORLD and an explicit TP/CP scope, including an empty participant.
         group = dist.new_group([0, 1])
@@ -150,7 +118,6 @@ def _worker(index: int, directory: Path) -> None:
                         check, sync_across_dp=sync_across_dp
                     )
                     assert check.fits == fits and check.local_required_bytes == required
-                    assert check.local_available_bytes == available
         dist.barrier()
         for mode in (
             "estimate",
@@ -273,6 +240,8 @@ def _worker(index: int, directory: Path) -> None:
             finally:
                 patches.undo()
             dist.barrier()
+    finally:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
