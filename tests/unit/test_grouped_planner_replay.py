@@ -92,6 +92,31 @@ def test_runtime_dimensions_change_recomputed_cost_not_expected_answer(tmp_path)
         assert result["aggregate"]["matches"] is False
 
 
+@pytest.mark.parametrize("mode", ["target", "top_k", "logits", "ignored_mixed"])
+@pytest.mark.parametrize("grad", [False, True])
+@pytest.mark.parametrize("stock_scale", [False, True])
+def test_eager_head_capacity_replays_output_modes(tmp_path, mode, grad, stock_scale):
+    rank = head_rank()
+    if not stock_scale:
+        rank.runtime.model[0]._scale_logits = lambda logits: logits
+    item = request(65, grad=grad)
+    if mode == "top_k":
+        item = replace(item, target_tokens=None, top_k=2)
+    elif mode in {"logits", "ignored_mixed"}:
+        item = replace(item, target_tokens=None, logits=True)
+    items = [item]
+    if mode == "ignored_mixed":
+        items.append(request(65, grad=grad, ignored=True))
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    plan = rank._plan_flat_forward(items, memory_minimal=True)
+    multiplier = 1 if not stock_scale else 7 if mode != "logits" else 3
+    assert rank._plan_head_workspace_bytes(plan) == multiplier * 65 * 248320 * 2
+    report, _ = emitted(rank, plan, tmp_path)
+    result = reports.replay(report)
+    assert result["aggregate"]["matches"]
+    assert all(item["matches"] for item in result["estimates"] + result["layouts"])
+
+
 def test_legacy_grouped_report_cannot_enable_replay_by_flipping_flag(
     monkeypatch, tmp_path
 ):
@@ -293,7 +318,18 @@ def test_custom_adapter_gradient_reader_is_explicitly_incomplete(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "change", ["version", "group", "layout", "gdn_segment", "budget"]
+    "change",
+    [
+        "version",
+        "parent_version",
+        "future_version",
+        "group",
+        "layout",
+        "gdn_segment",
+        "head_statistics",
+        "head_statistics_type",
+        "budget",
+    ],
 )
 def test_fact_validation_rejects_inconsistent_or_unbounded_input(
     change, pending_rank, tmp_path
@@ -304,14 +340,20 @@ def test_fact_validation_rejects_inconsistent_or_unbounded_input(
         rank, rank._plan_flat_forward([request(65, grad=True)]), tmp_path
     )
     facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
-    if change == "version":
-        facts["version"] += 1
+    if change in {"version", "parent_version", "future_version"}:
+        facts["version"] = {"version": 1, "parent_version": 2, "future_version": 4}[
+            change
+        ]
     elif change == "group":
         facts["groups"][0]["rows"] += 1
     elif change == "layout":
         facts["groups"][0]["layout_fingerprint"] = "wrong"
     elif change == "gdn_segment":
         facts["groups"][0]["gdn"]["segments"][0]["end"] += 1
+    elif change == "head_statistics":
+        facts["groups"][0]["head_statistics"] = False
+    elif change == "head_statistics_type":
+        facts["groups"][0]["head_statistics"] = 1
     else:
         facts["groups"] *= 1025
     with pytest.raises(ValueError):
