@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
-from contextlib import AbstractContextManager, ExitStack, contextmanager
 from copy import deepcopy
 from typing import TYPE_CHECKING, Literal, cast
 import weakref
@@ -53,15 +52,6 @@ def prefetch_checkpoints(
     for checkpoint in checkpoints:
         logical, source = self._checkpoint_source(checkpoint)
         assert logical is not None and source is not None
-        with self._checkpoint_prefetch_lock:
-            remembered = logical in self._checkpoint_sources
-        if remembered:
-            # Already admitted; demand owns preparation and its disk lease.
-            if isinstance(checkpoint, _impl.MaterializedCheckpoint):
-                raise self._slot_state_error(
-                    "Cannot replace an immutable checkpoint source"
-                )
-            continue
         futures.append(self._register_checkpoint_prefetch(logical, source))
 
     async def prefetch() -> None:
@@ -77,13 +67,9 @@ def _register_checkpoint_prefetch(
     checkpoint: str,
     source: str,
     prepare: Callable[[], PreparedCheckpoint] | None = None,
-) -> Future[PreparedCheckpoint] | Future[None]:
+) -> Future[PreparedCheckpoint]:
     key = self._checkpoint_source_key(source)
     with self._checkpoint_prefetch_lock:
-        if checkpoint in self._checkpoint_sources:
-            admitted: Future[None] = Future()
-            admitted.set_result(None)
-            return admitted
         previous = self._checkpoint_prefetch_sources.get(checkpoint)
         self._checkpoint_prefetch_sources[checkpoint] = key
         if (
@@ -105,74 +91,6 @@ def _register_checkpoint_prefetch(
         return future
 
 
-@contextmanager
-def _checkpoint_slot_write(
-    self: TrainerRank, checkpoint: str, owner: object = None
-) -> Iterator[
-    tuple[str, Callable[[], AbstractContextManager[PreparedCheckpoint]], bool] | None
-]:
-    """Reserve slot publication without holding a lock over I/O or collectives."""
-    with self._checkpoint_prefetch_lock:
-        descriptor = self._checkpoint_sources.get(checkpoint)
-        if owner is not _impl.Unset and descriptor is not owner:
-            raise self._slot_state_error(
-                f"Checkpoint {checkpoint!r} belongs to an immutable source"
-            )
-        self._checkpoint_slot_writes[checkpoint] = (
-            self._checkpoint_slot_writes.get(checkpoint, 0) + 1
-        )
-    try:
-        yield descriptor
-    finally:
-        with self._checkpoint_prefetch_lock:
-            remaining = self._checkpoint_slot_writes[checkpoint] - 1
-            if remaining:
-                self._checkpoint_slot_writes[checkpoint] = remaining
-            else:
-                del self._checkpoint_slot_writes[checkpoint]
-
-
-def _register_checkpoint_source(
-    self: TrainerRank,
-    checkpoint: str,
-    source: str,
-    prepare: Callable[[], AbstractContextManager[PreparedCheckpoint]],
-    *,
-    forward_only: bool = True,
-) -> None:
-    """Remember immutable state without preparing tensors or entering collectives.
-
-    The preparation context owns its backing files through transactional loading.
-    Unlike a prefetch result, this small descriptor survives cache eviction.
-    """
-    if not checkpoint or not source or not callable(prepare):
-        raise ValueError("Checkpoint source requires a name, identity and preparation")
-    with self._checkpoint_prefetch_lock:
-        previous = self._checkpoint_sources.get(checkpoint)
-        if previous is None and checkpoint in self._checkpoint_slot_writes:
-            raise self._slot_state_error(
-                f"Checkpoint {checkpoint!r} has an in-flight slot publication"
-            )
-        if previous is not None and (previous[0], previous[2]) != (
-            source,
-            forward_only,
-        ):
-            raise self._slot_state_error("Immutable checkpoint source changed")
-        slot = self._checkpoint_slots.get(checkpoint)
-        if slot is not None and (
-            previous is None or forward_only and not slot.snapshot
-        ):
-            raise self._slot_state_error(
-                f"Checkpoint {checkpoint!r} is already loaded with different ownership"
-            )
-        if previous is None:
-            self._checkpoint_sources[checkpoint] = (source, prepare, forward_only)
-        key = self._checkpoint_prefetch_sources.pop(checkpoint, None)
-        if key is not None and key not in self._checkpoint_prefetch_sources.values():
-            # Controls/workers retain their own Future and pin custody.
-            self._checkpoint_prefetches.pop(key, None)
-
-
 def _checkpoint_prefetch_waiter(
     self: TrainerRank, *checkpoints: str
 ) -> asyncio.Task[None]:
@@ -180,7 +98,6 @@ def _checkpoint_prefetch_waiter(
         futures = [
             self._checkpoint_prefetches[self._checkpoint_prefetch_sources[name]]
             for name in checkpoints
-            if name not in self._checkpoint_sources
         ]
 
     async def wait() -> None:
@@ -205,116 +122,19 @@ def _prefetched_checkpoint(self: TrainerRank, checkpoint: str) -> PreparedCheckp
 def _load_registered_checkpoint(self: TrainerRank, checkpoint: str) -> None:
     from . import _checkpoint
 
+    source: PreparedCheckpoint | None = None
+    error: BaseException | None = None
+    try:
+        source = self._prefetched_checkpoint(checkpoint)
+    except BaseException as exc:
+        error = exc
     group = _checkpoint._ensure_group(self)
-    with ExitStack() as backing:
-        # Freeze ownership before an eager load can publish a resident slot.
-        descriptor = backing.enter_context(
-            self._checkpoint_slot_write(checkpoint, _impl.Unset)
-        )
-        identity = None if descriptor is None else (descriptor[0], descriptor[2])
-        if any(value != identity for value in _checkpoint._gather(identity, group)):
-            raise self._slot_state_error("Checkpoint source differs across ranks")
-        source: PreparedCheckpoint | None = None
-        error: BaseException | None = None
-        try:
-            slot = self._checkpoint_slots.get(checkpoint)
-            if (
-                descriptor is not None
-                and descriptor[2]
-                and slot is not None
-                and not slot.snapshot
-            ):
-                raise self._slot_state_error(
-                    f"Immutable checkpoint {checkpoint!r} has a mutable resident slot"
-                )
-            source = (
-                self._prefetched_checkpoint(checkpoint)
-                if descriptor is None
-                else backing.enter_context(descriptor[1]())
-            )
-        except BaseException as exc:
-            error = exc
-        _checkpoint.raise_distributed(error, "prepare checkpoint", group)
-        assert source is not None
-        forward_only = (
-            checkpoint in self._snapshot_checkpoint_names
-            if descriptor is None
-            else descriptor[2]
-        )
-        if forward_only:
-            _checkpoint.load_checkpoint(
-                self,
-                source,
-                checkpoint,
-                forward_only=True,
-                **({"_source_owner": descriptor} if descriptor is not None else {}),
-            )
-            self._snapshot_checkpoint_names.add(checkpoint)
-        else:
-            _checkpoint.load_checkpoint(
-                self,
-                source,
-                checkpoint,
-                **({"_source_owner": descriptor} if descriptor is not None else {}),
-            )
-
-
-def _checkpoint_snapshot_state(
-    self: TrainerRank, requested: Sequence[str]
-) -> tuple[set[str], tuple[str, ...], set[str], int]:
-    """Collect cache status alongside the existing request-name gather."""
-    protected: set[str | None] = set(requested)
-    protected.update(ref.name for ref in self._slot_stack)
-    if self._default_slot_ref is not None:
-        protected.add(self._default_slot_ref.name)
-    with self._checkpoint_prefetch_lock:
-        remembered = {
-            name
-            for name in (*requested, *self._checkpoint_snapshot_lru)
-            if (descriptor := self._checkpoint_sources.get(name)) is not None
-            and descriptor[2]
-        }
-    resident = {
-        name
-        for name in remembered
-        if (slot := self._checkpoint_slots.get(name)) is not None and slot.snapshot
-    }
-    eligible = tuple(
-        name
-        for name in self._checkpoint_snapshot_lru
-        if name in resident
-        and name not in protected
-        # Custom objects can escape to callers without a live autograd graph.
-        # Until handles have explicit liveness tracking, retain these slots.
-        and not self._checkpoint_slots[name].custom
-        and not self._has_live_slot_graph(self._slot_ref(name))
-    )
-    return (
-        resident,
-        eligible,
-        set(requested) & remembered,
-        self._checkpoint_snapshot_cache_size,
-    )
-
-
-def _trim_checkpoint_snapshots(
-    self: TrainerRank,
-    states: Sequence[tuple[set[str], tuple[str, ...], set[str], int]],
-) -> None:
-    """Bound reloadable snapshot residency, preserving selected or held state."""
-    retained = set.union(
-        *(resident | requested for resident, _, requested, _ in states)
-    )
-    limit = min(limit for _, _, _, limit in states)
-    for name in states[0][1]:
-        if len(retained) <= limit:
-            break
-        if all(
-            name in names and name in candidates for names, candidates, _, _ in states
-        ):
-            self._discard_snapshot_checkpoint(name)
-            self._checkpoint_snapshot_lru.pop(name, None)
-            retained.discard(name)
+    _checkpoint.raise_distributed(error, "prepare checkpoint", group)
+    assert source is not None
+    if checkpoint in self._snapshot_checkpoint_names:
+        _checkpoint.load_checkpoint(self, source, checkpoint, forward_only=True)
+    else:
+        _checkpoint.load_checkpoint(self, source, checkpoint)
 
 
 def _ensure_checkpoint_slots(self: TrainerRank, checkpoints: Iterable[str]) -> None:
@@ -323,109 +143,46 @@ def _ensure_checkpoint_slots(self: TrainerRank, checkpoints: Iterable[str]) -> N
     requested = tuple(dict.fromkeys(checkpoints))
     with self._checkpoint_mutation_lock:
         group = _checkpoint._ensure_group(self)
-        choices = _checkpoint._gather(
-            (requested, self._checkpoint_snapshot_state(requested)), group
+        names = sorted(
+            {
+                name
+                for rank_names in _checkpoint._gather(requested, group)
+                for name in rank_names
+            }
         )
-        names = sorted({name for rank_names, _cache in choices for name in rank_names})
-        self._trim_checkpoint_snapshots([cache for _names, cache in choices])
         for name in names:
             with self._checkpoint_prefetch_lock:
-                descriptor = self._checkpoint_sources.get(name)
                 state = (
                     name in self._checkpoint_slots,
-                    name in self._checkpoint_prefetch_sources or descriptor is not None,
-                    None if descriptor is None else (descriptor[0], descriptor[2]),
+                    name in self._checkpoint_prefetch_sources,
                 )
             states = _checkpoint._gather(state, group)
-            if len({identity for _loaded, _prefetched, identity in states}) != 1:
-                raise self._slot_state_error(
-                    f"Checkpoint {name!r} source differs across ranks"
+            if all(loaded for loaded, _prefetched in states):
+                continue
+            if any(loaded for loaded, _prefetched in states):
+                raise _impl.TrainerRankSlotStateError(
+                    f"Checkpoint {name!r} is not loaded consistently across ranks"
                 )
-            if all(loaded for loaded, _prefetched, _identity in states):
-                error = (
-                    self._slot_state_error(
-                        f"Immutable checkpoint {name!r} has a mutable resident slot"
-                    )
-                    if descriptor is not None
-                    and descriptor[2]
-                    and not self._checkpoint_slots[name].snapshot
-                    else None
-                )
-                if descriptor is not None:
-                    _checkpoint.raise_distributed(
-                        error, "validate checkpoint source", group
-                    )
-            elif any(loaded for loaded, _prefetched, _identity in states):
-                if descriptor is None or not descriptor[2]:
-                    raise _impl.TrainerRankSlotStateError(
-                        f"Checkpoint {name!r} is not loaded consistently across ranks"
-                    )
-                slot = self._checkpoint_slots.get(name)
-                _checkpoint.raise_distributed(
-                    self._slot_state_error(
-                        f"Cannot reload checkpoint {name!r} with retained custom objects"
-                    )
-                    if slot is not None and slot.custom
-                    else None,
-                    "reload checkpoint source",
-                    group,
-                )
-                _checkpoint.discard_snapshot_checkpoint(self, name, allow_missing=True)
-                self._load_registered_checkpoint(name)
-            elif not all(prefetched for _loaded, prefetched, _identity in states):
+            if not all(prefetched for _loaded, prefetched in states):
                 raise _impl.TrainerRankSlotStateError(
                     f"Explicit selection references unloaded checkpoint {name!r}; "
                     "it has not been prefetched on every rank"
                 )
-            else:
-                self._load_registered_checkpoint(name)
-            if (
-                name in self._checkpoint_sources
-                and self._checkpoint_slots[name].snapshot
-            ):
-                self._checkpoint_snapshot_lru.pop(name, None)
-                self._checkpoint_snapshot_lru[name] = None
+            self._load_registered_checkpoint(name)
 
 
 def load_checkpoint(
     self: _impl.TrainerRank, checkpoint: str | _impl.MaterializedCheckpoint | None
 ) -> None:
-    from . import _checkpoint
-
     self._guard_forward_collective("load_checkpoint")
     logical, source = self._checkpoint_source(checkpoint)
-    with self._checkpoint_mutation_lock, ExitStack() as publication:
+    with self._checkpoint_mutation_lock:
         if self._slot_stack:
             raise RuntimeError("Cannot load a checkpoint while one is pushed")
-        descriptor = (
-            None
-            if logical is None
-            else publication.enter_context(
-                self._checkpoint_slot_write(logical, _impl.Unset)
-            )
-        )
-        state = (
-            logical,
-            None if descriptor is None else (descriptor[0], descriptor[2]),
-            isinstance(checkpoint, _impl.MaterializedCheckpoint),
-        )
-        if any(
-            value != state
-            for value in _checkpoint._gather(state, self._checkpoint_group())
-        ):
-            raise self._slot_state_error("Checkpoint source differs across ranks")
         if logical is None:
             self._set_default_slot(self._slot_ref(None))
             return
         assert source is not None
-        if descriptor is not None:
-            if isinstance(checkpoint, _impl.MaterializedCheckpoint):
-                raise self._slot_state_error(
-                    "Cannot replace an immutable checkpoint source"
-                )
-            self._ensure_checkpoint_slots((logical,))
-            self._set_default_slot(self._slot_ref(logical))
-            return
         if (
             isinstance(checkpoint, _impl.MaterializedCheckpoint)
             or logical not in self._checkpoint_prefetch_sources
@@ -440,7 +197,6 @@ def _discard_snapshot_checkpoint(self: TrainerRank, checkpoint: str) -> None:
     from . import _checkpoint
 
     _checkpoint.discard_snapshot_checkpoint(self, checkpoint)
-    self._checkpoint_snapshot_lru.pop(checkpoint, None)
 
 
 def _push_checkpoint(
@@ -460,7 +216,6 @@ def _push_checkpoint_sync(
             if (
                 logical_path not in self._checkpoint_slots
                 and logical_path not in self._checkpoint_prefetch_sources
-                and logical_path not in self._checkpoint_sources
             ):
                 self._register_checkpoint_prefetch(logical_path, source_path)
             self._ensure_checkpoint_slots((logical_path,))
@@ -835,14 +590,7 @@ def _prune_slot_graphs(self: TrainerRank, ref: "LoRASlotRef | None" = None) -> N
 
 def _has_live_slot_graph(self: TrainerRank, ref: "LoRASlotRef") -> bool:
     self._prune_slot_graphs(ref)
-    if self._slot_graphs().get(ref):
-        return True
-    cache = getattr(self, "_graph_cache", None)
-    return cache is not None and any(
-        version.checkpoint == ref.name
-        for handle in cache.handles()
-        for version in cache.state(handle).checkpoint_versions
-    )
+    return bool(self._slot_graphs().get(ref))
 
 
 def _guard_slot_can_load(self: TrainerRank, ref: "LoRASlotRef") -> None:

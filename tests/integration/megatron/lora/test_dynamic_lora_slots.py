@@ -613,10 +613,6 @@ def _trainer_for(lora: LoRA, device: torch.device) -> TrainerRank:
     }
     trainer._checkpoint_prefetches = {}
     trainer._checkpoint_prefetch_sources = {}
-    trainer._checkpoint_sources = {}
-    trainer._checkpoint_slot_writes = {}
-    trainer._checkpoint_snapshot_lru = {}
-    trainer._checkpoint_snapshot_cache_size = 2
     trainer._checkpoint_prefetch_lock = threading.Lock()
     trainer._checkpoint_mutation_lock = threading.RLock()
     return trainer

@@ -855,8 +855,8 @@ def test_collective_activation_loads_required_union_deterministically(
         ).result()
 
     def gather(value: object, _group: object = None) -> tuple[object, ...]:
-        if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], tuple):
-            return ((("b",), value[1]), (("a",), value[1]))
+        if isinstance(value, tuple) and value and isinstance(value[0], str):
+            return (("b",), ("a",))
         return (value, value)
 
     def install(target: TrainerRank, _source: object, name: str) -> None:
@@ -2269,9 +2269,6 @@ def _checkpoint_load_failure_worker(
         )
         trainer._checkpoint_process_group = None
         trainer._checkpoint_slots = {}
-        trainer._checkpoint_sources = {}
-        trainer._checkpoint_slot_writes = {}
-        trainer._checkpoint_prefetch_lock = threading.Lock()
         trainer._slot_stack = []
         trainer._local_lora_adapter_templates = lambda: {}  # type: ignore[method-assign]
         trainer._guard_slot_can_load = lambda _ref: None  # type: ignore[method-assign]

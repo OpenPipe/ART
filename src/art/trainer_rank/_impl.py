@@ -13,7 +13,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, fields, is_dataclass, replace
@@ -2168,13 +2168,6 @@ class TrainerRank:
         self._slot_stack: list[LoRASlotRef] = []
         self._checkpoint_slots: dict[str, _CheckpointSlot] = {}
         self._snapshot_checkpoint_names: set[str] = set()
-        self._checkpoint_sources: dict[
-            str,
-            tuple[str, Callable[[], AbstractContextManager[PreparedCheckpoint]], bool],
-        ] = {}
-        self._checkpoint_snapshot_lru: OrderedDict[str, None] = OrderedDict()
-        self._checkpoint_snapshot_cache_size = 2
-        self._checkpoint_slot_writes: dict[str, int] = {}
         self._prepared_lora_exports: dict[str, tuple[str, _VllmLoraPublishInputs]] = {}
         self._checkpoint_prefetches: dict[str, Future[PreparedCheckpoint]] = {}
         self._checkpoint_prefetch_sources: dict[str, str] = {}
@@ -2639,8 +2632,8 @@ class TrainerRank:
 
     @staticmethod
     async def _await_checkpoint_prefetch(
-        future: Future[T],
-    ) -> T:
+        future: Future[PreparedCheckpoint],
+    ) -> PreparedCheckpoint:
         return await asyncio.shield(asyncio.wrap_future(future))
 
     def snapshot_checkpoint(self, source: str, destination: str) -> bool:
@@ -6137,10 +6130,6 @@ class TrainerRank:
     _resolve_custom_checkpoint = _slots._resolve_custom_checkpoint
     prefetch_checkpoints = _slots.prefetch_checkpoints
     _register_checkpoint_prefetch = _slots._register_checkpoint_prefetch
-    _register_checkpoint_source = _slots._register_checkpoint_source
-    _checkpoint_slot_write = _slots._checkpoint_slot_write
-    _checkpoint_snapshot_state = _slots._checkpoint_snapshot_state
-    _trim_checkpoint_snapshots = _slots._trim_checkpoint_snapshots
     _checkpoint_prefetch_waiter = _slots._checkpoint_prefetch_waiter
     _prefetched_checkpoint = _slots._prefetched_checkpoint
     _load_registered_checkpoint = _slots._load_registered_checkpoint

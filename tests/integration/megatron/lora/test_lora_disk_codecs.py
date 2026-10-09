@@ -1727,17 +1727,12 @@ def _named_lora_checkpoint(
         rank=0,
         world_size=1,
     )
-    trainer._default_slot_ref = None
     trainer._slot_stack = []
     trainer._pending_slot_graphs = {}
     trainer._checkpoint_slots = {}
     trainer._skipped_forward_waves = {}
     trainer._snapshot_checkpoint_names = set()
     trainer._checkpoint_prefetch_sources = {}
-    trainer._checkpoint_sources = {}
-    trainer._checkpoint_slot_writes = {}
-    trainer._checkpoint_snapshot_lru = {}
-    trainer._checkpoint_snapshot_cache_size = 2
     trainer._checkpoint_prefetch_lock = threading.Lock()
     trainer._checkpoint_mutation_lock = threading.RLock()
     config = _config("Qwen/Qwen3-8B", rank=2, alpha=2)

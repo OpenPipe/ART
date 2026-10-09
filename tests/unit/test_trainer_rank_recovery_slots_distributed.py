@@ -115,11 +115,6 @@ def worker(index, mode, directory):
         rank._checkpoint_mutation_lock = threading.RLock()
         rank._checkpoint_prefetch_lock = threading.Lock()
         rank._checkpoint_slots = {}
-        rank._checkpoint_sources = {}
-        rank._checkpoint_snapshot_lru = {}
-        rank._checkpoint_snapshot_cache_size = 2
-        rank._slot_stack = []
-        rank._default_slot_ref = None
         rank._checkpoint_group_lock = threading.Lock()
         # Native _ensure_checkpoint_slots uses these all-rank groups unchanged.
         rank._checkpoint_process_group = dist.new_group(
