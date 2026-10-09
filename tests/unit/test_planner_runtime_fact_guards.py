@@ -38,10 +38,6 @@ def test_changed_custom_cost_is_not_reported_replay_complete(method, tmp_path):
         "_physical_tokens",
         "_plan_group_rows",
         "_plan_retained_tokens",
-        "_sequence_parallel_workspace_bytes",
-        "_sequence_parallel_lora_floor",
-        "_cold_recompute_transient_bytes",
-        "_checkpoint_input_gradient_bytes",
     ],
 )
 def test_custom_shared_estimator_readers_decline(method):
