@@ -286,9 +286,9 @@ def loss_fn(
         ),
         new_logprobs,
     )
-    # Assume missing old logprobs were sampled under the current policy
+    # Assume missing or non-finite old logprobs were sampled under the current policy
     old_logprobs = torch.where(
-        torch.isnan(old_logprobs),
+        ~torch.isfinite(old_logprobs),
         new_logprobs.detach(),
         old_logprobs,
     )
@@ -296,13 +296,15 @@ def loss_fn(
     importance_sampling_level = experimental_config.get(
         "importance_sampling_level", "token"
     )
-    prob_ratio = torch.exp(logprob_diff)
+    # FP16 overflows at exp(20); packed FP32 logprobs use the wider bound.
+    log_ratio_bound = 10.0 if logprob_diff.dtype == torch.float16 else 20.0
+    prob_ratio = torch.exp(logprob_diff.clamp(-log_ratio_bound, log_ratio_bound))
     if importance_sampling_level != "token":
         sequence_prob_ratio = torch.exp(
             aligned_inputs.group_mean(
                 logprob_diff,
                 by=aligned_inputs.group_ids * assistant_mask,
-            )
+            ).clamp(-log_ratio_bound, log_ratio_bound)
         )
         if importance_sampling_level == "sequence":
             prob_ratio = sequence_prob_ratio
