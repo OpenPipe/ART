@@ -562,17 +562,10 @@ def _plan_hybridep_growth_bytes(self: TrainerRank, plan: _impl._FlatForwardPlan)
     The buffer is allocated outside the PyTorch allocator after admission,
     so neither the free-memory sample nor a learned peak includes it.
     """
-    return _hybridep_growth_from_dimensions(_plan_hybridep_dimensions(self, plan))
-
-
-def _plan_hybridep_dimensions(
-    self: TrainerRank, plan: _impl._FlatForwardPlan
-) -> tuple[int, int, int, int, int] | None:
-    """Capacity, communication ranks, hidden width, expert columns, held rows."""
     provider: Any = getattr(getattr(self, "runtime", None), "provider", None)
     ep = int(getattr(provider, "expert_model_parallel_size", 1) or 1)
     if ep <= 1 or not plan.groups:
-        return None
+        return 0
     from megatron.core.transformer.moe import fused_a2a
 
     from art.megatron.train import _hybridep_token_capacity
@@ -596,25 +589,15 @@ def _plan_hybridep_dimensions(
     )
     etp = int(getattr(provider, "expert_tensor_parallel_size", 1) or 1)
     ranks = ep * etp
-    return (
+    if _impl._hybridep_rows_per_rank(capacity, ranks) <= held:
+        return 0
+    # The old buffer stays referenced while its replacement is allocated.
+    return _impl._hybridep_buffer_bytes(
         capacity,
         ranks,
         int(provider.hidden_size),
         int(provider.num_moe_experts) * etp,
-        held,
     )
-
-
-def _hybridep_growth_from_dimensions(
-    dimensions: tuple[int, int, int, int, int] | None,
-) -> int:
-    if dimensions is None:
-        return 0
-    capacity, ranks, hidden, experts, held = dimensions
-    if _impl._hybridep_rows_per_rank(capacity, ranks) <= held:
-        return 0
-    # The old buffer stays referenced while its replacement is allocated.
-    return _impl._hybridep_buffer_bytes(capacity, ranks, hidden, experts)
 
 
 def _checkpoint_moe_bytes_per_token(self: TrainerRank) -> int:
@@ -790,20 +773,10 @@ def _checkpoint_memory_floor(
     layers = _checkpoint_layers(self, group_rows)
     if not layers:
         return 0, 0
-    return _checkpoint_floor_from_facts(
-        self,
-        group_rows,
-        slot_refs,
-        gdn_segments,
-        layers,
-        hybridep_rows=_checkpoint_hybridep_rows(self, group_rows),
+    retained, workspace = _checkpoint_floor_from_facts(
+        self, group_rows, slot_refs, gdn_segments, layers
     )
-
-
-def _checkpoint_hybridep_rows(
-    self: TrainerRank, group_rows: tuple[tuple[int, bool], ...]
-) -> int | None:
-    """Live graph extent needed by the supported HybridEP recompute path."""
+    # HybridEP runtime state is intentionally outside grouped CPU replay v1.
     hybrid_rows = None
     if (
         any(grad for _, grad in group_rows)
@@ -816,7 +789,9 @@ def _checkpoint_hybridep_rows(
             _impl._graph_marker_is_live(ref) for ref in self._pending_hybridep_graphs
         ):
             hybrid_rows = max(hybrid_rows, self._hybridep_rows_high_water)
-    return hybrid_rows
+    if hybrid_rows is not None:
+        workspace = max(workspace, -(-hybrid_rows // 4) * 4 * self._hidden_size * 2)
+    return retained, workspace
 
 
 def _checkpoint_floor_from_facts(
@@ -825,8 +800,6 @@ def _checkpoint_floor_from_facts(
     slot_refs: tuple["LoRASlotRef | None", ...] | None,
     gdn_segments: int,
     layers: int,
-    *,
-    hybridep_rows: int | None = None,
 ) -> tuple[int, int]:
     if not layers:
         return 0, 0
@@ -864,8 +837,6 @@ def _checkpoint_floor_from_facts(
         # roots per group. Kernel-internal chunk states are not bounded here.
         roots = gdn_segments + (tp - 1) * sum(grad for _, grad in group_rows)
         workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
-    if hybridep_rows is not None:
-        workspace = max(workspace, -(-hybridep_rows // 4) * 4 * self._hidden_size * 2)
     return retained, workspace
 
 
