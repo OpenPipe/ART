@@ -36,6 +36,7 @@ from ..utils.chat_template import (
     merge_chat_template_kwargs,
     normalize_tool_call_arguments_for_chat_template,
 )
+from ..utils.grpo import rewards_have_zero_variance
 from .dynamo_tokens import choice_completion_logprobs, has_completion_logprobs
 from .moe_routing import (
     MoeRouteArray,
@@ -758,6 +759,9 @@ def tokenize_trajectory_groups(
         if not group:
             continue
         results: list[TokenizedResult] = []
+        zero_variance = rewards_have_zero_variance(
+            [trajectory.reward for trajectory in group]
+        )
         # Calculate GRPO group mean and standard deviation
         reward_mean = sum(trajectory.reward for trajectory in group) / len(group)
         reward_std = math.sqrt(
@@ -766,7 +770,7 @@ def tokenize_trajectory_groups(
         )
         for trajectory in group:
             # Calculate GRPO advantage for this trajectory
-            advantage = trajectory.reward - reward_mean
+            advantage = 0.0 if zero_variance else trajectory.reward - reward_mean
             if scale_rewards:
                 advantage /= reward_std + 1e-6
             if advantage == 0 and drop_zero_advantage_trajectories:

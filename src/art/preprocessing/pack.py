@@ -341,9 +341,9 @@ def prefix_tree_pack(
         assistant_mask_tensor, weights_tensor, torch.zeros_like(weights_tensor)
     )
     if bool(assistant_mask_tensor.any()):
-        weights_tensor[assistant_mask_tensor] /= weights_tensor[
-            assistant_mask_tensor
-        ].mean()
+        weights_mean = weights_tensor[assistant_mask_tensor].mean()
+        if weights_mean > 0:
+            weights_tensor[assistant_mask_tensor] /= weights_mean
     advantages_tensor = torch.from_numpy(advantages_np)
     advantages_tensor = torch.where(
         assistant_mask_tensor, advantages_tensor, torch.zeros_like(advantages_tensor)
@@ -361,10 +361,12 @@ def prefix_tree_pack(
             advantages_tensor * (1 + advantage_balance),
         )
     if bool(assistant_mask_tensor.any()):
-        advantages_tensor[assistant_mask_tensor] /= (
+        advantages_mean = (
             advantages_tensor[assistant_mask_tensor].abs()
             * weights_tensor[assistant_mask_tensor]
         ).mean()
+        if advantages_mean > 0:
+            advantages_tensor[assistant_mask_tensor] /= advantages_mean
 
     packed_tensors: PackedTensors = {
         "tokens": torch.from_numpy(tokens_np),

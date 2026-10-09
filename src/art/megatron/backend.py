@@ -567,6 +567,8 @@ class MegatronBackend(LocalBackend):
         *,
         include_moe_routing: bool,
     ) -> _PackedTrainingBatch | None:
+        if not trajectory_groups:
+            return None
         prepared = tuple(group._prepared_training_batch for group in trajectory_groups)
         collect_packing_shapes = any(
             group._collect_packing_shape for group in trajectory_groups
