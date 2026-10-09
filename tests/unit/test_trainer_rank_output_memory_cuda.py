@@ -9,6 +9,7 @@ from test_trainer_rank_output_memory import _output
 import torch
 from trainer_rank_test_support import report_measurement
 
+from art.trainer_rank import _impl
 from art.trainer_rank._commands import _Executor, _view
 from art.trainer_rank._tensors import detach_tree
 
@@ -76,4 +77,65 @@ def test_logical_outputs_leave_existing_replay_backward_admissible(monkeypatch):
         rejected_copy_bytes=large,
         admitted_copy_bytes=8 * 1024**2,
         peak_bytes=peak,
+    )
+
+
+def _graph_loss(trainer, weight, inputs):
+    handle, outputs = trainer._forward_graph_cache().run(
+        lambda values: ((values.sin() * weight).sum(),),
+        inputs,
+        retention="gpu",
+        output_device="cpu",
+        execution_peak_bytes=256 * 1024**2,
+        checkpoint_versions=(trainer._capture_checkpoint_version("student"),),
+        cuda_devices=[torch.cuda.current_device()],
+    )
+    return trainer._forward_cotangent_collector().attach(detach_tree(handle, outputs))[
+        0
+    ]
+
+
+def test_forward_cache_does_not_refuse_model_outputs():
+    torch.set_num_threads(2)
+    trainer, api = _trainer("student")
+    trainer.device = torch.device("cuda")
+    weight = api.parameter("weight", lambda: torch.ones(()), checkpoint="student")
+    inputs = torch.ones(4 * 1024**2, device="cuda")
+    view = _view(_Executor(trainer, "rank"))
+    output = _output(8 * 1024**2, policy="model")
+    # Unpressured reference for the same graph.
+    trainer.backward(_graph_loss(trainer, weight, inputs))
+    assert weight.grad is not None
+    reference = weight.grad.clone()
+    weight.grad = None
+    loss = _graph_loss(trainer, weight, inputs)
+    gc.collect()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    # Physical headroom for the pending backward plus 512 MiB, then 1 GiB of
+    # transients freed into the native cache: the sample goes negative.
+    free, total = torch.cuda.mem_get_info()
+    pending = sum(trainer._pending_backward_memory())
+    reserve = int(total * _impl._MEMORY_RESERVE_FRACTION)
+    ballast = torch.empty(
+        free - reserve - pending - 512 * 1024**2, dtype=torch.uint8, device="cuda"
+    )
+    transient = torch.empty(1024**3, dtype=torch.uint8, device="cuda")
+    del transient
+    refused = trainer._available_memory_bytes() - pending
+    assert refused < 0
+    placed = view._attach(view._place_outputs([output])[0])
+    assert placed.hidden_states.device.type == "cuda"
+    available = trainer._available_memory_bytes() - pending
+    assert available >= 8 * 1024**2
+    trainer.backward(loss)
+    torch.cuda.synchronize()
+    assert weight.grad is not None and torch.equal(weight.grad, reference)
+    del ballast
+    report_measurement(
+        "OUTPUT_FORWARD_CACHE_RELEASE",
+        pending_bytes=pending,
+        refused_available_bytes=refused,
+        released_available_bytes=available,
+        copy_bytes=8 * 1024**2,
     )

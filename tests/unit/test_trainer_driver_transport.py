@@ -79,6 +79,8 @@ async def test_driver_cpu_exports_preserve_old_gradients_and_worker_policy(
         assert all(packet.cpu)
         assert all(tensor.device.type == "cpu" for tensor in packet.packet.tensors)
         seen.append(packet.packet.handle)
+        # Earlier cycles holding CUDA tensors must not be collected inside attach.
+        gc.collect()
         before = torch.cuda.memory_allocated() if device == "cuda" else 0
         result = attach(packet)
         if device == "cuda":
