@@ -520,8 +520,8 @@ def test_shared_requests_fit_the_per_row_charge(monkeypatch, length, loss, fits)
     per_request = (
         _duplicate_request_peak(monkeypatch, 1 + extra, length, loss) - single
     ) / extra
-    # Nine head blocks per one-token request at least; the rest is the caller.
-    assert per_request >= 9 * 512
+    # Eight head blocks per one-token request at least; the rest is the caller.
+    assert per_request >= 8 * 512
     charge = _impl._PACKED_PRICED_LOGICAL_ROW_BYTES * length
     assert (per_request <= charge) == fits
 

@@ -11,14 +11,23 @@ keep today's pricing.
 """
 
 from dataclasses import replace
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
-from trainer_rank_test_support import fake_rank, recompute_model
+from trainer_rank_test_support import (
+    AllReduceSum,
+    all_reduce_max,
+    fake_rank,
+    process_group,
+    recompute_model,
+    spawn_and_join,
+)
 
-from art.trainer_rank import TrainerRank
+from art.trainer_rank import ForwardInput, TrainerRank
 from art.trainer_rank._impl import _SEQUENCE_PARALLEL_COLD_TRANSIENT_BYTES as COLD
 from art.trainer_rank._impl import _MemoryProfile, _MemorySignature
 
@@ -422,9 +431,9 @@ def test_the_tp2_head_stage_is_priced_with_the_floor():
     # Without the floor's eligibility (no SP) TP2 keeps today's zero.
     no_sp = _with_head(tp_rank(topology=TP2, sequence_parallel=False), vocabulary, 2)
     assert _memory._head_vocabulary(no_sp) == 0
-    # A short wave's head stage (logits plus both target-backward buffers)
-    # outweighs its recompute workspace and prices the floor.
-    head = 3 * r._head_workspace_bytes(512)
+    # A short wave's head stage (the logits and their gradient) outweighs
+    # its recompute workspace and prices the floor.
+    head = 2 * r._head_workspace_bytes(512)
     signature = _MemorySignature(TP2, (1, None), 1, (), True, (True,))
     cost = r._subforward_cost(
         packed_tokens=512,
@@ -466,13 +475,14 @@ def test_the_tp2_head_stage_follows_the_statistics_path(monkeypatch):
     r = _with_head(tp_rank(topology=TP2), 248_320, 2)
     monkeypatch.setattr(_memory, "_head_target_backward", lambda rank: True)
     dense = r._head_workspace_bytes(512)
+    targets = _memory._head_target_bytes(512, _labelled(512), grad_enabled=True)
     # The same predicate as _try_triton_stats: a CPU device, the
     # ART_TRAINER_RANK_TRITON_TOPK switch and short chunks take the eager
     # FP32 fallback, about seven BF16 buffers.
-    assert _head_stage(r, _labelled(512)) == 7 * dense
+    assert _head_stage(r, _labelled(512)) == 7 * dense + targets
     monkeypatch.setattr(_impl, "_triton_head_stats", lambda rank, rows, vocab: True)
     # The kernel path, plus the bounded fallback's increment should it fail.
-    assert _head_stage(r, _labelled(512)) == 3 * dense + BOUNDED
+    assert _head_stage(r, _labelled(512)) == 2 * dense + BOUNDED + targets
     monkeypatch.setenv("ART_TRAINER_RANK_TRITON_TOPK", "0")
     assert not _impl._triton_stats_enabled(True, 512)
     monkeypatch.delenv("ART_TRAINER_RANK_TRITON_TOPK")
@@ -488,11 +498,11 @@ def test_the_tp2_head_stage_follows_the_statistics_path(monkeypatch):
         (1_023, "512", 7 * 511 * 124_160 * 2, True),  # 888,240,640 bytes
         # Schulman: an 812-row wave's 300-row eager tail.
         (812, "512", 7 * 300 * 124_160 * 2, True),  # 521,472,000 bytes
-        # The default threshold (64): every chunk runs Triton (381,419,520
+        # The default threshold (64): every chunk runs Triton (254,279,680
         # bytes), or the bounded statistics should a kernel fail.
-        (1_023, None, 3 * 512 * 124_160 * 2 + BOUNDED, False),
+        (1_023, None, 2 * 512 * 124_160 * 2 + BOUNDED, False),
         # A 40-row default tail falls back, below the full chunk's charge.
-        (552, None, 3 * 512 * 124_160 * 2 + BOUNDED, True),
+        (552, None, 2 * 512 * 124_160 * 2 + BOUNDED, True),
     ],
 )
 def test_every_head_chunk_is_priced_for_its_own_statistics_path(
@@ -510,7 +520,8 @@ def test_every_head_chunk_is_priced_for_its_own_statistics_path(
         monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", minimum)
     # The planner's projection is capped at one chunk; the tail is not.
     assert r._head_projection_rows(_labelled(rows)) == 512
-    assert _head_stage(r, _labelled(rows)) == expected
+    targets = _memory._head_target_bytes(512, _labelled(rows), grad_enabled=True)
+    assert _head_stage(r, _labelled(rows)) == expected + targets
     # Replay capture refuses exactly the waves with an eager chunk.
     from art.trainer_rank._planner_replay import head_statistics_fallback
 
@@ -542,7 +553,7 @@ def _positioned(*positions):
         (
             range(812),
             [*range(600), *range(812, 1024)],
-            3 * 512 * 124_160 * 2 + BOUNDED,
+            2 * 512 * 124_160 * 2 + BOUNDED,
         ),
         # Two 512-row requests sharing 212 positions: their no-sharing sum is
         # two kernel chunks, but the 812-row union has a 300-row eager tail.
@@ -552,9 +563,12 @@ def _positioned(*positions):
 def test_head_bounds_envelope_every_possible_projected_union(
     monkeypatch, first, second, exact
 ):
+    from art.trainer_rank import _memory
+
     monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "512")
     r = _cuda_head(monkeypatch)
     requests, positions = _positioned(list(first), second)
+    exact += _memory._head_target_bytes(512, requests, grad_enabled=True)
 
     def charge(**bounds):
         rows = r._head_projection_rows(
@@ -581,7 +595,10 @@ def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
     def statistics(rows, *, top_k, logsumexp, max_top_k=0):
         """Run one head chunk's statistics with the given kernel outcomes."""
         logits = torch.zeros(rows, 8)
-        stats = (torch.zeros(rows), torch.ones(rows))
+
+        def stats(*args, targets, **kwargs):
+            return torch.zeros(rows), torch.ones(rows), logits[targets].float()
+
         with monkeypatch.context() as patch:
             patch.setattr(
                 TrainerRank, "_local_logits_from_hidden_rows", lambda *a, **k: logits
@@ -591,21 +608,29 @@ def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
             patch.setattr(
                 _impl,
                 "_try_triton_local_topk_stats",
-                lambda *a, **k: stats if top_k else None,
+                lambda *a, **k: stats(*a, **k) if top_k else None,
             )
             patch.setattr(
-                _impl, "_try_triton_stats", lambda *a, **k: stats if logsumexp else None
+                _impl,
+                "_try_triton_stats",
+                lambda *a, **k: stats(*a, **k) if logsumexp else None,
             )
             patch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
             patch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
-            patch.setattr(_impl, "_vocab_parallel_log_z", lambda t: t[:, 0].float())
+            patch.setattr(
+                _impl,
+                "_vocab_parallel_log_z",
+                lambda t, targets: (t[:, 0].float(), t[targets].float()),
+            )
             r._local_head_stats(
                 None, logits, output_weight=None, need_log_z=True, max_top_k=max_top_k
             )
 
     def priced(rows):
         """The head charge in chunk buffers, less the bounded increment."""
-        charge = _head_stage(r, _labelled(rows))
+        charge = _head_stage(r, _labelled(rows)) - _memory._head_target_bytes(
+            rows, _labelled(rows), grad_enabled=True
+        )
         if charge >= 7 * r._head_workspace_bytes(rows):
             return 7
         bounded = _memory._eager_stats_extra_bytes(8, rows)
@@ -613,17 +638,17 @@ def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
 
     # A fused top-k failure recovered by the Triton logsumexp: no fallback.
     statistics(512, top_k=False, logsumexp=True, max_top_k=4)
-    assert priced(512) == 3
+    assert priced(512) == 2
     # A 64-row kernel failure takes the eager fallback (that wave was priced
     # for the kernel); 64-row chunks are priced for the fallback from then on.
     statistics(64, top_k=False, logsumexp=False)
     assert priced(64) == 7
     # A 512-row chunk whose kernel succeeds stays priced for the kernel.
     statistics(512, top_k=False, logsumexp=True)
-    assert priced(512) == 3
+    assert priced(512) == 2
     # A later 64-row success clears that shape.
     statistics(64, top_k=False, logsumexp=True)
-    assert priced(64) == 3
+    assert priced(64) == 2
 
 
 class _LiveBytes:
@@ -674,12 +699,12 @@ class _LiveBytes:
 
 
 def test_a_failed_kernel_falls_back_within_the_kernel_buffers(monkeypatch):
-    """Admission priced the statistics kernel (three BF16 chunk buffers at the
-    head stage: logits, their gradient and the target gather's dense
-    gradient). The bounded eager statistics add one FP32 row sub-chunk to
-    the logits in forward, and to the logits and their gradient in backward;
-    the unchunked fallback adds six buffers in forward."""
-    from art.trainer_rank import _impl
+    """Admission priced the statistics kernel (two BF16 chunk buffers at the
+    head stage: logits and their gradient). The bounded eager statistics add
+    one FP32 row sub-chunk to the logits in forward, and to the logits and
+    their gradient in backward; the unchunked fallback adds six buffers in
+    forward."""
+    from art.trainer_rank import _impl, _memory
 
     monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
     monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
@@ -687,7 +712,7 @@ def test_a_failed_kernel_falls_back_within_the_kernel_buffers(monkeypatch):
     logits = torch.randn(512, 1_000, dtype=torch.bfloat16, requires_grad=True)
     buffer = 512 * 1_000 * 2  # one BF16 chunk buffer (D)
     with _LiveBytes() as forward:
-        local_max, local_sum = _impl._eager_local_logsumexp_stats(logits)
+        local_max, local_sum, _ = _impl._eager_local_logsumexp_stats(logits)
         log_z = local_max.detach() + torch.log(local_sum)
     assert forward.peak <= buffer / 16
     weights = torch.randn(512)
@@ -696,17 +721,22 @@ def test_a_failed_kernel_falls_back_within_the_kernel_buffers(monkeypatch):
     assert backward.peak <= buffer + buffer / 16
     # The priced TP2 head charge for this chunk shape (1,000-entry shard)
     # covers the measured live set on both paths: forward, the logits plus
-    # the forward increment; backward, the logits, the target gather's dense
-    # gradient and the backward increment.
+    # the forward increment; backward, the logits plus the gradient and the
+    # backward increment, with less than one sub-chunk to spare. These
+    # statistics gather no targets, so their index vectors are left out.
     r = _cuda_head(monkeypatch, vocabulary=2_000)
     targets = _labelled(512)
-    trained = r._group_head_workspace_bytes(512, targets, grad_enabled=True)
-    assert trained >= buffer + buffer + backward.peak
-    inference = r._group_head_workspace_bytes(512, targets, grad_enabled=False)
-    assert inference >= buffer + forward.peak
+
+    def charge(grad):
+        return r._group_head_workspace_bytes(
+            512, targets, grad_enabled=grad
+        ) - _memory._head_target_bytes(512, targets, grad_enabled=grad)
+
+    assert 0 <= charge(True) - (buffer + backward.peak) < buffer / 64
+    assert charge(False) >= buffer + forward.peak
     # The unchunked FP32 fallback, for contrast: about six buffers in forward.
     with _LiveBytes() as unchunked:
-        reference = _impl._vocab_parallel_log_z(logits)
+        reference, _ = _impl._vocab_parallel_log_z(logits)
     assert unchunked.peak >= 4 * buffer
     # Rows are independent: the same values and gradients.
     (expected,) = torch.autograd.grad((reference * weights).sum(), logits)
@@ -724,13 +754,13 @@ def test_the_bounded_statistics_never_write_fp32_logits(monkeypatch):
     torch.manual_seed(2)
     logits = torch.randn(512, 1_000, dtype=torch.float32, requires_grad=True)
     original = logits.detach().clone()
-    local_max, local_sum = _impl._eager_local_logsumexp_stats(logits)
+    local_max, local_sum, _ = _impl._eager_local_logsumexp_stats(logits)
     log_z = local_max.detach() + torch.log(local_sum)
     assert torch.equal(logits.detach(), original)
     weights = torch.randn(512)
     (gradient,) = torch.autograd.grad((log_z * weights).sum(), logits)
     assert torch.equal(logits.detach(), original)
-    reference = _impl._vocab_parallel_log_z(logits)
+    reference, _ = _impl._vocab_parallel_log_z(logits)
     (expected,) = torch.autograd.grad((reference * weights).sum(), logits)
     assert torch.allclose(log_z, reference, rtol=1e-6, atol=1e-6)
     assert torch.allclose(gradient, expected, rtol=1e-5, atol=1e-7)
@@ -746,7 +776,7 @@ def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failur
     logits = torch.randn(512, 1_000, dtype=torch.bfloat16)
     monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
     monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
-    reference = _impl._vocab_parallel_log_z(logits)
+    reference, _ = _impl._vocab_parallel_log_z(logits)
     monkeypatch.setattr(
         TrainerRank, "_local_logits_from_hidden_rows", lambda *a, **k: logits
     )
@@ -755,11 +785,11 @@ def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failur
     monkeypatch.setattr(_impl, "_try_triton_local_topk_stats", lambda *a, **k: None)
     monkeypatch.setattr(_impl, "_try_triton_stats", lambda *a, **k: None)
 
-    def unchunked(_logits):
+    def unchunked(_logits, _targets):
         raise AssertionError("the unchunked FP32 fallback ran after an attempt")
 
     monkeypatch.setattr(_impl, "_vocab_parallel_log_z", unchunked)
-    _, log_z, top_k = r._local_head_stats(
+    _, log_z, top_k, _ = r._local_head_stats(
         None, logits, output_weight=None, need_log_z=True, max_top_k=4
     )
     assert torch.equal(log_z, reference)
@@ -787,26 +817,29 @@ def test_replay_prices_the_tp2_head_stage_as_live_admission(monkeypatch):
     r = _cuda_head(monkeypatch)  # kernel path: capture declines the fallback
     dense = r._head_workspace_bytes(512)
     cases = (
-        # rows, gradient, requests, target rows (as captured), kernel buffers
-        (512, True, _requests(512), 512, 3),  # logits, statistics, target gather
-        (512, False, _requests(512), 0, 1),
-        (300, True, _requests(300), 300, 3),
-        # Top-k only: logits, statistics gradient and top-k's scatter.
-        (512, True, _requests(512, targets=False, top_k=4), 0, 3),
-        (512, False, _requests(512, targets=False, top_k=4), 0, 1),
+        # rows, gradient, requests, kernel buffers: the logits, and in a
+        # gradient wave the statistics gradient that targets and top-k join.
+        (512, True, _requests(512), 2),
+        (512, False, _requests(512), 1),
+        (300, True, _requests(300), 2),
+        (512, True, _requests(512, targets=False, top_k=4), 2),
+        (512, False, _requests(512, targets=False, top_k=4), 1),
+        (512, True, [*_requests(512), *_requests(512, targets=False, top_k=4)], 2),
     )
-    for rows, grad, requests, target_rows, buffers in cases:
+    for rows, grad, requests, buffers in cases:
         live = r._group_head_workspace_bytes(rows, requests, grad_enabled=grad)
         bounded = _memory._eager_stats_extra_bytes(124_160, rows)
-        assert live == buffers * r._head_workspace_bytes(rows) + bounded
+        targets = _memory._head_target_bytes(rows, requests, grad_enabled=grad)
+        assert 0 < targets < r._head_workspace_bytes(rows) / 64
+        assert live == buffers * r._head_workspace_bytes(rows) + bounded + targets
         frozen = _memory._frozen_head_bytes(
             124_160,
             rows,
-            target_rows,
             target_backward=True,
             statistics=True,
             grad=grad,
             tp=2,
+            targets=targets,
         )
         assert frozen == live
     # Requested logits: the local logits, their indexed copy, the gather
@@ -818,27 +851,28 @@ def test_replay_prices_the_tp2_head_stage_as_live_admission(monkeypatch):
             _memory._frozen_head_bytes(
                 124_160,
                 512,
-                0,
                 target_backward=True,
                 statistics=False,
                 grad=False,
                 tp=tp,
+                targets=0,
             )
             == units * dense
         )
-    # TP1 replay is #1068's capacity charge (its gather is the identity).
+    # TP1 replay is #1068's capacity charge (its gather is the identity), and
+    # the statistics' index vectors.
     for statistics, units in ((True, 7), (False, 3)):
         assert (
             _memory._frozen_head_bytes(
                 1_000,
                 512,
-                0,
                 target_backward=True,
                 statistics=statistics,
                 grad=True,
                 tp=1,
+                targets=4_096,
             )
-            == units * 512 * 1_000 * 2
+            == units * 512 * 1_000 * 2 + 4_096 * statistics
         )
 
 
@@ -847,19 +881,18 @@ class _ShapeChangingKernel(torch.autograd.Function):
     paths (as the real kernel's top-k tokens do)."""
 
     @staticmethod
-    def forward(ctx, logits):
+    def forward(ctx, logits, target_rows, target_columns):
         local_max = logits.max(dim=-1).values.float()
         local_sum = torch.exp(logits.float() - local_max[:, None]).sum(dim=-1)
         ctx.save_for_backward(logits, local_max, torch.empty(logits.shape[0], 0))
-        return local_max, local_sum
+        return local_max, local_sum, logits[target_rows, target_columns].float()
 
     @staticmethod
     def backward(ctx, *grad_outputs):
-        _grad_max, grad_sum = grad_outputs
+        _grad_max, grad_sum, _grad_targets = grad_outputs
         logits, local_max, _ = ctx.saved_tensors
-        return (torch.exp(logits.float() - local_max[:, None]) * grad_sum[:, None]).to(
-            logits.dtype
-        )
+        gradient = torch.exp(logits.float() - local_max[:, None]) * grad_sum[:, None]
+        return gradient.to(logits.dtype), None, None
 
 
 @pytest.mark.parametrize("forward_fails", [True, False])
@@ -887,11 +920,13 @@ def test_a_checkpoint_recompute_replays_the_forward_statistics_path(
         # The first attempt (the forward) fails or succeeds; later ones flip.
         attempts.append(name)
         succeeds = (len(attempts) > 1) == forward_fails
-        return _ShapeChangingKernel.apply(logits) if succeeds else None
+        if not succeeds:
+            return None
+        return _ShapeChangingKernel.apply(logits, *kwargs["targets"])
 
     monkeypatch.setattr(_impl, "_try_triton_stats", kernel)
     hidden = torch.randn(64, 16, requires_grad=True)
-    _, log_z, _ = r._checkpointed_head_stats(
+    _, log_z, _, _ = r._checkpointed_head_stats(
         None, hidden, output_weight=None, need_log_z=True, max_top_k=0
     )
     if forward_fails:
@@ -904,6 +939,413 @@ def test_a_checkpoint_recompute_replays_the_forward_statistics_path(
         # forward's saved tensors: a clear error, not a CheckpointError.
         with pytest.raises(RuntimeError, match="failed in a checkpoint recompute"):
             log_z.sum().backward()
+
+
+class _AllocatedBytes:
+    """Peak CPU allocator bytes for storages allocated inside the context.
+
+    From the profiler's allocation events, so a storage counts until it is
+    freed, including tensors that only autograd or a checkpoint still holds.
+    The peak is the allocator's running total recorded with each event, which
+    the allocator orders under its lock: the events' timestamps interleave
+    gloo's worker threads with the caller's. ``timed_peak`` replays the events
+    by timestamp instead.
+    """
+
+    def __enter__(self):
+        from torch.profiler import ProfilerActivity, profile
+
+        self._profile = profile(activities=[ProfilerActivity.CPU], profile_memory=True)
+        self._profile.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        from torch._C._profiler import _ExtraFields_Allocation
+
+        self._profile.__exit__(*exc)
+        profiler = self._profile.profiler
+        assert profiler is not None and profiler.kineto_results is not None
+        events, nodes = [], list(profiler.kineto_results.experimental_event_tree())
+        while nodes:
+            node = nodes.pop()
+            if isinstance(node.extra_fields, _ExtraFields_Allocation):
+                fields = node.extra_fields
+                events.append(
+                    (node.start_time_ns, fields.alloc_size, fields.total_allocated)
+                )
+            nodes.extend(node.children)
+        current = self.timed_peak = 0
+        for _, size, _ in sorted(events):
+            current += size
+            self.timed_peak = max(self.timed_peak, current)
+        start = min((total - size for _, size, total in events), default=0)
+        self.peak = max((total for _, _, total in events), default=start) - start
+
+
+class _Projection(torch.autograd.Function):
+    """The head projection's memory: a new BF16 logits chunk in forward and a
+    hidden-sized gradient in backward. GEMM workspaces are not head buffers."""
+
+    @staticmethod
+    def forward(ctx, hidden, logits):
+        ctx.shape = hidden.shape
+        return logits[: hidden.shape[0]].clone()
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        return grad_outputs[0].new_zeros(ctx.shape), None
+
+
+# One rank's vocabulary shard and head chunk for the measured head. Top-k
+# beyond twelve entries is measured at a production shard, where its index
+# vectors are small beside the chunk buffers.
+_SHARD, _CHUNK = 16_384, 64
+_MEASURED_CASES = (
+    "target",
+    "multi_label",
+    "shared_rows",
+    "top_k:4",
+    "target_top_k:12",
+    "top_k:128",
+    "top_k:1000",
+)
+
+
+def _measured_requests(case, rows, *, vocabulary, device="cpu"):
+    """Requests on ``rows`` shared positions: labels (``target``, two per row
+    in ``multi_label``, eight requests' in ``shared_rows``), or a ``top_k:K``
+    request, beside a label request in ``target_top_k:K``."""
+    generator = torch.Generator().manual_seed(rows)
+    labels = torch.randint(0, vocabulary, (rows, 2), generator=generator).to(device)
+    labels[::3, 1] = -100
+    labels[::7, 0] = -100
+    tokens = torch.zeros(rows, dtype=torch.long, device=device)
+    target = ForwardInput(input_tokens=tokens, target_tokens=labels[:, 0])
+    name, _, k = case.partition(":")
+    if name == "target":
+        return [target]
+    if name == "multi_label":
+        return [replace(target, target_tokens=labels)]
+    if name == "shared_rows":
+        return [target] * 8
+    top_k = ForwardInput(input_tokens=tokens, top_k=int(k))
+    return [top_k] if name == "top_k" else [target, top_k]
+
+
+def _measured_shard(case):
+    return 124_160 if case in ("top_k:128", "top_k:1000") else _SHARD
+
+
+def _host_rng_bytes(rows, chunk=_CHUNK):
+    """Checkpointing stashes the CPU generator's state per head chunk, and
+    once more in a recompute: host memory, which a CPU meter also counts."""
+    return (-(-rows // chunk) + 1) * int(torch.get_rng_state().numel())
+
+
+def _measured_head_peak(
+    monkeypatch,
+    requests,
+    *,
+    path,
+    grad,
+    meter,
+    chunk=_CHUNK,
+    shard=_SHARD,
+    stub_merge=True,
+):
+    """Peak bytes through the real head (checkpointed statistics, target and
+    top-k log-probs, a loss on both) and, with ``grad``, its backward.
+    ``stub_merge`` replaces the tensor-parallel top-k merge by its TP1 form."""
+    from art.trainer_rank import _impl
+
+    rows = int(requests[0].input_tokens.numel())
+    device = requests[0].input_tokens.device
+    monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", chunk)
+    monkeypatch.setattr(_impl, "_language_model", lambda model: model)
+    if stub_merge:
+        monkeypatch.setattr(
+            _impl,
+            "_vocab_parallel_topk_from_local",
+            lambda values, tokens, *, k, log_z, vocab_start: _impl.TopK(
+                values[:, :k] - log_z[:, None], tokens[:, :k]
+            ),
+        )
+    table = torch.randn(chunk, shard, device=device).bfloat16()
+    monkeypatch.setattr(
+        TrainerRank,
+        "_local_logits_from_hidden_rows",
+        lambda self, model, hidden, output_weight: _Projection.apply(hidden, table),
+    )
+    if path == "fallback":
+        monkeypatch.setattr(_impl, "_triton_stats_enabled", lambda cuda, rows: False)
+    elif path == "bounded":
+        monkeypatch.setattr(_impl, "_triton_stats_enabled", lambda cuda, rows: True)
+        monkeypatch.setattr(_impl, "_try_triton_stats", lambda *a, **k: None)
+    model = SimpleNamespace(
+        vocab_size=shard,
+        share_embeddings_and_output_weights=False,
+        _scale_logits=lambda value: value,
+    )
+    trainer = object.__new__(TrainerRank)
+    trainer.runtime = SimpleNamespace(model=[model])
+    items = [trainer._forward_item(replace(r, no_grad=not grad)) for r in requests]
+    positions = tuple(torch.arange(rows, device=device) for _ in requests)
+    prepared = SimpleNamespace(
+        positions_by_item=positions, source_positions_by_item=positions
+    )
+    hidden = torch.zeros(rows, 8, device=device, dtype=torch.bfloat16)
+    with meter() as measured, torch.set_grad_enabled(grad):
+        outputs = trainer._project_head(items, prepared, hidden.requires_grad_(grad))
+        if grad:
+            loss = torch.zeros((), device=device)
+            for output in outputs:
+                if output.target_logprobs is not None:
+                    loss = loss - output.target_logprobs.sum()
+                if output.top_k is not None:
+                    loss = loss - output.top_k.logprobs.sum()
+            loss.backward()
+        del outputs
+    return measured.peak
+
+
+def _head_charges(monkeypatch, requests, *, tp, grad, kernel, shard=_SHARD):
+    """The head's capacity and rejection lower bound for ``tp`` ranks' shards,
+    priced on the executed layout, that layout's dense chunk buffer, and the
+    requested outputs' separate charge."""
+    from art.trainer_rank import _impl, _memory
+
+    r = _with_head(tp_rank(topology=(1, tp, 1, 1)), tp * shard, tp)
+    if kernel:
+        r.device = torch.device("cuda", 0)
+        monkeypatch.setattr(_impl, "_triton_stats_importable", lambda: True)
+    monkeypatch.setattr(_memory, "_head_target_backward", lambda rank: True)
+    positions = tuple(torch.arange(int(q.input_tokens.numel())) for q in requests)
+    rows = r._head_projection_rows(requests, positions=positions)
+    return (
+        r._group_head_workspace_bytes(
+            rows, requests, grad_enabled=grad, positions=positions
+        ),
+        r._group_head_workspace_bytes(
+            rows, requests, grad_enabled=grad, positions=positions, lower_bound=True
+        ),
+        r._head_workspace_bytes(rows),
+        r._estimate_group_request_output_bytes(requests),
+    )
+
+
+@pytest.mark.parametrize("grad", [True, False])
+@pytest.mark.parametrize("rows", [_CHUNK, 2 * _CHUNK + 5])
+@pytest.mark.parametrize("case", _MEASURED_CASES)
+@pytest.mark.parametrize("path", ["fallback", "bounded"])
+def test_the_measured_head_fits_its_charge_without_a_spare_chunk(
+    monkeypatch, path, case, rows, grad
+):
+    """Targets and top-k join the statistics backward, so the head holds the
+    priced buffers (fallback: seven; kernel path: the logits and their
+    gradient plus the bounded increment) and no gathered-output gradient.
+    Their index vectors are priced beside the buffers, and the requested
+    outputs by their own charge."""
+    shard = _measured_shard(case)
+    requests = _measured_requests(case, rows, vocabulary=shard)
+    monkeypatch.setattr(
+        "art.trainer_rank._impl._all_reduce_tensor_parallel_max", lambda t: t
+    )
+    monkeypatch.setattr(
+        "art.trainer_rank._impl._all_reduce_tensor_parallel_sum", lambda t: t
+    )
+    monkeypatch.setattr(
+        "art.trainer_rank._impl._vocab_range", lambda logits: (0, logits.shape[-1])
+    )
+    peak = _measured_head_peak(
+        monkeypatch,
+        requests,
+        path=path,
+        grad=grad,
+        meter=_AllocatedBytes,
+        shard=shard,
+    )
+    for tp in (1, 2):
+        capacity, lower, dense, outputs = _head_charges(
+            monkeypatch,
+            requests,
+            tp=tp,
+            grad=grad,
+            kernel=path == "bounded",
+            shard=shard,
+        )
+        charged = capacity + outputs + _host_rng_bytes(rows)
+        assert lower <= peak <= charged
+        if tp == 2 or path == "fallback":
+            # TP1 reserves the fallback's seven buffers on every path.
+            assert charged - peak < dense / 8
+
+
+def test_tensor_parallel_heads_fit_their_charge_without_a_spare_chunk(tmp_path):
+    spawn_and_join(
+        _measured_tensor_parallel_worker,
+        (f"file://{tmp_path / 'tp'}", str(tmp_path)),
+        timeout=240,
+        failure="tensor-parallel head memory workers did not finish",
+    )
+    # Checked here, not in the workers: a rank that fails mid-loop closes its
+    # process group, and its peer then fails on the closed connection instead.
+    failures = []
+    for rank in range(2):
+        measured = json.loads((tmp_path / f"rank-{rank}.json").read_text())
+        assert len(measured) == 10
+        for path, case, lower, peak, charged, dense, timed_peak in measured:
+            if not (lower <= peak <= charged and charged - peak < dense / 8):
+                failures.append((rank, path, case, lower, peak, charged, timed_peak))
+    assert not failures, "(rank, path, case, lower, peak, charged, timed peak)"
+
+
+class _GatherLastDim(torch.autograd.Function):
+    """Megatron's vocabulary gather (``gather_from_tensor_model_parallel_region``)
+    over gloo: its all-gather buffer and concatenation, and the backward's
+    split copy."""
+
+    @staticmethod
+    def forward(ctx, values, group):
+        import torch.distributed as dist
+
+        world = dist.get_world_size(group)
+        gathered = values.new_empty((world * int(values.shape[0]), *values.shape[1:]))
+        dist.all_gather(list(gathered.chunk(world)), values.contiguous(), group=group)
+        ctx.group = group
+        return torch.cat(gathered.chunk(world), dim=-1)
+
+    @staticmethod
+    def backward(ctx, *gradients):
+        import torch.distributed as dist
+
+        (grad,) = gradients
+        world, rank = dist.get_world_size(ctx.group), dist.get_rank(ctx.group)
+        return grad.chunk(world, dim=-1)[rank].contiguous(), None
+
+
+def _measured_tensor_parallel_worker(rank, rendezvous, output):
+    import torch.distributed as dist
+
+    measured = []
+    with process_group(rank, rendezvous, world_size=2, timeout=200):
+        for path in ("fallback", "bounded"):
+            for case in (
+                "target",
+                "shared_rows",
+                "top_k:12",
+                "target_top_k:4",
+                "target_top_k:12",
+            ):
+                # Labels span both shards: each rank owns about half.
+                rows = 2 * _CHUNK + 5
+                requests = _measured_requests(case, rows, vocabulary=2 * _SHARD)
+                with pytest.MonkeyPatch.context() as monkeypatch:
+                    monkeypatch.setattr(
+                        "art.trainer_rank._impl._vocab_range",
+                        lambda logits: (rank * _SHARD, (rank + 1) * _SHARD),
+                    )
+                    monkeypatch.setattr(
+                        "art.trainer_rank._impl._all_reduce_tensor_parallel_max",
+                        all_reduce_max,
+                    )
+                    monkeypatch.setattr(
+                        "art.trainer_rank._impl._all_reduce_tensor_parallel_sum",
+                        AllReduceSum.apply,
+                    )
+                    # The real top-k merge across both ranks' shards.
+                    monkeypatch.setattr(
+                        "megatron.core.parallel_state.get_tensor_model_parallel_world_size",
+                        lambda: 2,
+                    )
+                    monkeypatch.setattr(
+                        "megatron.core.parallel_state.get_tensor_model_parallel_group",
+                        lambda check_initialized=True: dist.group.WORLD,
+                    )
+                    monkeypatch.setattr(
+                        "megatron.core.tensor_parallel.gather_from_tensor_model_parallel_region",
+                        lambda values, group=None: _GatherLastDim.apply(values, group),
+                    )
+                    meter = _AllocatedBytes()
+                    peak = _measured_head_peak(
+                        monkeypatch,
+                        requests,
+                        path=path,
+                        grad=True,
+                        meter=lambda: meter,
+                        stub_merge=False,
+                    )
+                    capacity, lower, dense, outputs = _head_charges(
+                        monkeypatch,
+                        requests,
+                        tp=2,
+                        grad=True,
+                        kernel=path == "bounded",
+                    )
+                charged = capacity + outputs + _host_rng_bytes(rows)
+                measured.append(
+                    (path, case, lower, peak, charged, dense, meter.timed_peak)
+                )
+    (Path(output) / f"rank-{rank}.json").write_text(json.dumps(measured))
+
+
+class _CudaAllocatedBytes:
+    """Peak CUDA allocator bytes above the context's starting allocation."""
+
+    def __enter__(self):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        self._base = torch.cuda.memory_allocated()
+        return self
+
+    def __exit__(self, *exc):
+        torch.cuda.synchronize()
+        self.peak = torch.cuda.max_memory_allocated() - self._base
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton needs CUDA")
+@pytest.mark.parametrize("grad", [True, False])
+@pytest.mark.parametrize("case", _MEASURED_CASES)
+def test_the_measured_triton_head_fits_its_charge_without_a_spare_chunk(
+    monkeypatch, case, grad
+):
+    """The production kernels at a TP2 Qwen3.8 shard's chunk shape. Top-k
+    beyond the fused kernel's sizes selects its tokens beside the logsumexp
+    kernel; CUDA rounds each allocation up to 512 bytes."""
+    from art.trainer_rank import _impl
+
+    monkeypatch.delenv("ART_TRAINER_RANK_TRITON_TOPK", raising=False)
+    monkeypatch.delenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", raising=False)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+    monkeypatch.setattr(_impl, "_vocab_range", lambda logits: (0, logits.shape[-1]))
+    chunk, shard = _impl._HEAD_CHUNK_TOKENS, 124_160
+    kernels = []
+    original = _impl._try_triton_stats
+
+    def kernel(name, local_logits, **kwargs):
+        result = original(name, local_logits, **kwargs)
+        if _impl._triton_stats_enabled(True, int(local_logits.shape[0])):
+            assert result is not None, f"{name} failed"
+            kernels.append(name)
+        return result
+
+    monkeypatch.setattr(_impl, "_try_triton_stats", kernel)
+    requests = _measured_requests(case, 2 * chunk + 5, vocabulary=shard, device="cuda")
+    measure = dict(
+        path="triton", grad=grad, meter=_CudaAllocatedBytes, chunk=chunk, shard=shard
+    )
+    _measured_head_peak(monkeypatch, requests, **measure)  # Compile and warm up.
+    peak = _measured_head_peak(monkeypatch, requests, **measure)
+    assert kernels and set(kernels) <= {"local_topk_stats", "local_logsumexp_stats"}
+    cpu_requests = _measured_requests(case, 2 * chunk + 5, vocabulary=shard)
+    capacity, lower, dense, outputs = _head_charges(
+        monkeypatch, cpu_requests, tp=2, grad=grad, kernel=True, shard=shard
+    )
+    _, tp1_lower, _, _ = _head_charges(
+        monkeypatch, cpu_requests, tp=1, grad=grad, kernel=True, shard=shard
+    )
+    assert max(lower, tp1_lower) <= peak <= capacity + outputs
+    assert capacity + outputs - peak < dense / 16
 
 
 def test_replay_declines_tp_sp_adapter_estimates_without_ranks():

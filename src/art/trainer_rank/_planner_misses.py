@@ -887,6 +887,7 @@ def replay(
                 )
                 request_cursor += count
                 group_cursor += 1
+            arguments = rank.verified_arguments(arguments)
         key = _impl._MemorySignature(**_signature_values(item["signature"]))
         if grouped and _adapter_ranks_unavailable(
             rank._topology_key(), item["runtime_facts"], key
