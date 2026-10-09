@@ -60,7 +60,9 @@ def test_large_finite_logits_have_normalized_logprobs_and_entropy(
 
     assert torch.isfinite(logprobs).all()
     assert torch.isfinite(entropy).all()
-    torch.testing.assert_close(logprobs.double(), ref_full[..., 0], rtol=1e-4, atol=4e-5)
+    torch.testing.assert_close(
+        logprobs.double(), ref_full[..., 0], rtol=1e-4, atol=4e-5
+    )
     torch.testing.assert_close(
         entropy.double(), -(ref_full.exp() * ref_full).sum(-1), rtol=1e-4, atol=4e-5
     )
