@@ -226,7 +226,6 @@ def test_cpu_shortage_is_not_overwritten_by_fresh_gpu_check(
 @pytest.mark.parametrize("cpu_available", [0, 1_000_000])
 def test_ep_oversized_preserves_graph_host_budget(rank, monkeypatch, cpu_available):
     rank._allow_oversized_batches = True
-    monkeypatch.setattr(rank, "_dp_rank_and_size", lambda: (0, 1))
     monkeypatch.setattr(rank, "_expert_parallel_active", lambda: True)
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 1)
     monkeypatch.setattr(rank, "_available_cpu_memory_bytes", lambda: cpu_available)
@@ -240,10 +239,13 @@ def test_ep_oversized_preserves_graph_host_budget(rank, monkeypatch, cpu_availab
         with pytest.raises(
             _impl.TrainerRankMemoryError, match="per-rank CPU headroom=0"
         ):
-            rank._select_next_micro_batch([requests], 0)
+            rank._plan_admissible_forward(
+                requests, checkpoint=_impl.Unset, context="test"
+            )
     else:
-        candidate = rank._select_next_micro_batch([requests], 0)
-        plan, check = candidate.plan, candidate.check
+        plan, check = rank._plan_admissible_forward(
+            requests, checkpoint=_impl.Unset, context="test"
+        )
         assert plan.request_count == 2 and plan.subforward_count == 1
         assert not check.fits and check.cpu_fits
         assert all(group.memory_placement is not None for group in plan.groups)
