@@ -38,7 +38,9 @@ def compute_advantages(
     centered = rewards_tensor - rewards_tensor.mean()
     if not normalize_advantages:
         return centered.tolist()
-    std_reward = rewards_tensor.std()
+    if all(abs(reward - rewards[0]) <= 1e-12 for reward in rewards[1:]):
+        return [0.0] * len(rewards)
+    std_reward = rewards_tensor.std(unbiased=False)
     if std_reward > 1e-8:
         return (centered / std_reward).tolist()
     return [0.0] * len(rewards)
