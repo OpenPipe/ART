@@ -647,12 +647,12 @@ def _calculate_logprobs(
     # Output shape is [B, S]
     log_probs = torch.empty(
         (batch_size, seq_len),
-        dtype=hidden_states.dtype,
+        dtype=torch.float32,
         device=hidden_states.device,
     )
     entropy = torch.empty(
         (batch_size, seq_len),
-        dtype=hidden_states.dtype,
+        dtype=torch.float32,
         device=hidden_states.device,
     )
     # Ensure lm_head_t is in the same dtype as hidden_states
@@ -662,7 +662,7 @@ def _calculate_logprobs(
     for i in range(0, seq_len, chunk_size):
         chunk_hs = hidden_states[:, i : i + chunk_size, :]  # [B, chunk_size, H]
         chunk_input_ids = next_input_ids[:, i : i + chunk_size]  # [B, chunk_size]
-        chunk_logits = torch.matmul(chunk_hs, lm_head_t)  # [B, chunk_size, V]
+        chunk_logits = torch.matmul(chunk_hs, lm_head_t).float()  # [B, chunk_size, V]
         chunk_selected_logits = torch.gather(
             chunk_logits, dim=-1, index=chunk_input_ids.unsqueeze(-1)
         ).squeeze(-1)  # [B, chunk_size]
