@@ -27,8 +27,10 @@ from art.megatron.model_support.registry import (
 )
 from art.megatron.model_support.spec import ModelSupportSpec
 from art.megatron.runtime.bridge_runtime import install_art_bridge_runtime_patches
+from art.megatron.te_cross_entropy import patch_te_cross_entropy
 
 install_art_bridge_runtime_patches()
+patch_te_cross_entropy()
 
 
 _NONE_ENV_VALUES = {"", "none", "null", "off", "disable", "disabled"}
