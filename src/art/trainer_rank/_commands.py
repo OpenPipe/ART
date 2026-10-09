@@ -970,18 +970,23 @@ class _RankView:
                 )
                 for tensor, cpu in zip(output.packet.tensors, output.cpu, strict=True)
             )
-        available = (
-            self._rank._available_memory_bytes()
-            if hasattr(self._rank, "_available_memory_bytes")
-            else 1 << 60
-        )
-        if hasattr(self._rank, "_pending_backward_memory"):
-            available -= sum(self._rank._pending_backward_memory())
+        allow_oversized = getattr(self._rank, "_allow_oversized_batches", False)
+        available = self._output_headroom()
+        required = sum(size for size, device in costs if device == "model")
+        if (
+            required > max(0, available)
+            and not allow_oversized
+            and hasattr(self._rank, "_release_cache_for_outputs")
+            and self._rank._release_cache_for_outputs()
+        ):
+            # The pending backward is reserved in full, yet would reuse the
+            # blocks its forward left cached, which native samples exclude.
+            available = self._output_headroom()
         placements = iter(
             choose_output_placements(
                 costs,
                 gpu_available_bytes=available,
-                allow_oversized=getattr(self._rank, "_allow_oversized_batches", False),
+                allow_oversized=allow_oversized,
             )
         )
         result = []
@@ -991,6 +996,16 @@ class _RankView:
                 replace(output, cpu=cpu, managed=output.managed or cpu != output.cpu)
             )
         return result
+
+    def _output_headroom(self) -> int:
+        available = (
+            self._rank._available_memory_bytes()
+            if hasattr(self._rank, "_available_memory_bytes")
+            else 1 << 60
+        )
+        if hasattr(self._rank, "_pending_backward_memory"):
+            available -= sum(self._rank._pending_backward_memory())
+        return available
 
     def _attach(self, output: _OutputPacket) -> Any:
         packet = replace(

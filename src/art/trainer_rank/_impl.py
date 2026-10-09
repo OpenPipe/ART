@@ -6291,6 +6291,7 @@ class TrainerRank:
     _cold_recompute_transient_bytes = _memory._cold_recompute_transient_bytes
     _checkpoint_input_gradient_bytes = _memory._checkpoint_input_gradient_bytes
     _available_memory_bytes = _memory._available_memory_bytes
+    _release_cache_for_outputs = _memory._release_cache_for_outputs
     _all_ranks_have_memory_profile = _memory._all_ranks_have_memory_profile
     _update_memory_profile = _memory._update_memory_profile
 

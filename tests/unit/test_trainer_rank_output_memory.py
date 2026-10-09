@@ -1,12 +1,13 @@
 """Logical placement must preserve native pending-backward reservations."""
 
-from types import SimpleNamespace
+from contextlib import nullcontext
+from types import MethodType, SimpleNamespace
 
 import pytest
 from test_trainer_rank_memory_admission import _requests, rank  # noqa: F401
 import torch
 
-from art.trainer_rank import ForwardInput, ForwardOptions, ForwardOutput, _impl
+from art.trainer_rank import ForwardInput, ForwardOptions, ForwardOutput, _impl, _memory
 from art.trainer_rank._commands import _Executor, _OutputPacket, _view
 from art.trainer_rank._tensors import detach_tree
 
@@ -159,3 +160,86 @@ def test_oversized_default_model_output_uses_retained_060_wave_geometry(
         view._place_outputs([(output, requests)])
     rank._allow_oversized_batches = True
     assert view._place_outputs([(output, requests)])[0].cpu == (False,) * 15
+
+
+_GIB = 1024**3
+# torch.cuda.mem_get_info total on an H200.
+_H200_BYTES = 150_754_820_096
+
+
+class _NativeAllocator:
+    """Native caching-allocator counters: physical free excludes cached blocks."""
+
+    def __init__(self, monkeypatch, *, allocated, reserved):
+        self.allocated, self.reserved, self.releases = allocated, reserved, 0
+        cuda = torch.cuda
+        monkeypatch.setattr(cuda, "is_available", lambda: True)
+        monkeypatch.setattr(cuda, "get_allocator_backend", lambda: "native")
+        monkeypatch.setattr(
+            cuda,
+            "mem_get_info",
+            lambda device=None: (_H200_BYTES - self.reserved, _H200_BYTES),
+        )
+        monkeypatch.setattr(
+            cuda, "memory_allocated", lambda device=None: self.allocated
+        )
+        monkeypatch.setattr(cuda, "memory_reserved", lambda device=None: self.reserved)
+        monkeypatch.setattr(cuda, "empty_cache", self.empty_cache)
+        monkeypatch.setattr(cuda, "device", lambda device: nullcontext())
+
+    def empty_cache(self):
+        self.releases += 1
+        self.reserved = self.allocated
+
+
+def _native_rank(rank, monkeypatch, *, allocated, reserved, restore):
+    monkeypatch.setattr(rank, "device", torch.device("cuda", 0))
+    monkeypatch.setattr(
+        rank,
+        "_available_memory_bytes",
+        MethodType(_memory._available_memory_bytes, rank),
+    )
+    _pending(rank, monkeypatch, SimpleNamespace(restore_workspace_bytes=restore))
+    return _NativeAllocator(monkeypatch, allocated=allocated, reserved=reserved)
+
+
+def test_model_outputs_reclaim_forward_cache_before_refusing(rank, monkeypatch):
+    # Shaped like 062's first large wave on one H200 (220420 B of FP32
+    # logprobs): a wave larger than its predecessors left 15 GiB of forward
+    # transients cached beside its graph. Physical free (5.4 GiB) minus the 3%
+    # reserve and the full 6 GiB backward reserve is negative, though the
+    # backward reuses those cached blocks.
+    allocator = _native_rank(
+        rank, monkeypatch, allocated=120 * _GIB, reserved=135 * _GIB, restore=6 * _GIB
+    )
+    view = _view(_Executor(rank, "rank"))
+    output = _output(220420, policy="model")
+    assert view._place_outputs([output])[0].cpu == (False,)
+    assert allocator.releases == 1 and allocator.reserved == allocator.allocated
+
+
+def test_output_cache_release_only_replaces_a_refusal(rank, monkeypatch):
+    allocator = _native_rank(
+        rank, monkeypatch, allocated=120 * _GIB, reserved=128 * _GIB, restore=6 * _GIB
+    )
+    view = _view(_Executor(rank, "rank"))
+    # Fitting model copies and over-budget auto copies keep their placement
+    # without touching the allocator.
+    assert view._place_outputs([_output(220420, policy="model")])[0].cpu == (False,)
+    assert view._place_outputs([_output(4 * _GIB)])[0].cpu == (True,)
+    assert allocator.releases == 0
+    # Nothing cached: the refusal stands, without a release.
+    allocator.reserved = allocator.allocated = 136 * _GIB
+    with pytest.raises(MemoryError, match="require 220420 GPU bytes; only 0"):
+        view._place_outputs([_output(220420, policy="model")])
+    assert allocator.releases == 0
+    # A release that still leaves too little refuses with the fresh sample.
+    allocator.allocated = 128 * _GIB
+    with pytest.raises(MemoryError, match=r"require 4294967296 GPU bytes; only \d+"):
+        view._place_outputs([_output(4 * _GIB, policy="model")])
+    assert allocator.releases == 1
+    # The oversized opt-in already permits the copy: no release.
+    allocator.reserved = 136 * _GIB
+    rank._allow_oversized_batches = True
+    assert view._place_outputs([_output(220420, policy="model")])[0].cpu == (False,)
+    assert allocator.releases == 1

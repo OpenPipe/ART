@@ -1981,6 +1981,38 @@ def _available_memory_bytes(
     return available
 
 
+def _release_cache_for_outputs(self: TrainerRank) -> bool:
+    """Return the native allocator's unused blocks to the device; False, without
+    releasing, when none are cached.
+
+    Native samples credit only physical free bytes, so blocks a finished
+    forward left cached are unavailable to output placement until released.
+    """
+    cuda = _impl.torch.cuda
+    if not (
+        cuda.is_available()
+        and self.device.type == "cuda"
+        and cuda.get_allocator_backend() == "native"
+    ):
+        return False
+    allocated = int(cuda.memory_allocated(self.device))
+    reserved = int(cuda.memory_reserved(self.device))
+    if reserved <= allocated:
+        return False
+    evidence = dict(
+        device=str(self.device),
+        physical_free_before_bytes=int(cuda.mem_get_info(self.device)[0]),
+        allocated_bytes=allocated,
+        reserved_before_bytes=reserved,
+    )
+    with _impl._telemetry_phase("output_placement_cache_release", evidence):
+        with cuda.device(self.device):
+            cuda.empty_cache()
+        evidence["physical_free_after_bytes"] = int(cuda.mem_get_info(self.device)[0])
+        evidence["reserved_after_bytes"] = int(cuda.memory_reserved(self.device))
+    return True
+
+
 def _all_ranks_have_memory_profile(
     self: TrainerRank,
     *,
