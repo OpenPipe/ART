@@ -51,17 +51,19 @@ def test_fitting_split_is_unchanged_when_override_enabled(monkeypatch):
     assert [plan.packed_tokens for plan in executed] == [20, 20]
 
 
-def test_cache_recovery_fit_wins_over_unsafe_minimum(monkeypatch):
+@pytest.mark.parametrize("ep", [False, True])
+def test_cache_recovery_fit_wins_over_unsafe_minimum(monkeypatch, ep):
     rank = _oversized(monkeypatch)
+    monkeypatch.setattr(rank, "_expert_parallel_active", lambda: ep)
 
     def recover(*args, **kwargs):
-        _packed_budget(monkeypatch, rank, 20)
+        _packed_budget(monkeypatch, rank, 40 if ep else 20)
         return True
 
     monkeypatch.setattr(rank, "_try_cache_recovery", recover)
     executed = _recording_executor(monkeypatch, rank)
     rank.dp_rank_forward([_request(i) for i in range(4)])
-    assert [plan.packed_tokens for plan in executed] == [20, 20]
+    assert [plan.packed_tokens for plan in executed] == ([40] if ep else [20, 20])
 
 
 def test_override_selects_best_rung_not_last(monkeypatch):
@@ -90,7 +92,7 @@ def test_disagreeing_peer_refuses_override(monkeypatch, ep):
     monkeypatch.setattr(rank, "_recovery_reduce", reduce)
     with pytest.raises(tr.TrainerRankMemoryError):
         rank.dp_rank_forward([_request(0), _request(1)] if ep else [_request(0)])
-    assert seen == [([1.0, 0.0, 0.0], "MIN", False)]
+    assert seen == ([] if ep else [([1.0, 0.0, 0.0], "MIN", False)])
 
 
 @pytest.mark.parametrize("ep", [False, True])
@@ -696,13 +698,13 @@ def test_ep_override_keeps_unsplit_plan(monkeypatch, allow):
     executed = _recording_executor(monkeypatch, rank)
     requests = [_request(i) for i in range(2)]
     if allow:
-        rank.dp_rank_forward(requests)
+        list(rank.forward_micro_batches([requests]))
         assert len(executed) == 1
         assert executed[0].request_count == 2
         assert executed[0].packed_tokens == 20
     else:
         with pytest.raises(tr.TrainerRankMemoryError, match="expert parallelism"):
-            rank.dp_rank_forward(requests)
+            list(rank.forward_micro_batches([requests]))
         assert not executed
 
 
@@ -725,7 +727,7 @@ def test_ep_override_selects_lowest_priced_unsplit_plan(monkeypatch, best_is_min
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
     monkeypatch.setattr(rank, "_memory_check", check)
     executed = _recording_executor(monkeypatch, rank)
-    rank.dp_rank_forward([_request(i) for i in range(2)])
+    list(rank.forward_micro_batches([[_request(i) for i in range(2)]]))
     assert len(executed) == 1
     assert plans[id(executed[0])] == best_is_minimal
     assert rank.last_forward_telemetry()["predicted_peak_bytes"] == 10
@@ -749,7 +751,7 @@ def test_ep_refusal_and_execution_oom_are_distinct(monkeypatch, tmp_path, allow)
 
     monkeypatch.setattr(rank, "_execute_flat_plan", fail)
     with pytest.raises(tr.TrainerRankMemoryError) as raised:
-        rank.dp_rank_forward([_request(0), _request(1)])
+        list(rank.forward_micro_batches([[_request(0), _request(1)]]))
     records = _records(tmp_path)
     if allow:
         assert calls == [2]
