@@ -369,6 +369,21 @@ class TrainerRank(_impl.TrainerRank):
         """Reduce in place over data-parallel batches, excluding TP/CP replicas."""
         super().dp_reduce(tensor, op=op)
 
+    # Callers written against the v1 names; there is no `options=` keyword.
+    forward_batches = forward_micro_batches
+    forward = dp_rank_forward
+    reduce = dp_reduce
+
+    def backward(
+        self,
+        loss: torch.Tensor | Sequence[torch.Tensor],
+        gradient: torch.Tensor | Sequence[torch.Tensor | None] | None = None,
+        *,
+        retain_graph: bool = False,
+    ) -> None:
+        """Equivalent to ``loss.backward(gradient, retain_graph=retain_graph)``."""
+        torch.autograd.backward(loss, gradient, retain_graph=retain_graph)
+
     def optim_step(
         self,
         *,

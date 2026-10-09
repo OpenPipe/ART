@@ -3307,7 +3307,7 @@ def test_dp_rank_forward_preserves_nested_shape_for_inactive_requests() -> None:
     assert outputs[1][0].checkpoint == "teacher"
     assert outputs[0][0].no_grad
     assert outputs[1][0].no_grad
-    assert not hasattr(trainer, "forward")
+    assert trainer.forward == trainer.dp_rank_forward
     assert not hasattr(trainer, "micro_batches")
 
 
