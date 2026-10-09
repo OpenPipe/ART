@@ -15,6 +15,7 @@ import yaml
 
 from .. import dev, types
 from ..loss import LossInputs, loss_fn, shift_tensor
+from ..megatron.prefix_tree import parse_prefix_tree_row
 from ..preprocessing.inputs import TrainInputs, create_train_inputs
 from ..preprocessing.pack import (
     DiskPackedTensors,
@@ -131,38 +132,34 @@ class TinkerService:
             )
             return loss.policy_loss, {"loss/train": loss.policy_loss.item()}
 
-        shifted_tokens = shift_tensor(packed_tensors["tokens"], 0)
-
         for i in range(packed_tensors["tokens"].shape[0]):
+            group_ids = packed_tensors["group_ids"][i]
+            row = parse_prefix_tree_row(
+                group_ids=group_ids, parent_ids=packed_tensors["parent_ids"][i]
+            )
             masks = [
-                (packed_tensors["group_ids"][i] == group_id)
-                | (packed_tensors["parent_ids"][i] == parent_id)
-                for group_id in packed_tensors["group_ids"][i].unique()
-                for parent_id in [
-                    packed_tensors["parent_ids"][i][
-                        packed_tensors["group_ids"][i] == group_id
-                    ][0]
-                ]
+                torch.isin(
+                    group_ids,
+                    group_ids.new_tensor((segment.group_id, *segment.ancestors)),
+                )
+                for segment in row.segments
             ]
+            datum_tokens = [packed_tensors["tokens"][i][mask] for mask in masks]
             forward_backward_output_future = (
                 await state.training_client.forward_backward_custom_async(
                     data=[
                         tinker.Datum(
                             loss_fn_inputs={
                                 "target_tokens": tinker.TensorData.from_torch(
-                                    shifted_tokens[i][mask]
+                                    shift_tensor(tokens.unsqueeze(0), 0).squeeze(0)
                                 ),
                                 "weights": tinker.TensorData.from_torch(
-                                    torch.ones_like(
-                                        shifted_tokens[i][mask], dtype=torch.float32
-                                    )
+                                    torch.ones_like(tokens, dtype=torch.float32)
                                 ),
                             },
-                            model_input=tinker.ModelInput.from_ints(
-                                packed_tensors["tokens"][i][mask].tolist()
-                            ),
+                            model_input=tinker.ModelInput.from_ints(tokens.tolist()),
                         )
-                        for mask in masks
+                        for tokens in datum_tokens
                     ],
                     loss_fn=partial(
                         custom_loss_fn,
