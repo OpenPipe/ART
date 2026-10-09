@@ -78,7 +78,7 @@ def test_mixed_checkpoint_head_demand_survives_recovery(monkeypatch, fits_after)
     values = r._estimate_flat_forward(requests, exact=True)
     assert values[3] == ((8, True), (16, False))
     assert r._checkpoint_memory_floor(values[3])[0] == 8 * 40 * 2048 * 2
-    assert values[4] == 7 * 16 * 248320 * 2
+    assert values[4] == 3 * 8 * 248320 * 2
     _check_component_demand_recovery(monkeypatch, r, requests, fits_after=fits_after)
 
 
@@ -147,7 +147,7 @@ def test_outputs_retention_and_empirical_peak_are_counted_once():
     plan = r._plan_flat_forward([request(grad=True)])
     retained = 512 * 40 * 2048 * 2
     gradient = 512 * 40 * 2048 * 2
-    head = 7 * 512 * 248320 * 2
+    head = 3 * 512 * 248320 * 2
     cost = r._plan_cost(plan)
     assert cost.retained == int((plan.output_bytes + retained + head) * 1.1)
     # Unprofiled: the first execution's transients beside the head workspace.
@@ -155,7 +155,7 @@ def test_outputs_retention_and_empirical_peak_are_counted_once():
         (plan.output_bytes + retained + gradient + head + COLD) * 1.1
     )
     r._memory_profiles[plan.signature] = _MemoryProfile(
-        bytes_per_token=10_000_000,
+        bytes_per_token=2_000_000,
         packed_tokens=512,
         logical_per_packed=1,
         retained_compute_bytes_per_token=1,
@@ -163,7 +163,7 @@ def test_outputs_retention_and_empirical_peak_are_counted_once():
     cost = r._plan_cost(plan)
     # Packed pricing adds head and caller memory for every logical row.
     rows = _PACKED_PRICED_LOGICAL_ROW_BYTES * 512
-    assert cost.required == int((plan.output_bytes + 512 * 10_000_000 + rows) * 1.1)
+    assert cost.required == int((plan.output_bytes + 512 * 2_000_000 + rows) * 1.1)
     assert cost.retained == int((plan.output_bytes + retained) * 1.1)
 
 
@@ -177,9 +177,9 @@ def test_ignored_targets_hidden_only_and_tiny_target_group():
     assert r._head_projection_rows([ignored, hidden]) == 0
     assert r._plan_head_workspace_bytes(r._plan_flat_forward([ignored, hidden])) == 0
     plan = r._plan_flat_forward([hidden, target])
-    assert r._plan_head_workspace_bytes(plan) == 7 * 248320 * 2
-    assert r._estimate_flat_forward([hidden, target])[-1] == 7 * 248320 * 2
-    assert r._estimate_flat_forward([hidden, target], exact=True)[-1] == 7 * 248320 * 2
+    assert r._plan_head_workspace_bytes(plan) == 3 * 248320 * 2
+    assert r._estimate_flat_forward([hidden, target])[-1] == 3 * 248320 * 2
+    assert r._estimate_flat_forward([hidden, target], exact=True)[-1] == 3 * 248320 * 2
 
 
 def test_multilabel_row_validity_matches_projection():
@@ -189,9 +189,7 @@ def test_multilabel_row_validity_matches_projection():
         target_tokens=torch.tensor([[-100, -100], [-100, 2], [3, -100], [-100, -100]]),
     )
     assert r._head_projection_rows([item]) == 2
-    assert (
-        r._plan_head_workspace_bytes(r._plan_flat_forward([item])) == 7 * 2 * 248320 * 2
-    )
+    assert r._plan_head_workspace_bytes(r._plan_flat_forward([item])) == 2 * 248320 * 2
 
 
 def test_shared_rows_use_lower_upper_and_exact_layout_union():
@@ -203,7 +201,7 @@ def test_shared_rows_use_lower_upper_and_exact_layout_union():
     assert r._head_projection_rows(req) == 4
     exact = r._estimate_flat_forward(req, exact=True, memory_minimal=True)
     plan = r._plan_flat_forward(req, memory_minimal=True)
-    assert exact[-1] == r._plan_head_workspace_bytes(plan) == 7 * 2 * 248320 * 2
+    assert exact[-1] == r._plan_head_workspace_bytes(plan) == 2 * 248320 * 2
     lower = r._split_chunk_lower_cost(
         req, tuple(x.input_tokens for x in req), checkpoint=Unset
     )
@@ -314,14 +312,14 @@ def test_tied_standard_head_weight_uses_the_same_capacity():
 
 
 @pytest.mark.parametrize("rows", [128, 512])
-def test_eager_statistics_refuses_budget_between_old_and_new_components(rows):
+def test_target_backward_refuses_budget_below_logits_and_both_gradients(rows):
     r = rank()
     plan = r._plan_flat_forward([request(rows, grad=True)])
     retained, _ = r._checkpoint_memory_floor(r._plan_group_rows(plan))
     gradient = rows * 40 * 2048 * 2
     dense = min(rows, 512) * 248320 * 2
-    before = int((plan.output_bytes + retained + gradient + 3 * dense + COLD) * 1.1)
-    expected = int((plan.output_bytes + retained + gradient + 7 * dense + COLD) * 1.1)
+    before = int((plan.output_bytes + retained + gradient + 2 * dense + COLD) * 1.1)
+    expected = int((plan.output_bytes + retained + gradient + 3 * dense + COLD) * 1.1)
     r._available_memory_bytes = lambda: (before + expected) // 2
     check = r._memory_check(plan)
     assert check.estimated_required_bytes == expected
@@ -334,17 +332,16 @@ def test_group_head_workspace_keeps_gradient_mode_with_its_rows(
 ):
     r = rank()
     requests = [request(gradient_rows, grad=True), request(reference_rows)]
-    expected = 7 * max(gradient_rows, reference_rows) * 248320 * 2
+    expected = max(3 * gradient_rows, reference_rows) * 248320 * 2
     plan = r._plan_flat_forward(requests)
     assert r._plan_head_workspace_bytes(plan) == expected
     for exact in (False, True):
         for minimal in (False, True):
-            assert r._estimate_flat_forward(
-                requests, exact=exact, memory_minimal=minimal
-            )[-1] == (
-                max(3 * gradient_rows, reference_rows) * 248320 * 2
-                if minimal and not exact
-                else expected
+            assert (
+                r._estimate_flat_forward(requests, exact=exact, memory_minimal=minimal)[
+                    -1
+                ]
+                == expected
             )
 
 
@@ -361,13 +358,8 @@ def test_gradient_statistics_floor_requires_exact_effective_scaling(mutation):
     r = rank()
     model = r.runtime.model[0]
     req = [request(128, grad=True)]
-    logits = [replace(request(128), target_tokens=None, logits=True)]
     assert (
-        r._plan_head_workspace_bytes(r._plan_flat_forward(logits))
-        == 3 * 128 * 248320 * 2
-    )
-    assert (
-        r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 7 * 128 * 248320 * 2
+        r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 3 * 128 * 248320 * 2
     )
     if mutation == "custom":
         model._scale_logits = lambda logits: logits
@@ -392,60 +384,6 @@ def test_gradient_statistics_floor_requires_exact_effective_scaling(mutation):
         del model._scale_logits
     # The standard head still allocates its original one-buffer component.
     assert r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 128 * 248320 * 2
-    assert (
-        r._plan_head_workspace_bytes(r._plan_flat_forward(logits)) == 128 * 248320 * 2
-    )
-
-
-@pytest.mark.parametrize("grad", [False, True])
-@pytest.mark.parametrize("rows", [1, 513])
-@pytest.mark.parametrize("hidden", [False, True])
-def test_logits_copies_refuse_budget_between_old_and_new_components(rows, hidden, grad):
-    r = rank()
-    req = [
-        replace(
-            request(rows, grad=grad, hidden=hidden), target_tokens=None, logits=True
-        )
-    ]
-    plan = r._plan_flat_forward(req)
-    dense = min(rows, 512) * 248320 * 2
-    output = rows * (248320 + (2048 if hidden else 0)) * 2
-    assert plan.output_bytes == output
-    assert r._plan_head_workspace_bytes(plan) == 3 * dense
-    for exact in (False, True):
-        assert r._estimate_flat_forward(req, exact=exact)[-1] == 3 * dense
-    # Capacity is not a universal rejection floor.
-    assert (
-        r._group_head_workspace_bytes(rows, req, grad_enabled=grad, lower_bound=True)
-        == dense
-    )
-    retained, _ = r._checkpoint_memory_floor(r._plan_group_rows(plan))
-    backward = retained + COLD if grad else 0
-    before = int((output + retained + backward + dense) * 1.1)
-    expected = int((output + retained + backward + 3 * dense) * 1.1)
-    r._available_memory_bytes = lambda: (before + expected) // 2
-    check = r._memory_check(plan)
-    assert check.estimated_required_bytes == expected
-    assert not check.fits
-
-
-def test_no_grad_logits_shared_rows_keep_outputs_and_statistics_separate():
-    r = rank()
-    item = replace(request(4), target_tokens=None, logits=True)
-    req = [item, item]
-    plan = r._plan_flat_forward(req, memory_minimal=True)
-    dense = 4 * 248320 * 2
-    assert plan.output_bytes == 2 * dense
-    assert r._plan_head_workspace_bytes(plan) == 3 * dense
-    assert (
-        r._estimate_flat_forward(req, exact=True, memory_minimal=True)[-1] == 3 * dense
-    )
-    # Any labels enable statistics group-wide, including ignored labels.
-    req.append(request(4, ignored=True))
-    assert (
-        r._plan_head_workspace_bytes(r._plan_flat_forward(req, memory_minimal=True))
-        == 7 * dense
-    )
 
 
 @pytest.mark.parametrize("extra", [{"logits": True}, {"top_k": 2}])
@@ -453,7 +391,7 @@ def test_gradient_statistics_floor_survives_additional_output_modes(extra):
     r = rank()
     req = [replace(request(128, grad=True), **extra)]
     assert (
-        r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 7 * 128 * 248320 * 2
+        r._plan_head_workspace_bytes(r._plan_flat_forward(req)) == 3 * 128 * 248320 * 2
     )
 
 
@@ -463,10 +401,10 @@ def test_gradient_shared_rows_price_same_union_in_exact_and_split_lower_cost():
     b = replace(a, target_tokens=torch.tensor([-100, 1]))
     requests = [a, a, b, b]
     plan = r._plan_flat_forward(requests, memory_minimal=True)
-    expected = 7 * 2 * 248320 * 2
+    expected = 3 * 2 * 248320 * 2
     exact = r._estimate_flat_forward(requests, exact=True, memory_minimal=True)
     assert exact[-1] == r._plan_head_workspace_bytes(plan) == expected
-    assert r._estimate_flat_forward(requests, memory_minimal=True)[-1] == 3 * 248320 * 2
+    assert r._estimate_flat_forward(requests, memory_minimal=True)[-1] == expected // 2
     lower = r._split_chunk_lower_cost(
         requests, tuple(x.input_tokens for x in requests), checkpoint=Unset
     )
@@ -478,4 +416,4 @@ def test_later_sparse_loss_does_not_reduce_6330_projected_targets():
     item = request(6330, grad=True)
     plan = r._plan_flat_forward([item])
     assert item.target_tokens.numel() == 6330
-    assert r._plan_head_workspace_bytes(plan) == 7 * 512 * 248320 * 2
+    assert r._plan_head_workspace_bytes(plan) == 3 * 512 * 248320 * 2
