@@ -22,9 +22,7 @@ def _inputs(original_logprobs: torch.Tensor | None = None) -> AlignedLossInputs:
 
 
 @pytest.mark.parametrize("ppo", [False, True])
-@pytest.mark.parametrize(
-    "level", ["token", "sequence", "average", "geometric_average"]
-)
+@pytest.mark.parametrize("level", ["token", "sequence", "average", "geometric_average"])
 def test_tis_without_original_logprobs_preserves_loss_and_gradient(
     ppo: bool, level: ImportanceSamplingLevel
 ) -> None:
@@ -60,7 +58,9 @@ def test_tis_uses_trainer_sampler_ratio_when_original_logprobs_exist(
             ratio.clamp(0.8, 1.2) * inputs.advantages,
         )
     else:
-        per_token_loss = -ratio.detach().clamp(0.0, 5.0) * inputs.advantages * new_logprobs
+        per_token_loss = (
+            -ratio.detach().clamp(0.0, 5.0) * inputs.advantages * new_logprobs
+        )
     correction = torch.tensor([[2.0, torch.exp(torch.tensor(-1.0)).item(), 1.0]])
     expected = (per_token_loss * correction * inputs.weights).mean()
     with warnings.catch_warnings(record=True) as caught:
