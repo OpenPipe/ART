@@ -910,6 +910,49 @@ class _ShapeChangingKernel(torch.autograd.Function):
         return gradient.to(logits.dtype), None, None
 
 
+@pytest.mark.parametrize("top_k", [0, 4])
+def test_successful_kernel_checkpoint_recompute_preserves_early_stop(
+    monkeypatch, top_k
+):
+    from art.trainer_rank import _impl, topk
+
+    r = _cuda_head(monkeypatch, vocabulary=64)
+    weight = torch.randn(16, 32)
+    monkeypatch.setattr(
+        TrainerRank,
+        "_local_logits_from_hidden_rows",
+        lambda self, model, hidden, output_weight: hidden @ weight,
+    )
+    monkeypatch.setattr(_impl, "_triton_stats_enabled", lambda cuda, rows: True)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_TOPK", "1")
+    completed = []
+
+    def kernel(logits, *, targets, **kwargs):
+        if top_k:
+            with torch.no_grad():
+                values, tokens = torch.topk(logits.float(), top_k, dim=-1)
+        stats = _ShapeChangingKernel.apply(logits, *targets)
+        completed.append(True)
+        if not top_k:
+            return stats
+        return stats[0], stats[1], values, tokens, stats[2]
+
+    monkeypatch.setattr(
+        topk, "local_topk_stats" if top_k else "local_logsumexp_stats", kernel
+    )
+    hidden = torch.randn(64, 16, requires_grad=True)
+    _, log_z, _, _ = r._checkpointed_head_stats(
+        None, hidden, output_weight=None, need_log_z=True, max_top_k=top_k
+    )
+    assert log_z is not None
+    log_z.sum().backward()
+    assert hidden.grad is not None and hidden.grad.isfinite().all()
+    # Replay stops at the kernel's last saved tensor, inside the attempt helper.
+    assert completed == [True]
+
+
 @pytest.mark.parametrize("forward_fails", [True, False])
 def test_a_checkpoint_recompute_replays_the_forward_statistics_path(
     monkeypatch, forward_fails

@@ -4752,6 +4752,7 @@ class TrainerRank:
                     k=max_top_k,
                     targets=gathered,
                     rows_ascending=rows_ascending,
+                    required=recorded == "topk",
                 )
                 if recorded in (None, "topk")
                 else None
@@ -4776,6 +4777,7 @@ class TrainerRank:
                         targets=gathered,
                         # Appended top-k tokens revisit every row.
                         rows_ascending=rows_ascending and topk_tokens is None,
+                        required=recorded == "logsumexp",
                     ),
                 )
                 if topk_stats is None and recorded in (None, "logsumexp")
@@ -5895,6 +5897,7 @@ def _try_triton_local_topk_stats(
     k: int,
     targets: tuple[torch.Tensor, torch.Tensor],
     rows_ascending: bool = False,
+    required: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     if k <= 0 or k > int(
         os.environ.get("ART_TRAINER_RANK_TRITON_FUSED_TOPK_MAX", "10")
@@ -5909,6 +5912,7 @@ def _try_triton_local_topk_stats(
             k=min(k, int(local_logits.shape[1])),
             targets=targets,
             rows_ascending=rows_ascending,
+            required=required,
         ),
     )
 
@@ -5960,6 +5964,8 @@ def _triton_head_stats(rank: Any, rows: int, vocabulary: int) -> bool:
 def _try_triton_stats(
     name: str,
     local_logits: torch.Tensor,
+    *,
+    required: bool = False,
     **kwargs: object,
 ) -> object | None:
     if not _triton_stats_enabled(local_logits.is_cuda, int(local_logits.shape[0])):
@@ -5969,7 +5975,12 @@ def _try_triton_stats(
 
         return getattr(topk, name)(local_logits, **kwargs)
     except Exception:
-        if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict":
+        # A recorded kernel must replay without fallback, including letting
+        # checkpoint's early-stop exception reach its recomputation hook.
+        if (
+            required
+            or os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict"
+        ):
             raise
         return None
 

@@ -88,7 +88,7 @@ def test_logits_assignment_has_output_and_three_distinct_cpu_storages(
     )
 
 
-@pytest.mark.parametrize("mode", ["short", "disabled", "error", "strict"])
+@pytest.mark.parametrize("mode", ["short", "disabled", "error", "strict", "required"])
 def test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound(
     monkeypatch, mode
 ):
@@ -112,12 +112,14 @@ def test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound(
     )
     rows = 63 if mode == "short" else 64
     probe = cast(torch.Tensor, SimpleNamespace(is_cuda=True, shape=(rows, 17)))
-    if mode == "strict":
+    if mode in {"strict", "required"}:
         with pytest.raises(RuntimeError, match="optional kernel failed"):
-            _impl._try_triton_stats("local_logsumexp_stats", probe)
+            _impl._try_triton_stats(
+                "local_logsumexp_stats", probe, required=mode == "required"
+            )
     else:
         assert _impl._try_triton_stats("local_logsumexp_stats", probe) is None
-    assert len(calls) == int(mode in {"error", "strict"})
+    assert len(calls) == int(mode in {"error", "strict", "required"})
     r = rank()
     dense = rows * 248320 * 2
     for grad in (False, True):
