@@ -671,16 +671,11 @@ def _calculate_logprobs(
 
         # Entropy is only used as a metric.
         with torch.no_grad():
-            chunk_probs = torch.exp(chunk_log_probs)
-            chunk_probs.mul_(chunk_log_probs)
-            entropy[:, i : i + chunk_size] = -chunk_probs.sum(dim=-1)
+            entropy[:, i : i + chunk_size] = (
+                -chunk_log_probs.exp().mul_(chunk_log_probs).sum(dim=-1)
+            )
 
-        del (
-            chunk_hs,
-            chunk_input_ids,
-            chunk_log_probs,
-            chunk_probs,
-        )
+        del chunk_hs, chunk_input_ids, chunk_log_probs
     del hidden_states
     return log_probs, entropy
 
