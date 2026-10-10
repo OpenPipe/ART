@@ -478,7 +478,7 @@ def test_oversized_iterator_output_copy_preserves_backward_and_failure_cleanup(
 ):
     rank: Any = _CachedRank()
     rank._allow_oversized_batches = True
-    rank._available_memory_bytes = lambda: 0
+    rank._available_memory_bytes = lambda **_: 0
     executor = _Executor(rank, "zero")
     packet = executor._packet
     targets = set()

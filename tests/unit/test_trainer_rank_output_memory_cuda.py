@@ -46,7 +46,7 @@ def test_logical_outputs_leave_existing_replay_backward_admissible(monkeypatch):
     monkeypatch.setattr(
         trainer,
         "_available_memory_bytes",
-        lambda: limit - torch.cuda.memory_allocated(),
+        lambda **_: limit - torch.cuda.memory_allocated(),
     )
     large = 32 * 1024**2
     with pytest.raises(MemoryError):

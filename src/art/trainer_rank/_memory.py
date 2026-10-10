@@ -18,7 +18,7 @@ from contextlib import nullcontext
 import hashlib
 import math
 from types import MethodType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from art.trainer_rank import _impl
 
@@ -1920,7 +1920,10 @@ def _gdn_segment_layer_bytes(self: TrainerRank) -> float:
 
 
 def _available_memory_bytes(
-    self: TrainerRank, sample: dict[str, Any] | None = None
+    self: TrainerRank,
+    sample: dict[str, Any] | None = None,
+    *,
+    reusable_cache: bool = False,
 ) -> int:
     if not (_impl.torch.cuda.is_available() and self.device.type == "cuda"):
         return 1 << 60
@@ -1930,14 +1933,25 @@ def _available_memory_bytes(
     if allocator == "native":
         # Cached bytes are not physical free memory. This sample does not
         # reserve memory for execution or the caller's later backward.
-        if sample is None:
+        if sample is None and not reusable_cache:
             allocated = int(_impl.torch.cuda.memory_allocated(self.device))
         else:
             # memory_allocated uses this same stats read. Retain its other
             # already-returned fields without another allocator query.
             stats = _impl.torch.cuda.memory_stats(self.device)
             allocated = int(stats.get("allocated_bytes.all.current", 0))
+        # Small copies made between physical forwards, such as gathered
+        # outputs, reuse cached blocks; frees pending on other streams remain
+        # active and are not credited.
+        counters = [
+            None if stats is None else stats.get(f"{name}_bytes.all.current")
+            for name in ("allocated", "active", "reserved")
+        ]
         reusable_reserved = 0
+        if reusable_cache and all(type(value) is int for value in counters):
+            used, active, reserved = cast("list[int]", counters)
+            if 0 <= used <= active <= reserved:
+                reusable_reserved = reserved - active
     else:
         # Preserve the previous, unqualified policy for other backends.
         allocated = int(_impl.torch.cuda.memory_allocated(self.device))
