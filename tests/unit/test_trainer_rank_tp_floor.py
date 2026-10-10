@@ -11,7 +11,9 @@ keep today's pricing.
 """
 
 from dataclasses import replace
+import gc
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -520,7 +522,7 @@ def test_every_head_chunk_is_priced_for_its_own_statistics_path(
         monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", minimum)
     # The planner's projection is capped at one chunk; the tail is not.
     assert r._head_projection_rows(_labelled(rows)) == 512
-    targets = _memory._head_target_bytes(512, _labelled(rows), grad_enabled=True)
+    targets = _memory._head_target_bytes(rows, _labelled(rows), grad_enabled=True)
     assert _head_stage(r, _labelled(rows)) == expected + targets
     # Replay capture refuses exactly the waves with an eager chunk.
     from art.trainer_rank._planner_replay import head_statistics_fallback
@@ -568,7 +570,11 @@ def test_head_bounds_envelope_every_possible_projected_union(
     monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "512")
     r = _cuda_head(monkeypatch)
     requests, positions = _positioned(list(first), second)
-    exact += _memory._head_target_bytes(512, requests, grad_enabled=True)
+    exact += _memory._head_target_bytes(
+        r._head_projection_rows(requests, positions=positions, uncapped=True),
+        requests,
+        grad_enabled=True,
+    )
 
     def charge(**bounds):
         rows = r._head_projection_rows(
@@ -619,8 +625,11 @@ def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
             patch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
             patch.setattr(
                 _impl,
-                "_vocab_parallel_log_z",
-                lambda t, targets: (t[:, 0].float(), t[targets].float()),
+                "_vocab_parallel_log_z_parts",
+                lambda t, targets: (
+                    (t[:, 0].float(), torch.ones(t.shape[0]), None),
+                    t[targets].float(),
+                ),
             )
             r._local_head_stats(
                 None, logits, output_weight=None, need_log_z=True, max_top_k=max_top_k
@@ -788,7 +797,7 @@ def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failur
     def unchunked(_logits, _targets):
         raise AssertionError("the unchunked FP32 fallback ran after an attempt")
 
-    monkeypatch.setattr(_impl, "_vocab_parallel_log_z", unchunked)
+    monkeypatch.setattr(_impl, "_vocab_parallel_log_z_parts", unchunked)
     _, log_z, top_k, _ = r._local_head_stats(
         None, logits, output_weight=None, need_log_z=True, max_top_k=4
     )
@@ -825,11 +834,17 @@ def test_replay_prices_the_tp2_head_stage_as_live_admission(monkeypatch):
         (512, True, _requests(512, targets=False, top_k=4), 2),
         (512, False, _requests(512, targets=False, top_k=4), 1),
         (512, True, [*_requests(512), *_requests(512, targets=False, top_k=4)], 2),
+        (512, True, _requests(1_024), 2),
+        (512, False, _requests(1_024), 1),
     )
     for rows, grad, requests, buffers in cases:
         live = r._group_head_workspace_bytes(rows, requests, grad_enabled=grad)
         bounded = _memory._eager_stats_extra_bytes(124_160, rows)
-        targets = _memory._head_target_bytes(rows, requests, grad_enabled=grad)
+        targets = _memory._head_target_bytes(
+            r._head_projection_rows(requests, uncapped=True),
+            requests,
+            grad_enabled=grad,
+        )
         assert 0 < targets < r._head_workspace_bytes(rows) / 64
         assert live == buffers * r._head_workspace_bytes(rows) + bounded + targets
         frozen = _memory._frozen_head_bytes(
@@ -941,6 +956,60 @@ def test_a_checkpoint_recompute_replays_the_forward_statistics_path(
             log_z.sum().backward()
 
 
+@pytest.mark.parametrize("statistics", ["fallback", "bounded", "kernel"])
+def test_checkpointed_head_saves_only_row_vectors_for_normalizer_backward(
+    monkeypatch, statistics
+):
+    from art.trainer_rank import _impl
+
+    r = _cuda_head(monkeypatch, vocabulary=64)
+    weight = torch.randn(16, 32, dtype=torch.bfloat16)
+    projections = []
+
+    def project(self, model, hidden, *, output_weight):
+        projections.append(int(hidden.shape[0]))
+        return hidden @ weight
+
+    monkeypatch.setattr(TrainerRank, "_local_logits_from_hidden_rows", project)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+    monkeypatch.setattr(
+        _impl, "_triton_stats_enabled", lambda cuda, rows: statistics != "fallback"
+    )
+    monkeypatch.setattr(_impl, "_try_triton_local_topk_stats", lambda *a, **k: None)
+    monkeypatch.setattr(
+        _impl,
+        "_try_triton_stats",
+        lambda name, logits, **kw: (
+            _ShapeChangingKernel.apply(logits, *kw["targets"])
+            if statistics == "kernel"
+            else None
+        ),
+    )
+    hidden = torch.randn(64, 16, dtype=torch.bfloat16, requires_grad=True)
+    saved = []
+
+    def pack(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        _, log_z, _, _ = r._checkpointed_head_stats(
+            None, hidden, output_weight=None, need_log_z=True, max_top_k=0
+        )
+    assert log_z is not None
+    # LogBackward must read a retained row vector, without replaying a dense
+    # chunk ahead of the statistics backward and caching that chunk's logits.
+    vectors = [tensor for tensor in saved if tensor.shape == (64,)]
+    assert len(vectors) == (1 if statistics == "fallback" else 2)
+    assert all(tensor.dtype == torch.float32 for tensor in vectors)
+    assert all(tensor.untyped_storage().nbytes() == 4 * 64 for tensor in vectors)
+    assert projections == [64]
+    log_z.sum().backward()
+    assert projections == [64, 64]
+    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+
+
 class _AllocatedBytes:
     """Peak CPU allocator bytes for storages allocated inside the context.
 
@@ -955,31 +1024,183 @@ class _AllocatedBytes:
     def __enter__(self):
         from torch.profiler import ProfilerActivity, profile
 
-        self._profile = profile(activities=[ProfilerActivity.CPU], profile_memory=True)
-        self._profile.__enter__()
+        self._restore_gc = gc.enable if gc.isenabled() else gc.disable
+        # Earlier cyclic garbage must not move the allocator baseline mid-profile.
+        gc.collect()
+        gc.disable()
+        try:
+            self._profile = profile(
+                activities=[ProfilerActivity.CPU], profile_memory=True
+            )
+            self._profile.__enter__()
+        except BaseException:
+            self._restore_gc()
+            raise
         return self
 
     def __exit__(self, *exc):
+        try:
+            self._profile.__exit__(*exc)
+        finally:
+            self._restore_gc()
         from torch._C._profiler import _ExtraFields_Allocation
 
-        self._profile.__exit__(*exc)
         profiler = self._profile.profiler
         assert profiler is not None and profiler.kineto_results is not None
-        events, nodes = [], list(profiler.kineto_results.experimental_event_tree())
+        events = []
+        nodes: list[tuple[Any, tuple[str, ...]]] = [
+            (node, ()) for node in profiler.kineto_results.experimental_event_tree()
+        ]
         while nodes:
-            node = nodes.pop()
+            node, origin = nodes.pop()
             if isinstance(node.extra_fields, _ExtraFields_Allocation):
                 fields = node.extra_fields
                 events.append(
-                    (node.start_time_ns, fields.alloc_size, fields.total_allocated)
+                    (
+                        node.start_time_ns,
+                        fields.alloc_size,
+                        fields.total_allocated,
+                        fields.ptr,
+                        node.start_tid,
+                        "/".join(origin[-3:]) or "[no operator]",
+                    )
                 )
-            nodes.extend(node.children)
+            else:
+                origin = (*origin, node.name)
+            nodes.extend((child, origin) for child in node.children)
+        self._events = sorted(events)
         current = self.timed_peak = 0
-        for _, size, _ in sorted(events):
+        for _, size, _, _, _, _ in self._events:
             current += size
             self.timed_peak = max(self.timed_peak, current)
-        start = min((total - size for _, size, total in events), default=0)
-        self.peak = max((total for _, _, total in events), default=start) - start
+        start = min((total - size for _, size, total, _, _, _ in events), default=0)
+        self.peak = (
+            max((total for _, _, total, _, _, _ in events), default=start) - start
+        )
+
+    def allocation_diagnostics(self):
+        """Storage origins near the allocator peak; timestamps can interleave."""
+        peak_event = max(self._events, key=lambda event: event[2], default=None)
+        allocated = {event[3] for event in self._events if event[1] > 0}
+        live, at_peak, earlier_frees = {}, {}, []
+        for event in self._events:
+            _, size, _, pointer, thread, origin = event
+            if size > 0:
+                live[pointer] = (size, thread, origin)
+            else:
+                live.pop(pointer, None)
+                if pointer not in allocated:
+                    earlier_frees.append(dict(size=-size, thread=thread, origin=origin))
+            if event is peak_event:
+                at_peak = live.copy()
+        groups, by_thread = {}, {}
+        for size, thread, origin in at_peak.values():
+            key = (size, thread, origin)
+            groups[key] = groups.get(key, 0) + 1
+            by_thread[thread] = by_thread.get(thread, 0) + size
+        ordered = sorted(
+            groups.items(), key=lambda pair: pair[0][0] * pair[1], reverse=True
+        )
+        return dict(
+            snapshot_order="profiler timestamps",
+            peak_event=(
+                dict(
+                    size=peak_event[1],
+                    total=peak_event[2],
+                    thread=peak_event[4],
+                    origin=peak_event[5],
+                )
+                if peak_event is not None
+                else None
+            ),
+            live_at_peak=[
+                dict(size=size, count=count, thread=thread, origin=origin)
+                for (size, thread, origin), count in ordered[:20]
+            ],
+            live_by_thread=by_thread,
+            omitted_groups=len(ordered[20:]),
+            pre_window_frees=earlier_frees[:8],
+            pre_window_free_bytes=sum(event["size"] for event in earlier_frees),
+            cpu_count=os.cpu_count(),
+            torch_threads=torch.get_num_threads(),
+        )
+
+
+def test_head_memory_meter_collects_earlier_cyclic_storage_before_profiling():
+    restore_gc = gc.enable if gc.isenabled() else gc.disable
+    gc.disable()
+    try:
+        with _AllocatedBytes():
+            garbage = [torch.empty(4_096, dtype=torch.uint8)]
+            garbage.append(garbage)
+        del garbage
+        with _AllocatedBytes() as measured:
+            temporary = torch.empty(1_024, dtype=torch.uint8)
+            del temporary
+            gc.collect()
+            tail = torch.empty(512, dtype=torch.uint8)
+            del tail
+        assert measured.peak == 1_024
+    finally:
+        restore_gc()
+
+
+def test_head_memory_meter_reports_peak_storage_origins_and_earlier_frees():
+    with _AllocatedBytes():
+        retained = torch.empty(4_096, dtype=torch.uint8)
+    with _AllocatedBytes() as measured:
+        first = torch.empty(1_024, dtype=torch.uint8)
+        second = torch.empty(2_048, dtype=torch.uint8)
+        del first, second, retained
+    diagnostics = measured.allocation_diagnostics()
+    assert sorted(
+        (group["size"], group["count"]) for group in diagnostics["live_at_peak"]
+    ) == [(1_024, 1), (2_048, 1)]
+    assert all(
+        group["thread"] == 1 and "aten::empty" in group["origin"]
+        for group in diagnostics["live_at_peak"]
+    )
+    assert diagnostics["pre_window_free_bytes"] == 4_096
+    assert diagnostics["pre_window_frees"] == [
+        dict(size=4_096, thread=1, origin="[no operator]")
+    ]
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_head_memory_meter_restores_gc_after_normal_and_failed_windows(enabled):
+    restore_gc = gc.enable if gc.isenabled() else gc.disable
+    (gc.enable if enabled else gc.disable)()
+    try:
+        with _AllocatedBytes():
+            assert not gc.isenabled()
+        assert gc.isenabled() == enabled
+        with pytest.raises(RuntimeError, match="head failed"):
+            with _AllocatedBytes():
+                assert not gc.isenabled()
+                raise RuntimeError("head failed")
+        assert gc.isenabled() == enabled
+    finally:
+        restore_gc()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_head_memory_meter_restores_gc_when_profiling_cannot_start(
+    monkeypatch, enabled
+):
+    class FailedProfile:
+        def __enter__(self):
+            raise RuntimeError("profile failed")
+
+    monkeypatch.setattr("torch.profiler.profile", lambda **kwargs: FailedProfile())
+    restore_gc = gc.enable if gc.isenabled() else gc.disable
+    (gc.enable if enabled else gc.disable)()
+    try:
+        with pytest.raises(RuntimeError, match="profile failed"):
+            with _AllocatedBytes():
+                pass
+        assert gc.isenabled() == enabled
+    finally:
+        restore_gc()
 
 
 class _Projection(torch.autograd.Function):
@@ -1192,11 +1413,25 @@ def test_tensor_parallel_heads_fit_their_charge_without_a_spare_chunk(tmp_path):
     failures = []
     for rank in range(2):
         measured = json.loads((tmp_path / f"rank-{rank}.json").read_text())
+        diagnostics = json.loads(
+            (tmp_path / f"rank-{rank}-allocations.json").read_text()
+        )
         assert len(measured) == 10
         for path, case, lower, peak, charged, dense, timed_peak in measured:
             if not (lower <= peak <= charged and charged - peak < dense / 8):
-                failures.append((rank, path, case, lower, peak, charged, timed_peak))
-    assert not failures, "(rank, path, case, lower, peak, charged, timed peak)"
+                failures.append(
+                    dict(
+                        rank=rank,
+                        path=path,
+                        case=case,
+                        lower=lower,
+                        peak=peak,
+                        charged=charged,
+                        timed_peak=timed_peak,
+                        allocations=diagnostics[f"{path}/{case}"],
+                    )
+                )
+    assert not failures, json.dumps(failures, indent=2)
 
 
 class _GatherLastDim(torch.autograd.Function):
@@ -1226,7 +1461,7 @@ class _GatherLastDim(torch.autograd.Function):
 def _measured_tensor_parallel_worker(rank, rendezvous, output):
     import torch.distributed as dist
 
-    measured = []
+    measured, diagnostics = [], {}
     with process_group(rank, rendezvous, world_size=2, timeout=200):
         for path in ("fallback", "bounded"):
             for case in (
@@ -1285,7 +1520,9 @@ def _measured_tensor_parallel_worker(rank, rendezvous, output):
                 measured.append(
                     (path, case, lower, peak, charged, dense, meter.timed_peak)
                 )
+                diagnostics[f"{path}/{case}"] = meter.allocation_diagnostics()
     (Path(output) / f"rank-{rank}.json").write_text(json.dumps(measured))
+    (Path(output) / f"rank-{rank}-allocations.json").write_text(json.dumps(diagnostics))
 
 
 class _CudaAllocatedBytes:

@@ -664,7 +664,13 @@ class ReplayRank(_impl.TrainerRank):
         ):
             raise ValueError("head statistics facts disagree with selected requests")
         self._head_targets.append(
-            _memory._head_target_bytes(projected, requests, grad_enabled=group["grad"])
+            _memory._head_target_bytes(
+                self._head_projection_rows(
+                    requests, positions=packed.positions_by_sequence, uncapped=True
+                ),
+                requests,
+                grad_enabled=group["grad"],
+            )
         )
 
     def _moe_workspace_bytes(

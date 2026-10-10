@@ -186,14 +186,14 @@ def test_group_stats_cover_logits_chunks_before_short_target_tail(
 ):
     _patch_local_head(monkeypatch)
     monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", 4)
-    original = _impl._vocab_parallel_log_z
+    original = _impl._vocab_parallel_log_z_parts
     calls = []
 
     def log_z(logits, targets):
         calls.append(tuple(logits.shape))
         return original(logits, targets)
 
-    monkeypatch.setattr(_impl, "_vocab_parallel_log_z", log_z)
+    monkeypatch.setattr(_impl, "_vocab_parallel_log_z_parts", log_z)
     model = SimpleNamespace(
         output_layer=_Head(torch.arange(85, dtype=torch.float32).reshape(17, 5) / 100),
         vocab_size=17,

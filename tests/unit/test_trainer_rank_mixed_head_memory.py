@@ -42,7 +42,7 @@ def test_sparse_target_prices_its_full_mixed_chunk_and_short_tail(extra):
     assert r._head_target_chunk_rows(req, lower_bound=True) == 1
     assert r._head_target_chunk_rows(req) == 512
     dense = 512 * 248320 * 2
-    capacity = 7 * dense + targets(512, req, grad=True)
+    capacity = 7 * dense + targets(513, req, grad=True)
     assert (
         r._group_head_workspace_bytes(512, req, grad_enabled=True, positions=full)
         == capacity
@@ -170,7 +170,7 @@ def test_actual_mixed_projection_preserves_target_outputs_and_backward(
             values[:, :k] - log_z[:, None], tokens[:, :k]
         ),
     )
-    original = TrainerRank._local_head_stats
+    original = TrainerRank._local_head_stats_parts
     calls = []
 
     def head_stats(self, model, hidden, *, targets=None, **kwargs):
@@ -178,7 +178,7 @@ def test_actual_mixed_projection_preserves_target_outputs_and_backward(
             calls.append((int(hidden.shape[0]), targets[0].unique().tolist()))
         return original(self, model, hidden, targets=targets, **kwargs)
 
-    monkeypatch.setattr(TrainerRank, "_local_head_stats", head_stats)
+    monkeypatch.setattr(TrainerRank, "_local_head_stats_parts", head_stats)
     generator = torch.Generator().manual_seed(97)
     hidden = torch.randn(13, 5, generator=generator, dtype=torch.float64)
     weights = torch.randn(17, 5, generator=generator, dtype=torch.float64)
