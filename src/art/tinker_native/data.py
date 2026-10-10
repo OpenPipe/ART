@@ -20,6 +20,7 @@ from ..trajectories import (
 )
 from ..trajectories._selection import ModelSelector, resolve_training_model
 from ..types import MessagesAndChoices
+from ..utils.grpo import rewards_have_zero_variance
 
 
 def create_conversation_prefix_with_tools(
@@ -34,7 +35,7 @@ def compute_advantages(
 ) -> list[float]:
     if not rewards:
         return []
-    if all(abs(reward - rewards[0]) <= 1e-12 for reward in rewards[1:]):
+    if rewards_have_zero_variance(rewards):
         return [0.0] * len(rewards)
     rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
     centered = rewards_tensor - rewards_tensor.mean()
