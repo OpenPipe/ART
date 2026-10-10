@@ -1104,13 +1104,6 @@ class LocalBackend:
             if not tokenized_results:
                 return None
 
-        tokenized_results = [
-            result
-            for result in tokenized_results
-            if any(result.assistant_mask[result.prompt_length :])
-        ]
-        if not tokenized_results:
-            return None
         self._record_packed_group_observations(trajectory_groups, tokenized_results)
         packed_tensors = packed_tensors_from_tokenized_results(
             tokenized_results,
@@ -1121,6 +1114,7 @@ class LocalBackend:
             pack_results=self._supports_result_packing,
             include_moe_routing=include_moe_routing,
         )
+        # Position 0 has no preceding token, so it never carries loss.
         if not bool(
             (
                 packed_tensors["advantages"][:, 1:] * packed_tensors["weights"][:, 1:]

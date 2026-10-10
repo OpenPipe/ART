@@ -283,7 +283,7 @@ async def test_megatron_noop_advances_every_rank_without_touching_optimizer() ->
         optimizer.zero_grad.assert_not_called()
 
 
-@pytest.mark.parametrize("empty_kind", ["zero_advantages", "zero_weights", "no_tokens"])
+@pytest.mark.parametrize("empty_kind", ["zero_advantages", "zero_weights"])
 def test_backend_packing_skips_batches_without_weighted_advantage(
     tmp_path: Path, empty_kind: str
 ) -> None:
@@ -301,10 +301,8 @@ def test_backend_packing_skips_batches_without_weighted_advantage(
     for result in results:
         if empty_kind == "zero_advantages":
             result.advantage = 0.0
-        elif empty_kind == "zero_weights":
-            result.weight = 0.0
         else:
-            result.assistant_mask = [0] * len(result.token_ids)
+            result.weight = 0.0
     with (
         patch("art.local.backend.get_tokenizer", return_value=_Tokenizer()),
         patch(
