@@ -51,6 +51,7 @@ from art.pipeline_tuner import (
     RolloutWorkerController,
 )
 from art.preprocessing.policy_spans import PolicyTokenSpan
+from art.utils.grpo import rewards_have_zero_variance
 
 from .checkpoint_retention import (
     CHECKPOINT_CREATED_AT_METRIC,
@@ -1827,11 +1828,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
     @staticmethod
     def _group_zero_variance(group: TrajectoryGroup) -> bool:
-        rewards = [t.reward for t in group.trajectories]
-        if len(rewards) <= 1:
-            return True
-        first = rewards[0]
-        return all(abs(r - first) <= 1e-12 for r in rewards[1:])
+        return rewards_have_zero_variance([t.reward for t in group.trajectories])
 
     def _group_initial_version(self, group: TrajectoryGroup) -> int | None:
         versions = [

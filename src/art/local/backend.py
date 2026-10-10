@@ -1114,6 +1114,13 @@ class LocalBackend:
             pack_results=self._supports_result_packing,
             include_moe_routing=include_moe_routing,
         )
+        # Position 0 has no preceding token, so it never carries loss.
+        if not bool(
+            (
+                packed_tensors["advantages"][:, 1:] * packed_tensors["weights"][:, 1:]
+            ).any()
+        ):
+            return None
         if (
             not allow_training_without_logprobs
             and np.isnan(packed_tensors["logprobs"]).all()

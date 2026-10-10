@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .trajectories import TrajectoryGroup
+from .utils.grpo import rewards_have_zero_variance
 
 TRAIN_GRADIENT_STEPS_KEY = "data/step_num_gradient_steps"
 SFT_METRIC_PREFIX = "sft"
@@ -107,7 +108,7 @@ def build_training_summary_metrics(
 
 def _group_is_trainable(group: TrajectoryGroup) -> bool:
     rewards = [trajectory.reward for trajectory in group.trajectories]
-    return len(rewards) > 1 and len(set(rewards)) > 1
+    return not rewards_have_zero_variance(rewards)
 
 
 def _extract_scenario_id(group: TrajectoryGroup) -> str | None:
