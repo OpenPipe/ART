@@ -4657,8 +4657,8 @@ class TrainerRank:
         """
         from torch.utils.checkpoint import checkpoint
 
-        return checkpoint(
-            self._local_head_stats,
+        local_logits, normalizer, local_topk, target_logits = checkpoint(
+            self._local_head_stats_parts,
             model,
             hidden,
             output_weight=output_weight,
@@ -4669,6 +4669,10 @@ class TrainerRank:
             path=[],
             use_reentrant=False,
         )
+        # Saving row normalization outside the checkpoint lets its backward
+        # run without replaying and retaining another chunk's dense logits.
+        log_z = _head_log_z(normalizer) if normalizer else None
+        return local_logits, log_z, local_topk, target_logits
 
     def _local_head_stats(
         self,
@@ -4687,7 +4691,39 @@ class TrainerRank:
         tuple[torch.Tensor, torch.Tensor] | None,
         torch.Tensor | None,
     ]:
-        """Local logits, log-normalizer, local top-k and FP32 target logits.
+        local_logits, normalizer, local_topk, target_logits = (
+            self._local_head_stats_parts(
+                model,
+                hidden,
+                output_weight=output_weight,
+                need_log_z=need_log_z,
+                max_top_k=max_top_k,
+                targets=targets,
+                rows_ascending=rows_ascending,
+                path=path,
+            )
+        )
+        log_z = _head_log_z(normalizer) if normalizer else None
+        return local_logits, log_z, local_topk, target_logits
+
+    def _local_head_stats_parts(
+        self,
+        model: "GPTModel",
+        hidden: torch.Tensor,
+        *,
+        output_weight: torch.Tensor | None,
+        need_log_z: bool,
+        max_top_k: int,
+        targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+        rows_ascending: bool = False,
+        path: list[str] | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None,
+        tuple[torch.Tensor, torch.Tensor] | None,
+        torch.Tensor | None,
+    ]:
+        """Local logits, normalization parts, local top-k and FP32 target logits.
 
         ``targets`` holds (chunk row, label) pairs. Every statistics path
         gathers their logits, and any top-k values, inside its autograd
@@ -4702,7 +4738,7 @@ class TrainerRank:
             hidden,
             output_weight=output_weight,
         )
-        log_z: torch.Tensor | None = None
+        normalizer: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None
         local_topk: tuple[torch.Tensor, torch.Tensor] | None = None
         target_logits: torch.Tensor | None = None
         if need_log_z:
@@ -4716,6 +4752,7 @@ class TrainerRank:
                     k=max_top_k,
                     targets=gathered,
                     rows_ascending=rows_ascending,
+                    required=recorded == "topk",
                 )
                 if recorded in (None, "topk")
                 else None
@@ -4740,6 +4777,7 @@ class TrainerRank:
                         targets=gathered,
                         # Appended top-k tokens revisit every row.
                         rows_ascending=rows_ascending and topk_tokens is None,
+                        required=recorded == "logsumexp",
                     ),
                 )
                 if topk_stats is None and recorded in (None, "logsumexp")
@@ -4789,14 +4827,13 @@ class TrainerRank:
                 gathered_logits = stats[-1]
                 local_max = local_max.detach()
                 global_max = _all_reduce_tensor_parallel_max(local_max)
-                global_sum = _all_reduce_tensor_parallel_sum(
-                    local_sum * torch.exp(local_max - global_max)
-                )
-                log_z = global_max + torch.log(global_sum)
+                normalizer = (global_max, local_sum, torch.exp(local_max - global_max))
             else:
                 # No kernel attempted (non-CUDA, disabled, short chunk):
                 # admission prices this FP32 fallback's seven buffers.
-                log_z, gathered_logits = _vocab_parallel_log_z(local_logits, gathered)
+                normalizer, gathered_logits = _vocab_parallel_log_z_parts(
+                    local_logits, gathered
+                )
 
             target_count = 0 if targets is None else int(targets[0].numel())
             if targets is not None:
@@ -4807,7 +4844,7 @@ class TrainerRank:
             elif topk_tokens is not None:
                 local_values = gathered_logits[target_count:]
                 local_topk = (local_values.reshape(topk_tokens.shape), topk_tokens)
-        return local_logits, log_z, local_topk, target_logits
+        return local_logits, normalizer, local_topk, target_logits
 
     def _local_logits_from_hidden_rows(
         self,
@@ -5860,6 +5897,7 @@ def _try_triton_local_topk_stats(
     k: int,
     targets: tuple[torch.Tensor, torch.Tensor],
     rows_ascending: bool = False,
+    required: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
     if k <= 0 or k > int(
         os.environ.get("ART_TRAINER_RANK_TRITON_FUSED_TOPK_MAX", "10")
@@ -5874,6 +5912,7 @@ def _try_triton_local_topk_stats(
             k=min(k, int(local_logits.shape[1])),
             targets=targets,
             rows_ascending=rows_ascending,
+            required=required,
         ),
     )
 
@@ -5925,6 +5964,8 @@ def _triton_head_stats(rank: Any, rows: int, vocabulary: int) -> bool:
 def _try_triton_stats(
     name: str,
     local_logits: torch.Tensor,
+    *,
+    required: bool = False,
     **kwargs: object,
 ) -> object | None:
     if not _triton_stats_enabled(local_logits.is_cuda, int(local_logits.shape[0])):
@@ -5934,7 +5975,12 @@ def _try_triton_stats(
 
         return getattr(topk, name)(local_logits, **kwargs)
     except Exception:
-        if os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict":
+        # A recorded kernel must replay without fallback, including letting
+        # checkpoint's early-stop exception reach its recomputation hook.
+        if (
+            required
+            or os.environ.get("ART_TRAINER_RANK_TRITON_TOPK", "1").lower() == "strict"
+        ):
             raise
         return None
 
@@ -6137,11 +6183,28 @@ def _vocab_parallel_log_z(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The FP32 fallback's log-normalizer and FP32 target logits (``targets``
     holds chunk rows and local columns, as ``_local_targets`` returns)."""
+    normalizer, target_logits = _vocab_parallel_log_z_parts(local_logits, targets)
+    return _head_log_z(normalizer), target_logits
+
+
+def _head_log_z(
+    normalizer: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
+) -> torch.Tensor:
+    global_max, local_sum, scale = normalizer
+    global_sum = _all_reduce_tensor_parallel_sum(
+        local_sum if scale is None else local_sum * scale
+    )
+    return global_max + torch.log(global_sum)
+
+
+def _vocab_parallel_log_z_parts(
+    local_logits: torch.Tensor,
+    targets: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor | None], torch.Tensor]:
     if targets is None:
         targets = _local_targets(local_logits, None)
     global_max, local_sum, target_logits = _LocalExpSum.apply(local_logits, *targets)
-    global_sum = _all_reduce_tensor_parallel_sum(local_sum)
-    return global_max + torch.log(global_sum), target_logits
+    return (global_max, local_sum, None), target_logits
 
 
 def _summed_target_gradients(

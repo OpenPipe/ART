@@ -11,7 +11,9 @@ keep today's pricing.
 """
 
 from dataclasses import replace
+import gc
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -520,7 +522,7 @@ def test_every_head_chunk_is_priced_for_its_own_statistics_path(
         monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", minimum)
     # The planner's projection is capped at one chunk; the tail is not.
     assert r._head_projection_rows(_labelled(rows)) == 512
-    targets = _memory._head_target_bytes(512, _labelled(rows), grad_enabled=True)
+    targets = _memory._head_target_bytes(rows, _labelled(rows), grad_enabled=True)
     assert _head_stage(r, _labelled(rows)) == expected + targets
     # Replay capture refuses exactly the waves with an eager chunk.
     from art.trainer_rank._planner_replay import head_statistics_fallback
@@ -568,7 +570,11 @@ def test_head_bounds_envelope_every_possible_projected_union(
     monkeypatch.setenv("ART_TRAINER_RANK_TRITON_MIN_ROWS", "512")
     r = _cuda_head(monkeypatch)
     requests, positions = _positioned(list(first), second)
-    exact += _memory._head_target_bytes(512, requests, grad_enabled=True)
+    exact += _memory._head_target_bytes(
+        r._head_projection_rows(requests, positions=positions, uncapped=True),
+        requests,
+        grad_enabled=True,
+    )
 
     def charge(**bounds):
         rows = r._head_projection_rows(
@@ -619,8 +625,11 @@ def test_a_kernel_failure_is_priced_only_at_its_chunk_shape(monkeypatch):
             patch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
             patch.setattr(
                 _impl,
-                "_vocab_parallel_log_z",
-                lambda t, targets: (t[:, 0].float(), t[targets].float()),
+                "_vocab_parallel_log_z_parts",
+                lambda t, targets: (
+                    (t[:, 0].float(), torch.ones(t.shape[0]), None),
+                    t[targets].float(),
+                ),
             )
             r._local_head_stats(
                 None, logits, output_weight=None, need_log_z=True, max_top_k=max_top_k
@@ -788,7 +797,7 @@ def test_the_head_statistics_fall_back_to_the_bounded_path_after_a_kernel_failur
     def unchunked(_logits, _targets):
         raise AssertionError("the unchunked FP32 fallback ran after an attempt")
 
-    monkeypatch.setattr(_impl, "_vocab_parallel_log_z", unchunked)
+    monkeypatch.setattr(_impl, "_vocab_parallel_log_z_parts", unchunked)
     _, log_z, top_k, _ = r._local_head_stats(
         None, logits, output_weight=None, need_log_z=True, max_top_k=4
     )
@@ -825,11 +834,17 @@ def test_replay_prices_the_tp2_head_stage_as_live_admission(monkeypatch):
         (512, True, _requests(512, targets=False, top_k=4), 2),
         (512, False, _requests(512, targets=False, top_k=4), 1),
         (512, True, [*_requests(512), *_requests(512, targets=False, top_k=4)], 2),
+        (512, True, _requests(1_024), 2),
+        (512, False, _requests(1_024), 1),
     )
     for rows, grad, requests, buffers in cases:
         live = r._group_head_workspace_bytes(rows, requests, grad_enabled=grad)
         bounded = _memory._eager_stats_extra_bytes(124_160, rows)
-        targets = _memory._head_target_bytes(rows, requests, grad_enabled=grad)
+        targets = _memory._head_target_bytes(
+            r._head_projection_rows(requests, uncapped=True),
+            requests,
+            grad_enabled=grad,
+        )
         assert 0 < targets < r._head_workspace_bytes(rows) / 64
         assert live == buffers * r._head_workspace_bytes(rows) + bounded + targets
         frozen = _memory._frozen_head_bytes(
@@ -895,6 +910,49 @@ class _ShapeChangingKernel(torch.autograd.Function):
         return gradient.to(logits.dtype), None, None
 
 
+@pytest.mark.parametrize("top_k", [0, 4])
+def test_successful_kernel_checkpoint_recompute_preserves_early_stop(
+    monkeypatch, top_k
+):
+    from art.trainer_rank import _impl, topk
+
+    r = _cuda_head(monkeypatch, vocabulary=64)
+    weight = torch.randn(16, 32)
+    monkeypatch.setattr(
+        TrainerRank,
+        "_local_logits_from_hidden_rows",
+        lambda self, model, hidden, output_weight: hidden @ weight,
+    )
+    monkeypatch.setattr(_impl, "_triton_stats_enabled", lambda cuda, rows: True)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+    monkeypatch.setenv("ART_TRAINER_RANK_TRITON_TOPK", "1")
+    completed = []
+
+    def kernel(logits, *, targets, **kwargs):
+        if top_k:
+            with torch.no_grad():
+                values, tokens = torch.topk(logits.float(), top_k, dim=-1)
+        stats = _ShapeChangingKernel.apply(logits, *targets)
+        completed.append(True)
+        if not top_k:
+            return stats
+        return stats[0], stats[1], values, tokens, stats[2]
+
+    monkeypatch.setattr(
+        topk, "local_topk_stats" if top_k else "local_logsumexp_stats", kernel
+    )
+    hidden = torch.randn(64, 16, requires_grad=True)
+    _, log_z, _, _ = r._checkpointed_head_stats(
+        None, hidden, output_weight=None, need_log_z=True, max_top_k=top_k
+    )
+    assert log_z is not None
+    log_z.sum().backward()
+    assert hidden.grad is not None and hidden.grad.isfinite().all()
+    # Replay stops at the kernel's last saved tensor, inside the attempt helper.
+    assert completed == [True]
+
+
 @pytest.mark.parametrize("forward_fails", [True, False])
 def test_a_checkpoint_recompute_replays_the_forward_statistics_path(
     monkeypatch, forward_fails
@@ -941,45 +999,342 @@ def test_a_checkpoint_recompute_replays_the_forward_statistics_path(
             log_z.sum().backward()
 
 
+@pytest.mark.parametrize("statistics", ["fallback", "bounded", "kernel"])
+def test_checkpointed_head_saves_only_row_vectors_for_normalizer_backward(
+    monkeypatch, statistics
+):
+    from art.trainer_rank import _impl
+
+    r = _cuda_head(monkeypatch, vocabulary=64)
+    weight = torch.randn(16, 32, dtype=torch.bfloat16)
+    projections = []
+
+    def project(self, model, hidden, *, output_weight):
+        projections.append(int(hidden.shape[0]))
+        return hidden @ weight
+
+    monkeypatch.setattr(TrainerRank, "_local_logits_from_hidden_rows", project)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_max", lambda t: t)
+    monkeypatch.setattr(_impl, "_all_reduce_tensor_parallel_sum", lambda t: t)
+    monkeypatch.setattr(
+        _impl, "_triton_stats_enabled", lambda cuda, rows: statistics != "fallback"
+    )
+    monkeypatch.setattr(_impl, "_try_triton_local_topk_stats", lambda *a, **k: None)
+    monkeypatch.setattr(
+        _impl,
+        "_try_triton_stats",
+        lambda name, logits, **kw: (
+            _ShapeChangingKernel.apply(logits, *kw["targets"])
+            if statistics == "kernel"
+            else None
+        ),
+    )
+    hidden = torch.randn(64, 16, dtype=torch.bfloat16, requires_grad=True)
+    saved = []
+
+    def pack(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        _, log_z, _, _ = r._checkpointed_head_stats(
+            None, hidden, output_weight=None, need_log_z=True, max_top_k=0
+        )
+    assert log_z is not None
+    # LogBackward must read a retained row vector, without replaying a dense
+    # chunk ahead of the statistics backward and caching that chunk's logits.
+    vectors = [tensor for tensor in saved if tensor.shape == (64,)]
+    assert len(vectors) == (1 if statistics == "fallback" else 2)
+    assert all(tensor.dtype == torch.float32 for tensor in vectors)
+    assert all(tensor.untyped_storage().nbytes() == 4 * 64 for tensor in vectors)
+    assert projections == [64]
+    log_z.sum().backward()
+    assert projections == [64, 64]
+    assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+
+
 class _AllocatedBytes:
     """Peak CPU allocator bytes for storages allocated inside the context.
 
     From the profiler's allocation events, so a storage counts until it is
     freed, including tensors that only autograd or a checkpoint still holds.
-    The peak is the allocator's running total recorded with each event, which
-    the allocator orders under its lock: the events' timestamps interleave
-    gloo's worker threads with the caller's. ``timed_peak`` replays the events
-    by timestamp instead.
+    The allocator orders its running totals under its lock; timestamps can
+    interleave Gloo workers with the caller. Earlier-storage frees adjust each
+    thread's baseline in its own event order. Frees on other threads use the
+    final baseline, giving a conservative bound rather than a timestamp peak.
+    ``timed_peak`` replays unadjusted sizes by timestamp instead.
     """
 
     def __enter__(self):
         from torch.profiler import ProfilerActivity, profile
 
-        self._profile = profile(activities=[ProfilerActivity.CPU], profile_memory=True)
-        self._profile.__enter__()
+        self._restore_gc = gc.enable if gc.isenabled() else gc.disable
+        # Earlier cyclic garbage must not move the allocator baseline mid-profile.
+        gc.collect()
+        gc.disable()
+        try:
+            self._profile = profile(
+                activities=[ProfilerActivity.CPU], profile_memory=True
+            )
+            self._profile.__enter__()
+            # A live marker identifies the starting total without pointer reuse.
+            self._marker = torch.empty(1, dtype=torch.uint8)
+            self._marker_pointer = self._marker.data_ptr()
+        except BaseException:
+            self._restore_gc()
+            raise
         return self
 
     def __exit__(self, *exc):
+        try:
+            self._profile.__exit__(*exc)
+        finally:
+            self._restore_gc()
+            del self._marker
         from torch._C._profiler import _ExtraFields_Allocation
 
-        self._profile.__exit__(*exc)
         profiler = self._profile.profiler
         assert profiler is not None and profiler.kineto_results is not None
-        events, nodes = [], list(profiler.kineto_results.experimental_event_tree())
+        events = []
+        nodes: list[tuple[Any, tuple[str, ...]]] = [
+            (node, ()) for node in profiler.kineto_results.experimental_event_tree()
+        ]
         while nodes:
-            node = nodes.pop()
+            node, origin = nodes.pop()
             if isinstance(node.extra_fields, _ExtraFields_Allocation):
                 fields = node.extra_fields
                 events.append(
-                    (node.start_time_ns, fields.alloc_size, fields.total_allocated)
+                    (
+                        node.start_time_ns,
+                        fields.alloc_size,
+                        fields.total_allocated,
+                        fields.ptr,
+                        node.start_tid,
+                        "/".join(origin[-3:]) or "[no operator]",
+                    )
                 )
-            nodes.extend(node.children)
+            else:
+                origin = (*origin, node.name)
+            nodes.extend((child, origin) for child in node.children)
+        self._measure(events)
+
+    def _measure(self, events):
+        marker = next(
+            event
+            for event in events
+            if event[3] == self._marker_pointer and event[1] > 0
+        )
+        self._events = sorted(
+            event
+            for event in events
+            if event[0] >= marker[0] and event[3] != self._marker_pointer
+        )
+        baseline = marker[2]
+        live, earlier_frees, freed_by_thread = {}, {}, {}
         current = self.timed_peak = 0
-        for _, size, _ in sorted(events):
+        for index, (_, size, _, pointer, thread, _) in enumerate(self._events):
             current += size
             self.timed_peak = max(self.timed_peak, current)
-        start = min((total - size for _, size, total in events), default=0)
-        self.peak = max((total for _, _, total in events), default=start) - start
+            if size > 0:
+                live[pointer] = size
+            elif live.pop(pointer, None) is None:
+                earlier_frees[index] = -size
+                freed_by_thread[thread] = freed_by_thread.get(thread, 0) - size
+        self._earlier_frees = earlier_frees
+        released, total_freed = {}, sum(earlier_frees.values())
+        self.peak, self._peak_event = 0, None
+        for index, event in enumerate(self._events):
+            _, _, total, _, thread, _ = event
+            released[thread] = released.get(thread, 0) + earlier_frees.get(index, 0)
+            # Other threads' frees may report after this allocator snapshot.
+            correction = released[thread] + total_freed - freed_by_thread.get(thread, 0)
+            upper = total - baseline + correction
+            if upper > self.peak:
+                self.peak, self._peak_event = upper, event
+
+    def allocation_diagnostics(self):
+        """Storage origins near the allocator peak; timestamps can interleave."""
+        peak_event = self._peak_event
+        live, at_peak, earlier_frees = {}, {}, []
+        for index, event in enumerate(self._events):
+            _, size, _, pointer, thread, origin = event
+            if size > 0:
+                live[pointer] = (size, thread, origin)
+            else:
+                live.pop(pointer, None)
+                if index in self._earlier_frees:
+                    earlier_frees.append(dict(size=-size, thread=thread, origin=origin))
+            if event is peak_event:
+                at_peak = live.copy()
+        groups, by_thread = {}, {}
+        for size, thread, origin in at_peak.values():
+            key = (size, thread, origin)
+            groups[key] = groups.get(key, 0) + 1
+            by_thread[thread] = by_thread.get(thread, 0) + size
+        ordered = sorted(
+            groups.items(), key=lambda pair: pair[0][0] * pair[1], reverse=True
+        )
+        return dict(
+            snapshot_order="profiler timestamps",
+            peak_event=(
+                dict(
+                    size=peak_event[1],
+                    total=peak_event[2],
+                    thread=peak_event[4],
+                    origin=peak_event[5],
+                )
+                if peak_event is not None
+                else None
+            ),
+            live_at_peak=[
+                dict(size=size, count=count, thread=thread, origin=origin)
+                for (size, thread, origin), count in ordered[:20]
+            ],
+            live_by_thread=by_thread,
+            omitted_groups=len(ordered[20:]),
+            pre_window_frees=earlier_frees[:8],
+            pre_window_free_bytes=sum(event["size"] for event in earlier_frees),
+            cpu_count=os.cpu_count(),
+            torch_threads=torch.get_num_threads(),
+        )
+
+
+def test_head_memory_meter_collects_earlier_cyclic_storage_before_profiling():
+    restore_gc = gc.enable if gc.isenabled() else gc.disable
+    gc.disable()
+    try:
+        with _AllocatedBytes():
+            garbage = [torch.empty(4_096, dtype=torch.uint8)]
+            garbage.append(garbage)
+        del garbage
+        with _AllocatedBytes() as measured:
+            temporary = torch.empty(1_024, dtype=torch.uint8)
+            del temporary
+            gc.collect()
+            tail = torch.empty(512, dtype=torch.uint8)
+            del tail
+        assert measured.peak == 1_024
+    finally:
+        restore_gc()
+
+
+def test_head_memory_meter_reports_peak_storage_origins_and_earlier_frees():
+    with _AllocatedBytes():
+        retained = torch.empty(4_096, dtype=torch.uint8)
+    with _AllocatedBytes() as measured:
+        first = torch.empty(1_024, dtype=torch.uint8)
+        second = torch.empty(2_048, dtype=torch.uint8)
+        del first, second, retained
+        tail = torch.empty(512, dtype=torch.uint8)
+        del tail
+    assert measured.peak == 3_072
+    diagnostics = measured.allocation_diagnostics()
+    assert sorted(
+        (group["size"], group["count"]) for group in diagnostics["live_at_peak"]
+    ) == [(1_024, 1), (2_048, 1)]
+    assert all(
+        group["thread"] == 1 and "aten::empty" in group["origin"]
+        for group in diagnostics["live_at_peak"]
+    )
+    assert diagnostics["pre_window_free_bytes"] == 4_096
+    assert diagnostics["pre_window_frees"] == [
+        dict(size=4_096, thread=1, origin="[no operator]")
+    ]
+
+
+@pytest.mark.parametrize("free_before_peak", [True, False])
+def test_head_memory_meter_excludes_earlier_storage_and_later_pointer_reuse(
+    free_before_peak,
+):
+    measured = _AllocatedBytes()
+    measured._marker_pointer = 1
+    # A Gloo Work can release its old gather buffer before the address is reused.
+    events = [(0, 1, 4_097, 1, 1, "marker")]
+    if free_before_peak:
+        events.append((1, -4_096, 1, 2, 1, "old work"))
+    events.extend(
+        [
+            (2, 1_024, 1_025 if free_before_peak else 5_121, 3, 1, "peak"),
+            (3, -1_024, 1 if free_before_peak else 4_097, 3, 1, "free"),
+        ]
+    )
+    if not free_before_peak:
+        events.append((4, -4_096, 1, 2, 1, "old work"))
+    events.extend([(5, 512, 513, 2, 1, "reuse"), (6, -512, 1, 2, 1, "free")])
+    measured._measure(events)
+    assert measured.peak == 1_024
+    assert measured.allocation_diagnostics()["pre_window_free_bytes"] == 4_096
+
+
+def test_head_memory_meter_preserves_allocator_order_across_threads():
+    measured = _AllocatedBytes()
+    measured._marker_pointer = 1
+    # The worker allocation reports before a free already recorded by the allocator.
+    measured._measure(
+        [
+            (0, 1, 1, 1, 1, "marker"),
+            (1, 100, 101, 2, 1, "caller"),
+            (2, 20, 21, 3, 2, "worker"),
+            (3, -100, 1, 2, 1, "free"),
+            (4, -20, 1, 3, 2, "free"),
+        ]
+    )
+    assert measured.peak == 100
+    assert measured.timed_peak == 120
+
+
+@pytest.mark.parametrize("free_thread", [1, 2])
+def test_head_memory_meter_bounds_other_threads_when_old_frees_report_late(free_thread):
+    measured = _AllocatedBytes()
+    measured._marker_pointer = 1
+    measured._measure(
+        [
+            (0, 1, 4_097, 1, 1, "marker"),
+            (1, 512, 513, 2, 3 - free_thread, "worker"),
+            (2, -512, 1, 2, 3 - free_thread, "free"),
+            (3, -4_096, 1, 3, free_thread, "old work"),
+            (4, 1_024, 1_025, 4, free_thread, "peak"),
+            (5, -1_024, 1, 4, free_thread, "free"),
+        ]
+    )
+    assert measured.peak == 1_024
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_head_memory_meter_restores_gc_after_normal_and_failed_windows(enabled):
+    restore_gc = gc.enable if gc.isenabled() else gc.disable
+    (gc.enable if enabled else gc.disable)()
+    try:
+        with _AllocatedBytes():
+            assert not gc.isenabled()
+        assert gc.isenabled() == enabled
+        with pytest.raises(RuntimeError, match="head failed"):
+            with _AllocatedBytes():
+                assert not gc.isenabled()
+                raise RuntimeError("head failed")
+        assert gc.isenabled() == enabled
+    finally:
+        restore_gc()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_head_memory_meter_restores_gc_when_profiling_cannot_start(
+    monkeypatch, enabled
+):
+    class FailedProfile:
+        def __enter__(self):
+            raise RuntimeError("profile failed")
+
+    monkeypatch.setattr("torch.profiler.profile", lambda **kwargs: FailedProfile())
+    restore_gc = gc.enable if gc.isenabled() else gc.disable
+    (gc.enable if enabled else gc.disable)()
+    try:
+        with pytest.raises(RuntimeError, match="profile failed"):
+            with _AllocatedBytes():
+                pass
+        assert gc.isenabled() == enabled
+    finally:
+        restore_gc()
 
 
 class _Projection(torch.autograd.Function):
@@ -1192,11 +1547,25 @@ def test_tensor_parallel_heads_fit_their_charge_without_a_spare_chunk(tmp_path):
     failures = []
     for rank in range(2):
         measured = json.loads((tmp_path / f"rank-{rank}.json").read_text())
+        diagnostics = json.loads(
+            (tmp_path / f"rank-{rank}-allocations.json").read_text()
+        )
         assert len(measured) == 10
         for path, case, lower, peak, charged, dense, timed_peak in measured:
             if not (lower <= peak <= charged and charged - peak < dense / 8):
-                failures.append((rank, path, case, lower, peak, charged, timed_peak))
-    assert not failures, "(rank, path, case, lower, peak, charged, timed peak)"
+                failures.append(
+                    dict(
+                        rank=rank,
+                        path=path,
+                        case=case,
+                        lower=lower,
+                        peak=peak,
+                        charged=charged,
+                        timed_peak=timed_peak,
+                        allocations=diagnostics[f"{path}/{case}"],
+                    )
+                )
+    assert not failures, json.dumps(failures, indent=2)
 
 
 class _GatherLastDim(torch.autograd.Function):
@@ -1223,10 +1592,71 @@ class _GatherLastDim(torch.autograd.Function):
         return grad.chunk(world, dim=-1)[rank].contiguous(), None
 
 
+def _synchronous_gloo_all_gather(outputs, values, group=None):
+    import torch.distributed as dist
+
+    world, rank = dist.get_world_size(group), dist.get_rank(group)
+    values = values.contiguous()
+    # Gloo's all-gather stages into this shape before copying to outputs. Its
+    # completed AsyncWork can retain tensors on a worker after wait returns;
+    # blocking P2P keeps the same buffers scoped to this call instead.
+    gathered = values.new_empty((world, *values.shape))
+    parts = gathered.unbind(0)
+    parts[rank].copy_(values)
+    for source in range(world):
+        if source == rank:
+            for peer in range(world):
+                if peer != rank:
+                    destination = (
+                        peer if group is None else dist.get_global_rank(group, peer)
+                    )
+                    dist.send(values, dst=destination, group=group)
+        else:
+            origin = source if group is None else dist.get_global_rank(group, source)
+            dist.recv(parts[source], src=origin, group=group)
+    for output, part in zip(outputs, parts, strict=True):
+        output.copy_(part)
+
+
+def test_the_gloo_memory_adapter_preserves_gather_values_and_gradients(tmp_path):
+    spawn_and_join(
+        _gloo_memory_adapter_worker,
+        (f"file://{tmp_path / 'gather'}",),
+        timeout=60,
+        failure="Gloo memory adapter workers did not finish",
+    )
+
+
+def _gloo_memory_adapter_worker(rank, rendezvous):
+    import torch.distributed as dist
+
+    with process_group(rank, rendezvous, world_size=2, timeout=40):
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(dist, "all_gather", _synchronous_gloo_all_gather)
+            base = (torch.arange(24.0).view(3, 8) + 100 * rank).requires_grad_()
+            values = base[:, ::2]
+            gathered = _GatherLastDim.apply(values, dist.group.WORLD)
+            shard = torch.arange(24.0).view(3, 8)[:, ::2]
+            expected = torch.cat((shard, shard + 100), dim=-1)
+            torch.testing.assert_close(gathered, expected)
+            gradient = torch.arange(24.0).view(3, 8) + 1
+            gathered.backward(gradient)
+            expected_gradient = torch.zeros_like(base)
+            expected_gradient[:, ::2] = gradient.chunk(2, dim=-1)[rank]
+            torch.testing.assert_close(base.grad, expected_gradient)
+            tokens = torch.arange(6, dtype=torch.int64).view(3, 2) + 10 * rank
+            outputs = [torch.empty_like(tokens) for _ in range(2)]
+            dist.all_gather(outputs, tokens, group=dist.group.WORLD)
+            for peer, output in enumerate(outputs):
+                torch.testing.assert_close(
+                    output, torch.arange(6).view(3, 2) + 10 * peer
+                )
+
+
 def _measured_tensor_parallel_worker(rank, rendezvous, output):
     import torch.distributed as dist
 
-    measured = []
+    measured, diagnostics = [], {}
     with process_group(rank, rendezvous, world_size=2, timeout=200):
         for path in ("fallback", "bounded"):
             for case in (
@@ -1240,6 +1670,10 @@ def _measured_tensor_parallel_worker(rank, rendezvous, output):
                 rows = 2 * _CHUNK + 5
                 requests = _measured_requests(case, rows, vocabulary=2 * _SHARD)
                 with pytest.MonkeyPatch.context() as monkeypatch:
+                    monkeypatch.setattr(
+                        "art.trainer_rank._impl.dist.all_gather",
+                        _synchronous_gloo_all_gather,
+                    )
                     monkeypatch.setattr(
                         "art.trainer_rank._impl._vocab_range",
                         lambda logits: (rank * _SHARD, (rank + 1) * _SHARD),
@@ -1285,7 +1719,9 @@ def _measured_tensor_parallel_worker(rank, rendezvous, output):
                 measured.append(
                     (path, case, lower, peak, charged, dense, meter.timed_peak)
                 )
+                diagnostics[f"{path}/{case}"] = meter.allocation_diagnostics()
     (Path(output) / f"rank-{rank}.json").write_text(json.dumps(measured))
+    (Path(output) / f"rank-{rank}-allocations.json").write_text(json.dumps(diagnostics))
 
 
 class _CudaAllocatedBytes:

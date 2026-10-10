@@ -92,11 +92,11 @@ def _run_head(monkeypatch, logits, requests, positions, *, path, tp_rank=None):
         # An attempted kernel that fails: the bounded eager statistics run.
         monkeypatch.setattr(_impl, "_triton_stats_enabled", lambda cuda, rows: True)
         monkeypatch.setattr(_impl, "_try_triton_stats", lambda *a, **k: None)
-        monkeypatch.setattr(_impl, "_vocab_parallel_log_z", unexpected)
+        monkeypatch.setattr(_impl, "_vocab_parallel_log_z_parts", unexpected)
     else:
         monkeypatch.setattr(_impl, "_HEAD_CHUNK_TOKENS", 64)
         monkeypatch.setattr(_impl, "_eager_local_logsumexp_stats", unexpected)
-        monkeypatch.setattr(_impl, "_vocab_parallel_log_z", unexpected)
+        monkeypatch.setattr(_impl, "_vocab_parallel_log_z_parts", unexpected)
     model = SimpleNamespace(
         vocab_size=int(logits.shape[-1]),
         share_embeddings_and_output_weights=False,

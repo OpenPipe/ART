@@ -298,6 +298,7 @@ def _head_vocabulary(self: TrainerRank) -> int:
                 "_project_vocab_parallel",
                 "_checkpointed_head_stats",
                 "_local_head_stats",
+                "_local_head_stats_parts",
                 "_local_logits_from_hidden_rows",
             )
         )
@@ -377,7 +378,11 @@ def _group_head_workspace_bytes(
             if not needs_statistics:
                 return 3 * dense
             return 7 * dense + _head_target_bytes(
-                rows, requests, grad_enabled=grad_enabled
+                self._head_projection_rows(
+                    requests, positions=positions, uncapped=True
+                ),
+                requests,
+                grad_enabled=grad_enabled,
             )
         if not grad_enabled or not any(
             request.target_tokens is not None for request in requests
@@ -455,7 +460,11 @@ def _tp_head_workspace_bytes(
         kernel + _eager_stats_extra_bytes(_head_vocabulary(self), rows),
         fallback,
         logits,
-    ) + _head_target_bytes(rows, requests, grad_enabled=grad_enabled)
+    ) + _head_target_bytes(
+        self._head_projection_rows(requests, positions=positions, uncapped=True),
+        requests,
+        grad_enabled=grad_enabled,
+    )
 
 
 # The statistics' index vectors beside the head buffers, measured on CPU and
@@ -481,9 +490,9 @@ _HEAD_CHUNK_ROW_BYTES = 128
 def _head_target_bytes(
     rows: int, requests: Sequence[AnyForwardInput], *, grad_enabled: bool
 ) -> int:
-    """The statistics' index vectors for ``rows`` projected head rows: per row
-    and target of the largest chunk, and per label and top-k entry retained
-    across chunks. Requested outputs are charged separately."""
+    """Statistics storage for all ``rows`` projected head rows: indices for
+    the largest chunk, and labels, top-k gradients and FP32 normalization
+    vectors retained across chunks. Requested outputs are charged separately."""
     chunk = min(rows, _impl._HEAD_CHUNK_TOKENS)
     labels = width = top_k = 0
     for request in requests:
@@ -499,6 +508,9 @@ def _head_target_bytes(
         + _HEAD_CHUNK_TARGET_BYTES * min(chunk * width, labels + top_k)
         + _HEAD_LABEL_BYTES * labels
         + (_HEAD_TOP_K_GRADIENT_BYTES * top_k if grad_enabled else 0)
+        # Row normalization retains the FP32 global sum and, on the optional
+        # kernel/bounded paths, its FP32 scale outside the dense checkpoint.
+        + (8 * rows if grad_enabled else 0)
     )
 
 
