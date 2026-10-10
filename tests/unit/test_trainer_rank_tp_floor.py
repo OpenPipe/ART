@@ -1058,10 +1058,11 @@ class _AllocatedBytes:
 
     From the profiler's allocation events, so a storage counts until it is
     freed, including tensors that only autograd or a checkpoint still holds.
-    The peak is the allocator's running total recorded with each event, which
-    the allocator orders under its lock: the events' timestamps interleave
-    gloo's worker threads with the caller's. ``timed_peak`` replays the events
-    by timestamp instead.
+    The allocator orders its running totals under its lock; timestamps can
+    interleave Gloo workers with the caller. Earlier-storage frees adjust each
+    thread's baseline in its own event order. Frees on other threads use the
+    final baseline, giving a conservative bound rather than a timestamp peak.
+    ``timed_peak`` replays unadjusted sizes by timestamp instead.
     """
 
     def __enter__(self):
@@ -1076,6 +1077,9 @@ class _AllocatedBytes:
                 activities=[ProfilerActivity.CPU], profile_memory=True
             )
             self._profile.__enter__()
+            # A live marker identifies the starting total without pointer reuse.
+            self._marker = torch.empty(1, dtype=torch.uint8)
+            self._marker_pointer = self._marker.data_ptr()
         except BaseException:
             self._restore_gc()
             raise
@@ -1086,6 +1090,7 @@ class _AllocatedBytes:
             self._profile.__exit__(*exc)
         finally:
             self._restore_gc()
+            del self._marker
         from torch._C._profiler import _ExtraFields_Allocation
 
         profiler = self._profile.profiler
@@ -1111,28 +1116,53 @@ class _AllocatedBytes:
             else:
                 origin = (*origin, node.name)
             nodes.extend((child, origin) for child in node.children)
-        self._events = sorted(events)
+        self._measure(events)
+
+    def _measure(self, events):
+        marker = next(
+            event
+            for event in events
+            if event[3] == self._marker_pointer and event[1] > 0
+        )
+        self._events = sorted(
+            event
+            for event in events
+            if event[0] >= marker[0] and event[3] != self._marker_pointer
+        )
+        baseline = marker[2]
+        live, earlier_frees, freed_by_thread = {}, {}, {}
         current = self.timed_peak = 0
-        for _, size, _, _, _, _ in self._events:
+        for index, (_, size, _, pointer, thread, _) in enumerate(self._events):
             current += size
             self.timed_peak = max(self.timed_peak, current)
-        start = min((total - size for _, size, total, _, _, _ in events), default=0)
-        self.peak = (
-            max((total for _, _, total, _, _, _ in events), default=start) - start
-        )
+            if size > 0:
+                live[pointer] = size
+            elif live.pop(pointer, None) is None:
+                earlier_frees[index] = -size
+                freed_by_thread[thread] = freed_by_thread.get(thread, 0) - size
+        self._earlier_frees = earlier_frees
+        released, total_freed = {}, sum(earlier_frees.values())
+        self.peak, self._peak_event = 0, None
+        for index, event in enumerate(self._events):
+            _, _, total, _, thread, _ = event
+            released[thread] = released.get(thread, 0) + earlier_frees.get(index, 0)
+            # Other threads' frees may report after this allocator snapshot.
+            correction = released[thread] + total_freed - freed_by_thread.get(thread, 0)
+            upper = total - baseline + correction
+            if upper > self.peak:
+                self.peak, self._peak_event = upper, event
 
     def allocation_diagnostics(self):
         """Storage origins near the allocator peak; timestamps can interleave."""
-        peak_event = max(self._events, key=lambda event: event[2], default=None)
-        allocated = {event[3] for event in self._events if event[1] > 0}
+        peak_event = self._peak_event
         live, at_peak, earlier_frees = {}, {}, []
-        for event in self._events:
+        for index, event in enumerate(self._events):
             _, size, _, pointer, thread, origin = event
             if size > 0:
                 live[pointer] = (size, thread, origin)
             else:
                 live.pop(pointer, None)
-                if pointer not in allocated:
+                if index in self._earlier_frees:
                     earlier_frees.append(dict(size=-size, thread=thread, origin=origin))
             if event is peak_event:
                 at_peak = live.copy()
@@ -1195,6 +1225,9 @@ def test_head_memory_meter_reports_peak_storage_origins_and_earlier_frees():
         first = torch.empty(1_024, dtype=torch.uint8)
         second = torch.empty(2_048, dtype=torch.uint8)
         del first, second, retained
+        tail = torch.empty(512, dtype=torch.uint8)
+        del tail
+    assert measured.peak == 3_072
     diagnostics = measured.allocation_diagnostics()
     assert sorted(
         (group["size"], group["count"]) for group in diagnostics["live_at_peak"]
@@ -1207,6 +1240,64 @@ def test_head_memory_meter_reports_peak_storage_origins_and_earlier_frees():
     assert diagnostics["pre_window_frees"] == [
         dict(size=4_096, thread=1, origin="[no operator]")
     ]
+
+
+@pytest.mark.parametrize("free_before_peak", [True, False])
+def test_head_memory_meter_excludes_earlier_storage_and_later_pointer_reuse(
+    free_before_peak,
+):
+    measured = _AllocatedBytes()
+    measured._marker_pointer = 1
+    # A Gloo Work can release its old gather buffer before the address is reused.
+    events = [(0, 1, 4_097, 1, 1, "marker")]
+    if free_before_peak:
+        events.append((1, -4_096, 1, 2, 1, "old work"))
+    events.extend(
+        [
+            (2, 1_024, 1_025 if free_before_peak else 5_121, 3, 1, "peak"),
+            (3, -1_024, 1 if free_before_peak else 4_097, 3, 1, "free"),
+        ]
+    )
+    if not free_before_peak:
+        events.append((4, -4_096, 1, 2, 1, "old work"))
+    events.extend([(5, 512, 513, 2, 1, "reuse"), (6, -512, 1, 2, 1, "free")])
+    measured._measure(events)
+    assert measured.peak == 1_024
+    assert measured.allocation_diagnostics()["pre_window_free_bytes"] == 4_096
+
+
+def test_head_memory_meter_preserves_allocator_order_across_threads():
+    measured = _AllocatedBytes()
+    measured._marker_pointer = 1
+    # The worker allocation reports before a free already recorded by the allocator.
+    measured._measure(
+        [
+            (0, 1, 1, 1, 1, "marker"),
+            (1, 100, 101, 2, 1, "caller"),
+            (2, 20, 21, 3, 2, "worker"),
+            (3, -100, 1, 2, 1, "free"),
+            (4, -20, 1, 3, 2, "free"),
+        ]
+    )
+    assert measured.peak == 100
+    assert measured.timed_peak == 120
+
+
+@pytest.mark.parametrize("free_thread", [1, 2])
+def test_head_memory_meter_bounds_other_threads_when_old_frees_report_late(free_thread):
+    measured = _AllocatedBytes()
+    measured._marker_pointer = 1
+    measured._measure(
+        [
+            (0, 1, 4_097, 1, 1, "marker"),
+            (1, 512, 513, 2, 3 - free_thread, "worker"),
+            (2, -512, 1, 2, 3 - free_thread, "free"),
+            (3, -4_096, 1, 3, free_thread, "old work"),
+            (4, 1_024, 1_025, 4, free_thread, "peak"),
+            (5, -1_024, 1, 4, free_thread, "free"),
+        ]
+    )
+    assert measured.peak == 1_024
 
 
 @pytest.mark.parametrize("enabled", [True, False])
