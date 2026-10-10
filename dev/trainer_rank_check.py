@@ -226,7 +226,7 @@ def _local_outputs(
     rank: TrainerRank,
     indexed_requests: Sequence[tuple[int, ForwardInput]],
 ) -> list[dict[str, object]]:
-    outputs = rank.forward([request for _, request in indexed_requests])
+    outputs = rank.dp_rank_forward([request for _, request in indexed_requests])
     return [
         _output_record(index, torch.arange(request.input_tokens.numel()), output)
         for (index, request), output in zip(indexed_requests, outputs, strict=True)
@@ -502,7 +502,7 @@ def _head_backward_chunk_parity(
             outputs = rank._project_head(items, prepared, candidate)
             loss = _output_loss(outputs)
             logprob_sums.append(loss.detach())
-            rank.backward(loss)
+            loss.backward()
             assert candidate.grad is not None
             gradients.append(candidate.grad)
         finally:
@@ -584,7 +584,7 @@ def _slot_gradients(
     slots: Sequence[str],
 ) -> dict[str, list[torch.Tensor]]:
     rank.zero_grad()
-    rank.backward(_output_loss(rank.forward(requests)))
+    _output_loss(rank.dp_rank_forward(requests)).backward()
     return {
         slot: [
             torch.zeros_like(parameter, dtype=torch.float32, device="cpu")
@@ -665,16 +665,14 @@ def _performance(
         rank.zero_grad()
         stats: list[MicroBatchStats] = []
         if adaptive:
-            for micro in rank.forward_batches(requests):
-                rank.backward(
-                    _output_loss(cast(Sequence[ForwardOutput], micro.outputs))
-                )
+            for micro in rank.forward_micro_batches(requests):
+                _output_loss(cast(Sequence[ForwardOutput], micro.outputs)).backward()
                 stats.append(micro.stats)
         else:
-            outputs = rank.forward(requests[dp_rank::dp_size])
+            outputs = rank.dp_rank_forward(requests[dp_rank::dp_size])
             if workload == "unequal_slots":
                 _trace_unequal_slots("forward_ready")
-            rank.backward(_output_loss(outputs))
+            _output_loss(outputs).backward()
             if workload == "unequal_slots":
                 _trace_unequal_slots("backward_ready")
         if optimizer_step:

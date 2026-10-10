@@ -137,35 +137,17 @@ def phase_contract() -> None:
 
     problems: list[str] = []
     constructor = _public_parameters(trainer_rank.TrainerRank.__init__)
-    if (
-        list(constructor) != ["runtime", "options"]
-        or constructor["options"].kind is not inspect.Parameter.KEYWORD_ONLY
-        or constructor["options"].default is not None
-    ):
+    if list(constructor) != ["runtime"]:
         problems.append(
-            f"TrainerRank must accept (runtime, *, options=None); found {constructor}"
+            f"TrainerRank must accept exactly (runtime); found {sorted(constructor)}"
         )
-    for method_name in ("forward_batches", "forward"):
+    for method_name in ("forward_micro_batches", "dp_rank_forward"):
         parameters = _public_parameters(getattr(trainer_rank.TrainerRank, method_name))
         # ``yield_empty`` (PR #864) is a keyword-only flag defaulting to False:
         # off, the contract the acceptance suite pins is unchanged.
-        extra = set(parameters) - {
-            "inputs",
-            "checkpoint",
-            "no_grad",
-            "yield_empty",
-            "options",
-        }
+        extra = set(parameters) - {"inputs", "checkpoint", "no_grad", "yield_empty"}
         if extra:
             problems.append(f"{method_name} has extra parameters {sorted(extra)}")
-        options = parameters.get("options")
-        if options is None or (
-            options.kind is not inspect.Parameter.KEYWORD_ONLY
-            or options.default is not None
-        ):
-            problems.append(
-                f"{method_name}: options must be keyword-only and default to None"
-            )
         flag = parameters.get("yield_empty")
         if flag is not None and (
             flag.kind is not inspect.Parameter.KEYWORD_ONLY or flag.default is not False
@@ -392,8 +374,8 @@ def phase_measure(cell: str, arm: str, output_jsonl: str, repeat: int) -> None:
 
         # Behavior smoke from the contract: empty inputs are valid zero-work
         # calls that must not disturb subsequent planning.
-        empty = rank.forward([])
-        assert len(list(empty)) == 0, "forward([]) must return no outputs"
+        empty = rank.dp_rank_forward([])
+        assert len(list(empty)) == 0, "dp_rank_forward([]) must return no outputs"
 
         rows: list[dict[str, object]] = []
         for sample in range(repeat + 4):  # 1 cold + 3 warmup + repeat measured
@@ -405,8 +387,8 @@ def phase_measure(cell: str, arm: str, output_jsonl: str, repeat: int) -> None:
             start.record()
             admission_failed = False
             try:
-                outputs = rank.forward(requests)
-                rank.backward(_output_loss(outputs))
+                outputs = rank.dp_rank_forward(requests)
+                _output_loss(outputs).backward()
             except TrainerRankMemoryError as error:
                 admission_failed = True
                 rows.append(
@@ -647,7 +629,7 @@ def phase_split_conversion(evidence: str | None, pressure: str) -> None:
         ) -> tuple[list[torch.Tensor], dict[str, object]]:
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
-            outputs = rank.forward(requests(), no_grad=no_grad)
+            outputs = rank.dp_rank_forward(requests(), no_grad=no_grad)
             telemetry = rank.last_forward_telemetry()
             logprobs = [
                 output.target_logprobs.detach().float().clone() for output in outputs
@@ -656,11 +638,9 @@ def phase_split_conversion(evidence: str | None, pressure: str) -> None:
 
         def combined_backward(info: dict[str, object]) -> None:
             outputs = cast(list, info["outputs"])
-            rank.backward(
-                torch.stack(
-                    [output.target_logprobs.float().sum() for output in outputs]
-                ).sum()
-            )
+            torch.stack(
+                [output.target_logprobs.float().sum() for output in outputs]
+            ).sum().backward()
             torch.cuda.synchronize()
 
         def unsplit_requirement() -> int:
@@ -704,7 +684,7 @@ def phase_split_conversion(evidence: str | None, pressure: str) -> None:
             torch.cuda.synchronize()
             before = int(torch.cuda.memory_allocated())
             try:
-                rank.forward(requests())
+                rank.dp_rank_forward(requests())
             except TrainerRankMemoryError as error:
                 message = str(error).lower()
                 if "unable to find a feasible split" not in message:
@@ -793,14 +773,9 @@ def phase_split_conversion(evidence: str | None, pressure: str) -> None:
             if len(partition) < 2:
                 _fail("reverse-order arm expected a split plan")
             for indices in reversed(partition):
-                rank.backward(
-                    torch.stack(
-                        [
-                            outputs[index].target_logprobs.float().sum()
-                            for index in indices
-                        ]
-                    ).sum()
-                )
+                torch.stack(
+                    [outputs[index].target_logprobs.float().sum() for index in indices]
+                ).sum().backward()
             rank.zero_grad()
             del info, outputs
 
@@ -997,7 +972,7 @@ def phase_split_conversion(evidence: str | None, pressure: str) -> None:
 # backward through an active LoRA slot, compared against the depth-one arm.
 # ``dp2-tp2-waves`` (4 ranks, DP2 x TP2) exercises the global wave planner's
 # collectives (world scope) composed with TP execution collectives (pair scope)
-# through public ``forward_batches``, including an empty DP slot.
+# through public ``forward_micro_batches``, including an empty DP slot.
 
 TP_GATES: dict[str, float] = {
     # bf16 kernels reorder reductions across packings (same metric/tolerance as
@@ -1362,7 +1337,7 @@ def _write_rows(evidence: str | None, rows: list[dict[str, object]], name: str) 
 def phase_tp2_public(
     evidence: str | None, repeat: int, *, tp: int, dump_dir: str | None
 ) -> None:
-    """DP1 x TP{tp} x CP1 public ``forward`` cell (Qwen3.5-4B full model).
+    """DP1 x TP{tp} x CP1 public ``dp_rank_forward`` cell (Qwen3.5-4B full model).
 
     Run at ``--tp 2`` (the gate) and at ``--tp 1`` (the control: the identical
     cell on one GPU). Structural gates run here; the numerics gates compare
@@ -1432,9 +1407,9 @@ def phase_tp2_public(
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            outputs = rank.forward(requests, checkpoint=slot)
+            outputs = rank.dp_rank_forward(requests, checkpoint=slot)
             loss = _output_loss(outputs)
-            rank.backward(loss)
+            loss.backward()
             end.record()
             torch.cuda.synchronize()
             telemetry = rank.last_forward_telemetry()
@@ -1784,7 +1759,7 @@ def phase_tp_compare(
 
 
 def phase_dp2_tp2_waves(evidence: str | None) -> None:
-    """DP2 x TP2 public ``forward_batches`` gate (4 ranks, Qwen3.5-4B).
+    """DP2 x TP2 public ``forward_micro_batches`` gate (4 ranks, Qwen3.5-4B).
 
     Arm A (branchy): six hierarchical GRPO groups as top-level items, the
     test-only memory cap sized so the stream needs at least two waves, forward
@@ -1841,7 +1816,7 @@ def phase_dp2_tp2_waves(evidence: str | None) -> None:
             logprobs: dict[int, list[torch.Tensor]] = {}
             loss_total = 0.0
             depths: list[int] = []
-            for batch in rank.forward_batches(items, checkpoint=slot):
+            for batch in rank.forward_micro_batches(items, checkpoint=slot):
                 seen.extend(int(index) for index in batch.indices)
                 telemetry = rank.last_forward_telemetry()
                 depths.append(int(telemetry["selected_max_depth"]))
@@ -1865,7 +1840,7 @@ def phase_dp2_tp2_waves(evidence: str | None) -> None:
                 if flat:
                     loss = _output_loss(flat)
                     loss_total += float(loss.detach().float().item())
-                    rank.backward(loss)
+                    loss.backward()
             torch.cuda.synchronize()
             result = {
                 "arm": arm,
@@ -1980,12 +1955,12 @@ def phase_dp2_tp2_waves(evidence: str | None) -> None:
         rank.zero_grad()
         waves = 0
         local_outputs = 0
-        for batch in rank.forward_batches([single], checkpoint=slot):
+        for batch in rank.forward_micro_batches([single], checkpoint=slot):
             waves += 1
             flat = [output for group in batch.outputs for output in group]
             local_outputs += len(flat)
             if flat:
-                rank.backward(_output_loss(flat))
+                _output_loss(flat).backward()
         torch.cuda.synchronize()
         counts = _gather_objects((dp_rank, waves, local_outputs))
         rows.append({"arm": "dp2-tp2-empty-slot", "per_rank": counts})
@@ -2650,9 +2625,9 @@ def phase_cost_calibrate(
             start.record()
             failed = 0
             try:
-                outputs = rank.forward(requests, checkpoint=slot)
+                outputs = rank.dp_rank_forward(requests, checkpoint=slot)
                 loss = _output_loss(outputs)
-                rank.backward(loss)
+                loss.backward()
             except TrainerRankMemoryError as error:
                 failed = 1
                 message = str(error)

@@ -14,6 +14,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from art.trainer_rank import (
+    ForwardOutput,
     MaterializedCheckpoint,
     TrainerRank,
     TrainerRankSlotStateError,
@@ -491,10 +492,7 @@ def test_multi_snapshot_request_can_exceed_soft_residency_limit(tmp_path, monkey
     assert set(trainer._checkpoint_slots) == {"three"}
 
 
-@pytest.mark.parametrize("retention", ["gpu", "cpu", "replay"])
-def test_versioned_graph_ownership_protects_saved_residency_until_backward(
-    tmp_path, monkeypatch, retention
-):
+def test_live_slot_graph_protects_saved_residency_until_backward(tmp_path, monkeypatch):
     trainer, source, _entered, _exited, loads = fixture(tmp_path, monkeypatch)
     trainer._checkpoint_snapshot_cache_size = 1
     mutable = _CheckpointSlot(params=(torch.nn.Parameter(torch.tensor(9.0)),))
@@ -504,30 +502,20 @@ def test_versioned_graph_ownership_protects_saved_residency_until_backward(
     source("new", 5)
     trainer._ensure_checkpoint_slots(("saved",))
     saved = trainer._checkpoint_slots["saved"]
-    version = trainer._capture_checkpoint_version("saved")
-    cache = trainer._forward_graph_cache()
     weight = torch.nn.Parameter(torch.tensor(2.0))
-    handle, outputs = cache.run(
-        lambda _: (weight * saved.params[0],),
-        None,
-        retention=retention,
-        checkpoint_versions=(version,),
-        validate_backward=lambda: trainer._version_state().validate(version),
+    (output,) = trainer._track_slot_graph_outputs(
+        _slot_ref("saved"),
+        [ForwardOutput(weight * saved.params[0], None, None, None)],
     )
-    assert outputs[0].item() == 6
-    # No caller marker exists: the cache alone owns this retained/replay graph.
-    assert not trainer._slot_graphs()
+    assert output.target_logprobs.item() == 6
     trainer._ensure_checkpoint_slots(("new",))
     assert trainer._checkpoint_slots["saved"] is saved
     with pytest.raises(TrainerRankSlotStateError, match="live outputs"):
         trainer._discard_snapshot_checkpoint("saved")
-    mutable.params[0].data.add_(1)
-    mutable.revision += 1
-    cache.backward(handle, (torch.tensor(1.0),))
+    output.target_logprobs.backward()
     assert weight.grad is not None and weight.grad.item() == 3
     assert saved.params[0].grad is None
-    assert mutable.params[0].item() == 10 and mutable.params[0].grad is None
-    assert not cache.handles()
+    assert mutable.params[0].item() == 9 and mutable.params[0].grad is None
     trainer._ensure_checkpoint_slots(("new",))
     assert "saved" not in trainer._checkpoint_slots
     trainer._ensure_checkpoint_slots(("saved",))
@@ -536,7 +524,7 @@ def test_versioned_graph_ownership_protects_saved_residency_until_backward(
     assert loads == ["saved", "new", "saved"]
 
 
-def test_native_saved_reload_reserves_fresh_generation_without_touching_live_slot(
+def test_native_saved_reload_restores_frozen_state_without_touching_live_slot(
     tmp_path, monkeypatch
 ):
     from tests.unit.test_trainer_rank_validation import _canonical_checkpoint
@@ -574,22 +562,15 @@ def test_native_saved_reload_reserves_fresh_generation_without_touching_live_slo
 
     trainer._register_checkpoint_source("saved", "immutable:saved", prepare)
     trainer._ensure_checkpoint_slots(("saved",))
-    first = trainer._capture_checkpoint_version("saved")
     frozen = trainer._checkpoint_slots["saved"].params[0].detach().clone()
-    assert first.generation > 0
     assert not trainer._checkpoint_slots["saved"].params[0].requires_grad
     trainer._discard_snapshot_checkpoint("saved")
     mutable.params[0].data.add_(1)
-    mutable.revision += 1
     trainer._ensure_checkpoint_slots(("saved",))
-    second = trainer._capture_checkpoint_version("saved")
-    assert second.generation > first.generation
-    with pytest.raises(TrainerRankSlotStateError, match="replaced after forward"):
-        trainer._version_state().validate(first)
     torch.testing.assert_close(trainer._checkpoint_slots["saved"].params[0], frozen)
     assert trainer._checkpoint_slots["saved"].optimizer is None
     assert trainer._checkpoint_slots["training"] is mutable
-    assert mutable.params[0].item() == 10 and mutable.revision == 1
+    assert mutable.params[0].item() == 10
 
 
 def _mixed_residency_worker(index: int, directory: str) -> None:

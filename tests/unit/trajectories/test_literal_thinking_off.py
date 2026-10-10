@@ -125,6 +125,35 @@ def _history(
     return history, tokenizer
 
 
+@pytest.mark.parametrize(
+    "content", [_LITERAL, "literal </think> text", "π<think>one<think>two</think>end"]
+)
+def test_legacy_preserved_template_keeps_literal_content(
+    content: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    history, tokenizer = _history(content=content)
+    original = history.model_dump(mode="python")
+    monkeypatch.setattr(
+        _tokenize, "chat_template_with_preserved_thinking", lambda value: value
+    )
+    view = _tokenize._ChatViewTokenizer(
+        history,
+        base_model=None,
+        tokenizer=tokenizer,
+        chat_template=None,
+        chat_template_kwargs=None,
+    )
+    tokenized = view.run()
+    assert content in tokenizer.rendered[0]
+    assert tokenizer.calls[0][-1]["reasoning_content"] == ""
+    sampled = [
+        i for i, flag in enumerate(tokenized.flags) if flag & tr.TokenFlag.SAMPLED
+    ]
+    assert "".join(chr(tokenized.tokens[i]) for i in sampled) == content
+    assert all(tokenized.logprobs[i] == -0.5 for i in sampled)
+    assert history.model_dump(mode="python") == original
+
+
 def _outcome(
     history: tr.ChatCompletionsHistory, tokenizer: _TemplateTokenizer, **kwargs: Any
 ) -> object:
@@ -502,6 +531,9 @@ def _check_literal_next_turn_boundary(
     with monkeypatch.context() as patch:
         patch.setattr(
             _tokenize, "chat_template_with_preserved_thinking", lambda value: value
+        )
+        patch.setattr(
+            _tokenize, "_preserve_literal_thinking_off_content", lambda *args: None
         )
         try:
             tokenize()

@@ -1,16 +1,13 @@
-"""Shared runtime construction and process groups for trainer-rank contract tests."""
+"""Shared fake runtimes and process groups for trainer-rank tests."""
 
-from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import timedelta
 from functools import partial
-import json
 from pathlib import Path
-import sys
 import tempfile
 import time
 import traceback
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -19,19 +16,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 if TYPE_CHECKING:
-    from art.megatron.train import TrainingRuntime
     from art.trainer_rank import TrainerRank
-
-
-class _FakeGPT(torch.nn.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.zeros((), dtype=torch.float16))
-        self.config = SimpleNamespace(hidden_size=8, num_layers=4, padded_vocab_size=32)
-        self.decoder = object()
-
-    def _preprocess(self, *args: object, **kwargs: object) -> None:
-        return None
 
 
 def fake_rank(rank_type: type["TrainerRank"], model, **provider) -> "TrainerRank":
@@ -77,60 +62,6 @@ def recompute_model(
     return model
 
 
-def checkpoint_runtime(
-    model: torch.nn.Module | None = None,
-    *,
-    optimizer: object | None = None,
-) -> "TrainingRuntime":
-    # Deliberately lightweight structural fake; importing/constructing the real
-    # Megatron runtime would make these CPU-only unit tests require Megatron.
-    return SimpleNamespace(
-        model=[model or torch.nn.Linear(1, 1)],
-        optimizer=optimizer,
-        provider=SimpleNamespace(
-            hidden_size=4,
-            num_layers=1,
-            kv_channels=2,
-            art_flex_sliding_windows=(16,),
-        ),
-        model_support_handler=SimpleNamespace(
-            build_gdn_execution_spec=True,
-            canonicalize_loaded_lora_state=lambda state, _model: state,
-            from_vllm_lora_tensors=lambda state, **_kwargs: state,
-            to_vllm_lora_tensors=lambda state, **kwargs: (
-                state,
-                kwargs["adapter_config"],
-            ),
-            zero_internal_padding_grads=lambda _model: None,
-            zero_internal_padding_params=lambda _model: None,
-        ),
-        rank=0,
-        world_size=1,
-    )  # type: ignore
-
-
-def _packed_budget(
-    monkeypatch: pytest.MonkeyPatch,
-    rank: "TrainerRank",
-    available: int | Callable[[], int],
-) -> None:
-    """Express memory purely in packed tokens, bypassing the live model."""
-
-    from art.trainer_rank._impl import _MemoryCheck
-
-    monkeypatch.setattr(
-        rank,
-        "_estimate_required_memory_bytes_from_values",
-        lambda *, packed_tokens, **_kwargs: packed_tokens,
-    )
-
-    def check(required: int, *, sync_across_dp: bool = False) -> _MemoryCheck:
-        limit = available if isinstance(available, int) else available()
-        return _MemoryCheck(required, limit, required <= limit)
-
-    monkeypatch.setattr(rank, "_memory_check_required", check)
-
-
 @contextmanager
 def process_group(rank, rendezvous, *, world_size=2, timeout=30, backend="gloo"):
     dist.init_process_group(
@@ -144,9 +75,6 @@ def process_group(rank, rendezvous, *, world_size=2, timeout=30, backend="gloo")
         yield
     finally:
         dist.destroy_process_group()
-
-
-gloo_group = process_group
 
 
 class AllReduceSum(torch.autograd.Function):
@@ -167,38 +95,6 @@ def all_reduce_max(tensor):
     output = tensor.clone()
     dist.all_reduce(output, op=dist.ReduceOp.MAX)
     return output
-
-
-@contextmanager
-def megatron_topology(physical, *, dp_size, tp_size):
-    """Install just the callback topology, with each real TP group created in order."""
-    assert dist.get_world_size() == dp_size * tp_size
-    groups = (
-        [dist.group.WORLD]
-        if dp_size == 1
-        else [
-            dist.new_group(list(range(dp * tp_size, (dp + 1) * tp_size)))
-            for dp in range(dp_size)
-        ]
-    )
-    dp, tp = divmod(physical, tp_size)
-    megatron, core = ModuleType("megatron"), ModuleType("megatron.core")
-    setattr(
-        core,
-        "parallel_state",
-        SimpleNamespace(
-            get_tensor_model_parallel_rank=lambda: tp,
-            get_context_parallel_rank=lambda: 0,
-            get_data_parallel_rank=lambda: dp,
-            get_data_parallel_world_size=lambda: dp_size,
-            get_tensor_and_context_parallel_group=lambda **kwargs: groups[dp],
-        ),
-    )
-    setattr(megatron, "core", core)
-    with pytest.MonkeyPatch.context() as modules:
-        modules.setitem(sys.modules, "megatron", megatron)
-        modules.setitem(sys.modules, "megatron.core", core)
-        yield getattr(core, "parallel_state")
 
 
 def _traced_worker(worker, errors, rank, *args):
@@ -265,7 +161,3 @@ def _spawn_and_join(worker, args, *, timeout, failure, nprocs):
                 )
             except BaseException:
                 pass
-
-
-def report_measurement(label: str, *, sort_keys: bool = False, **values: Any) -> None:
-    print(label + "=" + json.dumps(values, sort_keys=sort_keys))

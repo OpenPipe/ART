@@ -1426,27 +1426,6 @@ def test_a_warm_split_prices_below_the_whole_wave_it_splits():
     # The split still pays for that workspace (about 4.9 GB).
     assert split >= _checkpoint_split(children)
     assert max(c.checkpoint_workspace for c in children) > 4.5e9
-    # CUDA admission's placement path composes the same costs per unit (as
-    # _graph_memory_units does, GPU retention): the split still prices below.
-    from art.trainer_rank._memory_policy import ForwardMemoryCost, placement_cost
-
-    def placed(costs_and_outputs):
-        units = []
-        for cost, output in costs_and_outputs:
-            retained = max(output, cost.retained)
-            units.append(
-                ForwardMemoryCost(
-                    peak_bytes=max(cost.required, retained),
-                    retained_bytes=retained,
-                    output_bytes=output,
-                )
-            )
-        return placement_cost(
-            units, backward_state="gpu", output_device="model"
-        ).gpu_required_bytes
-
-    rows = (24_641, 22_962, 20_555)
-    assert placed(zip(children, (r * 4 for r in rows))) < placed([(whole, 272_632)])
 
 
 def test_a_split_whose_checkpoint_expression_binds():

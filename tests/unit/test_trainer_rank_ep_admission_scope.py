@@ -44,10 +44,10 @@ def _exercise(monkeypatch, *, api, ep, allow, peer_veto, count, limit=5):
     requests = [_request(i) for i in range(count)]
     refused = False
     try:
-        if api == "forward":
-            outputs = rank.forward(requests)
+        if api == "dp_rank_forward":
+            outputs = rank.dp_rank_forward(requests)
         else:
-            iterator = rank.forward_batches([requests])
+            iterator = rank.forward_micro_batches([requests])
             try:
                 batches = list(iterator)
                 assert len(batches) == 1
@@ -61,7 +61,7 @@ def _exercise(monkeypatch, *, api, ep, allow, peer_veto, count, limit=5):
     return refused, executed, calls, local_group
 
 
-@pytest.mark.parametrize("api", ["forward", "forward_batches"])
+@pytest.mark.parametrize("api", ["dp_rank_forward", "forward_micro_batches"])
 @pytest.mark.parametrize("count", [1, 2])
 @pytest.mark.parametrize("ep", [False, True])
 @pytest.mark.parametrize("allow", [False, True])
@@ -72,7 +72,7 @@ def test_oversized_requires_complete_peer_scope(
     refused, executed, calls, local_group = _exercise(
         monkeypatch, api=api, ep=ep, allow=allow, peer_veto=peer_veto, count=count
     )
-    local_ep = ep and api == "forward"
+    local_ep = ep and api == "dp_rank_forward"
     accepted = allow and not peer_veto and not local_ep
     assert refused is not accepted
     assert bool(executed) is accepted
@@ -88,7 +88,7 @@ def test_oversized_requires_complete_peer_scope(
             if len(values) == 3 and op == tr.dist.ReduceOp.MIN
         ]
         assert len(votes) == 1
-        assert votes[0] is (None if api == "forward_batches" else local_group)
+        assert votes[0] is (None if api == "forward_micro_batches" else local_group)
 
 
 @pytest.mark.parametrize("count", [1, 2])
@@ -96,7 +96,7 @@ def test_oversized_requires_complete_peer_scope(
 def test_fitting_local_ep_keeps_existing_behavior(monkeypatch, count, allow):
     refused, executed, calls, _ = _exercise(
         monkeypatch,
-        api="forward",
+        api="dp_rank_forward",
         ep=True,
         allow=allow,
         peer_veto=True,

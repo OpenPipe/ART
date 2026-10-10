@@ -4,27 +4,26 @@ import asyncio
 from collections.abc import Callable
 import copy
 from dataclasses import dataclass
+from datetime import timedelta
 from importlib.util import find_spec
 import io
 import json
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Protocol, TypeVar, cast
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from trainer_rank_test_support import checkpoint_runtime as _runtime
-from trainer_rank_test_support import gloo_group
 
 from art.trainer_rank import (
     AdamParams,
     MaterializedCheckpoint,
-    ModuleHandle,
     TrainerRank,
     TrainerRankSlotStateError,
+    Unset,
 )
 from art.trainer_rank._checkpoint import (
     PreparedCustomPayload,
@@ -34,6 +33,34 @@ from art.trainer_rank._checkpoint import (
     prepare_checkpoint,
 )
 from art.trainer_rank._impl import _CheckpointSlot
+
+ModuleT = TypeVar("ModuleT", bound=torch.nn.Module)
+
+
+class _CustomTensorAPI(Protocol):
+    def module(
+        self,
+        name: str,
+        factory: Callable[[], ModuleT],
+        *,
+        checkpoint: str | object = Unset,
+    ) -> ModuleT: ...
+
+    def parameter(
+        self,
+        name: str,
+        factory: Callable[[], torch.Tensor | torch.nn.Parameter],
+        *,
+        checkpoint: str | object = Unset,
+    ) -> torch.nn.Parameter: ...
+
+    def buffer(
+        self,
+        name: str,
+        factory: Callable[[], torch.Tensor],
+        *,
+        checkpoint: str | object = Unset,
+    ) -> torch.Tensor: ...
 
 
 class _ClassFactoryHead(torch.nn.Module):
@@ -97,6 +124,32 @@ class _BufferLayoutHead(torch.nn.Module):
         self.register_buffer("running", torch.ones(1), persistent=persistent)
 
 
+def _runtime(model: torch.nn.Module | None = None) -> Any:
+    return SimpleNamespace(
+        model=[model or torch.nn.Linear(1, 1)],
+        optimizer=None,
+        provider=SimpleNamespace(
+            hidden_size=4,
+            num_layers=1,
+            kv_channels=2,
+            art_flex_sliding_windows=(16,),
+        ),
+        model_support_handler=SimpleNamespace(
+            build_gdn_execution_spec=True,
+            canonicalize_loaded_lora_state=lambda state, _model: state,
+            from_vllm_lora_tensors=lambda state, **_kwargs: state,
+            to_vllm_lora_tensors=lambda state, **kwargs: (
+                state,
+                kwargs["adapter_config"],
+            ),
+            zero_internal_padding_grads=lambda _model: None,
+            zero_internal_padding_params=lambda _model: None,
+        ),
+        rank=0,
+        world_size=1,
+    )
+
+
 def _config() -> dict[str, object]:
     return {
         "base_model_name_or_path": "test/model",
@@ -106,24 +159,11 @@ def _config() -> dict[str, object]:
     }
 
 
-def _trainer(*names: str) -> tuple[TrainerRank, TrainerRank]:
+def _trainer(*names: str) -> tuple[TrainerRank, _CustomTensorAPI]:
     trainer = TrainerRank(_runtime())
     for name in names:
         trainer._checkpoint_slots[name] = _CheckpointSlot(config=cast(Any, _config()))
-    return trainer, trainer
-
-
-def _use_local_gradients(trainer: TrainerRank, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        trainer,
-        "_reduce_dynamic_grads",
-        lambda params, **_kwargs: tuple(
-            torch.zeros_like(param, dtype=torch.float32)
-            if param.grad is None
-            else param.grad.float()
-            for param in params
-        ),
-    )
+    return trainer, cast(_CustomTensorAPI, trainer)
 
 
 def test_custom_head_uses_model_hidden_size_before_forward() -> None:
@@ -140,7 +180,14 @@ def _distributed_custom_registration_worker(
     init_method: str,
     mode: str,
 ) -> None:
-    with gloo_group(rank, init_method, world_size=world_size):
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
         trainer, api = _trainer("student")
         slot = trainer._checkpoint_slots["student"]
         if mode == "trainability":
@@ -184,6 +231,8 @@ def _distributed_custom_registration_worker(
         assert "head" not in slot.custom
         assert not slot.params
         dist.barrier()
+    finally:
+        dist.destroy_process_group()
 
 
 def _distributed_custom_grad_flags_worker(
@@ -191,16 +240,24 @@ def _distributed_custom_grad_flags_worker(
     world_size: int,
     init_method: str,
 ) -> None:
-    with gloo_group(rank, init_method, world_size=world_size):
+    dist.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=30),
+    )
+    try:
         trainer, api = _trainer("student")
         used = api.parameter("used", lambda: torch.tensor(1.0), checkpoint="student")
         api.parameter("unused", lambda: torch.tensor(2.0), checkpoint="student")
         if rank == 0:
-            with trainer._gradient_transaction():
-                (used * 3).backward()
+            (used * 3).backward()
         assert trainer._dynamic_param_step_flags(
             trainer._checkpoint_slots["student"].params
         ) == (True, False)
+    finally:
+        dist.destroy_process_group()
 
 
 def test_module_accepts_class_and_lambda_factories_and_is_idempotent() -> None:
@@ -222,8 +279,8 @@ def test_module_accepts_class_and_lambda_factories_and_is_idempotent() -> None:
     class_head = rank.module("class_head", CountingHead, checkpoint="student")
     lambda_head = rank.module("lambda_head", value_head, checkpoint="student")
 
-    assert isinstance(class_head, torch.nn.Module)
-    assert isinstance(lambda_head, torch.nn.Module)
+    assert isinstance(class_head, CountingHead)
+    assert isinstance(lambda_head, _ValueHead)
     assert rank.module("class_head", CountingHead, checkpoint="student") is class_head
     assert rank.module("lambda_head", value_head, checkpoint="student") is lambda_head
     assert class_calls == 1
@@ -343,8 +400,7 @@ def test_custom_module_outputs_participate_in_checkpoint_graph_guards() -> None:
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(ref)
 
-    with trainer._gradient_transaction():
-        output.sum().backward()
+    output.sum().backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(ref)
 
@@ -367,8 +423,7 @@ def test_custom_module_tracks_direct_parameter_use_and_custom_outputs(
     assert isinstance(output, _HeadOutput)
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(trainer._slot_ref("student"))
-    with trainer._gradient_transaction():
-        output.value.sum().backward()
+    output.value.sum().backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(trainer._slot_ref("student"))
 
@@ -384,8 +439,7 @@ def test_custom_module_tracks_direct_weight_operations() -> None:
 
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(trainer._slot_ref("student"))
-    with trainer._gradient_transaction():
-        loss.backward()
+    loss.backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(trainer._slot_ref("student"))
 
@@ -400,13 +454,11 @@ def test_custom_parameter_graph_guard_tracks_retain_and_abandonment() -> None:
     ref = trainer._slot_ref("student")
     loss = parameter.square().sum()
 
-    with trainer._gradient_transaction():
-        loss.backward(retain_graph=True)
+    loss.backward(retain_graph=True)
     trainer.zero_grad()
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(ref)
-    with trainer._gradient_transaction():
-        loss.backward()
+    loss.backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(ref)
 
@@ -428,8 +480,7 @@ def test_custom_module_graph_tracking_allows_in_place_layers() -> None:
     )
 
     output = head(torch.ones(1, 3, requires_grad=True))
-    with _trainer_rank._gradient_transaction():
-        output.sum().backward()
+    output.sum().backward()
 
     assert head[0].weight.grad is not None
 
@@ -445,8 +496,7 @@ def test_custom_parameter_outputs_participate_in_checkpoint_graph_guards() -> No
     with pytest.raises(TrainerRankSlotStateError, match="live backward graph"):
         trainer._guard_slot_can_load(ref)
 
-    with trainer._gradient_transaction():
-        output.backward()
+    output.backward()
     trainer.zero_grad()
     trainer._guard_slot_can_load(ref)
 
@@ -457,8 +507,7 @@ def test_checkpoint_load_rejects_custom_grads_and_stale_objects() -> None:
     parameter = rank.parameter(
         "temperature", lambda: torch.tensor(2.0), checkpoint="student"
     )
-    with trainer._gradient_transaction():
-        (head(torch.ones(1)) + parameter).sum().backward()
+    (head(torch.ones(1)) + parameter).sum().backward()
     ref = trainer._slot_ref("student")
 
     with pytest.raises(TrainerRankSlotStateError, match="accumulated gradients"):
@@ -592,9 +641,17 @@ def test_selected_optimizer_step_updates_only_its_custom_checkpoint(
     trainer, rank = _trainer("A", "B")
     a = rank.parameter("gain", lambda: torch.tensor(1.0), checkpoint="A")
     b = rank.parameter("gain", lambda: torch.tensor(2.0), checkpoint="B")
-    _use_local_gradients(trainer, monkeypatch)
-    with trainer._gradient_transaction():
-        (a * 3).backward()
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(
+            torch.zeros_like(param, dtype=torch.float32)
+            if param.grad is None
+            else param.grad.float()
+            for param in params
+        ),
+    )
+    (a * 3).backward()
     before_b = b.detach().clone()
     trainer.optim_step(
         params=AdamParams(learning_rate=1e-2, weight_decay=0.0),
@@ -610,9 +667,17 @@ def test_optimizer_skips_unused_custom_parameters(
     trainer, rank = _trainer("student")
     used = rank.parameter("used", lambda: torch.tensor(1.0), checkpoint="student")
     unused = rank.parameter("unused", lambda: torch.tensor(3.0), checkpoint="student")
-    _use_local_gradients(trainer, monkeypatch)
-    with trainer._gradient_transaction():
-        (used * 2).backward()
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(
+            torch.zeros_like(param, dtype=torch.float32)
+            if param.grad is None
+            else param.grad.float()
+            for param in params
+        ),
+    )
+    (used * 2).backward()
 
     trainer.optim_step(
         params=AdamParams(learning_rate=0.1, weight_decay=0.5),
@@ -884,9 +949,17 @@ def test_custom_tensor_names_cannot_corrupt_lora_optimizer_metadata(
 ) -> None:
     trainer, rank = _real_lora_trainer()
     head = rank.module("layer", _CollisionHead, checkpoint="student")
-    _use_local_gradients(trainer, monkeypatch)
-    with trainer._gradient_transaction():
-        head.q_proj.lora_A.weight.sum().backward()
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(
+            torch.zeros_like(param, dtype=torch.float32)
+            if param.grad is None
+            else param.grad.float()
+            for param in params
+        ),
+    )
+    head.q_proj.lora_A.weight.sum().backward()
     trainer.optim_step(
         params=AdamParams(learning_rate=1e-3, weight_decay=0.0),
         checkpoints=["student"],
@@ -1030,11 +1103,10 @@ def test_prepared_forward_snapshot_restores_frozen_custom_tensors(
 
 
 @pytest.mark.skipif(find_spec("megatron") is None, reason="requires Megatron")
-@pytest.mark.parametrize("step,valid", [(0.5, False), (1.0, True)])
 def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_save(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, step: float, valid: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from safetensors.torch import load_file, save_file
+    from safetensors.torch import load_file
 
     from art.trainer_rank import _checkpoint
 
@@ -1046,17 +1118,6 @@ def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_
     _step_custom_tensors(original, original_head, original_temperature, monkeypatch)
     saved = tmp_path / "saved"
     original.save_checkpoint(str(saved), "student")
-
-    relative = "optimizer/custom.safetensors"
-    payload = load_file(saved / relative)
-    assert payload["step/value_head.proj.bias"].item() == 1.0
-    if not valid:
-        payload["step/value_head.proj.bias"].fill_(step)
-        save_file(payload, saved / relative)
-        manifest = json.loads((saved / "checkpoint.json").read_text())
-        manifest["files"][relative] = _file_digest(saved / relative)
-        manifest["digest"] = _manifest_digest(manifest)
-        (saved / "checkpoint.json").write_text(json.dumps(manifest))
 
     restored, restored_api = _empty_real_lora_trainer()
 
@@ -1084,27 +1145,6 @@ def test_custom_tensors_and_optimizer_restore_lazily_and_survive_unmaterialized_
         nonlocal calls
         calls += 1
         return _ValueHead(3)
-
-    if not valid:
-        slot = restored._checkpoint_slots["student"]
-        params, optimizer = slot.params, slot.optimizer
-        assert optimizer is not None
-        before = copy.deepcopy((params, optimizer.optimizer.state_dict()))
-        with pytest.raises(
-            TrainerRankSlotStateError,
-            match="value_head.proj.bias.*nonnegative finite integer step.*step=0.5",
-        ):
-            restored_api.module("value_head", head_factory, checkpoint="student")
-        assert calls == 1 and not slot.custom
-        assert slot.params is params and slot.optimizer is optimizer
-        torch.testing.assert_close(
-            (params, optimizer.optimizer.state_dict()), before, atol=0, rtol=0
-        )
-        temperature = restored_api.parameter(
-            "temperature", lambda: torch.tensor(-99.0), checkpoint="student"
-        )
-        torch.testing.assert_close(temperature, original_temperature, atol=0, rtol=0)
-        return
 
     restored_head = restored_api.module(
         "value_head", head_factory, checkpoint="student"
@@ -1207,7 +1247,7 @@ def test_custom_checkpoint_rejects_factory_schema_mismatch(
         api.module("head", factory, checkpoint="student")
 
 
-def _real_lora_trainer() -> tuple[TrainerRank, TrainerRank]:
+def _real_lora_trainer() -> tuple[TrainerRank, _CustomTensorAPI]:
     trainer, api = _empty_real_lora_trainer()
     adapter = {
         "layer.q_proj.lora_A.weight": torch.tensor([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]),
@@ -1221,17 +1261,17 @@ def _real_lora_trainer() -> tuple[TrainerRank, TrainerRank]:
     return trainer, api
 
 
-def _empty_real_lora_trainer() -> tuple[TrainerRank, TrainerRank]:
+def _empty_real_lora_trainer() -> tuple[TrainerRank, _CustomTensorAPI]:
     from art.megatron.lora import LoRA
 
     lora = LoRA("layer.q_proj", 3, 4, 2, 2, torch.float32, torch.device("cpu"))
     trainer = TrainerRank(_runtime(lora))
-    return trainer, trainer
+    return trainer, cast(_CustomTensorAPI, trainer)
 
 
 def _register_custom_tensors(
-    rank: TrainerRank,
-) -> tuple[ModuleHandle, torch.nn.Parameter, torch.Tensor]:
+    rank: _CustomTensorAPI,
+) -> tuple[_ValueHead, torch.nn.Parameter, torch.Tensor]:
     head = rank.module("value_head", lambda: _ValueHead(3), checkpoint="student")
     temperature = rank.parameter(
         "temperature", lambda: torch.tensor(0.5), checkpoint="student"
@@ -1244,16 +1284,24 @@ def _register_custom_tensors(
 
 def _step_custom_tensors(
     trainer: TrainerRank,
-    head: ModuleHandle,
+    head: _ValueHead,
     temperature: torch.nn.Parameter,
     monkeypatch: pytest.MonkeyPatch,
     *,
     scale: float = 1.0,
 ) -> None:
-    _use_local_gradients(trainer, monkeypatch)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(
+            torch.zeros_like(param, dtype=torch.float32)
+            if param.grad is None
+            else param.grad.float()
+            for param in params
+        ),
+    )
     hidden = torch.tensor([[0.25, -0.5, 1.0]])
-    with trainer._gradient_transaction():
-        (head(hidden).sum() + temperature * scale).backward()
+    (head(hidden).sum() + temperature * scale).backward()
     trainer.optim_step(
         params=AdamParams(
             learning_rate=1e-3,
