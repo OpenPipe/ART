@@ -1930,10 +1930,12 @@ def test_direct_3d_packed_expert_publish_matches_handler_vllm_exactly(
 
 
 @pytest.mark.parametrize("internal_ffn", [128, 1024])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     tmp_path: Path,
     monkeypatch,
     internal_ffn: int,
+    dtype: torch.dtype,
 ):
     monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
@@ -1943,7 +1945,7 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     intermediate = 128
     group_prefix = "base_model.model.model.layers.0.mlp.experts"
     full = {
-        key: tensor
+        key: tensor.to(dtype)
         for key, tensor in _gpt_oss_moe_art_tensors(
             "base_model.model.model.layers.0",
             rank=rank,
@@ -1956,7 +1958,7 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
         out_features=2 * internal_ffn,
         rank=rank,
         alpha=rank,
-        dtype=torch.float32,
+        dtype=dtype,
         device=torch.device("cpu"),
         num_local_experts=2,
     )
@@ -1966,7 +1968,7 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
         out_features=hidden,
         rank=rank,
         alpha=rank,
-        dtype=torch.float32,
+        dtype=dtype,
         device=torch.device("cpu"),
         num_local_experts=2,
     )
@@ -2025,6 +2027,48 @@ def test_direct_gpt_oss_packed_expert_publish_matches_handler_vllm_exactly(
     assert json.loads((current_dir / "adapter_config.json").read_text()) == json.loads(
         (old_dir / "adapter_config.json").read_text()
     )
+
+
+@pytest.mark.parametrize("shape", [(255, 4), (257, 4), (2049, 4), (256, 4, 1)])
+def test_prepared_gpt_oss_export_rejects_invalid_packed_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, ...],
+) -> None:
+    key = "base_model.model.model.layers.0.mlp.experts.base_layer.lora_B.weight"
+    monkeypatch.setattr(
+        lora_publish,
+        "_rank0_merged_lora_tensors",
+        lambda **_: {key: torch.zeros(shape)},
+    )
+    inputs = _lora_export._VllmLoraPublishInputs(
+        metadata=[],
+        tensors_by_owner_key={},
+        packed_expert_metadata=cast(
+            Any,
+            [
+                SimpleNamespace(
+                    key=key,
+                    pack_layout="interleaved_gate_up_rank_major_expert_cols",
+                )
+            ],
+        ),
+        packed_expert_tensors_by_owner_key={},
+        handler=GPT_OSS_MOE_HANDLER,
+        adapter_config=_gpt_oss_config(_gpt_oss_model_dir(tmp_path), rank=2, alpha=2),
+    )
+    trainer = SimpleNamespace(
+        _prepared_lora_exports={
+            "invalid": ("owner", _lora_export._PreparedLoraExport(inputs))
+        }
+    )
+    output = tmp_path / "invalid"
+    with pytest.raises(ValueError, match="invalid shape"):
+        _lora_export.finish_lora_export(
+            cast(Any, trainer), "invalid", str(output), owner_id="owner"
+        )
+    assert trainer._prepared_lora_exports == {}
+    assert not output.exists()
 
 
 def test_qwen35_megatron_shards_can_merge_to_separate_vllm_checkpoint(

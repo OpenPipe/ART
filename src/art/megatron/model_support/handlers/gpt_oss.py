@@ -324,7 +324,7 @@ def _gpt_oss_config_dict(base_model_name_or_path: str) -> dict[str, Any]:
 
 def _gpt_oss_padding_sizes_from_adapter_config(
     adapter_config: dict[str, Any],
-) -> tuple[int, int, int, int] | None:
+) -> tuple[int, int, int, int]:
     base_model = adapter_config.get("base_model_name_or_path")
     if not isinstance(base_model, str) or not base_model:
         raise RuntimeError("GPT OSS LoRA conversion requires base_model_name_or_path")
@@ -1299,11 +1299,11 @@ def _trim_gpt_oss_lora_for_vllm(
         if key.endswith(".base_layer.lora_B.weight"):
             if int(tensor.shape[0]) == 2 * logical_ffn:
                 return tensor.contiguous()
-            return _trim_gpt_oss_gate_up_dim0(
-                tensor,
+            return _trim_gpt_oss_interleaved_gate_up_last(
+                tensor.T,
                 logical=logical_ffn,
                 internal=internal_ffn,
-            )
+            ).T.contiguous()
         if key.endswith(".lora_A.weight"):
             return _trim_dim_right(tensor, dim=-1, size=logical_ffn)
         if key.endswith(".lora_B.weight"):

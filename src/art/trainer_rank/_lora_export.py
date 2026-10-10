@@ -161,14 +161,12 @@ def _prepare_vllm_lora_publish(
         packed_expert_groups=packed_expert_groups,
         slot_ref=slot_ref,
     )
-    all_packed_metadata = lora_publish._canonical_global_metadata(local_packed_metadata)
-    all_metadata = lora_publish._canonical_global_metadata(local_metadata)
     return _VllmLoraPublishPlan(
         rank=rank,
         device=device,
-        metadata=all_metadata,
+        metadata=local_metadata,
         local_tensors=local_tensors,
-        packed_expert_metadata=all_packed_metadata,
+        packed_expert_metadata=local_packed_metadata,
         local_packed_expert_tensors=local_packed_tensors,
         handler=handler,
         adapter_config=dict(adapter_config),
@@ -215,6 +213,25 @@ def _build_vllm_lora_tensors_from_inputs(
         packed_expert_metadata=inputs.packed_expert_metadata,
         packed_expert_tensors_by_owner_key=inputs.packed_expert_tensors_by_owner_key,
     )
+    interleaved_keys = frozenset(
+        meta.key
+        for meta in inputs.packed_expert_metadata
+        if meta.pack_layout == "interleaved_gate_up_rank_major_expert_cols"
+    )
+    if getattr(inputs.handler, "key", None) == "gpt_oss_moe" and interleaved_keys:
+        from art.megatron.model_support.handlers.gpt_oss import (
+            _gpt_oss_padding_sizes_from_adapter_config,
+        )
+
+        sizes = _gpt_oss_padding_sizes_from_adapter_config(inputs.adapter_config)
+        _, _, logical, internal = sizes
+        for key in interleaved_keys:
+            tensor = merged_tensors[key]
+            if tensor.ndim != 2 or tensor.shape[0] not in {
+                2 * logical,
+                2 * internal,
+            }:
+                raise ValueError("GPT-OSS packed gate/up LoRA has an invalid shape")
     return inputs.handler.to_vllm_lora_tensors(
         merged_tensors,
         adapter_config=inputs.adapter_config,
@@ -253,6 +270,23 @@ def _capture_lora_publish_inputs(
             runtime=runtime,
         ),
         "plan LoRA publish",
+        group,
+    )
+    # Every rank must finish local collection before metadata or tensor exchange.
+    from art.megatron.weights import lora_publish
+
+    packed_metadata = _checkpoint._phase(
+        lambda: lora_publish._canonical_global_metadata(plan.packed_expert_metadata),
+        "gather packed LoRA metadata",
+        group,
+    )
+    plan = _checkpoint._phase(
+        lambda: replace(
+            plan,
+            packed_expert_metadata=packed_metadata,
+            metadata=lora_publish._canonical_global_metadata(plan.metadata),
+        ),
+        "gather LoRA metadata",
         group,
     )
     timings["plan_collect"] = time.monotonic() - started
