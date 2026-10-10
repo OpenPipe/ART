@@ -1,6 +1,6 @@
-from types import ModuleType, SimpleNamespace
 import sys
 import textwrap
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -12,7 +12,9 @@ from art.megatron import te_cross_entropy
 @pytest.fixture
 def kernel(monkeypatch):
     module = ModuleType("transformer_engine.common.triton.cross_entropy")
-    source = "prefix\n" + te_cross_entropy._GRADIENT + te_cross_entropy._TARGET + "suffix"
+    source = (
+        "prefix\n" + te_cross_entropy._GRADIENT + te_cross_entropy._TARGET + "suffix"
+    )
     kernel = SimpleNamespace(src=source, device_caches={0: "compiled original"})
     updates = []
 
