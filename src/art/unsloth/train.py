@@ -647,12 +647,12 @@ def _calculate_logprobs(
     # Output shape is [B, S]
     log_probs = torch.empty(
         (batch_size, seq_len),
-        dtype=hidden_states.dtype,
+        dtype=torch.float32,
         device=hidden_states.device,
     )
     entropy = torch.empty(
         (batch_size, seq_len),
-        dtype=hidden_states.dtype,
+        dtype=torch.float32,
         device=hidden_states.device,
     )
     # Ensure lm_head_t is in the same dtype as hidden_states
@@ -662,29 +662,20 @@ def _calculate_logprobs(
     for i in range(0, seq_len, chunk_size):
         chunk_hs = hidden_states[:, i : i + chunk_size, :]  # [B, chunk_size, H]
         chunk_input_ids = next_input_ids[:, i : i + chunk_size]  # [B, chunk_size]
-        chunk_logits = torch.matmul(chunk_hs, lm_head_t)  # [B, chunk_size, V]
-        chunk_selected_logits = torch.gather(
-            chunk_logits, dim=-1, index=chunk_input_ids.unsqueeze(-1)
+        chunk_logits = torch.matmul(chunk_hs, lm_head_t).float()  # [B, chunk_size, V]
+        chunk_log_probs = torch.log_softmax(chunk_logits, dim=-1)
+        del chunk_logits
+        log_probs[:, i : i + chunk_size] = torch.gather(
+            chunk_log_probs, dim=-1, index=chunk_input_ids.unsqueeze(-1)
         ).squeeze(-1)  # [B, chunk_size]
-        chunk_logsumexp = torch.logsumexp(chunk_logits, dim=-1)  # [B, chunk_size]
-        log_probs[:, i : i + chunk_size] = chunk_selected_logits - chunk_logsumexp
 
-        # Compute entropy for the chunk
-        log_probs_full = chunk_logits - chunk_logsumexp.unsqueeze(-1)
-        chunk_entropy = (-torch.exp(log_probs_full) * log_probs_full).sum(
-            dim=-1
-        )  # [B, chunk_size]
-        entropy[:, i : i + chunk_size] = chunk_entropy
+        # Entropy is only used as a metric.
+        with torch.no_grad():
+            entropy[:, i : i + chunk_size] = (
+                -chunk_log_probs.exp().mul_(chunk_log_probs).sum(dim=-1)
+            )
 
-        del (
-            chunk_hs,
-            chunk_input_ids,
-            chunk_logits,
-            chunk_selected_logits,
-            chunk_logsumexp,
-            log_probs_full,
-            chunk_entropy,
-        )
+        del chunk_hs, chunk_input_ids, chunk_log_probs
     del hidden_states
     return log_probs, entropy
 
