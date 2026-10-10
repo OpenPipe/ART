@@ -764,10 +764,12 @@ def tokenize_trajectory_groups(
         )
         # Calculate GRPO group mean and standard deviation
         reward_mean = sum(trajectory.reward for trajectory in group) / len(group)
-        reward_std = math.sqrt(
-            sum((trajectory.reward - reward_mean) ** 2 for trajectory in group)
-            / len(group)
-        )
+        reward_std = 0.0
+        if not zero_variance:
+            reward_std = math.sqrt(
+                sum((trajectory.reward - reward_mean) ** 2 for trajectory in group)
+                / len(group)
+            )
         for trajectory in group:
             # Calculate GRPO advantage for this trajectory
             advantage = 0.0 if zero_variance else trajectory.reward - reward_mean

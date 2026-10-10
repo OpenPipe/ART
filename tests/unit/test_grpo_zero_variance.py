@@ -79,7 +79,14 @@ def _tokenize(
 @pytest.mark.parametrize("scale_rewards", [True, False])
 @pytest.mark.parametrize("drop", [True, False])
 @pytest.mark.parametrize(
-    "rewards", [[0.1] * 3, [1.0] * 3, [0.0] * 3, [0.1, 0.1 + 5e-13, 0.1 - 5e-13]]
+    "rewards",
+    [
+        [0.1] * 3,
+        [1.0] * 3,
+        [0.0] * 3,
+        [0.1, 0.1 + 5e-13, 0.1 - 5e-13],
+        [7e199] * 5,
+    ],
 )
 def test_zero_variance_groups(
     rewards: list[float], scale_rewards: bool, drop: bool
