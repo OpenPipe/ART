@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING, Any, Literal
+import warnings
 
 from pydantic import BaseModel, ConfigDict
 import torch
@@ -384,7 +385,14 @@ def loss_fn(
             )
             logprob_diff = old_logprobs - original_logprobs
             prob_ratio = torch.exp(logprob_diff)
-        policy_loss *= torch.clamp(prob_ratio, max=upper_bound).detach()
+            policy_loss *= torch.clamp(prob_ratio, max=upper_bound).detach()
+        else:
+            warnings.warn(
+                "Skipping truncated importance sampling because original_logprobs "
+                "are unavailable; enable precalculate_logprobs to retain sampler "
+                "logprobs on the Unsloth backend.",
+                stacklevel=2,
+            )
     policy_loss = policy_loss * weights * assistant_mask
     denominator = aligned_inputs.denominator(assistant_mask, reduction)
     reduced_policy_loss = policy_loss.sum() / denominator
