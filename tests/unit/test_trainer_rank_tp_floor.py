@@ -1592,6 +1592,67 @@ class _GatherLastDim(torch.autograd.Function):
         return grad.chunk(world, dim=-1)[rank].contiguous(), None
 
 
+def _synchronous_gloo_all_gather(outputs, values, group=None):
+    import torch.distributed as dist
+
+    world, rank = dist.get_world_size(group), dist.get_rank(group)
+    values = values.contiguous()
+    # Gloo's all-gather stages into this shape before copying to outputs. Its
+    # completed AsyncWork can retain tensors on a worker after wait returns;
+    # blocking P2P keeps the same buffers scoped to this call instead.
+    gathered = values.new_empty((world, *values.shape))
+    parts = gathered.unbind(0)
+    parts[rank].copy_(values)
+    for source in range(world):
+        if source == rank:
+            for peer in range(world):
+                if peer != rank:
+                    destination = (
+                        peer if group is None else dist.get_global_rank(group, peer)
+                    )
+                    dist.send(values, dst=destination, group=group)
+        else:
+            origin = source if group is None else dist.get_global_rank(group, source)
+            dist.recv(parts[source], src=origin, group=group)
+    for output, part in zip(outputs, parts, strict=True):
+        output.copy_(part)
+
+
+def test_the_gloo_memory_adapter_preserves_gather_values_and_gradients(tmp_path):
+    spawn_and_join(
+        _gloo_memory_adapter_worker,
+        (f"file://{tmp_path / 'gather'}",),
+        timeout=60,
+        failure="Gloo memory adapter workers did not finish",
+    )
+
+
+def _gloo_memory_adapter_worker(rank, rendezvous):
+    import torch.distributed as dist
+
+    with process_group(rank, rendezvous, world_size=2, timeout=40):
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(dist, "all_gather", _synchronous_gloo_all_gather)
+            base = (torch.arange(24.0).view(3, 8) + 100 * rank).requires_grad_()
+            values = base[:, ::2]
+            gathered = _GatherLastDim.apply(values, dist.group.WORLD)
+            shard = torch.arange(24.0).view(3, 8)[:, ::2]
+            expected = torch.cat((shard, shard + 100), dim=-1)
+            torch.testing.assert_close(gathered, expected)
+            gradient = torch.arange(24.0).view(3, 8) + 1
+            gathered.backward(gradient)
+            expected_gradient = torch.zeros_like(base)
+            expected_gradient[:, ::2] = gradient.chunk(2, dim=-1)[rank]
+            torch.testing.assert_close(base.grad, expected_gradient)
+            tokens = torch.arange(6, dtype=torch.int64).view(3, 2) + 10 * rank
+            outputs = [torch.empty_like(tokens) for _ in range(2)]
+            dist.all_gather(outputs, tokens, group=dist.group.WORLD)
+            for peer, output in enumerate(outputs):
+                torch.testing.assert_close(
+                    output, torch.arange(6).view(3, 2) + 10 * peer
+                )
+
+
 def _measured_tensor_parallel_worker(rank, rendezvous, output):
     import torch.distributed as dist
 
@@ -1609,6 +1670,10 @@ def _measured_tensor_parallel_worker(rank, rendezvous, output):
                 rows = 2 * _CHUNK + 5
                 requests = _measured_requests(case, rows, vocabulary=2 * _SHARD)
                 with pytest.MonkeyPatch.context() as monkeypatch:
+                    monkeypatch.setattr(
+                        "art.trainer_rank._impl.dist.all_gather",
+                        _synchronous_gloo_all_gather,
+                    )
                     monkeypatch.setattr(
                         "art.trainer_rank._impl._vocab_range",
                         lambda logits: (rank * _SHARD, (rank + 1) * _SHARD),
