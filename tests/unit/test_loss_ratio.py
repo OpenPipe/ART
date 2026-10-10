@@ -21,9 +21,7 @@ def _inputs(old_logprobs: torch.Tensor) -> AlignedLossInputs:
 @pytest.mark.parametrize(
     "old_logprob", [-float("inf"), -9999.0, -101.0, float("inf"), float("nan")]
 )
-@pytest.mark.parametrize(
-    "level", ["token", "sequence", "average", "geometric_average"]
-)
+@pytest.mark.parametrize("level", ["token", "sequence", "average", "geometric_average"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_ppo_extreme_old_logprobs_have_finite_loss_and_gradients(
     old_logprob: float, level: ImportanceSamplingLevel, dtype: torch.dtype
@@ -45,9 +43,7 @@ def test_ppo_extreme_old_logprobs_have_finite_loss_and_gradients(
 
 
 @pytest.mark.parametrize("ppo", [False, True])
-@pytest.mark.parametrize(
-    "level", ["token", "sequence", "average", "geometric_average"]
-)
+@pytest.mark.parametrize("level", ["token", "sequence", "average", "geometric_average"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_normal_ratios_preserve_loss_and_gradients_exactly(
     ppo: bool, level: ImportanceSamplingLevel, dtype: torch.dtype
@@ -72,7 +68,9 @@ def test_normal_ratios_preserve_loss_and_gradients_exactly(
             ratio * inputs.advantages, ratio.clamp(0.8, 1.2) * inputs.advantages
         ).mean()
     else:
-        expected = -(ratio.detach().clamp(0.0, 5.0) * inputs.advantages * expected_new).mean()
+        expected = -(
+            ratio.detach().clamp(0.0, 5.0) * inputs.advantages * expected_new
+        ).mean()
     actual = loss_fn(
         inputs, new, None, None, {"ppo": ppo, "importance_sampling_level": level}
     )
@@ -82,9 +80,7 @@ def test_normal_ratios_preserve_loss_and_gradients_exactly(
     assert torch.equal(new.grad, expected_new.grad)
 
 
-@pytest.mark.parametrize(
-    "level", ["token", "sequence", "average", "geometric_average"]
-)
+@pytest.mark.parametrize("level", ["token", "sequence", "average", "geometric_average"])
 def test_ignored_extreme_logprobs_do_not_affect_active_tokens(
     level: ImportanceSamplingLevel,
 ) -> None:
@@ -104,18 +100,28 @@ def test_sequence_ratio_aggregates_before_clamping() -> None:
     old = torch.tensor([[-32.0, -1.0]])
     new = torch.tensor([[-2.0, -11.0]], requires_grad=True)
     result = loss_fn(
-        _inputs(old), new, None, None, {"ppo": True, "importance_sampling_level": "sequence"}
+        _inputs(old),
+        new,
+        None,
+        None,
+        {"ppo": True, "importance_sampling_level": "sequence"},
     )
     assert result.policy_loss.item() == torch.exp(torch.tensor(10.0)).item()
     result.policy_loss.backward()
-    torch.testing.assert_close(new.grad, torch.full_like(new, result.policy_loss.item() / 2))
+    torch.testing.assert_close(
+        new.grad, torch.full_like(new, result.policy_loss.item() / 2)
+    )
 
 
 def test_sequence_ratio_handles_both_infinity_signs() -> None:
     old = torch.tensor([[-float("inf"), float("inf")]])
     new = torch.full_like(old, -1.0, requires_grad=True)
     result = loss_fn(
-        _inputs(old), new, None, None, {"ppo": True, "importance_sampling_level": "sequence"}
+        _inputs(old),
+        new,
+        None,
+        None,
+        {"ppo": True, "importance_sampling_level": "sequence"},
     )
     assert result.policy_loss.item() == 1.0
     result.policy_loss.backward()
