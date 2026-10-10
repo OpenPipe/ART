@@ -11,6 +11,8 @@ permissions:
 env:
   CI_BASE_IMAGE: "pytorch/pytorch:2.9.0-cuda12.8-cudnn9-devel"
   CI_PYTHON_MM: "3.12"
+  # uv can change its cache layout between releases; the prebuilt cache must match this version.
+  CI_UV_VERSION: "0.12.24"
   CI_UV_CACHE_RELEASE_TAG: "prek-uv-cache"
   CI_UV_CACHE_ASSET_PREFIX: "prek-uv-cache"
   CI_BUILD_JOBS: "8"
@@ -82,7 +84,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git zstd libibverbs-dev
           rm -rf /var/lib/apt/lists/*
-          curl -LsSf https://astral.sh/uv/install.sh | sh
+          curl -LsSf "https://astral.sh/uv/${CI_UV_VERSION}/install.sh" | sh
           echo "/root/.local/bin" >> "${GITHUB_PATH}"
 
       - name: Install gh CLI
@@ -123,7 +125,7 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates curl git zstd libibverbs-dev
           rm -rf /var/lib/apt/lists/*
-          curl -LsSf https://astral.sh/uv/install.sh | sh
+          curl -LsSf "https://astral.sh/uv/${CI_UV_VERSION}/install.sh" | sh
           echo "/root/.local/bin" >> "${GITHUB_PATH}"
 
       - name: Checkout code
