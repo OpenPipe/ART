@@ -34,12 +34,12 @@ def compute_advantages(
 ) -> list[float]:
     if not rewards:
         return []
+    if all(abs(reward - rewards[0]) <= 1e-12 for reward in rewards[1:]):
+        return [0.0] * len(rewards)
     rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
     centered = rewards_tensor - rewards_tensor.mean()
     if not normalize_advantages:
         return centered.tolist()
-    if all(abs(reward - rewards[0]) <= 1e-12 for reward in rewards[1:]):
-        return [0.0] * len(rewards)
     std_reward = rewards_tensor.std(unbiased=False)
     if std_reward > 1e-8:
         return (centered / std_reward).tolist()

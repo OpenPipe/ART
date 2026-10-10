@@ -34,3 +34,7 @@ def test_advantages_above_std_guard_are_normalized():
 
 def test_advantage_normalization_can_be_disabled():
     assert compute_advantages([0.0, 1.0, 2.0, 3.0], False) == [-1.5, -0.5, 0.5, 1.5]
+
+
+def test_equal_rewards_without_normalization_are_exactly_zero():
+    assert compute_advantages([0.3] * 8, False) == [0.0] * 8
