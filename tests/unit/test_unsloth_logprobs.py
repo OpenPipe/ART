@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -66,3 +68,56 @@ def test_large_finite_logits_have_normalized_logprobs_and_entropy(
     torch.testing.assert_close(
         entropy.double(), -(ref_full.exp() * ref_full).sum(-1), rtol=1e-4, atol=4e-5
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_near_certain_target_keeps_logprob_and_gradient(dtype: torch.dtype) -> None:
+    hidden_states = torch.tensor(
+        [[[35.0, 21.0, 0.0, 0.0]]], dtype=dtype, requires_grad=True
+    )
+    targets = torch.tensor([[0]])
+    logprobs, _ = _calculate_logprobs(torch.eye(4), hidden_states, targets, 1)
+    (-logprobs.sum()).backward()
+
+    ref_hidden = hidden_states.detach().double().requires_grad_()
+    ref_logprobs = torch.log_softmax(ref_hidden, dim=-1)[..., 0]
+    (-ref_logprobs.sum()).backward()
+
+    assert (logprobs < 0).all()
+    assert hidden_states.grad is not None
+    assert ref_hidden.grad is not None
+    assert (hidden_states.grad[..., 0] != 0).all()
+    torch.testing.assert_close(logprobs.double(), ref_logprobs, rtol=1e-2, atol=1e-9)
+    torch.testing.assert_close(
+        hidden_states.grad[..., 0].double(),
+        ref_hidden.grad[..., 0],
+        rtol=1e-2,
+        atol=1e-9,
+    )
+
+
+def test_entropy_does_not_require_grad() -> None:
+    hidden_states = torch.randn(1, 3, 4, requires_grad=True)
+    logprobs, entropy = _calculate_logprobs(
+        torch.eye(4), hidden_states, torch.tensor([[0, 1, 2]]), chunk_size=2
+    )
+    assert logprobs.requires_grad
+    assert not entropy.requires_grad
+    (-logprobs.sum()).backward()
+    assert hidden_states.grad is not None
+    assert torch.isfinite(hidden_states.grad).all()
+
+
+def test_fp16_flat_vocab_has_finite_logprobs_and_entropy() -> None:
+    vocab_size = 151936
+    logprobs, entropy = _calculate_logprobs(
+        torch.ones(1, vocab_size, dtype=torch.float16),
+        torch.zeros(1, 1, 1, dtype=torch.float16),
+        torch.zeros(1, 1, dtype=torch.long),
+        chunk_size=1,
+    )
+    expected_entropy = torch.full((1, 1), math.log(vocab_size))
+    assert torch.isfinite(logprobs).all()
+    assert torch.isfinite(entropy).all()
+    torch.testing.assert_close(logprobs, -expected_entropy, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(entropy, expected_entropy, rtol=1e-6, atol=1e-6)

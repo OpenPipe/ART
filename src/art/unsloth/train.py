@@ -663,27 +663,23 @@ def _calculate_logprobs(
         chunk_hs = hidden_states[:, i : i + chunk_size, :]  # [B, chunk_size, H]
         chunk_input_ids = next_input_ids[:, i : i + chunk_size]  # [B, chunk_size]
         chunk_logits = torch.matmul(chunk_hs, lm_head_t).float()  # [B, chunk_size, V]
-        chunk_selected_logits = torch.gather(
-            chunk_logits, dim=-1, index=chunk_input_ids.unsqueeze(-1)
+        chunk_log_probs = torch.log_softmax(chunk_logits, dim=-1)
+        del chunk_logits
+        log_probs[:, i : i + chunk_size] = torch.gather(
+            chunk_log_probs, dim=-1, index=chunk_input_ids.unsqueeze(-1)
         ).squeeze(-1)  # [B, chunk_size]
-        chunk_logsumexp = torch.logsumexp(chunk_logits, dim=-1)  # [B, chunk_size]
-        log_probs[:, i : i + chunk_size] = chunk_selected_logits - chunk_logsumexp
 
-        # Compute entropy for the chunk
-        log_probs_full = chunk_logits - chunk_logsumexp.unsqueeze(-1)
-        chunk_entropy = (-torch.exp(log_probs_full) * log_probs_full).sum(
-            dim=-1
-        )  # [B, chunk_size]
-        entropy[:, i : i + chunk_size] = chunk_entropy
+        # Entropy is only used as a metric.
+        with torch.no_grad():
+            chunk_probs = torch.exp(chunk_log_probs)
+            chunk_probs.mul_(chunk_log_probs)
+            entropy[:, i : i + chunk_size] = -chunk_probs.sum(dim=-1)
 
         del (
             chunk_hs,
             chunk_input_ids,
-            chunk_logits,
-            chunk_selected_logits,
-            chunk_logsumexp,
-            log_probs_full,
-            chunk_entropy,
+            chunk_log_probs,
+            chunk_probs,
         )
     del hidden_states
     return log_probs, entropy
