@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         _FlatForwardPlan,
         _ForwardGroupPlan,
         _ForwardRefusal,
+        _GroupLayout,
         _LayoutKey,
         _MemoryCheck,
         _MemorySignature,
@@ -436,6 +437,7 @@ def _split_chunk_lower_cost(
     unshared_packed_tokens = 0
     head_workspace_bytes = 0
     group_rows: list[tuple[int, bool]] = []
+    group_physical_rows: list[int] = []
     for (_slot, grad_enabled), group_indices in groups:
         estimated = _impl.estimate_prefix_tree_packed_tokens(
             (rows[index] for index in group_indices),
@@ -443,6 +445,7 @@ def _split_chunk_lower_cost(
         )
         assert estimated is not None  # rows are CPU copies
         physical_rows = self._physical_tokens(estimated)
+        group_physical_rows.append(physical_rows)
         packed_tokens += physical_rows
         # The most loaded CP rank holds at least an even share.
         cp = max(1, self._topology_key()[2])
@@ -474,6 +477,11 @@ def _split_chunk_lower_cost(
         signature=signature,
         logical_tokens=logical_tokens,
         group_rows=tuple(group_rows),
+        # Where exact plans price each rank's layouts, bound them from below
+        # the same way rather than with the busiest-rank widths.
+        group_layouts=self._minimum_layouts(group_physical_rows, signature.topology[2])
+        if self._layout_pricing_supported(signature.topology)
+        else None,
         slot_refs=tuple(ref for (ref, _), _ in groups),
         head_workspace_bytes=head_workspace_bytes,
         # The average CP load is an optimistic bound, not an admission cost.
@@ -539,6 +547,87 @@ def _plan_group_rows(
     )
 
 
+def _plan_group_layouts(
+    self: TrainerRank, plan: _FlatForwardPlan
+) -> tuple[_GroupLayout, ...] | None:
+    """Every rank's CP layouts per group, where layout pricing is modeled.
+
+    Only CP2 at TP1/PP1 for a covered dense model, all groups gradient or
+    all no-grad, ART's CP core attention with no softmax offset, and GDN
+    layers marked with island boundaries (``_layout_pricing_supported``).
+    Elsewhere ``None`` keeps the busiest-rank pricing.
+    """
+    if (
+        not plan.groups
+        or len({group.grad_enabled for group in plan.groups}) != 1
+        or not self._layout_pricing_supported(plan.signature.topology)
+    ):
+        return None
+    started = _impl.time.perf_counter()
+    try:
+        return self._compute_group_layouts(plan)
+    finally:
+        # Planning work: every rank's CP plan, cached by planning key.
+        self._planning_seconds_accum += _impl.time.perf_counter() - started
+
+
+def _compute_group_layouts(
+    self: TrainerRank, plan: _FlatForwardPlan
+) -> tuple[_GroupLayout, ...]:
+    geometry = self._geometry
+    from art.megatron.context_parallel.executor import retained_stage_record_bytes
+    from art.megatron.context_parallel.runtime import context_parallel_rank_layouts
+    from art.megatron.flex_attn.compiled import flash_sparse_block_size_for_head_dim
+    from art.megatron.training.microbatches import (
+        _context_parallel_config_for_provider,
+        _gdn_planner_config_for_provider,
+    )
+
+    topology = self._topology()
+    handler = self.runtime.model_support_handler
+    config = _context_parallel_config_for_provider(
+        self.runtime.provider, self.device, handler
+    )
+    head = int(geometry.kv_channels)
+    block = flash_sparse_block_size_for_head_dim(
+        head_dim=head, head_dim_v=head, device=self.device
+    )
+    layouts = []
+    for group in plan.groups:
+        batch = _impl._pad_packed_batch(group.packed, multiple=int(topology.tp))
+        attention, gdn, states, rank_plans = context_parallel_rank_layouts(
+            group_ids=batch.group_ids,
+            parent_ids=batch.parent_ids,
+            topology=topology,
+            config=config,
+            original_seq_len=int(batch.tokens.shape[1]),
+            build_gdn_execution_spec=handler.build_gdn_execution_spec,
+            gdn_planner_config=_gdn_planner_config_for_provider(
+                self.runtime.provider, handler
+            ),
+        )
+        layouts.append(
+            _impl._GroupLayout(
+                attention_rows=attention,
+                gdn_rows=gdn,
+                attention_retained=tuple(
+                    retained_stage_record_bytes(
+                        rank_plan,
+                        q_heads=int(geometry.num_attention_heads),
+                        kv_heads=int(geometry.num_query_groups),
+                        head_dim=head,
+                        value_head_dim=head,
+                        element_size=self._param_dtype_size,
+                        block_size=block,
+                    )
+                    for rank_plan in rank_plans
+                ),
+                gdn_states=states or (),
+            )
+        )
+    return tuple(layouts)
+
+
 def _plan_cost(self: TrainerRank, plan: _FlatForwardPlan) -> _SubforwardCost:
     return self._subforward_cost(
         packed_tokens=plan.packed_tokens,
@@ -547,6 +636,7 @@ def _plan_cost(self: TrainerRank, plan: _FlatForwardPlan) -> _SubforwardCost:
         logical_tokens=plan.active_logical_tokens,
         gdn_segments=plan.grad_segment_count,
         group_rows=self._plan_group_rows(plan),
+        group_layouts=self._plan_group_layouts(plan),
         slot_refs=tuple(g.slot_ref for g in plan.groups),
         head_workspace_bytes=self._plan_head_workspace_bytes(plan),
         checkpoint_floor=_impl._gdn_memory.plan_floor(self, plan),
