@@ -4,18 +4,21 @@ import asyncio
 from contextlib import asynccontextmanager
 import importlib
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from mcp import StdioServerParameters
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 from openai.types.chat import ChatCompletion
 import pytest
+import weave
 
 sys.path.insert(0, str(Path(__file__).parent))
 transport = importlib.import_module("mcp_rl.transport")
-rollout_module = importlib.import_module("mcp_rl.rollout")
+with patch.object(weave, "init"):
+    rollout_module = importlib.import_module("mcp_rl.rollout")
 
 
 @pytest.mark.asyncio
@@ -199,3 +202,30 @@ async def test_connection_failure_returns_error_trajectory(monkeypatch):
     assert trajectory.metrics["num_turns"] == 0
     assert trajectory.metrics["success"] is False
     assert any("Connection unavailable" in log for log in trajectory.logs)
+
+
+def test_tool_only_imports_and_cached_rollout_exports():
+    proof = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+from unittest.mock import patch
+import mcp_rl.transport
+import mcp_rl.utils
+assert 'mcp_rl.rollout' not in sys.modules
+import weave
+with patch.object(weave, 'init') as initialize:
+    from mcp_rl import McpScenario, rollout
+    from mcp_rl import rollout as again
+    assert callable(rollout) and again is rollout
+    assert McpScenario.__name__ == 'McpScenario'
+    initialize.assert_called_once_with('mcp-agent-training')
+""",
+        ],
+        cwd=Path(__file__).parent,
+        capture_output=True,
+        text=True,
+    )
+    assert proof.returncode == 0, proof.stderr

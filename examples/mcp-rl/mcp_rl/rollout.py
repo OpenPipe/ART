@@ -26,8 +26,7 @@ load_dotenv()
 logging.getLogger("weave.trace.op").setLevel(logging.WARNING)
 
 
-if os.getenv("WANDB_API_KEY"):
-    weave.init("mcp-agent-training")
+weave.init("mcp-agent-training")
 
 
 @dataclass
