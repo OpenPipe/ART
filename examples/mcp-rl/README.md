@@ -27,11 +27,14 @@ from mcp_rl.transport import parallel_search_params
 scenario = McpScenario(
     task_description="Find ART's MCP training documentation and summarize the prerequisites.",
     server_params=parallel_search_params,
+    max_tool_result_chars=40000,
 )
 trajectory = await rollout(model, scenario)
 ```
 
-Use your configured ART model for `model`. The existing rollout uses model
+Use your configured ART model for `model`. The optional response-size limit
+allows room for Parallel's excerpts and JSON formatting; existing scenarios keep
+their 20,000-character default. The existing rollout uses model
 inference credentials and an OpenAI key for its completion judge; these are
 separate from the anonymous MCP connection. This does not change the existing
 stdio scenarios, server choices, or training CLI defaults.

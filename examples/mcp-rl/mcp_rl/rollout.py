@@ -37,6 +37,7 @@ class McpScenario:
     task_description: str
     server_params: StdioServerParameters | StreamableHttpServerParameters
     max_turns: int = 10
+    max_tool_result_chars: int = 20000
 
 
 @weave.op()
@@ -192,7 +193,10 @@ async def rollout(
 
                                         content_text = get_content_text(result)
 
-                                        if len(content_text) > 20000:
+                                        if (
+                                            len(content_text)
+                                            > scenario.max_tool_result_chars
+                                        ):
                                             print(
                                                 f"Tool call result for {tool_call.function.name} is too long: {len(content_text)}"
                                             )

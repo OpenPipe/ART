@@ -73,7 +73,10 @@ async def test_stdio_parameters_preserved(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rollout_discovers_and_dispatches_http_tools(monkeypatch):
+@pytest.mark.parametrize("max_chars, expected_error", [(20000, True), (40000, False)])
+async def test_rollout_discovers_and_dispatches_http_tools(
+    monkeypatch, max_chars, expected_error
+):
     session = SimpleNamespace(
         initialize=AsyncMock(),
         list_tools=AsyncMock(
@@ -89,7 +92,11 @@ async def test_rollout_discovers_and_dispatches_http_tools(monkeypatch):
         ),
         call_tool=AsyncMock(
             return_value=CallToolResult(
-                content=[TextContent(type="text", text="ART trains agents with GRPO")]
+                content=[
+                    TextContent(
+                        type="text", text="ART trains agents with GRPO" + "x" * 20000
+                    )
+                ]
             )
         ),
     )
@@ -164,15 +171,17 @@ async def test_rollout_discovers_and_dispatches_http_tools(monkeypatch):
         inference_base_url="http://fixture",
         get_inference_name=lambda: "fixture",
     )
-    scenario = rollout_module.McpScenario("Find ART", transport.parallel_search_params)
+    scenario = rollout_module.McpScenario(
+        "Find ART", transport.parallel_search_params, max_tool_result_chars=max_chars
+    )
     trajectory = await rollout_module.rollout(model, scenario)
     session.initialize.assert_awaited_once()
     session.call_tool.assert_awaited_once_with("web_search", {"objective": "ART"})
     assert trajectory.tools[0]["function"]["name"] == "web_search"
-    assert any(
-        m.get("role") == "tool" and "GRPO" in m["content"]
-        for m in trajectory.messages()
-    )
+    message = next(m for m in trajectory.messages() if m.get("role") == "tool")
+    assert message["content"].startswith("Error:") is expected_error
+    if not expected_error:
+        assert "GRPO" in message["content"]
     assert trajectory.metrics["success"] is True
     assert closed == ["session", "transport"]
 
