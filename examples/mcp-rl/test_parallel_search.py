@@ -10,13 +10,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from mcp import StdioServerParameters
+from mcp.client import streamable_http
 from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 from openai.types.chat import ChatCompletion
 import pytest
 import weave
 
 sys.path.insert(0, str(Path(__file__).parent))
-transport = importlib.import_module("mcp_rl.transport")
+transport = importlib.import_module("mcp_transport")
 with patch.object(weave, "init"):
     rollout_module = importlib.import_module("mcp_rl.rollout")
 
@@ -33,7 +34,7 @@ async def test_http_selection_and_cancellation_cleanup(monkeypatch):
         finally:
             events.append("closed")
 
-    monkeypatch.setattr(transport, "streamablehttp_client", http)
+    monkeypatch.setattr(streamable_http, "streamablehttp_client", http)
     with pytest.raises(asyncio.CancelledError):
         async with transport.connect_mcp_transport(
             transport.parallel_search_params
@@ -204,7 +205,7 @@ async def test_connection_failure_returns_error_trajectory(monkeypatch):
     assert any("Connection unavailable" in log for log in trajectory.logs)
 
 
-def test_tool_only_imports_and_cached_rollout_exports():
+def test_tool_only_imports_and_existing_package_exports():
     proof = subprocess.run(
         [
             sys.executable,
@@ -212,11 +213,12 @@ def test_tool_only_imports_and_cached_rollout_exports():
             """
 import sys
 from unittest.mock import patch
-import mcp_rl.transport
-import mcp_rl.utils
+import mcp_transport
 assert 'mcp_rl.rollout' not in sys.modules
 import weave
 with patch.object(weave, 'init') as initialize:
+    import importlib
+    importlib.import_module('mcp_rl.rollout')
     from mcp_rl import McpScenario, rollout
     from mcp_rl import rollout as again
     assert callable(rollout) and again is rollout

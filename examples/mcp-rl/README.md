@@ -17,12 +17,15 @@ The script installs its declared client dependencies, discovers the server's
 schemas as ART `MCPTool` objects, and prints real search and fetch results. It does
 not run model inference or training.
 
+The HTTP connection uses the MCP 1.x SDK (`mcp>=1.11,<2`), declared in the script.
+Use that SDK version in your rollout environment too.
+
 To use the same connection in the existing agent rollout, supply the opt-in
 parameters instead of `StdioServerParameters`:
 
 ```python
 from mcp_rl.rollout import McpScenario, rollout
-from mcp_rl.transport import parallel_search_params
+from mcp_transport import parallel_search_params
 
 scenario = McpScenario(
     task_description="Find ART's MCP training documentation and summarize the prerequisites.",

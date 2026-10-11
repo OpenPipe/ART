@@ -12,13 +12,13 @@ import os
 
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
+from mcp_transport import StreamableHttpServerParameters, connect_mcp_transport
 from openai import AsyncOpenAI
 import weave
 
 import art
 
 from .checks import check_successful
-from .transport import StreamableHttpServerParameters, connect_mcp_transport
 from .utils import get_content_text
 
 load_dotenv()

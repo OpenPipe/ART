@@ -10,11 +10,16 @@ import argparse
 import asyncio
 import uuid
 
-from mcp import ClientSession
-from mcp_rl.transport import connect_mcp_transport, parallel_search_params
-from mcp_rl.utils import get_content_text
+from mcp import ClientSession, types
+from mcp_transport import connect_mcp_transport, parallel_search_params
 
 from art.mcp import MCPTool
+
+
+def get_content_text(result: types.CallToolResult) -> str:
+    return "\n".join(
+        block.text for block in result.content if isinstance(block, types.TextContent)
+    )
 
 
 async def main(query: str, url: str):

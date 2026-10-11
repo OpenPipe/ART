@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 
 from mcp import StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.client.streamable_http import streamablehttp_client
 
 
 @dataclass
@@ -31,6 +30,9 @@ async def connect_mcp_transport(
 ):
     """Open streams for either the existing stdio path or Streamable HTTP."""
     if isinstance(params, StreamableHttpServerParameters):
+        # The runnable example declares MCP 1.x; stdio does not need this import.
+        from mcp.client.streamable_http import streamablehttp_client
+
         async with streamablehttp_client(
             params.url,
             headers=params.headers,
