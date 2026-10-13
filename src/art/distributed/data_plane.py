@@ -555,6 +555,7 @@ class _AuthenticatedStreamPublisher:
         self._token = secrets.token_bytes(32)
         self._server: Any = None
         self._handlers: set[asyncio.Task[None]] = set()
+        self._closing = False
 
     async def start(self) -> None:
         if self._server_loop is not None:
@@ -562,6 +563,7 @@ class _AuthenticatedStreamPublisher:
         await self._start()
 
     async def _start(self) -> None:
+        self._closing = False
         family = socket.getaddrinfo(self.advertise_host, 0, type=socket.SOCK_STREAM)[0][
             0
         ]
@@ -576,18 +578,27 @@ class _AuthenticatedStreamPublisher:
         return int(self._server.sockets[0].getsockname()[1])
 
     async def close(self) -> None:
+        from art.utils.lifecycle import complete_task
+
         if self._server_loop is not None:
-            return await self._server_loop.submit(self._close())
-        await self._close()
+            cleanup = self._server_loop.submit(self._close())
+        else:
+            cleanup = self._close()
+        _, cancelled = await complete_task(asyncio.create_task(cleanup))
+        if cancelled is not None:
+            raise cancelled
 
     async def _close(self) -> None:
         if self._server is None:
             return
-        self._server.close()
-        await self._server.wait_closed()
-        for task in self._handlers:
+        self._closing = True
+        server = self._server
+        server.close()
+        handlers = tuple(self._handlers)
+        for task in handlers:
             task.cancel()
-        await asyncio.gather(*self._handlers, return_exceptions=True)
+        await asyncio.gather(*handlers, return_exceptions=True)
+        await server.wait_closed()
         self._handlers.clear()
         self._server = None
 
@@ -598,6 +609,8 @@ class _AuthenticatedStreamPublisher:
         self._handlers.add(task)
         sent = False
         try:
+            if self._closing:
+                return
             token = await reader.readexactly(len(self._token))
             if not secrets.compare_digest(token, self._token):
                 return
@@ -608,7 +621,7 @@ class _AuthenticatedStreamPublisher:
         finally:
             try:
                 writer.close()
-                if task.cancelling():
+                if task.cancelling() or self._closing:
                     writer.transport.abort()
                 else:
                     try:
