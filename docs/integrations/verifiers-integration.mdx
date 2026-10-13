@@ -1,0 +1,111 @@
+---
+title: "Verifiers"
+description: "Run Prime Intellect verifiers environments from ART training loops"
+---
+
+# Verifiers Integration
+
+[verifiers](https://github.com/PrimeIntellect-ai/verifiers) provides reusable RL
+environments for model evaluation and training. ART can consume those rollouts
+through `art.verifiers`, which keeps verifiers as an optional dependency and
+converts rollout outputs into ART trajectories.
+
+## Install
+
+```bash
+uv pip install -U openpipe-art verifiers
+```
+
+## Run a verifiers environment in ART
+
+Use `rollout_with_verifiers_environment` inside your ART rollout function. It
+passes ART's managed OpenAI-compatible client to the verifiers environment and
+returns an `art.Trajectory`.
+
+```python
+import art
+from art.verifiers import rollout_with_verifiers_environment
+import verifiers as vf
+
+
+async def rollout(
+    model: art.TrainableModel,
+    env: vf.Environment,
+    input: vf.RolloutInput,
+) -> art.Trajectory:
+    return await rollout_with_verifiers_environment(
+        env,
+        model,
+        input,
+        sampling_args={"n": 1, "temperature": 1.0},
+    )
+```
+
+For grouped rollouts, use `trajectory_group_with_verifiers_environment`:
+
+```python
+from art.verifiers import trajectory_group_with_verifiers_environment
+
+group = await trajectory_group_with_verifiers_environment(
+    env,
+    model,
+    group_inputs,
+    sampling_args={"n": 1, "temperature": 1.0},
+)
+```
+
+## Convert saved rollouts
+
+If you already have verifiers outputs, convert them without rerunning the
+environment:
+
+```python
+from art.verifiers import trajectory_from_verifiers_rollout
+
+trajectory = trajectory_from_verifiers_rollout(output)
+```
+
+For the richest transcript, include the verifiers trajectory column when
+generating outputs:
+
+```python
+output = await env.run_rollout(
+    input=input,
+    client=client,
+    model=model_name,
+    sampling_args={"n": 1},
+    state_columns=["trajectory"],
+)
+```
+
+The reverse conversion is also available for tooling that expects a
+verifiers-compatible output shape:
+
+```python
+from art.verifiers import rollout_output_from_trajectory
+
+output = rollout_output_from_trajectory(trajectory)
+```
+
+To validate 2-way portability for saved verifiers outputs, round-trip through
+ART and back to normalized verifiers-compatible output:
+
+```python
+from art.verifiers import normalize_verifiers_rollout_output
+
+normalized = normalize_verifiers_rollout_output(output)
+```
+
+The normalizer preserves reward, numeric metrics, tool definitions, logs,
+completion state, answer/stop metadata, and prompt/completion message shape
+while adding ART metadata to the optional trajectory column.
+
+## Notes
+
+- `art.verifiers` does not import verifiers until you call a function that
+  runs an environment.
+- Multi-turn verifiers trajectories are reconstructed by appending only the
+  new prompt suffix for each step, then that step's completion.
+- ART trajectories created from serialized verifiers outputs can train with
+  `allow_training_without_logprobs=True` because serialized assistant messages
+  do not carry OpenAI logprobs.
