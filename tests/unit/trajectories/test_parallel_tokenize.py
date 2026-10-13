@@ -856,3 +856,21 @@ if TYPE_CHECKING:
             tensorized_multi_groups,
             with_transformers_tokenizer,
         )
+
+
+def test_process_max_workers_dynamic_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ART_TOKENIZE_PROCESSES", raising=False)
+    assert _parallel._process_max_workers(2) == 2
+    assert _parallel._process_max_workers(8) == 8
+    assert _parallel._process_max_workers(32) == 16
+    assert _parallel._process_max_workers(64) == 16
+
+    monkeypatch.setenv("ART_TOKENIZE_PROCESSES", "32")
+    assert _parallel._process_max_workers(64) == 32
+    assert _parallel._process_max_workers(4) == 32
+
+    monkeypatch.setenv("ART_TOKENIZE_PROCESSES", "invalid")
+    assert _parallel._process_max_workers(8) == 8
+    monkeypatch.setenv("ART_TOKENIZE_PROCESSES", "-5")
+    assert _parallel._process_max_workers(8) == 8
+
