@@ -378,3 +378,157 @@ async def test_ruler_orders_scores_by_trajectory_id(monkeypatch):
 
     assert [score.trajectory_id for score in scores] == ["1", "2"]
     assert [score.score for score in scores] == pytest.approx([0.1, 0.2])
+
+
+@pytest.mark.asyncio
+async def test_ruler_handles_markdown_code_fences(monkeypatch):
+    async def _fake_acompletion(**_kwargs):
+        content = f"```json\n{_score_content(2)}\n```"
+        return _FakeResponse(content=content, prompt_tokens=100, completion_tokens=50)
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
+    assert len(scores) == 2
+    assert [score.trajectory_id for score in scores] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_ruler_handles_surrounding_commentary(monkeypatch):
+    async def _fake_acompletion(**_kwargs):
+        content = f"Here is my evaluation:\n{_score_content(2)}\nHope this was helpful!"
+        return _FakeResponse(content=content, prompt_tokens=100, completion_tokens=50)
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
+    assert len(scores) == 2
+    assert [score.trajectory_id for score in scores] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_ruler_normalizes_zero_to_ten_scale_scores(monkeypatch):
+    async def _fake_acompletion(**_kwargs):
+        content = json.dumps(
+            {
+                "scores": [
+                    {"trajectory_id": "1", "explanation": "Good", "score": 8.0},
+                    {"trajectory_id": "2", "explanation": "Average", "score": 4.0},
+                ]
+            }
+        )
+        return _FakeResponse(content=content, prompt_tokens=100, completion_tokens=50)
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
+    assert [score.score for score in scores] == pytest.approx([0.8, 0.4])
+
+
+@pytest.mark.asyncio
+async def test_ruler_normalizes_zero_to_hundred_scale_scores(monkeypatch):
+    async def _fake_acompletion(**_kwargs):
+        content = json.dumps(
+            {
+                "scores": [
+                    {"trajectory_id": "1", "explanation": "Great", "score": 90.0},
+                    {"trajectory_id": "2", "explanation": "Poor", "score": 30.0},
+                ]
+            }
+        )
+        return _FakeResponse(content=content, prompt_tokens=100, completion_tokens=50)
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
+    assert [score.score for score in scores] == pytest.approx([0.9, 0.3])
+
+
+@pytest.mark.asyncio
+async def test_ruler_clamps_out_of_bounds_scores(monkeypatch):
+    async def _fake_acompletion(**_kwargs):
+        content = json.dumps(
+            {
+                "scores": [
+                    {"trajectory_id": "1", "explanation": "Too high", "score": 1.05},
+                    {"trajectory_id": "2", "explanation": "Too low", "score": -0.2},
+                ]
+            }
+        )
+        return _FakeResponse(content=content, prompt_tokens=100, completion_tokens=50)
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
+    assert [score.score for score in scores] == pytest.approx([1.0, 0.0])
+
+
+@pytest.mark.asyncio
+async def test_ruler_parses_string_scores(monkeypatch):
+    async def _fake_acompletion(**_kwargs):
+        content = json.dumps(
+            {
+                "scores": [
+                    {"trajectory_id": "1", "explanation": "Fraction", "score": "8/10"},
+                    {"trajectory_id": "2", "explanation": "Percent", "score": "40%"},
+                ]
+            }
+        )
+        return _FakeResponse(content=content, prompt_tokens=100, completion_tokens=50)
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
+    assert [score.score for score in scores] == pytest.approx([0.8, 0.4])
+
+
+@pytest.mark.asyncio
+async def test_ruler_retries_malformed_json_and_succeeds(monkeypatch):
+    responses = iter(
+        [
+            _FakeResponse(
+                content="Not valid JSON at all!",
+                prompt_tokens=100,
+                completion_tokens=50,
+            ),
+            _response(2),
+        ]
+    )
+    calls = []
+
+    async def _fake_acompletion(**kwargs):
+        calls.append(kwargs)
+        return next(responses)
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    scores = await ruler_module.ruler(_TWO_TRAJECTORIES)
+    assert len(calls) == 2
+    assert len(scores) == 2
+    correction = calls[1]["messages"][3]["content"]
+    assert "could not be parsed as valid JSON" in correction
+
+
+@pytest.mark.asyncio
+async def test_ruler_raises_when_malformed_json_retries_exhausted(monkeypatch):
+    async def _fake_acompletion(**_kwargs):
+        return _FakeResponse(
+            content="Persistent malformed output",
+            prompt_tokens=100,
+            completion_tokens=50,
+        )
+
+    monkeypatch.setattr(ruler_module, "acompletion", _fake_acompletion)
+    monkeypatch.setattr(ruler_module, "ModelResponse", _FakeResponse)
+
+    with pytest.raises(
+        ValueError, match="Failed to parse RULER judge response as JSON"
+    ):
+        await ruler_module.ruler(_TWO_TRAJECTORIES)
