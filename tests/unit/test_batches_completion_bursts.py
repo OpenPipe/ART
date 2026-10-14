@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Coroutine, Sequence
 from typing import Any
 
@@ -91,3 +92,65 @@ async def test_completion_burst_propagates_exception_over_budget() -> None:
 
     with pytest.raises(RuntimeError, match="rollout failed"):
         await collect_batches(groups)
+
+
+async def test_buffered_batch_checks_completed_pending_failure() -> None:
+    release_failure = asyncio.Event()
+    failure_finished = asyncio.Event()
+
+    async def delayed_failure() -> art.TrajectoryGroup:
+        await release_failure.wait()
+        failure_finished.set()
+        raise RuntimeError("pending rollout failed")
+
+    groups = [completed_group(identity) for identity in range(4)]
+    groups.append(delayed_failure())
+    batches = art.trajectory_group_batches(groups, batch_size=2, pbar_desc=None)
+    try:
+        assert len(await anext(batches)) == 2
+        release_failure.set()
+        await asyncio.wait_for(failure_finished.wait(), timeout=5)
+        with pytest.raises(RuntimeError, match="pending rollout failed"):
+            await anext(batches)
+    finally:
+        release_failure.set()
+        try:
+            async for _ in batches:
+                pass
+        except RuntimeError:
+            pass
+        for group in groups:
+            group.close()
+
+
+async def test_buffered_batch_refills_rollout_slots() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def next_group(identity: int) -> art.TrajectoryGroup:
+        started.set()
+        await release.wait()
+        return await completed_group(identity)
+
+    groups = [completed_group(identity) for identity in range(8)]
+    groups.extend(next_group(identity) for identity in range(8, 10))
+    batches = art.trajectory_group_batches(groups, batch_size=2, pbar_desc=None)
+    observed = []
+    second = None
+    try:
+        observed.append(await anext(batches))
+        second = asyncio.ensure_future(anext(batches))
+        # A barrier checks scheduling while the consumer handles a buffered batch.
+        await asyncio.wait_for(started.wait(), timeout=5)
+        release.set()
+        observed.append(await second)
+        observed.extend([batch async for batch in batches])
+        assert identities(observed) == list(range(10))
+    finally:
+        release.set()
+        if second is not None:
+            await second
+        async for _ in batches:
+            pass
+        for group in groups:
+            group.close()

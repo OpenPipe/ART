@@ -29,17 +29,20 @@ async def trajectory_group_batches(
         increment_pbar=False,
     )
     with set_gather_context(context):
-        while unstarted or pending:
+        while unstarted or pending or len(batch) >= batch_size:
             if context.pbar is None:
                 context.pbar = tqdm.tqdm(desc=pbar_desc, total=batch_size)
             while len(pending) < batch_size * max_concurrent_batches and unstarted:
                 pending.add(asyncio.create_task(wrap_group_awaitable(unstarted.pop(0))))
-            done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
-            )
-            context.pbar.update(len(done))
-            batch.extend(g for task in done if (g := task.result()) is not None)
-            while len(batch) >= batch_size:
+            if pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=0 if len(batch) >= batch_size else None,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                context.pbar.update(len(done))
+                batch.extend(g for task in done if (g := task.result()) is not None)
+            if len(batch) >= batch_size:
                 if context.pbar is not None:
                     context.pbar.close()
                     context.reset()
