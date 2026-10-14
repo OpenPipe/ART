@@ -39,7 +39,7 @@ async def trajectory_group_batches(
             )
             context.pbar.update(len(done))
             batch.extend(g for task in done if (g := task.result()) is not None)
-            if len(batch) >= batch_size:
+            while len(batch) >= batch_size:
                 if context.pbar is not None:
                     context.pbar.close()
                     context.reset()
