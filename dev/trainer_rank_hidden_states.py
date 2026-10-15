@@ -105,7 +105,7 @@ def main():
                 "repeat": args.repeat,
             }
         )
-        packing_by_tokens = {}
+        packing_by_workload = {}
         for count in args.tokens:
             generator = torch.Generator().manual_seed(531)
             tokens = torch.randint(10, 32000, (count,), generator=generator)
@@ -178,7 +178,10 @@ def main():
                         plan = rank.last_forward_telemetry()
                         assert batches == 1 and plan["subforward_count"] == 1
                         packing = plan["packing_plan_sha256"]
-                        assert packing_by_tokens.setdefault(count, packing) == packing
+                        assert (
+                            packing_by_workload.setdefault((count, backward), packing)
+                            == packing
+                        )
                         emit(
                             {
                                 "kind": "timing",
