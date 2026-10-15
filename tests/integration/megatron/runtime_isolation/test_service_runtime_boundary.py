@@ -13,6 +13,23 @@ import httpx
 import pytest
 
 
+def test_trainer_only_service_does_not_require_inference_topology(
+    tmp_path: Path,
+) -> None:
+    from art.megatron.distributed_service import DistributedMegatronService
+
+    runtime = SimpleNamespace(topology=SimpleNamespace(model_services=()))
+    service = DistributedMegatronService(
+        model_name="trainer-only",
+        base_model="base",
+        config={},
+        output_dir=str(tmp_path),
+        runtime=cast(Any, runtime),
+        enable_expert_replay=False,
+    )
+    assert service._temporal_gpu_sharing is False
+
+
 def _process_is_running(pid: int) -> bool:
     try:
         state = Path(f"/proc/{pid}/stat").read_text().split()[2]
