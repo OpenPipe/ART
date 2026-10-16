@@ -55,7 +55,8 @@ def _distributed_group_mean(
     group: Any,
 ) -> torch.Tensor:
     flat_values = values.reshape(-1)
-    flat_by = by.reshape(-1).to(dtype=torch.float32)
+    flat_by = by.reshape(-1)
+    by_dtype = flat_by.dtype
     unique_local = torch.unique(flat_by, sorted=True)
     world_size = torch.distributed.get_world_size(group)  # ty: ignore[possibly-missing-attribute]
     local_count = torch.tensor(
@@ -70,7 +71,7 @@ def _distributed_group_mean(
         group=group,
     )
     max_count = int(torch.stack(gathered_counts).max().item())
-    padded_ids = torch.zeros(max_count, device=values.device, dtype=torch.float32)
+    padded_ids = torch.zeros(max_count, device=values.device, dtype=by_dtype)
     padded_ids[: unique_local.numel()] = unique_local
     gathered_ids = [torch.empty_like(padded_ids) for _ in range(world_size)]
     torch.distributed.all_gather(  # ty: ignore[possibly-missing-attribute]
