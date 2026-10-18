@@ -104,6 +104,7 @@ class AdamParams:
     learning_rate: float
     beta1: float = 0.9
     beta2: float = 0.99
+    eps: float = 1e-8
     weight_decay: float = 0.1
     grad_clip_norm: float = 0.1
 
