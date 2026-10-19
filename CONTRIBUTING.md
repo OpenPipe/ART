@@ -185,14 +185,16 @@ uv run sky down art
 
 ### Adding Docs
 
-We use Mintlify to serve our docs. Here are the steps for adding a new page:
-1. Clone the ART repo
-2. Open the /docs directory in your CLI and IDE
-3. Run npx mintlify dev to start serving a local version of the docs in your browser
-4. Create a new .mdx file in the relevant directory
-5. Add a title and sidebar title (see other pages for examples)
-6. In docs.json, add a link to the new page within one of the `navigation`.`groups`
-7. Ensure everything works by navigating to and viewing the page in your browser
-8. Submit a PR
+We use Astro to build our public docs from this repository.
+
+1. Open `docs/` and run `pnpm install --frozen-lockfile` with Node.js 22.12+.
+2. Run `pnpm dev` to preview the docs locally.
+3. Add a `.mdx` page under `docs/src/content/docs` with a title and description.
+4. Add the page to `docs/src/navigation.ts` and put images in `docs/public/images`.
+5. Run `pnpm build` to check the site and generate its Pagefind search index.
+6. Verify the page in your browser and submit a PR.
+
+The Docs workflow validates changes on PRs and deploys merges to `main` to the
+CoreWeave Cloudflare Worker. See `docs/README.md` for deployment configuration.
 
 When you're done, shut down your GPU instance (if using a cloud VM) or stop the local training process.

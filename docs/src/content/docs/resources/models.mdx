@@ -1,0 +1,53 @@
+---
+title: "Supported Models"
+description: "Train open source models on ART."
+---
+
+import { Accordion, Card, Frame, Note, Info, Warning, Callout } from "../../../components/mdx-components";
+
+## Serverless Models
+
+The serverless examples use **Qwen 3.8 27B** (`Qwen/Qwen3.8-27B`) with
+ART main (pinned to `88d3df2`). Install the pinned main revision and use `ServerlessBackend`
+with your `WANDB_API_KEY`; no local GPU is required.
+
+<Note>
+  ART 0.5.20 from PyPI does not yet read W&B Inference's exact Dynamo token
+  metadata. Use the pinned main revision below for these serverless examples.
+</Note>
+
+```bash
+pip install "openpipe-art @ git+https://github.com/OpenPipe/ART.git@88d3df23285f56fbcbb4629768ba0fc17ebe2d27"
+```
+
+Use `model.openai_client()` for training rollouts so ART captures the token IDs
+and log probabilities returned by inference. Select a completed checkpoint explicitly
+with `model.get_inference_name(await model.get_step())`.
+
+For other available models, check the W&B Training model catalog or contact
+support@wandb.com.
+
+
+## Recommended Local Models
+
+If you're developing locally or in your own hardware, here are a couple other models you could try in addition to the recommended serverless list.
+
+- [Qwen2.5 7B Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
+  - Less capable than 14B, but smaller and faster
+- [Qwen2.5 32B Instruct](https://huggingface.co/Qwen/Qwen2.5-32B-Instruct)
+  - More capable than 14B, but larger and slower
+
+## More Models
+
+ART has wide support for models supported by [vLLM](https://docs.vllm.ai/en/latest/models/supported_models.html). However, not all models support all features. For instance, if a model's chat template does not include tool call support, you won't be able to use tools with it natively. And if a model's architecture doesn't have support for LoRA layers, it won't be compatible with our LoRA-based backend, but still may work with our full-fine-tuning backend.
+
+Here are additional models that we've tested and found to work well with ART:
+
+- [Llama 3.1 8B Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
+- [Llama 3.2 1B Instruct](https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct)
+- [Llama 3.2 3B Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)
+- [Llama 3.3 70B Instruct](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct)
+- [Qwen2.5 72B Instruct](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct)
+- Additionally, the [Qwen 3](https://huggingface.co/collections/Qwen/qwen3-67dd247413f0e2e4f653967f) family of models is well supported for single-turn workflows. For multi-turn workflows the Qwen 3 chat template removes the `<think>` tokens from previous turns, which makes training more complicated. It is still possible to use for multi-turn workflows by splitting each turn into a separate message history with our `additional_histories` trajectory parameter (see [Additional Histories](/features/additional-histories)).
+
+If you're curious about a model that is not listed above, ask in the Discord [#support](https://discord.com/channels/1359674493949448375/1359674622965973185) channel.

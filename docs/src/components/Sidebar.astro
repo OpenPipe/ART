@@ -1,0 +1,34 @@
+---
+import { hrefFor, navigation } from "../navigation";
+
+interface Props { currentSlug: string }
+const { currentSlug } = Astro.props;
+
+const iconUrl = (name: string) => `url("https://d3gk2c5xim1je2.cloudfront.net/fontawesome/v7.2.0/regular/${name}.svg")`;
+---
+
+<ul class="art-sidebar-list">
+  {navigation.map((group) => (
+      <li class="art-sidebar-section">
+        <div class="art-sidebar-heading">{group.label}</div>
+        <ul>
+          {group.items.map((item) => (
+            <li>
+              <a href={hrefFor(item.slug)} aria-current={item.slug === currentSlug ? "page" : undefined}>
+                {item.icon && <span
+                  class="art-icon art-sidebar-icon"
+                  style={`--art-icon: ${iconUrl(item.icon)}`}
+                ></span>}
+                <span>{item.label}</span>
+              </a>
+            </li>
+          ))}
+        </ul>
+      </li>
+  ))}
+</ul>
+
+<div class="art-mobile-menu-footer">
+  <a href="https://discord.gg/zbBHRUpwf4">Discord</a>
+  <a href="https://github.com/openpipe/ART">GitHub</a>
+</div>

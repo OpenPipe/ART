@@ -1,0 +1,46 @@
+---
+import type { MarkdownHeading } from "astro";
+
+interface Props { headings: MarkdownHeading[] }
+const { headings } = Astro.props;
+const items = headings.filter(({ depth }) => depth === 2 || depth === 3);
+---
+
+{items.length > 0 && (
+  <>
+    <details class="mobile-toc">
+      <summary>On this page</summary>
+      <nav aria-label="On this page">
+        {items.map((heading) => (
+          <a class:list={{ nested: heading.depth === 3 }} href={`#${heading.slug}`}>{heading.text}</a>
+        ))}
+      </nav>
+    </details>
+    <aside class="page-toc print-hidden">
+      <nav aria-label="On this page">
+        <h2>On this page</h2>
+        {items.map((heading) => (
+          <a class:list={{ nested: heading.depth === 3 }} href={`#${heading.slug}`}>{heading.text}</a>
+        ))}
+      </nav>
+    </aside>
+  </>
+)}
+
+<script>
+  const links = [...document.querySelectorAll<HTMLAnchorElement>(".page-toc a")];
+  const targets = links
+    .map((link) => document.getElementById(decodeURIComponent(link.hash.slice(1))))
+    .filter((target): target is HTMLElement => Boolean(target));
+
+  if (targets.length) {
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        links.forEach((link) => link.removeAttribute("aria-current"));
+        document.querySelector<HTMLAnchorElement>(`.page-toc a[href="#${CSS.escape(entry.target.id)}"]`)?.setAttribute("aria-current", "location");
+      }
+    }, { rootMargin: "-20% 0px -70%", threshold: 0 });
+    targets.forEach((target) => observer.observe(target));
+  }
+</script>

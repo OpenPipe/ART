@@ -17,13 +17,14 @@ This project uses the `uv` package manager.
 
 ## Documentation
 
-- All documentation is in the `docs` directory.
-- If you add a new page, be sure to add it to the sidebar in `docs/docs.json`.
-- If you move a page, be sure to update the sidebar in `docs/docs.json` and check for any broken links.
+- All documentation is in the `docs` directory. Pages are in `docs/src/content/docs`.
+- Use Node.js 22.12+ and pnpm. Run `pnpm install --frozen-lockfile` and `pnpm build` from `docs/` to validate changes.
+- If you add a new page, be sure to add it to the sidebar in `docs/src/navigation.ts`.
+- If you move a page, be sure to update the sidebar in `docs/src/navigation.ts` and check for any broken links.
 
 ### Adding images
 
-- Add images to the `docs/images` directory
+- Add images to the `docs/public/images` directory
 - If the image is a png, first convert it to webp using `magick <input.png> <output.webp>`. Do not include the original png in the repo.
 - Use the `<Frame>` tag to add images with captions as seen in the page `checkpoint-forking.mdx`.
 

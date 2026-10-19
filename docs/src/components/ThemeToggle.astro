@@ -1,0 +1,18 @@
+<button class="art-theme print-hidden" type="button" aria-label="Switch to dark theme" title="Switch theme">
+  <svg class="theme-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" /></svg>
+  <svg class="theme-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" /></svg>
+</button>
+
+<script>
+  const toggle = document.querySelector<HTMLButtonElement>(".art-theme");
+
+  function setTheme(theme: "light" | "dark") {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("art-theme", theme);
+    toggle?.setAttribute("aria-label", `Switch to ${theme === "light" ? "dark" : "light"} theme`);
+  }
+
+  toggle?.addEventListener("click", () => {
+    setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+  });
+</script>
