@@ -1,17 +1,32 @@
 {
-  "name": "docs",
+  "name": "art-docs",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "private": true,
+  "type": "module",
   "scripts": {
-    "dev": "mintlify dev --port 3001",
-    "build": "mintlify build",
-    "generate:routes": "npx @mintlify/scraping@latest openapi-file ./openapi.json --outDir ./api-reference"
+    "dev": "astro dev --port 3001",
+    "build": "astro check && astro build && pagefind --site dist",
+    "preview": "astro preview --port 3001",
+    "preview:cloudflare": "pnpm build && wrangler dev --config wrangler.coreweave.jsonc",
+    "check": "astro check",
+    "deploy:coreweave": "wrangler deploy --config wrangler.coreweave.jsonc"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
-    "mintlify": "^4.0.433"
+    "@astrojs/check": "^0.9.6",
+    "@astrojs/mdx": "^7.0.8",
+    "@astrojs/sitemap": "^3.7.3",
+    "@fontsource-variable/inter": "^5.3.0",
+    "astro": "^7.2.7",
+    "astro-expressive-code": "^0.44.1",
+    "pagefind": "^1.5.2",
+    "sharp": "^0.34.4",
+    "typescript": "^5.9.3"
+  },
+  "devDependencies": {
+    "wrangler": "^4.126.0"
+  },
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

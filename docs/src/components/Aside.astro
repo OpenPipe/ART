@@ -1,0 +1,24 @@
+---
+interface Props {
+  type?: "note" | "info" | "tip" | "caution" | "danger" | "warning";
+  title?: string;
+}
+
+const { type = "info", title } = Astro.props;
+const normalizedType = type === "warning" ? "caution" : type;
+const label = title ?? (normalizedType === "caution" ? "Warning" : "Info");
+---
+
+<aside class={`art-aside art-aside-${normalizedType}`} role="note" aria-label={label}>
+  <span class="art-aside-icon" aria-hidden="true">
+    {normalizedType === "caution" || normalizedType === "danger" ? (
+      <svg viewBox="0 0 20 20"><path d="M8.58 2.9a1.64 1.64 0 0 1 2.84 0l7.15 12.4a1.64 1.64 0 0 1-1.42 2.46H2.85a1.64 1.64 0 0 1-1.42-2.46L8.58 2.9Zm1.42 3a.75.75 0 0 0-.75.75v5.1a.75.75 0 0 0 1.5 0v-5.1A.75.75 0 0 0 10 5.9Zm0 9.35a.95.95 0 1 0 0-1.9.95.95 0 0 0 0 1.9Z" fill="currentColor" /></svg>
+    ) : (
+      <svg viewBox="0 0 20 20"><path d="M10 1.75a8.25 8.25 0 1 0 0 16.5 8.25 8.25 0 0 0 0-16.5Zm0 3.5a1 1 0 1 1 0 2 1 1 0 0 1 0-2Zm1.15 9.5h-2.3a.75.75 0 0 1 0-1.5h.4V9.9h-.4a.75.75 0 0 1 0-1.5H10a.75.75 0 0 1 .75.75v4.1h.4a.75.75 0 0 1 0 1.5Z" fill="currentColor" /></svg>
+    )}
+  </span>
+  <div class="art-aside-content">
+    {title && <strong class="art-aside-title">{title}</strong>}
+    <slot />
+  </div>
+</aside>

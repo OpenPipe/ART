@@ -1,0 +1,74 @@
+<button class="search-button" type="button" aria-haspopup="dialog" aria-controls="search-dialog">
+  <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></svg>
+  <span>Search...</span>
+  <kbd>⌘K</kbd>
+</button>
+
+<dialog id="search-dialog" class="search-dialog">
+  <form method="dialog" class="search-panel">
+    <div class="search-input-row">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></svg>
+      <input type="search" aria-label="Search documentation" placeholder="Search documentation..." autocomplete="off" />
+      <button value="cancel" aria-label="Close search">Esc</button>
+    </div>
+    <div class="search-results" role="listbox"><p>Start typing to search the docs.</p></div>
+  </form>
+</dialog>
+
+<script is:inline type="module">
+  const openButton = document.querySelector(".search-button");
+  const dialog = document.querySelector("#search-dialog");
+  const input = dialog?.querySelector("input");
+  const results = dialog?.querySelector(".search-results");
+  let searchModule;
+
+  async function openSearch() {
+    dialog?.showModal();
+    input?.focus();
+    if (!searchModule) {
+      try {
+        searchModule = await import("/pagefind/pagefind.js");
+        await searchModule.init();
+      } catch {
+        if (results) results.innerHTML = "<p>Search is available in the production build.</p>";
+      }
+    }
+  }
+
+  openButton?.addEventListener("click", openSearch);
+  document.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      openSearch();
+    }
+  });
+  dialog?.addEventListener("click", (event) => {
+    if (event.target === dialog) dialog.close();
+  });
+
+  let request = 0;
+  input?.addEventListener("input", async () => {
+    if (!results || !searchModule) return;
+    const query = input.value.trim();
+    const current = ++request;
+    if (!query) {
+      results.innerHTML = "<p>Start typing to search the docs.</p>";
+      return;
+    }
+    const search = await searchModule.search(query);
+    const items = await Promise.all(search.results.slice(0, 8).map((result) => result.data()));
+    if (current !== request) return;
+    results.replaceChildren(...items.map((item) => {
+      const link = document.createElement("a");
+      link.href = item.url;
+      link.setAttribute("role", "option");
+      const title = document.createElement("strong");
+      title.textContent = item.meta?.title ?? item.url;
+      const excerpt = document.createElement("span");
+      excerpt.innerHTML = item.excerpt ?? "";
+      link.append(title, excerpt);
+      return link;
+    }));
+    if (!items.length) results.innerHTML = "<p>No results found.</p>";
+  });
+</script>
