@@ -6,12 +6,12 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
+from trainer_rank_test_support import process_group, spawn_and_join
 
 from art.megatron.context_parallel.checkpoint import (
     current_checkpoint_partition,
     shard_saved_activations,
 )
-from trainer_rank_test_support import process_group, spawn_and_join
 
 
 def _worker(rank, rendezvous, world, backend, dtype):
@@ -43,7 +43,7 @@ def _worker(rank, rendezvous, world, backend, dtype):
         model.zero_grad(set_to_none=True)
         x.grad = None
         with shard_saved_activations(
-            dist.group.WORLD, shape=tuple(x.shape), key="proof"
+            dist.group.WORLD, shape=(x.shape[0], x.shape[1], x.shape[2]), key="proof"
         ) as stats:
             assert current_checkpoint_partition() == (world, tuple(x.shape))
             # This saves the same shape, but is not a checkpoint boundary.
@@ -70,7 +70,9 @@ def _worker(rank, rendezvous, world, backend, dtype):
         # The same hook also handles contiguous copies of non-contiguous inputs.
         view = x.transpose(0, 2)
         with shard_saved_activations(
-            dist.group.WORLD, shape=tuple(view.shape), key="view"
+            dist.group.WORLD,
+            shape=(view.shape[0], view.shape[1], view.shape[2]),
+            key="view",
         ) as view_stats:
             restored = checkpoint(lambda v: v.sin(), view, use_reentrant=True)
         restored.sum().backward()
@@ -80,7 +82,7 @@ def _worker(rank, rendezvous, world, backend, dtype):
         for mismatch in ("ordinal", "identity"):
             key = f"rank-{rank}" if mismatch == "identity" else "fence"
             with shard_saved_activations(
-                dist.group.WORLD, shape=tuple(x.shape), key=key
+                dist.group.WORLD, shape=(x.shape[0], x.shape[1], x.shape[2]), key=key
             ):
                 a = checkpoint(model[0], x, use_reentrant=True)
                 b = checkpoint(model[0], x, use_reentrant=True)
