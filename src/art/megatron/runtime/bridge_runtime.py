@@ -676,6 +676,16 @@ def _art_get_model(
             use_torch_fsdp2=use_torch_fsdp2,
             pg_collection=pg_collection,
         )
+    if external_weights is not None:
+        for chunk in model:
+            for module in chunk.modules():
+                for tensor, pointer in getattr(
+                    module, "_art_external_weight_aliases", ()
+                ):
+                    if tensor.data_ptr() != pointer:
+                        raise RuntimeError(
+                            "model wrapping replaced external base storage"
+                        )
     return model
 
 
