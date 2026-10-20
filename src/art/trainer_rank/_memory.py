@@ -14,7 +14,8 @@ also lets the circular import resolve lazily.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import hashlib
 import math
 from types import MethodType
@@ -28,6 +29,21 @@ if TYPE_CHECKING:
 
     from art.megatron.lora import LoRASlotRef
     from art.trainer_rank._impl import AdapterSelection, AnyForwardInput, TrainerRank
+
+
+_DIRECT_FORWARD: ContextVar[bool] = ContextVar(
+    "art_direct_forward_profile", default=False
+)
+
+
+@contextmanager
+def direct_forward_profile() -> Iterator[None]:
+    """Keep direct-forward calibration separate from yielded caller phases."""
+    token = _DIRECT_FORWARD.set(True)
+    try:
+        yield
+    finally:
+        _DIRECT_FORWARD.reset(token)
 
 
 def _split_required_memory(costs: Sequence[_impl._SubforwardCost]) -> int:
@@ -130,6 +146,7 @@ def _split_memory_key(plan: _impl._SplitForwardPlan) -> bytes | None:
                     signature.request_mix,
                     signature.grad_enabled,
                     signature.grad_modes,
+                    signature.bounded_forward_peak,
                     signature.slot_shapes,
                     signature.short_requests,
                     p.packed_tokens,
@@ -1516,11 +1533,12 @@ def _memory_signature_from_requests(
         ):
             raise ValueError("checkpoint shards require one CP1 uniform-recompute root")
     modes = tuple(sorted(grad_modes))
+    topology = self._topology_key()
     shapes = tuple(
         sorted((grad, self._slot_memory_shapes(ref)) for ref, grad in slot_groups)
     )
     return _impl._MemorySignature(
-        topology=self._topology_key(),
+        topology=topology,
         planner_coefficients=(self._coefficient_version, self._coefficient_table),
         slot_group_count=slot_group_count,
         request_mix=tuple(
@@ -1531,6 +1549,24 @@ def _memory_signature_from_requests(
         slot_shapes=shapes if any(any(shape) for _, shape in shapes) else (),
         short_requests=any(_impl._short_request(request) for request in requests),
         checkpoint_partition=partition,
+        bounded_forward_peak=(
+            len(requests) == 1
+            and requests[0].input_tokens.ndim == 1
+            and (modes == (False,) or (modes == (True,) and _DIRECT_FORWARD.get()))
+            and _impl._request_mix_key(requests[0]) in ("hidden", "hidden+routes")
+            and topology[1:] == (1, 1, 1)
+            and self._parallel_shape.ep == self._parallel_shape.etp == 1
+            and bool(
+                _checkpoint_layers(
+                    self, ((int(requests[0].input_tokens.numel()), False),)
+                )
+            )
+            and (
+                self._moe_memory_supported
+                if self._moe_layers
+                else self._dense_fc1_adapted and bool(self._geometry.ffn_hidden_size)
+            )
+        ),
     )
 
 
@@ -1895,7 +1931,14 @@ def _estimate_required_memory_bytes_from_values(
         profiled_bytes = profiled.bytes_per_token * profiled_tokens(
             profiled.logical_per_packed
         )
-        if (
+        if signature.bounded_forward_peak and profiled.forward_compute_peak_bytes:
+            # Direct inference never observes the caller-phase warm fit. A
+            # three-token cold CUDA scratch allocation must not become a slope
+            # extrapolated over an entire long root. Keep every observed peak,
+            # bounded by the old fit for smaller roots, beside the unchanged
+            # token-dependent static floors. Both terms remain monotone.
+            profiled_bytes = min(profiled_bytes, profiled.forward_compute_peak_bytes)
+        elif (
             profiled.warm_bytes_per_token is not None
             and profiled.warm_packed_tokens is not None
             and profiled.warm_logical_per_packed is not None
@@ -2096,4 +2139,12 @@ def _update_memory_profile(
         warm_packed_tokens=warm_tokens,
         warm_logical_per_packed=warm_sharing,
         caller_plans=caller_plans,
+        forward_compute_peak_bytes=(
+            max(
+                compute_delta,
+                0 if previous is None else previous.forward_compute_peak_bytes,
+            )
+            if plan.signature.bounded_forward_peak
+            else 0
+        ),
     )

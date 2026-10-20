@@ -3,7 +3,7 @@
 Every group member executes the same full-root forward and backward. Only
 checkpoint storage is divided; no partial parameter gradients are produced.
 Use an outer group of CP1 models, disable automatic DP gradient reduction,
-and export one full parameter gradient (or average identical copies).
+and export one complete parameter-gradient copy without reduction.
 """
 
 from __future__ import annotations
