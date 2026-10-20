@@ -17,6 +17,7 @@ Public cross-repo API consumed by serverless-training:
 - inspect_resident_lora
 """
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 import hashlib
 import math
@@ -423,6 +424,7 @@ def build_training_runtime(
     allow_unvalidated_arch: bool | None = None,
     model_support_key: str | None = None,
     snapshot_pool_capacity: int = 2,
+    external_weights: Mapping[str, torch.Tensor] | None = None,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -444,6 +446,15 @@ def build_training_runtime(
         ),
         model_support_key=model_support_key,
     )
+    if external_weights is not None:
+        if model_initialization != "pretrained":
+            raise ValueError("external weights require pretrained model initialization")
+        provider_bundle.provider._art_external_weights = external_weights
+        provider_bundle.provider._pre_wrap_hooks = [
+            hook
+            for hook in getattr(provider_bundle.provider, "_pre_wrap_hooks", ())
+            if not _is_bridge_hf_load_hook(hook)
+        ]
     if model_initialization == "random":
         hooks = list(getattr(provider_bundle.provider, "_pre_wrap_hooks", ()))
         checkpoint_hooks = [hook for hook in hooks if _is_bridge_hf_load_hook(hook)]
@@ -2141,7 +2152,10 @@ def inspect_resident_lora(
             base_name=base_name,
             adapter_keys=tuple(
                 sorted(
-                    {getattr(weight, "adapter_key", None) for weight in weights},
+                    {
+                        cast(str | None, getattr(weight, "adapter_key", None))
+                        for weight in weights
+                    },
                     key=lambda value: "" if value is None else value,
                 )
             ),

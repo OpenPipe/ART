@@ -1,6 +1,7 @@
 __pycache__/
 .art/
-# .env
+.env
+.env.*
 .venv/
 .ruff_cache/
 .pytest_cache/
@@ -19,3 +20,6 @@ replays/
 /progress_log.md
 .DS_Store
 # .local/
+
+.git/
+**/.venv/

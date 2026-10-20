@@ -1002,6 +1002,7 @@ class _MemorySignature:
     # Short single-target requests keep the logical extrapolation, but share
     # the profile learned from longer requests of the same signature.
     short_requests: bool = dataclass_field(default=False, compare=False)
+    checkpoint_partition: tuple[int, tuple[int, int, int]] | None = None
 
 
 @dataclass(frozen=True)

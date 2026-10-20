@@ -181,6 +181,7 @@ class GdnPlannerConfig:
     chaining a long sequence across ranks pay off.
     """
 
+    root_closed: bool = False
     cp_chain_beam_width: int = 2
     cp_chain_beam_branch_factor: int = 4
     cp_chain_beam_candidate_limit: int = 16
@@ -465,6 +466,19 @@ def build_gdn_global_execution_decision(
     """Select one deterministic all-rank GDN assignment without tensors."""
 
     planner_config = planner_config or GdnPlannerConfig()
+    if planner_config.root_closed:
+        from .root_closed import build_root_closed_gdn_decision
+
+        return build_root_closed_gdn_decision(
+            spec,
+            cp_size=cp_size,
+            source_layout=_attention_source_layout(
+                spec,
+                cp_size=cp_size,
+                attention_token_layout_index=attention_token_layout_index,
+            ),
+            planner_config=planner_config,
+        )
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}")
     if not spec.tree_segments:
@@ -2300,7 +2314,7 @@ def _build_position_bucket_plan(
             local_token_ranges=local_token_ranges,
             local_range_ends=local_range_ends,
         )
-        if not int(positions.numel()):
+        if not int(positions.numel()) and token_ranges_by_rank is None:
             raise ValueError(
                 "planned GDN bucket contains a segment with no local tokens; "
                 f"family={segment.family_index} kind={segment.kind}"
