@@ -33,6 +33,7 @@ from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
+from .canonical.layout import capture as capture_canonical
 from .expert_parallel import get_expert_parallel_layout
 from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora,
@@ -131,7 +132,7 @@ def _collect_compile_garbage() -> None:
 
 def _with_captured_lora_slot(function: _F) -> _F:
     context = _CURRENT_LORA_SLOT.get()
-    function = capture_routes(function)
+    function = capture_routes(capture_canonical(function))
 
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:

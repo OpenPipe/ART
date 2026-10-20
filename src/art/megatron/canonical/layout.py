@@ -1,9 +1,10 @@
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+import functools
 import threading
-from typing import Literal
+from typing import Any, Literal, TypeVar, cast
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +13,7 @@ import torch.utils.deterministic
 POLICY_VERSION = "dense-root-v1"
 ROOT_ALIGNMENT = 128
 NumericalPolicy = Literal["native", "canonical"]
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,25 @@ _EXECUTION_LOCK = threading.RLock()
 
 def current_layout() -> RootLayout | None:
     return _LAYOUT.get()
+
+
+def capture(function: _F) -> _F:
+    """Carry immutable root metadata onto autograd's recomputation thread.
+
+    The execution scope stays open through backward, retaining process settings.
+    Do not acquire its thread lock on an autograd worker: the caller holds it.
+    """
+    layout = current_layout()
+
+    @functools.wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        token = _LAYOUT.set(layout)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _LAYOUT.reset(token)
+
+    return cast(_F, wrapped)
 
 
 @contextmanager

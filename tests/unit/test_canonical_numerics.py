@@ -184,3 +184,16 @@ def test_canonical_gdn_never_selects_uniform_bucket_algorithm():
     with execution(RootLayout((128, 128))):
         assert not _bucket_has_uniform_lengths(bucket)
     assert _bucket_has_uniform_lengths(bucket)
+
+
+def test_checkpoint_capture_carries_layout_to_autograd_worker_thread():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from art.megatron.canonical.layout import capture
+
+    layout = RootLayout((3, 5))
+    with ThreadPoolExecutor(max_workers=1) as pool, execution(layout):
+        assert pool.submit(current_layout).result() is None
+        captured = capture(current_layout)
+        assert pool.submit(captured).result() is layout
+        assert pool.submit(current_layout).result() is None
