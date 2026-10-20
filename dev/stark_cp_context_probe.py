@@ -279,6 +279,23 @@ def main():
             nonzero_gradient=nonzero,
             checkpoint_storage=None if shard_stats is None else vars(shard_stats),
         )
+        if args.checkpoint_shards and args.mode == "backward":
+            digest = hashlib.sha256()
+            for parameter in parameters:
+                if parameter.grad is None:
+                    digest.update(b"none")
+                else:
+                    digest.update(
+                        parameter.grad.detach()
+                        .contiguous()
+                        .view(torch.uint8)
+                        .cpu()
+                        .numpy()
+                    )
+            digests = [None] * world
+            dist.all_gather_object(digests, digest.hexdigest())
+            assert len(set(digests)) == 1, "replicated canonical gradients differ"
+            emit("replicated_gradients", sha256=digests[0], byte_exact=True)
         if args.snapshot and iteration == args.repeat - 1:
             from safetensors.torch import save_file
 
