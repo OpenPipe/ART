@@ -34,6 +34,8 @@ def main():
     args = parser.parse_args()
     import torch
     import torch.distributed as dist
+    import torch.nn.functional as F
+    from torch.utils.checkpoint import checkpoint
 
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     dist.init_process_group("nccl")
@@ -48,6 +50,7 @@ def main():
     from art.megatron.context_parallel.root_closed import execution
     from art.megatron.model_support.registry import get_model_support_spec
     from art.trainer_rank import ForwardInput, TrainerRank
+    from art.trainer_rank._impl import _language_model
 
     target = Path(args.output)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -61,6 +64,7 @@ def main():
         mode=args.mode,
         root_closed=args.root_closed,
         tokens=args.tokens,
+        head_dtype="float32",
         gpu=torch.cuda.get_device_name(),
         torch=torch.__version__,
     )
@@ -93,6 +97,14 @@ def main():
         runtime, trainer, 1, base_model=args.model, lora_rank=8
     )
     parameters = trainer._checkpoint_slots[slot].params
+    model = _language_model(runtime.model[0])
+    head_weight = (
+        model.shared_embedding_or_output_weight()
+        if model.share_embeddings_and_output_weights
+        else model.output_layer.weight
+    )
+    assert head_weight is not None
+    head_weight = head_weight.float()
     optimizer_state = (
         [torch.zeros_like(p, dtype=torch.float32) for p in parameters for _ in range(4)]
         if args.mode == "backward"
@@ -117,11 +129,28 @@ def main():
         started = time.perf_counter()
         with execution(placements) if args.root_closed else nullcontext():
             [result] = trainer.dp_rank_forward(
-                [ForwardInput(input_tokens=tokens[:-1], target_tokens=tokens[1:])],
+                [ForwardInput(input_tokens=tokens[:-1], hidden_states=True)],
                 checkpoint=slot,
                 no_grad=args.mode == "forward",
             )
-            logprobs = result.target_logprobs[: args.tokens].float()
+            assert result.hidden_states is not None
+            hidden = result.hidden_states
+
+            def head(h, labels):
+                return -F.cross_entropy(
+                    F.linear(h.float(), head_weight), labels, reduction="none"
+                )
+
+            pieces = []
+            for start in range(0, physical, 128):
+                h = hidden[start : start + 128]
+                labels = tokens[1 + start : 1 + start + 128].to(h.device)
+                pieces.append(
+                    checkpoint(head, h, labels, use_reentrant=False)
+                    if h.requires_grad
+                    else head(h, labels)
+                )
+            logprobs = torch.cat(pieces)[: args.tokens]
             loss = -logprobs.mean()
             if args.mode == "backward":
                 loss.backward()

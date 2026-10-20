@@ -37,7 +37,8 @@ def flex_backend_for_head_dims(
         return "TRITON"
     if device is not None and device.type == "cuda":
         major, _minor = torch.cuda.get_device_capability(device)
-        if major in {10, 11}:
+        # FA4 has no block-sparse backward on SM120; use the existing fallback.
+        if major in {10, 11, 12}:
             return "TRITON"
     if int(head_dim) > 256 or int(head_dim_v) > 256:
         return "TRITON"
