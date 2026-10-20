@@ -211,6 +211,15 @@ def test_unknown_parameter_types_are_rejected_before_wrapping(operator_types, na
     assert install(model, numerical_policy="native") == {}
 
 
+def test_output_layer_stays_native_and_is_not_rejected(operator_types):
+    model = torch.nn.Sequential(operator_types(2, 2))
+    setattr(model, "config", SimpleNamespace())
+    model.output_layer = torch.nn.Linear(2, 4)  # e.g. MCore ColumnParallelLinear
+    head_forward = model.output_layer.forward
+    assert install(model) == {"0": "row"}
+    assert model.output_layer.forward == head_forward
+
+
 def test_empty_operator_layout_is_rejected(operator_types):
     model = torch.nn.Identity()
     setattr(model, "config", SimpleNamespace())

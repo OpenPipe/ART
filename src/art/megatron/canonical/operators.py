@@ -144,7 +144,9 @@ def install(
 
     Validate the complete layout before mutating it. Reinstallation reports the
     same modules without wrapping twice. Native installation returns an empty
-    report. Parameter and optimizer identities are preserved.
+    report. Parameter and optimizer identities are preserved. The model's
+    ``output_layer`` stays native: canonical callers compute their own head
+    from hidden states.
     """
     if numerical_policy == "native":
         return {}
@@ -167,9 +169,12 @@ def install(
         for module in model.modules()
         if isinstance(module, parameter_types) and hasattr(module, "conv1d")
     }
+    head = getattr(model, "output_layer", None)
     report = {}
     unsupported = []
     for name, module in model.named_modules():
+        if module is head:
+            continue
         core_attention = getattr(module, "core_attention", None)
         if core_attention is not None and not isinstance(
             core_attention, attention_types

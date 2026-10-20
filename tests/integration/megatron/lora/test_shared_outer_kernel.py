@@ -26,9 +26,10 @@ def test_shared_outer_matches_expanded_grouped(rank, shared_factor, dtype):
         )
         * 0.05
     ).requires_grad_()
-    reference = [value.detach().clone().requires_grad_() for value in (x, a, b)]
+    # FP32 per-expert reference: QuACK itself rejects ranks like 12, and a
+    # low-precision reference would round each expert's gradient before summing.
+    reference = [value.detach().float().requires_grad_() for value in (x, a, b)]
     xx, aa, bb = reference
-    # Per-expert Torch reference: QuACK itself rejects ranks like 12.
     rows = torch.split(xx, counts.tolist())
     expected = torch.cat(
         [
@@ -42,13 +43,14 @@ def test_shared_outer_matches_expanded_grouped(rank, shared_factor, dtype):
     actual = shared_outer_lora(x, a, b, counts, scale=0.75, shared_factor=shared_factor)
     grad = torch.randn_like(actual)
     actual.backward(grad)
-    expected.backward(grad)
-    # Compact shared gradients accumulate before the final low-precision cast;
-    # the expanded reference rounds each expert's gradient before summing.
+    expected.backward(grad.float())
     tolerance = 0.025 if dtype == torch.bfloat16 else 0.004
-    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
+    torch.testing.assert_close(actual.float(), expected, atol=tolerance, rtol=tolerance)
     for value, ref in zip((x, a, b), reference, strict=True):
-        torch.testing.assert_close(value.grad, ref.grad, atol=tolerance, rtol=tolerance)
+        assert value.grad is not None and ref.grad is not None
+        torch.testing.assert_close(
+            value.grad.float(), ref.grad, atol=tolerance, rtol=tolerance
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
