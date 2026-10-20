@@ -172,6 +172,33 @@ def test_reversed_attention_spans_keep_canonical_gdn_chains():
         ]
 
 
+@pytest.mark.parametrize("cp", [2, 4, 8])
+def test_reordered_subsets_preserve_each_roots_gdn_ranges(cp):
+    rng = random.Random(517)
+    lengths = [128, 512, 32768, 65536]
+    ranks = [(0, 1, False), (cp - 1, 1, False), (0, 2, True), (0, cp, False)]
+    _, full = plan(lengths, ranks, cp)
+    full_offsets = [sum(lengths[:i]) for i in range(len(lengths))]
+    for _ in range(12):
+        order = rng.sample(range(len(lengths)), rng.randrange(1, len(lengths) + 1))
+        _, subset = plan([lengths[i] for i in order], [ranks[i] for i in order], cp)
+        offset = 0
+        for j, i in enumerate(order):
+            assert subset.owner_by_node[j] == full.owner_by_node[i]
+            assert subset.chained_nodes[j] == full.chained_nodes[i]
+            for rank in range(cp):
+
+                def relative(decision, start):
+                    return [
+                        (max(a, start) - start, min(b, start + lengths[i]) - start)
+                        for a, b, _ in decision.gdn_ranges_by_rank_by_position[rank]
+                        if a < start + lengths[i] and b > start
+                    ]
+
+                assert relative(subset, offset) == relative(full, full_offsets[i])
+            offset += lengths[i]
+
+
 @pytest.mark.parametrize("multi", [False, True])
 def test_empty_chain_identity_state_and_gradient(monkeypatch, multi):
     from art.megatron.gdn import fla_cp as f

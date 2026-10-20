@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen3.8-27B")
     parser.add_argument("--weight-path")
     parser.add_argument("--tokens", type=int, required=True)
+    parser.add_argument("--lora-rank", type=int, default=8)
     parser.add_argument(
         "--layers", type=int, default=0, help="0 means the complete model"
     )
@@ -65,6 +66,7 @@ def main():
         root_closed=args.root_closed,
         tokens=args.tokens,
         head_dtype="float32",
+        lora_rank=args.lora_rank,
         gpu=torch.cuda.get_device_name(),
         torch=torch.__version__,
     )
@@ -94,7 +96,7 @@ def main():
         chunk.train()
     trainer = TrainerRank(runtime)
     [slot] = load_random_checkpoints(
-        runtime, trainer, 1, base_model=args.model, lora_rank=8
+        runtime, trainer, 1, base_model=args.model, lora_rank=args.lora_rank
     )
     parameters = trainer._checkpoint_slots[slot].params
     model = _language_model(runtime.model[0])
