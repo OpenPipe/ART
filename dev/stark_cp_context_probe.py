@@ -336,9 +336,15 @@ def main():
 
             tensors = {"logprobs": logprobs.detach().cpu().contiguous()}
             if args.mode == "backward":
-                gradients = trainer._reduce_dynamic_grads(
-                    parameters,
-                    scale_grads=1.0 / world if args.checkpoint_shards else 1.0,
+                gradients = (
+                    tuple(
+                        torch.zeros_like(parameter, dtype=torch.float32)
+                        if parameter.grad is None
+                        else parameter.grad.detach().float()
+                        for parameter in parameters
+                    )
+                    if args.checkpoint_shards
+                    else trainer._reduce_dynamic_grads(parameters, scale_grads=1.0)
                 )
                 tensors.update(
                     {

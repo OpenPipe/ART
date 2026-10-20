@@ -185,7 +185,10 @@ def test_native_ep1_dispatch_replays_routing_without_modifying_base_result(monke
         assert actual_routing is routing and fused and not drop_and_pad
         assert num_out_tokens == 7 and not values.requires_grad
         calls.append("permute IDs")
-        return values[source_rows], probs.T[routing.T], source_rows, None, None
+        selected = probs.T[routing.T]
+        # TE masks payloads at zero-probability slots even with a true route.
+        payload = values[source_rows].masked_fill(selected[:, None] == 0, 0)
+        return payload, selected, source_rows, None, None
 
     module = ModuleType("megatron.core.transformer.moe.moe_utils")
     setattr(module, "permute", native_permute)
