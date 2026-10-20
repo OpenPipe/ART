@@ -542,6 +542,18 @@ def _collect_fp32_preserved_tensors(
 ) -> list[_Fp32PreservedTensor]:
     """Snapshot tensors explicitly marked to survive Megatron fp16/bf16 casts."""
 
+    external_ids = {
+        id(tensor)
+        for chunk in model
+        for module in chunk.modules()
+        for tensor, _ in getattr(module, "_art_external_weight_aliases", ())
+    }
+
+    def snapshot(tensor: torch.Tensor) -> torch.Tensor:
+        # The MP wrapper rebinds .data / buffers; retain the externally owned
+        # FP32 allocation itself so restoring precision also restores its alias.
+        return tensor.detach() if id(tensor) in external_ids else tensor.data.clone()
+
     keep_in_fp32: list[_Fp32PreservedTensor] = []
     for model_module in model:
         for submodule in model_module.modules():
@@ -553,24 +565,24 @@ def _collect_fp32_preserved_tensors(
                 expert_bias = getattr(submodule, "expert_bias", None)
                 if isinstance(expert_bias, torch.nn.Parameter):
                     keep_in_fp32.append(
-                        (submodule, "expert_bias", expert_bias.data.clone(), True)
+                        (submodule, "expert_bias", snapshot(expert_bias), True)
                     )
                     seen.add("expert_bias")
             for name in explicit_names - seen:
                 tensor = getattr(submodule, name, None)
                 if isinstance(tensor, torch.nn.Parameter):
-                    keep_in_fp32.append((submodule, name, tensor.data.clone(), True))
+                    keep_in_fp32.append((submodule, name, snapshot(tensor), True))
                     seen.add(name)
                 elif isinstance(tensor, torch.Tensor):
-                    keep_in_fp32.append((submodule, name, tensor.data.clone(), False))
+                    keep_in_fp32.append((submodule, name, snapshot(tensor), False))
                     seen.add(name)
             for name, param in submodule.named_parameters(recurse=False):
                 if name not in seen and getattr(param, "_keep_fp32", False):
-                    keep_in_fp32.append((submodule, name, param.data.clone(), True))
+                    keep_in_fp32.append((submodule, name, snapshot(param), True))
                     seen.add(name)
             for name, buffer in submodule.named_buffers(recurse=False):
                 if name not in seen and getattr(buffer, "_keep_fp32", False):
-                    keep_in_fp32.append((submodule, name, buffer.data.clone(), False))
+                    keep_in_fp32.append((submodule, name, snapshot(buffer), False))
                     seen.add(name)
     return keep_in_fp32
 
@@ -677,26 +689,9 @@ def _art_get_model(
             pg_collection=pg_collection,
         )
     if external_weights is not None:
-        reachable = {
-            parameter.data_ptr() for chunk in model for parameter in chunk.parameters()
-        }
-        for chunk in model:
-            for module in chunk.modules():
-                for tensor, pointer in getattr(
-                    module, "_art_external_weight_aliases", ()
-                ):
-                    if tensor.data_ptr() != pointer:
-                        raise RuntimeError(
-                            "model wrapping replaced external base storage"
-                        )
-                    if (
-                        isinstance(tensor, torch.nn.Parameter)
-                        and tensor.numel()
-                        and pointer not in reachable
-                    ):
-                        raise RuntimeError(
-                            "model wrapping detached an external base parameter"
-                        )
+        from art.megatron.runtime.external_weights import validate_external_weights
+
+        validate_external_weights(model)
     return model
 
 

@@ -54,3 +54,38 @@ def test_complete_validation_before_binding(failure):
         bind_external_weights([first, second], tensors)
     assert first.weight.is_meta
     assert second.weight.is_meta
+
+
+@pytest.mark.parametrize("kind", ["parameter", "buffer"])
+@pytest.mark.parametrize("replacement", ["rebind", "data"])
+def test_validation_rejects_replaced_registered_storage(kind, replacement):
+    model = torch.nn.Module()
+    if kind == "parameter":
+        model.register_parameter(
+            "weight", torch.nn.Parameter(torch.empty(3, device="meta"))
+        )
+    else:
+        model.register_buffer("weight", torch.empty(3, device="meta"))
+    source = torch.randn(3)
+    bind_external_weights([model], {"0:weight": source})
+    module.validate_external_weights([model])
+    if replacement == "rebind":
+        if kind == "parameter":
+            model.weight = torch.nn.Parameter(source.clone())
+        else:
+            model.weight = source.clone()
+    else:
+        model.weight.data = source.clone()
+    with pytest.raises(RuntimeError, match="external base"):
+        module.validate_external_weights([model])
+
+
+def test_buffers_and_empty_extra_state_are_bound_and_validated():
+    model = torch.nn.Module()
+    model.register_buffer("state", torch.empty(3, device="meta"))
+    source = torch.randn(3)
+    bind_external_weights(
+        [model], {"0:state": source, "0:layer._extra_state": torch.empty(0)}
+    )
+    assert model.get_buffer("state").data_ptr() == source.data_ptr()
+    module.validate_external_weights([torch.nn.Sequential(model)])

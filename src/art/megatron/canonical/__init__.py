@@ -7,7 +7,7 @@ FP32 root gradients in datum order, independent of request chunk boundaries.
 """
 
 from .layout import POLICY_VERSION, RootLayout, current_layout, execution
-from .operators import install, target_logprobs
+from .operators import install
 
 __all__ = [
     "POLICY_VERSION",
@@ -15,5 +15,4 @@ __all__ = [
     "current_layout",
     "execution",
     "install",
-    "target_logprobs",
 ]

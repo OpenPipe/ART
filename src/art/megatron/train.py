@@ -449,12 +449,12 @@ def build_training_runtime(
     if external_weights is not None:
         if model_initialization != "pretrained":
             raise ValueError("external weights require pretrained model initialization")
+        hooks = list(getattr(provider_bundle.provider, "_pre_wrap_hooks", ()))
+        retained = [hook for hook in hooks if not _is_bridge_hf_load_hook(hook)]
+        if len(hooks) - len(retained) != 1:
+            raise RuntimeError("external weights require exactly one HF loader hook")
         provider_bundle.provider._art_external_weights = external_weights
-        provider_bundle.provider._pre_wrap_hooks = [
-            hook
-            for hook in getattr(provider_bundle.provider, "_pre_wrap_hooks", ())
-            if not _is_bridge_hf_load_hook(hook)
-        ]
+        provider_bundle.provider._pre_wrap_hooks = retained
     if model_initialization == "random":
         hooks = list(getattr(provider_bundle.provider, "_pre_wrap_hooks", ()))
         checkpoint_hooks = [hook for hook in hooks if _is_bridge_hf_load_hook(hook)]

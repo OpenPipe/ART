@@ -76,3 +76,21 @@ def bind_external_weights(
             if module_chunk[id(module)] == index
         ]
     return chunks
+
+
+def validate_external_weights(chunks: list[torch.nn.Module]) -> None:
+    """Require all bound base parameters AND buffers to survive model wrapping."""
+    reachable = {
+        tensor.data_ptr()
+        for chunk in chunks
+        for tensor in (*chunk.parameters(), *chunk.buffers())
+    }
+    for chunk in chunks:
+        for module in chunk.modules():
+            for tensor, pointer in getattr(module, "_art_external_weight_aliases", ()):
+                if tensor.data_ptr() != pointer:
+                    raise RuntimeError("model wrapping replaced external base storage")
+                if tensor.numel() and pointer not in reachable:
+                    raise RuntimeError(
+                        "model wrapping detached an external base tensor"
+                    )

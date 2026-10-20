@@ -4554,7 +4554,7 @@ requires-dist = [
     { name = "setuptools", marker = "extra == 'backend'", specifier = ">=78.1.0" },
     { name = "setuptools", marker = "extra == 'backend-cu130'", specifier = ">=78.1.0" },
     { name = "tblib", specifier = ">=3.0.0" },
-    { name = "tinker", marker = "extra == 'tinker'", specifier = "==0.34.0" },
+    { name = "tinker", marker = "extra == 'tinker'", specifier = ">=0.34.0,<0.35" },
     { name = "tinker-cookbook", marker = "extra == 'tinker'", specifier = ">=0.5.2,<0.6" },
     { name = "torch", marker = "sys_platform == 'darwin' and extra == 'backend'", specifier = "==2.11.0" },
     { name = "torch", marker = "sys_platform == 'darwin' and extra == 'distributed'", specifier = "==2.11.0" },

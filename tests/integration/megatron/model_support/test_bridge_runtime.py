@@ -240,3 +240,164 @@ def test_direct_load_preserves_reader_error(monkeypatch: pytest.MonkeyPatch) -> 
         _load_direct(["first", "second"], StateDict(source))
 
     assert caught.value is error
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+@pytest.mark.parametrize("replace_buffer", [False, True])
+def test_external_binding_pre_wrap_mp_and_ddp(
+    monkeypatch, tmp_path, replace_buffer, device
+):
+    """Real MP with CPU gloo DDP, or the full Megatron DDP stack on one GPU."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires one CUDA GPU")
+    from megatron.bridge.models import model_provider
+    from megatron.core import parallel_state
+    from megatron.core.distributed import DistributedDataParallelConfig
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.module import MegatronModule
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel
+
+    from art.megatron.runtime.bridge_runtime import _art_get_model
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=2,
+        num_attention_heads=1,
+        bf16=True,
+        init_model_with_meta_device=True,
+        use_cpu_initialization=True,
+    )
+
+    class Model(MegatronModule):
+        _keep_fp32_parameters = ("A_log",)
+        _keep_fp32_buffers = ("state",)
+
+        def __init__(self):
+            super().__init__(config)
+            self.weight = torch.nn.Parameter(torch.empty(2, 2, dtype=torch.bfloat16))
+            self.A_log = torch.nn.Parameter(torch.empty(2))
+            self.D = torch.nn.Parameter(torch.empty(2))
+            setattr(self.D, "_keep_fp32", True)
+            self.register_buffer("state", torch.empty(2))
+            self.register_buffer("cache", torch.empty(2, dtype=torch.bfloat16))
+
+    sources = {
+        "0:weight": torch.randn(2, 2, dtype=torch.bfloat16, device=device),
+        **{
+            f"0:{name}": torch.randn(2, device=device)
+            for name in ("A_log", "D", "state")
+        },
+        "0:cache": torch.randn(2, dtype=torch.bfloat16, device=device),
+    }
+    setattr(config, "_art_external_weights", sources)
+    stages = []
+
+    def create(*args, **kwargs):
+        stages.append("meta")
+        return [Model()]
+
+    def check_aliases(model):
+        for name, source in sources.items():
+            actual = getattr(model, name.removeprefix("0:"))
+            assert actual.data_ptr() == source.data_ptr()
+            assert actual.dtype == source.dtype
+            assert torch.equal(actual, source)
+
+    def pre_wrap(chunks):
+        stages.append("pre_wrap")
+        check_aliases(chunks[0])
+        chunks[0].requires_grad_(False)
+        chunks[0].register_parameter(
+            "adapter",
+            torch.nn.Parameter(torch.ones(2, dtype=torch.bfloat16, device=device)),
+        )
+
+    original_ddp_wrap = model_provider._ddp_wrap
+
+    def ddp_wrap(chunks, *args, **kwargs):
+        stages.append("ddp")
+        check_aliases(chunks[0].module)
+        if replace_buffer:
+            chunks[0].module.cache = chunks[0].module.cache.clone()
+        if device == "cuda":
+            return original_ddp_wrap(chunks, *args, **kwargs)
+        return [DistributedDataParallel(chunk) for chunk in chunks]
+
+    monkeypatch.setattr(model_provider, "_create_model", create)
+    monkeypatch.setattr(
+        model_provider, "_print_num_params", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(model_provider, "_ddp_wrap", ddp_wrap)
+    monkeypatch.setattr(model_provider, "correct_amax_history_if_needed", None)
+    dist.init_process_group(
+        "nccl" if device == "cuda" else "gloo",
+        init_method=f"file://{tmp_path / 'rendezvous'}",
+        rank=0,
+        world_size=1,
+    )
+    try:
+        pg_collection = None
+        if device == "cuda":
+            parallel_state.initialize_model_parallel()
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        def build():
+            return _art_get_model(
+                cast(Any, config),
+                DistributedDataParallelConfig(),
+                init_model_with_meta_device=True,
+                use_cpu_initialization=True,
+                pre_wrap_hook=pre_wrap,
+                pg_collection=cast(Any, pg_collection),
+            )
+
+        if replace_buffer:
+            with pytest.raises(RuntimeError, match="detached an external base tensor"):
+                build()
+        else:
+            wrapped = build()
+            check_aliases(wrapped[0].module.module)
+        assert stages == ["meta", "pre_wrap", "ddp"]
+    finally:
+        if device == "cuda":
+            parallel_state.destroy_model_parallel()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("loader_count", [0, 1, 2])
+def test_external_weights_remove_exactly_one_hf_loader(monkeypatch, loader_count):
+    from art.megatron import train
+
+    def loader():
+        pass
+
+    loader.__name__ = "load_weights_hf_to_megatron"
+    other = lambda: None
+    provider = SimpleNamespace(_pre_wrap_hooks=[other, *([loader] * loader_count)])
+    bundle = SimpleNamespace(provider=provider)
+    monkeypatch.setattr(train, "install_fast_frozen_output_backward", lambda: None)
+    monkeypatch.setattr(
+        train, "prepare_provider_bundle", lambda *args, **kwargs: bundle
+    )
+
+    class Validated(Exception):
+        pass
+
+    def finish_validation(bundle):
+        assert bundle.provider._pre_wrap_hooks == [other]
+        assert bundle.provider._art_external_weights == {}
+        raise Validated
+
+    monkeypatch.setattr(train, "finalize_provider_bundle", finish_validation)
+    expected = Validated if loader_count == 1 else RuntimeError
+    with pytest.raises(
+        expected, match=None if loader_count == 1 else "exactly one HF loader hook"
+    ):
+        train.build_training_runtime(
+            model_identifier="test/model", external_weights={}, print_env=False
+        )
+    if loader_count != 1:
+        assert not hasattr(provider, "_art_external_weights")
+        assert len(provider._pre_wrap_hooks) == loader_count + 1
