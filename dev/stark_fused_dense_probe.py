@@ -31,16 +31,19 @@ def digest(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--caladan-executor", action="store_true")
     parser.add_argument("--model", default="Qwen/Qwen3.8-27B")
     parser.add_argument("--lengths", nargs="+", type=int, default=[257, 129])
+    parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--layers", type=int, default=0)
     parser.add_argument(
         "--initialization", default="pretrained", choices=["pretrained", "random"]
     )
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    os.environ["STARK_FUSED_WAVES"] = "1"
     os.environ["ART_DISABLE_MEGATRON_COMPILE"] = "1"
-    os.environ["ART_MEGATRON_LORA_RANK"] = "8"
+    os.environ["ART_MEGATRON_LORA_RANK"] = str(args.rank)
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     dist.init_process_group("nccl")
@@ -116,6 +119,10 @@ def main():
         "args": {**vars(args), "output": str(args.output)},
         "device": torch.cuda.get_device_name(),
         "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "parameterization": os.environ.get(
+            "ART_MEGATRON_QWEN_LORA_PARAMETERIZATION", "art"
+        ),
         "rows": [],
         "sources": {
             str(p.relative_to(Path(__file__).resolve().parents[1])): hashlib.sha256(
@@ -135,7 +142,82 @@ def main():
         },
     }
 
+    if args.caladan_executor:
+        from caladan.stark.trainer import fused as executor
+
+        evidence["caladan_executor_sha256"] = hashlib.sha256(
+            Path(executor.__file__).read_bytes()
+        ).hexdigest()
+
+    def execute_caladan(indices, active):
+        from caladan.stark.trainer.fused import (
+            FusedWave,
+            WaveItem,
+            dense_execution,
+            dense_forward,
+            execute_wave,
+        )
+
+        wave = FusedWave(
+            tuple(
+                WaveItem(
+                    run=str(index),
+                    epoch=0,
+                    seq=1,
+                    weight_version=0,
+                    slot=refs[index],
+                    root_lengths=(args.lengths[index],),
+                    model=args.model,
+                    bundle="probe",
+                    numerical_policy="canonical",
+                )
+                for index in indices
+            )
+        )
+        for owned in params.values():
+            for parameter in owned.values():
+                parameter.grad = None
+        outputs = {}
+
+        def loss(item, hidden):
+            index = int(item.run)
+            layout = RootLayout((args.lengths[index],))
+            labels = layout.pad([roots[index].roll(-1)], value=-100).cuda()
+            logps = target_logprobs(
+                layout.pad(list(hidden)), weight, labels, layout=layout
+            )[0]
+            value = -logps.sum() / args.lengths[index]
+            outputs[index] = (logps.detach().cpu(), value.detach().cpu())
+            return value if active is None or active == index else value * 0
+
+        execute_wave(
+            wave,
+            versions={str(index): (0, 0) for index in indices},
+            forward=lambda plan: dense_forward(
+                plan, runtime, [roots[index] for index in indices]
+            ),
+            execution=lambda plan: dense_execution(plan, runtime),
+            loss=loss,
+        )
+        return {
+            index: (
+                *outputs[index],
+                {
+                    name: cast(torch.Tensor, parameter.grad)
+                    .detach()
+                    .float()
+                    .cpu()
+                    .clone()
+                    for name, parameter in params[refs[index]].items()
+                    if parameter.grad is not None
+                },
+            )
+            for index in indices
+        }
+
     def execute(indices, fused, active=None):
+        if fused and args.caladan_executor:
+            return execute_caladan(indices, active)
         layout = RootLayout(tuple(args.lengths[i] for i in indices))
         physical = [RootLayout((args.lengths[i],)).pad([roots[i]]) for i in indices]
         pack = prefix_tree_pack(physical, max_depth=0)
