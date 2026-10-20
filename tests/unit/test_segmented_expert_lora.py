@@ -118,7 +118,10 @@ def test_transport_carries_ids_through_repeated_rows_and_native_combine():
             )
 
     ids = torch.tensor([1, 0, 1])
-    tokens = AdapterTokens(cast(Any, ("a", "b")), ids)
+    refs = ["a", "b"]
+    tokens = AdapterTokens(cast(Any, refs), ids)
+    refs.reverse()
+    assert tokens.refs == ("a", "b")
     ids.fill_(0)
     x = torch.randn(3, 16, dtype=torch.bfloat16, requires_grad=True)
     manager = SegmentedHybridEPManager(Manager())

@@ -183,6 +183,7 @@ class AdapterTokens:
     ids: torch.Tensor
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "refs", tuple(self.refs))
         if not 1 <= len(self.refs) <= 256 or len(set(self.refs)) != len(self.refs):
             raise ValueError("transport supports 1..256 distinct adapter refs")
         if self.ids.ndim != 1 or self.ids.dtype not in (torch.int32, torch.int64):
