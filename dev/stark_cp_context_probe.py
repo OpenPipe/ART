@@ -8,7 +8,7 @@ advertised service capability. Snapshot tensors use safetensors, never pickle.
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 import hashlib
 import json
 import math
@@ -31,6 +31,8 @@ def main():
     )
     parser.add_argument("--mode", choices=("forward", "backward"), default="backward")
     parser.add_argument("--root-closed", action="store_true")
+    parser.add_argument("--canonical", action="store_true")
+    parser.add_argument("--checkpoint-shards", action="store_true")
     parser.add_argument("--output", required=True)
     parser.add_argument("--snapshot")
     parser.add_argument(
@@ -49,7 +51,12 @@ def main():
 
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     dist.init_process_group("nccl")
-    cp = dist.get_world_size()
+    world = dist.get_world_size()
+    cp = 1 if args.checkpoint_shards else world
+    if args.canonical and cp != 1:
+        parser.error("canonical split-root CP is not qualified")
+    if args.checkpoint_shards and not args.canonical:
+        parser.error("checkpoint shards require the canonical CP1 reference")
     os.environ["ART_MEGATRON_CONTEXT_PARALLEL_SIZE"] = str(cp)
     os.environ["ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE"] = "1"
     os.environ["ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE"] = "1"
@@ -68,6 +75,8 @@ def main():
         model=args.model,
         weight_path=args.weight_path,
         cp=cp,
+        checkpoint_shards=world if args.checkpoint_shards else 1,
+        canonical=args.canonical,
         tp=1,
         ep=1,
         layers_override=args.layers,
@@ -159,6 +168,11 @@ def main():
             json.dumps(identity, sort_keys=True)
         )
     model = _language_model(runtime.model[0])
+    if args.canonical:
+        from art.megatron.canonical import RootLayout, install
+
+        install(model)
+        canonical_layout = RootLayout((args.tokens,))
     head_weight = (
         model.shared_embedding_or_output_weight()
         if model.share_embeddings_and_output_weights
@@ -188,12 +202,34 @@ def main():
         torch.cuda.reset_peak_memory_stats()
         dist.barrier()
         started = time.perf_counter()
-        with execution(placements) if args.root_closed else nullcontext():
-            [result] = trainer.dp_rank_forward(
-                [ForwardInput(input_tokens=tokens[:-1], hidden_states=True)],
-                checkpoint=None if args.base_only else slot,
-                no_grad=args.mode == "forward",
-            )
+        with ExitStack() as stack:
+            if args.root_closed:
+                stack.enter_context(execution(placements))
+            if args.canonical:
+                from art.megatron.canonical import execution as canonical_execution
+
+                stack.enter_context(canonical_execution(canonical_layout))
+            sharding = nullcontext(None)
+            if args.checkpoint_shards:
+                from art.megatron.context_parallel.checkpoint import (
+                    shard_saved_activations,
+                )
+
+                for chunk in runtime.model:
+                    no_sync = getattr(chunk, "no_sync", None)
+                    if callable(no_sync):
+                        stack.enter_context(no_sync())
+                sharding = shard_saved_activations(
+                    dist.group.WORLD,
+                    shape=(physical, 1, runtime.provider.hidden_size),
+                    key=f"probe/{args.model}/{args.tokens}/{args.lora_rank}/{iteration}",
+                )
+            with sharding as shard_stats:
+                [result] = trainer.dp_rank_forward(
+                    [ForwardInput(input_tokens=tokens[:-1], hidden_states=True)],
+                    checkpoint=None if args.base_only else slot,
+                    no_grad=args.mode == "forward",
+                )
             assert result.hidden_states is not None
             hidden = result.hidden_states
 
@@ -241,13 +277,17 @@ def main():
             peak_reserved_bytes=int(reserved),
             gradients_finite=finite,
             nonzero_gradient=nonzero,
+            checkpoint_storage=None if shard_stats is None else vars(shard_stats),
         )
         if args.snapshot and iteration == args.repeat - 1:
             from safetensors.torch import save_file
 
             tensors = {"logprobs": logprobs.detach().cpu().contiguous()}
             if args.mode == "backward":
-                gradients = trainer._reduce_dynamic_grads(parameters, scale_grads=1.0)
+                gradients = trainer._reduce_dynamic_grads(
+                    parameters,
+                    scale_grads=1.0 / world if args.checkpoint_shards else 1.0,
+                )
                 tensors.update(
                     {
                         f"gradient_{i}": g.cpu().contiguous()
