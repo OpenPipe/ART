@@ -670,6 +670,9 @@ class _MemoryProfile:
     warm_packed_tokens: int | None = None
     warm_logical_per_packed: float | None = None
     caller_plans: int = 0
+    # Qualified single-root hidden-only forwards keep observed scratch peaks
+    # as a fixed floor; analytic component floors still grow with token count.
+    forward_compute_peak_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -1003,6 +1006,7 @@ class _MemorySignature:
     # the profile learned from longer requests of the same signature.
     short_requests: bool = dataclass_field(default=False, compare=False)
     checkpoint_partition: tuple[int, tuple[int, int, int]] | None = None
+    bounded_forward_peak: bool = False
 
 
 @dataclass(frozen=True)
@@ -2776,7 +2780,7 @@ class TrainerRank:
         if backward is not None:
             backward.harvest()
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
-        with torch.set_grad_enabled(enabled):
+        with torch.set_grad_enabled(enabled), _memory.direct_forward_profile():
             self._reset_planning_telemetry()
             materialized = _materialize(inputs)
             requests = list(_flatten(materialized))
