@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -31,6 +33,13 @@ def main():
     parser.add_argument("--root-closed", action="store_true")
     parser.add_argument("--output", required=True)
     parser.add_argument("--snapshot")
+    parser.add_argument(
+        "--identity", help="Write complete frozen-base and adapter byte hashes"
+    )
+    parser.add_argument("--base-only", action="store_true")
+    parser.add_argument(
+        "--adapter-init", choices=("stress", "production", "zero_b"), default="stress"
+    )
     parser.add_argument("--repeat", type=int, default=1)
     args = parser.parse_args()
     import torch
@@ -67,6 +76,8 @@ def main():
         tokens=args.tokens,
         head_dtype="float32",
         lora_rank=args.lora_rank,
+        base_only=args.base_only,
+        adapter_init=args.adapter_init,
         gpu=torch.cuda.get_device_name(),
         torch=torch.__version__,
     )
@@ -99,6 +110,54 @@ def main():
         runtime, trainer, 1, base_model=args.model, lora_rank=args.lora_rank
     )
     parameters = trainer._checkpoint_slots[slot].params
+    if args.adapter_init != "stress":
+        from art.megatron.lora import LoRA, LoRASlot
+
+        generator = torch.Generator(device=trainer.device).manual_seed(32)
+        ref = trainer._slot_ref(slot)
+        with torch.no_grad():
+            modules = [
+                module
+                for chunk in runtime.model
+                for module in chunk.modules()
+                if isinstance(module, LoRA)
+            ]
+            for module in sorted(modules, key=lambda m: m.adapter_model_prefix):
+                if ref not in module._slot_keys:
+                    continue
+                adapter = module._slot_modules[module._slot_keys[ref]]
+                assert isinstance(adapter, LoRASlot)
+                adapter.A_T.uniform_(
+                    -1 / math.sqrt(module.in_features),
+                    1 / math.sqrt(module.in_features),
+                    generator=generator,
+                )
+                if args.adapter_init == "zero_b":
+                    adapter.B_T.zero_()
+                else:
+                    adapter.B_T.normal_(std=1e-3, generator=generator)
+    if args.identity:
+
+        def fingerprint(tensor):
+            raw = tensor.detach().contiguous().view(torch.uint8).cpu().numpy()
+            return dict(
+                shape=list(tensor.shape),
+                dtype=str(tensor.dtype),
+                sha256=hashlib.sha256(raw).hexdigest(),
+            )
+
+        identity = dict(
+            frozen={
+                f"{i}:{name}": fingerprint(p)
+                for i, chunk in enumerate(runtime.model)
+                for name, p in chunk.named_parameters()
+                if not p.requires_grad
+            },
+            adapter={str(i): fingerprint(p) for i, p in enumerate(parameters)},
+        )
+        Path(f"{args.identity}.rank{dist.get_rank()}.json").write_text(
+            json.dumps(identity, sort_keys=True)
+        )
     model = _language_model(runtime.model[0])
     head_weight = (
         model.shared_embedding_or_output_weight()
@@ -132,7 +191,7 @@ def main():
         with execution(placements) if args.root_closed else nullcontext():
             [result] = trainer.dp_rank_forward(
                 [ForwardInput(input_tokens=tokens[:-1], hidden_states=True)],
-                checkpoint=slot,
+                checkpoint=None if args.base_only else slot,
                 no_grad=args.mode == "forward",
             )
             assert result.hidden_states is not None
