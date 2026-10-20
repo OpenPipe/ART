@@ -89,3 +89,21 @@ def test_buffers_and_empty_extra_state_are_bound_and_validated():
     )
     assert model.get_buffer("state").data_ptr() == source.data_ptr()
     module.validate_external_weights([torch.nn.Sequential(model)])
+
+
+def test_validation_survives_ddp_style_buffers_attribute():
+    class Wrapper(torch.nn.Module):
+        def __init__(self, inner):
+            super().__init__()
+            self.module = inner
+            # MCore DDP shadows Module.buffers with its grad-buffer list.
+            object.__setattr__(self, "buffers", [])
+
+    model = torch.nn.Module()
+    model.register_buffer("state", torch.empty(3, device="meta"))
+    source = torch.randn(3)
+    bind_external_weights([model], {"0:state": source})
+    module.validate_external_weights([Wrapper(model)])
+    model.register_buffer("state", source.clone())
+    with pytest.raises(RuntimeError, match="external base"):
+        module.validate_external_weights([Wrapper(model)])

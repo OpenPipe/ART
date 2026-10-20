@@ -9,7 +9,6 @@ import torch
 @pytest.mark.parametrize("shared_factor", ["A", "B"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_shared_outer_matches_expanded_grouped(rank, shared_factor, dtype):
-    from art.megatron.kernels.cute_grouped_lora_quack import quack_grouped_lora
     from art.megatron.kernels.shared_outer_lora import shared_outer_lora
 
     torch.manual_seed(19)
@@ -29,8 +28,16 @@ def test_shared_outer_matches_expanded_grouped(rank, shared_factor, dtype):
     ).requires_grad_()
     reference = [value.detach().clone().requires_grad_() for value in (x, a, b)]
     xx, aa, bb = reference
-    expected = quack_grouped_lora(
-        xx, aa.expand(3, -1, -1), bb.expand(3, -1, -1), counts, scale=0.75
+    # Per-expert Torch reference: QuACK itself rejects ranks like 12.
+    rows = torch.split(xx, counts.tolist())
+    expected = torch.cat(
+        [
+            value
+            @ aa[0 if shared_factor == "A" else expert]
+            @ bb[0 if shared_factor == "B" else expert]
+            * 0.75
+            for expert, value in enumerate(rows)
+        ]
     )
     actual = shared_outer_lora(x, a, b, counts, scale=0.75, shared_factor=shared_factor)
     grad = torch.randn_like(actual)

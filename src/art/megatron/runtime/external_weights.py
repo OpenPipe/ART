@@ -80,13 +80,16 @@ def bind_external_weights(
 
 def validate_external_weights(chunks: list[torch.nn.Module]) -> None:
     """Require all bound base parameters AND buffers to survive model wrapping."""
+    # MCore DDP shadows Module.buffers with its grad-buffer list; call the
+    # Module methods directly.
+    module_api = torch.nn.Module
     reachable = {
         tensor.data_ptr()
         for chunk in chunks
-        for tensor in (*chunk.parameters(), *chunk.buffers())
+        for tensor in (*module_api.parameters(chunk), *module_api.buffers(chunk))
     }
     for chunk in chunks:
-        for module in chunk.modules():
+        for module in module_api.modules(chunk):
             for tensor, pointer in getattr(module, "_art_external_weight_aliases", ()):
                 if tensor.data_ptr() != pointer:
                     raise RuntimeError("model wrapping replaced external base storage")
