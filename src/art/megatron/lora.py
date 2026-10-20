@@ -45,6 +45,10 @@ from .lora_config import (
     default_lora_rank_for_handler,
 )
 from .routed_experts import capture_routes
+from .segmented_lora import (
+    _CURRENT_LORA_SEGMENTS,
+    segmented_lora_factors,
+)
 
 _LAYER_BLOCK_RE = re.compile(r"^(?P<block>.*\.layers\.\d+)\.")
 
@@ -131,15 +135,18 @@ def _collect_compile_garbage() -> None:
 
 def _with_captured_lora_slot(function: _F) -> _F:
     context = _CURRENT_LORA_SLOT.get()
+    segments = _CURRENT_LORA_SEGMENTS.get()
     function = capture_routes(function)
 
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         _collect_compile_garbage()
         token = _CURRENT_LORA_SLOT.set(context)
+        segment_token = _CURRENT_LORA_SEGMENTS.set(segments)
         try:
             result = function(*args, **kwargs)
         finally:
+            _CURRENT_LORA_SEGMENTS.reset(segment_token)
             _CURRENT_LORA_SLOT.reset(token)
         # A compile inside this call has unwound; collect before its backward.
         # Failed calls leave the mark for the next call, keeping their error.
@@ -964,6 +971,10 @@ class LoRA(torch.nn.Module):
     def active_lora_tensors(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+        if self.is_expert and _CURRENT_LORA_SEGMENTS.get() is not None:
+            raise NotImplementedError(
+                "segmented routed experts require an (expert, adapter) row layout"
+            )
         ref = _CURRENT_LORA_SLOT.get()
         if ref is None:
             return self.A_T, self.B_T, self.scale
@@ -977,6 +988,24 @@ class LoRA(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
     ) -> torch.Tensor:
+        segments = _CURRENT_LORA_SEGMENTS.get()
+        if segments is not None:
+            if self.is_expert or tokens_per_expert is not None:
+                raise NotImplementedError(
+                    "segmented routed experts require an (expert, adapter) row layout"
+                )
+            factors: list[tuple[torch.Tensor, torch.Tensor, float] | None] = []
+            for ref in segments.refs:
+                if ref is None:
+                    factors.append((self.A_T, self.B_T, self.scale))
+                else:
+                    slot = self._slot(ref) if ref.name is not None else None
+                    factors.append(
+                        (slot.A_T, slot.B_T, slot.scale) if slot is not None else None
+                    )
+            return segmented_lora_factors(
+                x, factors, segments, template_a=self.A_T, template_b=self.B_T
+            )
         active = self.active_lora_tensors()
         if active is None:
             return x.new_zeros((*x.shape[:-1], self.out_features))
@@ -1916,7 +1945,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             linear_fc1.return_layernorm_output = True
             linear_fc1.return_layernorm_output_gathered = True
         self.linear_fc1 = linear_fc1
-        self.out_features = int(linear_fc1.weight.shape[0])
+        self.out_features = int(cast(torch.Tensor, linear_fc1.weight).shape[0])
         self.non_gated = bool(non_gated)
         if self.non_gated:
             self.up_lora = _parallel_lora(
@@ -1950,8 +1979,11 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
                 (self.up_lora,) if self.non_gated else (self.gate_lora, self.up_lora)
             )
             for lora in loras:
-                zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
-                zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
+                if _CURRENT_LORA_SEGMENTS.get() is not None:
+                    zero = zero + lora(x).sum()
+                else:
+                    zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
+                    zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
             return zero.expand(*x.shape[:-1], self.out_features).clone(), None
         base_output, bias_out = self.linear_fc1(x)
         if isinstance(base_output, tuple):

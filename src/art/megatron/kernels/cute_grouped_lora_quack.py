@@ -494,9 +494,11 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         actual_rank = ctx.actual_rank
         scale = ctx.scale
         grad_out = cast(torch.Tensor, grad_outputs[0])
-        assert grad_out.stride(-1) == 1, (
-            "QuACK grouped LoRA backward requires grad_out stride(-1) == 1"
-        )
+        # Dense callers can supply an expanded gradient, e.g. output.sum().
+        # Preserve supported row-strided slices; materialize only the last axis
+        # when the GEMM contract requires it.
+        if grad_out.stride(-1) != 1:
+            grad_out = grad_out.contiguous()
 
         grad_tmp = _varlen_quack_gemm(
             grad_out,
