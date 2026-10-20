@@ -418,11 +418,13 @@ def _first_gdn(model: torch.nn.Module) -> GatedDeltaNet:
 def _packed_native_cp_case() -> GdnPhase0Case:
     return GdnPhase0Case(
         name="native_cp_packed_varying",
-        sequence_length=3072,
+        sequence_length=34816,
         rows=(
             GdnPackedRowShape(
                 families=(
-                    GdnFamilyShape(prefix_length=1024, suffix_lengths=(512, 512)),
+                    # The cost model keeps the old 1K prefix local. A 32K
+                    # prefix exercises CP while the short forks remain local.
+                    GdnFamilyShape(prefix_length=32768, suffix_lengths=(512, 512)),
                     GdnFamilyShape(prefix_length=512, suffix_lengths=(512,)),
                 )
             ),

@@ -2656,6 +2656,16 @@ def _runtime_plan_assignment(
             f"got {len(spec.rows)} rows."
         )
     row_spec = spec.rows[0]
+    if config.root_placements:
+        from .root_closed import root_closed_assignment
+
+        chunks, owners, waves = root_closed_assignment(
+            row_spec=row_spec,
+            placements=config.root_placements,
+            cp_size=cp_size,
+            block_size=int(config.block_size),
+        )
+        return row_spec, chunks, owners, waves
     chunk_size = _normalized_chunk_size(
         valid_tokens=int(row_spec.valid_tokens),
         block_size=int(config.block_size),
