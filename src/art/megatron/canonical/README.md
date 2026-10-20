@@ -31,6 +31,11 @@ recomputation. It serializes process-wide deterministic settings across trainer
 threads and restores them even after an exception. Do not suspend an async task
 inside it. ART's checkpoint wrapper captures immutable root metadata for CUDA
 recomputation threads, alongside the existing dynamic LoRA slot and routes.
+Fused callers may pass `install(model, row_context=slice_lora_segments)` to
+rebase adapter spans for each root call. This upgrades existing wrappers; later
+ordinary installation preserves that callback. The optional fused module is not
+a dependency of this policy.
+
 Hooks preserve model/Parameter identities and use ordinary operators outside
 the scope. Reinstalling them is harmless.
 
