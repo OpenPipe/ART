@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from contextvars import copy_context
 from dataclasses import (
     asdict,
     replace,
@@ -24,7 +23,6 @@ from dataclasses import (
 import hashlib
 from typing import TYPE_CHECKING
 
-from art.megatron.context_parallel.root_closed import current_root_placements
 from art.trainer_rank import _impl
 from art.trainer_rank._backward_work import region as _backward_region
 from art.trainer_rank._planner_cost import COEFFICIENT_VERSION_FALLBACK
@@ -1050,10 +1048,6 @@ def _layout_cache_key(
         hasher.update(str(row.dtype).encode("ascii"))
         hasher.update(_impl._U64_STRUCT.pack(int(row.numel())))
         hasher.update(row.numpy())
-    placements = current_root_placements()
-    if placements:
-        hasher.update(b"root_placements:")
-        hasher.update(repr(placements).encode("ascii"))
     return (
         hasher.hexdigest(),
         facts,
@@ -1296,13 +1290,8 @@ def _submit_speculative_wave_planning(
                 _impl.time.perf_counter() - worker_started
             )
 
-    planning_context = copy_context()
-
-    def warm_in_context() -> None:
-        planning_context.run(warm)
-
     self._speculative_planning_future = self._speculative_planning_executor().submit(
-        warm_in_context
+        warm
     )
 
 

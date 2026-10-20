@@ -124,12 +124,6 @@ class ContextParallelConfig:
     planner_remote_stage_pair_floor: int = 4_000_000
     planner_remote_stage_underfill_ms: float = 0.287151
     workload_profile: ContextParallelWorkloadProfile | None = None
-    # Explicit immutable placement leases, (start, end, first_rank, rank_count).
-    # An optional fifth boolean reverses the attention span-to-rank ordering.
-    # Empty retains ART's global search. Offsets include masked per-root padding.
-    root_placements: tuple[
-        tuple[int, int, int, int] | tuple[int, int, int, int, bool], ...
-    ] = ()
 
 
 @dataclass(frozen=True)
