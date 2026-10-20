@@ -139,3 +139,12 @@ def test_canonical_root_slices_keep_original_adapter_ownership():
         assert _CURRENT_LORA_SEGMENTS.get() is table
     with pytest.raises(ValueError, match="within"):
         table.slice(0, 385)
+
+
+def test_segment_metadata_owns_constructor_lists():
+    counts = [2, 5]
+    refs = ["a", "b"]
+    table = LoRASegments(cast(Any, refs), cast(Any, counts))
+    counts[0] = 100
+    refs.reverse()
+    assert table.counts == (2, 5) and table.refs == ("a", "b")

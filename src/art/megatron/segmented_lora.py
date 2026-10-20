@@ -32,6 +32,8 @@ class LoRASegments:
     grouped: bool = False
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "refs", tuple(self.refs))
+        object.__setattr__(self, "counts", tuple(self.counts))
         if not self.refs or len(self.refs) != len(self.counts):
             raise ValueError("segments require equally sized, nonempty refs/counts")
         if any(type(n) is not int or n < 0 for n in self.counts):
