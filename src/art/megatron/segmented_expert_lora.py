@@ -93,7 +93,10 @@ def expert_lora(
     *,
     scale: float = 1.0,
 ) -> torch.Tensor:
-    """Reference math for per-expert or singleton shared-outer A/B factors.
+    """Per-adapter math for per-expert or compact shared-outer A/B factors.
+
+    H200 reuses the ordinary native kernels with the adapter's own row geometry.
+    Other devices and FP32 use the Torch reference below.
 
     Shared A projects all of an adapter's rows together before expert B. Shared
     B projects all intermediate rows together after expert A. This avoids both
@@ -112,6 +115,27 @@ def expert_lora(
         or any(n < 0 for n in counts)
     ):
         raise ValueError("expert rows/counts/factor shapes disagree")
+    if (
+        x.shape[0] > 0
+        and x.is_cuda
+        and x.dtype in {torch.bfloat16, torch.float16}
+        and torch.cuda.get_device_capability(x.device)[0] == 9
+    ):
+        if a.shape[0] == b.shape[0] == experts:
+            from .kernels.cute_grouped_lora_quack import quack_grouped_lora
+
+            return quack_grouped_lora(x, a, b, list(counts), scale=scale)
+        if (a.shape[0], b.shape[0]) in {(1, experts), (experts, 1)}:
+            from .kernels.shared_outer_lora import shared_outer_lora
+
+            return shared_outer_lora(
+                x,
+                a,
+                b,
+                list(counts),
+                scale=scale,
+                shared_factor="A" if a.shape[0] == 1 else "B",
+            )
     if a.shape[0] == 1:
         tmp = x @ a[0]
     else:
