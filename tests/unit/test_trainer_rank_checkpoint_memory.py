@@ -773,6 +773,26 @@ def test_checkpoint_storage_partition_rejects_unmatched_roots(monkeypatch, unsup
     assert current_checkpoint_partition() is None
 
 
+def test_checkpoint_storage_partition_rejects_moe_models(monkeypatch):
+    from art.megatron.context_parallel.checkpoint import (
+        current_checkpoint_partition,
+        shard_saved_activations,
+    )
+
+    r = rank()
+    monkeypatch.setattr(r, "_topology_key", lambda: (2, 1, 1, 1))
+    monkeypatch.setattr(r, "_moe_layers", (0,))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    req = [
+        ForwardInput(input_tokens=torch.arange(1024), hidden_states=True, no_grad=False)
+    ]
+    with pytest.raises(ValueError, match="dense models only"):
+        with shard_saved_activations(object(), shape=(1024, 1, 2048), key="root"):
+            r._estimate_flat_forward(req)
+    assert current_checkpoint_partition() is None
+
+
 @pytest.mark.parametrize("element_bytes", [2, 4, 8])
 def test_checkpoint_partition_uses_activation_element_size(monkeypatch, element_bytes):
     from art.megatron.context_parallel.checkpoint import shard_saved_activations

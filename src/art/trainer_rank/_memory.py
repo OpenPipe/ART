@@ -1583,6 +1583,9 @@ def _memory_signature_from_requests(
 
     partition = current_checkpoint_partition()
     if partition is not None:
+        # Native MoE storage sharding failed full-model gradient parity on H200.
+        if self._moe_layers:
+            raise ValueError("checkpoint shards are qualified for dense models only")
         degree, shape = partition
         if (
             self._topology_key() != (degree, 1, 1, 1)
