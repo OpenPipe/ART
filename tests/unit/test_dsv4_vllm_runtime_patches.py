@@ -174,3 +174,51 @@ def test_dsv4_compressor_helper_uses_punica_metadata_without_full_batch_lora(
     assert result is output
     assert expand_calls == [((2, 1, 3, 2), 0), ((2, 1, 5, 2), 3)]
     assert output.abs().sum() > 0
+
+
+def _install_fake_platform(monkeypatch, *, cuda_alike: bool) -> None:
+    fake_vllm = types.ModuleType("vllm")
+    fake_platforms = types.ModuleType("vllm.platforms")
+    setattr(
+        fake_platforms,
+        "current_platform",
+        SimpleNamespace(is_cuda_alike=lambda: cuda_alike),
+    )
+    setattr(fake_vllm, "platforms", fake_platforms)
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.platforms", fake_platforms)
+
+
+def test_dsv4_mhc_fixed_split_skips_without_cuda_platform(monkeypatch) -> None:
+    patches = _load_dsv4_patches_module()
+    _install_fake_platform(monkeypatch, cuda_alike=False)
+    imported: list[str] = []
+    monkeypatch.setattr(patches.importlib, "import_module", imported.append)
+
+    # vLLM's TileLang mHC kernel module cannot be imported off CUDA.
+    patches.patch_dsv4_mhc_pre_fixed_split()
+
+    assert imported == []
+
+
+def test_dsv4_mhc_fixed_split_pins_prenorm_split_on_cuda(monkeypatch) -> None:
+    patches = _load_dsv4_patches_module()
+    _install_fake_platform(monkeypatch, cuda_alike=True)
+    kernels = SimpleNamespace(compute_num_split=lambda block_k, k, grid_size: 3)
+    monkeypatch.setattr(
+        patches.importlib,
+        "import_module",
+        lambda name: (
+            kernels
+            if name == "vllm.model_executor.kernels.mhc.tilelang_kernels"
+            else None
+        ),
+    )
+
+    patches.patch_dsv4_mhc_pre_fixed_split()
+    patched = kernels.compute_num_split
+    patches.patch_dsv4_mhc_pre_fixed_split()
+
+    assert kernels.compute_num_split is patched
+    assert patched(64, 16_384, 8) == 16
+    assert patched(64, 4_096, 8) == 3
