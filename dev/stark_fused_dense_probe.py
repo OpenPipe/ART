@@ -1,10 +1,14 @@
-"""Compare independent dense slots with one canonical mixed-adapter backward.
+"""Compare independent slots with one mixed-adapter backward.
 
 Run with one-rank torchrun; full pretrained Qwen3.8 by default. One complete
 root per adapter tests simultaneous gradients without cross-root BF16 sums.
+--moe selects native Qwen3.6 with compact shared-outer slots. --record-drift
+retains every failed comparison before exiting unsuccessfully; it never relaxes
+the exactness check.
 """
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -32,7 +36,11 @@ def digest(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--caladan-executor", action="store_true")
-    parser.add_argument("--model", default="Qwen/Qwen3.8-27B")
+    parser.add_argument("--model")
+    parser.add_argument("--moe", action="store_true")
+    parser.add_argument("--record-drift", action="store_true")
+    parser.add_argument("--native-repeats", type=int, default=0)
+    parser.add_argument("--zero-adapters", action="store_true")
     parser.add_argument("--lengths", nargs="+", type=int, default=[257, 129])
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--layers", type=int, default=0)
@@ -41,15 +49,31 @@ def main():
     )
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    args.model = args.model or (
+        "Qwen/Qwen3.6-35B-A3B" if args.moe else "Qwen/Qwen3.8-27B"
+    )
+    if args.moe and args.caladan_executor:
+        parser.error("the concrete Caladan callback currently qualifies dense only")
+    if len(args.lengths) < 2 or min(args.lengths) <= 0 or args.native_repeats < 0:
+        parser.error("use at least two positive root lengths and nonnegative repeats")
     os.environ["STARK_FUSED_WAVES"] = "1"
     os.environ["ART_DISABLE_MEGATRON_COMPILE"] = "1"
     os.environ["ART_MEGATRON_LORA_RANK"] = str(args.rank)
+    if args.moe:
+        os.environ["ART_MEGATRON_EXPERT_LORA_LAYOUT"] = "shared_outer"
+        os.environ["ART_MEGATRON_QWEN_LORA_PARAMETERIZATION"] = "tinker_v1"
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     dist.init_process_group("nccl")
     torch.manual_seed(731)
+    from art.megatron.model_support.registry import get_model_support_spec
     from art.megatron.prefix_tree_packing import prefix_tree_pack
     from art.megatron.prefix_tree_state import create_prefix_tree_state
+    from art.megatron.segmented_expert_lora import (
+        AdapterTokens,
+        install_segmented_dispatcher,
+        multi_adapter_tokens,
+    )
     from art.megatron.train import _placeholder_attention_mask, build_training_runtime
     from art.megatron.training.microbatches import _gdn_planner_config_for_provider
 
@@ -70,7 +94,7 @@ def main():
         model_identifier=args.model,
         model_initialization=args.initialization,
         provider_configure=configure,
-        model_support_key="qwen3_5_dense",
+        model_support_key=get_model_support_spec(args.model).key,
         build_optimizer=False,
         print_env=False,
     )
@@ -104,9 +128,16 @@ def main():
                 key = f"fused_{index}"
                 module._slot_keys[ref] = key
                 module._slot_modules[key] = slot
+                if args.zero_adapters:
+                    slot.B_T.zero_()
                 params[ref][name + ".A"] = slot.A_T
                 params[ref][name + ".B"] = slot.B_T
-    install(model, row_context=slice_lora_segments)
+    if args.moe:
+        for module in model.modules():
+            if hasattr(module, "token_dispatcher"):
+                install_segmented_dispatcher(module)
+    else:
+        install(model, row_context=slice_lora_segments)
     generator = torch.Generator().manual_seed(42)
     roots = [torch.randint(100, 10000, (n,), generator=generator) for n in args.lengths]
     weight = (
@@ -123,6 +154,7 @@ def main():
         "parameterization": os.environ.get(
             "ART_MEGATRON_QWEN_LORA_PARAMETERIZATION", "art"
         ),
+        "policy": "native" if args.moe else "canonical",
         "rows": [],
         "sources": {
             str(p.relative_to(Path(__file__).resolve().parents[1])): hashlib.sha256(
@@ -138,6 +170,12 @@ def main():
                 Path(__file__).resolve().parents[1] / "src/art/megatron/lora.py",
                 Path(__file__).resolve().parents[1]
                 / "src/art/megatron/segmented_lora.py",
+                Path(__file__).resolve().parents[1]
+                / "src/art/megatron/segmented_expert_lora.py",
+                Path(__file__).resolve().parents[1]
+                / "src/art/megatron/kernels/shared_outer_lora.py",
+                Path(__file__).resolve().parents[1]
+                / "src/art/megatron/kernels/cute_grouped_lora_quack.py",
             ]
         },
     }
@@ -248,7 +286,24 @@ def main():
             if fused
             else use_lora_slot(refs[indices[0]])
         )
-        with execution(layout), context:
+        adapter_tokens = (
+            multi_adapter_tokens(
+                AdapterTokens(
+                    tuple(refs[i] for i in indices),
+                    torch.repeat_interleave(
+                        torch.arange(len(indices), device="cuda"),
+                        torch.tensor(layout.padded_lengths, device="cuda"),
+                    ),
+                )
+            )
+            if args.moe
+            else nullcontext()
+        )
+        with (
+            nullcontext() if args.moe else execution(layout),
+            context,
+            adapter_tokens,
+        ):
             pre = model._preprocess(
                 input_ids=tokens, position_ids=positions, packed_seq_params=None
             )
@@ -293,12 +348,18 @@ def main():
 
     for index in range(len(refs)):
         reference.update(execute([index], False))
-    for indices, active in [
-        (list(range(len(refs))), None),
-        (list(reversed(range(len(refs)))), None),
-        (list(range(len(refs))), 0),
-    ]:
-        results = execute(indices, True, active)
+    comparisons = [
+        ("sequential-repeat", [index], False, None)
+        for _ in range(args.native_repeats)
+        for index in range(len(refs))
+    ] + [
+        ("fused", list(range(len(refs))), True, None),
+        ("fused-reversed", list(reversed(range(len(refs)))), True, None),
+        ("fused-isolation", list(range(len(refs))), True, 0),
+    ]
+    passed = True
+    for comparison, indices, fused, active in comparisons:
+        results = execute(indices, fused, active)
         for index, (logps, loss, gradients) in results.items():
             expected_logps, expected_loss, expected_grads = reference[index]
             masked = active is not None and index != active
@@ -307,11 +368,14 @@ def main():
                 for name, value in gradients.items()
             )
             row = {
+                "comparison": comparison,
                 "order": indices,
                 "active": active,
                 "adapter": index,
                 "logps_exact": torch.equal(logps, expected_logps),
                 "loss_exact": torch.equal(loss, expected_loss),
+                "logps_max_abs": float((logps - expected_logps).abs().max()),
+                "loss_abs": float((loss - expected_loss).abs()),
                 "gradients_exact": exact and gradients.keys() == expected_grads.keys(),
                 "gradient_max_abs": max(
                     float(
@@ -324,6 +388,22 @@ def main():
                 "gradient_hashes": {
                     name: digest(value) for name, value in gradients.items()
                 },
+                "gradient_relative_l2": (
+                    sum(
+                        float((value - expected_grads[name]).double().square().sum())
+                        for name, value in gradients.items()
+                    )
+                    / max(
+                        sum(
+                            float(value.double().square().sum())
+                            for value in expected_grads.values()
+                        ),
+                        1e-300,
+                    )
+                )
+                ** 0.5
+                if not masked
+                else None,
             }
             evidence["rows"].append(row)
             args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -341,8 +421,16 @@ def main():
             if not all(
                 row[key] for key in ("logps_exact", "loss_exact", "gradients_exact")
             ):
-                raise AssertionError("fused sequential canonical comparison failed")
+                passed = False
+                if not args.record_drift:
+                    raise AssertionError("fused sequential exact comparison failed")
+    evidence["passed"] = passed
+    args.output.write_text(json.dumps(evidence, indent=2))
     dist.destroy_process_group()
+    if not passed:
+        raise AssertionError(
+            "fused sequential exact comparison failed; see drift record"
+        )
 
 
 if __name__ == "__main__":
