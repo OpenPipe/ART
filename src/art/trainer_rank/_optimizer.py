@@ -513,13 +513,18 @@ def _dynamic_optimizer_padding_masks(
                 mapped_indices.add(index)
                 keys = expected_keys(str(suffix).removesuffix(".weight"))
                 if int(param.ndim) == 3:
-                    if len(keys) != int(param.shape[0]):
+                    shared = bool(getattr(param, "lora_shared_expert", False))
+                    if len(keys) != int(param.shape[0]) and not (
+                        shared and int(param.shape[0]) == 1
+                    ):
                         raise _impl.TrainerRankSlotStateError(
                             f"Cannot map optimizer padding for checkpoint "
                             f"{name!r}: {len(keys)} adapter keys describe "
                             f"{int(param.shape[0])} local experts."
                         )
                     for expert, key in enumerate(keys):
+                        # Logical shared-factor keys all own the singleton slice.
+                        expert = 0 if shared else expert
                         exported[str(key)] = _impl.torch.ones_like(param[expert].T)
                         owners[str(key)] = (index, expert)
                 elif len(keys) == 1:

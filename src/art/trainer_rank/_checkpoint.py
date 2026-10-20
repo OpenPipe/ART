@@ -998,7 +998,12 @@ def _expand_local_state(
             block = _block_for_key(key)
             payload = payloads.setdefault(block, {})
             for component, value in snapshot.tensors.items():
-                payload[f"{component}/{key}"] = lora_factor_view(value, index).T
+                tensor = lora_factor_view(value, index).T
+                if index is not None and value.shape[0] == 1 and len(experts) > 1:
+                    # Shared factors repeat under logical expert keys. A rank-1
+                    # transpose is already contiguous, so packing alone aliases.
+                    tensor = tensor.clone(memory_format=torch.contiguous_format)
+                payload[f"{component}/{key}"] = tensor
             value = payload[f"lora/{key}"]
             metadata_by_block.setdefault(block, {})[key] = LoraShardMeta(
                 key,

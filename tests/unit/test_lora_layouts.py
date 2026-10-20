@@ -30,12 +30,12 @@ def local_parallel_state(monkeypatch):
     monkeypatch.setattr(lm.ps, "get_tensor_model_parallel_world_size", lambda: 1)
 
 
-def expert_lora(projection="gate_up_proj", layout=None):
+def expert_lora(projection="gate_up_proj", layout=None, *, rank=2):
     return lm.LoRA(
         f"{PREFIX}.{{expert}}.{projection}",
         3,
         4,
-        2,
+        rank,
         3.5,
         torch.float32,
         torch.device("cpu"),
@@ -139,6 +139,133 @@ def test_shared_outer_persistence_inspection_and_packed_publish(projection):
     state[f"{PREFIX}.1.{projection}.{shared_suffix}.weight"].add_(1)
     with pytest.raises(ValueError, match="independent"):
         restored.load_lora(state)
+
+
+@pytest.mark.parametrize("rank", [1, 2])
+@pytest.mark.parametrize("projection", ["gate_up_proj", "down_proj"])
+@pytest.mark.parametrize("parameterization", ["tied_v0", "tinker_v1"])
+def test_shared_outer_public_checkpoint_continuation(
+    rank, projection, parameterization, tmp_path, monkeypatch
+):
+    from copy import deepcopy
+    import json
+    import shutil
+
+    import safetensors.torch
+    from test_trainer_rank_validation import _assert_nested_tensors_equal, _runtime
+
+    from art.trainer_rank import AdamParams, MaterializedCheckpoint
+    from art.trainer_rank._impl import _CheckpointSlot
+
+    layout = lm.LoraLayout(
+        expert="shared_outer", qwen_parameterization=parameterization
+    )
+    projections = (
+        ("gate_proj", "up_proj")
+        if parameterization == "tinker_v1" and projection == "gate_up_proj"
+        else (projection,)
+    )
+    config = layout.record_config(
+        {
+            "base_model_name_or_path": "test/model",
+            "r": rank,
+            "lora_alpha": 3.5,
+            "target_modules": list(projections),
+        }
+    )
+    adam = AdamParams(learning_rate=3e-4, beta1=0.8, beta2=0.95, weight_decay=0.1)
+
+    def make_trainer():
+        model = torch.nn.ModuleList(
+            [expert_lora(p, layout, rank=rank) for p in projections]
+        )
+        runtime = _runtime(model)
+        runtime.lora_layout = layout
+        trainer = TrainerRank(runtime)
+        monkeypatch.setattr(
+            trainer,
+            "_reduce_dynamic_grads",
+            lambda params, **_: tuple(p.grad.float() for p in params),
+        )
+        return trainer
+
+    def step(trainer):
+        ref = trainer._slot_ref("student")
+        for lora in trainer.runtime.model[0]:
+            a, b = lora.lora_slot_params(ref)
+            sum(
+                (lm.lora_factor_view(a, e) @ lm.lora_factor_view(b, e)).square().sum()
+                for e in range(3)
+            ).backward()
+        trainer.optim_step(params=adam, checkpoints=["student"])
+
+    def state(trainer):
+        slot = trainer._checkpoint_slots["student"]
+        dynamic = slot.optimizer
+        assert dynamic is not None
+        return deepcopy(
+            (slot.params, dynamic.master_params, dynamic.optimizer.state_dict())
+        )
+
+    original = make_trainer()
+    adapter = {}
+    for lora in original.runtime.model[0]:
+        with torch.no_grad():
+            for p in lora.parameters():
+                p.copy_(torch.arange(p.numel()).reshape(p.shape) / 16 + 0.25)
+        adapter.update(lora.sharded_lora_state_dict())
+    loaded = original._load_checkpoint_slot("student", adapter, alpha=3.5)
+    params = original._validate_checkpoint_consistency("student", loaded, set(adapter))
+    original._checkpoint_slots["student"] = _CheckpointSlot(params, cast(Any, config))
+    step(original)
+    before = state(original)
+    output = tmp_path / "checkpoint"
+    # Exercise both the asynchronous spill and final safetensors writers.
+    original.save_checkpoint(str(output), "student")
+    prepared = cp.prepare_checkpoint(str(output))
+    assert prepared.manifest is not None
+    assert len(prepared.keys) == len(projections) * 3 * 2
+    assert not list(tmp_path.glob(".checkpoint.snapshot-*"))
+    assert not (tmp_path / ".checkpoint.reserved").exists()
+
+    restored = make_trainer()
+    for trainer in (original, restored):
+        trainer.load_checkpoint(MaterializedCheckpoint("student", str(output)))
+        _assert_nested_tensors_equal(state(trainer), before)
+        assert [
+            tuple(p.shape) for p in trainer._checkpoint_slots["student"].params
+        ] == [tuple(p.shape) for p in params]
+        step(trainer)
+    _assert_nested_tensors_equal(state(restored), state(original))
+    assert any(
+        not torch.equal(after, prior)
+        for after, prior in zip(state(original)[0], before[0], strict=True)
+    )
+
+    # Authenticate edited artifacts so restore must check the shared duplicates,
+    # including masters and each Adam moment, rather than just file digests.
+    shared_suffix = "lora_B" if projection == "down_proj" else "lora_A"
+    key = f"{PREFIX}.1.{projections[0]}.{shared_suffix}.weight"
+    survivor = state(original)
+    for index, component in enumerate(("lora", "master", "exp_avg", "exp_avg_sq")):
+        broken = tmp_path / component
+        shutil.copytree(output, broken)
+        filename = (
+            "adapter_model.safetensors"
+            if index == 0
+            else prepared.manifest["parameters"][key][index - 1]
+        )
+        tensors = safetensors.torch.load_file(broken / filename)
+        tensors[key].add_(1)
+        safetensors.torch.save_file(tensors, broken / filename)
+        manifest = deepcopy(prepared.manifest)
+        manifest["files"][filename] = cp._file_digest(broken / filename)
+        manifest["digest"] = cp._manifest_digest(manifest)
+        (broken / cp.MANIFEST_FILE).write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="independent"):
+            original.load_checkpoint(MaterializedCheckpoint("broken", str(broken)))
+        assert set(original._checkpoint_slots) == {"student"}
+        _assert_nested_tensors_equal(state(original), survivor)
 
 
 @pytest.mark.parametrize("snapshot", [False, True])
