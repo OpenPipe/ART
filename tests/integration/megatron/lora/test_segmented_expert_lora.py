@@ -100,3 +100,109 @@ def test_slot_gradients_and_recompute_keep_dispatched_adapter_plan(shared, reent
             )
         else:
             assert parameter.grad is None
+
+
+@pytest.mark.parametrize("shared", ["A", "B"])
+def test_native_ep1_dispatch_outputs_input_probability_and_slot_gradients(shared):
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.moe.token_dispatcher import (
+        MoEAlltoAllTokenDispatcher,
+    )
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    from art.megatron.segmented_expert_lora import (
+        AdapterTokens,
+        install_segmented_dispatcher,
+        multi_adapter_tokens,
+    )
+
+    torch.manual_seed(81)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=2,
+        num_moe_experts=3,
+        moe_router_topk=2,
+        moe_permute_fusion=True,
+        moe_token_dispatcher_type="alltoall",
+        params_dtype=torch.bfloat16,
+    )
+    dispatcher = MoEAlltoAllTokenDispatcher(3, [0, 1, 2], config)
+    layer = SimpleNamespace(config=config, token_dispatcher=dispatcher)
+    install_segmented_dispatcher(layer)
+    install_segmented_dispatcher(layer)  # Idempotent, preserves the native object.
+    assert layer.token_dispatcher is dispatcher
+    prefix = "experts.{expert}." + ("gate_proj" if shared == "A" else "down_proj")
+    lora = LoRA(
+        prefix,
+        16,
+        16,
+        8,
+        8,
+        torch.bfloat16,
+        torch.device("cuda"),
+        num_local_experts=3,
+        expert_layout="shared_outer",
+    )
+    refs = tuple(LoRASlotRef("checkpoint", f"run-{i}") for i in range(3))
+    for index, ref in enumerate(refs):
+        slot = LoRASlot(
+            ref=ref,
+            a_t=torch.randn_like(lora.A_T) * 0.02,
+            b_t=torch.randn_like(lora.B_T) * 0.02,
+            alpha=8 * (index + 1),
+            a_template=lora.A_T,
+            b_template=lora.B_T,
+            requires_grad=True,
+        )
+        key = f"slot_{index}"
+        lora._slot_keys[ref], lora._slot_modules[key] = key, slot
+    x = torch.randn(7, 1, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    probabilities = torch.randn(7, 3, device="cuda", requires_grad=True)
+    routing = torch.ones(7, 3, device="cuda", dtype=torch.bool)
+    routing[torch.arange(7), torch.arange(7) % 3] = False
+    ids = torch.tensor([0, 2, 1, 0, 2, 1, 0], device="cuda")
+    cotangent = torch.randn_like(x)
+
+    def routed(hidden, routes, probs):
+        hidden, probs = dispatcher.dispatch_preprocess(hidden, routes, probs)
+        hidden, probs = dispatcher.token_dispatch(hidden, probs)
+        hidden, counts, probs = dispatcher.dispatch_postprocess(hidden, probs)
+        projected = lora(hidden, counts) * probs[:, None].to(hidden.dtype)
+        projected = dispatcher.combine_preprocess(projected)
+        projected = dispatcher.token_combine(projected)
+        return dispatcher.combine_postprocess(projected)
+
+    expected = torch.zeros_like(x)
+    for index, ref in enumerate(refs):
+        rows = torch.where(ids == index)[0]
+        tokens = AdapterTokens(
+            (ref,), torch.zeros(len(rows), dtype=torch.int64, device="cuda")
+        )
+        with multi_adapter_tokens(tokens):
+            result = routed(x[rows], routing[rows], probabilities[rows])
+        expected = expected.index_copy(0, rows, result)
+    expected.backward(cotangent)
+    dx, dp = (
+        cast(torch.Tensor, x.grad).clone(),
+        cast(torch.Tensor, probabilities.grad).clone(),
+    )
+    gradients = {
+        name: parameter.grad.clone()
+        for name, parameter in lora.named_parameters()
+        if parameter.grad is not None
+    }
+    lora.zero_grad(set_to_none=True)
+    x.grad = probabilities.grad = None
+    with multi_adapter_tokens(AdapterTokens(refs, ids)):
+        actual = routed(x, routing, probabilities)
+    actual.backward(cotangent)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(x.grad, dx, atol=0, rtol=0)
+    torch.testing.assert_close(probabilities.grad, dp, atol=0, rtol=0)
+    for name, parameter in lora.named_parameters():
+        if name in gradients:
+            torch.testing.assert_close(parameter.grad, gradients[name], atol=0, rtol=0)
+        else:
+            assert parameter.grad is None

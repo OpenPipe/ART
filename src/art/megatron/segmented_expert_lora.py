@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -285,10 +285,42 @@ def _combine_postprocess(dispatcher, hidden_states):
     return result
 
 
-def install_segmented_dispatcher(moe_layer) -> None:
-    """Install before execution, keeping ordinary per-run slot Parameters.
+def _ep1_dispatch_postprocess(dispatcher, original, hidden_states, probs):
+    """Replay EP1's exact native permutation on a detached scalar ID column."""
+    from megatron.core.transformer.moe.moe_utils import permute
 
-    The caller must initialize HybridEP buffers for hidden_size+16 and the
+    tokens = _CURRENT_ADAPTER_TOKENS.get()
+    if tokens is None:
+        raise RuntimeError("segmented dispatch requires multi_adapter_tokens")
+    if (
+        tokens.ids.device != hidden_states.device
+        or tokens.ids.numel() != dispatcher.routing_map.shape[0]
+    ):
+        raise ValueError("source adapter IDs must match native routing rows/device")
+    result = original(hidden_states, probs)
+    # TP=EP=1 makes native permutation 2 an identity. Use the same permutation
+    # implementation/flags as hidden states, including TE's fused row map.
+    ids, _, _, _, _ = permute(
+        tokens.ids[:, None].to(hidden_states.dtype),
+        dispatcher.routing_map,
+        probs=torch.zeros_like(dispatcher.routing_map, dtype=torch.float32),
+        num_out_tokens=dispatcher.num_out_tokens,
+        fused=dispatcher.config.moe_permute_fusion,
+        drop_and_pad=False,
+    )
+    _CURRENT_EXPERT_ADAPTER_PLAN.set(
+        ExpertAdapterPlan.build(tokens.refs, ids[:, 0].to(torch.int64), result[1])
+    )
+    return result
+
+
+def install_segmented_dispatcher(
+    moe_layer, *, transport: Literal["native", "hybridep"] = "native"
+) -> None:
+    """Install before execution, keeping ordinary slots and native EP1 dispatch.
+
+    Native all-to-all needs no communication header and supports the reference
+    path on SM120. Explicit HybridEP needs buffers for hidden_size+16 and the
     maximum admitted wave size before any graph is live. No buffer may grow
     while retained graphs exist. Only TP1/CP1/EP1 is admitted by v0.
     """
@@ -302,14 +334,37 @@ def install_segmented_dispatcher(moe_layer) -> None:
     ):
         raise ValueError("segmented transport requires TP1/CP1/EP1 BF16/FP16")
     dispatcher = moe_layer.token_dispatcher
+    if transport not in ("native", "hybridep"):
+        raise ValueError("unknown segmented transport")
+    if getattr(dispatcher, "_art_segmented_ep1", False):
+        if transport != "native":
+            raise ValueError("cannot switch a live segmented dispatcher transport")
+        return
     if isinstance(getattr(dispatcher, "_comm_manager", None), SegmentedHybridEPManager):
         return
     from megatron.core.transformer.moe.token_dispatcher import (
+        MoEAlltoAllTokenDispatcher,
         MoEFlexTokenDispatcher,
         _HybridEPManager,
     )
 
+    if transport == "native" and type(dispatcher) is MoEAlltoAllTokenDispatcher:
+        if (
+            dispatcher.tp_size != 1
+            or dispatcher.ep_size != 1
+            or dispatcher.drop_and_pad
+        ):
+            raise ValueError(
+                "native segmented dispatch requires TP1/EP1 without capacity padding"
+            )
+        dispatcher.dispatch_postprocess = partial(
+            _ep1_dispatch_postprocess, dispatcher, dispatcher.dispatch_postprocess
+        )
+        dispatcher._art_segmented_ep1 = True
+        return
     if not hasattr(dispatcher, "_comm_manager"):
+        if transport == "native":
+            raise ValueError("unsupported native segmented dispatcher")
         # Flex's constructor rejects TPxEP=1 although HybridEP supports it. Use
         # its initialized native groups and the existing flex methods, as in
         # the qualified EP1 spike. Never copy instance-bound ART callbacks.

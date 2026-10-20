@@ -160,3 +160,57 @@ def test_recompute_captures_original_tokens_and_dispatched_plan():
         assert captured() == (tokens, plan)
         assert _CURRENT_ADAPTER_TOKENS.get() is other
     assert _CURRENT_ADAPTER_TOKENS.get() is None
+
+
+def test_native_ep1_dispatch_replays_routing_without_modifying_base_result(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    from art.megatron.segmented_expert_lora import (
+        _CURRENT_EXPERT_ADAPTER_PLAN,
+        AdapterTokens,
+        _ep1_dispatch_postprocess,
+        multi_adapter_tokens,
+    )
+
+    routing = torch.tensor(
+        [[1, 0, 1], [1, 1, 0], [0, 1, 1], [0, 0, 1]], dtype=torch.bool
+    )
+    source_rows = routing.T.nonzero()[:, 1]
+    calls = []
+
+    def native_permute(
+        values, actual_routing, *, probs, num_out_tokens, fused, drop_and_pad
+    ):
+        assert actual_routing is routing and fused and not drop_and_pad
+        assert num_out_tokens == 7 and not values.requires_grad
+        calls.append("permute IDs")
+        return values[source_rows], probs.T[routing.T], source_rows, None, None
+
+    module = ModuleType("megatron.core.transformer.moe.moe_utils")
+    setattr(module, "permute", native_permute)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    dispatcher = SimpleNamespace(
+        routing_map=routing,
+        num_out_tokens=7,
+        config=SimpleNamespace(moe_permute_fusion=True),
+    )
+    hidden = torch.randn(7, 5, requires_grad=True)
+    probabilities = torch.randn(7, requires_grad=True)
+    result = (hidden, torch.tensor([2, 2, 3]), probabilities)
+
+    def original(x, p):
+        assert x is hidden and p is probabilities
+        calls.append("native postprocess")
+        return result
+
+    tokens = AdapterTokens(cast(Any, ("a", "b")), torch.tensor([0, 1, 0, 1]))
+    with multi_adapter_tokens(tokens):
+        assert (
+            _ep1_dispatch_postprocess(dispatcher, original, hidden, probabilities)
+            is result
+        )
+        plan = _CURRENT_EXPERT_ADAPTER_PLAN.get()
+        assert plan is not None and plan.counts == ((1, 1, 2), (1, 1, 1))
+    assert calls == ["native postprocess", "permute IDs"]
+    assert _CURRENT_EXPERT_ADAPTER_PLAN.get() is None
