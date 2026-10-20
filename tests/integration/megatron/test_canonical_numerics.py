@@ -9,6 +9,9 @@ pytestmark = pytest.mark.gpu
 
 
 def test_canonical_decoder_gradients_survive_repacking(monkeypatch, tmp_path):
+    monkeypatch.setenv("ART_DISABLE_MEGATRON_COMPILE", "1")
+    monkeypatch.setenv("ART_MEGATRON_LORA_RANK", "8")
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     if not torch.cuda.is_available():
         pytest.skip("requires one CUDA GPU and megatron_runtime")
     from megatron.core import parallel_state
@@ -21,9 +24,6 @@ def test_canonical_decoder_gradients_survive_repacking(monkeypatch, tmp_path):
     from art.megatron.train import _placeholder_attention_mask, build_training_runtime
     from art.megatron.training.microbatches import _gdn_planner_config_for_provider
 
-    monkeypatch.setenv("ART_DISABLE_MEGATRON_COMPILE", "1")
-    monkeypatch.setenv("ART_MEGATRON_LORA_RANK", "8")
-    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     torch.cuda.set_device(0)
     dist.init_process_group(
         "nccl", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
