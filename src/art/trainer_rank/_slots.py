@@ -510,6 +510,10 @@ def _validate_checkpoint_adapter_config(
     alpha: float | None,
 ) -> _AdapterConfig | None:
     config = None if adapter_config is None else deepcopy(dict(adapter_config))
+    if config is not None and "art_lora_native_config" in config:
+        from art.megatron.model_support.lora_disk import training_adapter_config
+
+        config = training_adapter_config(config)
     if _impl.dist.is_available() and _impl.dist.is_initialized():
         gathered: list[dict[str, object] | None] = [None] * _impl.dist.get_world_size()
         _impl.dist.all_gather_object(gathered, config, group=self._checkpoint_group())
@@ -556,6 +560,13 @@ def _validate_checkpoint_adapter_config(
         raise ValueError(
             f"alpha={alpha} conflicts with adapter_config lora_alpha={config_alpha}"
         )
+    layout = getattr(self.runtime, "lora_layout", None)
+    if layout is not None:
+        config = layout.record_config(config)
+    elif "art_lora_layout" in config:
+        from art.megatron.lora import LoraLayout
+
+        LoraLayout().validate_config(config)
     return cast(_impl._AdapterConfig, config)
 
 

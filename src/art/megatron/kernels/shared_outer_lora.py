@@ -24,14 +24,16 @@ from .cute_grouped_lora_quack import (
 )
 
 
-def _grouped(x, w, offsets, out_features, *, alpha=1.0):
+def _grouped(x, w, offsets, out_features, *, alpha=1.0, projection=False):
     return _varlen_quack_gemm(
         x.contiguous(),
         w,
         out_features=out_features,
         expert_offsets=offsets,
         tile_m=64,
-        tile_n=_matmul_tile_n(out_features),
+        tile_n=_proj_tile_n(out_features)
+        if projection
+        else _matmul_tile_n(out_features),
         alpha=alpha,
     )
 
@@ -50,7 +52,9 @@ class _SharedOuter(torch.autograd.Function):
                 tmp, b.transpose(1, 2).contiguous(), offsets, b.shape[-1], alpha=scale
             )
         else:
-            tmp = _grouped(x, a.transpose(1, 2).contiguous(), offsets, effective)
+            tmp = _grouped(
+                x, a.transpose(1, 2).contiguous(), offsets, effective, projection=True
+            )
             out = torch.addmm(b.new_empty(b.shape[-1]), tmp, b[0], beta=0, alpha=scale)
         ctx.save_for_backward(x, a, b, tmp, offsets)
         ctx.rank, ctx.scale, ctx.shared_a = rank, scale, shared_a
@@ -63,7 +67,9 @@ class _SharedOuter(torch.autograd.Function):
         effective, scale = a.shape[-1], ctx.scale
         grad_out = grad_out.contiguous()
         if ctx.shared_a:
-            grad_tmp = _grouped(grad_out, b, offsets, effective, alpha=scale)
+            grad_tmp = _grouped(
+                grad_out, b, offsets, effective, alpha=scale, projection=True
+            )
             grad_x = grad_tmp @ a[0].T
             grad_a = (x.T @ grad_tmp).unsqueeze(0)
             grad_b = _varlen_quack_gemm_k(

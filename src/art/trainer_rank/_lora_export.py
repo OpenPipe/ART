@@ -138,6 +138,9 @@ def _prepare_vllm_lora_publish(
 ) -> _VllmLoraPublishPlan:
     from art.megatron.weights import lora_publish
 
+    for module in lora_publish.iter_lora_modules(model):
+        adapter_config = module.lora_layout.record_config(adapter_config)
+        break
     rank, device = (
         _validate_vllm_lora_publish_runtime(rank, world_size)
         if runtime is None
