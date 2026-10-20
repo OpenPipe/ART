@@ -106,7 +106,7 @@ def install_compile_garbage_collection() -> bool:
         return False
     handler = torch._dynamo.callback_handler
     if _mark_compile_garbage not in handler.end_callbacks:
-        handler.register_end_callback(_mark_compile_garbage)
+        handler.register_end_callback(cast(Any, _mark_compile_garbage))
     return True
 
 
@@ -654,9 +654,9 @@ class LoRA(torch.nn.Module):
                 check_initialized=False
             )
             if group is not None and group.size() > 1:
-                torch.distributed.broadcast(
+                torch.distributed.broadcast(  # ty: ignore[possibly-missing-attribute]
                     param.data,
-                    src=torch.distributed.get_global_rank(group, 0),
+                    src=torch.distributed.get_global_rank(group, 0),  # ty: ignore[possibly-missing-attribute]
                     group=group,
                 )
             return
