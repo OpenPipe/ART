@@ -43,8 +43,6 @@ def chunk_gated_delta_rule_native_cp(
         raise ValueError(f"g must be [1, T, H], got {tuple(g.shape)}")
     if tuple(beta.shape) != tuple(q.shape[:3]):
         raise ValueError(f"beta must be [1, T, H], got {tuple(beta.shape)}")
-    if int(q.shape[1]) <= 0:
-        raise ValueError("native FLA CP GDN currently requires non-empty rank shards")
     if initial_state.ndim != 4:
         raise ValueError(
             f"initial_state must be [N, H, K, V], got {tuple(initial_state.shape)}"
@@ -122,7 +120,38 @@ def _fla_chunk_boundaries_aligned_cpu(lengths_by_rank: Tensor) -> bool:
     if int(lengths_by_rank.shape[0]) <= 1:
         return True
     starts = torch.cumsum(lengths_by_rank, dim=0)[:-1]
-    return bool(torch.all(starts.remainder(64) == 0).item())
+    # The last participating rank may finish a partial chunk. Trailing
+    # zero-token ranks carry identity summaries and do not start a new chunk.
+    tokens_after = lengths_by_rank.sum(dim=0).unsqueeze(0) - starts
+    return bool(torch.all((starts.remainder(64) == 0) | (tokens_after == 0)).item())
+
+
+def _identity_summary(state: Tensor, *, multi: bool) -> Tensor:
+    """An empty shard forwards the recurrent state and its cotangent unchanged."""
+    key_dim, value_dim = state.shape[-2:]
+    summary = state.new_zeros(
+        (*state.shape[:-1], value_dim + key_dim), dtype=torch.float32
+    )
+    summary[..., value_dim:] = torch.eye(key_dim, device=state.device)
+    return summary if multi else summary[0]
+
+
+def _native_chunk_indices(cu_seqlens: Tensor, cu_seqlens_cpu: Tensor) -> Tensor:
+    lengths = (cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]).tolist()
+    if any(length == 0 for length in lengths):
+        # FLA 0.5 infers sequence IDs by counting chunk-index zeros, which
+        # silently renumbers sequences after an empty column. Preserve IDs.
+        entries = [
+            (sequence, chunk)
+            for sequence, length in enumerate(lengths)
+            for chunk in range((int(length) + 63) // 64)
+        ]
+        return torch.tensor(
+            entries, dtype=cu_seqlens.dtype, device=cu_seqlens.device
+        ).reshape(-1, 2)
+    from fla.ops.utils import prepare_chunk_indices
+
+    return prepare_chunk_indices(cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu)
 
 
 class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
@@ -141,15 +170,33 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
         output_final_state: bool,
         scale: float,
     ) -> tuple[Tensor, Tensor | None]:
+        ctx.empty_rank = int(q.shape[1]) == 0
+        if ctx.empty_rank:
+            summary = _identity_summary(initial_state, multi=cu_seqlens is not None)
+            local_initial = _scan_fwd_initial_state(
+                _prefix_summary_exclusive(summary, group), initial_state
+            )
+            final_state = (
+                _broadcast_chain_final_state(local_initial.clone(), group)
+                if output_final_state
+                else None
+            )
+            ctx.save_for_backward(q, k, v, g, beta, local_initial)
+            ctx.group = group
+            ctx.multi = cu_seqlens is not None
+            ctx.output_final_state = output_final_state
+            return torch.empty_like(v), final_state
         from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
         from fla.ops.common.chunk_o import chunk_fwd_o
         from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
         from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
-        from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices, solve_tril
+        from fla.ops.utils import chunk_local_cumsum, solve_tril
 
+        if cu_seqlens is not None and cu_seqlens_cpu is None:
+            raise ValueError("native FLA CP varlen requires CPU cu_seqlens metadata")
         chunk_indices = (
-            prepare_chunk_indices(cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu)
-            if cu_seqlens is not None
+            _native_chunk_indices(cu_seqlens, cu_seqlens_cpu)
+            if cu_seqlens is not None and cu_seqlens_cpu is not None
             else None
         )
         chunk_local_cumsum = cast(Any, chunk_local_cumsum)
@@ -227,6 +274,31 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Tensor | None) -> tuple[Any, ...]:
+        if ctx.empty_rank:
+            q, k, v, g, beta, local_initial = ctx.saved_tensors
+            external = _external_final_state_grad(
+                grad_outputs[1],
+                local_initial,
+                group=ctx.group,
+                enabled=ctx.output_final_state,
+            )
+            _, full = _suffix_summary_exclusive_and_full(
+                _identity_summary(local_initial, multi=ctx.multi), ctx.group
+            )
+            dh0 = _scan_bwd_initial_state_grad(full, external)
+            return (
+                torch.zeros_like(q),
+                torch.zeros_like(k),
+                torch.zeros_like(v),
+                torch.zeros_like(g),
+                torch.zeros_like(beta),
+                dh0.to(local_initial),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         from fla.ops.common.chunk_o import chunk_bwd_dv_local
         from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd
         from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd

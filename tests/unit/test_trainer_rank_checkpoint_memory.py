@@ -709,3 +709,65 @@ def test_dense_no_grad_stage_and_pending_backward_are_separate_peaks(
     assert actual == int((1_000_000 + max(backward, no_grad_stage)) * 1.1)
     assert (backward > no_grad_stage) == (pending_per_layer == 2_000_000)
     assert actual < int((1_000_000 + backward + no_grad_stage) * 1.1)
+
+
+@pytest.mark.parametrize("degree", [2, 4, 8])
+def test_checkpoint_storage_partition_has_separate_profile_and_full_workspace(
+    monkeypatch, degree
+):
+    from art.megatron.context_parallel.checkpoint import (
+        current_checkpoint_partition,
+        shard_saved_activations,
+    )
+
+    r = rank()
+    monkeypatch.setattr(r, "_topology_key", lambda: (degree, 1, 1, 1))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: degree)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    req = [
+        ForwardInput(input_tokens=torch.arange(1024), hidden_states=True, no_grad=False)
+    ]
+    plain = r._estimate_flat_forward(req)
+    original, _ = r._checkpoint_memory_floor(plain[3])
+    with shard_saved_activations(object(), shape=(1024, 1, 2048), key="root"):
+        shared = r._estimate_flat_forward(req)
+        saved, workspace = r._checkpoint_memory_floor(shared[3])
+        assert saved * degree == original
+        assert workspace >= r._sequence_parallel_workspace_bytes(1024) + 1024 * 2048 * 2
+        assert price(r, shared).checkpoint_input_gradient == 1024 * 2048 * 2
+        assert shared[2] != plain[2]
+        assert shared[2].checkpoint_partition == (degree, (1024, 1, 2048))
+        r._memory_profiles[shared[2]] = _MemoryProfile(
+            bytes_per_token=1, packed_tokens=1024, logical_per_packed=1
+        )
+        assert plain[2] not in r._memory_profiles
+    assert current_checkpoint_partition() is None
+    assert r._checkpoint_memory_floor(plain[3])[0] == original
+
+
+@pytest.mark.parametrize("unsupported", ["length", "multiple", "recompute"])
+def test_checkpoint_storage_partition_rejects_unmatched_roots(monkeypatch, unsupported):
+    from art.megatron.context_parallel.checkpoint import (
+        current_checkpoint_partition,
+        shard_saved_activations,
+    )
+
+    r = rank()
+    monkeypatch.setattr(r, "_topology_key", lambda: (2, 1, 1, 1))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    req = [
+        ForwardInput(
+            input_tokens=torch.arange(1025 if unsupported == "length" else 1024),
+            hidden_states=True,
+            no_grad=False,
+        )
+    ]
+    if unsupported == "multiple":
+        req *= 2
+    if unsupported == "recompute":
+        r.runtime.model[0].decoder.config.recompute_num_layers = 2
+    with pytest.raises(ValueError, match="one CP1 uniform-recompute root"):
+        with shard_saved_activations(object(), shape=(1024, 1, 2048), key="root"):
+            r._estimate_flat_forward(req)
+    assert current_checkpoint_partition() is None

@@ -903,6 +903,19 @@ def _checkpoint_floor_from_facts(
         workspace += math.ceil(roots * self._gdn_segment_layer_bytes())
     if hybridep_rows is not None:
         workspace = max(workspace, -(-hybridep_rows // 4) * 4 * self._hidden_size * 2)
+    from art.megatron.context_parallel.checkpoint import current_checkpoint_partition
+
+    partition = current_checkpoint_partition()
+    if partition is not None and gradient_rows:
+        degree, shape = partition
+        if group_rows != ((shape[0], True),):
+            raise ValueError("checkpoint shards require one complete gradient root")
+        width = math.ceil(math.prod(shape) / degree)
+        retained = width * 2 * layers
+        # Recompute still runs the complete CP1 layer, beside the all-gather
+        # buffer. Only the saved boundaries shrink; workspace does not.
+        workspace = max(workspace, self._sequence_parallel_workspace_bytes(shape[0]))
+        workspace += width * degree * 2
     return retained, workspace
 
 
@@ -1023,6 +1036,12 @@ def _checkpoint_input_gradient_bytes(
     group being recomputed.
     """
     tp = self._topology_key()[1]
+    from art.megatron.context_parallel.checkpoint import current_checkpoint_partition
+
+    partition = current_checkpoint_partition()
+    if partition is not None and retained:
+        # One full recomputed root's dX; its layer workspace is explicit.
+        return math.prod(partition[1]) * self._param_dtype_size
     if not retained or tp == 1:
         return retained
     rows = max((rows for rows, grad in group_rows if grad), default=0)
@@ -1483,6 +1502,19 @@ def _memory_signature_from_requests(
     grad_modes: Iterable[bool],
     slot_groups: Iterable[tuple["LoRASlotRef | None", bool]] = (),
 ) -> _impl._MemorySignature:
+    from art.megatron.context_parallel.checkpoint import current_checkpoint_partition
+
+    partition = current_checkpoint_partition()
+    if partition is not None:
+        degree, shape = partition
+        if (
+            self._topology_key() != (degree, 1, 1, 1)
+            or len(requests) != 1
+            or int(requests[0].input_tokens.numel()) != shape[0]
+            or shape[2] != self._hidden_size
+            or not _checkpoint_layers(self, ((shape[0], True),))
+        ):
+            raise ValueError("checkpoint shards require one CP1 uniform-recompute root")
     modes = tuple(sorted(grad_modes))
     shapes = tuple(
         sorted((grad, self._slot_memory_shapes(ref)) for ref, grad in slot_groups)
@@ -1498,6 +1530,7 @@ def _memory_signature_from_requests(
         grad_modes=modes,
         slot_shapes=shapes if any(any(shape) for _, shape in shapes) else (),
         short_requests=any(_impl._short_request(request) for request in requests),
+        checkpoint_partition=partition,
     )
 
 

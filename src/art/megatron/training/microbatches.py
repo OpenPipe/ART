@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from typing import Any, cast
 
 from megatron.core import parallel_state as ps
@@ -8,6 +9,7 @@ from pydantic import BaseModel, ConfigDict
 import torch
 
 from art.loss import LossInputs, shift_tensor
+from art.megatron.context_parallel.root_closed import current_root_placements
 from art.megatron.context_parallel.runtime import (
     context_parallel_rank_model_token_counts,
     prepare_cp_micro,
@@ -546,12 +548,14 @@ def _context_parallel_config_for_provider(
     head_dim = getattr(provider, "kv_channels", None)
     if head_dim is None:
         return ContextParallelConfig(
+            root_placements=current_root_placements(),
             workload_profile=model_support_handler.context_parallel_workload_profile(
                 provider
             ),
             planner_owned_token_ms=_owned_token_ms_for_provider(provider),
         )
     return ContextParallelConfig(
+        root_placements=current_root_placements(),
         attention_sparse_block_size=flash_sparse_block_size_for_head_dim(
             head_dim=int(head_dim),
             head_dim_v=int(head_dim),
@@ -601,7 +605,8 @@ def _gdn_planner_config_for_provider(
         return None
     from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
 
-    return GdnPlannerConfig.from_provider(provider)
+    config = GdnPlannerConfig.from_provider(provider)
+    return replace(config, root_closed=True) if current_root_placements() else config
 
 
 def _next_micro_lookahead(
