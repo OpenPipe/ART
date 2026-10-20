@@ -87,6 +87,10 @@ def main():
         lora_rank=args.lora_rank,
         base_only=args.base_only,
         adapter_init=args.adapter_init,
+        gdn_parameterization=os.environ.get(
+            "ART_MEGATRON_QWEN_LORA_PARAMETERIZATION", "native"
+        ),
+        expert_lora_layout=os.environ.get("ART_MEGATRON_EXPERT_LORA_LAYOUT"),
         gpu=torch.cuda.get_device_name(),
         torch=torch.__version__,
     )
@@ -207,6 +211,8 @@ def main():
         "loaded",
         elapsed_s=time.perf_counter() - started,
         layers=runtime.provider.num_layers,
+        trainable_tensors=len(parameters),
+        trainable_elements=sum(parameter.numel() for parameter in parameters),
         optimizer_state_bytes=sum(
             t.numel() * t.element_size() for t in optimizer_state
         ),
