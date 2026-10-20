@@ -11,7 +11,7 @@ from art.megatron.context_parallel.checkpoint import (
     current_checkpoint_partition,
     shard_saved_activations,
 )
-from tests.unit.trainer_rank_test_support import process_group, spawn_and_join
+from trainer_rank_test_support import process_group, spawn_and_join
 
 
 def _worker(rank, rendezvous, world, backend, dtype):
