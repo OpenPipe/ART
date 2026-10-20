@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from tests.unit.test_checkpoint_shards import run_shards
+from ..unit.test_checkpoint_shards import run_shards
 
 
 @pytest.mark.parametrize("world", [2, 4])

@@ -30,7 +30,7 @@ def observe(rank, plan, compute):
     )
 
 
-def test_three_token_cold_peak_does_not_price_81920_linearly(bounded_rank, monkeypatch):
+def test_three_token_cold_peak_refuses_uncalibrated_81920(bounded_rank, monkeypatch):
     rank = bounded_rank
     short = rank._plan_flat_forward([request(3)])
     long = rank._plan_flat_forward([request(81920)])
@@ -46,10 +46,10 @@ def test_three_token_cold_peak_does_not_price_81920_linearly(bounded_rank, monke
     assert profile.forward_compute_peaks == ((3, fixed),)
     assert profile.bytes_per_token * 81920 > 10_000 * 2**30
     # A lone tiny observation cannot bound an unseen long root safely.
-    assert rank._memory_check(long).estimated_required_bytes > 10_000 * 2**30
+    assert rank._memory_check(long).estimated_required_bytes > 63 * 2**30
     assert not rank._memory_check(long).fits
-    # Calibrate progressively within the ordinary profile trust window. Cold
-    # scratch no longer poisons the slope after longer roots are observed.
+    # Calibrate progressively as the growing estimates permit. Cold scratch
+    # no longer poisons the slope after longer roots are observed.
     for tokens in (24, 192, 1536, 8192):
         plan = rank._plan_flat_forward([request(tokens)])
         assert rank._memory_check(plan).fits
@@ -226,15 +226,15 @@ def test_cap_grows_beyond_longest_observed_root(bounded_rank):
     observed = rank._plan_flat_forward([request(8192)])
     peak = 2**40  # Dominate the analytic floors and outputs in this witness.
     observe(rank, observed, peak)
-    for tokens in (4096, 8192, 16384, 32768):
+    for tokens, growth in ((4096, 1), (8192, 1), (16384, 1.25), (32768, 1.75)):
         plan = rank._plan_flat_forward([request(tokens)])
         assert rank._memory_check(plan).estimated_required_bytes == int(
-            (plan.output_bytes + peak * max(1, tokens / 8192)) * 1.1
+            (plan.output_bytes + peak * growth) * 1.1
         )
 
 
 @pytest.mark.parametrize("grad", [False, True])
-def test_fixed_intercept_admits_long_root_with_marginal_growth(
+def test_fixed_intercept_admits_within_horizon_and_keeps_steepest_rate(
     bounded_rank, monkeypatch, grad
 ):
     rank = bounded_rank
@@ -242,12 +242,12 @@ def test_fixed_intercept_admits_long_root_with_marginal_growth(
     with _memory.direct_forward_profile():
         short, medium, long = [
             rank._plan_flat_forward([replace(request(tokens), no_grad=not grad)])
-            for tokens in (128, 1024, 81920)
+            for tokens in (128, 1024, 4096)
         ]
     observe(rank, short, 10 * 2**30)
     observe(rank, medium, 21 * 2**29)
     slope = 2**29 / (1024 - 128)
-    compute = 21 * 2**29 + slope * (81920 - 1024)
+    compute = 21 * 2**29 * 1.75
     check = rank._memory_check(long)
     assert check.fits
     assert check.estimated_required_bytes == int(
@@ -256,19 +256,22 @@ def test_fixed_intercept_admits_long_root_with_marginal_growth(
     # A flatter later interval must not replace the steepest qualifying pair.
     with _memory.direct_forward_profile():
         later = rank._plan_flat_forward([replace(request(8192), no_grad=not grad)])
+        long = rank._plan_flat_forward([replace(request(32768), no_grad=not grad)])
     observe(rank, later, 11 * 2**30)
-    compute = 11 * 2**30 + slope * (81920 - 8192)
+    compute = 11 * 2**30 + slope * (32768 - 8192)
     assert rank._memory_check(long).estimated_required_bytes == int(
         (long.output_bytes + int(compute)) * 1.1
     )
 
 
 @pytest.mark.parametrize("grad", [False, True])
-def test_caladan_ladder_admits_each_step(bounded_rank, monkeypatch, grad):
+def test_fixed_intercept_ladder_admits_each_step_within_horizon(
+    bounded_rank, monkeypatch, grad
+):
     rank = bounded_rank
-    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 90 * 2**30)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 63 * 2**30)
     with _memory.direct_forward_profile():
-        for tokens in (128, 1024, 8192, 32768, 81920):
+        for tokens in (128, 512, 2048, 8192, 32768, 81920):
             plan = rank._plan_flat_forward([replace(request(tokens), no_grad=not grad)])
             check = rank._memory_check(plan)
             assert check.fits
@@ -278,7 +281,9 @@ def test_caladan_ladder_admits_each_step(bounded_rank, monkeypatch, grad):
             observe(rank, plan, compute)
 
 
-def test_close_observations_keep_proportional_extrapolation(bounded_rank, monkeypatch):
+def test_close_observations_grow_proportionally_beyond_horizon(
+    bounded_rank, monkeypatch
+):
     rank = bounded_rank
     for tokens, peak in ((128, 10 * 2**30), (200, 12 * 2**30)):
         observe(rank, rank._plan_flat_forward([request(tokens)]), peak)
@@ -287,7 +292,7 @@ def test_close_observations_keep_proportional_extrapolation(bounded_rank, monkey
     check = rank._memory_check(long)
     assert not check.fits
     assert check.estimated_required_bytes == int(
-        (long.output_bytes + int(12 * 2**30 * 8192 / 200)) * 1.1
+        (long.output_bytes + int(12 * 2**30 * 1.75 * 8192 / 800)) * 1.1
     )
 
 
@@ -296,11 +301,14 @@ def test_marginal_growth_can_refuse_more_than_origin_fit(bounded_rank, monkeypat
     for tokens, peak in ((128, 10 * 2**30), (256, 30 * 2**30)):
         observe(rank, rank._plan_flat_forward([request(tokens)]), peak)
     monkeypatch.setattr(rank, "_available_memory_bytes", lambda: 70 * 2**30)
-    long = rank._plan_flat_forward([request(512)])
     # The measured slope predicts 70 GiB, while the origin fit predicts 60.
-    check = rank._memory_check(long)
-    assert not check.fits
-    assert check.estimated_required_bytes == int((long.output_bytes + 70 * 2**30) * 1.1)
+    for tokens, gib in ((512, 70), (1024, 150), (2048, 300)):
+        long = rank._plan_flat_forward([request(tokens)])
+        check = rank._memory_check(long)
+        assert not check.fits
+        assert check.estimated_required_bytes == int(
+            (long.output_bytes + gib * 2**30) * 1.1
+        )
 
 
 def test_observed_range_uses_smallest_covering_peak(bounded_rank):
@@ -343,14 +351,19 @@ def test_observations_stay_bounded_and_keep_peak_envelope(bounded_rank):
 
 
 @pytest.mark.parametrize("later_peak", [2**40, 2**39])
-def test_flat_or_decreasing_peaks_have_no_negative_growth(bounded_rank, later_peak):
+def test_plateau_grows_then_becomes_proportional(bounded_rank, later_peak):
     rank = bounded_rank
     observe(rank, rank._plan_flat_forward([request(128)]), 2**40)
     observe(rank, rank._plan_flat_forward([request(256)]), later_peak)
-    for tokens in (256, 512, 81920):
+    profile = rank._memory_profiles[rank._plan_flat_forward([request(256)]).signature]
+    assert profile.compute_peak(512) > profile.compute_peak(256)
+    # The horizon joins continuously to proportional growth at longer roots.
+    assert profile.compute_peak(1025) == profile.compute_peak(1024) * 1025 / 1024
+    assert profile.compute_peak(81920) == 2 * profile.compute_peak(40960)
+    for tokens, growth in ((256, 1), (512, 1.25), (1024, 1.75), (81920, 140)):
         plan = rank._plan_flat_forward([request(tokens)])
         assert rank._memory_check(plan).estimated_required_bytes == int(
-            (plan.output_bytes + 2**40) * 1.1
+            (plan.output_bytes + 2**40 * growth) * 1.1
         )
 
 
