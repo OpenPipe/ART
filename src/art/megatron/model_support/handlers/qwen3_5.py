@@ -274,6 +274,11 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         )
 
         target_set = set(target_modules)
+        from art.megatron.lora import UnembeddingLoRA
+
+        for chunk in model_chunks:
+            if "lm_head" in target_set:
+                chunk.output_layer = UnembeddingLoRA(chunk.output_layer, rank, alpha)
         for chunk in model_chunks:
             for module_name, module in chunk.named_modules():
                 if not isinstance(module, TransformerLayer):
@@ -441,7 +446,11 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         rank: int,
         alpha: int,
     ) -> None:
-        from art.megatron.lora import wrap_grouped_moe_experts, wrap_split_mlp_lora
+        from art.megatron.lora import (
+            qwen_lora_parameterization,
+            wrap_grouped_moe_experts,
+            wrap_split_mlp_lora,
+        )
 
         wrap_grouped_moe_experts(
             _require_moe_experts(module),
@@ -449,7 +458,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
             target_modules=target_modules,
             rank=rank,
             alpha=alpha,
-            fused_gate_up=True,
+            fused_gate_up=qwen_lora_parameterization() == "tied_v0",
         )
         shared_experts = getattr(module.mlp, "shared_experts", None)
         if shared_experts is not None:
