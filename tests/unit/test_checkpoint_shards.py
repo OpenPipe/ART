@@ -6,12 +6,17 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.utils.checkpoint import checkpoint
-from trainer_rank_test_support import process_group, spawn_and_join
 
 from art.megatron.context_parallel.checkpoint import (
     current_checkpoint_partition,
     shard_saved_activations,
 )
+
+# Pytest imports this file directly or through the integration package.
+if __package__:
+    from .trainer_rank_test_support import process_group, spawn_and_join
+else:
+    from trainer_rank_test_support import process_group, spawn_and_join
 
 
 def _worker(rank, rendezvous, world, backend, dtype):
