@@ -228,6 +228,8 @@ def test_shared_outer_public_checkpoint_continuation(
     assert not list(tmp_path.glob(".checkpoint.snapshot-*"))
     assert not (tmp_path / ".checkpoint.reserved").exists()
 
+    step(original)
+    continued = state(original)
     restored = make_trainer()
     for trainer in (original, restored):
         trainer.load_checkpoint(MaterializedCheckpoint("student", str(output)))
@@ -236,7 +238,7 @@ def test_shared_outer_public_checkpoint_continuation(
             tuple(p.shape) for p in trainer._checkpoint_slots["student"].params
         ] == [tuple(p.shape) for p in params]
         step(trainer)
-    _assert_nested_tensors_equal(state(restored), state(original))
+        _assert_nested_tensors_equal(state(trainer), continued)
     assert any(
         not torch.equal(after, prior)
         for after, prior in zip(state(original)[0], before[0], strict=True)
