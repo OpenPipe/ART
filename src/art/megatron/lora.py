@@ -46,6 +46,15 @@ from .lora_config import (
     default_lora_rank_for_handler,
 )
 from .routed_experts import capture_routes
+from .segmented_expert_lora import (
+    _CURRENT_EXPERT_ADAPTER_PLAN,
+    capture_expert_context,
+    segmented_expert_lora,
+)
+from .segmented_lora import (
+    _CURRENT_LORA_SEGMENTS,
+    segmented_lora_factors,
+)
 
 _LAYER_BLOCK_RE = re.compile(r"^(?P<block>.*\.layers\.\d+)\.")
 
@@ -132,15 +141,21 @@ def _collect_compile_garbage() -> None:
 
 def _with_captured_lora_slot(function: _F) -> _F:
     context = _CURRENT_LORA_SLOT.get()
-    function = capture_routes(capture_canonical(function))
+    segments = _CURRENT_LORA_SEGMENTS.get()
+    expert_plan = _CURRENT_EXPERT_ADAPTER_PLAN.get()
+    function = capture_expert_context(capture_routes(capture_canonical(function)))
 
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         _collect_compile_garbage()
         token = _CURRENT_LORA_SLOT.set(context)
+        segment_token = _CURRENT_LORA_SEGMENTS.set(segments)
+        expert_token = _CURRENT_EXPERT_ADAPTER_PLAN.set(expert_plan)
         try:
             result = function(*args, **kwargs)
         finally:
+            _CURRENT_EXPERT_ADAPTER_PLAN.reset(expert_token)
+            _CURRENT_LORA_SEGMENTS.reset(segment_token)
             _CURRENT_LORA_SLOT.reset(token)
         # A compile inside this call has unwound; collect before its backward.
         # Failed calls leave the mark for the next call, keeping their error.
@@ -1021,6 +1036,10 @@ class LoRA(torch.nn.Module):
     def active_lora_tensors(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+        if self.is_expert and _CURRENT_LORA_SEGMENTS.get() is not None:
+            raise NotImplementedError(
+                "segmented routed experts require an (expert, adapter) row layout"
+            )
         active = self._active_lora_storage()
         return None if active is None else self._expert_views(*active)
 
@@ -1054,6 +1073,43 @@ class LoRA(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
     ) -> torch.Tensor:
+        segments = _CURRENT_LORA_SEGMENTS.get()
+        expert_plan = _CURRENT_EXPERT_ADAPTER_PLAN.get() if self.is_expert else None
+        if (
+            expert_plan is not None
+            and segments is not None
+            and expert_plan.refs != segments.refs
+        ):
+            raise ValueError("expert plan adapter refs disagree with dense segments")
+        refs = (
+            expert_plan.refs
+            if expert_plan is not None
+            else segments.refs
+            if segments is not None
+            else None
+        )
+        if refs is not None:
+            factors: list[tuple[torch.Tensor, torch.Tensor, float] | None] = []
+            for ref in refs:
+                if ref is None:
+                    factors.append((self.A_T, self.B_T, self.scale))
+                else:
+                    slot = self._slot(ref) if ref.name is not None else None
+                    factors.append(
+                        (slot.A_T, slot.B_T, slot.scale) if slot is not None else None
+                    )
+            if expert_plan is not None:
+                return segmented_expert_lora(
+                    x, factors, expert_plan, out_features=self.out_features
+                )
+        if segments is not None:
+            if self.is_expert or tokens_per_expert is not None:
+                raise NotImplementedError(
+                    "segmented routed experts require an (expert, adapter) row layout"
+                )
+            return segmented_lora_factors(
+                x, factors, segments, template_a=self.A_T, template_b=self.B_T
+            )
         compact_experts = (
             tokens_per_expert is not None
             and self.shared_factor is not None
@@ -1313,9 +1369,14 @@ def _expert_grouped_lora_forward(
     tokens_per_expert: list[int] | torch.Tensor,
     out_features: int,
 ) -> torch.Tensor:
-    if x.shape[0] == 0 and not (
-        lora.shared_factor is not None
-        and os.environ.get("ART_MEGATRON_SHARED_OUTER_KERNEL", "compact") == "compact"
+    if (
+        x.shape[0] == 0
+        and _CURRENT_EXPERT_ADAPTER_PLAN.get() is None
+        and not (
+            lora.shared_factor is not None
+            and os.environ.get("ART_MEGATRON_SHARED_OUTER_KERNEL", "compact")
+            == "compact"
+        )
     ):
         return x.new_zeros((x.shape[0], out_features))
     return lora(x, tokens_per_expert=tokens_per_expert)
@@ -1334,6 +1395,14 @@ def _expert_grouped_lora_dual_forward(
     x: torch.Tensor,
     tokens_per_expert: list[int] | torch.Tensor,
 ) -> torch.Tensor:
+    if _CURRENT_EXPERT_ADAPTER_PLAN.get() is not None:
+        return torch.cat(
+            [
+                module.gate_lora(x, tokens_per_expert),
+                module.up_lora(x, tokens_per_expert),
+            ],
+            dim=-1,
+        )
     counts = tokens_per_expert
     if isinstance(counts, list):
         counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
@@ -2019,6 +2088,13 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if x.shape[0] == 0 and _CURRENT_EXPERT_ADAPTER_PLAN.get() is not None:
+            output = (
+                (self.up_lora if self.non_gated else self.lora)(x, tokens_per_expert)
+                if self.non_gated or self.fused_gate_up
+                else _expert_grouped_lora_dual_forward(self, x, tokens_per_expert)
+            )
+            return output, None
         base_out, bias_out = cast(
             Callable[
                 [torch.Tensor, list[int] | torch.Tensor],
@@ -2067,6 +2143,8 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if x.shape[0] == 0 and _CURRENT_EXPERT_ADAPTER_PLAN.get() is not None:
+            return self.lora(x, tokens_per_expert), None
         base_out, bias_out = cast(
             Callable[
                 [torch.Tensor, list[int] | torch.Tensor],
@@ -2134,8 +2212,11 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
                 (self.up_lora,) if self.non_gated else (self.gate_lora, self.up_lora)
             )
             for lora in loras:
-                zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
-                zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
+                if _CURRENT_LORA_SEGMENTS.get() is not None:
+                    zero = zero + lora(x).sum()
+                else:
+                    zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
+                    zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
             return zero.expand(*x.shape[:-1], self.out_features).clone(), None
         base_output, bias_out = self.linear_fc1(x)
         if isinstance(base_output, tuple):
