@@ -40,7 +40,25 @@ class _ScopedMemorySignature(_impl._MemorySignature):
 
 @dataclass(frozen=True)
 class _BoundedMemoryProfile(_impl._MemoryProfile):
-    forward_compute_peak_bytes: int = 0
+    forward_compute_peaks: tuple[tuple[int, int], ...] = ()
+
+    def compute_peak(self, tokens: int | float) -> float:
+        for length, peak in self.forward_compute_peaks:
+            if tokens <= length:
+                return peak
+        longest, peak = self.forward_compute_peaks[-1]
+        slope = max(
+            (
+                (high_peak - low_peak) / (high - low)
+                for i, (low, low_peak) in enumerate(self.forward_compute_peaks)
+                for high, high_peak in self.forward_compute_peaks[i + 1 :]
+                if high >= 2 * low
+            ),
+            default=None,
+        )
+        if slope is None:
+            return peak * tokens / longest
+        return peak + max(0.0, slope) * (tokens - longest)
 
 
 _BOUNDED_FORWARD_PEAKS: ContextVar[bool] = ContextVar(
@@ -52,10 +70,15 @@ _BOUNDED_FORWARD_PEAKS: ContextVar[bool] = ContextVar(
 def bounded_forward_peaks() -> Iterator[None]:
     """Opt into single-root forward peak calibration.
 
-    Observed peaks cap the fit through the longest observed root. Beyond it,
-    the cap grows at that peak's per-token rate. Grow calibration roots before
-    admitting long requests: one cold, tiny observation is not a safe bound.
-    Profiles remain separate from ordinary TrainerRank requests.
+    Keep at most eight (packed tokens, compute peak) observations per signature,
+    max-merging repeated lengths and taking a nondecreasing upper envelope.
+    Retain the shortest and seven longest lengths when the set fills. Within
+    that range, use the smallest covering root's peak.
+    Beyond it, use the longest root's peak plus the steepest nonnegative
+    marginal rate between retained roots differing by at least 2x in length.
+    Without such a pair, extrapolate proportionally from the longest root.
+    Analytic floors still apply. Grow calibration roots before admitting long
+    requests; profiles remain separate from ordinary TrainerRank requests.
     """
     token = _BOUNDED_FORWARD_PEAKS.set(True)
     try:
@@ -1972,18 +1995,10 @@ def _estimate_required_memory_bytes_from_values(
         )
         if (
             isinstance(profiled, _BoundedMemoryProfile)
-            and profiled.forward_compute_peak_bytes
+            and profiled.forward_compute_peaks
         ):
-            # The peak is measured only through packed_tokens. Extrapolate
-            # beyond that root, rather than claiming constant scratch forever.
-            profiled_bytes = min(
-                profiled_bytes,
-                profiled.forward_compute_peak_bytes
-                * max(
-                    1.0,
-                    profiled_tokens(profiled.logical_per_packed)
-                    / profiled.packed_tokens,
-                ),
+            profiled_bytes = profiled.compute_peak(
+                profiled_tokens(profiled.logical_per_packed)
             )
         elif (
             profiled.warm_bytes_per_token is not None
@@ -2191,12 +2206,20 @@ def _update_memory_profile(
         isinstance(plan.signature, _ScopedMemorySignature)
         and plan.signature.bounded_forward_peak
     ):
+        peaks = dict(
+            previous.forward_compute_peaks
+            if isinstance(previous, _BoundedMemoryProfile)
+            else ()
+        )
+        peaks[plan.packed_tokens] = max(compute_delta, peaks.get(plan.packed_tokens, 0))
+        observations = []
+        peak = 0
+        for length, compute in sorted(peaks.items()):
+            peak = max(peak, compute)
+            observations.append((length, peak))
+        if len(observations) > 8:
+            observations = [observations[0], *observations[-7:]]
         self._memory_profiles[plan.signature] = _BoundedMemoryProfile(
             **vars(self._memory_profiles[plan.signature]),
-            forward_compute_peak_bytes=max(
-                compute_delta,
-                previous.forward_compute_peak_bytes
-                if isinstance(previous, _BoundedMemoryProfile)
-                else 0,
-            ),
+            forward_compute_peaks=tuple(observations),
         )
