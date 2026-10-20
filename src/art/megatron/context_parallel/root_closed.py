@@ -14,8 +14,6 @@ from contextvars import ContextVar
 from functools import lru_cache
 from math import lcm
 
-from .types import TokenRange
-
 RootPlacements = tuple[tuple[int, int, int, int] | tuple[int, int, int, int, bool], ...]
 _PLACEMENTS: ContextVar[RootPlacements] = ContextVar("art_root_placements", default=())
 
@@ -40,27 +38,6 @@ def execution(placements: RootPlacements) -> Iterator[None]:
         _PLACEMENTS.reset(token)
 
 
-def root_span(
-    length: int,
-    cp_size: int,
-    short_limit: int = 16384,
-    two_rank_limit: int | None = None,
-    four_rank_limit: int | None = None,
-) -> int:
-    """Pure length policy; span sizes are 1/2/4/8 (capped by the replica)."""
-    if cp_size not in (1, 2, 4, 8) or length <= 0 or short_limit <= 0:
-        raise ValueError("positive root length/threshold and CP 1/2/4/8 required")
-    limits = (
-        short_limit,
-        two_rank_limit or short_limit * 2,
-        four_rank_limit or short_limit * 4,
-    )
-    if list(limits) != sorted(limits):
-        raise ValueError("span thresholds must be nondecreasing")
-    span = next((s for s, limit in zip((1, 2, 4), limits) if length <= limit), 8)
-    return min(span, cp_size)
-
-
 @lru_cache(maxsize=1024)
 def root_owner_spans(length: int, rank_count: int, alignment: int = 128):
     """Cache root-relative contiguous spans, with no batch dependencies."""
@@ -80,6 +57,8 @@ def root_owner_spans(length: int, rank_count: int, alignment: int = 128):
 
 def root_closed_assignment(*, row_spec, placements, cp_size: int, block_size: int):
     """Union root templates. One remote wave; no global ownership search."""
+    from .types import TokenRange
+
     alignment = lcm(64, block_size)
     cursor = 0
     ranges, owners = [], []

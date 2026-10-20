@@ -21,12 +21,14 @@ def chunk_gated_delta_rule_native_cp(
     cu_seqlens_cpu: Tensor | None = None,
     lengths_by_rank_cpu: Tensor | None = None,
     scale: float | None = None,
+    allow_empty_shards: bool = False,
 ) -> tuple[Tensor, Tensor | None]:
     """Run FLA gated-delta recurrence on one CP-sharded logical chain.
 
     This is the ART-owned extension missing from FLA's public CP surface:
     parent recurrent state is injected at rank 0, FLA summary scans seed every
     rank-local shard, and chain-tail state is emitted on every rank.
+    Empty shards are enabled only for buckets from root-closed placements.
     """
 
     if group is None:
@@ -43,6 +45,8 @@ def chunk_gated_delta_rule_native_cp(
         raise ValueError(f"g must be [1, T, H], got {tuple(g.shape)}")
     if tuple(beta.shape) != tuple(q.shape[:3]):
         raise ValueError(f"beta must be [1, T, H], got {tuple(beta.shape)}")
+    if int(q.shape[1]) <= 0 and not allow_empty_shards:
+        raise ValueError("native FLA CP GDN currently requires non-empty rank shards")
     if initial_state.ndim != 4:
         raise ValueError(
             f"initial_state must be [N, H, K, V], got {tuple(initial_state.shape)}"
@@ -96,7 +100,9 @@ def chunk_gated_delta_rule_native_cp(
             "native FLA CP lengths_by_rank_cpu must be [world_size, segments], got "
             f"{tuple(lengths_by_rank_cpu.shape)}"
         )
-    if not _fla_chunk_boundaries_aligned_cpu(lengths_by_rank_cpu):
+    if not _fla_chunk_boundaries_aligned_cpu(
+        lengths_by_rank_cpu, allow_empty_shards=allow_empty_shards
+    ):
         raise ValueError(
             "native FLA CP GDN requires 64-token aligned non-final rank "
             f"boundaries; lengths_by_rank={lengths_by_rank_cpu.tolist()}"
@@ -113,13 +119,18 @@ def chunk_gated_delta_rule_native_cp(
         group,
         bool(output_final_state),
         float(scale),
+        allow_empty_shards,
     )
 
 
-def _fla_chunk_boundaries_aligned_cpu(lengths_by_rank: Tensor) -> bool:
+def _fla_chunk_boundaries_aligned_cpu(
+    lengths_by_rank: Tensor, *, allow_empty_shards: bool = False
+) -> bool:
     if int(lengths_by_rank.shape[0]) <= 1:
         return True
     starts = torch.cumsum(lengths_by_rank, dim=0)[:-1]
+    if not allow_empty_shards:
+        return bool(torch.all(starts.remainder(64) == 0).item())
     # The last participating rank may finish a partial chunk. Trailing
     # zero-token ranks carry identity summaries and do not start a new chunk.
     tokens_after = lengths_by_rank.sum(dim=0).unsqueeze(0) - starts
@@ -169,6 +180,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
         group: Any,
         output_final_state: bool,
         scale: float,
+        allow_empty_shards: bool,
     ) -> tuple[Tensor, Tensor | None]:
         ctx.empty_rank = int(q.shape[1]) == 0
         if ctx.empty_rank:
@@ -190,13 +202,17 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
         from fla.ops.common.chunk_o import chunk_fwd_o
         from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
         from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
-        from fla.ops.utils import chunk_local_cumsum, solve_tril
+        from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices, solve_tril
 
-        if cu_seqlens is not None and cu_seqlens_cpu is None:
-            raise ValueError("native FLA CP varlen requires CPU cu_seqlens metadata")
         chunk_indices = (
-            _native_chunk_indices(cu_seqlens, cu_seqlens_cpu)
-            if cu_seqlens is not None and cu_seqlens_cpu is not None
+            (
+                _native_chunk_indices(cu_seqlens, cast(Tensor, cu_seqlens_cpu))
+                if allow_empty_shards
+                else prepare_chunk_indices(
+                    cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu
+                )
+            )
+            if cu_seqlens is not None
             else None
         )
         chunk_local_cumsum = cast(Any, chunk_local_cumsum)
@@ -298,6 +314,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
             )
         from fla.ops.common.chunk_o import chunk_bwd_dv_local
         from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd
@@ -376,6 +393,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
             dg.to(g),
             db.to(beta),
             dh0.to(local_initial),
+            None,
             None,
             None,
             None,

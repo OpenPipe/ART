@@ -87,13 +87,14 @@ def test_real_qwen35_gdn_native_fla_cp_prepared_varlen_batch_matches_single_rank
     reason="At least four CUDA devices are required for native packed CP GDN coverage.",
 )
 @pytest.mark.parametrize("cp_size", _CP_SIZES)
+@pytest.mark.parametrize("prefix_length", [1024, 32768], ids=["small", "32k_chain"])
 def test_real_qwen35_gdn_native_cp_packed_layer_matches_cp1(
-    cp_size: int, tmp_path: Path
+    cp_size: int, prefix_length: int, tmp_path: Path
 ) -> None:
     init_method = file_init_method(tmp_path, f"native_gdn_packed_cp{cp_size}")
     mp.spawn(
         _native_gdn_cp_packed_layer_worker,
-        args=(cp_size, init_method, str(tmp_path)),
+        args=(cp_size, init_method, str(tmp_path), prefix_length),
         nprocs=cp_size,
         join=True,
     )
@@ -106,6 +107,7 @@ def _native_gdn_cp_packed_layer_worker(
     cp_size: int,
     init_method: str,
     output_dir: str,
+    prefix_length: int,
 ) -> None:
     torch.cuda.set_device(rank)
     init_process_group(
@@ -124,7 +126,7 @@ def _native_gdn_cp_packed_layer_worker(
         ref_gdn, cp_gdn = _make_matching_gdn_pair(cp_size=cp_size)
         zero_parameter_grads(ref_gdn)
         zero_parameter_grads(cp_gdn)
-        case = _packed_native_cp_case()
+        case = _packed_native_cp_case(prefix_length=prefix_length)
         tensors = build_phase0_packed_tensors(case)
         group_ids = tensors["group_ids"].cuda()
         parent_ids = tensors["parent_ids"].cuda()
@@ -139,7 +141,7 @@ def _native_gdn_cp_packed_layer_worker(
             ),
             planner_config=GdnPlannerConfig(),
         )
-        assert any(plan.tree_chain_buckets_by_depth)
+        assert any(plan.tree_chain_buckets_by_depth) == (prefix_length >= 32768)
         hidden, output_grad = _packed_hidden_and_grad(case, cp_size)
         ref_hidden = hidden.clone().detach().requires_grad_(True)
         ref_out, _ = run_gdn_layer(
@@ -415,16 +417,17 @@ def _first_gdn(model: torch.nn.Module) -> GatedDeltaNet:
     raise AssertionError("expected Qwen3.5 provider to build a GDN layer")
 
 
-def _packed_native_cp_case() -> GdnPhase0Case:
+def _packed_native_cp_case(*, prefix_length: int = 32768) -> GdnPhase0Case:
     return GdnPhase0Case(
         name="native_cp_packed_varying",
-        sequence_length=34816,
+        sequence_length=prefix_length + 2048,
         rows=(
             GdnPackedRowShape(
                 families=(
-                    # The cost model keeps the old 1K prefix local. A 32K
-                    # prefix exercises CP while the short forks remain local.
-                    GdnFamilyShape(prefix_length=32768, suffix_lengths=(512, 512)),
+                    # Keep the small local plan and exercise a CP chain at 32K.
+                    GdnFamilyShape(
+                        prefix_length=prefix_length, suffix_lengths=(512, 512)
+                    ),
                     GdnFamilyShape(prefix_length=512, suffix_lengths=(512,)),
                 )
             ),

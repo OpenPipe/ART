@@ -4,7 +4,7 @@ import random
 import pytest
 import torch
 
-from art.megatron.context_parallel.root_closed import root_owner_spans, root_span
+from art.megatron.context_parallel.root_closed import root_owner_spans
 from art.megatron.context_parallel.runtime import _get_or_build_planning_bundle
 from art.megatron.context_parallel.types import ContextParallelConfig, ParallelTopology
 from art.megatron.gdn.gdn_prefix_tree import (
@@ -46,8 +46,7 @@ def test_subset_keeps_root_owners_and_gdn_decisions(cp):
     rng = random.Random(314)
     lengths = [1024, 32768, 2048, 65536, 16384, 4096]
     ranks = []
-    for length in lengths:
-        span = root_span(length, cp)
+    for span in (1, min(2, cp), 1, cp, 1, 1):
         ranks.append((rng.randrange(cp - span + 1), span))
     full, full_d = plan(lengths, ranks, cp)
     offset = 0
@@ -77,16 +76,7 @@ def test_subset_keeps_root_owners_and_gdn_decisions(cp):
     assert sum(full_d.gdn_token_counts_by_rank) == sum(lengths)
 
 
-def test_span_and_alignment():
-    assert root_span(65536, 8, 16384, 65536, 131072) == 2
-    assert root_span(32768, 4, 12288, 32768, 65536) == 2
-    assert [root_span(n, 8) for n in [1024, 16384, 32768, 65536, 131072]] == [
-        1,
-        1,
-        2,
-        4,
-        8,
-    ]
+def test_root_alignment():
     assert root_owner_spans(65536, 4) == (
         (0, 16384, 0),
         (16384, 32768, 1),
@@ -118,10 +108,13 @@ def test_tree_boundary_cannot_be_cut():
 def test_fla_alignment_ignores_empty_trailing_ranks():
     from art.megatron.gdn.fla_cp import _fla_chunk_boundaries_aligned_cpu
 
-    assert _fla_chunk_boundaries_aligned_cpu(torch.tensor([[8192], [8195], [0], [0]]))
-    assert _fla_chunk_boundaries_aligned_cpu(torch.tensor([[0], [8192], [8195], [0]]))
+    for lengths in ([[8192], [8195], [0], [0]], [[0], [8192], [8195], [0]]):
+        assert not _fla_chunk_boundaries_aligned_cpu(torch.tensor(lengths))
+        assert _fla_chunk_boundaries_aligned_cpu(
+            torch.tensor(lengths), allow_empty_shards=True
+        )
     assert not _fla_chunk_boundaries_aligned_cpu(
-        torch.tensor([[8195], [8192], [0], [0]])
+        torch.tensor([[8195], [8192], [0], [0]]), allow_empty_shards=True
     )
 
 
@@ -237,7 +230,7 @@ def test_empty_chain_identity_state_and_gradient(monkeypatch, multi):
     beta = torch.empty_like(g, requires_grad=True)
     cu = torch.zeros(n + 1, dtype=torch.int32) if multi else None
     out, final = f._NativeCpChunkGatedDeltaRule.apply(
-        q, k, v, g, beta, state, cu, cu, object(), True, 0.5
+        q, k, v, g, beta, state, cu, cu, object(), True, 0.5, True
     )
     assert out.shape == v.shape
     torch.testing.assert_close(state, before)
@@ -255,8 +248,6 @@ def test_native_chunk_indices_preserve_empty_sequence_ids():
 
 
 def test_execution_scopes_provider_configs_and_restores_after_exception():
-    from concurrent.futures import ThreadPoolExecutor
-    from contextvars import Context
     from types import SimpleNamespace
 
     from art.megatron.context_parallel.root_closed import (
@@ -289,15 +280,178 @@ def test_execution_scopes_provider_configs_and_restores_after_exception():
             assert config.root_placements == placements
             gdn = _gdn_planner_config_for_provider(provider, handler)
             assert gdn is not None and gdn.root_closed
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                # Caladan explicitly propagates contexts to worker threads.
-                assert (
-                    executor.submit(Context().run, current_root_placements).result()
-                    == ()
-                )
             with execution(()):
                 gdn = _gdn_planner_config_for_provider(provider, handler)
                 assert gdn is not None and not gdn.root_closed
             assert current_root_placements() == placements
             raise RuntimeError("probe")
     assert current_root_placements() == ()
+
+
+def test_planner_positional_constructor_matches_main():
+    assert GdnPlannerConfig(8) == replace(GdnPlannerConfig(), cp_chain_beam_width=8)
+    assert GdnPlannerConfig(8, 3, root_closed=True) == replace(
+        GdnPlannerConfig(root_closed=True),
+        cp_chain_beam_width=8,
+        cp_chain_beam_branch_factor=3,
+    )
+
+
+@pytest.mark.parametrize("allow_empty_shards", [False, True])
+def test_chain_bucket_empty_segments_require_explicit_permission(allow_empty_shards):
+    from art.megatron.gdn.gdn_prefix_tree import (
+        GdnSegmentSpec,
+        _build_tree_bucket_plans,
+    )
+
+    segment = GdnSegmentSpec(0, 0, 0, 0, 0, 128, "prefix")
+
+    def build():
+        return _build_tree_bucket_plans(
+            (segment,),
+            (-1,),
+            (False,),
+            local_token_ranges=(),
+            sequence_length=128,
+            device="cpu",
+            token_ranges_by_rank=(((0, 128, 0),), ()),
+            allow_empty_shards=allow_empty_shards,
+        )[0]
+
+    if not allow_empty_shards:
+        with pytest.raises(ValueError, match="no local tokens"):
+            build()
+    else:
+        bucket = build()
+        assert bucket.real_token_count == 0
+        assert bucket.allow_empty_shards
+        assert bucket.lengths_by_rank_cpu.tolist() == [[128], [0]]
+
+
+@pytest.mark.parametrize("allow_empty_shards", [False, True])
+@pytest.mark.parametrize("lengths", [[[0], [64]], [[65], [0]], [[64], [64]]])
+def test_native_cp_empty_validation_is_opt_in(monkeypatch, allow_empty_shards, lengths):
+    from art.megatron.gdn import fla_cp as f
+
+    monkeypatch.setattr(f.dist, "is_available", lambda: True)
+    monkeypatch.setattr(f.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(f.dist, "get_world_size", lambda group: 2)
+    calls = []
+    monkeypatch.setattr(
+        f._NativeCpChunkGatedDeltaRule, "apply", lambda *args: calls.append(args)
+    )
+    tokens = lengths[0][0]
+    q = torch.zeros(1, tokens, 1, 2)
+
+    def run():
+        f.chunk_gated_delta_rule_native_cp(
+            q,
+            q,
+            q,
+            g=q[..., 0],
+            beta=q[..., 0],
+            initial_state=torch.zeros(1, 1, 2, 2),
+            group=object(),
+            output_final_state=True,
+            lengths_by_rank_cpu=torch.tensor(lengths),
+            allow_empty_shards=allow_empty_shards,
+        )
+
+    if not allow_empty_shards and lengths != [[64], [64]]:
+        with pytest.raises(ValueError, match="non-empty|64-token aligned"):
+            run()
+        assert calls == []
+    else:
+        run()
+        assert len(calls) == 1
+        assert calls[0][-1] is allow_empty_shards
+
+
+def test_speculative_planner_propagates_placements_and_isolates_layout_cache(
+    monkeypatch,
+):
+    from threading import Event
+
+    from art.megatron.context_parallel.root_closed import (
+        current_root_placements,
+        execution,
+    )
+    from art.megatron.training.microbatches import _gdn_planner_config_for_provider
+    from art.trainer_rank import Unset
+    from tests.unit.test_trainer_rank_weird_shapes import (
+        _prewarmed_rank,
+        _rows,
+        _unshared_requests,
+    )
+
+    inputs = _unshared_requests(8)
+    rank = _prewarmed_rank(monkeypatch, inputs, inputs[:4])
+    rank._last_global_micro_batch_size = 4
+    rows = _rows(inputs[4:8])
+    default_key = rank._layout_cache_key(rows)
+    default_layout = rank._compute_group_layout(rows, default_key)
+    observed = []
+    release = Event()
+    original = rank._compute_group_layout
+
+    def compute(snapshots, key):
+        assert release.wait(timeout=30)
+        config = _gdn_planner_config_for_provider(
+            rank.runtime.provider, rank.runtime.model_support_handler
+        )
+        assert config is not None
+        observed.append(
+            (
+                key,
+                current_root_placements(),
+                config.root_closed,
+            )
+        )
+        return original(snapshots, key)
+
+    # Config construction below needs the same shape fields used by production.
+    provider = rank.runtime.provider
+    provider.linear_num_key_heads = provider.linear_num_value_heads = 1
+    provider.linear_key_head_dim = provider.linear_value_head_dim = 8
+    monkeypatch.setattr(rank, "_compute_group_layout", compute)
+    placements = ((0, 128, 0, 1),)
+    try:
+        with execution(placements):
+            root_key = rank._layout_cache_key(rows)
+            assert root_key != default_key
+            assert rank._cached_group_layout(root_key) is None
+            rank._submit_speculative_wave_planning(inputs, 4, checkpoint=Unset)
+            future = rank._speculative_planning_future
+            assert future is not None
+        # The caller exits the scope before the worker builds provider configs.
+        release.set()
+        future.result(timeout=30)
+        assert observed == [(root_key, placements, True)]
+        assert current_root_placements() == ()
+        assert rank._layout_cache_key(rows) == default_key
+        assert rank._cached_group_layout(default_key) is default_layout
+        assert rank._cached_group_layout(root_key) is not None
+        with execution(((0, 128, 1, 1),)):
+            assert rank._layout_cache_key(rows) not in (default_key, root_key)
+    finally:
+        release.set()
+        rank._speculative_planning_executor().shutdown(wait=True)
+
+
+def test_root_closed_decision_carries_empty_permission_without_planner_context():
+    bundle, decision = plan([32768], [(1, 2)], 4)
+    assert decision.allow_empty_shards
+    assert decision.chained_nodes == (True,)
+    for rank in range(4):
+        rank_plan = materialize_gdn_rank_execution_plan(
+            bundle.gdn_execution_spec,
+            decision,
+            device="cpu",
+            cp_rank=rank,
+        )
+        buckets = rank_plan.tree_chain_buckets_by_depth[0]
+        assert buckets
+        assert all(bucket.allow_empty_shards for bucket in buckets)
+        assert sum(bucket.real_token_count for bucket in buckets) == (
+            16384 if rank in (1, 2) else 0
+        )
