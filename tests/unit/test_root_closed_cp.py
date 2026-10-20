@@ -256,6 +256,7 @@ def test_native_chunk_indices_preserve_empty_sequence_ids():
 
 def test_execution_scopes_provider_configs_and_restores_after_exception():
     from concurrent.futures import ThreadPoolExecutor
+    from contextvars import Context
     from types import SimpleNamespace
 
     from art.megatron.context_parallel.root_closed import (
@@ -289,7 +290,11 @@ def test_execution_scopes_provider_configs_and_restores_after_exception():
             gdn = _gdn_planner_config_for_provider(provider, handler)
             assert gdn is not None and gdn.root_closed
             with ThreadPoolExecutor(max_workers=1) as executor:
-                assert executor.submit(current_root_placements).result() == ()
+                # Caladan explicitly propagates contexts to worker threads.
+                assert (
+                    executor.submit(Context().run, current_root_placements).result()
+                    == ()
+                )
             with execution(()):
                 gdn = _gdn_planner_config_for_provider(provider, handler)
                 assert gdn is not None and not gdn.root_closed
