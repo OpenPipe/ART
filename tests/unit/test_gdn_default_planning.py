@@ -32,12 +32,7 @@ def _metadata(value):
     elif is_dataclass(value):
         value = {field.name: getattr(value, field.name) for field in fields(value)}
     if isinstance(value, dict):
-        # New opt-in metadata is asserted separately, outside main's snapshot.
-        return {
-            key: _metadata(item)
-            for key, item in value.items()
-            if key != "allow_empty_shards"
-        }
+        return {key: _metadata(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_metadata(item) for item in value]
     return value
@@ -79,15 +74,7 @@ def _default_plan_metadata(cp_size, prefix_length, planner=gdn):
 @pytest.mark.parametrize("cp_size,prefix_length", _MAIN_SHA256)
 def test_default_cp_decisions_and_buckets_match_main(cp_size, prefix_length):
     decision, plans = _default_plan_metadata(cp_size, prefix_length)
-    assert not decision.allow_empty_shards
     assert any(decision.chained_nodes) == (prefix_length >= 32768)
-    for plan in plans:
-        for depths in (
-            plan.tree_chain_buckets_by_depth,
-            plan.tree_segment_buckets_by_depth,
-        ):
-            for buckets in depths:
-                assert all(not bucket.allow_empty_shards for bucket in buckets)
     snapshot = json.dumps(
         _metadata((decision, plans)), sort_keys=True, separators=(",", ":")
     )

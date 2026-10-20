@@ -658,7 +658,7 @@ def _run_tree_bucket(
     if bucket.needs_final_state and (segment_conv is None or segment_rec is None):
         raise RuntimeError("tree GDN execution must return final states")
     if (
-        (bucket.needs_final_state or (recurrent_cp and bucket.allow_empty_shards))
+        bucket.needs_final_state
         and segment_conv is not None
         and segment_rec is not None
     ):
@@ -2242,9 +2242,6 @@ def run_gdn_bucket(
             "GDN bucket execution requires compact projected streams; "
             f"got qkv shape {tuple(qkv.shape)}"
         )
-    if recurrent_cp and token_count == 0 and not bucket.allow_empty_shards:
-        raise ValueError("native FLA CP GDN currently requires non-empty rank shards")
-    empty_peer = recurrent_cp and bucket.allow_empty_shards and token_count == 0
     if token_count != int(bucket.real_token_count):
         raise ValueError(
             "GDN packed varlen token count mismatch, got "
@@ -2284,31 +2281,24 @@ def run_gdn_bucket(
         )
         conv_output_final_state = False
 
-    if not empty_peer:
-        qkv, conv_final = _causal_conv1d_packed_varlen_with_state(
-            gdn,
-            qkv,
-            conv_initial,
-            bucket.cu_seqlens,
-            output_final_state=conv_output_final_state,
-        )
-    else:
-        # Empty chain peers still exchanged conv tails above. They need no
-        # local convolution, but must retain both conv/recurrent scan graphs.
-        conv_final = None
+    qkv, conv_final = _causal_conv1d_packed_varlen_with_state(
+        gdn,
+        qkv,
+        conv_initial,
+        bucket.cu_seqlens,
+        output_final_state=conv_output_final_state,
+    )
     if recurrent_cp:
         conv_final = chain_conv_final
 
     dense_local_bucket = not recurrent_cp and _bucket_has_uniform_lengths(bucket)
-    if dense_local_bucket or empty_peer:
-        local_batch = batch_size if dense_local_bucket else 1
-        local_length = int(bucket.length) if dense_local_bucket else 0
+    if dense_local_bucket:
         query, key, value, beta, recurrent_g = _prepare_dense_recurrent_inputs(
-            qkv.reshape(local_batch, local_length, int(qkv.shape[-1])),
-            beta.reshape(local_batch, local_length, int(beta.shape[-1])),
+            qkv.reshape(batch_size, int(bucket.length), int(qkv.shape[-1])),
+            beta.reshape(batch_size, int(bucket.length), int(beta.shape[-1])),
             recurrent_g.reshape(
-                local_batch,
-                local_length,
+                batch_size,
+                int(bucket.length),
                 int(recurrent_g.shape[-1]),
             ),
             key_heads=_local_key_heads(gdn),
@@ -2326,7 +2316,7 @@ def run_gdn_bucket(
             key_dim=int(gdn.key_head_dim),
             value_dim=int(gdn.value_head_dim),
         )
-    if gdn.use_qk_l2norm and not empty_peer:
+    if gdn.use_qk_l2norm:
         query = _l2norm(query.contiguous())
         key = _l2norm(key.contiguous())
 
@@ -2345,7 +2335,6 @@ def run_gdn_bucket(
             cu_seqlens=bucket.cu_seqlens,
             cu_seqlens_cpu=bucket.cu_seqlens_cpu,
             lengths_by_rank_cpu=bucket.lengths_by_rank_cpu,
-            allow_empty_shards=bucket.allow_empty_shards,
         )
     else:
         recurrent_out, recurrent_final = _chunk_gated_delta_rule(
@@ -2441,9 +2430,6 @@ def _local_packed_conv_tail(
     segment_count = int(cu_seqlens_cpu.numel()) - 1
     channels = int(qkv.shape[1])
     tails = qkv.new_zeros(segment_count, channels, tail_width)
-    if int(qkv.shape[0]) == 0:
-        # Keep reduce-scatter backward alive on an empty chain peer.
-        tails = tails + qkv.sum() * 0
     lengths = cu_seqlens_cpu[1:] - cu_seqlens_cpu[:-1]
     valid_lengths = torch.clamp(lengths, max=tail_width).tolist()
     ends = cu_seqlens_cpu[1:].tolist()

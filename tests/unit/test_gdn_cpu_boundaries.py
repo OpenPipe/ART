@@ -111,11 +111,8 @@ def test_fp32_oracle_accepts_hint_but_uses_independent_device_boundaries(monkeyp
     assert final is None
 
 
-@pytest.mark.parametrize("root_closed,tokens", [(False, 64), (True, 64), (True, 0)])
 @pytest.mark.parametrize("needs_final_state", [False, True])
-def test_tree_cp_final_state_autograd_edges_match_main_unless_root_closed(
-    monkeypatch, root_closed, tokens, needs_final_state
-):
+def test_tree_cp_final_state_autograd_edges_match_main(monkeypatch, needs_final_state):
     from dataclasses import replace
 
     from art.megatron.gdn.gdn_prefix_tree import (
@@ -126,17 +123,15 @@ def test_tree_cp_final_state_autograd_edges_match_main_unless_root_closed(
     bucket = replace(
         _build_position_bucket_plan(
             (GdnSegmentSpec(0, 0, 0, 0, 0, 64, "prefix"),),
-            ((0, 64, 0),) if tokens else (),
+            ((0, 64, 0),),
             sequence_length=64,
             device="cpu",
-            allow_empty_shards=root_closed,
         ),
-        allow_empty_shards=root_closed,
         needs_final_state=needs_final_state,
         parent_indices=torch.tensor([-1]),
         parent_indices_cpu=torch.tensor([-1]),
     )
-    output = torch.ones(tokens, requires_grad=True)
+    output = torch.ones(64, requires_grad=True)
     conv = torch.ones(1, requires_grad=True)
     rec = torch.ones(1, requires_grad=True)
     cache = operator._TreeStateChunkCache(device=output.device)
@@ -162,75 +157,8 @@ def test_tree_cp_final_state_autograd_edges_match_main_unless_root_closed(
         state_reference=output,
         recurrent_cp=True,
     )
+    assert dependency is not None
     grads = torch.autograd.grad(dependency, (output, conv, rec), allow_unused=True)
-    assert (grads[0] is not None) == (tokens > 0)
+    assert grads[0] is not None
     for grad in grads[1:]:
-        assert (grad is not None) == (needs_final_state or root_closed)
-
-
-@pytest.mark.parametrize("root_closed", [False, True])
-def test_empty_bucket_native_permission_is_forwarded_only_when_opted_in(
-    monkeypatch, root_closed
-):
-    from art.megatron.gdn.gdn_prefix_tree import (
-        GdnSegmentSpec,
-        _build_position_bucket_plan,
-    )
-
-    bucket = _build_position_bucket_plan(
-        (GdnSegmentSpec(0, 0, 0, 0, 0, 64, "prefix"),),
-        (),
-        sequence_length=64,
-        device="cpu",
-        allow_empty_shards=True,
-    )
-    from dataclasses import replace
-
-    bucket = replace(bucket, allow_empty_shards=root_closed)
-    gdn = SimpleNamespace(
-        num_key_heads=1,
-        num_value_heads=1,
-        tp_size=1,
-        key_head_dim=1,
-        value_head_dim=1,
-        use_qk_l2norm=True,
-    )
-    conv, rec = torch.zeros(1, 3, 2), torch.zeros(1, 1, 1, 1)
-    monkeypatch.setattr(
-        operator,
-        "_chain_conv_initial_and_final",
-        lambda *args, **kwargs: (conv, conv, None),
-    )
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("Empty peers must skip local convolution and L2 kernels")
-
-    monkeypatch.setattr(operator, "_causal_conv1d_packed_varlen_with_state", forbidden)
-    monkeypatch.setattr(operator, "_l2norm", forbidden)
-    calls = []
-
-    def native(q, k, v, **kwargs):
-        calls.append(kwargs)
-        return v, rec
-
-    monkeypatch.setattr(operator, "chunk_gated_delta_rule_native_cp", native)
-
-    def run():
-        return operator.run_gdn_bucket(
-            bucket,
-            (torch.empty(0, 3), torch.empty(0, 1), torch.empty(0, 1)),
-            (conv, rec),
-            gdn=gdn,
-            group=object(),
-            recurrent_cp=True,
-        )
-
-    if root_closed:
-        out, conv_final, rec_final = run()
-        assert out.shape == (1, 0, 1, 1)
-        assert conv_final is conv and rec_final is rec
-        assert calls[0]["allow_empty_shards"] is True
-    else:
-        with pytest.raises(ValueError, match="non-empty"):
-            run()
-        assert calls == []
+        assert (grad is not None) == needs_final_state

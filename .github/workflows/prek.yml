@@ -253,7 +253,6 @@ jobs:
             tests/unit/test_megatron_compile_garbage.py \
             tests/unit/test_canonical_numerics.py \
             tests/unit/test_lora_layouts.py \
-            tests/unit/test_root_closed_cp.py \
             tests/unit/test_trainer_rank_forward_profile.py \
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
@@ -304,7 +303,6 @@ jobs:
             --ignore=tests/unit/test_grouped_planner_replay.py \
             --ignore=tests/unit/test_canonical_numerics.py \
             --ignore=tests/unit/test_lora_layouts.py \
-            --ignore=tests/unit/test_root_closed_cp.py \
             --ignore=tests/unit/test_trainer_rank_forward_profile.py \
             --ignore=tests/unit/test_hybridep_planner_replay.py \
             --ignore=tests/unit/test_planner_runtime_fact_guards.py \
