@@ -31,6 +31,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="Qwen/Qwen3.8-27B")
     parser.add_argument("--layers", type=int, default=0)
+    parser.add_argument("--model-support-key", default="qwen3_5_dense")
     parser.add_argument(
         "--initialization", choices=("random", "pretrained"), default="pretrained"
     )
@@ -68,6 +69,7 @@ def main():
         model_identifier=args.model,
         model_initialization=args.initialization,
         provider_configure=configure,
+        model_support_key=args.model_support_key,
         build_optimizer=False,
         print_env=False,
     )
@@ -86,6 +88,11 @@ def main():
     sequences = [
         torch.randint(100, 10000, (n,), generator=generator) for n in args.lengths
     ]
+    original_count = len(sequences)
+    sequences += [
+        torch.randint(100, 10000, (n,), generator=generator) for n in args.lengths[1:]
+    ]
+    lengths = [len(sequence) for sequence in sequences]
     weight = (
         model.shared_embedding_or_output_weight()
         if model.share_embeddings_and_output_weights
@@ -106,29 +113,36 @@ def main():
             )
         },
         "policy_sources": {
-            p.name: hashlib.sha256(p.read_bytes()).hexdigest()
-            for p in Path(__file__)
-            .resolve()
-            .parents[1]
-            .joinpath("src/art/megatron/canonical")
-            .glob("*.py")
+            str(p.relative_to(Path(__file__).resolve().parents[1])): hashlib.sha256(
+                p.read_bytes()
+            ).hexdigest()
+            for p in [
+                *Path(__file__)
+                .resolve()
+                .parents[1]
+                .joinpath("src/art/megatron/canonical")
+                .glob("*.py"),
+                Path(__file__).resolve().parents[1] / "src/art/megatron/lora.py",
+                Path(__file__).resolve().parents[1]
+                / "src/art/megatron/gdn/operator.py",
+                Path(__file__).resolve(),
+            ]
         },
         "rows": [],
     }
     reference_logps = reference_grads = None
     variants = [
-        list(range(len(sequences))),
-        list(reversed(range(len(sequences)))),
+        list(range(original_count)),
+        list(reversed(range(original_count))),
         [0],
-        [0, len(sequences) - 1],
-        list(range(len(sequences))),
+        [0, *range(original_count, len(sequences))],
+        [0, original_count - 1],
+        list(range(original_count)),
     ]
     for repetition in range(args.repeat):
         for roots in variants:
-            layout = RootLayout(tuple(args.lengths[r] for r in roots))
-            physical = [
-                RootLayout((args.lengths[r],)).pad([sequences[r]]) for r in roots
-            ]
+            layout = RootLayout(tuple(lengths[r] for r in roots))
+            physical = [RootLayout((lengths[r],)).pad([sequences[r]]) for r in roots]
             pack = prefix_tree_pack(physical, max_depth=0)
             state = create_prefix_tree_state(
                 pack.group_ids,

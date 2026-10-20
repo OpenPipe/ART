@@ -1917,7 +1917,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             linear_fc1.return_layernorm_output = True
             linear_fc1.return_layernorm_output_gathered = True
         self.linear_fc1 = linear_fc1
-        self.out_features = int(linear_fc1.weight.shape[0])
+        self.out_features = int(cast(torch.Tensor, linear_fc1.weight).shape[0])
         self.non_gated = bool(non_gated)
         if self.non_gated:
             self.up_lora = _parallel_lora(
