@@ -65,7 +65,7 @@ def bind_external_weights(
             module._buffers[attribute] = source
     for index, chunk in enumerate(chunks):
         # Keep identity checks independent of names changed by LoRA/DDP wrappers.
-        chunk._art_external_weight_aliases = [
+        chunk.__dict__["_art_external_weight_aliases"] = [
             (
                 module._parameters[attribute]
                 if parameters

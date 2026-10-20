@@ -2152,7 +2152,10 @@ def inspect_resident_lora(
             base_name=base_name,
             adapter_keys=tuple(
                 sorted(
-                    {getattr(weight, "adapter_key", None) for weight in weights},
+                    {
+                        cast(str | None, getattr(weight, "adapter_key", None))
+                        for weight in weights
+                    },
                     key=lambda value: "" if value is None else value,
                 )
             ),
