@@ -14,7 +14,8 @@ also lets the circular import resolve lazily.
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 import hashlib
 import math
 from types import MethodType
@@ -28,6 +29,21 @@ if TYPE_CHECKING:
 
     from art.megatron.lora import LoRASlotRef
     from art.trainer_rank._impl import AdapterSelection, AnyForwardInput, TrainerRank
+
+
+_DIRECT_FORWARD: ContextVar[bool] = ContextVar(
+    "art_direct_forward_profile", default=False
+)
+
+
+@contextmanager
+def direct_forward_profile() -> Iterator[None]:
+    """Keep direct-forward calibration separate from yielded caller phases."""
+    token = _DIRECT_FORWARD.set(True)
+    try:
+        yield
+    finally:
+        _DIRECT_FORWARD.reset(token)
 
 
 def _split_required_memory(costs: Sequence[_impl._SubforwardCost]) -> int:
@@ -1536,7 +1552,7 @@ def _memory_signature_from_requests(
         bounded_forward_peak=(
             len(requests) == 1
             and requests[0].input_tokens.ndim == 1
-            and modes == (False,)
+            and (modes == (False,) or (modes == (True,) and _DIRECT_FORWARD.get()))
             and _impl._request_mix_key(requests[0]) in ("hidden", "hidden+routes")
             and topology[1:] == (1, 1, 1)
             and self._parallel_shape.ep == self._parallel_shape.etp == 1

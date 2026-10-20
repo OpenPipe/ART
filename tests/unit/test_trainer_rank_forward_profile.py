@@ -7,7 +7,7 @@ from test_trainer_rank_moe_memory import layer as layer
 from test_trainer_rank_pending_memory import pending_rank as pending_rank
 import torch
 
-from art.trainer_rank import ForwardInput
+from art.trainer_rank import ForwardInput, _memory
 
 
 def request(tokens):
@@ -76,6 +76,48 @@ def test_costs_are_monotone_and_static_floors_survive(pending_rank):
         rank._memory_profiles[long.signature].forward_compute_peak_bytes == 32 * 2**30
     )
     assert rank._memory_check(long).estimated_required_bytes >= prior
+
+
+def test_direct_gradient_profile_keeps_static_and_retained_graph_floors(pending_rank):
+    rank = pending_rank
+    inputs = [replace(request(3), no_grad=False)]
+    yielded = rank._plan_flat_forward(inputs)
+    assert not yielded.signature.bounded_forward_peak
+    with _memory.direct_forward_profile():
+        short = rank._plan_flat_forward(inputs)
+        long = rank._plan_flat_forward([replace(request(81920), no_grad=False)])
+    assert short.signature == long.signature and short.signature.bounded_forward_peak
+    assert short.signature != yielded.signature
+    # Existing policy drops a one-time recompute allowance once profiled;
+    # compare the token-dependent floors with that same observation state.
+    observe(rank, short, 0)
+    static = rank._memory_check(long).estimated_required_bytes
+    rank._memory_profiles.clear()
+    rank._update_memory_profile(
+        short,
+        short.output_bytes + 4058112,
+        retained_bytes=short.output_bytes + 516608,
+    )
+    required = rank._memory_check(long).estimated_required_bytes
+    assert static <= required < 63 * 2**30
+    assert (
+        rank._plan_cost(long).retained
+        >= rank._checkpoint_memory_floor(((81920, True),))[0]
+    )
+    assert rank._memory_profiles[short.signature].caller_plans == 0
+    assert rank._plan_flat_forward(inputs).signature == yielded.signature
+
+
+def test_direct_scope_resets_after_nested_scope_and_exception(pending_rank):
+    rank = pending_rank
+    inputs = [replace(request(3), no_grad=False)]
+    with pytest.raises(ValueError, match="scope"):
+        with _memory.direct_forward_profile():
+            with _memory.direct_forward_profile():
+                assert rank._plan_flat_forward(inputs).signature.bounded_forward_peak
+            assert rank._plan_flat_forward(inputs).signature.bounded_forward_peak
+            raise ValueError("scope")
+    assert not rank._plan_flat_forward(inputs).signature.bounded_forward_peak
 
 
 @pytest.mark.parametrize(
