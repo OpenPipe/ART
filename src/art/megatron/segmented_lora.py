@@ -43,6 +43,17 @@ class LoRASegments:
     def rows(self) -> int:
         return sum(self.counts)
 
+    def slice(self, start: int, stop: int) -> "LoRASegments":
+        """Intersect a canonical root slice with the original adapter spans."""
+        if not 0 <= start <= stop <= self.rows:
+            raise ValueError("segment slice must lie within the original rows")
+        offset = 0
+        counts = []
+        for count in self.counts:
+            counts.append(max(0, min(stop, offset + count) - max(start, offset)))
+            offset += count
+        return LoRASegments(self.refs, tuple(counts), grouped=self.grouped)
+
     def adapter_indices(self, device: torch.device | str = "cpu") -> torch.Tensor:
         """Materialize the per-token adapter table for a planner/debugger."""
         return torch.repeat_interleave(
@@ -83,6 +94,14 @@ def use_lora_segments(segments: LoRASegments | None) -> Iterator[None]:
         yield
     finally:
         _CURRENT_LORA_SEGMENTS.reset(token)
+
+
+@contextmanager
+def slice_lora_segments(start: int, stop: int) -> Iterator[None]:
+    """Keep adapter ownership when an operator executes one root at a time."""
+    segments = _CURRENT_LORA_SEGMENTS.get()
+    with use_lora_segments(None if segments is None else segments.slice(start, stop)):
+        yield
 
 
 def stack_lora_factors(
@@ -162,7 +181,11 @@ def segmented_lora(
     if flat.shape[0] == 0:
         # Keep zero gradients attached to every participating parameter.
         out = flat.new_zeros(0, b.shape[-1]) + (a.sum() + b.sum() + flat.sum()) * 0
-    elif x.is_cuda and x.dtype in {torch.bfloat16, torch.float16}:
+    elif (
+        x.is_cuda
+        and x.dtype in {torch.bfloat16, torch.float16}
+        and torch.cuda.get_device_capability(x.device)[0] == 9
+    ):
         from .kernels.cute_grouped_lora_quack import quack_grouped_lora
 
         out = quack_grouped_lora(flat, a, b, list(segments.counts))

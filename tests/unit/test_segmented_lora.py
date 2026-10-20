@@ -125,3 +125,17 @@ def test_layout_validation_empty_gradients_and_context_restoration():
         assert _CURRENT_LORA_SEGMENTS.get() is table
         raise RuntimeError("forward failed")
     assert _CURRENT_LORA_SEGMENTS.get() is None
+
+
+def test_canonical_root_slices_keep_original_adapter_ownership():
+    from art.megatron.segmented_lora import slice_lora_segments
+
+    table = LoRASegments(cast(Any, ("a", "b")), (256, 128))
+    with use_lora_segments(table):
+        with slice_lora_segments(128, 256):
+            assert _CURRENT_LORA_SEGMENTS.get() == LoRASegments(table.refs, (128, 0))
+        with slice_lora_segments(256, 384):
+            assert _CURRENT_LORA_SEGMENTS.get() == LoRASegments(table.refs, (0, 128))
+        assert _CURRENT_LORA_SEGMENTS.get() is table
+    with pytest.raises(ValueError, match="within"):
+        table.slice(0, 385)
