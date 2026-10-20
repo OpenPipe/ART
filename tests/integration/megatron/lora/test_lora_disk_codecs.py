@@ -169,9 +169,12 @@ def _assert_stock_vllm_loads(
     script = r"""
 import json
 import sys
+import vllm.lora.lora_model as lora_module
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 
+# This helper checks CPU parsing and layout; pinned storage requires CUDA.
+lora_module.PIN_MEMORY = False
 path = sys.argv[1]
 expected = set(json.loads(sys.argv[2]))
 mapper_name = sys.argv[3]
@@ -199,10 +202,11 @@ print(json.dumps(sorted(lora.loras)))
             json.dumps(sorted(expected_modules)),
             mapper,
         ],
-        check=True,
+        check=False,
         text=True,
         capture_output=True,
     )
+    assert result.returncode == 0, result.stderr
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
