@@ -91,6 +91,9 @@ def main():
             "ART_MEGATRON_QWEN_LORA_PARAMETERIZATION", "native"
         ),
         expert_lora_layout=os.environ.get("ART_MEGATRON_EXPERT_LORA_LAYOUT"),
+        cuda_allocator=os.environ.get(
+            "PYTORCH_ALLOC_CONF", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "default")
+        ),
         gpu=torch.cuda.get_device_name(),
         torch=torch.__version__,
     )
@@ -107,10 +110,18 @@ def main():
         try:
             yield
         except RuntimeError as error:
-            if "out of memory" in str(error).lower():
+            event = (
+                "out_of_memory"
+                if "out of memory" in str(error).lower()
+                else "memory_refused"
+                if type(error).__name__ == "TrainerRankMemoryError"
+                else None
+            )
+            if event is not None:
                 emit(
-                    "out_of_memory",
+                    event,
                     phase=phase,
+                    error=str(error),
                     allocated_bytes=torch.cuda.memory_allocated(),
                     reserved_bytes=torch.cuda.memory_reserved(),
                     peak_allocated_bytes=torch.cuda.max_memory_allocated(),
