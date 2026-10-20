@@ -1,16 +1,12 @@
 from collections.abc import Callable
-from contextlib import AbstractContextManager, nullcontext
 import functools
 from typing import Any
 
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
-from .layout import ROOT_ALIGNMENT, NumericalPolicy, RootLayout, current_layout
-
-RowContext = Callable[[int, int], AbstractContextManager[Any]]
+from .layout import NumericalPolicy, current_layout
 
 
 def _join(values: list[Any], first_rows: int) -> Any:
@@ -30,7 +26,7 @@ def _join(values: list[Any], first_rows: int) -> Any:
 
 
 def _row_forward(
-    original: Callable[..., Any], *, owner: torch.nn.Module | None = None
+    original: Callable[..., Any],
 ) -> Callable[..., Any]:
     @functools.wraps(original)
     def forward(x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
@@ -43,13 +39,9 @@ def _row_forward(
             or len(layout.lengths) == 1
         ):
             return original(x, *args, **kwargs)
-        row_context = getattr(owner, "_art_canonical_row_context", None)
-        pieces = []
-        for part in layout.slices():
-            # Segmented LoRA rebases adapter ownership alongside root rows.
-            # The optional callback avoids a dependency on that gated feature.
-            with row_context(part.start, part.stop) if row_context else nullcontext():
-                pieces.append(original(x[part].contiguous(), *args, **kwargs))
+        pieces = [
+            original(x[part].contiguous(), *args, **kwargs) for part in layout.slices()
+        ]
         return _join(pieces, layout.padded_lengths[0])
 
     return forward
@@ -110,23 +102,52 @@ def _attention_forward(module: Any, original: Callable[..., Any]) -> Callable[..
     return forward
 
 
+def _module_types() -> tuple[tuple[type, ...], tuple[type, ...], tuple[type, ...]]:
+    # Keep optional Megatron/CUDA imports out of the layout-only CPU API.
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELayerNormColumnParallelLinear,
+        TERowParallelLinear,
+    )
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+    from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
+    import transformer_engine.pytorch as te
+
+    from art.megatron.context_parallel.core_attention import (
+        ArtContextParallelCoreAttention,
+    )
+    from art.megatron.flex_attn.attention import FlexDotProductAttention
+    from art.megatron.lora import LoRA, LoRASlot
+
+    return (
+        (
+            LoRA,
+            TEColumnParallelLinear,
+            TELayerNormColumnParallelLinear,
+            TERowParallelLinear,
+            te.Linear,
+            te.LayerNormLinear,
+            te.LayerNorm,
+            te.RMSNorm,
+        ),
+        (FlexDotProductAttention, ArtContextParallelCoreAttention),
+        (GatedDeltaNet, VocabParallelEmbedding, torch.nn.Embedding, LoRASlot),
+    )
+
+
 def install(
     model: torch.nn.Module,
     *,
     numerical_policy: NumericalPolicy = "canonical",
-    row_context: RowContext | None = None,
-) -> None:
-    """Install context-aware row/attention wrappers once, after ART/LoRA hooks.
+) -> dict[str, str]:
+    """Wrap supported dense row/attention modules; return {path: wrapper kind}.
 
-    ``numerical_policy`` is the trainer's only policy flag. Use native for MoE.
-    The initial policy qualifies TP1/CP1 dense models with zero dropout and
-    disabled full-layer compilation. Component kernel compilation is retained.
-    Parameters and optimizer identities are preserved. A nonnull row_context
-    rebases optional adapter metadata for each root call, and upgrades existing
-    wrappers without wrapping them twice. None preserves the installed callback.
+    Validate the complete layout before mutating it. Reinstallation reports the
+    same modules without wrapping twice. Native installation returns an empty
+    report. Parameter and optimizer identities are preserved.
     """
     if numerical_policy == "native":
-        return
+        return {}
     if numerical_policy != "canonical":
         raise ValueError(f"unknown numerical policy: {numerical_policy}")
     config = getattr(model, "config", None)
@@ -140,66 +161,49 @@ def install(
     for name in ("hidden_dropout", "attention_dropout"):
         if getattr(config, name, 0):
             raise ValueError("canonical v1 requires zero dropout")
-    for module in model.modules():
-        if getattr(module, "_art_canonical_installed", False):
-            if row_context is not None:
-                setattr(module, "_art_canonical_row_context", row_context)
-            continue
-        kind = type(module).__name__
-        if kind in ("FlexDotProductAttention", "ArtContextParallelCoreAttention"):
-            wrapped = _attention_forward(module, module.forward)
-        elif (
-            (kind == "LoRA" and not getattr(module, "is_expert", False))
-            or ("Norm" in kind and "Transformer" not in kind)
-            or (kind.startswith("TE") and "Linear" in kind and "Grouped" not in kind)
+    row_types, attention_types, parameter_types = _module_types()
+    gdn_convolutions = {
+        id(module.conv1d)
+        for module in model.modules()
+        if isinstance(module, parameter_types) and hasattr(module, "conv1d")
+    }
+    report = {}
+    unsupported = []
+    for name, module in model.named_modules():
+        core_attention = getattr(module, "core_attention", None)
+        if core_attention is not None and not isinstance(
+            core_attention, attention_types
         ):
-            wrapped = _row_forward(module.forward, owner=module)
-        else:
-            continue
-        module.forward = wrapped
-        if row_context is not None:
-            setattr(module, "_art_canonical_row_context", row_context)
-        setattr(module, "_art_canonical_installed", True)
-
-
-def target_logprobs(
-    hidden: torch.Tensor,
-    weight: torch.Tensor,
-    targets: torch.Tensor,
-    *,
-    layout: RootLayout,
-) -> tuple[torch.Tensor, ...]:
-    """FP32 head with fixed 128-row calls, independently restarted per root.
-
-    Hidden rows/targets include padding; ignore labels with -100. The returned
-    logical rows include zeros for ignored labels. Weight is normally frozen.
-    """
-    if hidden.ndim != 2 or hidden.shape[0] != layout.rows:
-        raise ValueError("head hidden rows must match the canonical layout")
-    if targets.shape != (layout.rows,):
-        raise ValueError("head targets must match the canonical layout")
-    fp32_weight = weight.float()
-
-    def chunk_logprobs(h: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return -F.cross_entropy(
-            F.linear(h.float(), fp32_weight),
-            labels,
-            reduction="none",
-            ignore_index=-100,
-        )
-
-    outputs = []
-    for part, length in zip(layout.slices(), layout.lengths, strict=True):
-        root_hidden, root_targets = hidden[part], targets[part]
-        chunks = []
-        for start in range(0, len(root_hidden), ROOT_ALIGNMENT):
-            h = root_hidden[start : start + ROOT_ALIGNMENT]
-            labels = root_targets[start : start + ROOT_ALIGNMENT]
-            # Do not retain a sequence x vocabulary FP32 softmax for backward.
-            chunks.append(
-                checkpoint(chunk_logprobs, h, labels, use_reentrant=False)
-                if torch.is_grad_enabled() and (h.requires_grad or weight.requires_grad)
-                else chunk_logprobs(h, labels)
+            unsupported.append(
+                f"{name}.core_attention ({type(core_attention).__name__})"
             )
-        outputs.append(torch.cat(chunks)[:length])
-    return tuple(outputs)
+        if isinstance(module, attention_types):
+            if (
+                getattr(module, "softmax_offset", None) is not None
+                or getattr(module, "art_sliding_window", None) is not None
+            ):
+                unsupported.append(f"{name} (attention sinks or sliding windows)")
+            report[name] = "attention"
+        elif isinstance(module, row_types) and not getattr(module, "is_expert", False):
+            report[name] = "row"
+        elif (
+            any(True for _ in module.parameters(recurse=False))
+            and not isinstance(module, parameter_types)
+            and id(module) not in gdn_convolutions
+        ):
+            unsupported.append(f"{name or '<root>'} ({type(module).__name__})")
+    if unsupported or not report:
+        raise ValueError(
+            "unsupported canonical layout: "
+            + ", ".join(unsupported or ["no supported operators"])
+        )
+    for name, module in model.named_modules():
+        if name not in report or getattr(module, "_art_canonical_installed", False):
+            continue
+        module.forward = (
+            _attention_forward(module, module.forward)
+            if report[name] == "attention"
+            else _row_forward(module.forward)
+        )
+        setattr(module, "_art_canonical_installed", True)
+    return report

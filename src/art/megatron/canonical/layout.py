@@ -63,8 +63,8 @@ class RootLayout:
 _LAYOUT: ContextVar[RootLayout | None] = ContextVar(
     "art_canonical_layout", default=None
 )
-# Deterministic-algorithm and allocation settings are process-wide. ART trainer
-# kernels execute synchronously; serialize policy scopes across worker threads.
+# Process-wide PyTorch flags affect every thread, including TrainerRank workers.
+# This lock coordinates execution() callers only; it cannot isolate other work.
 _EXECUTION_LOCK = threading.RLock()
 
 
@@ -97,9 +97,11 @@ def execution(
 ) -> Iterator[None]:
     """One synchronous forward/recompute/backward scope; no async suspension.
 
-    Native calls are no-ops outside a scope and explicitly mask an outer layout.
-    Allocate outputs normally, with deterministic algorithms still enabled but
-    debug fills disabled, matching the qualified elastic-canonical fast policy.
+    Deterministic algorithms and disabled debug fills are PROCESS-WIDE until
+    backward completes. Other TrainerRank/planner/prefetch threads inherit them.
+    Callers must dedicate the process to this policy or quiesce other PyTorch
+    work; this lock only serializes callers of execution(), including native
+    scopes. Never suspend async work here. Native scopes only mask the layout.
     """
     if numerical_policy not in ("native", "canonical"):
         raise ValueError(f"unknown numerical policy: {numerical_policy}")
@@ -107,13 +109,18 @@ def execution(
         raise ValueError("canonical execution requires a root layout")
     with _EXECUTION_LOCK:
         token = _LAYOUT.set(layout if numerical_policy == "canonical" else None)
+        if numerical_policy == "native":
+            try:
+                yield
+            finally:
+                _LAYOUT.reset(token)
+            return
         deterministic = torch.are_deterministic_algorithms_enabled()
         warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
         fill = getattr(torch.utils.deterministic, "fill_uninitialized_memory")
         try:
-            if numerical_policy == "canonical":
-                torch.use_deterministic_algorithms(True, warn_only=False)
-                setattr(torch.utils.deterministic, "fill_uninitialized_memory", False)
+            torch.use_deterministic_algorithms(True, warn_only=False)
+            setattr(torch.utils.deterministic, "fill_uninitialized_memory", False)
             yield
         finally:
             setattr(torch.utils.deterministic, "fill_uninitialized_memory", fill)

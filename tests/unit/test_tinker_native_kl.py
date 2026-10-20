@@ -11,7 +11,7 @@ class FakeSamplingClient(tinker.SamplingClient):
         self._responses = responses
 
     async def compute_logprobs_async(
-        self, prompt: tinker.ModelInput
+        self, prompt: tinker.ModelInput, prompt_logprobs_last_n: int | None = None
     ) -> list[float | None]:
         return self._responses[tuple(prompt.to_ints())]
 

@@ -11,7 +11,6 @@ from art.megatron.canonical import (
     current_layout,
     execution,
     install,
-    target_logprobs,
 )
 from art.megatron.canonical.operators import _attention_forward, _row_forward
 
@@ -113,40 +112,6 @@ def test_checkpoint_recomputation_observes_same_layout():
     assert seen == [layout, layout]
 
 
-def test_fp32_head_is_exact_across_root_packing_and_masks_padding():
-    torch.manual_seed(9)
-    layout = RootLayout((3, 129))
-    roots = [torch.randn(n, 8, dtype=torch.bfloat16) for n in layout.lengths]
-    targets = [torch.randint(0, 19, (n,)) for n in layout.lengths]
-    targets[0][1] = -100
-    weight = torch.randn(19, 8, dtype=torch.bfloat16)
-    hidden = layout.pad(roots).requires_grad_()
-    packed = target_logprobs(
-        hidden, weight, layout.pad(targets, value=-100), layout=layout
-    )
-    packed[0].sum().backward()
-    assert hidden.grad is not None
-    expected_dx = hidden.grad[:3].clone()
-    solo_layout = RootLayout((3,))
-    solo_hidden = solo_layout.pad(roots[:1]).requires_grad_()
-    solo = target_logprobs(
-        solo_hidden,
-        weight,
-        solo_layout.pad(targets[:1], value=-100),
-        layout=solo_layout,
-    )
-    solo[0].sum().backward()
-    assert packed[0].dtype == torch.float32
-    assert packed[0][1] == 0
-    assert torch.equal(packed[0], solo[0])
-    assert solo_hidden.grad is not None
-    assert torch.equal(expected_dx, solo_hidden.grad[:3])
-    expected = -F.cross_entropy(
-        F.linear(roots[0].float(), weight.float()), targets[0], reduction="none"
-    )
-    torch.testing.assert_close(packed[0], expected)
-
-
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -203,42 +168,108 @@ def test_checkpoint_capture_carries_layout_to_autograd_worker_thread():
         assert pool.submit(empty.run, current_layout).result() is None
 
 
-def test_installed_row_context_can_upgrade_without_rewrapping():
-    from contextlib import contextmanager
-
-    class TECanonicalLinear(torch.nn.Linear):
+@pytest.fixture
+def operator_types(monkeypatch):
+    # Test dispatch by identity with neutral names. The runtime integration test
+    # exercises the production registry against real TE/MCore/ART modules.
+    class Projection(torch.nn.Linear):
         pass
 
-    linear = TECanonicalLinear(2, 2)
+    monkeypatch.setattr(
+        "art.megatron.canonical.operators._module_types",
+        lambda: ((Projection,), (), (torch.nn.Embedding,)),
+    )
+    return Projection
+
+
+def test_install_reports_types_and_is_idempotent(operator_types):
+    linear = operator_types(2, 2)
     model = torch.nn.Sequential(linear)
     setattr(model, "config", SimpleNamespace())
-    install(model)
-    original_wrapper = model[0].forward
-    calls = []
-
-    @contextmanager
-    def row_context(start, stop):
-        calls.append((start, stop, "enter"))
-        try:
-            yield
-        finally:
-            calls.append((start, stop, "exit"))
-
-    install(model, row_context=row_context)
-    install(model)  # ordinary adapter creation must preserve the callback
-    assert model[0].forward is original_wrapper
+    weight = linear.weight
+    assert install(model) == {"0": "row"}
+    wrapper = linear.forward
+    assert install(model) == {"0": "row"}
+    assert linear.forward is wrapper
+    assert linear.weight is weight
     layout = RootLayout((3, 129))
     x = torch.randn(layout.rows, 2)
     with execution(layout):
-        expected = F.linear(x, linear.weight, linear.bias)
         actual = model(x)
-    torch.testing.assert_close(actual, expected)
-    assert calls == [
-        (0, 128, "enter"),
-        (0, 128, "exit"),
-        (128, 384, "enter"),
-        (128, 384, "exit"),
-    ]
-    calls.clear()
-    model(x)  # native calls do not rebase metadata
-    assert calls == []
+    torch.testing.assert_close(actual, F.linear(x, linear.weight, linear.bias))
+
+
+@pytest.mark.parametrize("name", ["TECanonicalLinear", "UnexpectedNorm"])
+def test_unknown_parameter_types_are_rejected_before_wrapping(operator_types, name):
+    impostor = type(name, (torch.nn.Linear,), {})(2, 2)
+    model = torch.nn.Sequential(operator_types(2, 2), impostor)
+    setattr(model, "config", SimpleNamespace())
+    original = model[0].forward
+    with pytest.raises(ValueError, match=rf"1 \({name}\)"):
+        install(model)
+    assert model[0].forward == original
+    assert install(model, numerical_policy="native") == {}
+
+
+def test_empty_operator_layout_is_rejected(operator_types):
+    model = torch.nn.Identity()
+    setattr(model, "config", SimpleNamespace())
+    with pytest.raises(ValueError, match="no supported operators"):
+        install(model)
+
+
+def test_non_row_input_and_shared_output_are_not_split():
+    calls = []
+    shared = torch.randn(2, 2)
+
+    def original(x):
+        calls.append(x)
+        return shared
+
+    forward = _row_forward(original)
+    layout = RootLayout((3, 5))
+    non_row = torch.randn(7, 2)
+    with execution(layout):
+        assert forward(non_row) is shared
+        assert forward(torch.randn(layout.rows, 2)) is shared
+    assert calls[0] is non_row
+    assert len(calls) == 3
+
+
+def test_process_flags_are_visible_to_other_threads_and_restored():
+    from concurrent.futures import ThreadPoolExecutor
+
+    previous = torch.are_deterministic_algorithms_enabled()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with execution(RootLayout((3,))):
+            assert pool.submit(torch.are_deterministic_algorithms_enabled).result()
+        assert (
+            pool.submit(torch.are_deterministic_algorithms_enabled).result() == previous
+        )
+
+
+def test_native_scope_does_not_write_process_flags(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("native scope modified deterministic settings")
+
+    monkeypatch.setattr(torch, "use_deterministic_algorithms", unexpected)
+    with execution(None, numerical_policy="native"):
+        assert current_layout() is None
+
+
+def test_production_registry_matches_imported_te_type():
+    pytest.importorskip("megatron.core")
+    import transformer_engine.pytorch as te
+
+    class Projection(te.RMSNorm):
+        pass
+
+    projection = Projection(8, device="cpu")
+    model = torch.nn.Sequential(projection)
+    setattr(model, "config", SimpleNamespace())
+    weight = projection.weight
+    assert install(model) == {"0": "row"}
+    assert projection.weight is weight
+    wrapper = projection.forward
+    assert install(model) == {"0": "row"}
+    assert projection.forward is wrapper

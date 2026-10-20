@@ -134,7 +134,7 @@ tinker = [
     "pydantic>=2.12.5",
     "protobuf>=6.31.1",
     "tinker-cookbook>=0.5.2,<0.6",
-    "tinker==0.34.0",
+    "tinker>=0.34.0,<0.35",
     "torch==2.11.0",
     "transformers>=5.2.0,<=5.5.3",
     "uvicorn>=0.35.0",
@@ -204,6 +204,7 @@ force-sort-within-sections = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
+    "gpu: requires CUDA hardware and the Megatron runtime",
     "live_api_cost: opt-in live API cost validation against provider endpoints",
 ]
 
