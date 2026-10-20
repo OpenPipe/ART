@@ -303,7 +303,9 @@ def _ep1_dispatch_postprocess(dispatcher, original, hidden_states, probs):
     ids, _, _, _, _ = permute(
         tokens.ids[:, None].to(hidden_states.dtype),
         dispatcher.routing_map,
-        probs=torch.zeros_like(dispatcher.routing_map, dtype=torch.float32),
+        # TE zeros the payload for zero-probability padding slots. Metadata
+        # must retain IDs even there, so use nonzero detached dummy scores.
+        probs=torch.ones_like(dispatcher.routing_map, dtype=torch.float32),
         num_out_tokens=dispatcher.num_out_tokens,
         fused=dispatcher.config.moe_permute_fusion,
         drop_and_pad=False,

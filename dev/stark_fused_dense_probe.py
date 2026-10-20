@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--record-drift", action="store_true")
     parser.add_argument("--native-repeats", type=int, default=0)
     parser.add_argument("--zero-adapters", action="store_true")
+    parser.add_argument("--prepared-root", type=Path)
     parser.add_argument("--lengths", nargs="+", type=int, default=[257, 129])
     parser.add_argument("--rank", type=int, default=8)
     parser.add_argument("--layers", type=int, default=0)
@@ -90,13 +91,29 @@ def main():
         provider.recompute_method = "uniform"
         provider.recompute_num_layers = 1
 
+    external = None
+    model_path = args.model
+    if args.prepared_root is not None:
+        from safetensors import safe_open
+
+        ready = json.loads((args.prepared_root / "ready.json").read_bytes())
+        model_path = ready["weight_path"]
+        external = {}
+        for file in sorted(
+            (args.prepared_root / ready["identity"]).glob("chunk-*.safetensors")
+        ):
+            chunk = int(file.stem.split("-")[1])
+            with safe_open(file, framework="pt", device="cpu") as data:
+                for name in data.keys():  # noqa: SIM118 -- safe_open is not iterable.
+                    external[f"{chunk}:{name}"] = data.get_tensor(name).cuda()
     runtime = build_training_runtime(
-        model_identifier=args.model,
+        model_identifier=model_path,
         model_initialization=args.initialization,
         provider_configure=configure,
         model_support_key=get_model_support_spec(args.model).key,
         build_optimizer=False,
         print_env=False,
+        external_weights=external,
     )
     model: Any = runtime.model[0]
     while hasattr(model, "module"):
@@ -147,7 +164,11 @@ def main():
     )
     reference = {}
     evidence = {
-        "args": {**vars(args), "output": str(args.output)},
+        "args": {
+            **vars(args),
+            "output": str(args.output),
+            "prepared_root": str(args.prepared_root) if args.prepared_root else None,
+        },
         "device": torch.cuda.get_device_name(),
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
