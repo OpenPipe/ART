@@ -188,15 +188,19 @@ def test_canonical_gdn_never_selects_uniform_bucket_algorithm():
 
 def test_checkpoint_capture_carries_layout_to_autograd_worker_thread():
     from concurrent.futures import ThreadPoolExecutor
+    from contextvars import Context
 
     from art.megatron.canonical.layout import capture
 
     layout = RootLayout((3, 5))
+    # Caladan intentionally propagates ContextVars through thread pools. Force
+    # the empty context used by CUDA autograd independently of pool patches.
+    empty = Context()
     with ThreadPoolExecutor(max_workers=1) as pool, execution(layout):
-        assert pool.submit(current_layout).result() is None
+        assert pool.submit(empty.run, current_layout).result() is None
         captured = capture(current_layout)
-        assert pool.submit(captured).result() is layout
-        assert pool.submit(current_layout).result() is None
+        assert pool.submit(empty.run, captured).result() is layout
+        assert pool.submit(empty.run, current_layout).result() is None
 
 
 def test_installed_row_context_can_upgrade_without_rewrapping():
