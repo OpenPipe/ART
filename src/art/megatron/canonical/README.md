@@ -10,10 +10,11 @@ The trainer selects `numerical_policy="canonical"`, disables full-layer compile
 before building the model (`ART_DISABLE_MEGATRON_COMPILE=1`), and installs hooks
 after ART's LoRA hooks. Component kernel compilation remains enabled. Stark's
 runtime applies that compile setting from the single numerical-policy flag.
-CUDA process bootstrap must also set `CUBLAS_WORKSPACE_CONFIG=:4096:8` before
-CUDA/cuBLAS initialization, as the GPU probes do. Deterministic FP32 matmuls
-require that workspace configuration; setting it after a cuBLAS handle exists
-is too late for a reliable bootstrap.
+All recorded GPU cohorts set `CUBLAS_WORKSPACE_CONFIG=:4096:8` before CUDA
+initialization. Preserve that bootstrap configuration when reproducing the
+qualified policy; an unset workspace configuration was not separately tested.
+PyTorch2.11 documents this as a per-handle/stream workspace setting, so this
+module does not claim that an unset value necessarily raises an error.
 
 ```python
 from art.megatron.canonical import RootLayout, execution, install
