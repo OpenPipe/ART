@@ -69,6 +69,19 @@ _BLACKWELL_WIDE_HEAD_FLEX_KERNEL_OPTIONS = cast(
         "BLOCK_M": 32,
     },
 )
+_SM120_WIDE_HEAD_FLEX_KERNEL_OPTIONS = cast(
+    FlexKernelOptions,
+    {
+        "BACKEND": "TRITON",
+        "num_stages": 1,
+        "BLOCK_M": 32,
+        "BLOCK_N": 32,
+        "bwd_BLOCK_M1": 32,
+        "bwd_BLOCK_N1": 32,
+        "bwd_BLOCK_M2": 32,
+        "bwd_BLOCK_N2": 32,
+    },
+)
 _FORCED_FLEX_KERNEL_OPTIONS = cast(
     FlexKernelOptions,
     {"BACKEND": _FORCED_FLEX_BACKEND},
@@ -290,6 +303,8 @@ def get_dense_compiled_flex_attention(
     triton_num_stages_2_head_dims: tuple[int, ...] = (),
     device: torch.device | None = None,
 ) -> Any:
+    if _needs_sm120_wide_head_tile(backend, head_dim, head_dim_v, device):
+        return sm120_wide_head_dense_compiled_flex_attention
     if _needs_blackwell_wide_head_tile(
         backend=backend,
         head_dim=head_dim,
@@ -322,6 +337,8 @@ def get_sparse_compiled_flex_attention(
     device: torch.device | None = None,
 ) -> Any:
     del family_key
+    if _needs_sm120_wide_head_tile(backend, head_dim, head_dim_v, device):
+        return sm120_wide_head_sparse_compiled_flex_attention
     if _needs_blackwell_wide_head_tile(
         backend=backend,
         head_dim=head_dim,
@@ -344,6 +361,16 @@ def get_sparse_compiled_flex_attention(
     return triton_sparse_compiled_flex_attention
 
 
+def _needs_sm120_wide_head_tile(backend, head_dim, head_dim_v, device) -> bool:
+    return (
+        backend == "TRITON"
+        and max(head_dim, head_dim_v) > 128
+        and device is not None
+        and device.type == "cuda"
+        and torch.cuda.get_device_capability(device)[0] == 12
+    )
+
+
 dense_compiled_flex_attention = torch.compile(
     _forced_flex_attention_dense,
 )
@@ -358,6 +385,9 @@ triton_num_stages_2_dense_compiled_flex_attention = torch.compile(
 )
 blackwell_wide_head_dense_compiled_flex_attention = torch.compile(
     _flex_attention_with_options(_BLACKWELL_WIDE_HEAD_FLEX_KERNEL_OPTIONS),
+)
+sm120_wide_head_dense_compiled_flex_attention = torch.compile(
+    _flex_attention_with_options(_SM120_WIDE_HEAD_FLEX_KERNEL_OPTIONS),
 )
 
 sparse_compiled_flex_attention = torch.compile(
@@ -374,4 +404,7 @@ triton_num_stages_2_sparse_compiled_flex_attention = torch.compile(
 )
 blackwell_wide_head_sparse_compiled_flex_attention = torch.compile(
     _sparse_flex_attention_with_options(_BLACKWELL_WIDE_HEAD_FLEX_KERNEL_OPTIONS),
+)
+sm120_wide_head_sparse_compiled_flex_attention = torch.compile(
+    _sparse_flex_attention_with_options(_SM120_WIDE_HEAD_FLEX_KERNEL_OPTIONS),
 )
