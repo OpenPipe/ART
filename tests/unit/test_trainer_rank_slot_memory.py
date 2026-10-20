@@ -28,6 +28,7 @@ def load_slot(rank, name, selected_rank):
         for index, lora in enumerate(chunk.modules()):
             if type(lora) is not LoRA:
                 continue
+            lora.shared_factor = None
             expert = lora.A_T.ndim == 3
             lora.adapter_model_prefix = f"layer{index}" + (
                 ".{expert}" if expert else ""
