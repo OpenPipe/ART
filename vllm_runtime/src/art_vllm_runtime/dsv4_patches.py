@@ -215,6 +215,14 @@ def patch_dsv4_mhc_pre_fixed_split() -> None:
     shape to the TileLang kernel default split count keeps the reduction plan
     stable without changing model math.
     """
+    from vllm.platforms import current_platform
+
+    # vLLM only builds its TileLang mHC kernels on CUDA-like platforms. Without
+    # one (e.g. in the release smoke test), the kernel module cannot be
+    # imported and there is no split plan to pin.
+    if not current_platform.is_cuda_alike():
+        return
+
     kernels = importlib.import_module(
         "vllm.model_executor.kernels.mhc.tilelang_kernels"
     )
