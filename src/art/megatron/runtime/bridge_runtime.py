@@ -676,6 +676,27 @@ def _art_get_model(
             use_torch_fsdp2=use_torch_fsdp2,
             pg_collection=pg_collection,
         )
+    if external_weights is not None:
+        reachable = {
+            parameter.data_ptr() for chunk in model for parameter in chunk.parameters()
+        }
+        for chunk in model:
+            for module in chunk.modules():
+                for tensor, pointer in getattr(
+                    module, "_art_external_weight_aliases", ()
+                ):
+                    if tensor.data_ptr() != pointer:
+                        raise RuntimeError(
+                            "model wrapping replaced external base storage"
+                        )
+                    if (
+                        isinstance(tensor, torch.nn.Parameter)
+                        and tensor.numel()
+                        and pointer not in reachable
+                    ):
+                        raise RuntimeError(
+                            "model wrapping detached an external base parameter"
+                        )
     return model
 
 

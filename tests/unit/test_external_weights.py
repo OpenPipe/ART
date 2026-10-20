@@ -18,7 +18,7 @@ bind_external_weights = module.bind_external_weights
 
 def test_parameter_metadata_and_external_alias_survive():
     model = torch.nn.Linear(3, 2, device="meta", dtype=torch.bfloat16)
-    model.weight.tensor_model_parallel = True
+    setattr(model.weight, "tensor_model_parallel", True)
     weight, bias = (
         torch.randn(2, 3, dtype=torch.bfloat16),
         torch.randn(2, dtype=torch.bfloat16),
@@ -28,7 +28,7 @@ def test_parameter_metadata_and_external_alias_survive():
     ]
     assert model.weight.data_ptr() == weight.data_ptr()
     assert model.bias.data_ptr() == bias.data_ptr()
-    assert model.weight.tensor_model_parallel
+    assert getattr(model.weight, "tensor_model_parallel")
     assert model.weight.requires_grad
 
 
