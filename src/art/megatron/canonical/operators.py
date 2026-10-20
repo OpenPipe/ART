@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from .layout import ROOT_ALIGNMENT, NumericalPolicy, RootLayout, current_layout
 
@@ -163,21 +164,27 @@ def target_logprobs(
     if targets.shape != (layout.rows,):
         raise ValueError("head targets must match the canonical layout")
     fp32_weight = weight.float()
+
+    def chunk_logprobs(h: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        return -F.cross_entropy(
+            F.linear(h.float(), fp32_weight),
+            labels,
+            reduction="none",
+            ignore_index=-100,
+        )
+
     outputs = []
     for part, length in zip(layout.slices(), layout.lengths, strict=True):
         root_hidden, root_targets = hidden[part], targets[part]
         chunks = []
         for start in range(0, len(root_hidden), ROOT_ALIGNMENT):
-            logits = F.linear(
-                root_hidden[start : start + ROOT_ALIGNMENT].float(), fp32_weight
-            )
+            h = root_hidden[start : start + ROOT_ALIGNMENT]
+            labels = root_targets[start : start + ROOT_ALIGNMENT]
+            # Do not retain a sequence x vocabulary FP32 softmax for backward.
             chunks.append(
-                -F.cross_entropy(
-                    logits,
-                    root_targets[start : start + ROOT_ALIGNMENT],
-                    reduction="none",
-                    ignore_index=-100,
-                )
+                checkpoint(chunk_logprobs, h, labels, use_reentrant=False)
+                if torch.is_grad_enabled() and (h.requires_grad or weight.requires_grad)
+                else chunk_logprobs(h, labels)
             )
         outputs.append(torch.cat(chunks)[:length])
     return tuple(outputs)
