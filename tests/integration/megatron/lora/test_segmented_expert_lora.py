@@ -106,6 +106,7 @@ def test_slot_gradients_and_recompute_keep_dispatched_adapter_plan(shared, reent
 def test_native_ep1_dispatch_outputs_input_probability_and_slot_gradients(shared):
     from types import SimpleNamespace
 
+    from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.transformer.moe.token_dispatcher import (
         MoEAlltoAllTokenDispatcher,
     )
@@ -128,7 +129,14 @@ def test_native_ep1_dispatch_outputs_input_probability_and_slot_gradients(shared
         moe_token_dispatcher_type="alltoall",
         params_dtype=torch.bfloat16,
     )
-    dispatcher = MoEAlltoAllTokenDispatcher(3, [0, 1, 2], config)
+    dispatcher = MoEAlltoAllTokenDispatcher(
+        3,
+        [0, 1, 2],
+        config,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["ep", "expt_tp", "tp_ep"]
+        ),
+    )
     layer = SimpleNamespace(config=config, token_dispatcher=dispatcher)
     install_segmented_dispatcher(layer)
     install_segmented_dispatcher(layer)  # Idempotent, preserves the native object.
