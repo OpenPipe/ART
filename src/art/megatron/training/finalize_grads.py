@@ -7,7 +7,7 @@ from megatron.core.transformer.module import MegatronModule
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-GradSyncDomain = Literal["tp_default", "expert_tp"]
+GradSyncDomain = Literal["tp_default", "expert_tp", "expert_tp_ep"]
 GradSyncOp = Literal["none", "sum", "avg"]
 
 TP_DEFAULT_GRAD_SYNC_DOMAIN: GradSyncDomain = "tp_default"
@@ -40,13 +40,12 @@ def _resolve_domain_group(
 ) -> Any | None:
     if domain == TP_DEFAULT_GRAD_SYNC_DOMAIN:
         group = ps.get_tensor_model_parallel_group(check_initialized=False)
-        if group is None or group.size() <= 1:
-            return None
-        return group
-    if domain != EXPERT_TP_GRAD_SYNC_DOMAIN:
+    elif domain == EXPERT_TP_GRAD_SYNC_DOMAIN:
+        group = ps.get_expert_tensor_parallel_group(check_initialized=False)
+    elif domain == "expert_tp_ep":
+        group = ps.get_expert_tensor_and_model_parallel_group(check_initialized=False)
+    else:
         raise RuntimeError(f"Unknown grad sync domain: {domain}")
-
-    group = ps.get_expert_tensor_parallel_group(check_initialized=False)
     if group is None or group.size() <= 1:
         return None
     return group

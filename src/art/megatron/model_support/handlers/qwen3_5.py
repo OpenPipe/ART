@@ -5,7 +5,7 @@ from copy import copy
 from functools import lru_cache
 import re
 from types import MethodType
-from typing import Any, Sequence, cast
+from typing import TYPE_CHECKING, Any, Sequence, cast
 
 import torch
 
@@ -25,6 +25,9 @@ from art.megatron.model_support.spec import (
     LayerFamilyInstance,
 )
 
+if TYPE_CHECKING:
+    from art.megatron.lora import LoraLayout
+
 _QWEN35_MOE_COMPILE_WORKAROUND_FLAGS = (
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
@@ -34,7 +37,7 @@ _ART_LAYER_PREFIX = "base_model.model.model.layers."
 _VLLM_LAYER_PREFIX = "base_model.model.model.language_model.layers."
 _ART_MOE_EXPERT_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\.(?P<expert>\d+)\."
-    r"(?P<module>gate_up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
+    r"(?P<module>gate_up_proj|gate_proj|up_proj|down_proj)\.(?P<lora>lora_[AB])\.weight$"
 )
 _VLLM_MOE_KEY_RE = re.compile(
     r"^(?P<prefix>.*\.mlp\.experts)\."
@@ -69,6 +72,9 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         target_set = set(target_modules)
         if "in_proj_qkv" in target_set:
             suffixes.append("linear_attn.in_proj_qkv.weight")
+        for projection in ("q", "k", "v"):
+            if f"in_proj_{projection}" in target_set:
+                suffixes.append(f"linear_attn.in_proj_{projection}.weight")
         if "in_proj_z" in target_set:
             suffixes.append("linear_attn.in_proj_z.weight")
         if "out_proj" in target_set:
@@ -81,6 +87,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         *,
         adapter_config: dict[str, Any],
     ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+        tensors, adapter_config = _serving_lora_tensors(tensors, adapter_config)
         if _group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE):
             raise TypeError("Dense Qwen3.5 handler received MoE LoRA tensors")
         transformed: dict[str, torch.Tensor] = {}
@@ -112,7 +119,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                 adapter_config=adapter_config,
             )
             transformed[art_key] = tensor
-        return transformed
+        return _training_lora_tensors(transformed, adapter_config)
 
     def install_preprocess_patch(self, model_chunks: Sequence[Any]) -> None:
         from megatron.core.models.gpt.gpt_model import GPTModel
@@ -261,12 +268,15 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         target_modules: list[str],
         rank: int,
         alpha: int,
+        lora_layout: LoraLayout | None = None,
     ) -> None:
         from megatron.core.ssm.gated_delta_net import GatedDeltaNet
         from megatron.core.transformer.attention import SelfAttention
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
         from art.megatron.lora import (
+            LoRA,
+            LoraLayout,
             _adapter_model_prefix,
             _is_language_transformer_layer_name,
             wrap_gated_delta_net_attention,
@@ -274,11 +284,6 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         )
 
         target_set = set(target_modules)
-        from art.megatron.lora import UnembeddingLoRA
-
-        for chunk in model_chunks:
-            if "lm_head" in target_set:
-                chunk.output_layer = UnembeddingLoRA(chunk.output_layer, rank, alpha)
         for chunk in model_chunks:
             for module_name, module in chunk.named_modules():
                 if not isinstance(module, TransformerLayer):
@@ -298,6 +303,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                 elif isinstance(module.self_attention, GatedDeltaNet):
                     wrap_gated_delta_net_attention(
                         module.self_attention,
+                        lora_layout=lora_layout,
                         adapter_model_prefix=adapter_model_prefix,
                         provider=provider,
                         target_modules=target_set,
@@ -311,12 +317,17 @@ class Qwen35BaseHandler(DefaultDenseHandler):
                     )
                 self._wrap_mlp_lora(
                     module,
+                    lora_layout=lora_layout,
                     adapter_model_prefix=adapter_model_prefix,
                     provider=provider,
                     target_modules=target_set,
                     rank=rank,
                     alpha=alpha,
                 )
+        for chunk in model_chunks:
+            for module in chunk.modules():
+                if isinstance(module, LoRA):
+                    module.lora_layout = lora_layout or LoraLayout()
 
     def build_adapter_weights_by_base(
         self,
@@ -340,6 +351,7 @@ class Qwen35BaseHandler(DefaultDenseHandler):
         target_modules: set[str],
         rank: int,
         alpha: int,
+        lora_layout: LoraLayout | None = None,
     ) -> None:
         from art.megatron.lora import wrap_split_mlp_lora
 
@@ -445,9 +457,10 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         target_modules: set[str],
         rank: int,
         alpha: int,
+        lora_layout: LoraLayout | None = None,
     ) -> None:
         from art.megatron.lora import (
-            qwen_lora_parameterization,
+            LoraLayout,
             wrap_grouped_moe_experts,
             wrap_split_mlp_lora,
         )
@@ -455,10 +468,14 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
         wrap_grouped_moe_experts(
             _require_moe_experts(module),
             adapter_model_prefix=adapter_model_prefix,
-            target_modules=target_modules,
+            target_modules=(target_modules | {"gate_proj", "up_proj", "down_proj"})
+            if "experts" in target_modules
+            else target_modules,
             rank=rank,
             alpha=alpha,
-            fused_gate_up=qwen_lora_parameterization() == "tied_v0",
+            fused_gate_up=(lora_layout or LoraLayout()).qwen_parameterization
+            == "tied_v0",
+            lora_layout=lora_layout,
         )
         shared_experts = getattr(module.mlp, "shared_experts", None)
         if shared_experts is not None:
@@ -726,11 +743,128 @@ def _convert_remaining_lora_tensors(
         transformed[converted_key] = converted
 
 
+def _serving_lora_tensors(
+    tensors: dict[str, torch.Tensor], config: dict[str, Any]
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    if (
+        config.get("art_lora_layout", {}).get("qwen_parameterization") != "tinker_v1"
+        or "art_lora_native_config" in config
+    ):
+        return tensors, config
+    result = dict(tensors)
+    fused: dict[str, list[tuple[str, int]]] = {}
+    for key in tuple(tensors):
+        if any(
+            key.endswith(f".in_proj_{part}.lora_{factor}.weight")
+            for part in ("q", "k", "v")
+            for factor in ("A", "B")
+        ):
+            prefix = key.rsplit("in_proj_", 1)[0]
+            fused[prefix + "in_proj_qkv"] = [
+                (prefix + "in_proj_" + part, 0) for part in ("q", "k", "v")
+            ]
+        elif _ART_MOE_EXPERT_KEY_RE.match(key) and key.endswith(
+            ".gate_proj.lora_A.weight"
+        ):
+            prefix = key.removesuffix("gate_proj.lora_A.weight")
+            fused[prefix + "gate_up_proj"] = [
+                (prefix + part + "_proj", 0) for part in ("gate", "up")
+            ]
+    for prefix, parts in fused.items():
+        pairs = [
+            (result.pop(part + ".lora_A.weight"), result.pop(part + ".lora_B.weight"))
+            for part, _ in parts
+        ]
+        fused[prefix] = [
+            (part, b.shape[0]) for (part, _), (_, b) in zip(parts, pairs, strict=True)
+        ]
+        result[prefix + ".lora_A.weight"] = torch.cat([a for a, _ in pairs])
+        result[prefix + ".lora_B.weight"] = torch.block_diag(*[b for _, b in pairs])
+    # vLLM has one serving rank and scale for all projections. Padding to 3r
+    # preserves independent Q/K/V (3r), gate/up (2r), and ordinary factors (r).
+    rank = 3 * int(config["r"])
+    for key, tensor in result.items():
+        axis = 0 if key.endswith(".lora_A.weight") else 1
+        padding = (
+            (0, 0, 0, rank - tensor.shape[0])
+            if axis == 0
+            else (0, rank - tensor.shape[1])
+        )
+        result[key] = torch.nn.functional.pad(tensor, padding)
+    serving = {
+        **config,
+        "r": rank,
+        "lora_alpha": 3 * config["lora_alpha"],
+        "art_lora_native_config": dict(config),
+        "art_lora_fused_projections": {
+            prefix: parts
+            for prefix, parts in fused.items()
+            if prefix.endswith(".in_proj_qkv")
+        },
+    }
+    targets = set(config["target_modules"]) - {"in_proj_q", "in_proj_k", "in_proj_v"}
+    if any(".in_proj_qkv" in prefix for prefix in fused):
+        targets.add("in_proj_qkv")
+    serving["target_modules"] = sorted(targets)
+    return result, serving
+
+
+def _training_lora_tensors(
+    tensors: dict[str, torch.Tensor], config: dict[str, Any]
+) -> dict[str, torch.Tensor]:
+    native = config.get("art_lora_native_config")
+    if native is None:
+        return tensors
+    rank = int(native["r"])
+    result = dict(tensors)
+    fused = dict(config["art_lora_fused_projections"])
+    for key, tensor in tensors.items():
+        if _ART_MOE_EXPERT_KEY_RE.match(key) and key.endswith(
+            ".gate_up_proj.lora_B.weight"
+        ):
+            prefix = key.removesuffix("gate_up_proj.lora_B.weight")
+            fused[prefix + "gate_up_proj"] = [
+                (prefix + part + "_proj", tensor.shape[0] // 2)
+                for part in ("gate", "up")
+            ]
+    split_keys: set[str] = set()
+    for prefix, parts in fused.items():
+        a, b = (result.pop(prefix + f".lora_{factor}.weight") for factor in ("A", "B"))
+        row = 0
+        pairs = []
+        for index, (part, width) in enumerate(parts):
+            aa = a[index * rank : (index + 1) * rank]
+            bb = b[row : row + width, index * rank : (index + 1) * rank]
+            result[part + ".lora_A.weight"], result[part + ".lora_B.weight"] = (
+                aa.contiguous(),
+                bb.contiguous(),
+            )
+            split_keys.update(part + f".lora_{factor}.weight" for factor in ("A", "B"))
+            pairs.append((aa, bb))
+            row += width
+        expected_a, expected_b = torch.zeros_like(a), torch.zeros_like(b)
+        expected_a[: len(parts) * rank] = torch.cat([aa for aa, _ in pairs])
+        expected_b[:, : len(parts) * rank] = torch.block_diag(*[bb for _, bb in pairs])
+        if not torch.equal(a, expected_a) or not torch.equal(b, expected_b):
+            raise ValueError(
+                f"Serving LoRA no longer matches independent training factors: {prefix}"
+            )
+    for key, tensor in result.items():
+        if key in split_keys:
+            continue
+        axis = 0 if key.endswith(".lora_A.weight") else 1
+        if torch.count_nonzero(tensor.narrow(axis, rank, tensor.shape[axis] - rank)):
+            raise ValueError(f"Serving LoRA has nonzero rank padding: {key}")
+        result[key] = tensor.narrow(axis, 0, rank).contiguous()
+    return result
+
+
 def _to_vllm_lora_tensors(
     tensors: dict[str, torch.Tensor],
     *,
     adapter_config: dict[str, Any],
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    tensors, adapter_config = _serving_lora_tensors(tensors, adapter_config)
     grouped = _group_expert_lora_tensors(tensors, _ART_MOE_EXPERT_KEY_RE)
     has_shared_experts = _has_shared_expert_lora_tensors(tensors)
     transformed: dict[str, torch.Tensor] = {}
@@ -812,6 +946,13 @@ def _to_vllm_lora_tensors(
 
 
 def _from_vllm_lora_tensors(
+    tensors: dict[str, torch.Tensor], *, adapter_config: dict[str, Any]
+) -> dict[str, torch.Tensor]:
+    restored = _from_vllm_tied_lora_tensors(tensors, adapter_config=adapter_config)
+    return _training_lora_tensors(restored, adapter_config)
+
+
+def _from_vllm_tied_lora_tensors(
     tensors: dict[str, torch.Tensor],
     *,
     adapter_config: dict[str, Any],
@@ -838,6 +979,19 @@ def _from_vllm_lora_tensors(
                     raise RuntimeError(
                         f"Incomplete Qwen3.5 vLLM MoE LoRA block for {prefix}.{expert}"
                     ) from exc
+                if (
+                    adapter_config.get("art_lora_layout", {}).get(
+                        "qwen_parameterization"
+                    )
+                    == "tinker_v1"
+                    and "art_lora_native_config" not in adapter_config
+                ):
+                    for slot, tensor in expert_tensors.items():
+                        transformed[_expert_lora_key(art_prefix, expert, *slot)] = (
+                            _clone(tensor)
+                        )
+                        used_keys.add(_expert_lora_key(prefix, expert, *slot))
+                    continue
                 gate_a = expert_tensors[("gate_proj", "lora_A")]
                 up_a = expert_tensors[("up_proj", "lora_A")]
                 if not torch.equal(gate_a, up_a):

@@ -5483,6 +5483,9 @@ def _include_in_distributed_grad_norm(param: torch.nn.Parameter) -> bool:
     if replica_group is not None and replica_group.size() > 1:
         if replica_group.rank() != 0:
             return False
+    if getattr(param, "lora_shared_expert", False):
+        group = ps.get_expert_tensor_and_model_parallel_group(check_initialized=False)
+        return group is None or group.rank() == 0
     if bool(getattr(param, "lora_tp_sharded", False)):
         return True
     shard_group = (
