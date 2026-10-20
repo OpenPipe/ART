@@ -8,10 +8,36 @@ inside trees must not change parent positions: pad only the final leaf.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from math import lcm
 
 from .types import TokenRange
+
+RootPlacements = tuple[tuple[int, int, int, int] | tuple[int, int, int, int, bool], ...]
+_PLACEMENTS: ContextVar[RootPlacements] = ContextVar("art_root_placements", default=())
+
+
+def current_root_placements() -> RootPlacements:
+    return _PLACEMENTS.get()
+
+
+@contextmanager
+def execution(placements: RootPlacements) -> Iterator[None]:
+    """Scope exact padded-wave ownership through forward/recompute/backward.
+
+    All participating ranks enter the same synchronous scope. The caller
+    supplies already padded complete roots, matching the packing exactly;
+    retain these placements until every backward graph has completed.
+    An empty tuple temporarily selects ART's global planning policy.
+    """
+    token = _PLACEMENTS.set(tuple(placements))
+    try:
+        yield
+    finally:
+        _PLACEMENTS.reset(token)
 
 
 def root_span(

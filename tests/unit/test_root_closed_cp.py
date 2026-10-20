@@ -225,3 +225,47 @@ def test_native_chunk_indices_preserve_empty_sequence_ids():
 
     cu = torch.tensor([0, 0, 64, 64, 192], dtype=torch.int32)
     assert _native_chunk_indices(cu, cu).tolist() == [[1, 0], [3, 0], [3, 1]]
+
+
+def test_execution_scopes_provider_configs_and_restores_after_exception():
+    from concurrent.futures import ThreadPoolExecutor
+    from types import SimpleNamespace
+
+    from art.megatron.context_parallel.root_closed import (
+        current_root_placements,
+        execution,
+    )
+    from art.megatron.training.microbatches import (
+        _context_parallel_config_for_provider,
+        _gdn_planner_config_for_provider,
+    )
+
+    provider = SimpleNamespace(
+        hidden_size=16,
+        linear_num_key_heads=1,
+        linear_num_value_heads=1,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+    )
+    handler = SimpleNamespace(
+        context_parallel_workload_profile=lambda provider: None,
+        build_gdn_execution_spec=True,
+    )
+    placements = ((0, 1024, 0, 2),)
+    assert current_root_placements() == ()
+    with pytest.raises(RuntimeError, match="probe"):
+        with execution(placements):
+            config = _context_parallel_config_for_provider(
+                provider, torch.device("cpu"), handler
+            )
+            assert config.root_placements == placements
+            gdn = _gdn_planner_config_for_provider(provider, handler)
+            assert gdn is not None and gdn.root_closed
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                assert executor.submit(current_root_placements).result() == ()
+            with execution(()):
+                gdn = _gdn_planner_config_for_provider(provider, handler)
+                assert gdn is not None and not gdn.root_closed
+            assert current_root_placements() == placements
+            raise RuntimeError("probe")
+    assert current_root_placements() == ()

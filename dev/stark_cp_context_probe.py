@@ -1,0 +1,177 @@
+"""Full-token, full-height CP capacity/parity probe; synthetic data, no service calls.
+
+Run one context per fresh torchrun process. An r8 adapter includes FP32 master,
+accumulator and Adam moments in backward mode. Never use proxy-layer results as
+advertised service capability. Snapshot tensors use safetensors, never pickle.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import nullcontext
+import json
+import os
+from pathlib import Path
+import time
+
+os.environ.setdefault("ART_DISABLE_MEGATRON_COMPILE", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="Qwen/Qwen3.8-27B")
+    parser.add_argument("--weight-path")
+    parser.add_argument("--tokens", type=int, required=True)
+    parser.add_argument(
+        "--layers", type=int, default=0, help="0 means the complete model"
+    )
+    parser.add_argument("--mode", choices=("forward", "backward"), default="backward")
+    parser.add_argument("--root-closed", action="store_true")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--snapshot")
+    parser.add_argument("--repeat", type=int, default=1)
+    args = parser.parse_args()
+    import torch
+    import torch.distributed as dist
+
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    dist.init_process_group("nccl")
+    cp = dist.get_world_size()
+    os.environ["ART_MEGATRON_CONTEXT_PARALLEL_SIZE"] = str(cp)
+    os.environ["ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE"] = "1"
+    os.environ["ART_MEGATRON_PIPELINE_MODEL_PARALLEL_SIZE"] = "1"
+    os.environ["ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE"] = "1"
+    from trainer_rank_support import load_random_checkpoints
+
+    from art.megatron import train
+    from art.megatron.context_parallel.root_closed import execution
+    from art.megatron.model_support.registry import get_model_support_spec
+    from art.trainer_rank import ForwardInput, TrainerRank
+
+    target = Path(args.output)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    facts = dict(
+        model=args.model,
+        weight_path=args.weight_path,
+        cp=cp,
+        tp=1,
+        ep=1,
+        layers_override=args.layers,
+        mode=args.mode,
+        root_closed=args.root_closed,
+        tokens=args.tokens,
+        gpu=torch.cuda.get_device_name(),
+        torch=torch.__version__,
+    )
+
+    def emit(event, **data):
+        if dist.get_rank() == 0:
+            row = dict(**facts, event=event, **data)
+            print(json.dumps(row, sort_keys=True), flush=True)
+            with target.open("a") as output:
+                output.write(json.dumps(row, sort_keys=True) + "\n")
+
+    def configure(provider):
+        if args.layers:
+            provider.num_layers = args.layers
+
+    torch.manual_seed(1234)
+    started = time.perf_counter()
+    runtime = train.build_training_runtime(
+        model_identifier=args.weight_path or args.model,
+        model_support_key=get_model_support_spec(args.model).key,
+        model_initialization="pretrained",
+        provider_configure=configure,
+        build_optimizer=False,
+        print_env=False,
+    )
+    for chunk in runtime.model:
+        chunk.train()
+    trainer = TrainerRank(runtime)
+    [slot] = load_random_checkpoints(
+        runtime, trainer, 1, base_model=args.model, lora_rank=8
+    )
+    parameters = trainer._checkpoint_slots[slot].params
+    optimizer_state = (
+        [torch.zeros_like(p, dtype=torch.float32) for p in parameters for _ in range(4)]
+        if args.mode == "backward"
+        else []
+    )
+    torch.cuda.synchronize()
+    emit(
+        "loaded",
+        elapsed_s=time.perf_counter() - started,
+        layers=runtime.provider.num_layers,
+        optimizer_state_bytes=sum(
+            t.numel() * t.element_size() for t in optimizer_state
+        ),
+    )
+    physical = args.tokens + (-args.tokens % (128 * cp))
+    tokens = torch.arange(physical + 1, dtype=torch.long) % 1000 + 100
+    placements = ((0, physical, 0, cp),)
+    for iteration in range(args.repeat):
+        trainer.zero_grad()
+        torch.cuda.reset_peak_memory_stats()
+        dist.barrier()
+        started = time.perf_counter()
+        with execution(placements) if args.root_closed else nullcontext():
+            [result] = trainer.dp_rank_forward(
+                [ForwardInput(input_tokens=tokens[:-1], target_tokens=tokens[1:])],
+                checkpoint=slot,
+                no_grad=args.mode == "forward",
+            )
+            logprobs = result.target_logprobs[: args.tokens].float()
+            loss = -logprobs.mean()
+            if args.mode == "backward":
+                loss.backward()
+        torch.cuda.synchronize()
+        seconds = torch.tensor(time.perf_counter() - started, device="cuda")
+        dist.all_reduce(seconds, op=dist.ReduceOp.MAX)
+        peak = torch.tensor(torch.cuda.max_memory_allocated(), device="cuda")
+        dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+        reserved = torch.tensor(torch.cuda.max_memory_reserved(), device="cuda")
+        dist.all_reduce(reserved, op=dist.ReduceOp.MAX)
+        finite = all(
+            p.grad is None or bool(torch.isfinite(p.grad).all()) for p in parameters
+        )
+        nonzero = any(
+            p.grad is not None and bool(p.grad.count_nonzero()) for p in parameters
+        )
+        assert bool(torch.isfinite(logprobs).all()) and finite
+        if args.mode == "backward":
+            assert nonzero, "no adapter gradients"
+        emit(
+            "passed",
+            iteration=iteration,
+            physical_tokens=physical,
+            seconds=float(seconds),
+            loss=float(loss.detach()),
+            peak_allocated_bytes=int(peak),
+            peak_reserved_bytes=int(reserved),
+            gradients_finite=finite,
+            nonzero_gradient=nonzero,
+        )
+        if args.snapshot and iteration == args.repeat - 1:
+            from safetensors.torch import save_file
+
+            tensors = {"logprobs": logprobs.detach().cpu().contiguous()}
+            if args.mode == "backward":
+                gradients = trainer._reduce_dynamic_grads(parameters, scale_grads=1.0)
+                tensors.update(
+                    {
+                        f"gradient_{i}": g.cpu().contiguous()
+                        for i, g in enumerate(gradients)
+                    }
+                )
+            if dist.get_rank() == 0:
+                save_file(
+                    tensors,
+                    args.snapshot,
+                    metadata={k: str(v) for k, v in facts.items()},
+                )
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
