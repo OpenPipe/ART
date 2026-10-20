@@ -10,12 +10,22 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
 
 import torch
 import torch.distributed as dist
+
+CheckpointPartition = tuple[int, tuple[int, int, int]]
+_PARTITION: ContextVar[CheckpointPartition | None] = ContextVar(
+    "art_checkpoint_partition", default=None
+)
+
+
+def current_checkpoint_partition() -> CheckpointPartition | None:
+    return _PARTITION.get()
 
 
 @dataclass
@@ -94,5 +104,11 @@ def shard_saved_activations(
         stats.restored_bytes += saved.numel * saved.tensor.element_size()
         return full[: saved.numel].view(saved.shape)
 
-    with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
-        yield stats
+    if _PARTITION.get() is not None:
+        raise RuntimeError("checkpoint sharding scopes cannot overlap")
+    token = _PARTITION.set((world, shape))
+    try:
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            yield stats
+    finally:
+        _PARTITION.reset(token)
