@@ -17,13 +17,18 @@ _EXPERT = re.compile(
     r"\.lora_([AB])\.weight$"
 )
 
+_COMPACT = re.compile(r"^(.*\.mlp\.experts)\.w([123])\.lora_([AB])\.weight$")
+
 
 def _fuse(pairs: list[tuple[torch.Tensor, torch.Tensor]]):
     return torch.cat([a for a, _ in pairs]), torch.block_diag(*[b for _, b in pairs])
 
 
 def convert(
-    tensors: dict[str, torch.Tensor], *, adapter_config: dict[str, Any]
+    tensors: dict[str, torch.Tensor],
+    *,
+    adapter_config: dict[str, Any],
+    serving: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     from art.megatron.model_support.handlers.qwen3_5 import (
         _to_vllm_key,
@@ -32,18 +37,39 @@ def convert(
 
     # The full HF conditional model uses the same language_model namespace and
     # gated-query row order as vLLM. Only packed expert factors differ.
-    result, experts = {}, {}
+    result, experts, compact = {}, {}, {}
     for name, tensor in tensors.items():
-        if match := _EXPERT.match(name):
+        if match := _COMPACT.match(name):
+            prefix, projection, suffix = match.groups()
+            projection = {"1": "gate_proj", "2": "down_proj", "3": "up_proj"}[
+                projection
+            ]
+            compact.setdefault(prefix, {}).setdefault(projection, {})[suffix] = tensor
+        elif match := _EXPERT.match(name):
             prefix, expert, projection, suffix = match.groups()
             experts.setdefault(prefix, {}).setdefault(int(expert), {}).setdefault(
                 projection, {}
             )[suffix] = tensor
+        elif serving:
+            result[name] = tensor
         else:
             public, value = _to_vllm_lora_tensor(
                 name, tensor, adapter_config=adapter_config
             )
             result[public] = value
+
+    for prefix, projections in compact.items():
+        count = max(t.shape[0] for pair in projections.values() for t in pair.values())
+        experts[prefix] = {
+            expert: {
+                projection: {
+                    suffix: tensor[0 if tensor.shape[0] == 1 else expert]
+                    for suffix, tensor in pair.items()
+                }
+                for projection, pair in projections.items()
+            }
+            for expert in range(count)
+        }
 
     rank = int(adapter_config["r"])
     alpha = int(adapter_config["lora_alpha"])
