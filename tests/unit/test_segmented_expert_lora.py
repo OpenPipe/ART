@@ -214,3 +214,34 @@ def test_native_ep1_dispatch_replays_routing_without_modifying_base_result(monke
         assert plan is not None and plan.counts == ((1, 1, 2), (1, 1, 1))
     assert calls == ["native postprocess", "permute IDs"]
     assert _CURRENT_EXPERT_ADAPTER_PLAN.get() is None
+
+
+def test_installer_cannot_switch_transport_or_promote_native_to_header(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    from art.megatron.segmented_expert_lora import (
+        SegmentedHybridEPManager,
+        install_segmented_dispatcher,
+    )
+
+    module = ModuleType("megatron.core.transformer.moe.token_dispatcher")
+    for name in (
+        "MoEAlltoAllTokenDispatcher",
+        "MoEFlexTokenDispatcher",
+        "_HybridEPManager",
+    ):
+        setattr(module, name, type(name, (), {}))
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    dispatcher = SimpleNamespace(_comm_manager=SimpleNamespace())
+    layer = SimpleNamespace(config=SimpleNamespace(), token_dispatcher=dispatcher)
+    with pytest.raises(ValueError, match="unsupported native"):
+        install_segmented_dispatcher(layer)
+    assert layer.token_dispatcher is dispatcher
+    dispatcher._comm_manager = SegmentedHybridEPManager(SimpleNamespace())
+    install_segmented_dispatcher(layer, transport="hybridep")
+    with pytest.raises(ValueError, match="cannot switch"):
+        install_segmented_dispatcher(layer)
+    layer.token_dispatcher = SimpleNamespace(_art_segmented_ep1=True)
+    with pytest.raises(ValueError, match="cannot switch"):
+        install_segmented_dispatcher(layer, transport="hybridep")

@@ -341,6 +341,8 @@ def install_segmented_dispatcher(
             raise ValueError("cannot switch a live segmented dispatcher transport")
         return
     if isinstance(getattr(dispatcher, "_comm_manager", None), SegmentedHybridEPManager):
+        if transport != "hybridep":
+            raise ValueError("cannot switch a live segmented dispatcher transport")
         return
     from megatron.core.transformer.moe.token_dispatcher import (
         MoEAlltoAllTokenDispatcher,
@@ -362,9 +364,9 @@ def install_segmented_dispatcher(
         )
         dispatcher._art_segmented_ep1 = True
         return
+    if transport == "native":
+        raise ValueError("unsupported native segmented dispatcher")
     if not hasattr(dispatcher, "_comm_manager"):
-        if transport == "native":
-            raise ValueError("unsupported native segmented dispatcher")
         # Flex's constructor rejects TPxEP=1 although HybridEP supports it. Use
         # its initialized native groups and the existing flex methods, as in
         # the qualified EP1 spike. Never copy instance-bound ART callbacks.
