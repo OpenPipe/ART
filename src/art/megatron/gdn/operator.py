@@ -658,7 +658,7 @@ def _run_tree_bucket(
     if bucket.needs_final_state and (segment_conv is None or segment_rec is None):
         raise RuntimeError("tree GDN execution must return final states")
     if (
-        (bucket.needs_final_state or recurrent_cp)
+        (bucket.needs_final_state or (recurrent_cp and bucket.allow_empty_shards))
         and segment_conv is not None
         and segment_rec is not None
     ):
@@ -2242,6 +2242,9 @@ def run_gdn_bucket(
             "GDN bucket execution requires compact projected streams; "
             f"got qkv shape {tuple(qkv.shape)}"
         )
+    if recurrent_cp and token_count == 0 and not bucket.allow_empty_shards:
+        raise ValueError("native FLA CP GDN currently requires non-empty rank shards")
+    empty_peer = recurrent_cp and bucket.allow_empty_shards and token_count == 0
     if token_count != int(bucket.real_token_count):
         raise ValueError(
             "GDN packed varlen token count mismatch, got "
@@ -2281,7 +2284,7 @@ def run_gdn_bucket(
         )
         conv_output_final_state = False
 
-    if token_count or not recurrent_cp:
+    if not empty_peer:
         qkv, conv_final = _causal_conv1d_packed_varlen_with_state(
             gdn,
             qkv,
@@ -2297,7 +2300,7 @@ def run_gdn_bucket(
         conv_final = chain_conv_final
 
     dense_local_bucket = not recurrent_cp and _bucket_has_uniform_lengths(bucket)
-    if dense_local_bucket or token_count == 0:
+    if dense_local_bucket or empty_peer:
         local_batch = batch_size if dense_local_bucket else 1
         local_length = int(bucket.length) if dense_local_bucket else 0
         query, key, value, beta, recurrent_g = _prepare_dense_recurrent_inputs(
@@ -2323,7 +2326,7 @@ def run_gdn_bucket(
             key_dim=int(gdn.key_head_dim),
             value_dim=int(gdn.value_head_dim),
         )
-    if gdn.use_qk_l2norm and token_count:
+    if gdn.use_qk_l2norm and not empty_peer:
         query = _l2norm(query.contiguous())
         key = _l2norm(key.contiguous())
 
@@ -2342,6 +2345,7 @@ def run_gdn_bucket(
             cu_seqlens=bucket.cu_seqlens,
             cu_seqlens_cpu=bucket.cu_seqlens_cpu,
             lengths_by_rank_cpu=bucket.lengths_by_rank_cpu,
+            allow_empty_shards=bucket.allow_empty_shards,
         )
     else:
         recurrent_out, recurrent_final = _chunk_gated_delta_rule(

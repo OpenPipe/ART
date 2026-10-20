@@ -127,6 +127,7 @@ def build_root_closed_gdn_decision(spec, *, cp_size, source_layout, planner_conf
                 for s in decision.chain_segments_by_depth[depth]
             )
     return GdnGlobalExecutionDecision(
+        allow_empty_shards=True,
         cp_size=cp_size,
         source_layout=source_layout,
         depth_count=depth_count,

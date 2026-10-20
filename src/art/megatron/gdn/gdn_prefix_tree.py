@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal, NamedTuple, cast
 
 from pydantic import BaseModel, ConfigDict
@@ -129,6 +129,7 @@ class GdnSegmentBucketPlan:
     parent_indices_cpu: torch.Tensor | None = None
     needs_final_state: bool = True
     output_mask: torch.Tensor | None = None
+    allow_empty_shards: bool = field(default=False, kw_only=True)
 
     @property
     def segment_count(self) -> int:
@@ -181,7 +182,7 @@ class GdnPlannerConfig:
     chaining a long sequence across ranks pay off.
     """
 
-    root_closed: bool = False
+    root_closed: bool = field(default=False, kw_only=True)
     cp_chain_beam_width: int = 2
     cp_chain_beam_branch_factor: int = 4
     cp_chain_beam_candidate_limit: int = 16
@@ -375,6 +376,7 @@ class GdnGlobalExecutionDecision(BaseModel):
     segments_by_rank_depth: tuple[tuple[tuple[GdnSegmentSpec, ...], ...], ...]
     chain_segments_by_depth: tuple[tuple[GdnSegmentSpec, ...], ...]
     cross_rank_token_count: int
+    allow_empty_shards: bool = False
 
 
 @dataclass(frozen=True)
@@ -722,6 +724,7 @@ def materialize_gdn_rank_execution_plan(
                     tuple(ranges) for ranges in gdn_ranges_by_rank_by_source
                 ),
                 split_by_final_state=False,
+                allow_empty_shards=decision.allow_empty_shards,
             )
             for depth in range(depth_count)
         )
@@ -2035,6 +2038,7 @@ def _build_tree_bucket_plans(
     device: torch.device | str,
     token_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...] | None = None,
     split_by_final_state: bool = True,
+    allow_empty_shards: bool = False,
 ) -> tuple[GdnSegmentBucketPlan, ...]:
     segment_buckets = (
         _batch_tree_segments_by_padded_work(
@@ -2055,6 +2059,7 @@ def _build_tree_bucket_plans(
                     sequence_length=sequence_length,
                     device=device,
                     token_ranges_by_rank=token_ranges_by_rank,
+                    allow_empty_shards=allow_empty_shards,
                 )
             ),
             bucket,
@@ -2269,6 +2274,7 @@ def _build_position_bucket_plan(
     sequence_length: int,
     device: torch.device | str,
     token_ranges_by_rank: tuple[tuple[tuple[int, int, int], ...], ...] | None = None,
+    allow_empty_shards: bool = False,
 ) -> GdnSegmentBucketPlan:
     range_positions = {
         (start, end): position for start, end, position in local_token_ranges
@@ -2303,6 +2309,7 @@ def _build_position_bucket_plan(
                 sequence_length=sequence_length,
             ),
             device=device,
+            allow_empty_shards=allow_empty_shards,
         )
 
     local_positions_by_segment: list[torch.Tensor] = []
@@ -2314,7 +2321,7 @@ def _build_position_bucket_plan(
             local_token_ranges=local_token_ranges,
             local_range_ends=local_range_ends,
         )
-        if not int(positions.numel()) and token_ranges_by_rank is None:
+        if not int(positions.numel()) and not allow_empty_shards:
             raise ValueError(
                 "planned GDN bucket contains a segment with no local tokens; "
                 f"family={segment.family_index} kind={segment.kind}"
@@ -2340,6 +2347,7 @@ def _build_position_bucket_plan(
             sequence_length=sequence_length,
         ),
         device=device,
+        allow_empty_shards=allow_empty_shards,
     )
 
 
@@ -2427,6 +2435,7 @@ def _build_bucket_plan(
     position_indices_cpu: torch.Tensor,
     device: torch.device | str,
     lengths_by_rank_cpu: torch.Tensor | None = None,
+    allow_empty_shards: bool = False,
 ) -> GdnSegmentBucketPlan:
     max_length = int(lengths_cpu.max().item())
     if (
@@ -2445,6 +2454,7 @@ def _build_bucket_plan(
         dtype=torch.long,
     )
     return GdnSegmentBucketPlan(
+        allow_empty_shards=allow_empty_shards,
         length=max_length,
         lengths=_move_planner_tensor(lengths_cpu, device),
         lengths_cpu=lengths_cpu,
