@@ -8,7 +8,7 @@ advertised service capability. Snapshot tensors use safetensors, never pickle.
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import hashlib
 import json
 import math
@@ -97,6 +97,23 @@ def main():
             print(json.dumps(row, sort_keys=True), flush=True)
             with target.open("a") as output:
                 output.write(json.dumps(row, sort_keys=True) + "\n")
+
+    @contextmanager
+    def memory_guard(phase):
+        try:
+            yield
+        except RuntimeError as error:
+            if "out of memory" in str(error).lower():
+                emit(
+                    "out_of_memory",
+                    phase=phase,
+                    allocated_bytes=torch.cuda.memory_allocated(),
+                    reserved_bytes=torch.cuda.memory_reserved(),
+                    peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+                    peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+                    device_free_bytes=torch.cuda.mem_get_info()[0],
+                )
+            raise
 
     def configure(provider):
         if args.layers:
@@ -224,7 +241,7 @@ def main():
                     shape=(physical, 1, runtime.provider.hidden_size),
                     key=f"probe/{args.model}/{args.tokens}/{args.lora_rank}/{iteration}",
                 )
-            with sharding as shard_stats:
+            with memory_guard("forward"), sharding as shard_stats:
                 [result] = trainer.dp_rank_forward(
                     [ForwardInput(input_tokens=tokens[:-1], hidden_states=True)],
                     checkpoint=None if args.base_only else slot,
@@ -250,7 +267,8 @@ def main():
             logprobs = torch.cat(pieces)[: args.tokens]
             loss = -logprobs.mean()
             if args.mode == "backward":
-                loss.backward()
+                with memory_guard("backward"):
+                    loss.backward()
         torch.cuda.synchronize()
         seconds = torch.tensor(time.perf_counter() - started, device="cuda")
         dist.all_reduce(seconds, op=dist.ReduceOp.MAX)
