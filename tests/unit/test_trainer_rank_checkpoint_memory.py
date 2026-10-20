@@ -771,3 +771,75 @@ def test_checkpoint_storage_partition_rejects_unmatched_roots(monkeypatch, unsup
         with shard_saved_activations(object(), shape=(1024, 1, 2048), key="root"):
             r._estimate_flat_forward(req)
     assert current_checkpoint_partition() is None
+
+
+@pytest.mark.parametrize("element_bytes", [2, 4, 8])
+def test_checkpoint_partition_uses_activation_element_size(monkeypatch, element_bytes):
+    from art.megatron.context_parallel.checkpoint import shard_saved_activations
+    from art.trainer_rank import _memory
+
+    r = rank()
+    r._param_dtype_size = element_bytes
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 4)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    shape = (3, 1, 7)  # Deliberately uneven, with a known padded gather size.
+    monkeypatch.setattr(r, "_sequence_parallel_workspace_bytes", lambda rows: 0)
+    monkeypatch.setattr(r, "_moe_workspace_bytes", lambda *a, **k: 0)
+    with shard_saved_activations(object(), shape=shape, key="dtype"):
+        retained, workspace = _memory._checkpoint_floor_from_facts(
+            r, ((3, True),), None, 0, 5
+        )
+        assert retained == 6 * element_bytes * 5
+        assert workspace == 6 * 4 * element_bytes
+        assert (
+            r._checkpoint_input_gradient_bytes(((3, True),), retained)
+            == 21 * element_bytes
+        )
+
+
+def test_split_memory_key_separates_checkpoint_partitions(monkeypatch):
+    from art.megatron.context_parallel.checkpoint import shard_saved_activations
+    from art.trainer_rank._impl import _SplitForwardPlan
+
+    r = rank()
+    monkeypatch.setattr(r, "_topology_key", lambda: (2, 1, 1, 1))
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    inputs = [
+        ForwardInput(input_tokens=torch.arange(17), hidden_states=True, no_grad=False)
+    ]
+    plain = r._plan_flat_forward(inputs)
+    with shard_saved_activations(object(), shape=(17, 1, 2048), key="root"):
+        sharded = r._plan_flat_forward(inputs)
+    # Keep all plan fields fixed, isolating the signature's partition identity.
+    a = _SplitForwardPlan((plain,), ((0,),), 1)
+    b = replace(a, subforwards=(replace(plain, signature=sharded.signature),))
+    assert r._split_memory_key(a) != r._split_memory_key(b)
+    changed = replace(sharded.signature, checkpoint_partition=(4, (17, 1, 2048)))
+    c = replace(a, subforwards=(replace(plain, signature=changed),))
+    assert r._split_memory_key(b) != r._split_memory_key(c)
+
+
+def test_megatron_checkpoint_shards_one_boundary_per_layer(monkeypatch):
+    from contextlib import nullcontext
+
+    from megatron.core.tensor_parallel import random
+
+    from art.megatron.context_parallel.checkpoint import shard_saved_activations
+
+    # Exercise Megatron's actual checkpoint autograd function on CPU. Only its
+    # CUDA RNG helpers are replaced; tensor saves and checkpoint calls are real.
+    monkeypatch.setattr(random, "_get_all_rng_states", lambda: ())
+    monkeypatch.setattr(random, "_set_all_rng_states", lambda *a: None)
+    monkeypatch.setattr(random, "_fork_rng", nullcontext)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
+    model = torch.nn.ModuleList([torch.nn.Linear(7, 7) for _ in range(3)])
+    x = torch.randn(5, 1, 7, requires_grad=True)
+    with shard_saved_activations(object(), shape=tuple(x.shape), key="mcore") as stats:
+        value = x.sin()  # Ordinary saves of this shape must stay local.
+        for layer in model:
+            value = random.checkpoint(layer, False, value)
+    assert value.shape == x.shape
+    assert stats.tensors == len(model)
+    assert stats.original_bytes == len(model) * x.numel() * x.element_size()

@@ -12,7 +12,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
@@ -670,9 +670,6 @@ class _MemoryProfile:
     warm_packed_tokens: int | None = None
     warm_logical_per_packed: float | None = None
     caller_plans: int = 0
-    # Qualified single-root hidden-only forwards keep observed scratch peaks
-    # as a fixed floor; analytic component floors still grow with token count.
-    forward_compute_peak_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -1005,8 +1002,6 @@ class _MemorySignature:
     # Short single-target requests keep the logical extrapolation, but share
     # the profile learned from longer requests of the same signature.
     short_requests: bool = dataclass_field(default=False, compare=False)
-    checkpoint_partition: tuple[int, tuple[int, int, int]] | None = None
-    bounded_forward_peak: bool = False
 
 
 @dataclass(frozen=True)
@@ -2780,7 +2775,12 @@ class TrainerRank:
         if backward is not None:
             backward.harvest()
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
-        with torch.set_grad_enabled(enabled), _memory.direct_forward_profile():
+        with (
+            torch.set_grad_enabled(enabled),
+            _memory.direct_forward_profile()
+            if _memory._BOUNDED_FORWARD_PEAKS.get()
+            else nullcontext(),
+        ):
             self._reset_planning_telemetry()
             materialized = _materialize(inputs)
             requests = list(_flatten(materialized))

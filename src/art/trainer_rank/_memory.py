@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
+from dataclasses import dataclass
 import hashlib
 import math
 from types import MethodType
@@ -29,6 +30,38 @@ if TYPE_CHECKING:
 
     from art.megatron.lora import LoRASlotRef
     from art.trainer_rank._impl import AdapterSelection, AnyForwardInput, TrainerRank
+
+
+@dataclass(frozen=True)
+class _ScopedMemorySignature(_impl._MemorySignature):
+    checkpoint_partition: tuple[int, tuple[int, int, int]] | None = None
+    bounded_forward_peak: bool = False
+
+
+@dataclass(frozen=True)
+class _BoundedMemoryProfile(_impl._MemoryProfile):
+    forward_compute_peak_bytes: int = 0
+
+
+_BOUNDED_FORWARD_PEAKS: ContextVar[bool] = ContextVar(
+    "art_bounded_forward_peaks", default=False
+)
+
+
+@contextmanager
+def bounded_forward_peaks() -> Iterator[None]:
+    """Opt into single-root forward peak calibration.
+
+    Observed peaks cap the fit through the longest observed root. Beyond it,
+    the cap grows at that peak's per-token rate. Grow calibration roots before
+    admitting long requests: one cold, tiny observation is not a safe bound.
+    Profiles remain separate from ordinary TrainerRank requests.
+    """
+    token = _BOUNDED_FORWARD_PEAKS.set(True)
+    try:
+        yield
+    finally:
+        _BOUNDED_FORWARD_PEAKS.reset(token)
 
 
 _DIRECT_FORWARD: ContextVar[bool] = ContextVar(
@@ -146,7 +179,6 @@ def _split_memory_key(plan: _impl._SplitForwardPlan) -> bytes | None:
                     signature.request_mix,
                     signature.grad_enabled,
                     signature.grad_modes,
-                    signature.bounded_forward_peak,
                     signature.slot_shapes,
                     signature.short_requests,
                     p.packed_tokens,
@@ -158,6 +190,8 @@ def _split_memory_key(plan: _impl._SplitForwardPlan) -> bytes | None:
                     len(p.groups),
                 )
             )
+            if isinstance(signature, _ScopedMemorySignature):
+                feed((signature.checkpoint_partition, signature.bounded_forward_peak))
             for g in p.groups:
                 slot = (
                     None
@@ -928,11 +962,11 @@ def _checkpoint_floor_from_facts(
         if group_rows != ((shape[0], True),):
             raise ValueError("checkpoint shards require one complete gradient root")
         width = math.ceil(math.prod(shape) / degree)
-        retained = width * 2 * layers
+        retained = width * self._param_dtype_size * layers
         # Recompute still runs the complete CP1 layer, beside the all-gather
         # buffer. Only the saved boundaries shrink; workspace does not.
         workspace = max(workspace, self._sequence_parallel_workspace_bytes(shape[0]))
-        workspace += width * degree * 2
+        workspace += width * degree * self._param_dtype_size
     return retained, workspace
 
 
@@ -1537,7 +1571,7 @@ def _memory_signature_from_requests(
     shapes = tuple(
         sorted((grad, self._slot_memory_shapes(ref)) for ref, grad in slot_groups)
     )
-    return _impl._MemorySignature(
+    signature = _impl._MemorySignature(
         topology=topology,
         planner_coefficients=(self._coefficient_version, self._coefficient_table),
         slot_group_count=slot_group_count,
@@ -1548,26 +1582,31 @@ def _memory_signature_from_requests(
         grad_modes=modes,
         slot_shapes=shapes if any(any(shape) for _, shape in shapes) else (),
         short_requests=any(_impl._short_request(request) for request in requests),
-        checkpoint_partition=partition,
-        bounded_forward_peak=(
-            len(requests) == 1
-            and requests[0].input_tokens.ndim == 1
-            and (modes == (False,) or (modes == (True,) and _DIRECT_FORWARD.get()))
-            and _impl._request_mix_key(requests[0]) in ("hidden", "hidden+routes")
-            and topology[1:] == (1, 1, 1)
-            and self._parallel_shape.ep == self._parallel_shape.etp == 1
-            and bool(
-                _checkpoint_layers(
-                    self, ((int(requests[0].input_tokens.numel()), False),)
-                )
-            )
-            and (
-                self._moe_memory_supported
-                if self._moe_layers
-                else self._dense_fc1_adapted and bool(self._geometry.ffn_hidden_size)
-            )
-        ),
     )
+    bounded = (
+        _BOUNDED_FORWARD_PEAKS.get()
+        and len(requests) == 1
+        and requests[0].input_tokens.ndim == 1
+        and (modes == (False,) or (modes == (True,) and _DIRECT_FORWARD.get()))
+        and _impl._request_mix_key(requests[0]) in ("hidden", "hidden+routes")
+        and topology[1:] == (1, 1, 1)
+        and self._parallel_shape.ep == self._parallel_shape.etp == 1
+        and bool(
+            _checkpoint_layers(self, ((int(requests[0].input_tokens.numel()), False),))
+        )
+        and (
+            self._moe_memory_supported
+            if self._moe_layers
+            else self._dense_fc1_adapted and bool(self._geometry.ffn_hidden_size)
+        )
+    )
+    if partition is not None or bounded:
+        return _ScopedMemorySignature(
+            **vars(signature),
+            checkpoint_partition=partition,
+            bounded_forward_peak=bounded,
+        )
+    return signature
 
 
 def _slot_memory_shapes(
@@ -1931,13 +1970,21 @@ def _estimate_required_memory_bytes_from_values(
         profiled_bytes = profiled.bytes_per_token * profiled_tokens(
             profiled.logical_per_packed
         )
-        if signature.bounded_forward_peak and profiled.forward_compute_peak_bytes:
-            # Direct inference never observes the caller-phase warm fit. A
-            # three-token cold CUDA scratch allocation must not become a slope
-            # extrapolated over an entire long root. Keep every observed peak,
-            # bounded by the old fit for smaller roots, beside the unchanged
-            # token-dependent static floors. Both terms remain monotone.
-            profiled_bytes = min(profiled_bytes, profiled.forward_compute_peak_bytes)
+        if (
+            isinstance(profiled, _BoundedMemoryProfile)
+            and profiled.forward_compute_peak_bytes
+        ):
+            # The peak is measured only through packed_tokens. Extrapolate
+            # beyond that root, rather than claiming constant scratch forever.
+            profiled_bytes = min(
+                profiled_bytes,
+                profiled.forward_compute_peak_bytes
+                * max(
+                    1.0,
+                    profiled_tokens(profiled.logical_per_packed)
+                    / profiled.packed_tokens,
+                ),
+            )
         elif (
             profiled.warm_bytes_per_token is not None
             and profiled.warm_packed_tokens is not None
@@ -2139,12 +2186,17 @@ def _update_memory_profile(
         warm_packed_tokens=warm_tokens,
         warm_logical_per_packed=warm_sharing,
         caller_plans=caller_plans,
-        forward_compute_peak_bytes=(
-            max(
-                compute_delta,
-                0 if previous is None else previous.forward_compute_peak_bytes,
-            )
-            if plan.signature.bounded_forward_peak
-            else 0
-        ),
     )
+    if (
+        isinstance(plan.signature, _ScopedMemorySignature)
+        and plan.signature.bounded_forward_peak
+    ):
+        self._memory_profiles[plan.signature] = _BoundedMemoryProfile(
+            **vars(self._memory_profiles[plan.signature]),
+            forward_compute_peak_bytes=max(
+                compute_delta,
+                previous.forward_compute_peak_bytes
+                if isinstance(previous, _BoundedMemoryProfile)
+                else 0,
+            ),
+        )

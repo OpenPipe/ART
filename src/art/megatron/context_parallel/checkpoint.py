@@ -12,16 +12,73 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import wraps
 from hashlib import sha256
+import sys
 from typing import Any
 
 import torch
 import torch.distributed as dist
+import torch.utils.checkpoint
 
 CheckpointPartition = tuple[int, tuple[int, int, int]]
 _PARTITION: ContextVar[CheckpointPartition | None] = ContextVar(
     "art_checkpoint_partition", default=None
 )
+_HOOKS: ContextVar[Any] = ContextVar("art_checkpoint_shard_hooks", default=None)
+
+
+def _install_checkpoint_hooks() -> None:
+    # Wrap apply, not forward: autograd packs save_for_backward's tensors
+    # after forward returns. Megatron's checkpoint saves its hidden input here.
+    def install(function: Any) -> None:
+        original = function.apply
+        if getattr(original, "_art_checkpoint_shards", False):
+            return
+
+        @wraps(original)
+        def apply(run_function: Any, *args: Any) -> Any:
+            hooks = _HOOKS.get()
+            if hooks is None:
+                return original(run_function, *args)
+
+            def local(*inputs: Any) -> Any:
+                # Ordinary saves inside the layer (including enable_grad
+                # regions) are not checkpoint boundaries.
+                token = _HOOKS.set(None)
+                try:
+                    with torch.autograd.graph.saved_tensors_hooks(
+                        lambda x: x, lambda x: x
+                    ):
+                        return run_function(*inputs)
+                finally:
+                    _HOOKS.reset(token)
+
+            packed = 0
+
+            def pack(tensor: torch.Tensor) -> Any:
+                nonlocal packed
+                saved = hooks[0](tensor)
+                if isinstance(saved, _Shard):
+                    packed += 1
+                    if packed > 1:
+                        raise ValueError(
+                            "checkpoint sharding requires one hidden input"
+                        )
+                return saved
+
+            with torch.autograd.graph.saved_tensors_hooks(pack, hooks[1]):
+                return original(local, *args)
+
+        setattr(apply, "_art_checkpoint_shards", True)
+        function.apply = staticmethod(apply)
+
+    install(torch.utils.checkpoint.CheckpointFunction)
+    # TrainerRank has already imported Megatron before entering the scope;
+    # pure torch/gloo users need neither Megatron nor Transformer Engine.
+    megatron = sys.modules.get("megatron.core.tensor_parallel.random")
+    if megatron is not None:
+        install(megatron.CheckpointFunction)
 
 
 def current_checkpoint_partition() -> CheckpointPartition | None:
@@ -51,8 +108,10 @@ def shard_saved_activations(
     """Forward-only scope for uniform one-layer recomputation checkpoints.
 
     ``shape`` is the complete [root_tokens, 1, hidden] activation shape. All
-    ranks must have identical values and checkpoint save/unpack order. A
-    collective ordinal fence rejects mismatched backward order. Uneven shards
+    ranks must have identical values and checkpoint save/unpack order. Only
+    the hidden input to each reentrant torch/Megatron checkpoint is sharded;
+    other same-shaped saves remain local. A collective ordinal fence rejects
+    mismatched backward order. Uneven shards
     are supported without changing root padding or any arithmetic geometry.
     ``key`` identifies run/epoch/request/datum and numerical-policy version.
 
@@ -60,6 +119,8 @@ def shard_saved_activations(
     tensors, while recomputation's temporary saves should remain local. Keep
     the numerical-policy scope open across both forward and backward.
     """
+    if _PARTITION.get() is not None:
+        raise RuntimeError("checkpoint sharding scopes cannot overlap")
     if len(shape) != 3 or shape[1] != 1 or any(n <= 0 for n in shape):
         raise ValueError("checkpoint activation shape must be [tokens, 1, hidden]")
     world, rank = dist.get_world_size(group), dist.get_rank(group)
@@ -94,6 +155,8 @@ def shard_saved_activations(
             dtype=torch.int64,
         )
         headers = header.new_empty(world * header.numel())
+        # Fence every restore: matching the first boundary does not establish
+        # the later order when ranks traverse different autograd branches.
         dist.all_gather_into_tensor(headers, header, group=group)
         if not bool((headers.reshape(world, -1) == header).all()):
             raise RuntimeError(
@@ -104,11 +167,11 @@ def shard_saved_activations(
         stats.restored_bytes += saved.numel * saved.tensor.element_size()
         return full[: saved.numel].view(saved.shape)
 
-    if _PARTITION.get() is not None:
-        raise RuntimeError("checkpoint sharding scopes cannot overlap")
+    _install_checkpoint_hooks()
     token = _PARTITION.set((world, shape))
+    hooks_token = _HOOKS.set((pack, unpack))
     try:
-        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
-            yield stats
+        yield stats
     finally:
+        _HOOKS.reset(hooks_token)
         _PARTITION.reset(token)
