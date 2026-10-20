@@ -10,6 +10,11 @@ The trainer selects `numerical_policy="canonical"`, disables full-layer compile
 before building the model (`ART_DISABLE_MEGATRON_COMPILE=1`), and installs hooks
 after ART's LoRA hooks. Component kernel compilation remains enabled. Stark's
 runtime applies that compile setting from the single numerical-policy flag.
+All recorded GPU cohorts set `CUBLAS_WORKSPACE_CONFIG=:4096:8` before CUDA
+initialization. Preserve that bootstrap configuration when reproducing the
+qualified policy; an unset workspace configuration was not separately tested.
+PyTorch2.11 documents this as a per-handle/stream workspace setting, so this
+module does not claim that an unset value necessarily raises an error.
 
 ```python
 from art.megatron.canonical import RootLayout, execution, install
@@ -31,6 +36,11 @@ recomputation. It serializes process-wide deterministic settings across trainer
 threads and restores them even after an exception. Do not suspend an async task
 inside it. ART's checkpoint wrapper captures immutable root metadata for CUDA
 recomputation threads, alongside the existing dynamic LoRA slot and routes.
+Fused callers may pass `install(model, row_context=slice_lora_segments)` to
+rebase adapter spans for each root call. This upgrades existing wrappers; later
+ordinary installation preserves that callback. The optional fused module is not
+a dependency of this policy.
+
 Hooks preserve model/Parameter identities and use ordinary operators outside
 the scope. Reinstalling them is harmless.
 

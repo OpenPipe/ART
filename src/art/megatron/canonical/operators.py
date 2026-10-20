@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 import functools
 from typing import Any
 
@@ -8,6 +9,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from .layout import ROOT_ALIGNMENT, NumericalPolicy, RootLayout, current_layout
+
+RowContext = Callable[[int, int], AbstractContextManager[Any]]
 
 
 def _join(values: list[Any], first_rows: int) -> Any:
@@ -26,7 +29,9 @@ def _join(values: list[Any], first_rows: int) -> Any:
     raise TypeError(f"unsupported canonical row output: {type(first)}")
 
 
-def _row_forward(original: Callable[..., Any]) -> Callable[..., Any]:
+def _row_forward(
+    original: Callable[..., Any], *, owner: torch.nn.Module | None = None
+) -> Callable[..., Any]:
     @functools.wraps(original)
     def forward(x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
         layout = current_layout()
@@ -38,13 +43,14 @@ def _row_forward(original: Callable[..., Any]) -> Callable[..., Any]:
             or len(layout.lengths) == 1
         ):
             return original(x, *args, **kwargs)
-        return _join(
-            [
-                original(x[part].contiguous(), *args, **kwargs)
-                for part in layout.slices()
-            ],
-            layout.padded_lengths[0],
-        )
+        row_context = getattr(owner, "_art_canonical_row_context", None)
+        pieces = []
+        for part in layout.slices():
+            # Segmented LoRA rebases adapter ownership alongside root rows.
+            # The optional callback avoids a dependency on that gated feature.
+            with row_context(part.start, part.stop) if row_context else nullcontext():
+                pieces.append(original(x[part].contiguous(), *args, **kwargs))
+        return _join(pieces, layout.padded_lengths[0])
 
     return forward
 
@@ -105,14 +111,19 @@ def _attention_forward(module: Any, original: Callable[..., Any]) -> Callable[..
 
 
 def install(
-    model: torch.nn.Module, *, numerical_policy: NumericalPolicy = "canonical"
+    model: torch.nn.Module,
+    *,
+    numerical_policy: NumericalPolicy = "canonical",
+    row_context: RowContext | None = None,
 ) -> None:
     """Install context-aware row/attention wrappers once, after ART/LoRA hooks.
 
     ``numerical_policy`` is the trainer's only policy flag. Use native for MoE.
     The initial policy qualifies TP1/CP1 dense models with zero dropout and
     disabled full-layer compilation. Component kernel compilation is retained.
-    Parameters and optimizer identities are preserved.
+    Parameters and optimizer identities are preserved. A nonnull row_context
+    rebases optional adapter metadata for each root call, and upgrades existing
+    wrappers without wrapping them twice. None preserves the installed callback.
     """
     if numerical_policy == "native":
         return
@@ -131,6 +142,8 @@ def install(
             raise ValueError("canonical v1 requires zero dropout")
     for module in model.modules():
         if getattr(module, "_art_canonical_installed", False):
+            if row_context is not None:
+                setattr(module, "_art_canonical_row_context", row_context)
             continue
         kind = type(module).__name__
         if kind in ("FlexDotProductAttention", "ArtContextParallelCoreAttention"):
@@ -140,10 +153,12 @@ def install(
             or ("Norm" in kind and "Transformer" not in kind)
             or (kind.startswith("TE") and "Linear" in kind and "Grouped" not in kind)
         ):
-            wrapped = _row_forward(module.forward)
+            wrapped = _row_forward(module.forward, owner=module)
         else:
             continue
         module.forward = wrapped
+        if row_context is not None:
+            setattr(module, "_art_canonical_row_context", row_context)
         setattr(module, "_art_canonical_installed", True)
 
 

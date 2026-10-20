@@ -188,12 +188,57 @@ def test_canonical_gdn_never_selects_uniform_bucket_algorithm():
 
 def test_checkpoint_capture_carries_layout_to_autograd_worker_thread():
     from concurrent.futures import ThreadPoolExecutor
+    from contextvars import Context
 
     from art.megatron.canonical.layout import capture
 
     layout = RootLayout((3, 5))
+    # Caladan intentionally propagates ContextVars through thread pools. Force
+    # the empty context used by CUDA autograd independently of pool patches.
+    empty = Context()
     with ThreadPoolExecutor(max_workers=1) as pool, execution(layout):
-        assert pool.submit(current_layout).result() is None
+        assert pool.submit(empty.run, current_layout).result() is None
         captured = capture(current_layout)
-        assert pool.submit(captured).result() is layout
-        assert pool.submit(current_layout).result() is None
+        assert pool.submit(empty.run, captured).result() is layout
+        assert pool.submit(empty.run, current_layout).result() is None
+
+
+def test_installed_row_context_can_upgrade_without_rewrapping():
+    from contextlib import contextmanager
+
+    class TECanonicalLinear(torch.nn.Linear):
+        pass
+
+    linear = TECanonicalLinear(2, 2)
+    model = torch.nn.Sequential(linear)
+    setattr(model, "config", SimpleNamespace())
+    install(model)
+    original_wrapper = model[0].forward
+    calls = []
+
+    @contextmanager
+    def row_context(start, stop):
+        calls.append((start, stop, "enter"))
+        try:
+            yield
+        finally:
+            calls.append((start, stop, "exit"))
+
+    install(model, row_context=row_context)
+    install(model)  # ordinary adapter creation must preserve the callback
+    assert model[0].forward is original_wrapper
+    layout = RootLayout((3, 129))
+    x = torch.randn(layout.rows, 2)
+    with execution(layout):
+        expected = F.linear(x, linear.weight, linear.bias)
+        actual = model(x)
+    torch.testing.assert_close(actual, expected)
+    assert calls == [
+        (0, 128, "enter"),
+        (0, 128, "exit"),
+        (128, 384, "enter"),
+        (128, 384, "exit"),
+    ]
+    calls.clear()
+    model(x)  # native calls do not rebase metadata
+    assert calls == []
