@@ -740,7 +740,9 @@ class LoRA(torch.nn.Module):
         b_t = self._localized_weight(weights[1], into=self.B_T)
         slot_key = self._slot_keys.get(ref)
         if slot_key is None:
-            slot_key = f"slot_{len(self._slot_keys)}"
+            index = len(self._slot_keys)
+            while (slot_key := f"slot_{index}") in self._slot_modules:
+                index += 1
             self._slot_keys[ref] = slot_key
         elif self._has_live_slot_grads(ref):
             raise RuntimeError(
