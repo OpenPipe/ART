@@ -113,6 +113,20 @@ def flash_sparse_block_size_for_head_dim(
     return (128, 64)
 
 
+def _require_compiled_deterministic_flash(backend: object) -> None:
+    if (
+        backend == "FLASH"
+        and torch.are_deterministic_algorithms_enabled()
+        and not torch.compiler.is_compiling()
+    ):
+        raise RuntimeError(
+            "Deterministic attention requires compiled FLASH execution; "
+            "the uncompiled fallback bypasses its backward lowering and uses "
+            "a different LSE convention. Start a fresh trainer or increase "
+            "torch._dynamo.config.recompile_limit before compiling."
+        )
+
+
 def _forced_flex_attention_dense(
     q,
     k,
@@ -123,6 +137,7 @@ def _forced_flex_attention_dense(
     enable_gqa,
     return_aux: AuxRequest | None = None,
 ):
+    _require_compiled_deterministic_flash(_FORCED_FLEX_BACKEND)
     return flex_attention(
         q,
         k,
@@ -149,6 +164,7 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
     resolved_options["OUTPUT_MAX"] = False
 
     def _flex_attention(q, k, v, *, block_mask, scale, enable_gqa):
+        _require_compiled_deterministic_flash(resolved_options.get("BACKEND"))
         del enable_gqa
         for tensor in (q, k, v):
             torch._dynamo.mark_static(tensor, -3)
@@ -214,6 +230,7 @@ def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
         enable_gqa,
         return_aux: AuxRequest | None = None,
     ):
+        _require_compiled_deterministic_flash(kernel_options.get("BACKEND"))
         return flex_attention(
             q,
             k,
