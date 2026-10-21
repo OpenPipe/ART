@@ -1627,7 +1627,7 @@ def _memory_signature_from_requests(
             or (
                 topology[2] in (2, 4, 8)
                 and self._parallel_shape.cp == topology[2]
-                and self._moe_layers
+                and self._moe_layers > 0
                 and self._moe_memory_supported
             )
         )
