@@ -29,6 +29,24 @@ def test_layout_pads_roots_independently_and_masks_labels():
         layout.pad(roots[::-1])
 
 
+def test_deterministic_native_scope_keeps_layout_native_and_restores_flags():
+    initial = torch.are_deterministic_algorithms_enabled()
+    warning = torch.is_deterministic_algorithms_warn_only_enabled()
+    fill = getattr(torch.utils.deterministic, "fill_uninitialized_memory")
+    with pytest.raises(RuntimeError, match="abort"):
+        with execution(None, numerical_policy="native", deterministic_native=True):
+            assert current_layout() is None
+            assert torch.are_deterministic_algorithms_enabled()
+            assert not torch.is_deterministic_algorithms_warn_only_enabled()
+            with execution(None, numerical_policy="native"):
+                assert current_layout() is None
+                assert torch.are_deterministic_algorithms_enabled()
+            raise RuntimeError("abort")
+    assert torch.are_deterministic_algorithms_enabled() == initial
+    assert torch.is_deterministic_algorithms_warn_only_enabled() == warning
+    assert getattr(torch.utils.deterministic, "fill_uninitialized_memory") == fill
+
+
 @pytest.mark.parametrize("lengths", [(), (0,), (-1,), (1.5,), (True,)])
 def test_invalid_root_lengths(lengths):
     with pytest.raises(ValueError):

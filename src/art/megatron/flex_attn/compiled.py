@@ -14,9 +14,13 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from art.megatron.flex_attn.flash_dlse_patch import apply_flash_flex_dlse_patch
+from art.megatron.flex_attn.flash_dlse_patch import (
+    apply_deterministic_flash_backward_patch,
+    apply_flash_flex_dlse_patch,
+)
 
 apply_flash_flex_dlse_patch()
+apply_deterministic_flash_backward_patch()
 
 
 # Integration tests patch this module in-process when they need a non-default
