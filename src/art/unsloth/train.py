@@ -431,6 +431,9 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             trainer.model.get_output_embeddings().weight.t(),  # type: ignore
         )  # Shape [H, V]
         next_input_ids = shift_tensor(inputs["tokens"], 0)
+        # The loss only reads assistant rows of the shifted logprobs, so the
+        # head projection can skip every other row.
+        row_mask = shift_tensor(inputs["assistant_mask"], False)
         chunk_size = _config.get("logprob_calculation_chunk_size", 1024)
         # Assert that sequence length is evenly divisible by the chunk size
         assert seq_len % chunk_size == 0, (
@@ -454,6 +457,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             inference_mode=return_new_logprobs,
             no_grad=return_new_logprobs,
             reference_logprobs=False,
+            row_mask=row_mask,
         )
         if return_new_logprobs:
             return torch.nn.functional.pad(new_logprobs[:, :-1], (1, 0), value=0.0)
@@ -475,6 +479,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
                 no_grad=ref_adapter is not None,
                 reference_logprobs=True,
                 reference_adapter_name=ref_adapter,
+                row_mask=row_mask,
             )
         else:
             ref_logprobs = None
@@ -612,6 +617,7 @@ def calculate_logprobs(
     no_grad: bool,
     reference_logprobs: bool,
     reference_adapter_name: str | None = None,
+    row_mask: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor
 ]:  # Returns (log_probs, entropy) both shape [B, S]
@@ -632,7 +638,9 @@ def calculate_logprobs(
         hidden_states = trainer.model(  # type: ignore
             input_ids=input_ids, causal_mask=causal_mask, **forward_kwargs
         ).logits  # Shape [B, S, H]
-    return _calculate_logprobs(lm_head_t, hidden_states, next_input_ids, chunk_size)
+    return _calculate_logprobs(
+        lm_head_t, hidden_states, next_input_ids, chunk_size, row_mask=row_mask
+    )
 
 
 def _calculate_logprobs(
@@ -640,17 +648,26 @@ def _calculate_logprobs(
     hidden_states: torch.Tensor,  # Shape [B, S, H]
     next_input_ids: torch.Tensor,  # Shape [B, S]
     chunk_size: int,
+    row_mask: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor
 ]:  # Returns (log_probs, entropy) both shape [B, S]
     batch_size, seq_len, _ = hidden_states.shape
+    if row_mask is not None:
+        row_mask = row_mask.to(dtype=torch.bool)
+        if not bool(row_mask.any()):
+            # Keep one ignored row so a zero-contribution batch keeps a graph.
+            row_mask = torch.zeros(
+                row_mask.shape, dtype=torch.bool, device=row_mask.device
+            )
+            row_mask.reshape(-1)[0] = True
     # Output shape is [B, S]
-    log_probs = torch.empty(
+    log_probs = torch.zeros(
         (batch_size, seq_len),
         dtype=torch.float32,
         device=hidden_states.device,
     )
-    entropy = torch.empty(
+    entropy = torch.zeros(
         (batch_size, seq_len),
         dtype=torch.float32,
         device=hidden_states.device,
@@ -662,20 +679,33 @@ def _calculate_logprobs(
     for i in range(0, seq_len, chunk_size):
         chunk_hs = hidden_states[:, i : i + chunk_size, :]  # [B, chunk_size, H]
         chunk_input_ids = next_input_ids[:, i : i + chunk_size]  # [B, chunk_size]
-        chunk_logits = torch.matmul(chunk_hs, lm_head_t).float()  # [B, chunk_size, V]
+        # Only trainable rows reach the loss, so project just those.
+        chunk_mask = (
+            None if row_mask is None else row_mask[:, i : i + chunk_size]
+        )  # [B, chunk_size]
+        if chunk_mask is not None:
+            if not bool(chunk_mask.any()):
+                del chunk_hs, chunk_input_ids
+                continue
+            chunk_hs = chunk_hs[chunk_mask]  # [rows, H]
+            chunk_input_ids = chunk_input_ids[chunk_mask]  # [rows]
+        chunk_logits = torch.matmul(chunk_hs, lm_head_t).float()  # [rows, V]
         chunk_log_probs = torch.log_softmax(chunk_logits, dim=-1)
         del chunk_logits
-        log_probs[:, i : i + chunk_size] = torch.gather(
+        chunk_values = torch.gather(
             chunk_log_probs, dim=-1, index=chunk_input_ids.unsqueeze(-1)
-        ).squeeze(-1)  # [B, chunk_size]
-
+        ).squeeze(-1)  # [rows]
         # Entropy is only used as a metric.
         with torch.no_grad():
-            entropy[:, i : i + chunk_size] = (
-                -chunk_log_probs.exp().mul_(chunk_log_probs).sum(dim=-1)
-            )
+            chunk_entropy = -chunk_log_probs.exp().mul_(chunk_log_probs).sum(dim=-1)
+        if chunk_mask is None:
+            log_probs[:, i : i + chunk_size] = chunk_values
+            entropy[:, i : i + chunk_size] = chunk_entropy
+        else:
+            log_probs[:, i : i + chunk_size][chunk_mask] = chunk_values
+            entropy[:, i : i + chunk_size][chunk_mask] = chunk_entropy
 
-        del chunk_hs, chunk_input_ids, chunk_log_probs
+        del chunk_hs, chunk_input_ids, chunk_log_probs, chunk_values, chunk_entropy
     del hidden_states
     return log_probs, entropy
 
