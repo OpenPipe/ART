@@ -840,26 +840,6 @@ def test_split_memory_key_separates_checkpoint_partitions(monkeypatch):
     assert r._split_memory_key(b) != r._split_memory_key(c)
 
 
-def test_split_memory_key_separates_host_activation_storage():
-    from art.trainer_rank._impl import _SplitForwardPlan
-    from art.trainer_rank._memory import _ScopedMemorySignature
-
-    r = rank()
-    plain = r._plan_flat_forward(
-        [ForwardInput(input_tokens=torch.arange(17), hidden_states=True)]
-    )
-    signature = _ScopedMemorySignature(
-        **(vars(plain.signature) | {"topology": (1, 1, 4, 1)}),
-        bounded_forward_peak=True,
-    )
-    plan = _SplitForwardPlan((replace(plain, signature=signature),), ((0,),), 1)
-    host = replace(signature, checkpoint_host_offload=(2048, 64 * 2**30))
-    offloaded = replace(plan, subforwards=(replace(plain, signature=host),))
-    smaller = replace(host, checkpoint_host_offload=(2048, 32 * 2**30))
-    constrained = replace(plan, subforwards=(replace(plain, signature=smaller),))
-    assert len({r._split_memory_key(p) for p in (plan, offloaded, constrained)}) == 3
-
-
 def test_megatron_checkpoint_shards_one_boundary_per_layer(monkeypatch):
     from contextlib import nullcontext
 

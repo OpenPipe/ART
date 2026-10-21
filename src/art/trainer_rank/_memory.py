@@ -221,13 +221,7 @@ def _split_memory_key(plan: _impl._SplitForwardPlan) -> bytes | None:
                 )
             )
             if isinstance(signature, _ScopedMemorySignature):
-                feed(
-                    (
-                        signature.checkpoint_partition,
-                        signature.bounded_forward_peak,
-                        signature.checkpoint_host_offload,
-                    )
-                )
+                feed((signature.checkpoint_partition, signature.bounded_forward_peak))
             for g in p.groups:
                 slot = (
                     None

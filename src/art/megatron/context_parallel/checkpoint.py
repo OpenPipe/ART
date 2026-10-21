@@ -1,8 +1,9 @@
-"""Bound saved checkpoint activations through rank sharding or host storage.
+"""Shard saved root activations while keeping CP1 operator geometry.
 
-Rank sharding keeps CP1 operator geometry: every group member executes the
-same full root and exports one complete gradient without reduction. Host
-storage keeps the original native CP operators and gradient contract.
+Every group member executes the same full-root forward and backward. Only
+checkpoint storage is divided; no partial parameter gradients are produced.
+Use an outer group of CP1 models, disable automatic DP gradient reduction,
+and export one complete parameter-gradient copy without reduction.
 """
 
 from __future__ import annotations
