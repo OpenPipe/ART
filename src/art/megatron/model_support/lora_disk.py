@@ -64,6 +64,11 @@ def load_adapter_config(lora_path: str | Path) -> dict[str, Any]:
     return config if isinstance(config, dict) else {}
 
 
+def training_adapter_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Recover the training config from a rank-expanded serving artifact."""
+    return dict(config.get("art_lora_native_config", config))
+
+
 def save_adapter_config(lora_path: str | Path, adapter_config: dict[str, Any]) -> None:
     config_path = Path(lora_path) / "adapter_config.json"
     with config_path.open("w", encoding="utf-8") as config_file:
@@ -169,6 +174,11 @@ def load_lora_tensors_for_megatron(
     )
     adapter_config = load_adapter_config(lora_path)
     if provider is not None:
+        layout = getattr(provider, "_art_lora_layout", None)
+        if layout is not None or "art_lora_layout" in adapter_config:
+            from art.megatron.lora import LoraLayout
+
+            (layout or LoraLayout()).validate_config(adapter_config)
         adapter_config = with_model_attention_dimensions(adapter_config, provider)
     return resolved_handler.from_vllm_lora_tensors(
         load_vllm_lora_tensors(lora_path),

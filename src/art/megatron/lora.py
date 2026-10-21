@@ -1,7 +1,7 @@
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 import contextvars
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import functools
 import gc
 import importlib
@@ -33,6 +33,7 @@ from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
+from .canonical.layout import capture as capture_canonical
 from .expert_parallel import get_expert_parallel_layout
 from .kernels.cute_grouped_lora_quack import (
     quack_grouped_lora,
@@ -49,7 +50,7 @@ from .routed_experts import capture_routes
 _LAYER_BLOCK_RE = re.compile(r"^(?P<block>.*\.layers\.\d+)\.")
 
 ShardDomain = Literal["tp", "expert_tp"]
-GradSyncDomain = Literal["tp_default", "expert_tp"]
+GradSyncDomain = Literal["tp_default", "expert_tp", "expert_tp_ep"]
 GradSyncOp = Literal["none", "sum", "avg"]
 LoraSlotKind = Literal["checkpoint", "lora"]
 _F = TypeVar("_F", bound=Callable[..., Any])
@@ -59,6 +60,42 @@ EXPERT_TP_GRAD_SYNC_DOMAIN: GradSyncDomain = "expert_tp"
 GRAD_SYNC_OP_NONE: GradSyncOp = "none"
 GRAD_SYNC_OP_SUM: GradSyncOp = "sum"
 GRAD_SYNC_OP_AVG: GradSyncOp = "avg"
+
+
+@dataclass(frozen=True)
+class LoraLayout:
+    expert: Literal["per_expert", "shared_outer"] = "per_expert"
+    qwen_parameterization: Literal["tied_v0", "tinker_v1"] = "tied_v0"
+    shared_outer_kernel: bool = True
+
+    def __post_init__(self) -> None:
+        if self.expert not in ("per_expert", "shared_outer"):
+            raise ValueError(f"Unknown expert LoRA layout: {self.expert}")
+        if self.qwen_parameterization not in ("tied_v0", "tinker_v1"):
+            raise ValueError(
+                f"Unknown Qwen LoRA parameterization: {self.qwen_parameterization}"
+            )
+        if not isinstance(self.shared_outer_kernel, bool):
+            raise TypeError("shared_outer_kernel must be a bool")
+
+    def validate_config(self, config: dict[str, Any]) -> None:
+        recorded = LoraLayout(**config.get("art_lora_layout", {}))
+        if recorded != self:
+            raise ValueError(f"LoRA layout mismatch: saved={recorded}, runtime={self}")
+
+    def record_config(self, config: dict[str, Any]) -> dict[str, Any]:
+        if "art_lora_layout" in config:
+            self.validate_config(config)
+        return (
+            {**config, "art_lora_layout": asdict(self)}
+            if self != LoraLayout()
+            else dict(config)
+        )
+
+
+def lora_factor_view(tensor: torch.Tensor, expert: int | None) -> torch.Tensor:
+    """Logical expert view of either singleton shared or per-expert storage."""
+    return tensor if expert is None else tensor[0 if tensor.shape[0] == 1 else expert]
 
 
 @dataclass(frozen=True)
@@ -105,7 +142,7 @@ def install_compile_garbage_collection() -> bool:
         return False
     handler = torch._dynamo.callback_handler
     if _mark_compile_garbage not in handler.end_callbacks:
-        handler.register_end_callback(_mark_compile_garbage)
+        handler.register_end_callback(cast(Any, _mark_compile_garbage))
     return True
 
 
@@ -131,7 +168,7 @@ def _collect_compile_garbage() -> None:
 
 def _with_captured_lora_slot(function: _F) -> _F:
     context = _CURRENT_LORA_SLOT.get()
-    function = capture_routes(function)
+    function = capture_routes(capture_canonical(function))
 
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -496,6 +533,8 @@ def _copy_lora_param_metadata(
         "partition_stride",
         "lora_tp_shard_strategy",
         "lora_tp_component_sizes",
+        "lora_shared_expert",
+        "shared",
     ):
         if hasattr(source, name):
             setattr(target, name, getattr(source, name))
@@ -545,6 +584,7 @@ class LoRA(torch.nn.Module):
         a_parallel_spec: LoRAParallelSpec = LoRAParallelSpec(),
         b_parallel_spec: LoRAParallelSpec = LoRAParallelSpec(),
         allreduce: bool = True,
+        lora_layout: LoraLayout | None = None,
     ) -> None:
         super().__init__()
         is_expert = "{expert}" in adapter_model_prefix
@@ -554,6 +594,14 @@ class LoRA(torch.nn.Module):
                 "adapter_model_prefix when greater than one"
             )
         self.adapter_model_prefix = adapter_model_prefix
+        self.lora_layout = lora_layout or LoraLayout()
+        self.expert_layout = self.lora_layout.expert if is_expert else "per_expert"
+        self._num_local_experts = num_local_experts
+        self.shared_factor = (
+            ("B" if adapter_model_prefix.endswith(".down_proj") else "A")
+            if self.expert_layout == "shared_outer"
+            else None
+        )
         self.alpha = float(alpha)
         self.in_features = int(in_features)
         self.out_features = int(out_features)
@@ -561,10 +609,12 @@ class LoRA(torch.nn.Module):
         self._slot_modules = torch.nn.ModuleDict()
         self._slot_keys: dict[LoRASlotRef, str] = {}
         a_shape = (
-            (num_local_experts, in_features, rank) if is_expert else (in_features, rank)
+            (1 if self.shared_factor == "A" else num_local_experts, in_features, rank)
+            if is_expert
+            else (in_features, rank)
         )
         b_shape = (
-            (num_local_experts, rank, out_features)
+            (1 if self.shared_factor == "B" else num_local_experts, rank, out_features)
             if is_expert
             else (rank, out_features)
         )
@@ -580,6 +630,19 @@ class LoRA(torch.nn.Module):
             parallel_spec=b_parallel_spec,
             allreduce=allreduce,
         )
+        if self.shared_factor is not None:
+            shared = self.A_T if self.shared_factor == "A" else self.B_T
+            setattr(shared, "lora_shared_expert", True)
+            # Expert-DP reduction remains unchanged. Sum the extra EP x ETP
+            # contributions, including ETP's replicated hidden-side factor.
+            setattr(shared, "grad_sync_domain", "expert_tp_ep")
+            setattr(shared, "grad_sync_op", GRAD_SYNC_OP_SUM)
+            # MCore's native optimizer excludes `shared` replicas from norm
+            # statistics; its expert statistics group includes EP x ETP.
+            group = ps.get_expert_tensor_and_model_parallel_group(
+                check_initialized=False
+            )
+            setattr(shared, "shared", group is not None and group.rank() != 0)
         self._expert_offset = ps.get_expert_model_parallel_rank() * num_local_experts
         self._expert_ids: tuple[int | None, ...] = tuple(
             range(self._expert_offset, self._expert_offset + num_local_experts)
@@ -589,7 +652,7 @@ class LoRA(torch.nn.Module):
 
     @property
     def num_local_experts(self) -> int:
-        return self.A_T.shape[0] if self.is_expert else 1
+        return self._num_local_experts if self.is_expert else 1
 
     @property
     def is_expert(self) -> bool:
@@ -612,10 +675,23 @@ class LoRA(torch.nn.Module):
         self._expert_layout = physical_to_logical
         for local_expert, logical_expert in enumerate(expert_ids):
             if logical_expert is None:
-                self.A_T.data[local_expert].zero_()
-                self.B_T.data[local_expert].zero_()
+                if self.shared_factor != "A":
+                    self.A_T.data[local_expert].zero_()
+                if self.shared_factor != "B":
+                    self.B_T.data[local_expert].zero_()
 
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
+        if getattr(param, "lora_shared_expert", False):
+            group = ps.get_expert_tensor_and_model_parallel_group(
+                check_initialized=False
+            )
+            if group is not None and group.size() > 1:
+                torch.distributed.broadcast(  # ty: ignore[possibly-missing-attribute]
+                    param.data,
+                    src=torch.distributed.get_global_rank(group, 0),  # ty: ignore[possibly-missing-attribute]
+                    group=group,
+                )
+            return
         if not param.lora_tp_replicated:  # ty: ignore[unresolved-attribute]
             return
         domain = param.lora_shard_domain  # ty: ignore[unresolved-attribute]
@@ -643,7 +719,8 @@ class LoRA(torch.nn.Module):
     def reset_lora_parameters(self) -> None:
         """Initialize LoRA weights (A=Kaiming, B=zeros) like PEFT defaults."""
         if self.is_expert:
-            for expert, logical_expert in enumerate(self.expert_ids):
+            ids = (0,) if self.shared_factor == "A" else self.expert_ids
+            for expert, logical_expert in enumerate(ids):
                 if logical_expert is None:
                     torch.nn.init.zeros_(self.A_T[expert])
                 else:
@@ -680,7 +757,7 @@ class LoRA(torch.nn.Module):
         b_t = self._localized_weight(weights[1], into=self.B_T)
         slot_key = self._slot_keys.get(ref)
         if slot_key is None:
-            slot_key = f"slot_{len(self._slot_keys)}"
+            slot_key = self._next_slot_key()
             self._slot_keys[ref] = slot_key
         elif self._has_live_slot_grads(ref):
             raise RuntimeError(
@@ -708,9 +785,7 @@ class LoRA(torch.nn.Module):
             raise RuntimeError(
                 f"LoRA slot {destination.kind}:{destination.name} already exists"
             )
-        index = len(self._slot_keys)
-        while (key := f"slot_{index}") in self._slot_modules:
-            index += 1
+        key = self._next_slot_key()
         self._slot_keys[destination] = key
         self._slot_modules[key] = LoRASlot(
             ref=destination,
@@ -722,6 +797,12 @@ class LoRA(torch.nn.Module):
             requires_grad=False,
         )
         return True
+
+    def _next_slot_key(self) -> str:
+        index = len(self._slot_keys)
+        while (key := f"slot_{index}") in self._slot_modules:
+            index += 1
+        return key
 
     def _discard_lora_slot(self, ref: LoRASlotRef) -> None:
         key = self._slot_keys.pop(ref, None)
@@ -791,6 +872,13 @@ class LoRA(torch.nn.Module):
         if self.is_expert:
             loaded = [adapter_model[key].T for key in keys]
             first = loaded[0]
+            if self.shared_factor == suffix.removeprefix("lora_"):
+                if any(not torch.equal(first, weight) for weight in loaded[1:]):
+                    raise ValueError(
+                        f"{self.adapter_model_prefix}: cannot load independent {suffix} "
+                        "weights into a shared-outer factor"
+                    )
+                return first.unsqueeze(0)
             real_weights = iter(loaded)
             return torch.stack(
                 [
@@ -942,7 +1030,7 @@ class LoRA(torch.nn.Module):
     ) -> dict[str, torch.Tensor]:
         state: dict[str, torch.Tensor] = {}
         for key, param, expert in self._export_items(ref):
-            state[key] = param.data[expert].T if expert is not None else param.data.T
+            state[key] = lora_factor_view(param.data, expert).T
         return state
 
     def sharded_lora_grad_dict(self) -> dict[str, torch.Tensor]:
@@ -957,13 +1045,20 @@ class LoRA(torch.nn.Module):
                 raise RuntimeError(f"LoRA param main_grad is None for key '{key}'")
             if hasattr(grad, "_local_tensor"):
                 grad = cast(Any, grad)._local_tensor
-            local_grad = grad[expert] if expert is not None else grad
+            local_grad = lora_factor_view(grad, expert)
             grads[key] = local_grad.T
         return grads
 
     def active_lora_tensors(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+        active = self._active_lora_storage()
+        return None if active is None else self._expert_views(*active)
+
+    def _active_lora_storage(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
+        """Return stored factors without an expanded-view autograd chain."""
         ref = _CURRENT_LORA_SLOT.get()
         if ref is None:
             return self.A_T, self.B_T, self.scale
@@ -974,10 +1069,32 @@ class LoRA(torch.nn.Module):
             return None
         return slot.A_T, slot.B_T, slot.scale
 
+    def _expert_views(
+        self, a_t: torch.Tensor, b_t: torch.Tensor, scale: float
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        # The legacy grouped path materializes these expanded views inside
+        # QuACK. The compact caller bypasses the views entirely: slicing an
+        # expanded view back to one expert still allocates an E-sized gradient
+        # in SliceBackward before ExpandBackward sums it.
+        if self.shared_factor == "A":
+            a_t = a_t.expand(self.num_local_experts, -1, -1)
+        elif self.shared_factor == "B":
+            b_t = b_t.expand(self.num_local_experts, -1, -1)
+        return a_t, b_t, scale
+
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
     ) -> torch.Tensor:
-        active = self.active_lora_tensors()
+        compact_experts = (
+            tokens_per_expert is not None
+            and self.shared_factor is not None
+            and self.lora_layout.shared_outer_kernel
+        )
+        active = (
+            self._active_lora_storage()
+            if compact_experts
+            else self.active_lora_tensors()
+        )
         if active is None:
             return x.new_zeros((*x.shape[:-1], self.out_features))
         a_t, b_t, scale = active
@@ -986,6 +1103,17 @@ class LoRA(torch.nn.Module):
             bsz = tokens_per_expert
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
+            if compact_experts:
+                from .kernels.shared_outer_lora import shared_outer_lora
+
+                return shared_outer_lora(
+                    x,
+                    a_t,
+                    b_t,
+                    bsz,
+                    scale=scale,
+                    shared_factor=self.shared_factor,
+                )
             if x.shape[0] == 0:
                 return x.new_zeros((*x.shape[:-1], self.out_features))
             return quack_grouped_lora(x, a_t, b_t, bsz, scale=scale)
@@ -1203,9 +1331,7 @@ class LoRAPublishPlanner:
 
 
 def _exported_param_shape(module: LoRA, param: torch.nn.Parameter) -> tuple[int, ...]:
-    if module.is_expert:
-        return tuple(int(dim) for dim in param[0].T.shape)
-    return tuple(int(dim) for dim in param.T.shape)
+    return tuple(lora_factor_view(param, 0 if module.is_expert else None).T.shape)
 
 
 @torch.compiler.disable
@@ -1215,7 +1341,9 @@ def _expert_grouped_lora_forward(
     tokens_per_expert: list[int] | torch.Tensor,
     out_features: int,
 ) -> torch.Tensor:
-    if x.shape[0] == 0:
+    if x.shape[0] == 0 and not (
+        lora.shared_factor is not None and lora.lora_layout.shared_outer_kernel
+    ):
         return x.new_zeros((x.shape[0], out_features))
     return lora(x, tokens_per_expert=tokens_per_expert)
 
@@ -1236,6 +1364,19 @@ def _expert_grouped_lora_dual_forward(
     counts = tokens_per_expert
     if isinstance(counts, list):
         counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
+    if (
+        module.gate_lora.shared_factor is not None
+        and module.gate_lora.lora_layout.shared_outer_kernel
+    ):
+        # Pass each stored leaf directly. Expanding then slicing creates an
+        # E-sized SliceBackward temporary even when the view has stride zero.
+        return torch.cat(
+            [
+                module.gate_lora(x, tokens_per_expert=counts),
+                module.up_lora(x, tokens_per_expert=counts),
+            ],
+            dim=-1,
+        )
     if x.shape[0] == 0:
         return x.new_zeros((x.shape[0], module.out_features))
     gate = module.gate_lora.active_lora_tensors()
@@ -1275,6 +1416,7 @@ def _parallel_lora(
     allreduce: bool = True,
     num_local_experts: int = 1,
     lora_cls: type[LoRA] = LoRA,
+    lora_layout: LoraLayout | None = None,
 ) -> LoRA:
     weight = getattr(linear, "weight0", None)
     if weight is None:
@@ -1297,13 +1439,14 @@ def _parallel_lora(
     )
     return lora_cls(
         adapter_model_prefix=adapter_model_prefix,
-        in_features=linear.in_features,
+        in_features=getattr(linear, "in_features", None) or linear.input_size,
         out_features=out_features,
         rank=rank,
         alpha=alpha,
         dtype=weight.dtype,
         device=weight.device,
         num_local_experts=num_local_experts,
+        **({"lora_layout": lora_layout} if lora_layout is not None else {}),
         a_parallel_spec=a_parallel_spec,
         b_parallel_spec=b_parallel_spec,
         allreduce=allreduce,
@@ -1321,6 +1464,7 @@ def _parallel_lora_pair(
     suffixes: tuple[str, str],
     num_local_experts: int = 1,
     lora_cls: type[LoRA] = LoRA,
+    lora_layout: LoraLayout | None = None,
 ) -> tuple[LoRA, LoRA]:
     expert_parallel = "{expert}" in adapter_model_prefix
     return cast(
@@ -1341,6 +1485,7 @@ def _parallel_lora_pair(
                 ),
                 allreduce=not expert_parallel,
                 num_local_experts=num_local_experts,
+                lora_layout=lora_layout,
                 lora_cls=lora_cls,
             )
             for suffix in suffixes
@@ -1633,6 +1778,10 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
 
 
 class GatedDeltaNetInProjLoRA(torch.nn.Module):
+    q_lora: LoRA
+    k_lora: LoRA
+    v_lora: LoRA
+
     def __init__(
         self,
         adapter_model_prefix: str,
@@ -1640,6 +1789,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         gated_delta_net: GatedDeltaNet,
         rank: int,
         alpha: float,
+        lora_layout: LoraLayout | None = None,
     ) -> None:
         super().__init__()
         in_proj.return_layernorm_output = True
@@ -1654,23 +1804,48 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         z_out_features_per_partition = (
             gated_delta_net.v_dim // ps.get_tensor_model_parallel_world_size()
         )
-        self.qkv_lora = _parallel_lora(
-            adapter_model_prefix=f"{adapter_model_prefix}.in_proj_qkv",
-            linear=in_proj,
-            out_features=qkv_out_features_per_partition,
-            rank=rank,
-            alpha=alpha,
-            layout="column",
-        )
-        _set_lora_shard_strategy_metadata(
-            self.qkv_lora.B_T,
-            strategy="componentwise",
-            component_sizes=(
-                gated_delta_net.qk_dim,
-                gated_delta_net.qk_dim,
-                gated_delta_net.v_dim,
-            ),
-        )
+        self.split_qkv = (
+            lora_layout or LoraLayout()
+        ).qwen_parameterization == "tinker_v1"
+        if self.split_qkv:
+            tp = ps.get_tensor_model_parallel_world_size()
+            for name, width in (
+                ("q", gated_delta_net.qk_dim),
+                ("k", gated_delta_net.qk_dim),
+                ("v", gated_delta_net.v_dim),
+            ):
+                setattr(
+                    self,
+                    name + "_lora",
+                    _parallel_lora(
+                        adapter_model_prefix=f"{adapter_model_prefix}.in_proj_{name}",
+                        linear=in_proj,
+                        out_features=width // tp,
+                        rank=rank,
+                        alpha=alpha,
+                        layout="column",
+                        lora_layout=lora_layout,
+                    ),
+                )
+        else:
+            self.qkv_lora = _parallel_lora(
+                adapter_model_prefix=f"{adapter_model_prefix}.in_proj_qkv",
+                linear=in_proj,
+                out_features=qkv_out_features_per_partition,
+                rank=rank,
+                alpha=alpha,
+                layout="column",
+                lora_layout=lora_layout,
+            )
+            _set_lora_shard_strategy_metadata(
+                self.qkv_lora.B_T,
+                strategy="componentwise",
+                component_sizes=(
+                    gated_delta_net.qk_dim,
+                    gated_delta_net.qk_dim,
+                    gated_delta_net.v_dim,
+                ),
+            )
         self.z_lora = _parallel_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.in_proj_z",
             linear=in_proj,
@@ -1678,6 +1853,7 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
             rank=rank,
             alpha=alpha,
             layout="column",
+            lora_layout=lora_layout,
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -1687,7 +1863,18 @@ class GatedDeltaNetInProjLoRA(torch.nn.Module):
         assert isinstance(layernorm_output, torch.Tensor)
         assert isinstance(bias, (torch.Tensor, type(None)))
 
-        qkv = self.qkv_lora(layernorm_output)
+        qkv = (
+            torch.cat(
+                [
+                    self.q_lora(layernorm_output),
+                    self.k_lora(layernorm_output),
+                    self.v_lora(layernorm_output),
+                ],
+                dim=-1,
+            )
+            if self.split_qkv
+            else self.qkv_lora(layernorm_output)
+        )
         z = self.z_lora(layernorm_output)
         beta = qkv.new_zeros(
             qkv.shape[0],
@@ -1776,6 +1963,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         num_local_experts: int,
         fused_gate_up: bool = False,
         non_gated: bool = False,
+        lora_layout: LoraLayout | None = None,
     ) -> None:
         super().__init__()
         if fused_gate_up and non_gated:
@@ -1796,6 +1984,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
                 grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
                 allreduce=False,
                 num_local_experts=num_local_experts,
+                lora_layout=lora_layout,
             )
         elif self.fused_gate_up:
             self.lora = _parallel_lora(
@@ -1809,6 +1998,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
                 grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
                 allreduce=False,
                 num_local_experts=num_local_experts,
+                lora_layout=lora_layout,
             )
             gate_out_features = self.out_features // 2
             expert_tp_world_size = _get_shard_world_size("expert_tp")
@@ -1830,6 +2020,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
                 layout="column",
                 suffixes=("gate_proj", "up_proj"),
                 num_local_experts=num_local_experts,
+                lora_layout=lora_layout,
             )
 
     def forward(
@@ -1863,6 +2054,7 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         rank: int,
         alpha: float,
         num_local_experts: int,
+        lora_layout: LoraLayout | None = None,
     ) -> None:
         super().__init__()
         self.linear_fc2 = linear_fc2
@@ -1878,6 +2070,7 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
             grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
             allreduce=False,
             num_local_experts=num_local_experts,
+            lora_layout=lora_layout,
         )
 
     def forward(
@@ -1916,7 +2109,7 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
             linear_fc1.return_layernorm_output = True
             linear_fc1.return_layernorm_output_gathered = True
         self.linear_fc1 = linear_fc1
-        self.out_features = int(linear_fc1.weight.shape[0])
+        self.out_features = int(cast(torch.Tensor, linear_fc1.weight).shape[0])
         self.non_gated = bool(non_gated)
         if self.non_gated:
             self.up_lora = _parallel_lora(
@@ -2110,6 +2303,7 @@ def wrap_gated_delta_net_attention(
     target_modules: set[str],
     rank: int,
     alpha: int,
+    lora_layout: LoraLayout | None = None,
 ) -> None:
     if _targets_include(target_modules, "out_proj"):
         gated_delta_net_out_proj = _unwrap_attr(
@@ -2124,7 +2318,14 @@ def wrap_gated_delta_net_attention(
             alpha=alpha,
             provider=provider,
         )
-    if _targets_include(target_modules, "in_proj_qkv", "in_proj_z"):
+    if _targets_include(
+        target_modules,
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_q",
+        "in_proj_k",
+        "in_proj_v",
+    ):
         gated_delta_net_in_proj = _unwrap_attr(
             self_attention.in_proj,
             "in_proj",
@@ -2134,6 +2335,7 @@ def wrap_gated_delta_net_attention(
             adapter_model_prefix=f"{adapter_model_prefix}.linear_attn",
             in_proj=gated_delta_net_in_proj,
             gated_delta_net=self_attention,
+            lora_layout=lora_layout,
             rank=rank,
             alpha=alpha,
         )
@@ -2149,6 +2351,7 @@ def wrap_grouped_moe_experts(
     fused_gate_up: bool = False,
     non_gated: bool = False,
     module_namespace: str = "mlp.experts",
+    lora_layout: LoraLayout | None = None,
 ) -> None:
     if fused_gate_up and non_gated:
         raise ValueError("fused_gate_up and non_gated are mutually exclusive")
@@ -2174,6 +2377,7 @@ def wrap_grouped_moe_experts(
             rank=rank,
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
+            lora_layout=lora_layout,
             fused_gate_up=fused_gate_up,
             non_gated=non_gated,
         )
@@ -2207,6 +2411,7 @@ def wrap_grouped_moe_experts(
             rank=rank,
             alpha=alpha,
             num_local_experts=experts.num_local_experts,
+            lora_layout=lora_layout,
         )
         setattr(experts, "linear_fc2", linear_fc2_lora)
         expert_loras.append(linear_fc2_lora.lora)
@@ -2322,18 +2527,27 @@ def wrap_shared_experts_mlp(
 def apply_lora_adapters(
     model: Sequence[torch.nn.Module],
     provider: GPTModelProvider,
+    *,
+    lora_layout: LoraLayout | None = None,
 ) -> list[torch.nn.Module]:
     provider = cast(Any, provider)
     handler = provider._art_model_support_handler
     spec = provider._art_model_support_spec
     target_modules = _configured_lora_target_modules(provider, spec)
     rank = _configured_lora_rank(provider, handler)
+    layout = lora_layout or LoraLayout()
+    if layout != LoraLayout() and not handler.key.startswith("qwen3_5_"):
+        raise ValueError(f"LoRA layout {layout} is unsupported by {handler.key}")
+    layout_kwargs = (
+        {"lora_layout": layout} if handler.key.startswith("qwen3_5_") else {}
+    )
     handler.apply_lora_adapters(
         model,
         provider,
         target_modules=target_modules,
         rank=rank,
         alpha=LORA_ALPHA,
+        **layout_kwargs,
     )
     return list(model)
 

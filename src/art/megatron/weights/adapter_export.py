@@ -18,6 +18,7 @@ from art.megatron.lora import (
     SelfAttentionLinearQKVLoRA,
     SharedExpertsLinearFC1LoRA,
     SharedExpertsLinearFC2LoRA,
+    lora_factor_view,
 )
 from art.megatron.weights.param_name_canonicalization import canonical_art_param_name
 
@@ -34,8 +35,8 @@ def _adapter_tensors(
     lora: LoRA,
     expert_idx: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    a_t = lora.A_T if expert_idx is None else lora.A_T[expert_idx]
-    b_t = lora.B_T if expert_idx is None else lora.B_T[expert_idx]
+    a_t = lora_factor_view(lora.A_T, expert_idx)
+    b_t = lora_factor_view(lora.B_T, expert_idx)
     return a_t.transpose(-1, -2).contiguous(), b_t.transpose(-1, -2).contiguous()
 
 
@@ -105,43 +106,22 @@ def _zero_adapter_weight(
     )
 
 
-def _fused_pair_adapter_weight(
+def _fused_adapter_weight(
     base_prefix: str,
-    first_lora: LoRA,
-    second_lora: LoRA,
-    *,
-    first_expert_idx: int | None = None,
-    second_expert_idx: int | None = None,
+    *items: tuple[LoRA, int | None],
+    adapter_key: str | None = None,
 ) -> AdapterWeight:
-    first_linear_in, first_linear_out = _adapter_tensors(first_lora, first_expert_idx)
-    second_linear_in, second_linear_out = _adapter_tensors(
-        second_lora,
-        second_expert_idx,
-    )
-    assert math.isclose(float(first_lora.scale), float(second_lora.scale))
-    total_dim = int(first_linear_in.shape[0] + second_linear_in.shape[0])
-    alpha = round(float(first_lora.scale) * total_dim)
-
-    first_rank = int(first_linear_in.shape[0])
-    second_rank = int(second_linear_in.shape[0])
-    first_out = int(first_linear_out.shape[0])
-    second_out = int(second_linear_out.shape[0])
-
-    first_padding = first_linear_out.new_zeros((first_out, second_rank))
-    second_padding = second_linear_out.new_zeros((second_out, first_rank))
+    pairs = [_adapter_tensors(lora, expert) for lora, expert in items]
+    scale = float(items[0][0].scale)
+    assert all(math.isclose(float(lora.scale), scale) for lora, _ in items)
+    total_dim = sum(int(a.shape[0]) for a, _ in pairs)
     return _adapter_weight(
         base_prefix=base_prefix,
-        adapter_key=None,
-        alpha=alpha,
+        adapter_key=adapter_key,
+        alpha=round(scale * total_dim),
         dim=total_dim,
-        linear_in=torch.cat([first_linear_in, second_linear_in], dim=0),
-        linear_out=torch.cat(
-            [
-                torch.cat([first_linear_out, first_padding], dim=1),
-                torch.cat([second_padding, second_linear_out], dim=1),
-            ],
-            dim=0,
-        ),
+        linear_in=torch.cat([a for a, _ in pairs], dim=0),
+        linear_out=torch.block_diag(*[b for _, b in pairs]),
     )
 
 
@@ -307,14 +287,24 @@ def add_self_attention_adapter_weights(
     in_proj = getattr(self_attention, "in_proj", None)
     if isinstance(in_proj, GatedDeltaNetInProjLoRA):
         base_prefix = f"{layer_prefix}.self_attention.in_proj"
-        input_dim = int(in_proj.qkv_lora.A_T.shape[-2])
+        first_lora = in_proj.q_lora if in_proj.split_qkv else in_proj.qkv_lora
+        input_dim = int(first_lora.A_T.shape[-2])
+        qkv_weight = (
+            _fused_adapter_weight(
+                base_prefix,
+                *((getattr(in_proj, f"{part}_lora"), None) for part in ("q", "k", "v")),
+                adapter_key="adapter_qkv",
+            )
+            if in_proj.split_qkv
+            else _simple_adapter_weight(
+                base_prefix, in_proj.qkv_lora, adapter_key="adapter_qkv"
+            )
+        )
         output_dim = int(in_proj.num_value_heads_per_partition)
         _set_adapter_weights(
             adapter_weights_by_base,
             base_prefix,
-            _simple_adapter_weight(
-                base_prefix, in_proj.qkv_lora, adapter_key="adapter_qkv"
-            ),
+            qkv_weight,
             _simple_adapter_weight(
                 base_prefix, in_proj.z_lora, adapter_key="adapter_z"
             ),
@@ -324,7 +314,7 @@ def add_self_attention_adapter_weights(
                     adapter_key=adapter_key,
                     input_dim=input_dim,
                     output_dim=output_dim,
-                    like=in_proj.qkv_lora.B_T,
+                    like=first_lora.B_T,
                 )
                 for adapter_key in ("adapter_b", "adapter_a")
             ),
@@ -429,12 +419,10 @@ def add_grouped_moe_adapter_weights(
             )
         else:
             lora = linear_fc1.gate_lora
-            build_weight = lambda local_expert_idx: _fused_pair_adapter_weight(
+            build_weight = lambda local_expert_idx: _fused_adapter_weight(
                 base_prefix,
-                linear_fc1.gate_lora,
-                linear_fc1.up_lora,
-                first_expert_idx=local_expert_idx,
-                second_expert_idx=local_expert_idx,
+                (linear_fc1.gate_lora, local_expert_idx),
+                (linear_fc1.up_lora, local_expert_idx),
             )
         _set_expert_adapter_weights(
             adapter_weights_by_base,

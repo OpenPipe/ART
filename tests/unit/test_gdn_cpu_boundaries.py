@@ -109,3 +109,56 @@ def test_fp32_oracle_accepts_hint_but_uses_independent_device_boundaries(monkeyp
     assert lengths == [2, 3]
     torch.testing.assert_close(result, value, rtol=0, atol=0)
     assert final is None
+
+
+@pytest.mark.parametrize("needs_final_state", [False, True])
+def test_tree_cp_final_state_autograd_edges_match_main(monkeypatch, needs_final_state):
+    from dataclasses import replace
+
+    from art.megatron.gdn.gdn_prefix_tree import (
+        GdnSegmentSpec,
+        _build_position_bucket_plan,
+    )
+
+    bucket = replace(
+        _build_position_bucket_plan(
+            (GdnSegmentSpec(0, 0, 0, 0, 0, 64, "prefix"),),
+            ((0, 64, 0),),
+            sequence_length=64,
+            device="cpu",
+        ),
+        needs_final_state=needs_final_state,
+        parent_indices=torch.tensor([-1]),
+        parent_indices_cpu=torch.tensor([-1]),
+    )
+    output = torch.ones(64, requires_grad=True)
+    conv = torch.ones(1, requires_grad=True)
+    rec = torch.ones(1, requires_grad=True)
+    cache = operator._TreeStateChunkCache(device=output.device)
+    monkeypatch.setattr(cache, "parent_states", lambda *args, **kwargs: (conv, rec))
+    monkeypatch.setattr(cache, "append", lambda *args: None)
+    monkeypatch.setattr(
+        operator, "_gather_bucket_streams", lambda *args: (output, output, output)
+    )
+    monkeypatch.setattr(
+        operator, "run_gdn_bucket", lambda *args, **kwargs: (output, conv, rec)
+    )
+    monkeypatch.setattr(
+        operator, "_scatter_bucket_recurrent_output", lambda *args: output
+    )
+    _, dependency = operator._run_tree_bucket(
+        None,
+        output,
+        output,
+        output,
+        output,
+        cache,
+        bucket,
+        state_reference=output,
+        recurrent_cp=True,
+    )
+    assert dependency is not None
+    grads = torch.autograd.grad(dependency, (output, conv, rec), allow_unused=True)
+    assert grads[0] is not None
+    for grad in grads[1:]:
+        assert (grad is not None) == needs_final_state

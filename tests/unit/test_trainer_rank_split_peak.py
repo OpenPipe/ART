@@ -435,3 +435,12 @@ def test_large_unsupported_keys_and_full_cache_remain_explicit(monkeypatch):
         rank._split_memory_key(replace(plan, subforwards=(a, plan.subforwards[1])))
         is None
     )
+
+
+def test_default_split_key_matches_main_digest():
+    # Pinned against e18c570's _split_memory_key for this deterministic plan.
+    rank = _rank()
+    plan = _split(rank, _requests(), ((0,), (1,)))
+    assert rank._split_memory_key(plan).hex() == (
+        "be5eda58754725f9c25471f8d0adf483d498f3d86c5a99364952d8df1c68b46f"
+    )

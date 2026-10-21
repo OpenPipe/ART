@@ -12,7 +12,7 @@ from collections.abc import (
     Sequence,
 )
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
@@ -2775,7 +2775,12 @@ class TrainerRank:
         if backward is not None:
             backward.harvest()
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
-        with torch.set_grad_enabled(enabled):
+        with (
+            torch.set_grad_enabled(enabled),
+            _memory.direct_forward_profile()
+            if _memory._BOUNDED_FORWARD_PEAKS.get()
+            else nullcontext(),
+        ):
             self._reset_planning_telemetry()
             materialized = _materialize(inputs)
             requests = list(_flatten(materialized))
@@ -5478,6 +5483,9 @@ def _include_in_distributed_grad_norm(param: torch.nn.Parameter) -> bool:
     if replica_group is not None and replica_group.size() > 1:
         if replica_group.rank() != 0:
             return False
+    if getattr(param, "lora_shared_expert", False):
+        group = ps.get_expert_tensor_and_model_parallel_group(check_initialized=False)
+        return group is None or group.rank() == 0
     if bool(getattr(param, "lora_tp_sharded", False)):
         return True
     shard_group = (

@@ -169,9 +169,12 @@ def _assert_stock_vllm_loads(
     script = r"""
 import json
 import sys
+import vllm.lora.lora_model as lora_module
 from vllm.lora.lora_model import LoRAModel
 from vllm.lora.peft_helper import PEFTHelper
 
+# This helper checks CPU parsing and layout; pinned storage requires CUDA.
+lora_module.PIN_MEMORY = False
 path = sys.argv[1]
 expected = set(json.loads(sys.argv[2]))
 mapper_name = sys.argv[3]
@@ -199,10 +202,11 @@ print(json.dumps(sorted(lora.loras)))
             json.dumps(sorted(expected_modules)),
             mapper,
         ],
-        check=True,
+        check=False,
         text=True,
         capture_output=True,
     )
+    assert result.returncode == 0, result.stderr
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
@@ -2109,3 +2113,77 @@ def test_qwen35_megatron_shards_can_merge_to_separate_vllm_checkpoint(
         handler=QWEN3_5_MOE_HANDLER,
     )
     _assert_tensors_equal(roundtrip, full)
+
+
+def test_tinker_v1_producer_export_roundtrip_and_stock_vllm_loader(
+    tmp_path, monkeypatch
+):
+    from art.megatron.lora import GatedDeltaNetInProjLoRA, LoraLayout
+    from art.megatron.model_support.lora_disk import training_adapter_config
+
+    monkeypatch.setattr(lora_module.ps, "get_expert_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(lora_module.ps, "get_expert_data_parallel_rank", lambda: 0)
+    monkeypatch.setattr(lora_module.ps, "get_data_parallel_rank", lambda **_: 0)
+    monkeypatch.setattr(
+        lora_module.ps, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    layout = LoraLayout(expert="shared_outer", qwen_parameterization="tinker_v1")
+    prefix = "base_model.model.model.layers.0"
+    in_proj = torch.nn.Linear(3, 14, bias=False)
+    in_proj.in_features = 3
+    gdn = GatedDeltaNetInProjLoRA(
+        prefix + ".linear_attn",
+        in_proj,
+        SimpleNamespace(num_value_heads=1, qk_dim=2, v_dim=4),
+        2,
+        3.5,
+        lora_layout=layout,
+    )
+    experts = [
+        LoRA(
+            f"{prefix}.mlp.experts.{{expert}}.{projection}",
+            3,
+            4,
+            2,
+            3.5,
+            torch.float32,
+            torch.device("cpu"),
+            num_local_experts=2,
+            lora_layout=layout,
+        )
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    ]
+    modules = [
+        *(module for module in gdn.modules() if isinstance(module, LoRA)),
+        *experts,
+    ]
+    for module in modules:
+        with torch.no_grad():
+            module.B_T.normal_()
+    original = {
+        key: value.clone().contiguous()
+        for module in modules
+        for key, value in module.sharded_lora_state_dict().items()
+    }
+    native_config = _qwen35_config("Qwen/Qwen3.6-35B-A3B")
+    native_config["lora_alpha"] = 3.5
+    config = layout.record_config(native_config)
+    serving, serving_config = QWEN3_5_MOE_HANDLER.to_vllm_lora_tensors(
+        original, adapter_config=config
+    )
+    assert serving_config["r"] == 6 and serving_config["lora_alpha"] == 10.5
+    assert training_adapter_config(serving_config) == config
+    _assert_tensors_equal(
+        QWEN3_5_MOE_HANDLER.from_vllm_lora_tensors(
+            serving, adapter_config=serving_config
+        ),
+        original,
+    )
+    _save_adapter(tmp_path, serving, serving_config)
+    loaded = _assert_stock_vllm_loads(
+        tmp_path,
+        expected_modules={"in_proj_qkv", "in_proj_z", "experts"},
+        mapper="qwen35",
+    )
+    assert any("in_proj_qkv" in name for name in loaded)
+    assert any(name.endswith("experts") for name in loaded)

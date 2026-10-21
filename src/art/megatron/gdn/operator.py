@@ -12,6 +12,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from art.megatron.canonical.layout import current_layout
+
 from .conv_gelu import packed_varlen_causal_conv
 from .fla_cp import chunk_gated_delta_rule_native_cp
 from .gdn_prefix_tree import (
@@ -912,6 +914,9 @@ def _bucket_has_parent_state(bucket: GdnSegmentBucketPlan) -> bool:
 
 
 def _bucket_has_uniform_lengths(bucket: GdnSegmentBucketPlan) -> bool:
+    # Never switch GDN algorithms when a root gains same-length companions.
+    if current_layout() is not None:
+        return False
     lengths_cpu = bucket.lengths_cpu
     if lengths_cpu is None:
         lengths_cpu = bucket.lengths.detach().cpu()

@@ -17,6 +17,7 @@ Public cross-repo API consumed by serverless-training:
 - inspect_resident_lora
 """
 
+from collections.abc import Mapping
 from contextlib import contextmanager
 import hashlib
 import math
@@ -47,11 +48,12 @@ from art.megatron.context_parallel.types import (
     PreparedMegatronBatch,
     TrainingStepWorkload,
 )
-from art.megatron.lora import LoRA, apply_lora_adapters
+from art.megatron.lora import LoRA, LoraLayout, apply_lora_adapters
 from art.megatron.megatron_patches import install_fast_frozen_output_backward
 from art.megatron.model_support.lora_disk import (
     load_adapter_config,
     load_lora_tensors_for_megatron,
+    training_adapter_config,
 )
 from art.megatron.optimizer_state import (
     ALLOW_UNPAIRED_MEGATRON_RESUME_ENV,
@@ -171,6 +173,7 @@ class TrainingRuntime(BaseModel):
 
     provider_bundle: ProviderBundle
     provider: Any
+    lora_layout: LoraLayout = Field(default_factory=LoraLayout)
     model: ModelChunks
     optimizer: Any | None
     optimizer_config: OptimizerConfig
@@ -245,11 +248,14 @@ def _register_trainable_parameter_mode(
     provider: Any,
     *,
     trainable_parameter_mode: Literal["lora", "base_model"],
+    lora_layout: LoraLayout | None = None,
 ) -> None:
     if trainable_parameter_mode == "lora":
         provider.register_pre_wrap_hook(freeze_model)
         provider.register_pre_wrap_hook(
-            lambda chunks: apply_lora_adapters(chunks, provider)
+            lambda chunks: apply_lora_adapters(
+                chunks, provider, lora_layout=lora_layout
+            )
         )
         return
     if trainable_parameter_mode == "base_model":
@@ -423,6 +429,8 @@ def build_training_runtime(
     allow_unvalidated_arch: bool | None = None,
     model_support_key: str | None = None,
     snapshot_pool_capacity: int = 2,
+    lora_layout: LoraLayout | None = None,
+    external_weights: Mapping[str, torch.Tensor] | None = None,
 ) -> TrainingRuntime:
     if random_state := os.environ.get("ART_MEGATRON_RANDOM_STATE"):
         seed = int(random_state)
@@ -444,6 +452,15 @@ def build_training_runtime(
         ),
         model_support_key=model_support_key,
     )
+    if external_weights is not None:
+        if model_initialization != "pretrained":
+            raise ValueError("external weights require pretrained model initialization")
+        hooks = list(getattr(provider_bundle.provider, "_pre_wrap_hooks", ()))
+        retained = [hook for hook in hooks if not _is_bridge_hf_load_hook(hook)]
+        if len(hooks) - len(retained) != 1:
+            raise RuntimeError("external weights require exactly one HF loader hook")
+        provider_bundle.provider._art_external_weights = external_weights
+        provider_bundle.provider._pre_wrap_hooks = retained
     if model_initialization == "random":
         hooks = list(getattr(provider_bundle.provider, "_pre_wrap_hooks", ()))
         checkpoint_hooks = [hook for hook in hooks if _is_bridge_hf_load_hook(hook)]
@@ -465,10 +482,12 @@ def build_training_runtime(
     )
     if replay_requested:
         _enable_native_moe_routing_replay(provider)
+    provider._art_lora_layout = lora_layout or LoraLayout()
     finalize_provider_bundle(provider_bundle)
     _register_trainable_parameter_mode(
         provider,
         trainable_parameter_mode=trainable_parameter_mode,
+        lora_layout=lora_layout,
     )
 
     model = cast(
@@ -528,6 +547,7 @@ def build_training_runtime(
     )
 
     runtime = TrainingRuntime(
+        lora_layout=lora_layout or LoraLayout(),
         provider_bundle=provider_bundle,
         provider=provider,
         model=model,
@@ -1028,7 +1048,9 @@ def _prepare_rl_training_state(
     # Serialize the live LoRA dtype instead of perpetuating a source checkpoint's
     # PEFT-upcast FP32 dtype.
     runtime.adapter_export_dtypes = {}
-    runtime.adapter_export_config = load_adapter_config(job.source_adapter_path)
+    runtime.adapter_export_config = training_adapter_config(
+        load_adapter_config(job.source_adapter_path)
+    )
     runtime.resident_training_session_id = job.training_session_id
     runtime.resident_policy_step = job.source_policy_step
     runtime.resident_generation_id = job.source.generation_id
@@ -2141,7 +2163,10 @@ def inspect_resident_lora(
             base_name=base_name,
             adapter_keys=tuple(
                 sorted(
-                    {getattr(weight, "adapter_key", None) for weight in weights},
+                    {
+                        cast(str | None, getattr(weight, "adapter_key", None))
+                        for weight in weights
+                    },
                     key=lambda value: "" if value is None else value,
                 )
             ),

@@ -969,7 +969,12 @@ def _expand_local_state(
     captured: tuple[_LoraSnapshot, ...],
     files: dict[str, dict[str, torch.Tensor]],
 ) -> tuple[_LocalShard, ...]:
-    from art.megatron.lora import LoraShardMeta, _block_for_key, _dtype_name
+    from art.megatron.lora import (
+        LoraShardMeta,
+        _block_for_key,
+        _dtype_name,
+        lora_factor_view,
+    )
 
     payloads: dict[str, dict[str, torch.Tensor]] = {}
     metadata_by_block: dict[str, dict[str, LoraShardMeta]] = {}
@@ -993,9 +998,12 @@ def _expand_local_state(
             block = _block_for_key(key)
             payload = payloads.setdefault(block, {})
             for component, value in snapshot.tensors.items():
-                payload[f"{component}/{key}"] = (
-                    value if index is None else value[index]
-                ).T
+                tensor = lora_factor_view(value, index).T
+                if index is not None and value.shape[0] == 1 and len(experts) > 1:
+                    # Shared factors repeat under logical expert keys. A rank-1
+                    # transpose is already contiguous, so packing alone aliases.
+                    tensor = tensor.clone(memory_format=torch.contiguous_format)
+                payload[f"{component}/{key}"] = tensor
             value = payload[f"lora/{key}"]
             metadata_by_block.setdefault(block, {})[key] = LoraShardMeta(
                 key,
@@ -2196,6 +2204,15 @@ def _load_checkpoint(
     if any(value != source.digest for value in _gather(source.digest, group)):
         raise trainer._slot_state_error(
             f"Checkpoint {name!r} content differs across ranks"
+        )
+    layout = getattr(trainer.runtime, "lora_layout", None)
+    if layout is not None or "art_lora_layout" in source.config:
+        from art.megatron.lora import LoraLayout
+
+        _phase(
+            lambda: (layout or LoraLayout()).validate_config(source.config),
+            "validate checkpoint LoRA layout",
+            group,
         )
     config = _phase(
         lambda: trainer._validate_checkpoint_adapter_config(

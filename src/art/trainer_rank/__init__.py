@@ -9,6 +9,7 @@ import torch.distributed as dist
 
 from . import _impl
 from ._checkpoint import CheckpointManifest, materialize_lora, validate_checkpoint
+from ._memory import bounded_forward_peaks
 
 AdapterSelection = _impl.AdapterSelection
 AdamParams = _impl.AdamParams
@@ -419,6 +420,7 @@ __all__ = [
     "AdapterSelection",
     "AdamParams",
     "CheckpointManifest",
+    "bounded_forward_peaks",
     "ForwardInput",
     "ForwardOutput",
     "MicroBatch",

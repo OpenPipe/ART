@@ -10,6 +10,7 @@ from art.megatron.lora import (
     LoRASlotRef,
     _block_for_key,
     _dtype_name,
+    lora_factor_view,
 )
 from art.megatron.lora import (
     _distributed_initialized as _distributed_ready,
@@ -86,7 +87,10 @@ def _uses_packed_expert_publish(
     groups: Sequence[ExpertPackedLoraGroup],
     slot_ref: LoRASlotRef | None = None,
 ) -> bool:
-    if module.num_local_experts <= 1:
+    if (
+        module.num_local_experts <= 1
+        or module.lora_layout.qwen_parameterization == "tinker_v1"
+    ):
         return False
     params = tuple(module._lora_params(slot_ref))
     return bool(params) and all(
@@ -162,7 +166,13 @@ def collect_local_packed_expert_entries(
                 continue
             group_prefix, slot = slot_match
             key = f"{group_prefix}.{slot.output_suffix}"
-            tensor = param.data[:expert_count].transpose(1, 2).contiguous()
+            tensor = torch.stack(
+                [
+                    lora_factor_view(param.data, index).T
+                    for index, expert in enumerate(module.expert_ids)
+                    if expert is not None
+                ]
+            )
             source_keys = module._expected_weight_keys(suffix.removesuffix(".weight"))
             target_dtype = (
                 adapter_dtypes[source_keys[0]]
@@ -762,6 +772,9 @@ def stage_vllm_lora_snapshot_from_model(
     stager: PinnedCpuSnapshotStager,
     slot_ref: LoRASlotRef | None = None,
 ) -> PendingCpuSnapshot[LoraSnapshot] | None:
+    for module in iter_lora_modules(model):
+        adapter_config = module.lora_layout.record_config(adapter_config)
+        break
     merged_tensors = _build_merged_lora_tensors_from_model(
         model=model,
         adapter_dtypes=adapter_dtypes,
