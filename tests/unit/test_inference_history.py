@@ -48,8 +48,8 @@ class Message(BaseModel):
     tool_calls: list[dict] = []
 
 
-@pytest.fixture
-def serving(monkeypatch):
+@pytest.fixture(params=["0.24", "0.31"])
+def serving(monkeypatch, request):
     monkeypatch.setattr(vllm, "_PREFIXES", TokenPrefixStore())
 
     class Tokenizer:
@@ -201,7 +201,26 @@ def serving(monkeypatch):
         construct_chat_messages_with_tool_call=lambda items: items,
         construct_tool_dicts=lambda *_: None,
     )
+    online_renderer = SimpleNamespace(construct_input_messages=construct_input_messages)
+
+    class ErrorResponse:
+        pass
+
+    if request.param == "0.31":
+        make_request = Serving._make_request
+
+        async def render_resolved(self, request, previous):
+            messages, inputs = await make_request(self, request, previous)
+            return SimpleNamespace(messages=messages, engine_input=inputs[0])
+
+        Serving._render_resolved_response_inputs = render_resolved
+        del Serving._make_request
+
     modules = {
+        "vllm.renderers.online_renderer": online_renderer,
+        "vllm.entrypoints.serve.engine.protocol": SimpleNamespace(
+            ErrorResponse=ErrorResponse
+        ),
         "vllm.renderers.base": SimpleNamespace(BaseRenderer=Renderer),
         "vllm.renderers.params": SimpleNamespace(ChatParams=Params),
         "vllm.v1.engine.async_llm": SimpleNamespace(AsyncLLM=Engine),
@@ -496,9 +515,13 @@ def test_responses_optional_tools_use_valid_native_chat_view(
 
 
 def test_previous_responses_keep_reasoning_and_tool_calls(serving):
-    _, modules = serving
+    server, modules = serving
     previous = [{"type": "reasoning"}, {"type": "function_call"}]
-    utils = modules["vllm.entrypoints.openai.responses.utils"]
+    utils = modules[
+        "vllm.renderers.online_renderer"
+        if hasattr(server, "_render_resolved_response_inputs")
+        else "vllm.entrypoints.openai.responses.utils"
+    ]
     assert utils.construct_input_messages(
         prev_response_output=previous, request_input="next"
     )["request_input"] == [*previous, {"role": "user", "content": "next"}]
@@ -718,12 +741,56 @@ def test_responses_use_the_native_renderer_and_preserve_ids(serving, legacy, str
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("serving", ["0.31"], indirect=True)
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("render_error", [False, True])
+def test_responses_resolved_inputs_keep_previous_response_and_render_errors(
+    serving, stream, render_error
+):
+    server, modules = serving
+    native_render = server._render_resolved_response_inputs
+    previous = SimpleNamespace(id="previous", output=[])
+    seen = []
+
+    async def render(request, prev_response):
+        seen.append(prev_response)
+        if render_error:
+            return modules["vllm.entrypoints.serve.engine.protocol"].ErrorResponse()
+        return await native_render(request, prev_response)
+
+    server._render_resolved_response_inputs = render
+
+    async def run():
+        server.response_store_lock = asyncio.Lock()
+        server.response_store = {previous.id: previous}
+        response = await server.create_responses(
+            Request(
+                messages=[{"role": "user", "content": "question"}],
+                previous_response_id=previous.id,
+                stream=stream,
+            )
+        )
+        if stream:
+            events = [event async for event in response]
+            response = events[0].response
+        assert response.output[0]["content"] == "action"
+        assert seen == [previous]
+        assert vllm._CURRENT.get() is None
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_responses_observe_rendered_tool_history_without_rejecting_result(
     serving, stream
 ):
     server, modules = serving
-    original_make = server._make_request
+    method = (
+        "_make_request"
+        if hasattr(server, "_make_request")
+        else "_render_resolved_response_inputs"
+    )
+    original_make = getattr(server, method)
     rendered = []
 
     class StrictRequest(Request):
@@ -737,15 +804,18 @@ def test_responses_observe_rendered_tool_history_without_rejecting_result(
             return self
 
     async def make_request(request, previous):
-        conversation, inputs = await original_make(request, previous)
+        result = await original_make(request, previous)
+        conversation = result[0] if isinstance(result, tuple) else result.messages
         conversation = copy.deepcopy(conversation)
         # vLLM's renderer converts historical JSON argument strings to mappings.
         function = conversation[1]["tool_calls"][0]["function"]
         function["arguments"] = json.loads(function["arguments"])
         rendered.append(conversation)
-        return conversation, inputs
+        if isinstance(result, tuple):
+            return conversation, result[1]
+        return SimpleNamespace(messages=conversation, engine_input=result.engine_input)
 
-    server._make_request = make_request
+    setattr(server, method, make_request)
     modules[
         "vllm.entrypoints.openai.chat_completion.protocol"
     ].ChatCompletionRequest = StrictRequest
