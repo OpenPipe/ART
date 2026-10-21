@@ -1621,7 +1621,16 @@ def _memory_signature_from_requests(
         and requests[0].input_tokens.ndim == 1
         and (modes == (False,) or (modes == (True,) and _DIRECT_FORWARD.get()))
         and _impl._request_mix_key(requests[0]) in ("hidden", "hidden+routes")
-        and topology[1:] == (1, 1, 1)
+        and topology[1] == topology[3] == 1
+        and (
+            topology[2] == 1
+            or (
+                topology[2] in (2, 4, 8)
+                and self._parallel_shape.cp == topology[2]
+                and self._moe_layers
+                and self._moe_memory_supported
+            )
+        )
         and self._parallel_shape.ep == self._parallel_shape.etp == 1
         and bool(
             _checkpoint_layers(self, ((int(requests[0].input_tokens.numel()), False),))

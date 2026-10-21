@@ -403,3 +403,45 @@ def test_dp_rank_forward_enters_direct_profile_only_when_opted_in(
     with bounded_forward_peaks() if enabled else nullcontext():
         rank.dp_rank_forward([request(3)])
     assert calls == ([True] if enabled else [])
+
+
+@pytest.mark.parametrize("cp", (2, 4, 8))
+@pytest.mark.parametrize("grad", (False, True))
+def test_native_moe_cp_bounded_profiles_keep_static_floors(bounded_rank, cp, grad):
+    rank = bounded_rank
+    inputs = [replace(request(128), no_grad=not grad)]
+    with _memory.direct_forward_profile():
+        control = rank._plan_flat_forward(inputs)
+        rank._topology_key = lambda: (1, 1, cp, 1)
+        rank._parallel_shape = replace(rank._parallel_shape, cp=cp)
+        signature = rank._memory_signature_from_requests(
+            inputs, slot_group_count=1, grad_modes=(grad,)
+        )
+    assert signature.bounded_forward_peak
+    assert signature.topology == (1, 1, cp, 1)
+    assert signature != control.signature
+    # Fixed scratch is an intercept. Preserve the existing physical-row and
+    # full-output floors; the calibration never divides a CP1 prediction.
+    observe(rank, replace(control, signature=signature), 470221312)
+    profile = rank._memory_profiles[signature]
+    assert profile.forward_compute_peaks == ((128, 470221312),)
+    arguments = dict(
+        packed_tokens=32768,
+        logical_tokens=32768,
+        output_bytes=32768 * 2048 * 2,
+        signature=signature,
+        group_rows=((32768 // cp, grad),),
+    )
+    required = rank._estimate_required_memory_bytes_from_values(**arguments)
+    rank._memory_profiles[signature] = replace(
+        profile, forward_compute_peaks=((8192, 470221312),)
+    )
+    calibrated = rank._estimate_required_memory_bytes_from_values(**arguments)
+    assert calibrated < required
+    rank._memory_profiles[signature] = replace(
+        profile, forward_compute_peaks=((8192, 0),)
+    )
+    floor = rank._estimate_required_memory_bytes_from_values(**arguments)
+    assert calibrated >= floor
+    rank._memory_profiles.clear()
+    assert signature.topology == (1, 1, cp, 1)
