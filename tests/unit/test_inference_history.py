@@ -213,7 +213,7 @@ def serving(monkeypatch, request):
             messages, inputs = await make_request(self, request, previous)
             return SimpleNamespace(messages=messages, engine_input=inputs[0])
 
-        Serving._render_resolved_response_inputs = render_resolved
+        setattr(Serving, "_render_resolved_response_inputs", render_resolved)
         del Serving._make_request
 
     modules = {
