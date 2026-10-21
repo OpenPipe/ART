@@ -9,6 +9,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def fresh_compilation_history():
+    # Each case represents a fresh trainer with one fixed numerical policy.
+    # Shared specialization history can exhaust Dynamo's cache and run the
+    # unfused debug fallback, whose LSE convention is different from FLASH.
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
+@pytest.mark.filterwarnings("error:flex_attention called without torch.compile")
 @pytest.mark.parametrize("use_lse", [False, True])
 @pytest.mark.parametrize(
     "length,dim,heads,kv_heads", [(256, 128, 8, 2), (183, 256, 16, 2), (65, 256, 24, 4)]
