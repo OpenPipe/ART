@@ -1108,6 +1108,11 @@ def _sequence_parallel_lora_floor(
             (len(shapes) for grad, shapes in signature.slot_shapes if grad), default=0
         )
     rows = max((rows for rows, grad in group_rows if grad), default=0)
+    if dense_cp and modules and not rank:
+        # Historical/scalar callers may declare LoRA targets without recording
+        # selected ranks. Keep the legacy boundary-gradient allowance beside
+        # explicit workspace rather than treating missing metadata as rank 0.
+        return retained, workspace + retained
     copies = 2 if dense_cp else 1
     return retained, workspace + copies * rows * modules * rank * self._param_dtype_size
 

@@ -581,11 +581,22 @@ def test_dense_cp_prices_loaded_lora_products_without_opt_in(cp, adapter_rank):
     # Even the six products measured live by FC1 in Sol's CPU witness exceed
     # that cap at rank 768. The full charge also covers the seventh target.
     assert required >= rows * 6 * adapter_rank * 2
-    # No-grad and a selected base model must not acquire adapter workspace.
-    base = replace(signature, slot_shapes=())
-    assert r._sequence_parallel_lora_floor((retained, workspace), groups, base) == (
+    # The literal original probe omitted slot ranks despite declaring seven
+    # targets. That must preserve the old allowance, not imply rank zero.
+    missing = replace(signature, slot_shapes=())
+    assert r._sequence_parallel_lora_floor((retained, workspace), groups, missing) == (
         retained,
-        workspace,
+        workspace + retained,
+    )
+    assert (
+        r._estimate_required_memory_bytes_from_values(
+            packed_tokens=2 * rows,
+            logical_tokens=2 * rows,
+            output_bytes=2 * rows * 32 * 2,
+            signature=missing,
+            group_rows=groups,
+        )
+        > 550_000_000
     )
     assert not torch.cuda.is_initialized()
 
