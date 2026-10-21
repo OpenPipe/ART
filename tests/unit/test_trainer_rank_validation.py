@@ -3903,3 +3903,121 @@ def _assert_nested_tensors_equal(actual: object, expected: object) -> None:
             _assert_nested_tensors_equal(actual_item, expected_item)
     else:
         assert actual == expected
+
+
+def test_adam_params_eps_defaults_to_torch_default() -> None:
+    # PyTorch's torch.optim.AdamW default; keep it so existing runs are unchanged.
+    assert AdamParams(learning_rate=1e-3).eps == 1e-8
+
+
+def test_adam_params_eps_reaches_the_optimizer() -> None:
+    trainer = TrainerRank(_runtime())
+    param = torch.nn.Parameter(torch.zeros(2))
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(params=(param,))
+
+    dynamic = trainer._dynamic_optimizer(
+        "student", AdamParams(learning_rate=1e-3, eps=1e-13)
+    )
+
+    assert dynamic.optimizer.param_groups[0]["eps"] == 1e-13
+
+
+def test_reusing_an_optimizer_updates_its_eps() -> None:
+    trainer = TrainerRank(_runtime())
+    param = torch.nn.Parameter(torch.zeros(2))
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(params=(param,))
+
+    first = trainer._dynamic_optimizer("student", AdamParams(learning_rate=1e-3))
+    assert first.optimizer.param_groups[0]["eps"] == 1e-8
+
+    second = trainer._dynamic_optimizer(
+        "student", AdamParams(learning_rate=1e-3, eps=1e-13)
+    )
+
+    assert second is first
+    assert second.optimizer.param_groups[0]["eps"] == 1e-13
+
+
+def test_failed_optim_step_rollback_restores_eps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    param = torch.nn.Parameter(torch.zeros(2))
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(params=(param,))
+    slot = trainer._checkpoint_slots["student"]
+    slot.optimizer = trainer._dynamic_optimizer(
+        "student", AdamParams(learning_rate=1e-3)
+    )
+    original = slot.optimizer
+    assert original.optimizer.param_groups[0]["eps"] == 1e-8
+    apply_new_params = trainer._dynamic_optimizer
+
+    # Apply the new params, then fail: the rollback must undo the eps update.
+    def configure_then_fail(name: str, params: AdamParams) -> object:
+        apply_new_params(name, params)
+        raise RuntimeError("invalid optimizer state")
+
+    monkeypatch.setattr(trainer, "_dynamic_optimizer", configure_then_fail)
+    monkeypatch.setattr(
+        trainer,
+        "_reduce_dynamic_grads",
+        lambda params, **_kwargs: tuple(item.grad.float() for item in params),
+    )
+    param.grad = torch.ones_like(param)
+
+    with pytest.raises(RuntimeError, match="invalid optimizer state"):
+        trainer.optim_step(params=AdamParams(learning_rate=1e-2, eps=1e-13))
+
+    restored = slot.optimizer
+    assert restored is original
+    assert restored.optimizer.param_groups[0]["eps"] == 1e-8
+
+
+def test_optim_step_guard_distinguishes_eps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = TrainerRank(_runtime())
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda _group=None: 2)
+    digests: list[torch.Tensor] = []
+
+    def gather(outputs: list[torch.Tensor], value: torch.Tensor) -> None:
+        for output in outputs:
+            output.copy_(value)
+        digests.append(value.clone())
+
+    monkeypatch.setattr(dist, "all_gather", gather)
+
+    for eps in (1e-8, 1e-13):
+        trainer._guard_optim_step_configuration(
+            ["student"], AdamParams(learning_rate=1e-3, eps=eps), "allow"
+        )
+
+    # Ranks that differ only in eps must produce different digests.
+    assert not torch.equal(digests[0], digests[1])
+
+
+def test_restored_optimizer_keeps_checkpoint_eps() -> None:
+    trainer = TrainerRank(_runtime())
+    param = torch.nn.Parameter(torch.zeros(2))
+    trainer._checkpoint_slots["student"] = _CheckpointSlot(params=(param,))
+    state = LocalOptimizerState(
+        masters=(torch.zeros(2),),
+        exp_avgs=(torch.zeros(2),),
+        exp_avg_sqs=(torch.zeros(2),),
+        steps=(1.0,),
+        config=OptimizerConfig(
+            learning_rate=1e-3,
+            beta1=0.9,
+            beta2=0.99,
+            eps=1e-13,
+            weight_decay=0.0,
+        ),
+    )
+
+    restored = trainer._restore_canonical_optimizer("student", state)
+
+    assert restored.optimizer.param_groups[0]["eps"] == 1e-13
+    # The extension path reads defaults, so the restored eps must land there.
+    assert restored.optimizer.defaults["eps"] == 1e-13
