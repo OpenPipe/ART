@@ -92,7 +92,7 @@ def fill_summary_transition(
         heads,
         key_dim,
         value_dim,
-        BK=triton.next_power_of_2(key_dim),
+        BK=max(16, triton.next_power_of_2(key_dim)),
         BC=32,
         IS_VARLEN=cu_seqlens is not None,
         REVERSE=reverse,
