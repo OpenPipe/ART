@@ -7,7 +7,10 @@ from art.megatron.segmented_gdn import native_gdn_reductions
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_batched_recurrence_matches_separate_native_gate_gradients(packed):
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_batched_recurrence_matches_separate_native_gate_gradients(
+    packed, checkpointed
+):
     if not torch.cuda.is_available():
         pytest.skip("one CUDA device required")
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
@@ -53,15 +56,28 @@ def test_batched_recurrence_matches_separate_native_gate_gradients(packed):
         args = [x.reshape(1, n * length, *x.shape[2:]) for x in variables]
         boundaries = torch.arange(n + 1, dtype=torch.int32) * length
         kwargs = {"cu_seqlens": boundaries.cuda(), "cu_seqlens_cpu": boundaries}
-    with native_gdn_reductions():
-        actual = chunk_gated_delta_rule(
-            *args[:3],
-            g=args[3],
-            beta=args[4],
+
+    def run(*values):
+        return chunk_gated_delta_rule(
+            *values[:3],
+            g=values[3],
+            beta=values[4],
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
             **kwargs,
-        )[0].reshape_as(expected)
+        )[0]
+
+    from torch.utils import checkpoint as checkpoint_module
+
+    from art.megatron.lora import install_lora_checkpoint_context_hooks
+
+    install_lora_checkpoint_context_hooks()
+    with native_gdn_reductions():
+        actual = (
+            checkpoint_module.checkpoint(run, *args, use_reentrant=True)
+            if checkpointed
+            else run(*args)
+        ).reshape_as(expected)
     # Scope has exited before backward: FLA's context must retain it.
     actual.backward(dy)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)

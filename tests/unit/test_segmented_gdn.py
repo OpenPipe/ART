@@ -70,3 +70,21 @@ def test_backward_scope_restores_after_failure():
     with pytest.raises(RuntimeError, match="backward failure"):
         gdn._backward(fail, ctx)
     assert not gdn._ACTIVE.get()
+
+
+def test_art_checkpoint_capture_restores_reduction_scope_on_worker_thread():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from art.megatron.lora import _with_captured_lora_slot
+
+    ordinary = _with_captured_lora_slot(lambda: gdn._ACTIVE.get())
+    token = gdn._ACTIVE.set(True)
+    try:
+        captured = _with_captured_lora_slot(lambda: gdn._ACTIVE.get())
+    finally:
+        gdn._ACTIVE.reset(token)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(captured).result() is True
+        assert pool.submit(gdn._ACTIVE.get).result() is False
+        assert pool.submit(ordinary).result() is False
+    assert not gdn._ACTIVE.get()

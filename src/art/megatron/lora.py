@@ -179,7 +179,11 @@ def _with_captured_lora_slot(function: _F) -> _F:
     context = _CURRENT_LORA_SLOT.get()
     segments = _CURRENT_LORA_SEGMENTS.get()
     expert_plan = _CURRENT_EXPERT_ADAPTER_PLAN.get()
-    function = capture_expert_context(capture_routes(capture_canonical(function)))
+    from .segmented_gdn import capture as capture_gdn_reductions
+
+    function = capture_gdn_reductions(
+        capture_expert_context(capture_routes(capture_canonical(function)))
+    )
 
     @functools.wraps(function)
     def wrapped(*args: Any, **kwargs: Any) -> Any:

@@ -9,7 +9,7 @@ context so backward does not depend on the caller's ContextVars.
 
 from contextlib import contextmanager
 import contextvars
-from functools import partial
+from functools import partial, wraps
 import importlib
 
 import torch
@@ -76,3 +76,19 @@ def native_gdn_reductions():
         yield
     finally:
         _ACTIVE.reset(token)
+
+
+def capture(function):
+    """Preserve this opt-in scope across checkpoint/autograd worker threads."""
+    if not _ACTIVE.get():
+        return function
+
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        token = _ACTIVE.set(True)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _ACTIVE.reset(token)
+
+    return wrapped
