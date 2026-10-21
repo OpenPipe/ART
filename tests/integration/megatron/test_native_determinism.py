@@ -3,12 +3,15 @@
 import pytest
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="SM90 FLASH attention required",
+)
 
 
 @pytest.mark.parametrize("use_lse", [False, True])
 @pytest.mark.parametrize(
-    "length,dim,heads,kv_heads", [(256, 128, 8, 2), (183, 256, 16, 2)]
+    "length,dim,heads,kv_heads", [(256, 128, 8, 2), (183, 256, 16, 2), (65, 256, 24, 4)]
 )
 def test_masked_gqa_deterministic_backward(use_lse, length, dim, heads, kv_heads):
     from torch.nn.attention.flex_attention import AuxRequest, create_block_mask
