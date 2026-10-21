@@ -1468,6 +1468,8 @@ def _fill_planner_snapshot(
         )
         rank_fields["geometry"] = asdict(self._geometry)
         rank_fields["topology"] = list(plan.signature.topology)
+        rank_fields["parallel_shape"] = asdict(self._parallel_shape)
+        rank_fields["moe_layers"] = self._moe_layers
 
         def version(tensor: torch.Tensor | None) -> int | None:
             try:

@@ -936,6 +936,16 @@ def _checkpoint_hybridep_rows(
     return hybrid_rows
 
 
+def _native_dense_cp(self: TrainerRank) -> bool:
+    cp = self._topology_key()[2]
+    return (
+        cp in (2, 4, 8)
+        and self._parallel_shape.cp == cp
+        and not self._moe_layers
+        and self._dense_fc1_adapted
+    )
+
+
 def _checkpoint_floor_from_facts(
     self: TrainerRank,
     group_rows: tuple[tuple[int, bool], ...],
@@ -948,13 +958,8 @@ def _checkpoint_floor_from_facts(
     if not layers:
         return 0, 0
     gradient_rows = sum(rows for rows, grad in group_rows if grad)
-    _, tp, cp, _ = self._topology_key()
-    dense_cp = (
-        cp in (2, 4, 8)
-        and self._parallel_shape.cp == cp
-        and not self._moe_layers
-        and self._dense_fc1_adapted
-    )
+    tp = self._topology_key()[1]
+    dense_cp = _native_dense_cp(self)
     # Physical rows are padded to a multiple of TP; each rank saves its shard.
     retained = (
         sum(-(-rows // tp) for rows, grad in group_rows if grad)
@@ -1071,15 +1076,19 @@ def _sequence_parallel_lora_floor(
     group_rows: tuple[tuple[int, bool], ...],
     signature: _impl._MemorySignature,
 ) -> tuple[int, int]:
-    """Add the recomputed layer's LoRA ``x @ A`` intermediates to a TP x SP floor.
+    """Add the recomputed layer's LoRA row-by-rank intermediates.
 
     Each adapted module of the recomputed layer saves rows x rank over the
     gathered rows (FC1 gate/up measured 16 B/row at rank 4). Charge the
     decoder's most-adapted layer at the gradient slots' largest rank, from
     the signature's slot shapes ((ndim, *A.shape, *B.shape) per module).
+    Native dense CP also reserves that many bytes for backward factor-product
+    gradients beside the saved forward products. Counting every target at the
+    largest selected rank bounds layers with different target/rank inventories.
     """
     retained, workspace = floor
-    if not retained or self._topology_key()[1] == 1:
+    dense_cp = _native_dense_cp(self)
+    if not retained or (self._topology_key()[1] == 1 and not dense_cp):
         return floor
     rank = max(
         (
@@ -1099,7 +1108,8 @@ def _sequence_parallel_lora_floor(
             (len(shapes) for grad, shapes in signature.slot_shapes if grad), default=0
         )
     rows = max((rows for rows, grad in group_rows if grad), default=0)
-    return retained, workspace + rows * modules * rank * self._param_dtype_size
+    copies = 2 if dense_cp else 1
+    return retained, workspace + copies * rows * modules * rank * self._param_dtype_size
 
 
 def _cold_recompute_transient_bytes(self: TrainerRank) -> int:
@@ -1120,13 +1130,8 @@ def _checkpoint_input_gradient_bytes(
     Native dense CP and TP x SP price that workspace explicitly, beside one
     input-gradient shard of the group being recomputed.
     """
-    _, tp, cp, _ = self._topology_key()
-    dense_cp = (
-        cp in (2, 4, 8)
-        and self._parallel_shape.cp == cp
-        and not self._moe_layers
-        and self._dense_fc1_adapted
-    )
+    tp = self._topology_key()[1]
+    dense_cp = _native_dense_cp(self)
     from art.megatron.context_parallel.checkpoint import current_checkpoint_partition
 
     partition = current_checkpoint_partition()
@@ -1611,6 +1616,11 @@ def _memory_signature_from_requests(
             raise ValueError("checkpoint shards require one CP1 uniform-recompute root")
     modes = tuple(sorted(grad_modes))
     topology = self._topology_key()
+    slot_groups = tuple(slot_groups)
+    if not slot_groups and _native_dense_cp(self):
+        # Direct estimator callers use the template adapter when no slot
+        # selection was supplied, just as _slot_lora_tensors(None) does.
+        slot_groups = tuple((None, grad) for grad in modes)
     shapes = tuple(
         sorted((grad, self._slot_memory_shapes(ref)) for ref, grad in slot_groups)
     )
@@ -1661,17 +1671,20 @@ def _slot_memory_shapes(
 ) -> tuple[tuple[int, ...], ...]:
     """Separate empirical trust across actual selected adapter layouts.
 
-    Sequence-parallel (TP > 1) models record them too: the explicit TP x SP
-    checkpoint floor prices LoRA intermediates from these ranks.
+    TP x SP and native dense CP checkpoint floors price LoRA intermediates
+    from these ranks, including attention-only dense models and the template
+    adapter selected by a None reference.
     """
+    dense_cp = _native_dense_cp(self)
     if (
-        ref is None
-        or ref.name is None
+        (ref is None and not dense_cp)
+        or (ref is not None and ref.name is None)
         or isinstance(ref, _impl._LocalLoRASlotRef)
         or not (
             getattr(self, "_moe_layers", 0)
             or getattr(self, "_gdn_layers", 0)
             or getattr(self, "_sequence_parallel", False)
+            or dense_cp
         )
     ):
         # Generic/no-component planning must not import Megatron or walk

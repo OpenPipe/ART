@@ -646,17 +646,19 @@ _RANK_FIELDS = frozenset(
     "moe_forward_stages".split()
 )
 # TP x SP floor facts; reports captured before them replay conservatively.
-_OPTIONAL_RANK_FIELDS = frozenset({"mixer_top_gaps", "lora_modules_per_layer"})
+_OPTIONAL_RANK_FIELDS = frozenset(
+    {"mixer_top_gaps", "lora_modules_per_layer", "parallel_shape", "moe_layers"}
+)
 
 
 def _adapter_ranks_unavailable(
     topology: tuple[int, ...], facts: dict[str, Any], signature: Any
 ) -> bool:
-    """A TP x SP floor estimate trains a named adapter whose ranks (the LoRA
+    """A TP x SP or CP floor estimate trains a named adapter whose ranks (the LoRA
     intermediates' price) were not recorded, as in reports from before
     sequence-parallel signatures carried slot shapes."""
     return (
-        topology[1] > 1
+        (topology[1] > 1 or topology[2] in (2, 4, 8))
         and bool(facts["checkpoint_layers"])
         and any(
             group["grad"] and group["adapter"] is not None for group in facts["groups"]
@@ -766,6 +768,23 @@ def replay(
     rank._geometry = ModelGeometry(**values["geometry"])
     dp, tp, cp, pp = values["topology"]
     rank._topology_key = lambda: (dp, tp, cp, pp)
+    # CP workspace eligibility uses the runtime shape and observed MoE layer
+    # count, not merely the requested topology or configured expert count.
+    if cp > 1 and not {"parallel_shape", "moe_layers"} <= values.keys():
+        raise ValueError("incomplete replay: CP runtime shape/layers not recorded")
+    shape = values.get("parallel_shape", {"tp": tp, "cp": cp})
+    if (
+        type(shape) is not dict
+        or set(shape) - {"tp", "cp", "ep", "etp"}
+        or ("parallel_shape" in values and set(shape) != {"tp", "cp", "ep", "etp"})
+        or any(type(v) is not int or not 1 <= v <= 1024 for v in shape.values())
+    ):
+        raise ValueError("incomplete replay: invalid parallel shape")
+    rank._parallel_shape = _impl.ParallelShape(**shape)
+    moe_layers = values.get("moe_layers", int(bool(rank._geometry.moe_experts)))
+    if type(moe_layers) is not int or not 0 <= moe_layers <= layers:
+        raise ValueError("incomplete replay: invalid MoE layer count")
+    rank._moe_layers = moe_layers
     # Check the same shared subforward inventories as capture, including the
     # independently retained layout inputs, before constructing any prefix tree.
     group_offset = request_offset = 0

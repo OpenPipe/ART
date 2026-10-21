@@ -522,6 +522,130 @@ def dense_rank():
     return dense
 
 
+@pytest.mark.parametrize("cp", [2, 4, 8])
+@pytest.mark.parametrize("adapter_rank", [8, 768])
+def test_dense_cp_prices_loaded_lora_products_without_opt_in(cp, adapter_rank):
+    from test_trainer_rank_slot_memory import load_slot
+
+    from art.megatron.lora import LoRA
+    from art.trainer_rank._impl import _lora_modules_per_layer
+
+    r = dense_rank()
+    r._hidden_size = r.runtime.model[0].config.hidden_size = 32
+    r._geometry = replace(
+        r._geometry,
+        hidden_size=32,
+        ffn_hidden_size=64,
+        num_attention_heads=1,
+        num_query_groups=1,
+        kv_channels=32,
+    )
+    r._mixer_top_gaps = (0, None)
+    r._topology_key = lambda: (1, 1, cp, 1)
+    r._parallel_shape = replace(r._parallel_shape, cp=cp)
+    # q/k/v/output/gate/up/down: the selected rank differs from the template.
+    loras = torch.nn.ModuleList(
+        [
+            LoRA(f"target.{i}", 32, 32, 4, 4, torch.bfloat16, torch.device("cpu"))
+            for i in range(7)
+        ]
+    )
+    r.runtime.model[0].decoder.layers[0].loras = loras
+    r._lora_modules_per_layer = _lora_modules_per_layer(r.runtime.model[0])
+    ref = load_slot(r, "selected", adapter_rank)
+    rows = 65_536
+    request = ForwardInput(
+        input_tokens=torch.zeros(2 * rows, dtype=torch.long), hidden_states=True
+    )
+    signature = r._memory_signature_from_requests(
+        [request], slot_group_count=1, grad_modes=(True,), slot_groups=((ref, True),)
+    )
+    assert len(signature.slot_shapes[0][1]) == 7
+    assert {shape[2] for shape in signature.slot_shapes[0][1]} == {adapter_rank}
+    assert not getattr(signature, "bounded_forward_peak", False)
+    groups = ((rows, True),)
+    retained, workspace = r._checkpoint_memory_floor(groups)
+    # All targets' saved products plus backward factor-product gradients.
+    lora_bytes = 2 * rows * 7 * adapter_rank * 2
+    assert r._sequence_parallel_lora_floor(
+        (retained, workspace), groups, signature
+    ) == (retained, workspace + lora_bytes)
+    required = r._estimate_required_memory_bytes_from_values(
+        packed_tokens=2 * rows,
+        logical_tokens=2 * rows,
+        output_bytes=2 * rows * 32 * 2,
+        signature=signature,
+        group_rows=groups,
+    )
+    assert (required <= 550_000_000) is (adapter_rank == 8)
+    # Even the six products measured live by FC1 in Sol's CPU witness exceed
+    # that cap at rank 768. The full charge also covers the seventh target.
+    assert required >= rows * 6 * adapter_rank * 2
+    # No-grad and a selected base model must not acquire adapter workspace.
+    base = replace(signature, slot_shapes=())
+    assert r._sequence_parallel_lora_floor((retained, workspace), groups, base) == (
+        retained,
+        workspace,
+    )
+    assert not torch.cuda.is_initialized()
+
+
+# Frozen rank-8/all-target Qwen3.8-27B complete lifecycle receipts:
+# workstreams/cp-dense/gpu/evidence/timed-v2-cp{2,4,8}/result.rank*.json;
+# lc-qual recovered-r2/results/dense-n65536/capacity-cp{2,4}/result.rank*.json.
+# Rows are the CPU planner's worst attention/GDN extent, not tokens / CP.
+# Admission prices additional allocations; compare resident + demand to the
+# measured allocated peak. Reserved peaks are allocator cache, not live bytes.
+@pytest.mark.parametrize(
+    "cp,tokens,rows,resident,measured,usable",
+    [
+        (2, 32768, 19456, 55332260352, 74358620160, 59837713613),
+        (4, 131072, 54528, 55332869632, 104346683392, 84904971469),
+        (8, 131072, 33280, 55332021760, 84065598464, 47617608909),
+        (2, 65536, 41472, 55333083648, 95180360704, 63154038375),
+        (4, 65536, 24576, 55332046336, 77951084544, 53037246055),
+    ],
+)
+def test_dense_cp_rank8_floor_covers_measured_lifecycles(
+    cp, tokens, rows, resident, measured, usable
+):
+    r = dense_rank()
+    r._geometry = replace(
+        r._geometry,
+        num_attention_heads=24,
+        num_query_groups=4,
+        kv_channels=256,
+        gdn_key_heads=16,
+        gdn_value_heads=48,
+        gdn_key_head_dim=128,
+        gdn_value_head_dim=128,
+        gdn_conv_kernel=4,
+    )
+    r._gdn_layers = 48
+    r._attention_output_gate = True
+    r._mixer_top_gaps = (0, 1)
+    r._lora_modules_per_layer = 8
+    r._topology_key = lambda: (1, 1, cp, 1)
+    r._parallel_shape = replace(r._parallel_shape, cp=cp)
+    req = ForwardInput(input_tokens=torch.arange(tokens), hidden_states=True)
+    sig = r._memory_signature_from_requests(
+        [req], slot_group_count=1, grad_modes=(True,)
+    )
+    sig = replace(sig, slot_shapes=((True, ((2, 5120, 8, 8, 5120),) * 8),))
+    # A small learned slope must never erase the analytic charge.
+    r._memory_profiles[sig] = _MemoryProfile(1, tokens)
+    required = r._estimate_required_memory_bytes_from_values(
+        packed_tokens=tokens,
+        logical_tokens=tokens,
+        output_bytes=tokens * 5120 * 2,
+        signature=sig,
+        group_rows=((rows, True),),
+        gdn_segments=1,
+    )
+    assert resident + required >= measured
+    assert required <= usable
+
+
 # Qwen3.8-27B TP1/CP1 no-grad target-only waves (random init, ART a68fa500,
 # 2026-09-29): a cold first wave peaked at 260,789 B per row, warm waves at
 # 250,181-250,507; the floor they share is (6F + 4H) x 2 = 249,856.
