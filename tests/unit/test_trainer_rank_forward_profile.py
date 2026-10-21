@@ -226,7 +226,8 @@ def test_cap_grows_beyond_longest_observed_root(bounded_rank):
     observed = rank._plan_flat_forward([request(8192)])
     peak = 2**40  # Dominate the analytic floors and outputs in this witness.
     observe(rank, observed, peak)
-    for tokens, growth in ((4096, 1), (8192, 1), (16384, 1.25), (32768, 1.75)):
+    # One observation grows proportionally until a second root fits a rate.
+    for tokens, growth in ((4096, 1), (8192, 1), (16384, 2), (32768, 4), (65536, 8)):
         plan = rank._plan_flat_forward([request(tokens)])
         assert rank._memory_check(plan).estimated_required_bytes == int(
             (plan.output_bytes + peak * growth) * 1.1
@@ -292,7 +293,7 @@ def test_close_observations_grow_proportionally_beyond_horizon(
     check = rank._memory_check(long)
     assert not check.fits
     assert check.estimated_required_bytes == int(
-        (long.output_bytes + int(12 * 2**30 * 1.75 * 8192 / 800)) * 1.1
+        (long.output_bytes + int(12 * 2**30 * 8192 / 200)) * 1.1
     )
 
 

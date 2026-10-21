@@ -54,10 +54,12 @@ class _BoundedMemoryProfile(_impl._MemoryProfile):
                 for high, high_peak in self.forward_compute_peaks[i + 1 :]
                 if high >= 2 * low
             ),
-            default=0.0,
+            default=None,
         )
         horizon = 4 * longest
-        rate = max(slope, peak / horizon)
+        # One observation cannot separate fixed from growing memory; grow
+        # proportionally until a second root fits a marginal rate.
+        rate = peak / longest if slope is None else max(slope, peak / horizon)
         if tokens <= horizon:
             return peak + rate * (tokens - longest)
         return (peak + rate * (horizon - longest)) * tokens / horizon
@@ -77,9 +79,10 @@ def bounded_forward_peaks() -> Iterator[None]:
     Retain the shortest and seven longest lengths when the set fills. Within
     that range, use the smallest covering root's peak.
     Beyond it, grow through 4x the longest root at the greater of the steepest
-    nonnegative marginal rate between retained roots at least 2x apart (zero
-    without such a pair) and a quarter of the longest root's peak/token rate.
-    Beyond that trust horizon, grow proportionally from the horizon estimate.
+    nonnegative marginal rate between retained roots at least 2x apart and a
+    quarter of the longest root's peak/token rate. Without such a pair, grow at
+    the full peak/token rate. Beyond that trust horizon, grow proportionally
+    from the horizon estimate.
     Analytic floors still apply. Grow calibration roots before admitting long
     requests; profiles remain separate from ordinary TrainerRank requests.
     """
