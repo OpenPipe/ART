@@ -158,6 +158,33 @@ class TestMetricRoutingBaseline:
         assert "allow_val_change" not in init_kwargs
         fake_run.config.update.assert_called_once_with(payload)
 
+    @pytest.mark.parametrize("entity", ["test-entity", None])
+    def test_get_wandb_run_uses_model_entity(
+        self, tmp_path: Path, entity: str | None
+    ) -> None:
+        fake_run = MagicMock()
+        fake_run._is_finished = False
+
+        fake_init = MagicMock(return_value=fake_run)
+
+        with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
+            with (
+                patch("art.model.wandb_sdk.init", fake_init),
+                patch("art.model.wandb_sdk.settings", lambda **kwargs: kwargs),
+            ):
+                model = Model(
+                    name="test-model",
+                    project="test-project",
+                    entity=entity,
+                    base_path=str(tmp_path),
+                )
+                run = model._get_wandb_run()
+
+        assert run is fake_run
+        init_kwargs = fake_init.call_args.kwargs
+        assert init_kwargs["entity"] == entity
+        assert init_kwargs["project"] == "test-project"
+
     def test_update_wandb_config_updates_active_run(self, tmp_path: Path) -> None:
         fake_run = MagicMock()
         fake_run._is_finished = False
