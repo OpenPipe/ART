@@ -249,9 +249,9 @@ def test_routed_experts_reject_adapter_segments():
     lora = LoRA("experts.{expert}", 64, 96, 8, 8, torch.float32, torch.device("cuda"))
     segments = LoRASegments((None,), (3,))
     with use_lora_segments(segments):
-        with pytest.raises(NotImplementedError, match="expert, adapter"):
+        with pytest.raises(NotImplementedError, match="not supported"):
             lora(torch.zeros(3, 64, device="cuda"), [3])
-        with pytest.raises(NotImplementedError, match="expert, adapter"):
+        with pytest.raises(NotImplementedError, match="not supported"):
             lora.active_lora_tensors()
 
 

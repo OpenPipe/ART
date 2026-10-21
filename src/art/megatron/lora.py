@@ -2168,8 +2168,11 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
                 (self.up_lora,) if self.non_gated else (self.gate_lora, self.up_lora)
             )
             for lora in loras:
-                zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
-                zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
+                if _CURRENT_LORA_SEGMENTS.get() is not None:
+                    zero = zero + lora(x).sum() * 0.0
+                else:
+                    zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
+                    zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
             return zero.expand(*x.shape[:-1], self.out_features).clone(), None
         base_output, bias_out = self.linear_fc1(x)
         if isinstance(base_output, tuple):

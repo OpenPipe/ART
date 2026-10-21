@@ -150,22 +150,23 @@ def test_segment_metadata_owns_constructor_lists():
     assert table.counts == (2, 5) and table.refs == ("a", "b")
 
 
-@pytest.mark.parametrize("reduction", ["sum", "strided"])
-def test_grouped_backward_accepts_noncontiguous_cotangents(monkeypatch, reduction):
+@pytest.fixture
+def grouped_kernel(monkeypatch):
     pytest.importorskip("quack")
     from art.megatron.kernels import cute_grouped_lora_quack as kernel
 
     # Exercise the actual custom autograd boundary on CPU. Only the CUDA GEMMs
     # are replaced, retaining their last-dimension stride contract.
-    def gemm(values, weights, *, expert_offsets, alpha=1.0, **kwargs):
+    def gemm(values, weights, *, expert_offsets, alpha=1.0, residual=None, **kwargs):
         assert values.stride(-1) == 1
         counts = expert_offsets.diff().tolist()
-        return (
+        output = (
             torch.cat(
                 [chunk @ weights[i].T for i, chunk in enumerate(values.split(counts))]
             )
             * alpha
         )
+        return output if residual is None else output + residual
 
     def gemm_k(left, right, *, expert_offsets, alpha=1.0, **kwargs):
         return (
@@ -184,30 +185,112 @@ def test_grouped_backward_accepts_noncontiguous_cotangents(monkeypatch, reductio
 
     monkeypatch.setattr(kernel, "_varlen_quack_gemm", gemm)
     monkeypatch.setattr(kernel, "_varlen_quack_gemm_k", gemm_k)
+    return kernel
+
+
+@pytest.mark.parametrize("segmented", [False, True])
+@pytest.mark.parametrize("residual", [False, True])
+@pytest.mark.parametrize("reduction", ["sum", "strided", "contiguous"])
+def test_grouped_backward_preserves_main_contract(
+    monkeypatch, grouped_kernel, reduction, residual, segmented
+):
+    monkeypatch.delenv("STARK_FUSED_WAVES", raising=False)
     torch.manual_seed(74)
     counts = torch.tensor([2, 0, 3])
     x = torch.randn(5, 4, requires_grad=True)
     a = torch.randn(3, 4, 3, requires_grad=True)
     b = torch.randn(3, 3, 6, requires_grad=True)
+    base = torch.randn(5, 6, requires_grad=True) if residual else None
     expected = (
         torch.cat(
             [(chunk @ a[i]) @ b[i] for i, chunk in enumerate(x.split(counts.tolist()))]
         )
         * 1.375
     )
+    if base is not None:
+        expected = expected + base
     cotangent = (
-        torch.ones(1).expand_as(expected) if reduction == "sum" else torch.randn(6, 5).T
+        torch.ones(1).expand_as(expected)
+        if reduction == "sum"
+        else torch.randn(6, 5).T
+        if reduction == "strided"
+        else torch.randn_like(expected)
     )
-    assert cotangent.stride(-1) != 1
+    assert (cotangent.stride(-1) == 1) == (reduction == "contiguous")
+    params = (x, a, b) if base is None else (x, a, b, base)
     expected.backward(cotangent)
-    grads = [cast(torch.Tensor, p.grad).clone() for p in (x, a, b)]
-    for p in (x, a, b):
+    grads = [cast(torch.Tensor, p.grad).clone() for p in params]
+    for p in params:
         p.grad = None
-    actual = kernel._QuackGroupedLoraFn.apply(x, a, b, counts, 1.375, None)
-    actual.backward(cotangent)
+    table = LoRASegments(cast(Any, ("a", "b", "c")), (2, 0, 3), grouped=True)
+    with use_lora_segments(table if segmented else None):
+        actual = grouped_kernel._QuackGroupedLoraFn.apply(x, a, b, counts, 1.375, base)
+    # Backward must use the forward's opt-in, even under conflicting context.
+    with use_lora_segments(None if segmented else table):
+        if not segmented and reduction != "contiguous":
+            # ART main rejects both scalar and strided cotangents by default.
+            with pytest.raises(
+                AssertionError,
+                match=r"^QuACK grouped LoRA backward requires grad_out stride\(-1\) == 1$",
+            ):
+                actual.backward(cotangent)
+            assert all(p.grad is None for p in params)
+            return
+        actual.backward(cotangent)
     torch.testing.assert_close(actual, expected, atol=2e-5, rtol=1e-5)
-    for p, grad in zip((x, a, b), grads, strict=True):
+    for p, grad in zip(params, grads, strict=True):
         torch.testing.assert_close(p.grad, grad, atol=2e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("non_gated", [False, True])
+@pytest.mark.parametrize("grouped", [False, True])
+@pytest.mark.parametrize("segmented", [False, True])
+def test_empty_shared_fc1_preserves_gradient_ownership(
+    monkeypatch, non_gated, grouped, segmented
+):
+    pytest.importorskip("megatron.core")
+    from art.megatron import lora as lm
+
+    monkeypatch.setattr(lm.ps, "get_expert_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(lm.ps, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(lm.ps, "get_tensor_model_parallel_rank", lambda: 0)
+    base = torch.nn.Linear(64, 192, bias=False)
+    monkeypatch.setattr(
+        base, "forward", lambda *_: pytest.fail("empty base projection")
+    )
+    wrapped = lm.SharedExpertsLinearFC1LoRA(
+        "shared", cast(Any, base), rank=8, alpha=8, non_gated=non_gated
+    )
+    refs = tuple(lm.LoRASlotRef("checkpoint", name) for name in ("first", "second"))
+    loras = (wrapped.up_lora,) if non_gated else (wrapped.gate_lora, wrapped.up_lora)
+    for lora in loras:
+        for ref in refs:
+            lora.load_lora_slot(
+                ref,
+                {
+                    f"{lora.adapter_model_prefix}.lora_A.weight": torch.randn(3, 64),
+                    f"{lora.adapter_model_prefix}.lora_B.weight": torch.randn(
+                        lora.out_features, 3
+                    ),
+                },
+                requires_grad=True,
+            )
+    x = torch.empty(0, 1, 64, requires_grad=True)
+    table = LoRASegments(refs, (0, 0), grouped=grouped)
+    # Main's ordinary empty path still attaches the default factors, even with
+    # a named single-slot context. Only the segmented API changes ownership.
+    with lm.use_lora_slot(refs[0]), use_lora_segments(table if segmented else None):
+        output, bias = wrapped(x)
+    output.sum().backward()
+    assert output.shape == (0, 1, 192) and bias is None
+    assert x.grad is not None and x.grad.shape == x.shape
+    assert base.weight.grad is not None and not base.weight.grad.any()
+    for lora in loras:
+        defaults = (lora.A_T, lora.B_T)
+        selected = tuple(p for ref in refs for p in lora.lora_slot_params(ref))
+        owned, untouched = (selected, defaults) if segmented else (defaults, selected)
+        assert all(p.grad is not None and not p.grad.any() for p in owned)
+        assert all(p.grad is None for p in untouched)
 
 
 def test_expert_views_reject_missing_dispatch_ownership(monkeypatch):

@@ -14,6 +14,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ..segmented_lora import _CURRENT_LORA_SEGMENTS
+
 _PADDED_LOW_RANK_TARGET = 8
 
 
@@ -481,6 +483,8 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         ctx.effective_rank = effective_rank
         ctx.scale = scale
         ctx.has_residual = has_residual
+        # Capture the opt-in now: backward may run outside this context.
+        ctx.segmented = _CURRENT_LORA_SEGMENTS.get() is not None
         return out
 
     @staticmethod
@@ -494,9 +498,13 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         actual_rank = ctx.actual_rank
         scale = ctx.scale
         grad_out = cast(torch.Tensor, grad_outputs[0])
-        # Scalar reductions and strided views need the GEMM's unit inner stride.
-        if grad_out.stride(-1) != 1:
+        # Only segmented callers opt into cotangent normalization. Ordinary
+        # grouped/expert execution retains main's stride assertion.
+        if ctx.segmented and grad_out.stride(-1) != 1:
             grad_out = grad_out.contiguous()
+        assert grad_out.stride(-1) == 1, (
+            "QuACK grouped LoRA backward requires grad_out stride(-1) == 1"
+        )
 
         grad_tmp = _varlen_quack_gemm(
             grad_out,
