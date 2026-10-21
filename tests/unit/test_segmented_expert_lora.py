@@ -49,6 +49,76 @@ def test_native_row_geometry_nested_scopes_and_gradients():
     assert calls == [(8, None)]
 
 
+def test_native_attention_root_masks_scope_cache_and_foreign_parent_rejection(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from art.megatron import prefix_tree_state
+    from art.megatron.segmented_expert_lora import _attention_forward
+    from art.megatron.segmented_lora import (
+        _CURRENT_LORA_SEGMENTS,
+        LoRASegments,
+        use_lora_segments,
+    )
+
+    built, calls = [], []
+    groups = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1]])
+    state = SimpleNamespace(group_ids=groups, parent_ids=groups.clone(), model_state={})
+    module = SimpleNamespace(art_sliding_window=None)
+    segments = LoRASegments(cast(Any, ("a", "idle", "b")), (3, 0, 5))
+
+    def build(groups, parents, **kwargs):
+        assert torch.equal(
+            kwargs["input_pos"], torch.arange(groups.numel()).unsqueeze(0)
+        )
+        built.append(groups.clone())
+        return SimpleNamespace(group_ids=groups, parent_ids=parents)
+
+    monkeypatch.setattr(prefix_tree_state, "create_prefix_tree_state", build)
+
+    def original(q, k, v, mask, *, attention_bias, **kwargs):
+        current = _CURRENT_LORA_SEGMENTS.get()
+        calls.append((len(q), current))
+        assert attention_bias.group_ids.numel() == len(q)
+        if current is not None:
+            assert sum(n > 0 for n in current.counts) == 1
+            assert bool(
+                (
+                    attention_bias.group_ids == attention_bias.group_ids.flatten()[0]
+                ).all()
+            )
+        else:
+            assert attention_bias is state
+        return (q + k + v).flatten(2)
+
+    q = torch.randn(8, 1, 2, 4, requires_grad=True)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    expected = (q + k + v).flatten(2)
+    with use_lora_segments(segments):
+        actual = _attention_forward(
+            module, original, q, k, v, None, attention_bias=state
+        )
+        _attention_forward(module, original, q, k, v, None, attention_bias=state)
+        assert _CURRENT_LORA_SEGMENTS.get() is segments
+    assert [len(g.flatten()) for g in built] == [3, 5]
+    assert [n for n, _ in calls] == [3, 5, 3, 5]
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    actual.sum().backward()
+    torch.testing.assert_close(q.grad, torch.ones_like(q), atol=0, rtol=0)
+    _attention_forward(module, original, q, k, v, None, attention_bias=state)
+    assert calls[-1] == (8, None)
+    state.model_state.clear()
+    state.parent_ids[:, 3:] = 0
+    calls.clear()
+    with (
+        use_lora_segments(segments),
+        pytest.raises(ValueError, match="independent unshared"),
+    ):
+        _attention_forward(module, original, q, k, v, None, attention_bias=state)
+    assert not calls
+
+
 @pytest.mark.parametrize("shared", ["A", "B", "neither"])
 @pytest.mark.parametrize("empty", [False, True])
 def test_original_factor_gradients_against_per_token_dense_oracle(shared, empty):

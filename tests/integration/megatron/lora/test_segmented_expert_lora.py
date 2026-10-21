@@ -56,6 +56,7 @@ def test_native_te_normalization_projection_keeps_adapter_row_geometry():
     expected = torch.cat([result[0] for result in separate])
     expected_norm = torch.cat([result[1] for result in separate])
     expected.backward(dy)
+    assert x.grad is not None
     dx = x.grad.clone()
     x.grad = None
     install_segmented_row_modules(module)
@@ -67,6 +68,74 @@ def test_native_te_normalization_projection_keeps_adapter_row_geometry():
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(normalized, expected_norm, atol=0, rtol=0)
     torch.testing.assert_close(x.grad, dx, atol=0, rtol=0)
+
+
+def test_native_attention_preserves_independent_root_tile_origins():
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    from art.megatron.flex_attn.attention import FlexDotProductAttention
+    from art.megatron.prefix_tree_state import create_prefix_tree_state
+    from art.megatron.segmented_expert_lora import install_segmented_attention_modules
+    from art.megatron.segmented_lora import LoRASegments, use_lora_segments
+
+    torch.manual_seed(731)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=512,
+        num_attention_heads=2,
+        num_query_groups=1,
+        kv_channels=256,
+        hidden_dropout=0,
+        attention_dropout=0,
+        params_dtype=torch.bfloat16,
+    )
+    module = FlexDotProductAttention(config, 1, AttnMaskType.causal, "self")
+    counts = (257, 129)
+    q = torch.randn(386, 1, 2, 256, dtype=torch.bfloat16, device="cuda")
+    k, v = [
+        torch.randn(386, 1, 1, 256, dtype=q.dtype, device=q.device) for _ in range(2)
+    ]
+    mask = torch.empty(0, dtype=torch.bool, device=q.device)
+    expected = []
+    start = 0
+    for count in counts:
+        groups = torch.zeros(1, count, dtype=torch.long)
+        state = create_prefix_tree_state(
+            groups,
+            groups,
+            input_pos=torch.arange(count).unsqueeze(0),
+            target_device=q.device,
+            attention_head_dim=256,
+            attention_value_head_dim=256,
+        )
+        expected.append(
+            module(
+                q[start : start + count].contiguous(),
+                k[start : start + count].contiguous(),
+                v[start : start + count].contiguous(),
+                mask,
+                attention_bias=state,
+            )
+        )
+        start += count
+    groups = torch.cat(
+        [torch.full((count,), i, dtype=torch.long) for i, count in enumerate(counts)]
+    )[None, :]
+    state = create_prefix_tree_state(
+        groups,
+        groups,
+        input_pos=torch.cat([torch.arange(count) for count in counts])[None, :],
+        target_device=q.device,
+        attention_head_dim=256,
+        attention_value_head_dim=256,
+    )
+    install_segmented_attention_modules(module)
+    with use_lora_segments(
+        LoRASegments((None, LoRASlotRef("checkpoint", None)), counts)
+    ):
+        actual = module(q, k, v, mask, attention_bias=state)
+    torch.testing.assert_close(actual, torch.cat(expected), atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("shared", ["A", "B"])

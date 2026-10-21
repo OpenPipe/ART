@@ -340,6 +340,111 @@ def install_segmented_row_modules(model) -> None:
             module._art_segmented_rows = True
 
 
+def _attention_forward(
+    module,
+    original,
+    query,
+    key,
+    value,
+    attention_mask,
+    attn_mask_type=None,
+    attention_bias=None,
+    packed_seq_params=None,
+):
+    """Use the native attention backend with each root's original tile origin."""
+    from .segmented_lora import _CURRENT_LORA_SEGMENTS, slice_lora_segments
+
+    segments = _CURRENT_LORA_SEGMENTS.get()
+    if segments is None or sum(n > 0 for n in segments.counts) < 2:
+        return original(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+        )
+    if packed_seq_params is not None or any(
+        tensor.shape[0] != segments.rows or tensor.shape[1] != 1
+        for tensor in (query, key, value)
+    ):
+        raise ValueError("segmented attention requires complete batch-one roots")
+    if not all(
+        hasattr(attention_bias, name)
+        for name in ("model_state", "group_ids", "parent_ids")
+    ):
+        raise ValueError("segmented attention requires prefix-tree metadata")
+    from .prefix_tree_state import create_prefix_tree_state
+
+    assert attention_bias is not None
+    window = getattr(module, "art_sliding_window", None)
+    cache = attention_bias.model_state.setdefault("_art_segmented_attention", {})
+    cache_key = (segments.counts, query.shape[-1], value.shape[-1], window)
+    if cache_key not in cache:
+        states = []
+        start = 0
+        for count in segments.counts:
+            stop = start + count
+            if count:
+                groups = attention_bias.group_ids[:, start:stop]
+                parents = attention_bias.parent_ids[:, start:stop]
+                if (
+                    groups.numel() != count
+                    or not torch.equal(groups, parents)
+                    or not bool((groups == groups.flatten()[0]).all())
+                ):
+                    raise ValueError(
+                        "segmented attention requires independent unshared roots"
+                    )
+                states.append(
+                    create_prefix_tree_state(
+                        groups,
+                        parents,
+                        input_pos=torch.arange(count).unsqueeze(0),
+                        target_device=query.device,
+                        sliding_windows=() if window is None else (window,),
+                        attention_head_dim=query.shape[-1],
+                        attention_value_head_dim=value.shape[-1],
+                    )
+                )
+            start = stop
+        cache[cache_key] = states
+    outputs = []
+    start = 0
+    states = iter(cache[cache_key])
+    for count in segments.counts:
+        stop = start + count
+        if count:
+            with slice_lora_segments(start, stop):
+                outputs.append(
+                    original(
+                        query[start:stop].contiguous(),
+                        key[start:stop].contiguous(),
+                        value[start:stop].contiguous(),
+                        attention_mask,
+                        attn_mask_type=attn_mask_type,
+                        attention_bias=next(states),
+                        packed_seq_params=None,
+                    )
+                )
+        start = stop
+    return torch.cat(outputs, dim=0)
+
+
+def install_segmented_attention_modules(model) -> None:
+    """Install root-local native attention without changing ordinary execution."""
+    from .canonical.operators import _module_types
+
+    _, attention_types, _ = _module_types()
+    for module in model.modules():
+        if isinstance(module, attention_types) and not getattr(
+            module, "_art_segmented_attention", False
+        ):
+            module.forward = partial(_attention_forward, module, module.forward)
+            module._art_segmented_attention = True
+
+
 def install_segmented_dispatcher(moe_layer) -> None:
     """Opt into native TP1/CP1/EP1 adapter IDs; ordinary dispatch stays native."""
     config = moe_layer.config
