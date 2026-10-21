@@ -20,7 +20,7 @@ async def log_constant_metrics_wandb(
     Parameters
     ----------
     model : art.Model
-        The model whose `project` and `name` are used for the W&B run.
+        The model whose `entity`, `project` and `name` are used for the W&B run.
     num_steps : int
         Total training steps. Metrics are logged at steps 0 through `num_steps`.
     split_metrics : dict[str, dict[str, float]]
@@ -30,6 +30,7 @@ async def log_constant_metrics_wandb(
         Example: `{"train": {"loss": 0.5}, "val": {"loss": 0.4, "accuracy": 0.8}}`
     """
     run = wandb_sdk.init(
+        entity=model.entity,
         project=model.project,
         name=logged_run_name if logged_run_name else model._storage_name(),
         reinit="create_new",

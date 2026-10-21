@@ -962,6 +962,7 @@ class Model(
         if self._wandb_run is None or _wandb_run_is_finished(self._wandb_run):
             try:
                 run = wandb_sdk.init(
+                    entity=self.entity,
                     project=self.project,
                     name=self._storage_name(),
                     id=self._storage_name(),
