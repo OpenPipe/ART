@@ -88,3 +88,13 @@ def test_art_checkpoint_capture_restores_reduction_scope_on_worker_thread():
         assert pool.submit(gdn._ACTIVE.get).result() is False
         assert pool.submit(ordinary).result() is False
     assert not gdn._ACTIVE.get()
+
+
+def test_context_created_before_installation_keeps_native_backward():
+    ctx = SimpleNamespace()
+    token = gdn._ACTIVE.set(True)
+    try:
+        assert gdn._backward(lambda ctx: gdn._ACTIVE.get(), ctx) is False
+        assert gdn._ACTIVE.get() is True
+    finally:
+        gdn._ACTIVE.reset(token)

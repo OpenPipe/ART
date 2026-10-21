@@ -50,7 +50,7 @@ def _forward(original, ctx, *args, **kwargs):
 
 
 def _backward(original, ctx, *args, **kwargs):
-    token = _ACTIVE.set(ctx._art_native_gdn_reductions)
+    token = _ACTIVE.set(getattr(ctx, "_art_native_gdn_reductions", False))
     try:
         return original(ctx, *args, **kwargs)
     finally:
