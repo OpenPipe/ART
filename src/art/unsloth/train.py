@@ -794,6 +794,17 @@ def _precalculate_new_logprobs(
     ).to("cpu")
 
 
+def _validate_rl_gradient_accumulation(steps: int) -> None:
+    if steps < 1:
+        raise ValueError("Unsloth gradient accumulation must be >= 1")
+    # The RL producer waits for an optimizer-step result after each input.
+    if steps != 1:
+        raise ValueError(
+            "Unsloth RL training does not support gradient accumulation; "
+            f"set gradient_accumulation_steps=1 (got {steps})"
+        )
+
+
 async def run_unsloth_rl_training(
     ctx: UnslothTrainContext,
     disk_packed_tensors: DiskPackedTensors,
@@ -801,6 +812,7 @@ async def run_unsloth_rl_training(
     _config: dev.TrainConfig,
     verbose: bool = False,
 ) -> AsyncIterator[dict[str, float]]:
+    _validate_rl_gradient_accumulation(ctx.trainer.args.gradient_accumulation_steps)
     _reset_optimizer_if_mode_changed(ctx, "rl")
     optimizer = _get_trainer_optimizer(ctx)
     for param_group in optimizer.param_groups:
