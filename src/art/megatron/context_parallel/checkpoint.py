@@ -26,9 +26,6 @@ _PARTITION: ContextVar[CheckpointPartition | None] = ContextVar(
     "art_checkpoint_partition", default=None
 )
 _HOOKS: ContextVar[Any] = ContextVar("art_checkpoint_shard_hooks", default=None)
-_HOST_OFFLOAD: ContextVar[HostActivationStats | None] = ContextVar(
-    "art_checkpoint_host_offload", default=None
-)
 
 
 def _install_checkpoint_hooks() -> None:
@@ -62,7 +59,7 @@ def _install_checkpoint_hooks() -> None:
             def pack(tensor: torch.Tensor) -> Any:
                 nonlocal packed
                 saved = hooks[0](tensor)
-                if isinstance(saved, (_Shard, _HostBoundary)):
+                if isinstance(saved, _Shard):
                     packed += 1
                     if packed > 1:
                         raise ValueError(
@@ -71,10 +68,7 @@ def _install_checkpoint_hooks() -> None:
                 return saved
 
             with torch.autograd.graph.saved_tensors_hooks(pack, hooks[1]):
-                result = original(local, *args)
-            if _HOST_OFFLOAD.get() is not None and packed != 1:
-                raise ValueError("host offload requires one checkpoint hidden input")
-            return result
+                return original(local, *args)
 
         setattr(apply, "_art_checkpoint_shards", True)
         function.apply = staticmethod(apply)
@@ -107,88 +101,6 @@ class _Shard:
     numel: int
 
 
-@dataclass
-class HostActivationStats:
-    hidden_size: int
-    max_cpu_bytes: int
-    saved_bytes: int = 0
-    boundaries: int = 0
-    unpacked: int = 0
-    verified: int = 0
-
-
-@dataclass(frozen=True)
-class _HostBoundary:
-    tensor: torch.Tensor
-    device: torch.device
-
-
-def current_host_activation_offload() -> HostActivationStats | None:
-    return _HOST_OFFLOAD.get()
-
-
-@contextmanager
-def offload_saved_activations(
-    *, hidden_size: int, max_cpu_bytes: int = 64 * 2**30, verify: bool = False
-) -> Iterator[HostActivationStats]:
-    """Copy full/uniform checkpoint inputs to host; retain native CP arithmetic.
-
-    Only the checkpoint boundary's contiguous [rows, 1, hidden] input moves.
-    The layer's ordinary autograd saves stay on device. Copies preserve dtype;
-    synchronous transfers make lifetime and completion explicit. Host storage
-    is bounded per scope, independent of the device admission budgets.
-    """
-    if type(hidden_size) is not int or hidden_size <= 0:
-        raise ValueError("host offload requires a positive hidden size")
-    if type(max_cpu_bytes) is not int or max_cpu_bytes <= 0:
-        raise ValueError("host offload requires a positive CPU byte budget")
-    if _HOOKS.get() is not None or _HOST_OFFLOAD.get() is not None:
-        raise RuntimeError("checkpoint storage scopes cannot overlap")
-    stats = HostActivationStats(hidden_size, max_cpu_bytes)
-
-    def pack(tensor: torch.Tensor) -> torch.Tensor | _HostBoundary:
-        if tensor.ndim != 3 or tensor.shape[-1] != hidden_size:
-            return tensor
-        if (
-            tensor.shape[1] != 1
-            or not tensor.is_floating_point()
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError("host offload requires contiguous [rows, 1, hidden] input")
-        size = tensor.numel() * tensor.element_size()
-        if stats.saved_bytes + size > max_cpu_bytes:
-            raise ValueError("checkpoint host activation byte budget exceeded")
-        host = torch.empty_like(
-            tensor, device="cpu", pin_memory=tensor.device.type == "cuda"
-        )
-        host.copy_(tensor.detach(), non_blocking=False)
-        if verify:
-            if not torch.equal(
-                host.to(tensor.device).view(torch.uint8),
-                tensor.detach().view(torch.uint8),
-            ):
-                raise ValueError("checkpoint host round-trip changed input bytes")
-            stats.verified += 1
-        stats.saved_bytes += size
-        stats.boundaries += 1
-        return _HostBoundary(host, tensor.device)
-
-    def unpack(value: torch.Tensor | _HostBoundary) -> torch.Tensor:
-        if isinstance(value, torch.Tensor):
-            return value
-        stats.unpacked += 1
-        return value.tensor.to(value.device, non_blocking=False)
-
-    _install_checkpoint_hooks()
-    token = _HOST_OFFLOAD.set(stats)
-    hooks = _HOOKS.set((pack, unpack))
-    try:
-        yield stats
-    finally:
-        _HOOKS.reset(hooks)
-        _HOST_OFFLOAD.reset(token)
-
-
 @contextmanager
 def shard_saved_activations(
     group: Any, *, shape: tuple[int, int, int], key: str
@@ -207,7 +119,7 @@ def shard_saved_activations(
     tensors, while recomputation's temporary saves should remain local. Keep
     the numerical-policy scope open across both forward and backward.
     """
-    if _PARTITION.get() is not None or _HOST_OFFLOAD.get() is not None:
+    if _PARTITION.get() is not None:
         raise RuntimeError("checkpoint sharding scopes cannot overlap")
     if len(shape) != 3 or shape[1] != 1 or any(n <= 0 for n in shape):
         raise ValueError("checkpoint activation shape must be [tokens, 1, hidden]")
