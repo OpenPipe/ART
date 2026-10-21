@@ -1,5 +1,6 @@
 """Cold fixed scratch must not poison known single-root hidden-only inference."""
 
+from contextlib import ExitStack
 from dataclasses import fields, replace
 
 import pytest
@@ -524,3 +525,42 @@ def test_native_moe_cp_bounded_profiles_keep_static_floors(bounded_rank, cp, gra
     assert calibrated >= floor
     rank._memory_profiles.clear()
     assert signature.topology == (1, 1, cp, 1)
+
+
+# Values from origin/main e720a9e9, before bounded CP2/4/8 calibration, for one
+# 32,768-token hidden root: cold required, required after one 128-token
+# observation, checkpoint retained and workspace bytes, and the input-gradient
+# term. The CP extension must leave every CP1 prediction where it was.
+@pytest.mark.parametrize("scoped", (False, True))
+@pytest.mark.parametrize(
+    "kind,grad,expected",
+    (
+        ("dense", False, (9375108300, 132783420211, 0, 1342177280, 0)),
+        ("dense", True, (47687558758, 132783420211, 21474836480, 0, 21474836480)),
+        ("moe", False, (7529614540, 132561960960, 0, 6710886400, 0)),
+        ("moe", True, (21066437427, 132561960960, 5368709120, 6178209792, 5368709120)),
+    ),
+)
+def test_cp1_predictions_are_unchanged_by_bounded_cp(
+    pending_rank, kind, grad, expected, scoped
+):
+    rank = dense_rank() if kind == "dense" else pending_rank
+    assert rank._topology_key()[2] == rank._parallel_shape.cp == 1
+
+    def root(tokens):
+        ids = torch.arange(tokens) % 1900 + 100
+        return ForwardInput(input_tokens=ids, hidden_states=True, no_grad=not grad)
+
+    with ExitStack() as stack:
+        if scoped:
+            stack.enter_context(bounded_forward_peaks())
+            stack.enter_context(_memory.direct_forward_profile())
+        long, short = (rank._plan_flat_forward([root(n)]) for n in (32768, 128))
+        assert getattr(long.signature, "bounded_forward_peak", False) is scoped
+        rows = rank._plan_group_rows(long)
+        retained, workspace = rank._checkpoint_memory_floor(rows)
+        cold = rank._memory_check(long).estimated_required_bytes
+        observe(rank, short, 470221312)
+        warm = rank._memory_check(long).estimated_required_bytes
+        gradient = rank._checkpoint_input_gradient_bytes(rows, retained)
+    assert (cold, warm, retained, workspace, gradient) == expected
