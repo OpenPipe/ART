@@ -949,7 +949,12 @@ def _checkpoint_floor_from_facts(
         return 0, 0
     gradient_rows = sum(rows for rows, grad in group_rows if grad)
     _, tp, cp, _ = self._topology_key()
-    dense_cp = cp in (2, 4, 8) and not self._moe_layers and self._dense_fc1_adapted
+    dense_cp = (
+        cp in (2, 4, 8)
+        and self._parallel_shape.cp == cp
+        and not self._moe_layers
+        and self._dense_fc1_adapted
+    )
     # Physical rows are padded to a multiple of TP; each rank saves its shard.
     retained = (
         sum(-(-rows // tp) for rows, grad in group_rows if grad)
@@ -1111,19 +1116,24 @@ def _checkpoint_input_gradient_bytes(
 ) -> int:
     """The input-gradient term beside the checkpoint floor's boundaries.
 
-    TP1 charges one logical gradient per boundary, which also stands in for
-    the recompute workspace. Under TP x SP the workspace is priced
-    explicitly, and the recompute peak held one input-gradient shard of the
-    group being recomputed.
+    TP1's legacy boundary-gradient charge also stands in for workspace.
+    Native dense CP and TP x SP price that workspace explicitly, beside one
+    input-gradient shard of the group being recomputed.
     """
-    tp = self._topology_key()[1]
+    _, tp, cp, _ = self._topology_key()
+    dense_cp = (
+        cp in (2, 4, 8)
+        and self._parallel_shape.cp == cp
+        and not self._moe_layers
+        and self._dense_fc1_adapted
+    )
     from art.megatron.context_parallel.checkpoint import current_checkpoint_partition
 
     partition = current_checkpoint_partition()
     if partition is not None and retained:
         # One full recomputed root's dX; its layer workspace is explicit.
         return math.prod(partition[1]) * self._param_dtype_size
-    if not retained or tp == 1:
+    if not retained or (tp == 1 and not dense_cp):
         return retained
     rows = max((rows for rows, grad in group_rows if grad), default=0)
     return -(-rows // tp) * self._hidden_size * self._param_dtype_size

@@ -68,6 +68,9 @@ def test_native_cp_bounded_calibration_keeps_physical_workspace_and_full_outputs
         assert retained == rows * rank._num_layers * rank._hidden_size * 2
         if kind == "dense":
             assert workspace >= rank._sequence_parallel_workspace_bytes(rows)
+            assert rank._checkpoint_input_gradient_bytes(((rows, grad),), retained) == (
+                rows * rank._hidden_size * 2
+            )
     assert calibrated >= int(
         (retained + workspace + 2 * arguments["output_bytes"]) * 1.1
     )
