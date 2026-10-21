@@ -948,7 +948,8 @@ def _checkpoint_floor_from_facts(
     if not layers:
         return 0, 0
     gradient_rows = sum(rows for rows, grad in group_rows if grad)
-    _, tp, _, _ = self._topology_key()
+    _, tp, cp, _ = self._topology_key()
+    dense_cp = cp in (2, 4, 8) and not self._moe_layers and self._dense_fc1_adapted
     # Physical rows are padded to a multiple of TP; each rank saves its shard.
     retained = (
         sum(-(-rows // tp) for rows, grad in group_rows if grad)
@@ -964,7 +965,7 @@ def _checkpoint_floor_from_facts(
         + (0 if grad else 4 * rows * self._hidden_size * 2)
         for (rows, grad), ref in zip(group_rows, refs, strict=True)
     )
-    if tp > 1 and gradient_rows:
+    if (tp > 1 or dense_cp) and gradient_rows:
         # The recomputed layer's workspace, for the largest gradient group:
         # groups run their backward one after another.
         workspace = max(
@@ -975,7 +976,7 @@ def _checkpoint_floor_from_facts(
                 if grad
             ),
         )
-    if tp > 1 and self._gdn_layers and gradient_rows:
+    if (tp > 1 or dense_cp) and self._gdn_layers and gradient_rows:
         # Recurrent states grow with segments, not rows; backward recomputes
         # one layer at a time. Padding to TP adds up to TP - 1 one-token
         # roots per group. Kernel-internal chunk states are not bounded here.
@@ -1624,12 +1625,7 @@ def _memory_signature_from_requests(
         and topology[1] == topology[3] == 1
         and (
             topology[2] == 1
-            or (
-                topology[2] in (2, 4, 8)
-                and self._parallel_shape.cp == topology[2]
-                and self._moe_layers > 0
-                and self._moe_memory_supported
-            )
+            or (topology[2] in (2, 4, 8) and self._parallel_shape.cp == topology[2])
         )
         and self._parallel_shape.ep == self._parallel_shape.etp == 1
         and bool(
@@ -1842,15 +1838,18 @@ def _estimate_required_memory_bytes_from_values(
         not self._geometry.moe_experts
         and self._geometry.ffn_hidden_size
         and self._dense_fc1_adapted
-        and signature.topology[1:3] == (1, 1)
+        and signature.topology[1] == 1
+        and (
+            signature.topology[2] == 1
+            or getattr(signature, "bounded_forward_peak", False)
+        )
     ):
         # A dense no-grad layer peaks at its FC1 stage (the base GEMM output,
         # the adapter output and their sum: 6F, or the SwiGLU live set if
         # wider) beside the residual pair, embedding and norm output (4H), per
-        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. At CP1 every packed
-        # row is local, which the per-packed-token floor above prices at only
-        # 16H. Groups run one after another, so the largest no-grad group
-        # bounds it.
+        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. Under CP use actual
+        # physical rank rows, never a global count divided by degree. Groups
+        # run one after another, so the largest no-grad group bounds it.
         rows = max(
             (n for n, grad in group_rows if not grad),
             default=0 if signature.grad_enabled else packed_tokens,

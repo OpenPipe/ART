@@ -3,6 +3,7 @@
 from dataclasses import fields, replace
 
 import pytest
+from test_trainer_rank_checkpoint_memory import dense_rank
 from test_trainer_rank_moe_memory import layer as layer
 from test_trainer_rank_pending_memory import pending_rank as pending_rank
 import torch
@@ -28,6 +29,81 @@ def observe(rank, plan, compute):
     rank._update_memory_profile(
         plan, plan.output_bytes + compute, retained_bytes=plan.output_bytes
     )
+
+
+@pytest.mark.parametrize("cp", (2, 4, 8))
+@pytest.mark.parametrize("grad", (False, True))
+@pytest.mark.parametrize("kind", ("dense", "moe"))
+def test_native_cp_bounded_calibration_keeps_physical_workspace_and_full_outputs(
+    bounded_rank, cp, grad, kind
+):
+    rank = dense_rank() if kind == "dense" else bounded_rank
+    inputs = [replace(request(128), no_grad=not grad)]
+    with bounded_forward_peaks(), _memory.direct_forward_profile():
+        control = rank._plan_flat_forward(inputs)
+        rank._topology_key = lambda: (1, 1, cp, 1)
+        rank._parallel_shape = replace(rank._parallel_shape, cp=cp)
+        signature = rank._memory_signature_from_requests(
+            inputs, slot_group_count=1, grad_modes=(grad,)
+        )
+    assert signature.bounded_forward_peak and signature != control.signature
+    observe(rank, replace(control, signature=signature), 470221312)
+    profile = rank._memory_profiles[signature]
+    rows = 32768 // cp + 128  # Uneven ownership must use actual rows.
+    arguments = dict(
+        packed_tokens=32768,
+        logical_tokens=32768,
+        output_bytes=32768 * rank._hidden_size * 2,
+        signature=signature,
+        group_rows=((rows, grad),),
+    )
+    cold = rank._estimate_required_memory_bytes_from_values(**arguments)
+    rank._memory_profiles[signature] = replace(
+        profile, forward_compute_peaks=((8192, 470221312),)
+    )
+    calibrated = rank._estimate_required_memory_bytes_from_values(**arguments)
+    assert calibrated < cold
+    retained, workspace = rank._checkpoint_memory_floor(((rows, grad),))
+    if grad:
+        assert retained == rows * rank._num_layers * rank._hidden_size * 2
+        if kind == "dense":
+            assert workspace >= rank._sequence_parallel_workspace_bytes(rows)
+    assert calibrated >= int(
+        (retained + workspace + 2 * arguments["output_bytes"]) * 1.1
+    )
+    rank._memory_profiles[signature] = replace(
+        profile, forward_compute_peaks=((8192, 0),)
+    )
+    assert calibrated >= rank._estimate_required_memory_bytes_from_values(**arguments)
+
+
+@pytest.mark.parametrize("cp,actual", ((2, 1), (3, 3), (16, 16), (4, 8)))
+def test_dense_bounded_cp_requires_supported_matching_runtime_geometry(cp, actual):
+    rank = dense_rank()
+    rank._topology_key = lambda: (1, 1, cp, 1)
+    rank._parallel_shape = replace(rank._parallel_shape, cp=actual)
+    with bounded_forward_peaks():
+        signature = rank._memory_signature_from_requests(
+            [request(128)], slot_group_count=1, grad_modes=(False,)
+        )
+    assert not isinstance(signature, _memory._ScopedMemorySignature)
+
+
+def test_bounded_dense_cp_no_grad_charges_the_worst_rank_fc1_stage():
+    rank = dense_rank()
+    rank._topology_key = lambda: (1, 1, 8, 1)
+    rank._parallel_shape = replace(rank._parallel_shape, cp=8)
+    with bounded_forward_peaks():
+        signature = rank._memory_signature_from_requests(
+            [request(128)], slot_group_count=1, grad_modes=(False,)
+        )
+    required = rank._estimate_required_memory_bytes_from_values(
+        packed_tokens=32768,
+        output_bytes=0,
+        signature=signature,
+        group_rows=((32768, False),),
+    )
+    assert required >= int(32768 * (6 * 17408 + 4 * 5120) * 2 * 1.1)
 
 
 def test_three_token_cold_peak_refuses_uncalibrated_81920(bounded_rank, monkeypatch):
