@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 class _ScopedMemorySignature(_impl._MemorySignature):
     checkpoint_partition: tuple[int, tuple[int, int, int]] | None = None
     bounded_forward_peak: bool = False
+    checkpoint_host_offload: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -962,6 +963,25 @@ def _checkpoint_floor_from_facts(
         * self._hidden_size
         * 2
     )
+    from art.megatron.context_parallel.checkpoint import current_host_activation_offload
+
+    offload = current_host_activation_offload()
+    if offload is not None:
+        if not dense_cp or offload.hidden_size != self._hidden_size:
+            raise ValueError(
+                "checkpoint host offload requires matching native dense CP"
+            )
+        if retained > offload.max_cpu_bytes:
+            raise ValueError(
+                "checkpoint host activation byte budget exceeded before forward"
+            )
+        # All saved boundaries move to bounded host storage. One full input
+        # still exists on device while packing or unpacking a checkpoint.
+        retained = (
+            max((rows for rows, grad in group_rows if grad), default=0)
+            * self._hidden_size
+            * 2
+        )
     if gradient_rows:
         self._checkpoint_moe_bytes_per_token()
     refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
@@ -1245,11 +1265,15 @@ def _checkpoint_gradient_groups(
     decoder layer saves the group's rows (this rank's TP shard). The base
     model (no name) has no adapter slot.
     """
+    from art.megatron.context_parallel.checkpoint import current_host_activation_offload
+
     tp = self._topology_key()[1]
+    offload = current_host_activation_offload() is not None
     return tuple(
         (
             ref if ref is not None and ref.name is not None else None,
-            (-(-rows // tp) * self._hidden_size * 2,) * self._num_layers,
+            ((0 if offload else -(-rows // tp) * self._hidden_size * 2),)
+            * self._num_layers,
         )
         for (rows, grad), ref in zip(
             group_rows, slot_refs or (None,) * len(group_rows), strict=True
@@ -1593,9 +1617,30 @@ def _memory_signature_from_requests(
     grad_modes: Iterable[bool],
     slot_groups: Iterable[tuple["LoRASlotRef | None", bool]] = (),
 ) -> _impl._MemorySignature:
-    from art.megatron.context_parallel.checkpoint import current_checkpoint_partition
+    from art.megatron.context_parallel.checkpoint import (
+        current_checkpoint_partition,
+        current_host_activation_offload,
+    )
 
     partition = current_checkpoint_partition()
+    offload = current_host_activation_offload()
+    if offload is not None and (
+        partition is not None
+        or len(requests) != 1
+        or self._topology_key() not in ((1, 1, 2, 1), (1, 1, 4, 1), (1, 1, 8, 1))
+        or self._parallel_shape.cp != self._topology_key()[2]
+        or self._parallel_shape.ep != 1
+        or self._parallel_shape.etp != 1
+        or self._moe_layers
+        or not self._dense_fc1_adapted
+        or offload.hidden_size != self._hidden_size
+        or not _checkpoint_layers(
+            self, ((int(requests[0].input_tokens.numel()), True),)
+        )
+    ):
+        raise ValueError(
+            "checkpoint host offload requires one native dense CP uniform root"
+        )
     if partition is not None:
         # Native MoE storage sharding failed full-model gradient parity on H200.
         if self._moe_layers:
@@ -1647,11 +1692,14 @@ def _memory_signature_from_requests(
             else self._dense_fc1_adapted and bool(self._geometry.ffn_hidden_size)
         )
     )
-    if partition is not None or bounded:
+    if partition is not None or bounded or offload is not None:
         return _ScopedMemorySignature(
             **vars(signature),
             checkpoint_partition=partition,
             bounded_forward_peak=bounded,
+            checkpoint_host_offload=None
+            if offload is None
+            else (offload.hidden_size, offload.max_cpu_bytes),
         )
     return signature
 
