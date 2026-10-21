@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import torch
@@ -144,7 +144,9 @@ def test_attention_rejects_partial_root_before_launching_kernel():
 def test_canonical_gdn_never_selects_uniform_bucket_algorithm():
     from art.megatron.gdn.operator import _bucket_has_uniform_lengths
 
-    bucket: Any = SimpleNamespace(length=128, lengths_cpu=torch.tensor([128, 128]))
+    bucket = cast(
+        Any, SimpleNamespace(length=128, lengths_cpu=torch.tensor([128, 128]))
+    )
     assert _bucket_has_uniform_lengths(bucket)
     with execution(RootLayout((128, 128))):
         assert not _bucket_has_uniform_lengths(bucket)
@@ -282,3 +284,42 @@ def test_production_registry_matches_imported_te_type():
     wrapper = projection.forward
     assert install(model) == {"0": "row"}
     assert projection.forward is wrapper
+
+
+def test_segmented_slots_follow_canonical_root_slices_through_backward():
+    from art.megatron.segmented_lora import (
+        _CURRENT_LORA_SEGMENTS,
+        LoRASegments,
+        segmented_lora_factors,
+        use_lora_segments,
+    )
+
+    factors = [
+        (
+            torch.randn(3, 2, requires_grad=True),
+            torch.randn(2, 4, requires_grad=True),
+            1.0,
+        )
+        for _ in range(2)
+    ]
+    segments = LoRASegments((None, cast(Any, "second")), (128, 256))
+    seen = []
+
+    def original(x):
+        current = _CURRENT_LORA_SEGMENTS.get()
+        assert current is not None
+        seen.append(current.counts)
+        return segmented_lora_factors(
+            x, factors, current, template_a=factors[0][0], template_b=factors[0][1]
+        )
+
+    x = torch.randn(384, 3)
+    with use_lora_segments(segments), execution(RootLayout((3, 129))):
+        actual = _row_forward(original)(x)
+        actual[:3].sum().backward()
+    assert seen == [(128, 0), (0, 256)]
+    assert torch.equal(actual[:128], x[:128] @ factors[0][0] @ factors[0][1])
+    assert torch.equal(actual[128:], x[128:] @ factors[1][0] @ factors[1][1])
+    assert not cast(torch.Tensor, factors[1][0].grad).any()
+    assert not cast(torch.Tensor, factors[1][1].grad).any()
+    assert _CURRENT_LORA_SEGMENTS.get() is None

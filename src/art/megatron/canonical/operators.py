@@ -6,6 +6,7 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 import torch.nn.functional as F
 
+from ..segmented_lora import slice_lora_segments
 from .layout import NumericalPolicy, current_layout
 
 
@@ -39,9 +40,10 @@ def _row_forward(
             or len(layout.lengths) == 1
         ):
             return original(x, *args, **kwargs)
-        pieces = [
-            original(x[part].contiguous(), *args, **kwargs) for part in layout.slices()
-        ]
+        pieces = []
+        for part in layout.slices():
+            with slice_lora_segments(part.start, part.stop):
+                pieces.append(original(x[part].contiguous(), *args, **kwargs))
         return _join(pieces, layout.padded_lengths[0])
 
     return forward
