@@ -1096,7 +1096,7 @@ def _sequence_parallel_lora_floor(
             for grad, shapes in signature.slot_shapes
             if grad
             for shape in shapes
-            if len(shape) == 5 and shape[0] == 2
+            if len(shape) == 5 and shape[0] == 2 and shape[2] == shape[3]
         ),
         default=0,
     )
@@ -1108,13 +1108,35 @@ def _sequence_parallel_lora_floor(
             (len(shapes) for grad, shapes in signature.slot_shapes if grad), default=0
         )
     rows = max((rows for rows, grad in group_rows if grad), default=0)
-    if dense_cp and modules and not rank:
-        # Historical/scalar callers may declare LoRA targets without recording
-        # selected ranks. Keep the legacy boundary-gradient allowance beside
-        # explicit workspace rather than treating missing metadata as rank 0.
-        return retained, workspace + retained
     copies = 2 if dense_cp else 1
-    return retained, workspace + copies * rows * modules * rank * self._param_dtype_size
+    lora_bytes = copies * rows * modules * rank * self._param_dtype_size
+    if dense_cp and (
+        not rank
+        or self._geometry.moe_experts
+        or self._geometry.moe_ffn_hidden_size
+        or not all(
+            len(shapes) >= modules
+            and all(
+                not shape  # A recognized owner with an inactive selected slot.
+                or (
+                    len(shape) == 5
+                    and shape[0] == 2
+                    and min(shape) > 0
+                    and shape[2] == shape[3]
+                )
+                for shape in shapes
+            )
+            for grad, shapes in signature.slot_shapes
+            if grad
+        )
+    ):
+        # Dense dX refinement requires a complete native 2-D inventory and
+        # supported geometry. (0,) records an unknown owner/implementation;
+        # missing/partial metadata is unknown even with zero recognized owners.
+        # Restore main's per-layer allowance beside the explicit workspace and
+        # any known rank charge, rather than letting unknown mean rank zero.
+        workspace += retained
+    return retained, workspace + lora_bytes
 
 
 def _cold_recompute_transient_bytes(self: TrainerRank) -> int:
@@ -1678,7 +1700,8 @@ def _slot_memory_shapes(
 
     TP x SP and native dense CP checkpoint floors price LoRA intermediates
     from these ranks, including attention-only dense models and the template
-    adapter selected by a None reference.
+    adapter selected by a None reference. For dense CP, (0,) marks incomplete
+    classification; () is a recognized owner with an inactive selected slot.
     """
     dense_cp = _native_dense_cp(self)
     if (
@@ -1698,15 +1721,73 @@ def _slot_memory_shapes(
     from art.megatron.lora import LoRA
 
     shapes = []
+    owned: set[int] = set()
     for chunk in self.runtime.model:
         for module in chunk.modules():
-            if type(module) is LoRA:
-                tensors = _impl._slot_lora_tensors(module, ref)
-                shapes.append(
-                    ()
-                    if tensors is None
-                    else (tensors[0].ndim, *tensors[0].shape, *tensors[1].shape)
+            if id(module) in owned:
+                continue
+            if isinstance(module, LoRA):
+                if dense_cp:
+                    # Slot Parameters belong to this recognized owner; they
+                    # are not separate, unclassified adapter implementations.
+                    owned.update(
+                        id(child) for child in module.modules() if child is not module
+                    )
+                try:
+                    tensors = _impl._slot_lora_tensors(module, ref)
+                    shape = (
+                        ()
+                        if tensors is None
+                        else (tensors[0].ndim, *tensors[0].shape, *tensors[1].shape)
+                    )
+                    if (
+                        dense_cp
+                        and tensors is not None
+                        and any(
+                            tensor.element_size() != self._param_dtype_size
+                            for tensor in tensors
+                        )
+                    ):
+                        shapes.append((0,))
+                except (AttributeError, RuntimeError, TypeError):
+                    shape = (0,)
+                shapes.append(shape)
+                if dense_cp and (
+                    any(
+                        name in vars(module)
+                        or getattr(type(module), name) is not getattr(LoRA, name)
+                        for name in (
+                            "forward",
+                            "active_lora_tensors",
+                            "_slot",
+                            "_active_lora_storage",
+                            "_expert_views",
+                        )
+                    )
+                    or module._forward_hooks
+                    or module._forward_pre_hooks
+                ):
+                    # Inherited native behavior is priced; an overridden
+                    # kernel/selection path needs its own workspace proof.
+                    shapes.append((0,))
+            elif dense_cp and (
+                any(param.requires_grad for param in module.parameters(recurse=False))
+                or any(
+                    hasattr(module, name)
+                    for name in (
+                        "A_T",
+                        "B_T",
+                        "lora_A",
+                        "lora_B",
+                        "_lora_params",
+                        "lora_slot_params",
+                    )
                 )
+            ):
+                # All trainable tensors must be owned by a recognized adapter.
+                # Also catch frozen/inactive foreign factor owners. Never infer
+                # completeness from the number of recognized owners alone.
+                shapes.append((0,))
     return tuple(shapes)
 
 
