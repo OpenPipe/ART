@@ -91,6 +91,8 @@ def patch_deepseek_renderer(
             # user in the full chat, even with drop_thinking=False.
             if prefix_only:
                 messages = messages[: index + 1]
+                # vLLM 0.31 caches the full chat's index; this prefix has its own.
+                kwargs.pop("last_user_idx", None)
                 message = messages[index]
                 if (
                     message.get("role") == "assistant"
