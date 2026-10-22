@@ -128,6 +128,9 @@ def test_checkpoint_extent_is_frozen_without_retaining_live_graph(live, monkeypa
     replay._facts = facts
     replay._hidden_size = rank._hidden_size
     replay._gdn_layers = 0
+    replay._parallel_shape = rank._parallel_shape
+    replay._moe_layers = rank._moe_layers
+    replay._dense_fc1_adapted = rank._dense_fc1_adapted
     replay._moe_output_bytes_per_token = rank._moe_output_bytes_per_token
     replay._topology_key = lambda: (1, 1, 2, 1)
     replay._moe_checkpoint_grad_bytes_per_token = facts[
@@ -139,4 +142,38 @@ def test_checkpoint_extent_is_frozen_without_retaining_live_graph(live, monkeypa
         del marker
     assert ref() is None
     assert replay._checkpoint_memory_floor(rows) == expected
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("cp", [2, 4, 8])
+@pytest.mark.parametrize("dense", [False, True])
+@pytest.mark.parametrize("matching", [False, True])
+def test_cp_report_replays_runtime_shape_and_layers(
+    cp, dense, matching, monkeypatch, tmp_path
+):
+    rank = head_rank()
+    rank._parallel_shape = replace(rank._parallel_shape, cp=cp if matching else 1)
+    rank._dense_fc1_adapted = dense
+    rank._moe_layers = 0 if dense else 2
+    rank.runtime.model_support_handler.context_parallel_workload_profile = lambda _: (
+        None
+    )
+    monkeypatch.setattr(
+        rank, "_topology", lambda: SimpleNamespace(tp=1, cp=cp, dp=1, pp=1, sp=False)
+    )
+    rank._planner_reporter = reports.Reporter(0, spool_dir=tmp_path)
+    report, costs = emitted(
+        rank, rank._plan_flat_forward([request(32, grad=True)]), tmp_path
+    )
+    assert report["replay_complete"], report["incomplete_reasons"]
+    result = reports.replay(report)
+    assert result["aggregate"]["matches"]
+    assert result["estimates"][0]["required_bytes"] == costs[0].required
+    rank._parallel_shape = replace(rank._parallel_shape, cp=16)
+    rank._moe_layers = 4
+    assert reports.replay(report) == result
+    # An old CP report cannot invent runtime eligibility from requested CP.
+    del report["replay"]["memory_replay"]["rank"]["parallel_shape"]
+    with pytest.raises(ValueError, match="CP runtime shape/layers not recorded"):
+        reports.replay(report)
     assert not torch.cuda.is_initialized()

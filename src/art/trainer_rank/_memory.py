@@ -936,6 +936,16 @@ def _checkpoint_hybridep_rows(
     return hybrid_rows
 
 
+def _native_dense_cp(self: TrainerRank) -> bool:
+    cp = self._topology_key()[2]
+    return (
+        cp in (2, 4, 8)
+        and self._parallel_shape.cp == cp
+        and not self._moe_layers
+        and self._dense_fc1_adapted
+    )
+
+
 def _checkpoint_floor_from_facts(
     self: TrainerRank,
     group_rows: tuple[tuple[int, bool], ...],
@@ -948,7 +958,8 @@ def _checkpoint_floor_from_facts(
     if not layers:
         return 0, 0
     gradient_rows = sum(rows for rows, grad in group_rows if grad)
-    _, tp, _, _ = self._topology_key()
+    tp = self._topology_key()[1]
+    dense_cp = _native_dense_cp(self)
     # Physical rows are padded to a multiple of TP; each rank saves its shard.
     retained = (
         sum(-(-rows // tp) for rows, grad in group_rows if grad)
@@ -964,7 +975,7 @@ def _checkpoint_floor_from_facts(
         + (0 if grad else 4 * rows * self._hidden_size * 2)
         for (rows, grad), ref in zip(group_rows, refs, strict=True)
     )
-    if tp > 1 and gradient_rows:
+    if (tp > 1 or dense_cp) and gradient_rows:
         # The recomputed layer's workspace, for the largest gradient group:
         # groups run their backward one after another.
         workspace = max(
@@ -975,7 +986,7 @@ def _checkpoint_floor_from_facts(
                 if grad
             ),
         )
-    if tp > 1 and self._gdn_layers and gradient_rows:
+    if (tp > 1 or dense_cp) and self._gdn_layers and gradient_rows:
         # Recurrent states grow with segments, not rows; backward recomputes
         # one layer at a time. Padding to TP adds up to TP - 1 one-token
         # roots per group. Kernel-internal chunk states are not bounded here.
@@ -1065,15 +1076,19 @@ def _sequence_parallel_lora_floor(
     group_rows: tuple[tuple[int, bool], ...],
     signature: _impl._MemorySignature,
 ) -> tuple[int, int]:
-    """Add the recomputed layer's LoRA ``x @ A`` intermediates to a TP x SP floor.
+    """Add the recomputed layer's LoRA row-by-rank intermediates.
 
     Each adapted module of the recomputed layer saves rows x rank over the
     gathered rows (FC1 gate/up measured 16 B/row at rank 4). Charge the
     decoder's most-adapted layer at the gradient slots' largest rank, from
     the signature's slot shapes ((ndim, *A.shape, *B.shape) per module).
+    Native dense CP also reserves that many bytes for backward factor-product
+    gradients beside the saved forward products. Counting every target at the
+    largest selected rank bounds layers with different target/rank inventories.
     """
     retained, workspace = floor
-    if not retained or self._topology_key()[1] == 1:
+    dense_cp = _native_dense_cp(self)
+    if not retained or (self._topology_key()[1] == 1 and not dense_cp):
         return floor
     rank = max(
         (
@@ -1081,7 +1096,7 @@ def _sequence_parallel_lora_floor(
             for grad, shapes in signature.slot_shapes
             if grad
             for shape in shapes
-            if len(shape) == 5 and shape[0] == 2
+            if len(shape) == 5 and shape[0] == 2 and shape[2] == shape[3]
         ),
         default=0,
     )
@@ -1093,7 +1108,35 @@ def _sequence_parallel_lora_floor(
             (len(shapes) for grad, shapes in signature.slot_shapes if grad), default=0
         )
     rows = max((rows for rows, grad in group_rows if grad), default=0)
-    return retained, workspace + rows * modules * rank * self._param_dtype_size
+    copies = 2 if dense_cp else 1
+    lora_bytes = copies * rows * modules * rank * self._param_dtype_size
+    if dense_cp and (
+        not rank
+        or self._geometry.moe_experts
+        or self._geometry.moe_ffn_hidden_size
+        or not all(
+            len(shapes) >= modules
+            and all(
+                not shape  # A recognized owner with an inactive selected slot.
+                or (
+                    len(shape) == 5
+                    and shape[0] == 2
+                    and min(shape) > 0
+                    and shape[2] == shape[3]
+                )
+                for shape in shapes
+            )
+            for grad, shapes in signature.slot_shapes
+            if grad
+        )
+    ):
+        # Dense dX refinement requires a complete native 2-D inventory and
+        # supported geometry. (0,) records an unknown owner/implementation;
+        # missing/partial metadata is unknown even with zero recognized owners.
+        # Restore main's per-layer allowance beside the explicit workspace and
+        # any known rank charge, rather than letting unknown mean rank zero.
+        workspace += retained
+    return retained, workspace + lora_bytes
 
 
 def _cold_recompute_transient_bytes(self: TrainerRank) -> int:
@@ -1110,19 +1153,19 @@ def _checkpoint_input_gradient_bytes(
 ) -> int:
     """The input-gradient term beside the checkpoint floor's boundaries.
 
-    TP1 charges one logical gradient per boundary, which also stands in for
-    the recompute workspace. Under TP x SP the workspace is priced
-    explicitly, and the recompute peak held one input-gradient shard of the
-    group being recomputed.
+    TP1's legacy boundary-gradient charge also stands in for workspace.
+    Native dense CP and TP x SP price that workspace explicitly, beside one
+    input-gradient shard of the group being recomputed.
     """
     tp = self._topology_key()[1]
+    dense_cp = _native_dense_cp(self)
     from art.megatron.context_parallel.checkpoint import current_checkpoint_partition
 
     partition = current_checkpoint_partition()
     if partition is not None and retained:
         # One full recomputed root's dX; its layer workspace is explicit.
         return math.prod(partition[1]) * self._param_dtype_size
-    if not retained or tp == 1:
+    if not retained or (tp == 1 and not dense_cp):
         return retained
     rows = max((rows for rows, grad in group_rows if grad), default=0)
     return -(-rows // tp) * self._hidden_size * self._param_dtype_size
@@ -1600,6 +1643,11 @@ def _memory_signature_from_requests(
             raise ValueError("checkpoint shards require one CP1 uniform-recompute root")
     modes = tuple(sorted(grad_modes))
     topology = self._topology_key()
+    slot_groups = tuple(slot_groups)
+    if not slot_groups and _native_dense_cp(self):
+        # Direct estimator callers use the template adapter when no slot
+        # selection was supplied, just as _slot_lora_tensors(None) does.
+        slot_groups = tuple((None, grad) for grad in modes)
     shapes = tuple(
         sorted((grad, self._slot_memory_shapes(ref)) for ref, grad in slot_groups)
     )
@@ -1621,7 +1669,11 @@ def _memory_signature_from_requests(
         and requests[0].input_tokens.ndim == 1
         and (modes == (False,) or (modes == (True,) and _DIRECT_FORWARD.get()))
         and _impl._request_mix_key(requests[0]) in ("hidden", "hidden+routes")
-        and topology[1:] == (1, 1, 1)
+        and topology[1] == topology[3] == 1
+        and (
+            topology[2] == 1
+            or (topology[2] in (2, 4, 8) and self._parallel_shape.cp == topology[2])
+        )
         and self._parallel_shape.ep == self._parallel_shape.etp == 1
         and bool(
             _checkpoint_layers(self, ((int(requests[0].input_tokens.numel()), False),))
@@ -1646,17 +1698,21 @@ def _slot_memory_shapes(
 ) -> tuple[tuple[int, ...], ...]:
     """Separate empirical trust across actual selected adapter layouts.
 
-    Sequence-parallel (TP > 1) models record them too: the explicit TP x SP
-    checkpoint floor prices LoRA intermediates from these ranks.
+    TP x SP and native dense CP checkpoint floors price LoRA intermediates
+    from these ranks, including attention-only dense models and the template
+    adapter selected by a None reference. For dense CP, (0,) marks incomplete
+    classification; () is a recognized owner with an inactive selected slot.
     """
+    dense_cp = _native_dense_cp(self)
     if (
-        ref is None
-        or ref.name is None
+        (ref is None and not dense_cp)
+        or (ref is not None and ref.name is None)
         or isinstance(ref, _impl._LocalLoRASlotRef)
         or not (
             getattr(self, "_moe_layers", 0)
             or getattr(self, "_gdn_layers", 0)
             or getattr(self, "_sequence_parallel", False)
+            or dense_cp
         )
     ):
         # Generic/no-component planning must not import Megatron or walk
@@ -1665,15 +1721,73 @@ def _slot_memory_shapes(
     from art.megatron.lora import LoRA
 
     shapes = []
+    owned: set[int] = set()
     for chunk in self.runtime.model:
         for module in chunk.modules():
-            if type(module) is LoRA:
-                tensors = _impl._slot_lora_tensors(module, ref)
-                shapes.append(
-                    ()
-                    if tensors is None
-                    else (tensors[0].ndim, *tensors[0].shape, *tensors[1].shape)
+            if id(module) in owned:
+                continue
+            if isinstance(module, LoRA):
+                if dense_cp:
+                    # Slot Parameters belong to this recognized owner; they
+                    # are not separate, unclassified adapter implementations.
+                    owned.update(
+                        id(child) for child in module.modules() if child is not module
+                    )
+                try:
+                    tensors = _impl._slot_lora_tensors(module, ref)
+                    shape = (
+                        ()
+                        if tensors is None
+                        else (tensors[0].ndim, *tensors[0].shape, *tensors[1].shape)
+                    )
+                    if (
+                        dense_cp
+                        and tensors is not None
+                        and any(
+                            tensor.element_size() != self._param_dtype_size
+                            for tensor in tensors
+                        )
+                    ):
+                        shapes.append((0,))
+                except (AttributeError, RuntimeError, TypeError):
+                    shape = (0,)
+                shapes.append(shape)
+                if dense_cp and (
+                    any(
+                        name in vars(module)
+                        or getattr(type(module), name) is not getattr(LoRA, name)
+                        for name in (
+                            "forward",
+                            "active_lora_tensors",
+                            "_slot",
+                            "_active_lora_storage",
+                            "_expert_views",
+                        )
+                    )
+                    or module._forward_hooks
+                    or module._forward_pre_hooks
+                ):
+                    # Inherited native behavior is priced; an overridden
+                    # kernel/selection path needs its own workspace proof.
+                    shapes.append((0,))
+            elif dense_cp and (
+                any(param.requires_grad for param in module.parameters(recurse=False))
+                or any(
+                    hasattr(module, name)
+                    for name in (
+                        "A_T",
+                        "B_T",
+                        "lora_A",
+                        "lora_B",
+                        "_lora_params",
+                        "lora_slot_params",
+                    )
                 )
+            ):
+                # All trainable tensors must be owned by a recognized adapter.
+                # Also catch frozen/inactive foreign factor owners. Never infer
+                # completeness from the number of recognized owners alone.
+                shapes.append((0,))
     return tuple(shapes)
 
 
@@ -1833,15 +1947,18 @@ def _estimate_required_memory_bytes_from_values(
         not self._geometry.moe_experts
         and self._geometry.ffn_hidden_size
         and self._dense_fc1_adapted
-        and signature.topology[1:3] == (1, 1)
+        and signature.topology[1] == 1
+        and (
+            signature.topology[2] == 1
+            or getattr(signature, "bounded_forward_peak", False)
+        )
     ):
         # A dense no-grad layer peaks at its FC1 stage (the base GEMM output,
         # the adapter output and their sum: 6F, or the SwiGLU live set if
         # wider) beside the residual pair, embedding and norm output (4H), per
-        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. At CP1 every packed
-        # row is local, which the per-packed-token floor above prices at only
-        # 16H. Groups run one after another, so the largest no-grad group
-        # bounds it.
+        # row: Qwen3.8-27B TP1/CP1 traces at 7k-174k rows. Under CP use actual
+        # physical rank rows, never a global count divided by degree. Groups
+        # run one after another, so the largest no-grad group bounds it.
         rows = max(
             (n for n, grad in group_rows if not grad),
             default=0 if signature.grad_enabled else packed_tokens,

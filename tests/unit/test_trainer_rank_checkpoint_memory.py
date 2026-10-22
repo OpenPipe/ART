@@ -507,7 +507,7 @@ def dense_rank():
     config.ffn_hidden_size, config.bias_activation_fusion = 17408, True
     decoder = r.runtime.model[0].decoder
     decoder.layers = torch.nn.ModuleList(
-        [torch.nn.Linear(1, 1).bfloat16() for _ in range(64)]
+        [torch.nn.Linear(1, 1).bfloat16().requires_grad_(False) for _ in range(64)]
     )
     decoder.num_layers_per_pipeline_rank = 64
     r.runtime.provider = SimpleNamespace(
@@ -520,6 +520,326 @@ def dense_rank():
     assert dense._dense_fc1_adapted is False
     dense._dense_fc1_adapted = True
     return dense
+
+
+@pytest.mark.parametrize("cp", [2, 4, 8])
+@pytest.mark.parametrize("adapter_rank", [8, 768])
+@pytest.mark.parametrize("subclass", [False, True])
+def test_dense_cp_prices_loaded_lora_products_without_opt_in(
+    cp, adapter_rank, subclass
+):
+    from test_trainer_rank_slot_memory import load_slot
+
+    from art.megatron.lora import LoRA
+    from art.trainer_rank._impl import _lora_modules_per_layer
+
+    class DerivedLoRA(LoRA):
+        pass
+
+    r = dense_rank()
+    r._hidden_size = r.runtime.model[0].config.hidden_size = 32
+    r._geometry = replace(
+        r._geometry,
+        hidden_size=32,
+        ffn_hidden_size=64,
+        num_attention_heads=1,
+        num_query_groups=1,
+        kv_channels=32,
+    )
+    r._mixer_top_gaps = (0, None)
+    r._topology_key = lambda: (1, 1, cp, 1)
+    r._parallel_shape = replace(r._parallel_shape, cp=cp)
+    # q/k/v/output/gate/up/down: the selected rank differs from the template.
+    loras = torch.nn.ModuleList(
+        [
+            (DerivedLoRA if subclass else LoRA)(
+                f"target.{i}", 32, 32, 4, 4, torch.bfloat16, torch.device("cpu")
+            )
+            for i in range(7)
+        ]
+    )
+    r.runtime.model[0].decoder.layers[0].loras = loras
+    r._lora_modules_per_layer = _lora_modules_per_layer(r.runtime.model[0])
+    if subclass:
+        # Use the real loader for inherited owners too; the shared test helper
+        # deliberately handles only its original exact-class fixtures.
+        from art.megatron.lora import LoRASlotRef
+
+        ref = LoRASlotRef("checkpoint", "selected")
+        for owner in loras:
+            assert isinstance(owner, LoRA)
+            prefix = owner.adapter_model_prefix
+            assert owner.load_lora_slot(
+                ref,
+                {
+                    prefix + ".lora_A.weight": torch.zeros(adapter_rank, 32).bfloat16(),
+                    prefix + ".lora_B.weight": torch.zeros(32, adapter_rank).bfloat16(),
+                },
+                requires_grad=True,
+            )
+    else:
+        ref = load_slot(r, "selected", adapter_rank)
+    assert r._lora_modules_per_layer == 7
+    rows = 65_536
+    request = ForwardInput(
+        input_tokens=torch.zeros(2 * rows, dtype=torch.long), hidden_states=True
+    )
+    signature = r._memory_signature_from_requests(
+        [request], slot_group_count=1, grad_modes=(True,), slot_groups=((ref, True),)
+    )
+    assert len(signature.slot_shapes[0][1]) == 7
+    assert {shape[2] for shape in signature.slot_shapes[0][1]} == {adapter_rank}
+    assert not getattr(signature, "bounded_forward_peak", False)
+    groups = ((rows, True),)
+    retained, workspace = r._checkpoint_memory_floor(groups)
+    # All targets' saved products plus backward factor-product gradients.
+    lora_bytes = 2 * rows * 7 * adapter_rank * 2
+    assert r._sequence_parallel_lora_floor(
+        (retained, workspace), groups, signature
+    ) == (retained, workspace + lora_bytes)
+    required = r._estimate_required_memory_bytes_from_values(
+        packed_tokens=2 * rows,
+        logical_tokens=2 * rows,
+        output_bytes=2 * rows * 32 * 2,
+        signature=signature,
+        group_rows=groups,
+    )
+    assert (required <= 550_000_000) is (adapter_rank == 8)
+    # Even the six products measured live by FC1 in Sol's CPU witness exceed
+    # that cap at rank 768. The full charge also covers the seventh target.
+    assert required >= rows * 6 * adapter_rank * 2
+    # The literal original probe omitted slot ranks despite declaring seven
+    # targets. That must preserve the old allowance, not imply rank zero.
+    missing = replace(signature, slot_shapes=())
+    assert r._sequence_parallel_lora_floor((retained, workspace), groups, missing) == (
+        retained,
+        workspace + retained,
+    )
+    assert (
+        r._estimate_required_memory_bytes_from_values(
+            packed_tokens=2 * rows,
+            logical_tokens=2 * rows,
+            output_bytes=2 * rows * 32 * 2,
+            signature=missing,
+            group_rows=groups,
+        )
+        > 550_000_000
+    )
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize(
+    "kind", ["foreign", "custom forward", "malformed factors", "unmarked"]
+)
+def test_dense_cp_unknown_adapter_inventory_keeps_legacy_allowance(mixed, kind):
+    from art.megatron.lora import LoRA
+    from art.trainer_rank._impl import _lora_modules_per_layer
+
+    class CustomLoRA(LoRA):
+        def forward(self, x, tokens_per_expert=None):
+            return super().forward(x, tokens_per_expert)
+
+    r = dense_rank()
+    model = r.runtime.model[0]
+    model.requires_grad_(False)
+    owner = (
+        CustomLoRA("custom", 32, 32, 8, 8, torch.bfloat16, torch.device("cpu"))
+        if kind == "custom forward"
+        else torch.nn.Module()
+        if kind in ("foreign", "unmarked")
+        else LoRA("bad", 32, 32, 8, 8, torch.bfloat16, torch.device("cpu"))
+    )
+    if kind == "foreign":
+        owner.A_T = torch.nn.Parameter(torch.zeros(32, 512).bfloat16())
+        owner.B_T = torch.nn.Parameter(torch.zeros(512, 32).bfloat16())
+    elif kind == "malformed factors":
+        owner.B_T = torch.nn.Parameter(torch.zeros(9, 32).bfloat16())
+    elif kind == "unmarked":
+        owner.weight = torch.nn.Parameter(torch.zeros(32, 512).bfloat16())
+    model.decoder.layers[0].unknown = owner
+    if mixed:
+        model.decoder.layers[0].known = LoRA(
+            "known", 32, 32, 8, 8, torch.bfloat16, torch.device("cpu")
+        )
+    r._lora_modules_per_layer = _lora_modules_per_layer(model)
+    r._topology_key = lambda: (1, 1, 2, 1)
+    r._parallel_shape = replace(r._parallel_shape, cp=2)
+    req = ForwardInput(input_tokens=torch.arange(128), hidden_states=True)
+    sig = r._memory_signature_from_requests(
+        [req], slot_group_count=1, grad_modes=(True,)
+    )
+    groups = ((64, True),)
+    retained, workspace = r._checkpoint_memory_floor(groups)
+    # Unknown inventory must restore the old per-layer allowance even when
+    # there are zero recognized owners, or other owners have usable ranks.
+    assert r._sequence_parallel_lora_floor((retained, workspace), groups, sig)[1] >= (
+        workspace + retained
+    )
+    args = dict(
+        packed_tokens=128,
+        logical_tokens=128,
+        output_bytes=128 * 5120 * 2,
+        signature=sig,
+        group_rows=groups,
+    )
+    required = r._estimate_required_memory_bytes_from_values(**args)
+    r._dense_fc1_adapted = False
+    assert required >= r._estimate_required_memory_bytes_from_values(**args)
+    assert not torch.cuda.is_initialized()
+
+
+def test_glm52_lora_subclass_witness_refuses_1150mb(monkeypatch):
+    from art.megatron.glm52.lora import Glm52LoRA
+    from art.megatron.lora import LoRA, LoRASlotRef, SharedExpertsLinearFC1LoRA
+    from art.trainer_rank._impl import _lora_modules_per_layer
+
+    r = dense_rank()
+    model = r.runtime.model[0]
+    model.config.hidden_size = 32
+    model.config.ffn_hidden_size = 64
+    model.config.num_layers = model.decoder.num_layers_per_pipeline_rank = 128
+    model.config.num_attention_heads = model.config.num_query_groups = 1
+    model.config.kv_channels = 256
+    model.config.num_moe_experts = 1
+    r.runtime.model_support_handler.is_moe = True
+    layers = []
+    for index in range(128):
+
+        def lora(label, inputs=32, outputs=32):
+            return Glm52LoRA(
+                f"{index}.{label}",
+                inputs,
+                outputs,
+                4,
+                4,
+                torch.bfloat16,
+                torch.device("cpu"),
+            )
+
+        layer = torch.nn.Module()
+        layer.mlp = torch.nn.Module()
+        fc1 = SharedExpertsLinearFC1LoRA.__new__(SharedExpertsLinearFC1LoRA)
+        torch.nn.Module.__init__(fc1)
+        fc1.non_gated = False
+        fc1.gate_lora, fc1.up_lora = lora("gate", outputs=64), lora("up", outputs=64)
+        layer.mlp.linear_fc1 = fc1
+        layer.other_loras = torch.nn.ModuleList(
+            [
+                lora("q_a", 32, 512),
+                lora("kv_a", 32, 576),
+                lora("q_b", 512, 576),
+                lora("o", 256, 32),
+                lora("down", 64, 32),
+            ]
+        )
+        layers.append(layer)
+    model.decoder.layers = torch.nn.ModuleList(layers)
+    model.embedding = torch.nn.Linear(1, 1).bfloat16().requires_grad_(False)
+    r = TrainerRank(r.runtime)
+    assert r._dense_fc1_adapted and not r._moe_layers
+    monkeypatch.setattr(r, "_topology_key", lambda: (1, 1, 2, 1))
+    r._parallel_shape = replace(r._parallel_shape, cp=2)
+    selected = LoRASlotRef("checkpoint", "selected")
+    for owner in model.modules():
+        if isinstance(owner, LoRA):
+            prefix = owner.adapter_model_prefix
+            assert owner.load_lora_slot(
+                selected,
+                {
+                    prefix + ".lora_A.weight": torch.zeros(
+                        512, owner.in_features
+                    ).bfloat16(),
+                    prefix + ".lora_B.weight": torch.zeros(
+                        owner.out_features, 512
+                    ).bfloat16(),
+                },
+                alpha=512,
+                requires_grad=True,
+            )
+    rows = 65_536
+    req = ForwardInput(input_tokens=torch.arange(2 * rows), hidden_states=True)
+    sig = r._memory_signature_from_requests(
+        [req],
+        slot_group_count=1,
+        grad_modes=(True,),
+        slot_groups=((selected, True),),
+    )
+    required = r._estimate_required_memory_bytes_from_values(
+        packed_tokens=2 * rows,
+        logical_tokens=2 * rows,
+        output_bytes=2 * rows * 32 * 2,
+        signature=sig,
+        group_rows=((rows, True),),
+        slot_refs=(selected,),
+    )
+    monkeypatch.setattr(r, "_available_memory_bytes", lambda: 1_150_000_000)
+    assert not r._memory_check_required(required).fits
+    assert _lora_modules_per_layer(model) == 7
+    assert (
+        sum(len(shape) == 5 and shape[2] == 512 for shape in sig.slot_shapes[0][1])
+        == 896
+    )
+    # Sol's CPU autograd storage witness already exceeds this cap before
+    # other activations, outputs, cold scratch and the safety factor.
+    assert required >= 1_174_405_120
+    assert not torch.cuda.is_initialized()
+
+
+# Frozen rank-8/all-target Qwen3.8-27B complete lifecycle receipts:
+# workstreams/cp-dense/gpu/evidence/timed-v2-cp{2,4,8}/result.rank*.json;
+# lc-qual recovered-r2/results/dense-n65536/capacity-cp{2,4}/result.rank*.json.
+# Rows are the CPU planner's worst attention/GDN extent, not tokens / CP.
+# Admission prices additional allocations; compare resident + demand to the
+# measured allocated peak. Reserved peaks are allocator cache, not live bytes.
+@pytest.mark.parametrize(
+    "cp,tokens,rows,resident,measured,usable",
+    [
+        (2, 32768, 19456, 55332260352, 74358620160, 59837713613),
+        (4, 131072, 54528, 55332869632, 104346683392, 84904971469),
+        (8, 131072, 33280, 55332021760, 84065598464, 47617608909),
+        (2, 65536, 41472, 55333083648, 95180360704, 63154038375),
+        (4, 65536, 24576, 55332046336, 77951084544, 53037246055),
+    ],
+)
+def test_dense_cp_rank8_floor_covers_measured_lifecycles(
+    cp, tokens, rows, resident, measured, usable
+):
+    r = dense_rank()
+    r._geometry = replace(
+        r._geometry,
+        num_attention_heads=24,
+        num_query_groups=4,
+        kv_channels=256,
+        gdn_key_heads=16,
+        gdn_value_heads=48,
+        gdn_key_head_dim=128,
+        gdn_value_head_dim=128,
+        gdn_conv_kernel=4,
+    )
+    r._gdn_layers = 48
+    r._attention_output_gate = True
+    r._mixer_top_gaps = (0, 1)
+    r._lora_modules_per_layer = 8
+    r._topology_key = lambda: (1, 1, cp, 1)
+    r._parallel_shape = replace(r._parallel_shape, cp=cp)
+    req = ForwardInput(input_tokens=torch.arange(tokens), hidden_states=True)
+    sig = r._memory_signature_from_requests(
+        [req], slot_group_count=1, grad_modes=(True,)
+    )
+    sig = replace(sig, slot_shapes=((True, ((2, 5120, 8, 8, 5120),) * 8),))
+    # A small learned slope must never erase the analytic charge.
+    r._memory_profiles[sig] = _MemoryProfile(1, tokens)
+    required = r._estimate_required_memory_bytes_from_values(
+        packed_tokens=tokens,
+        logical_tokens=tokens,
+        output_bytes=tokens * 5120 * 2,
+        signature=sig,
+        group_rows=((rows, True),),
+        gdn_segments=1,
+    )
+    assert resident + required >= measured
+    assert required <= usable
 
 
 # Qwen3.8-27B TP1/CP1 no-grad target-only waves (random init, ART a68fa500,

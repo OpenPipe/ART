@@ -1279,7 +1279,10 @@ def _lora_modules_per_layer(model: torch.nn.Module) -> int:
     except (AttributeError, ImportError, RuntimeError, TypeError):
         return 0
     return max(
-        (sum(type(module) is LoRA for module in layer.modules()) for layer in layers),
+        (
+            sum(isinstance(module, LoRA) for module in layer.modules())
+            for layer in layers
+        ),
         default=0,
     )
 
