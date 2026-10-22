@@ -27,3 +27,9 @@ mask the root layout without modifying process flags.
 Record `POLICY_VERSION` and kernel/runtime versions with a run; retain the same
 policy between forward, backward and replay. The GPU regression is
 `tests/integration/megatron/test_canonical_numerics.py`.
+
+`execution(None, numerical_policy="native", deterministic_native=True)` scopes
+the standard PyTorch determinism opt-in while retaining native root geometry.
+ART's FLASH lowering preserves its forward and uses deterministic TRITON
+backward, converting saved LSE/cotangent units at the existing boundary. The
+process-wide flags, locking and thread-quiescence requirements above still apply.

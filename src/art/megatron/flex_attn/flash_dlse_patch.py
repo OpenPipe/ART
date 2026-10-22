@@ -8,6 +8,7 @@ public autograd-compatible tile override for CUTE flex attention.
 from __future__ import annotations
 
 import inspect
+import math
 from typing import Any, cast
 
 import torch
@@ -15,6 +16,7 @@ import torch
 _PATCH_APPLIED = False
 _TILE_PATCH_APPLIED = False
 _DQ_POSTPROCESS_PATCH_APPLIED = False
+_DETERMINISTIC_BWD_PATCH_APPLIED = False
 
 
 def _sm90_block_sparse_fwd_config(cute_interface: Any, head_dim: int, head_dim_v: int):
@@ -583,3 +585,39 @@ def apply_flash_flex_dlse_patch() -> None:
         flex_attention_backward_with_flash_dlse
     )
     _PATCH_APPLIED = True
+
+
+def apply_deterministic_flash_backward_patch() -> None:
+    """Keep FLASH forward; honor PyTorch determinism with Triton backward.
+
+    FLASH saves natural-log LSE, whereas Triton consumes log2 LSE. Convert
+    both the saved value and its cotangent at the existing lowering boundary.
+    """
+    global _DETERMINISTIC_BWD_PATCH_APPLIED
+    if _DETERMINISTIC_BWD_PATCH_APPLIED:
+        return
+
+    import torch._inductor.kernel.flex.flex_attention as flex_attention_mod
+    from torch._inductor.lowering import lowerings
+
+    operation = torch.ops.higher_order.flex_attention_backward
+    original = lowerings[operation]
+
+    def backward(*args, **kwargs):
+        if (
+            not kwargs
+            and torch.are_deterministic_algorithms_enabled()
+            and args[11].get("BACKEND") == "FLASH"
+        ):
+            converted = list(args)
+            multiply = lowerings[torch.ops.aten.mul.Tensor]
+            converted[4] = multiply(args[4], math.log2(math.e))
+            if args[6] is not None:
+                converted[6] = multiply(args[6], math.log(2.0))
+            converted[11] = {**args[11], "BACKEND": "TRITON"}
+            return original(*converted)
+        return original(*args, **kwargs)
+
+    cast(Any, flex_attention_mod).flex_attention_backward = backward
+    lowerings[operation] = backward
+    _DETERMINISTIC_BWD_PATCH_APPLIED = True

@@ -93,7 +93,10 @@ def capture(function: _F) -> _F:
 
 @contextmanager
 def execution(
-    layout: RootLayout | None, *, numerical_policy: NumericalPolicy = "canonical"
+    layout: RootLayout | None,
+    *,
+    numerical_policy: NumericalPolicy = "canonical",
+    deterministic_native: bool = False,
 ) -> Iterator[None]:
     """One synchronous forward/recompute/backward scope; no async suspension.
 
@@ -101,7 +104,9 @@ def execution(
     backward completes. Other TrainerRank/planner/prefetch threads inherit them.
     Callers must dedicate the process to this policy or quiesce other PyTorch
     work; this lock only serializes callers of execution(), including native
-    scopes. Never suspend async work here. Native scopes only mask the layout.
+    scopes. Never suspend async work here. Native scopes mask the layout;
+    deterministic_native=True also opts into deterministic backward without
+    selecting canonical root geometry.
     """
     if numerical_policy not in ("native", "canonical"):
         raise ValueError(f"unknown numerical policy: {numerical_policy}")
@@ -109,7 +114,7 @@ def execution(
         raise ValueError("canonical execution requires a root layout")
     with _EXECUTION_LOCK:
         token = _LAYOUT.set(layout if numerical_policy == "canonical" else None)
-        if numerical_policy == "native":
+        if numerical_policy == "native" and not deterministic_native:
             try:
                 yield
             finally:
