@@ -252,6 +252,9 @@ jobs:
             tests/unit/test_trainer_rank_split.py \
             tests/unit/test_megatron_compile_garbage.py \
             tests/unit/test_canonical_numerics.py \
+            tests/unit/test_segmented_expert_lora.py \
+            tests/unit/test_segmented_gdn.py \
+            tests/unit/test_segmented_router.py \
             tests/unit/test_lora_layouts.py \
             tests/unit/test_trainer_rank_forward_profile.py \
             tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
@@ -302,6 +305,9 @@ jobs:
             --ignore=tests/unit/test_trainer_rank_head_memory.py \
             --ignore=tests/unit/test_grouped_planner_replay.py \
             --ignore=tests/unit/test_canonical_numerics.py \
+            --ignore=tests/unit/test_segmented_expert_lora.py \
+            --ignore=tests/unit/test_segmented_gdn.py \
+            --ignore=tests/unit/test_segmented_router.py \
             --ignore=tests/unit/test_lora_layouts.py \
             --ignore=tests/unit/test_trainer_rank_forward_profile.py \
             --ignore=tests/unit/test_hybridep_planner_replay.py \
