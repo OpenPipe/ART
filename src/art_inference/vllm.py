@@ -208,6 +208,15 @@ def patch_history(importer=importlib.import_module) -> None:
 
     setattr(responses_utils, "construct_input_messages", input_messages)
     setattr(responses_serving, "construct_input_messages", input_messages)
+    if hasattr(
+        responses_serving.OpenAIServingResponses, "_render_resolved_response_inputs"
+    ):
+        # vLLM 0.31 moved Responses rendering (and this imported alias) here.
+        setattr(
+            importer("vllm.renderers.online_renderer"),
+            "construct_input_messages",
+            input_messages,
+        )
 
     engine = importer("vllm.v1.engine.async_llm").AsyncLLM
     generate = engine.generate
@@ -349,7 +358,20 @@ def patch_history(importer=importlib.import_module) -> None:
                 if request.previous_response_id:
                     async with self.response_store_lock:
                         previous = self.response_store.get(request.previous_response_id)
-                conversation, inputs = await self._make_request(request, previous)
+                if hasattr(self, "_make_request"):  # vLLM 0.24
+                    conversation, inputs = await self._make_request(request, previous)
+                else:  # vLLM 0.31
+                    rendered = await self._render_resolved_response_inputs(
+                        request, previous
+                    )
+                    if isinstance(
+                        rendered,
+                        importer(
+                            "vllm.entrypoints.serve.engine.protocol"
+                        ).ErrorResponse,
+                    ):
+                        return
+                    conversation, inputs = rendered.messages, [rendered.engine_input]
                 if len(inputs) != 1:
                     return
                 protocol = importer("vllm.entrypoints.openai.chat_completion.protocol")

@@ -17,9 +17,16 @@ from art_inference.append_only import (
 
 
 @pytest.mark.parametrize("reasoning", [None, "", "\nthought\n"])
-def test_dsv32_earlier_turn_framing_survives_a_new_user_turn(reasoning):
-    def render(index, messages, thinking_mode):
-        last_user = max(i for i, m in enumerate(messages) if m["role"] == "user")
+@pytest.mark.parametrize("cached_last_user", [False, True])
+def test_dsv32_earlier_turn_framing_survives_a_new_user_turn(
+    reasoning, cached_last_user
+):
+    def render(index, messages, thinking_mode, last_user_idx=None):
+        last_user = (
+            max(i for i, m in enumerate(messages) if m["role"] == "user")
+            if last_user_idx is None
+            else last_user_idx
+        )
         thinking = thinking_mode == "thinking"
         if messages[index]["role"] == "user":
             return "USER" + (
@@ -39,8 +46,17 @@ def test_dsv32_earlier_turn_framing_survives_a_new_user_turn(reasoning):
     ]
 
     def encode(messages):
+        kwargs = (
+            {
+                "last_user_idx": max(
+                    i for i, m in enumerate(messages) if m["role"] == "user"
+                )
+            }
+            if cached_last_user
+            else {}
+        )
         return "".join(
-            encoding.render_message(i, messages, "thinking")
+            encoding.render_message(i, messages, "thinking", **kwargs)
             for i in range(len(messages))
         )
 
