@@ -35,6 +35,7 @@ from ..vllm_runtime import (
 )
 from .train import (
     UnslothTrainContext,
+    _validate_rl_gradient_accumulation,
     create_unsloth_train_context,
     gc_and_empty_cuda_cache,
     run_unsloth_rl_training,
@@ -441,8 +442,7 @@ class UnslothService:
         configured = int(
             self.config.get("trainer_args", {}).get("gradient_accumulation_steps", 1)
         )
-        if configured < 1:
-            raise ValueError("Unsloth gradient accumulation must be >= 1")
+        _validate_rl_gradient_accumulation(configured)
         requested = config.grad_accumulation_sequences
         if requested is not None and requested != configured:
             raise ValueError(
