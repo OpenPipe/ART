@@ -389,10 +389,15 @@ async def ruler_score_group(
                 h.model_copy(deep=True) for h in t.additional_histories
             ],
             reward=t.reward,
+            initial_policy_version=t.initial_policy_version,
+            final_policy_version=t.final_policy_version,
             metrics=t.metrics.copy(),
             metadata=t.metadata.copy(),
             logs=t.logs.copy(),
+            start_time=t.start_time,
         )
+        if t._policy_token_counts is not None:
+            new_traj._policy_token_counts = dict(t._policy_token_counts)
         new_trajectories.append(new_traj)
 
     for trajectory in new_trajectories:
@@ -430,4 +435,12 @@ async def ruler_score_group(
         traj.reward = score.score  # Replace reward with RULER score
         traj.log(f"RULER explanation: {score.explanation}")
 
-    return art.TrajectoryGroup(new_trajectories)
+    # Keep the group's failed rollouts, metadata (e.g. scenario_id), metrics and logs:
+    # logging derives exception_rate and scenario metrics from them.
+    return art.TrajectoryGroup(
+        new_trajectories,
+        exceptions=group.exceptions,
+        metadata=group.metadata.copy(),
+        metrics=group.metrics.copy(),
+        logs=group.logs.copy(),
+    )
