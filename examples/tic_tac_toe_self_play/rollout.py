@@ -111,7 +111,7 @@ class TicTacToeScenario(BaseModel):
 @weave.op
 async def rollout(
     x_model: art.Model, o_model: art.Model, scenario: TicTacToeScenario
-) -> list[art.Trajectory]:
+) -> tuple[art.Trajectory, art.Trajectory]:
     game = generate_game()
 
     player_states = {
