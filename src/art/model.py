@@ -1683,7 +1683,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
                 pl.read_ndjson(f"{output_dir}/history.jsonl")
                 .drop_nulls(subset=[best_checkpoint_metric])
                 .group_by("step")
-                .mean()
+                .agg(pl.col(best_checkpoint_metric).mean())
                 .sort(best_checkpoint_metric)
                 .select(pl.col("step").last())
                 .item()
