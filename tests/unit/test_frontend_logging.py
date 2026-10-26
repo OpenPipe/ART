@@ -215,6 +215,46 @@ class TestHistoryJsonlCompatibility:
         assert "val/reward_std_dev" in df.columns
 
     @pytest.mark.asyncio
+    async def test_delete_checkpoints_keeps_latest_and_best_step(self, tmp_path: Path):
+        """delete_checkpoints averages only the metric, not string columns like recorded_at."""
+        model = TrainableModel(
+            run_name="test-model",
+            name="test-model",
+            project="test-project",
+            base_model="gpt-4",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+        mock_backend = MagicMock()
+        mock_backend._get_step = AsyncMock(return_value=3)
+        mock_backend._delete_checkpoint_files = AsyncMock()
+        model._backend = mock_backend
+
+        for step, reward in [(1, 0.2), (2, 0.9), (3, 0.5)]:
+            await model.log(
+                [
+                    TrajectoryGroup(
+                        trajectories=[
+                            Trajectory(
+                                reward=reward,
+                                messages_and_choices=[
+                                    {"role": "user", "content": "Hello"},
+                                    {"role": "assistant", "content": "Hi!"},
+                                ],
+                            )
+                        ],
+                        exceptions=[],
+                    )
+                ],
+                split="train",
+                step=step,
+            )
+
+        await model.delete_checkpoints("train/reward")
+
+        mock_backend._delete_checkpoint_files.assert_awaited_once_with(model, [3, 2])
+
+    @pytest.mark.asyncio
     async def test_history_appends_entries(
         self, tmp_path: Path, sample_trajectory_groups: list[TrajectoryGroup]
     ):
