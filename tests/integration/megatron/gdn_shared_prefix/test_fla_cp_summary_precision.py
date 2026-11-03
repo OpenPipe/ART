@@ -1,27 +1,74 @@
 """A slow-decay layer detects reduced-precision rank-transition products.
 
-Run with torchrun and GDN_SUMMARY_REGRESSION=1. The beta=0 recurrence has an
+The beta=0 recurrence has an
 independent closed FP64 form for outputs, final state and initial-state grad.
 Both ordinary and packed chains retain the original fixed 2x CP1 error gate.
 """
 
-from datetime import timedelta
 import json
-import os
 from pathlib import Path
 
 import pytest
-import torch
-import torch.distributed as dist
 
-from .gates import compare_errors
-from .reference import error_metrics
+torch = pytest.importorskip("torch")
+pytest.importorskip("fla.ops.gated_delta_rule")
+import torch.distributed as dist  # noqa: E402
+import torch.multiprocessing as mp  # noqa: E402
+
+from .distributed_init import file_init_method  # noqa: E402
 
 
+def error_metrics(actual, reference):
+    difference = actual.double() - reference.double()
+    return {
+        "relative_l2": float(
+            difference.norm() / reference.double().norm().clamp_min(1e-12)
+        ),
+        "max_abs": float(difference.abs().max()),
+    }
+
+
+def compare_errors(cp1, candidate):
+    return {
+        metric: {
+            "baseline": cp1[metric],
+            "candidate": candidate[metric],
+            "limit": 2 * max(cp1[metric], 1e-12),
+            "pass": candidate[metric] <= 2 * max(cp1[metric], 1e-12),
+        }
+        for metric in ("relative_l2", "max_abs")
+    }
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
 @pytest.mark.parametrize("packed", [False, True])
-def test_slow_decay_summary_layer(packed):
-    if os.environ.get("GDN_SUMMARY_REGRESSION") != "1":
-        pytest.skip("requires granted GPUs and torchrun")
+def test_slow_decay_summary_layer(cp_size, packed, tmp_path):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < cp_size:
+        pytest.skip(f"requires {cp_size} granted CUDA devices")
+    mp.spawn(
+        _worker,
+        args=(cp_size, packed, file_init_method(tmp_path, "summary"), str(tmp_path)),
+        nprocs=cp_size,
+        join=True,
+    )
+    for rank in range(cp_size):
+        report = json.loads((tmp_path / f"packed{packed}.rank{rank}.json").read_text())
+        assert all(check["pass"] for row in report.values() for check in row.values())
+
+
+def _worker(rank, world, packed, init_method, output_dir):
+    torch.cuda.set_device(rank)
+    torch.set_num_threads(2)
+    dist.init_process_group(
+        "nccl", init_method=init_method, rank=rank, world_size=world
+    )
+    try:
+        _slow_decay_summary_layer(packed, output_dir)
+    finally:
+        dist.destroy_process_group()
+
+
+def _slow_decay_summary_layer(packed, output_dir):
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     from art.megatron.gdn.fla_cp import chunk_gated_delta_rule_native_cp
@@ -141,31 +188,9 @@ def test_slow_decay_summary_layer(packed):
         report[name] = compare_errors(
             error_metrics(baseline, reference), error_metrics(actual, reference)
         )
-    destination = os.environ.get("GDN_SUMMARY_RESULTS")
-    if destination:
-        path = Path(destination)
-        path.mkdir(parents=True, exist_ok=True)
-        (path / f"packed{packed}.rank{rank}.json").write_text(
-            json.dumps(report, indent=2) + "\n"
-        )
+    (Path(output_dir) / f"packed{packed}.rank{rank}.json").write_text(
+        json.dumps(report, indent=2) + "\n"
+    )
     assert all(check["pass"] for row in report.values() for check in row.values()), (
         report
     )
-
-
-if __name__ == "__main__":
-    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
-    torch.set_num_threads(2)
-    dist.init_process_group("nccl", timeout=timedelta(minutes=15))
-    failed = False
-    try:
-        for packed_case in (False, True):
-            try:
-                test_slow_decay_summary_layer(packed_case)
-                print("PASS", packed_case, dist.get_rank(), flush=True)
-            except AssertionError:
-                failed = True
-                print("FAIL", packed_case, dist.get_rank(), flush=True)
-    finally:
-        dist.destroy_process_group()
-    raise SystemExit(int(failed))
