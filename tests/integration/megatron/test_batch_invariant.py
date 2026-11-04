@@ -15,6 +15,19 @@ pytestmark = [
 LENGTHS = (1, 4, 5, 63, 64, 65, 129, 1000)
 
 
+def _configure_tiny_provider(provider, *, moe):
+    provider.hidden_dropout = provider.attention_dropout = 0.0
+    provider.num_layers, provider.hidden_size = 2, 128
+    provider.num_attention_heads, provider.num_query_groups = 4, 2
+    provider.kv_channels, provider.ffn_hidden_size = 32, 256
+    # Qwen's 25% rotary width is now 8; its three sections cover half of it.
+    provider.mrope_section = [1, 1, 2]
+    provider.linear_attention_freq = [0, 1]
+    if moe:
+        provider.num_moe_experts, provider.moe_router_topk = 4, 2
+        provider.moe_ffn_hidden_size = 128
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_prefix_batch_and_backward(dtype):
     from art.megatron.batch_invariant.ops import linear, logsumexp, rms_norm
@@ -120,22 +133,13 @@ def test_tiny_trainer_prefix_packing_and_autograd(monkeypatch, tmp_path, moe):
     )
     runtime = None
     try:
-
-        def configure(provider):
-            provider.hidden_dropout = provider.attention_dropout = 0.0
-            provider.num_layers, provider.hidden_size = 2, 128
-            provider.num_attention_heads, provider.num_query_groups = 4, 2
-            provider.kv_channels, provider.ffn_hidden_size = 32, 256
-            provider.linear_attention_freq = [0, 1]
-            if moe:
-                provider.num_moe_experts, provider.moe_router_topk = 4, 2
-                provider.moe_ffn_hidden_size = 128
-
         runtime = build_training_runtime(
             model_identifier="Qwen/Qwen3.6-35B-A3B" if moe else "Qwen/Qwen3.8-27B",
             model_support_key="qwen3_5_moe" if moe else "qwen3_5_dense",
             model_initialization="random",
-            provider_configure=configure,
+            provider_configure=lambda provider: _configure_tiny_provider(
+                provider, moe=moe
+            ),
             build_optimizer=False,
             print_env=False,
         )
