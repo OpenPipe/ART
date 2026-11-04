@@ -51,6 +51,8 @@ def rank():
             ),
         )
     )
+    # These estimator fixtures supply fixed rank-row counts, without a CP runtime.
+    cast(Any, result)._select_cp_ownership = lambda plan, **_: plan
     result._moe_output_bytes_per_token = 188416
     result._moe_checkpoint_grad_bytes_per_token = 188416
     return result
@@ -1176,7 +1178,9 @@ def test_megatron_checkpoint_shards_one_boundary_per_layer(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
     model = torch.nn.ModuleList([torch.nn.Linear(7, 7) for _ in range(3)])
     x = torch.randn(5, 1, 7, requires_grad=True)
-    with shard_saved_activations(object(), shape=tuple(x.shape), key="mcore") as stats:
+    with shard_saved_activations(
+        object(), shape=cast(tuple[int, int, int], tuple(x.shape)), key="mcore"
+    ) as stats:
         value = x.sin()  # Ordinary saves of this shape must stay local.
         for layer in model:
             value = random.checkpoint(layer, False, value)

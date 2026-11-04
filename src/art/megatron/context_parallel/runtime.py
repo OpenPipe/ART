@@ -225,6 +225,48 @@ def summarize_prefix_tree_plan(
     )
 
 
+def context_parallel_ownership_candidates(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+) -> tuple[tuple[ContextParallelConfig, float], ...]:
+    """Price original and token-balanced ownership with the same attention program.
+
+    The trainer compares their full admission bytes before selecting one. Both
+    layouts retain their causal pair imbalance, remote waves and owned-token cost.
+    """
+    _, bundle, _, _ = _get_or_build_planning_bundle(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
+        build_gdn_execution_spec=False,
+    )
+    lengths = [float(r.size()) for r in bundle.chunk_ranges]
+    balanced = _contiguous_chunk_assignment(q_weights=lengths, cp_size=topology.cp)
+    pairs, _ = _build_chunk_pair_program(
+        bundle.row_spec, chunk_ranges=bundle.chunk_ranges
+    )
+    program = _pair_program(pairs, chunk_ranges=bundle.chunk_ranges)
+    return tuple(
+        (
+            replace(config, chunk_owners=owners),
+            _evaluate_plan(
+                program=program,
+                owners=owners,
+                wave_assignment=bundle.wave_assignment,
+                cp_size=topology.cp,
+                config=config,
+            )["score"],
+        )
+        for owners in dict.fromkeys((bundle.owners, balanced))
+    )
+
+
 def _get_or_build_bundle_rank_plan(
     *,
     planning_key: str,
@@ -1917,31 +1959,23 @@ def _search_chunk_assignment(
         cp_size=cp_size,
         config=config,
     )
-    if config.planner_max_owned_tokens is not None:
-        from ._ownership import capped_owners
-
-        if config.workload_profile is not None:
-            raise ValueError("CP ownership ceiling does not support profiled layouts")
-        lengths = [int(range_.size()) for range_ in chunk_ranges]
-        owners = capped_owners(
-            generic[0],
-            _contiguous_chunk_assignment(q_weights=lengths, cp_size=cp_size),
-            lengths,
-            cp_size,
-            config.planner_max_owned_tokens,
+    if config.chunk_owners is not None:
+        owners = config.chunk_owners
+        if len(owners) != len(chunk_ranges) or any(
+            not 0 <= owner < cp_size for owner in owners
+        ):
+            raise ValueError("CP ownership does not match the chunk inventory")
+        return (
+            owners,
+            generic[1],
+            _evaluate_plan(
+                program=_pair_program(pair_matrix, chunk_ranges=chunk_ranges),
+                owners=owners,
+                wave_assignment=generic[1],
+                cp_size=cp_size,
+                config=config,
+            ),
         )
-        if owners != generic[0]:
-            return (
-                owners,
-                generic[1],
-                _evaluate_plan(
-                    program=_pair_program(pair_matrix, chunk_ranges=chunk_ranges),
-                    owners=owners,
-                    wave_assignment=generic[1],
-                    cp_size=cp_size,
-                    config=config,
-                ),
-            )
     profile = config.workload_profile
     if profile is None:
         return generic

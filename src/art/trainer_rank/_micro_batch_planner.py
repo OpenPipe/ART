@@ -526,6 +526,11 @@ def _plan_group_rows(
                             group.packed, multiple=int(topology.tp)
                         ),
                         topology=topology,
+                        **(
+                            {"config": group.cp_config}
+                            if group.cp_config is not None
+                            else {}
+                        ),
                     ),
                 )
             ),
@@ -1358,7 +1363,7 @@ def _plan_flat_forward(
                 )
             )
 
-        return _impl._FlatForwardPlan(
+        plan = _impl._FlatForwardPlan(
             request_count=len(requests),
             output_metadata=tuple(
                 self._forward_output_metadata(request, checkpoint=checkpoint)
@@ -1380,6 +1385,69 @@ def _plan_flat_forward(
             inactive_logical_tokens=logical_tokens
             - _impl._active_logical_tokens(requests),
         )
+
+    return self._select_cp_ownership(plan, sync_planning_errors=sync_planning_errors)
+
+
+def _select_cp_ownership(
+    self: TrainerRank, plan: _FlatForwardPlan, *, sync_planning_errors: bool = False
+) -> _FlatForwardPlan:
+    """Choose ownership by full admission fit, then priced step time and bytes.
+
+    Keep the lowest-byte refusal if neither candidate fits: the ordinary caller
+    owns admission/recovery and must still refuse it. No safety factor, empirical
+    floor, reserve or recovery policy is changed here.
+    """
+    if plan.signature.topology[2] <= 1 or not plan.groups:
+        return plan
+    from art.megatron.context_parallel.runtime import (
+        context_parallel_ownership_candidates,
+    )
+    from art.megatron.training.microbatches import _context_parallel_config_for_provider
+
+    topology = self._topology()
+    choices = []
+    with self._planning_status(sync_planning_errors):
+        handler = self.runtime.model_support_handler
+        config = _context_parallel_config_for_provider(
+            self.runtime.provider, self.device, handler
+        )
+        for group in plan.groups:
+            batch = _impl._pad_packed_batch(group.packed, multiple=int(topology.tp))
+            choices.append(
+                context_parallel_ownership_candidates(
+                    group_ids=batch.group_ids,
+                    parent_ids=batch.parent_ids,
+                    topology=topology,
+                    config=config,
+                    original_seq_len=int(batch.tokens.shape[1]),
+                )
+            )
+    if all(len(c) == 1 for c in choices):
+        return plan
+    candidates = []
+    for index in range(max(map(len, choices))):
+        selected = [c[min(index, len(c) - 1)] for c in choices]
+        candidate = replace(
+            plan,
+            groups=tuple(
+                replace(group, cp_config=c[0])
+                for group, c in zip(plan.groups, selected, strict=True)
+            ),
+        )
+        check = self._memory_check(
+            candidate,
+            **({"sync_planning_errors": True} if sync_planning_errors else {}),
+        )
+        step_ms = sum(c[1] for c in selected) * self._num_layers
+        key = (
+            not check.fits,
+            step_ms if check.fits else check.estimated_required_bytes,
+            check.estimated_required_bytes,
+            index,
+        )
+        candidates.append((key, candidate))
+    return min(candidates, key=lambda c: c[0])[1]
 
 
 def _fill_planner_snapshot(
@@ -2138,6 +2206,11 @@ def _plan_retained_tokens(self: TrainerRank, plan: _FlatForwardPlan) -> int:
                 self._max_rank_model_tokens(
                     _impl._pad_packed_batch(group.packed, multiple=int(topology.tp)),
                     topology=topology,
+                    **(
+                        {"config": group.cp_config}
+                        if group.cp_config is not None
+                        else {}
+                    ),
                 ),
             )
         )

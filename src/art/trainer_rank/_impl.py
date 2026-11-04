@@ -1013,6 +1013,7 @@ class _ForwardGroupPlan:
     packed: PrefixTreePack
     layout: PrefixTreeLayout | None = None
     input_row_fingerprints: tuple[tuple[int, str], ...] = ()
+    cp_config: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -3640,7 +3641,13 @@ class TrainerRank:
         self._validate_hybridep_topology()
         hybridep = (
             self._configure_hybridep(
-                tuple(group.packed for group in plan.groups), topology=self._topology()
+                tuple(group.packed for group in plan.groups),
+                topology=self._topology(),
+                **(
+                    {"configs": tuple(g.cp_config for g in plan.groups)}
+                    if any(g.cp_config is not None for g in plan.groups)
+                    else {}
+                ),
             )
             if plan.groups
             else None
@@ -3653,7 +3660,13 @@ class TrainerRank:
                     self._set_hybridep_rows(hybridep[0][group_index])
                 with torch.set_grad_enabled(group.grad_enabled):
                     with use_lora_slot(group.slot_ref):
-                        prepared = self._prepare_packed_forward(group.packed)
+                        prepared = (
+                            self._prepare_packed_forward(group.packed)
+                            if group.cp_config is None
+                            else self._prepare_packed_forward(
+                                group.packed, config=group.cp_config
+                            )
+                        )
                         from art.megatron.routed_experts import (
                             prepare_routes,
                             use_routes,
@@ -4896,11 +4909,15 @@ class TrainerRank:
     def _prepare_packed_forward(
         self,
         batch: PrefixTreePack,
+        *,
+        config: Any | None = None,
     ) -> _PreparedPackedForward:
         topology = self._topology()
         batch = _pad_packed_batch(batch, multiple=int(topology.tp))
         if int(topology.cp) > 1:
-            return self._prepare_context_parallel_forward(batch, topology=topology)
+            return self._prepare_context_parallel_forward(
+                batch, topology=topology, config=config
+            )
         from art.megatron.prefix_tree_state import create_prefix_tree_state
         from art.megatron.training.microbatches import (
             _art_flex_sliding_windows,
@@ -4944,6 +4961,7 @@ class TrainerRank:
         batches: Sequence[PrefixTreePack],
         *,
         topology: "ParallelTopology",
+        configs: tuple[Any, ...] | None = None,
     ) -> tuple[tuple[int, ...], int] | None:
         from megatron.core import parallel_state as ps
 
@@ -4966,7 +4984,12 @@ class TrainerRank:
         )
         sequence_length = max(int(batch.tokens.shape[1]) for batch in padded)
         rows = tuple(
-            self._max_rank_model_tokens(batch, topology=topology) for batch in padded
+            self._max_rank_model_tokens(
+                batch,
+                topology=topology,
+                **({"config": configs[i]} if configs is not None else {}),
+            )
+            for i, batch in enumerate(padded)
         )
         current = fused_a2a._hybrid_ep_buffer
         live = self._has_live_hybridep_graphs()
@@ -5037,6 +5060,7 @@ class TrainerRank:
         batch: PrefixTreePack,
         *,
         topology: "ParallelTopology",
+        config: Any | None = None,
     ) -> int:
         sequence_length = int(batch.tokens.shape[1])
         if int(topology.cp) <= 1:
@@ -5056,7 +5080,8 @@ class TrainerRank:
                     group_ids=batch.group_ids,
                     parent_ids=batch.parent_ids,
                     topology=topology,
-                    config=_context_parallel_config_for_provider(
+                    config=config
+                    or _context_parallel_config_for_provider(
                         self.runtime.provider,
                         self.device,
                         handler,
@@ -5075,6 +5100,7 @@ class TrainerRank:
         batch: PrefixTreePack,
         *,
         topology: "ParallelTopology",
+        config: Any | None = None,
     ) -> _PreparedPackedForward:
         from megatron.core import parallel_state as ps
 
@@ -5110,7 +5136,8 @@ class TrainerRank:
         prepared = prepare_cp_micro(
             micro=sparse_micro,
             topology=topology,
-            config=_context_parallel_config_for_provider(
+            config=config
+            or _context_parallel_config_for_provider(
                 provider,
                 self.device,
                 handler,
@@ -5234,6 +5261,7 @@ class TrainerRank:
     _submit_speculative_wave_planning = (
         _micro_batch_planner._submit_speculative_wave_planning
     )
+    _select_cp_ownership = _micro_batch_planner._select_cp_ownership
     _plan_flat_forward = _micro_batch_planner._plan_flat_forward
     _fill_planner_snapshot = _micro_batch_planner._fill_planner_snapshot
     _complete_planner_observation = _micro_batch_planner._complete_planner_observation
