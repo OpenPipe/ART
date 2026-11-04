@@ -4599,7 +4599,7 @@ requires-dist = [
     { name = "wandb", marker = "extra == 'backend-cu130'", specifier = "==0.28.0" },
     { name = "wandb", marker = "extra == 'megatron'", specifier = "==0.28.0" },
     { name = "wandb", marker = "extra == 'megatron-cu130'", specifier = "==0.28.0" },
-    { name = "weave", specifier = ">=0.52.41" },
+    { name = "weave", specifier = ">=0.54.0" },
 ]
 provides-extras = ["plotting", "distributed", "distributed-cu130", "tensors", "backend", "backend-cu130", "megatron", "megatron-cu130", "langgraph", "tinker"]
 
@@ -8416,12 +8416,13 @@ wheels = [
 
 [[package]]
 name = "weave"
-version = "0.52.41"
+version = "0.54.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "cachetools" },
     { name = "click" },
     { name = "diskcache-weave" },
+    { name = "distro" },
     { name = "gql", extra = ["httpx"] },
     { name = "jsonschema" },
     { name = "opentelemetry-api" },
@@ -8430,13 +8431,15 @@ dependencies = [
     { name = "packaging" },
     { name = "polyfile-weave" },
     { name = "pydantic" },
+    { name = "requests" },
     { name = "sentry-sdk" },
+    { name = "sniffio" },
     { name = "tenacity" },
     { name = "tzdata", marker = "sys_platform == 'win32'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/96/7c/f0c54919dc390beaf33086e15abdc1b8499c6273c2035d73703ed8a0b9d6/weave-0.52.41.tar.gz", hash = "sha256:59159952f9c7c65d78dd4f7a96bfc13accb2f3d93cb43583af6c6d05c5036b4d", size = 937328, upload-time = "2026-05-19T22:03:03.124Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a1/b3/c52793f9fd40a1d14b1c23f07dc3974836ceee5997f84b09941c2fb444f8/weave-0.54.0.tar.gz", hash = "sha256:0199a8af7a8f50db4f6fc10f12e2a127c3bcf2147b37fe9abf0eb471deff8206", size = 716418, upload-time = "2026-10-23T17:08:46.786Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fc/c9/5ccf0962f20189399edb7461afac225501a30a1567592baea899e5300ca5/weave-0.52.41-py3-none-any.whl", hash = "sha256:3f5611b2eee399a48ce26c1df4c3238418dd5a4cee1d0e8b86a3b7db8a7d931c", size = 1150794, upload-time = "2026-05-19T22:03:00.675Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/9d/782bef4f570b9f1db12720397d5edbe4f61cbf3cd64a4e08f63742834e74/weave-0.54.0-py3-none-any.whl", hash = "sha256:b47ae432e58fd2de9467a3cf451b49787b00eb27f67a69aa4823640214942451", size = 1054003, upload-time = "2026-10-23T17:08:44.431Z" },
 ]
 
 [[package]]
