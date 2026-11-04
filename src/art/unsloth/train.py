@@ -235,12 +235,25 @@ class UnslothTrainContext:
                     set_peft_model_state_dict as _set_peft_model_state_dict,  # type: ignore
                 )
 
+            drop_unused_adapters(self.peft_model)
             active_adapter = getattr(self.peft_model, "active_adapter", "default")
-            _set_peft_model_state_dict(
+            load_result = _set_peft_model_state_dict(
                 self.peft_model,
                 state_dict,
                 adapter_name=active_adapter,
             )
+            # The load is not strict, so a weight missing from the file would
+            # keep the previous adapter's value. Refuse instead of mixing them.
+            missing = [
+                key
+                for key in load_result.missing_keys
+                if "lora_" in key and f".{active_adapter}." in key
+            ]
+            if missing:
+                raise ValueError(
+                    f"{lora_path} is missing {len(missing)} LoRA weights, "
+                    f"such as {missing[0]}"
+                )
             self.peft_model.set_adapter(active_adapter)
         except Exception as exc:
             raise RuntimeError(f"Failed to set LoRA weights in-place: {exc}") from exc
@@ -268,6 +281,7 @@ class UnslothTrainContext:
             self.trainer.optimizer.load_state_dict(optimizer_state)
 
     def save_lora_adapter(self, lora_path: str) -> None:
+        drop_unused_adapters(self.peft_model)
         self.trainer.save_model(lora_path)
 
     def save_optimizer_state(self, checkpoint_dir: str) -> None:
@@ -577,6 +591,22 @@ def calculate_mask(
     parent_mask = parent_ids.unsqueeze(2) == group_ids.unsqueeze(1)
     mask = causal_mask & (group_mask | parent_mask)
     return mask
+
+
+def drop_unused_adapters(peft_model: PeftModel) -> list[str]:
+    """Delete every adapter except the active one(s), and return their names.
+
+    `_use_adapter` leaves KL reference adapters loaded on the shared PEFT model,
+    and `save_pretrained` writes every loaded adapter, each extra one into a
+    subfolder. Without this, a checkpoint would also carry the reference
+    adapter, and a later job reusing the model would save it too.
+    """
+    active = peft_model.active_adapter
+    keep = {active} if isinstance(active, str) else set(active)
+    dropped = [name for name in peft_model.peft_config if name not in keep]
+    for name in dropped:
+        peft_model.delete_adapter(name)
+    return dropped
 
 
 @contextmanager
