@@ -50,32 +50,39 @@ def test_bf16_lora_fp32_handoff_and_zero_suffix():
     a = torch.nn.Parameter(torch.randn(17, 8, dtype=x.dtype) * 0.01)
     b = torch.nn.Parameter(torch.randn(8, 19, dtype=x.dtype) * 0.01)
     for p in (a, b):
-        p._stark_fp32_gradients = True
+        setattr(p, "_stark_fp32_gradients", True)
     dy = torch.randn(65, 19, dtype=x.dtype)
     ops.lora(x, a, b, scale=4).backward(dy)
-    dx, da, db = x.grad.clone(), a.main_grad.clone(), b.main_grad.clone()
+    assert x.grad is not None
+    dx, da, db = (
+        x.grad.clone(),
+        getattr(a, "main_grad").clone(),
+        getattr(b, "main_grad").clone(),
+    )
     tmp = ops._mm(x.detach(), a.detach())
     scaled = dy * 4
-    dt = ops._mm(scaled, b.detach().T)
+    dt = torch.mm(scaled, b.detach().T)
     torch.testing.assert_close(
-        da, ops._mm(x.detach().float().T, dt.float()), rtol=0, atol=0
+        da, torch.mm(x.detach().float().T, dt.float()), rtol=0, atol=0
     )
     torch.testing.assert_close(
-        db, ops._mm(tmp.float().T, scaled.float()), rtol=0, atol=0
+        db, torch.mm(tmp.float().T, scaled.float()), rtol=0, atol=0
     )
     assert a.grad is None and b.grad is None and da.dtype == torch.float32
     assert not torch.equal(da, da.bfloat16().float())
     # Repeat accumulation consumes each contribution once, through saved aliases.
     ops.lora(x, a, b, scale=4).backward(dy)
-    torch.testing.assert_close(a.main_grad, 2 * da, rtol=0, atol=0)
-    a.main_grad = b.main_grad = None
+    torch.testing.assert_close(getattr(a, "main_grad"), 2 * da, rtol=0, atol=0)
+    setattr(a, "main_grad", None)
+    setattr(b, "main_grad", None)
     long = torch.cat((x.detach(), torch.randn(1, 17, dtype=x.dtype))).requires_grad_()
     ops.lora(long, a, b, scale=4).backward(
         torch.cat((dy, torch.zeros(1, 19, dtype=x.dtype)))
     )
+    assert long.grad is not None
     assert torch.equal(long.grad[:65], dx)
-    torch.testing.assert_close(a.main_grad, da, atol=1e-5, rtol=2e-5)
-    torch.testing.assert_close(b.main_grad, db, atol=1e-5, rtol=2e-5)
+    torch.testing.assert_close(getattr(a, "main_grad"), da, atol=1e-5, rtol=2e-5)
+    torch.testing.assert_close(getattr(b, "main_grad"), db, atol=1e-5, rtol=2e-5)
     assert not torch.cuda.is_initialized()
 
 

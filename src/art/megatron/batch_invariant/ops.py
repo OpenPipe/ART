@@ -5,7 +5,7 @@ from typing import Any, cast
 import torch
 import torch.nn.functional as F
 
-POLICY_VERSION = "fixed-tree-rows-v2"
+POLICY_VERSION = "certified-forward-native-vjp-v3"
 ROW_TILE = 128
 K_TILE = 32
 
@@ -48,9 +48,9 @@ def _cpu_mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def _mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.device.type != "cuda" or a.dtype == torch.float64:
         return _cpu_mm(a, b)
-    from .fast_ops import persistent
+    from .policy import forward
 
-    return persistent(a, b)
+    return forward(a, b)
 
 
 class _Matmul(torch.autograd.Function):
@@ -64,21 +64,17 @@ class _Matmul(torch.autograd.Function):
         (dy,) = grad_outputs
         a, b = ctx.saved_tensors
         return (
-            _mm(dy, b.T) if ctx.needs_input_grad[0] else None,
-            _mm(a.T.float(), dy.float()).to(b.dtype)
+            torch.mm(dy, b.T) if ctx.needs_input_grad[0] else None,
+            torch.mm(a.T.float(), dy.float()).to(b.dtype)
             if ctx.needs_input_grad[1] and b.dtype != torch.float64
-            else _mm(a.T, dy)
+            else torch.mm(a.T, dy)
             if ctx.needs_input_grad[1]
             else None,
         )
 
 
 def matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """x[..., K] @ weight[K, N], with the same geometry in forward and dgrad.
-
-    Wgrad has an inherently batch-dependent reduction domain; its K traversal
-    is fixed, with no shape-selected split. Parameters keep their identities.
-    """
+    """Certified row-invariant forward with native dgrad and FP32 wgrad."""
     if x.ndim < 2 or weight.ndim != 2 or x.shape[-1] != weight.shape[0]:
         raise ValueError("expected [..., K] @ [K, N]")
     if x.device != weight.device or x.dtype != weight.dtype:
@@ -98,10 +94,9 @@ class _Bias(torch.autograd.Function):
         (dy,) = grad_outputs
         (bias,) = ctx.saved_tensors
         flat = dy.reshape(-1, dy.shape[-1])
-        # The same fixed K schedule as wgrad; accumulate low-precision grads
-        # in FP32 and cast once at the parameter boundary.
+        # Native token reduction belongs to the separate gradient contract.
         dtype = torch.float64 if dy.dtype == torch.float64 else torch.float32
-        grad = _mm(flat.T.to(dtype), flat.new_ones((flat.shape[0], 1), dtype=dtype))
+        grad = flat.to(dtype).sum(0, keepdim=True).T
         return dy, grad[:, 0].to(bias.dtype)
 
 
@@ -186,7 +181,12 @@ def rms_norm(x, weight, eps, *, zero_centered=False):
     if x.shape[-1] != weight.numel() or weight.ndim != 1:
         raise ValueError("RMSNorm requires one weight per channel")
     if x.device.type == "cuda" and x.dtype != torch.float64:
-        return _RMSNorm.apply(x, weight, eps, zero_centered)
+        from .policy import norm
+
+        result = norm(x, weight, eps, zero_centered)
+        return (
+            _RMSNorm.apply(x, weight, eps, zero_centered) if result is None else result
+        )
     dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
     xx = x.to(dtype)
     r = torch.rsqrt(fixed_sum(xx * xx) / x.shape[-1] + eps)
@@ -205,11 +205,14 @@ class _GroupedMatmul(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_outputs):
         (dy,) = grad_outputs
-        from .fast_ops import experts
-
         x, *weights = ctx.saved_tensors
         dx = (
-            experts(dy, [w.T for w in weights], ctx.counts)
+            torch.cat(
+                [
+                    torch.mm(g, w.T)
+                    for g, w in zip(dy.split(ctx.counts), weights, strict=True)
+                ]
+            )
             if ctx.needs_input_grad[0]
             else None
         )
@@ -219,7 +222,7 @@ class _GroupedMatmul(torch.autograd.Function):
         ):
             dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
             dw.append(
-                _mm(part.to(dtype).T, grad.to(dtype)).to(w.dtype)
+                torch.mm(part.to(dtype).T, grad.to(dtype)).to(w.dtype)
                 if ctx.needs_input_grad[i + 2]
                 else None
             )
@@ -230,11 +233,16 @@ def grouped_matmul(x, weights, counts):
     return _GroupedMatmul.apply(x, tuple(counts), *weights)
 
 
-def _project(x, weight, counts):
+def _project(x, weight, counts, *, native=False):
+    mm = torch.mm if native else _mm
     if counts is None:
-        return _mm(x, weight)
+        return mm(x, weight)
     if weight.shape[0] == 1:
-        return _mm(x, weight[0])
+        return mm(x, weight[0])
+    if native:
+        return torch.cat(
+            [mm(part, w) for part, w in zip(x.split(counts), weight, strict=True)]
+        )
     from .fast_ops import experts
 
     return experts(x, tuple(weight.unbind()), counts)
@@ -243,12 +251,12 @@ def _project(x, weight, counts):
 def _project_wgrad(x, dy, counts, shared):
     dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
     if counts is None:
-        return _mm(x.to(dtype).T, dy.to(dtype))
+        return torch.mm(x.to(dtype).T, dy.to(dtype))
     if shared:
-        return _mm(x.to(dtype).T, dy.to(dtype)).unsqueeze(0)
+        return torch.mm(x.to(dtype).T, dy.to(dtype)).unsqueeze(0)
     return torch.stack(
         [
-            _mm(a.to(dtype).T, b.to(dtype))
+            torch.mm(a.to(dtype).T, b.to(dtype))
             for a, b in zip(x.split(counts), dy.split(counts), strict=True)
         ]
     )
@@ -283,9 +291,9 @@ class _LoRA(torch.autograd.Function):
         # Scale once in the cotangent, matching the two rounded forward GEMMs.
         scaled = dy if scale == 1 else dy * scale
         tmp = _project(x, a, counts)
-        dt = _project(scaled, b.transpose(-1, -2), counts)
+        dt = _project(scaled, b.transpose(-1, -2), counts, native=True)
         dx = (
-            _project(dt, a.transpose(-1, -2), counts)
+            _project(dt, a.transpose(-1, -2), counts, native=True)
             if ctx.needs_input_grad[0]
             else None
         )
