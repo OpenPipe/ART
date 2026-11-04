@@ -151,6 +151,16 @@ def _router_gating(module, x):
     )
 
 
+def _shared_expert_forward(module, hidden_states):
+    from megatron.core.transformer.mlp import MLP
+
+    output, _ = MLP.forward(module, hidden_states)
+    if module.use_shared_expert_gate:
+        logits = linear(hidden_states, module.gate_weight.to(hidden_states.dtype))
+        output = output * torch.sigmoid(logits)
+    return output
+
+
 def install(chunks):
     """Pre-wrap hook for LoRA and full training; install once and return chunks.
 
@@ -159,6 +169,7 @@ def install(chunks):
     """
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear
     from megatron.core.transformer.moe.router import TopKRouter
+    from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
     import transformer_engine.pytorch as te
 
     replacements = []
@@ -167,7 +178,13 @@ def install(chunks):
             if getattr(module, "_art_batch_invariant", False):
                 continue
             forward = None
-            if isinstance(module, te.LayerNormLinear):
+            if isinstance(module, SharedExpertMLP):
+                if module.config.moe_shared_expert_overlap:
+                    raise ValueError(
+                        "batch-invariant shared-expert overlap is unqualified"
+                    )
+                forward = _shared_expert_forward
+            elif isinstance(module, te.LayerNormLinear):
                 if module.normalization != "RMSNorm":
                     raise ValueError("batch-invariant fused linear requires RMSNorm")
                 forward = _te_linear
@@ -197,7 +214,8 @@ def install(chunks):
                     )
                 ):
                     raise ValueError(
-                        "batch-invariant arithmetic does not support quantized/delayed GEMMs"
+                        "batch-invariant arithmetic does not support "
+                        "quantized/delayed GEMMs"
                     )
                 if len(getattr(module, "weight_names", ["weight"])) != 1:
                     raise ValueError(

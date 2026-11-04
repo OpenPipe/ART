@@ -28,6 +28,13 @@ TE cross entropy already uses one program per row, a vocabulary-only block and
 fixed vocabulary traversal; its scalar loss reduction depends on the actual loss
 normalization as expected. ART resident token scoring uses the fixed logsumexp.
 
+The shared-expert sigmoid gate also uses the fixed GEMM. Its native functional
+linear call bypassed module replacement; GPU8 first observed equal inputs and
+different outputs at a shared-expert boundary. That observation does not assign
+the cause. CPU coverage now includes this gate's prefix, suffix VJP and FP64
+parity. Shared-expert overlap is refused before installation because its separate
+communication path still contains an unqualified functional gate contraction.
+
 CPU `fixed_sum` and padded matmul are executable ordering contracts and FP64
 gradient oracles, not promises of cross-device bitwise equivalence. Shared weight
 gradients necessarily depend on all contributing rows. Their reduction schedule
@@ -44,6 +51,12 @@ the whole decoder packed while removing global softmax tile offsets. Shared
 trees and CP state composition still need the GPU gates below. FLASH backward now always uses ART's existing Triton
 lowering with fixed 32x32 tiles and the required natural-log/log2 LSE and dLSE
 conversion, without relying on a process-wide determinism opt-in.
+
+An adapter span may contain several independent roots. Segmented attention
+splits each root within its adapter, preserves zero-length adapter slots and
+resets local positions; a root crossing adapters remains invalid. GPU8 exposed
+the previous one-root-per-adapter restriction. This repair has CPU forward/VJP
+and isolation regressions but has not been rerun on a GPU.
 
 FLA GDN chunks are 64 tokens from each segment's origin. ART supplies segment
 `cu_seqlens` (or a uniform dense bucket), and CP explicitly refuses non-final
@@ -67,6 +80,11 @@ step time, CP/packing/fused/elastic behavior and long context are preregistered 
 Caladan `docs/design/stark-batch-invariant/GPU-PLAN.md`. CPU checks or offline
 compilation do not establish production GPU qualification. Do not merge before
 those gates and the source/runtime compatibility checks pass.
+
+GPU8 failed real MoE prefix, backward parity and packing gates. Dense prefix
+passed, but dense backward parity and packing failed. Informational T1024 full
+steps were about8.3–9.2x slower for MoE and4.0x slower for dense. The subsequent
+CPU repairs do not establish GPU qualification or remove these failures.
 
 Design reference: Thinking Machines Lab's MIT
 [batch_invariant_ops](https://github.com/thinking-machines-lab/batch_invariant_ops/tree/f22b1fbe534b1fe045080f44a970a441caaf3c4f)

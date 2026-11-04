@@ -350,6 +350,9 @@ def _attention_forward(
     if cache_key not in cache:
         states = []
         start = 0
+        all_groups = attention_bias.group_ids.flatten()
+        if all_groups.unique_consecutive().numel() != all_groups.unique().numel():
+            raise ValueError("segmented attention requires independent unshared roots")
         for count in segments.counts:
             stop = start + count
             if count:
@@ -358,43 +361,51 @@ def _attention_forward(
                 if (
                     groups.numel() != count
                     or not torch.equal(groups, parents)
-                    or not bool((groups == groups.flatten()[0]).all())
+                    or (start > 0 and bool(all_groups[start - 1] == all_groups[start]))
+                    or (
+                        stop < segments.rows
+                        and bool(all_groups[stop - 1] == all_groups[stop])
+                    )
                 ):
                     raise ValueError(
                         "segmented attention requires independent unshared roots"
                     )
-                states.append(
-                    create_prefix_tree_state(
-                        groups,
-                        parents,
-                        input_pos=torch.arange(count).unsqueeze(0),
-                        target_device=query.device,
-                        sliding_windows=() if window is None else (window,),
-                        attention_head_dim=query.shape[-1],
-                        attention_value_head_dim=value.shape[-1],
+                _, root_counts = groups.flatten().unique_consecutive(return_counts=True)
+                root_start = start
+                for length in root_counts.tolist():
+                    root_stop = root_start + length
+                    states.append(
+                        (
+                            root_start,
+                            root_stop,
+                            create_prefix_tree_state(
+                                attention_bias.group_ids[:, root_start:root_stop],
+                                attention_bias.parent_ids[:, root_start:root_stop],
+                                input_pos=torch.arange(length).unsqueeze(0),
+                                target_device=query.device,
+                                sliding_windows=() if window is None else (window,),
+                                attention_head_dim=query.shape[-1],
+                                attention_value_head_dim=value.shape[-1],
+                            ),
+                        )
                     )
-                )
+                    root_start = root_stop
             start = stop
         cache[cache_key] = states
     outputs = []
-    start = 0
-    states = iter(cache[cache_key])
-    for count in segments.counts:
-        stop = start + count
-        if count:
-            with slice_lora_segments(start, stop):
-                outputs.append(
-                    original(
-                        query[start:stop].contiguous(),
-                        key[start:stop].contiguous(),
-                        value[start:stop].contiguous(),
-                        attention_mask,
-                        attn_mask_type=attn_mask_type,
-                        attention_bias=next(states),
-                        packed_seq_params=None,
-                    )
+    for start, stop, state in cache[cache_key]:
+        with slice_lora_segments(start, stop):
+            outputs.append(
+                original(
+                    query[start:stop].contiguous(),
+                    key[start:stop].contiguous(),
+                    value[start:stop].contiguous(),
+                    attention_mask,
+                    attn_mask_type=attn_mask_type,
+                    attention_bias=state,
+                    packed_seq_params=None,
                 )
-        start = stop
+            )
     return torch.cat(outputs, dim=0)
 
 
