@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .batch_invariant.ops import grouped_lora
+
 if TYPE_CHECKING:
     from .lora import LoRASlotRef
 
@@ -96,12 +98,8 @@ def expert_lora(
 ) -> torch.Tensor:
     """Per-adapter math for per-expert or compact shared-outer A/B factors.
 
-    H200 reuses the ordinary native kernels with the adapter's own row geometry.
-    Other devices and FP32 use the Torch reference below.
-
-    Shared A projects all of an adapter's rows together before expert B. Shared
-    B projects all intermediate rows together after expert A. This avoids both
-    expert-sized shared weights and expert-sized shared gradient temporaries.
+    All layouts use fixed geometry for each expert. Shared factors remain views
+    of the original leaf; no expert-sized parameter copies are constructed.
     """
     experts = len(counts)
     if (
@@ -116,39 +114,7 @@ def expert_lora(
         or any(n < 0 for n in counts)
     ):
         raise ValueError("expert rows/counts/factor shapes disagree")
-    if not shared_outer_kernel:
-        a = a.expand(experts, -1, -1)
-        b = b.expand(experts, -1, -1)
-    if (
-        x.shape[0] > 0
-        and x.is_cuda
-        and x.dtype in {torch.bfloat16, torch.float16}
-        and torch.cuda.get_device_capability(x.device)[0] == 9
-    ):
-        if a.shape[0] == b.shape[0] == experts:
-            from .kernels.cute_grouped_lora_quack import quack_grouped_lora
-
-            return quack_grouped_lora(x, a, b, list(counts), scale=scale)
-        if (a.shape[0], b.shape[0]) in {(1, experts), (experts, 1)}:
-            from .kernels.shared_outer_lora import shared_outer_lora
-
-            return shared_outer_lora(
-                x,
-                a,
-                b,
-                list(counts),
-                scale=scale,
-                shared_factor="A" if a.shape[0] == 1 else "B",
-            )
-    if a.shape[0] == 1:
-        tmp = x @ a[0]
-    else:
-        tmp = torch.cat([chunk @ a[e] for e, chunk in enumerate(x.split(counts))])
-    if b.shape[0] == 1:
-        out = tmp @ b[0]
-    else:
-        out = torch.cat([chunk @ b[e] for e, chunk in enumerate(tmp.split(counts))])
-    return out if scale == 1.0 else out * scale
+    return grouped_lora(x, a, b, counts, scale=scale)
 
 
 def segmented_expert_lora(

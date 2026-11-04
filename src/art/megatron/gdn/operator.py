@@ -12,6 +12,8 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from art.megatron.batch_invariant.ops import linear as invariant_linear
+from art.megatron.batch_invariant.ops import rms_norm
 from art.megatron.canonical.layout import current_layout
 
 from .conv_gelu import packed_varlen_causal_conv
@@ -2017,14 +2019,9 @@ def _explicit_out_proj(
 
 
 def _stable_fp32_linear(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
-    if x.dtype != torch.float32:
-        return F.linear(x, weight, bias)
-    out = F.linear(
-        x.to(dtype=torch.float64),
-        weight.to(dtype=torch.float64),
-        None if bias is None else bias.to(dtype=torch.float64),
+    return invariant_linear(
+        x, weight.to(x.dtype), None if bias is None else bias.to(x.dtype)
     )
-    return out.to(dtype=torch.float32)
 
 
 def _apply_explicit_norm(
@@ -2049,9 +2046,14 @@ def _apply_explicit_norm(
         normalization = "LayerNorm" if module_name == "LayerNorm" else "RMSNorm"
     normalization = str(normalization)
     if normalization == "RMSNorm":
-        normed = x_float * torch.rsqrt(
-            x_float.square().mean(dim=-1, keepdim=True) + eps
+        normed = rms_norm(
+            x,
+            weight,
+            eps,
+            zero_centered=bool(getattr(module, "zero_centered_gamma", False)),
         )
+        bias = getattr(module, bias_name, None)
+        return normed if bias is None else normed + bias.to(x_dtype)
     elif normalization == "LayerNorm":
         centered = x_float - x_float.mean(dim=-1, keepdim=True)
         normed = centered * torch.rsqrt(

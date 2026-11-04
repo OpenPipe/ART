@@ -489,6 +489,9 @@ def build_training_runtime(
         trainable_parameter_mode=trainable_parameter_mode,
         lora_layout=lora_layout,
     )
+    from art.megatron.batch_invariant.modules import install as install_invariant
+
+    provider.register_pre_wrap_hook(install_invariant)
 
     model = cast(
         ModelChunks,
@@ -1774,7 +1777,11 @@ def _vocab_parallel_token_scores(
             op=torch.distributed.ReduceOp.MAX,  # ty: ignore[possibly-missing-attribute]
             group=group,
         )
-    local_exp_sum = torch.exp(local_logits - global_max.unsqueeze(1)).sum(dim=-1)
+    from art.megatron.batch_invariant.ops import sum_last
+
+    local_exp_sum = sum_last(torch.exp(local_logits - global_max.unsqueeze(1))).squeeze(
+        -1
+    )
     global_exp_sum = local_exp_sum.clone()
     if tp_size > 1:
         torch.distributed.all_reduce(

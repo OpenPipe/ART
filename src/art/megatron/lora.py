@@ -33,12 +33,9 @@ from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
+from .batch_invariant.ops import grouped_lora, matmul
 from .canonical.layout import capture as capture_canonical
 from .expert_parallel import get_expert_parallel_layout
-from .kernels.cute_grouped_lora_quack import (
-    quack_grouped_lora,
-    quack_grouped_lora_dual,
-)
 from .lora_config import (
     LORA_ALPHA,
     MEGATRON_LORA_RANK_ENV,
@@ -1165,21 +1162,8 @@ class LoRA(torch.nn.Module):
             bsz = tokens_per_expert
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
-            if compact_experts:
-                from .kernels.shared_outer_lora import shared_outer_lora
-
-                return shared_outer_lora(
-                    x,
-                    a_t,
-                    b_t,
-                    bsz,
-                    scale=scale,
-                    shared_factor=self.shared_factor,
-                )
-            if x.shape[0] == 0:
-                return x.new_zeros((*x.shape[:-1], self.out_features))
-            return quack_grouped_lora(x, a_t, b_t, bsz, scale=scale)
-        out = (x @ a_t) @ b_t
+            return grouped_lora(x, a_t, b_t, bsz, scale=scale)
+        out = matmul(matmul(x, a_t), b_t)
         return out if scale == 1.0 else out * scale
 
 
@@ -1427,53 +1411,9 @@ def _expert_grouped_lora_dual_forward(
     x: torch.Tensor,
     tokens_per_expert: list[int] | torch.Tensor,
 ) -> torch.Tensor:
-    if _CURRENT_EXPERT_ADAPTER_PLAN.get() is not None:
-        return torch.cat(
-            [
-                module.gate_lora(x, tokens_per_expert),
-                module.up_lora(x, tokens_per_expert),
-            ],
-            dim=-1,
-        )
-    counts = tokens_per_expert
-    if isinstance(counts, list):
-        counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
-    if (
-        module.gate_lora.shared_factor is not None
-        and module.gate_lora.lora_layout.shared_outer_kernel
-    ):
-        # Pass each stored leaf directly. Expanding then slicing creates an
-        # E-sized SliceBackward temporary even when the view has stride zero.
-        return torch.cat(
-            [
-                module.gate_lora(x, tokens_per_expert=counts),
-                module.up_lora(x, tokens_per_expert=counts),
-            ],
-            dim=-1,
-        )
-    if x.shape[0] == 0:
-        return x.new_zeros((x.shape[0], module.out_features))
-    gate = module.gate_lora.active_lora_tensors()
-    up = module.up_lora.active_lora_tensors()
-    if gate is None or up is None:
-        return torch.cat(
-            [
-                module.gate_lora(x, tokens_per_expert=counts),
-                module.up_lora(x, tokens_per_expert=counts),
-            ],
-            dim=-1,
-        )
-    gate_a_t, gate_b_t, gate_scale = gate
-    up_a_t, up_b_t, up_scale = up
-    return quack_grouped_lora_dual(
-        x,
-        gate_a_t,
-        gate_b_t,
-        up_a_t,
-        up_b_t,
-        counts,
-        scale_gate=gate_scale,
-        scale_up=up_scale,
+    return torch.cat(
+        [module.gate_lora(x, tokens_per_expert), module.up_lora(x, tokens_per_expert)],
+        dim=-1,
     )
 
 

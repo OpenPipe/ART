@@ -49,6 +49,7 @@ from torch.autograd.function import FunctionCtx
 import torch.distributed as dist
 from typing_extensions import TypeIs
 
+from art.megatron.batch_invariant.ops import sum_last
 from art.megatron.prefix_tree_packing import (
     PrefixTreePack,
     _local_position_pairs,
@@ -6078,7 +6079,7 @@ class _EagerLocalStats(torch.autograd.Function):
             block = work[: stop - start]
             block.copy_(logits[start:stop])  # owned: FP32 logits stay intact
             block.sub_(local_max[start:stop, None]).exp_()
-            local_sum[start:stop] = block.sum(dim=-1)
+            local_sum[start:stop] = sum_last(block).squeeze(-1)
         del work
         target_logits = gather_target_logits(logits, target_rows, target_columns)
         ctx.save_for_backward(logits, local_max, target_rows, target_columns)
@@ -6281,7 +6282,9 @@ def _local_vocab_exp_sum(
     local_logits: torch.Tensor,
     global_max: torch.Tensor,
 ) -> torch.Tensor:
-    return torch.exp(local_logits.float() - global_max.unsqueeze(1)).sum(dim=-1)
+    return sum_last(torch.exp(local_logits.float() - global_max.unsqueeze(1))).squeeze(
+        -1
+    )
 
 
 def _vocab_range(local_logits: torch.Tensor) -> tuple[int, int]:

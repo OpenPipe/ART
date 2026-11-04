@@ -588,7 +588,7 @@ def apply_flash_flex_dlse_patch() -> None:
 
 
 def apply_deterministic_flash_backward_patch() -> None:
-    """Keep FLASH forward; honor PyTorch determinism with Triton backward.
+    """Keep FLASH forward; always use fixed-geometry Triton backward.
 
     FLASH saves natural-log LSE, whereas Triton consumes log2 LSE. Convert
     both the saved value and its cotangent at the existing lowering boundary.
@@ -604,17 +604,20 @@ def apply_deterministic_flash_backward_patch() -> None:
     original = lowerings[operation]
 
     def backward(*args, **kwargs):
-        if (
-            not kwargs
-            and torch.are_deterministic_algorithms_enabled()
-            and args[11].get("BACKEND") == "FLASH"
-        ):
+        if not kwargs and args[11].get("BACKEND") == "FLASH":
             converted = list(args)
             multiply = lowerings[torch.ops.aten.mul.Tensor]
             converted[4] = multiply(args[4], math.log2(math.e))
             if args[6] is not None:
                 converted[6] = multiply(args[6], math.log(2.0))
-            converted[11] = {**args[11], "BACKEND": "TRITON"}
+            converted[11] = {
+                **args[11],
+                "BACKEND": "TRITON",
+                "bwd_BLOCK_M1": 32,
+                "bwd_BLOCK_N1": 32,
+                "bwd_BLOCK_M2": 32,
+                "bwd_BLOCK_N2": 32,
+            }
             return original(*converted)
         return original(*args, **kwargs)
 

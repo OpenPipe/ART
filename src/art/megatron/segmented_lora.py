@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 
+from .batch_invariant.ops import grouped_lora, matmul
+
 if TYPE_CHECKING:
     from .lora import LoRASlotRef
 
@@ -159,7 +161,7 @@ def segmented_lora_factors(
             outputs.append(chunk.new_zeros((chunk.shape[0], template_b.shape[-1])))
         else:
             a, b, scale = pair
-            output = (chunk @ a) @ b
+            output = matmul(matmul(chunk, a), b)
             outputs.append(output if scale == 1.0 else output * scale)
     return torch.cat(outputs).reshape(*x.shape[:-1], template_b.shape[-1])
 
@@ -183,20 +185,6 @@ def segmented_lora(
     if flat.shape[0] == 0:
         # Keep zero gradients attached to every participating parameter.
         out = flat.new_zeros(0, b.shape[-1]) + (a.sum() + b.sum() + flat.sum()) * 0
-    elif (
-        x.is_cuda
-        and x.dtype in {torch.bfloat16, torch.float16}
-        and torch.cuda.get_device_capability(x.device)[0] == 9
-    ):
-        from .kernels.cute_grouped_lora_quack import quack_grouped_lora
-
-        out = quack_grouped_lora(flat, a, b, list(segments.counts))
     else:
-        out = torch.cat(
-            [
-                (chunk @ a[i]) @ b[i]
-                for i, chunk in enumerate(torch.split(flat, list(segments.counts)))
-            ],
-            dim=0,
-        )
+        out = grouped_lora(flat, a, b, segments.counts)
     return out.reshape(*shape[:-1], b.shape[-1])

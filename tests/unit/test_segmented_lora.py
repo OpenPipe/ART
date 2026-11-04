@@ -64,7 +64,8 @@ def test_outputs_losses_and_original_parameter_gradients(adapters, grouped):
         template_b=factors[0][1],
     )
     losses(actual).sum().backward()
-    atol, rtol = (1e-6, 1e-5) if grouped else (0, 0)
+    # Fixed tile reductions need numerical parity with the former native order.
+    atol, rtol = 1e-6, 1e-5
     torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
     torch.testing.assert_close(losses(actual), losses(expected), atol=atol, rtol=rtol)
     torch.testing.assert_close(x.grad, dx, atol=atol, rtol=rtol)
