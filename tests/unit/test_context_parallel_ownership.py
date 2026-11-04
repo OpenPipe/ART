@@ -104,7 +104,16 @@ class Plan:
     signature: object
 
 
-def select(monkeypatch, available, *, original_ms=100, balanced_ms=150, required=None):
+def select(
+    monkeypatch,
+    available,
+    *,
+    original_ms=100,
+    balanced_ms=150,
+    required=None,
+    group_times=None,
+    candidate_count=2,
+):
     from art.trainer_rank import _micro_batch_planner as planner
 
     original = SimpleNamespace(
@@ -115,8 +124,12 @@ def select(monkeypatch, available, *, original_ms=100, balanced_ms=150, required
         chunk_owners=tuple(r for r in range(8) for _ in range(32))
     )
 
+    times = ((original_ms, balanced_ms),) if group_times is None else group_times
+    prices = iter(times)
+
     def candidates(**kwargs):
-        return ((original, original_ms), (balanced, balanced_ms))
+        original_cost, balanced_cost = next(prices)
+        return ((original, original_cost), (balanced, balanced_cost))[:candidate_count]
 
     monkeypatch.setitem(
         sys.modules,
@@ -131,9 +144,13 @@ def select(monkeypatch, available, *, original_ms=100, balanced_ms=150, required
     monkeypatch.setattr(planner._impl, "_pad_packed_batch", lambda batch, **kw: batch)
     checks = []
 
-    def check(plan):
-        owners = plan.groups[0].cp_config.chunk_owners
-        rows = max(owners.count(r) for r in range(8)) * 1024
+    def check(plan, **kwargs):
+        assert kwargs["sync_planning_errors"] is True
+        assert not kwargs.get("sync_across_dp", False)
+        rows = sum(
+            max(g.cp_config.chunk_owners.count(r) for r in range(8)) * 1024
+            for g in plan.groups
+        )
         demand = required(rows) if required else rows * 1000
         checks.append((rows, demand, available))
         return SimpleNamespace(
@@ -151,14 +168,19 @@ def select(monkeypatch, available, *, original_ms=100, balanced_ms=150, required
     batch = SimpleNamespace(
         tokens=torch.empty(1, 262144, device="meta"), group_ids=None, parent_ids=None
     )
-    plan = Plan((Group(batch),), SimpleNamespace(topology=(1, 1, 8, 1)))
-    result = cast(Any, planner._select_cp_ownership)(rank, plan)
-    return result.groups[0].cp_config, checks
+    plan = Plan(
+        tuple(Group(batch) for _ in times), SimpleNamespace(topology=(1, 1, 8, 1))
+    )
+    result = cast(Any, planner._select_cp_ownership)(
+        rank, plan, sync_planning_errors=True
+    )
+    configs = tuple(g.cp_config for g in result.groups)
+    return configs[0] if len(configs) == 1 else configs, checks
 
 
 def test_original_refusal_becomes_balanced_fit_at_same_safeguards(monkeypatch):
     config, checks = select(monkeypatch, 60000000)
-    assert checks == [(76800, 76800000, 60000000), (32768, 32768000, 60000000)]
+    assert checks[:2] == [(76800, 76800000, 60000000), (32768, 32768000, 60000000)]
     assert config.chunk_owners.count(7) == 32
 
 
@@ -227,3 +249,34 @@ def test_admission_and_execution_receive_the_same_concrete_ownership(monkeypatch
         == 32768
     )
     assert seen == [config, config, config]
+
+
+@pytest.mark.parametrize(
+    "available, expected", [(200000000, (75, 32)), (100000000, (32, 32))]
+)
+def test_multiple_groups_can_choose_a_cheaper_mixed_ownership(
+    monkeypatch, available, expected
+):
+    configs, checks = select(
+        monkeypatch, available, group_times=((100, 150), (200, 50))
+    )
+    assert tuple(c.chunk_owners.count(0) for c in configs) == expected
+    assert [rows for rows, _, _ in checks] == [153600, 65536, 109568]
+
+
+@pytest.mark.parametrize(
+    "group_times, candidate_count",
+    [
+        ((), 1),
+        (((100, 150),), 1),
+        (((100, 150),), 2),
+        (((100, 150), (200, 50)), 2),
+    ],
+)
+def test_world_check_count_matches_for_empty_and_degenerate_dp_plans(
+    monkeypatch, group_times, candidate_count
+):
+    _, checks = select(
+        monkeypatch, 10**9, group_times=group_times, candidate_count=candidate_count
+    )
+    assert len(checks) == 3

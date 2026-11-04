@@ -1398,7 +1398,7 @@ def _select_cp_ownership(
     owns admission/recovery and must still refuse it. No safety factor, empirical
     floor, reserve or recovery policy is changed here.
     """
-    if plan.signature.topology[2] <= 1 or not plan.groups:
+    if plan.signature.topology[2] <= 1:
         return plan
     from art.megatron.context_parallel.runtime import (
         context_parallel_ownership_candidates,
@@ -1423,11 +1423,17 @@ def _select_cp_ownership(
                     original_seq_len=int(batch.tokens.shape[1]),
                 )
             )
-    if all(len(c) == 1 for c in choices):
-        return plan
+    # Also compare the unconstrained time optimum; groups need not all use
+    # the same ownership kind. The full-plan check still prices their coupling.
+    assignments = (
+        (0,) * len(choices),
+        tuple(len(c) - 1 for c in choices),
+        tuple(min(range(len(c)), key=lambda i: c[i][1]) for c in choices),
+    )
     candidates = []
-    for index in range(max(map(len, choices))):
-        selected = [c[min(index, len(c) - 1)] for c in choices]
+    # Keep WORLD planning-error exchanges aligned for empty/duplicate DP plans.
+    for index, assignment in enumerate(assignments):
+        selected = [c[i] for c, i in zip(choices, assignment, strict=True)]
         candidate = replace(
             plan,
             groups=tuple(
@@ -1437,7 +1443,7 @@ def _select_cp_ownership(
         )
         check = self._memory_check(
             candidate,
-            **({"sync_planning_errors": True} if sync_planning_errors else {}),
+            sync_planning_errors=sync_planning_errors,
         )
         step_ms = sum(c[1] for c in selected) * self._num_layers
         key = (
