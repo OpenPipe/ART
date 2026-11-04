@@ -15,6 +15,14 @@ pytestmark = [
 LENGTHS = (1, 4, 5, 63, 64, 65, 129, 1000)
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+@pytest.mark.parametrize("shared", (None, "A", "B"))
+def test_native_moe_dispatch_and_expert_occupancy(dtype, shared):
+    from tests.unit.test_batch_invariant_moe import check_native_moe_occupancy
+
+    check_native_moe_occupancy(dtype, shared, device="cuda", fused=True)
+
+
 def _configure_tiny_provider(provider, *, moe):
     provider.hidden_dropout = provider.attention_dropout = 0.0
     provider.num_layers, provider.hidden_size = 2, 128

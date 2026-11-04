@@ -99,6 +99,16 @@ def coefficient(layer):
     return _moe_output_bytes_per_token([layer], ParallelShape(tp=1, cp=1))
 
 
+@pytest.mark.parametrize("gated", (False, True))
+def test_invariant_shared_expert_retains_its_memory_floor(layer, gated):
+    layer = shared_layer(layer, gated)
+    rank, _ = rank_with_moe(layer, invariant=True)
+    assert _shared_expert_output_bytes_per_token(layer) == 4096
+    assert rank._moe_output_bytes_per_token == 192512
+    assert rank._moe_checkpoint_grad_bytes_per_token == (196608 if gated else 192512)
+    assert g.model_shapes(rank) is not None
+
+
 @pytest.mark.parametrize("gate", [False, True])
 @pytest.mark.parametrize("no_grad", [False, True])
 def test_shared_return_in_actual_constructor_and_plan(layer, gate, no_grad):

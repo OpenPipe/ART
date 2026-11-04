@@ -22,7 +22,7 @@ def module(cls):
     return obj
 
 
-def rank_with_moe(moe_layer, *, install_hooks=False):
+def rank_with_moe(moe_layer, *, install_hooks=False, invariant=False):
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet
     from megatron.core.transformer.transformer_block import TransformerBlock
     from transformer_engine.pytorch import RMSNorm
@@ -85,6 +85,10 @@ def rank_with_moe(moe_layer, *, install_hooks=False):
         from art.megatron.gdn.operator import install_gdn_island_hooks
 
         install_gdn_island_hooks([model])
+    if invariant:
+        from art.megatron.batch_invariant.modules import install
+
+        install([model])
     r: Any = TrainerRank(
         cast(
             Any,

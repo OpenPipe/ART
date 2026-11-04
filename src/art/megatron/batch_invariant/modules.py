@@ -11,6 +11,16 @@ import torch
 from .ops import linear, rms_norm
 
 
+def has_invariant_forward(module, function):
+    """Recognize our exact bound arithmetic, never a user-set marker alone."""
+    forward = vars(module).get("forward")
+    return (
+        type(forward) is types.MethodType
+        and forward.__self__ is module
+        and forward.__func__ is function
+    )
+
+
 def _norm(module, x, *, fused=False):
     return rms_norm(
         x,

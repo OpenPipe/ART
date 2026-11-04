@@ -1467,6 +1467,7 @@ def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
     )
     from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 
+    from art.megatron.batch_invariant.modules import _te_linear, has_invariant_forward
     from art.megatron.lora import (
         LoRA,
         SelfAttentionLinearProjLoRA,
@@ -1570,7 +1571,13 @@ def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
         type(base1) not in (TEColumnParallelLinear, TELayerNormColumnParallelLinear)
         or any(type(site) is not cls for site, cls in sites)
         or any(
-            "forward" in vars(site)
+            (
+                "forward" in vars(site)
+                and not (
+                    (site is base1 or site is base2)
+                    and has_invariant_forward(site, _te_linear)
+                )
+            )
             or cast(Any, site)._forward_hooks
             or cast(Any, site)._forward_pre_hooks
             for site in (base1, *(site for site, _ in sites))
@@ -1738,6 +1745,7 @@ def _moe_output_bytes_per_token(
         _HybridEPManager,
     )
 
+    from art.megatron.batch_invariant.modules import _te_grouped, has_invariant_forward
     from art.megatron.lora import LoRA, MLPExpertsLinearFC1LoRA, MLPExpertsLinearFC2LoRA
 
     # HybridEP hands each rank the pairs routed to its local experts, already
@@ -1763,7 +1771,13 @@ def _moe_output_bytes_per_token(
             )
             if any(
                 type(site) is not expected
-                or "forward" in vars(site)
+                or (
+                    "forward" in vars(site)
+                    and not (
+                        expected is TERowParallelGroupedLinear
+                        and has_invariant_forward(site, _te_grouped)
+                    )
+                )
                 or getattr(site, "_forward_hooks", None)
                 or getattr(site, "_forward_pre_hooks", None)
                 for site, expected in sites
@@ -1887,7 +1901,10 @@ def _moe_output_bytes_per_token(
                         and adapter is not None
                         and base is not None
                         and type(base) is TEColumnParallelGroupedLinear
-                        and "forward" not in vars(base)
+                        and (
+                            "forward" not in vars(base)
+                            or has_invariant_forward(base, _te_grouped)
+                        )
                         and not base._forward_hooks
                         and not base._forward_pre_hooks
                         and first_tensors is not None

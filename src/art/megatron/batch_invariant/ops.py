@@ -24,18 +24,21 @@ def _cpu_mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     # not a fast CPU implementation. Preserve FP64 for gradient references.
     m, k = a.shape
     n = b.shape[1]
+    dtype = torch.float64 if a.dtype == torch.float64 else torch.float32
     rows = []
     for start in range(0, m, ROW_TILE):
         columns = []
         for col in range(0, n, 64):
-            acc = a.new_zeros((ROW_TILE, 64))
+            acc = a.new_zeros((ROW_TILE, 64), dtype=dtype)
             for kk in range(0, k, K_TILE):
                 aa = a[start : start + ROW_TILE, kk : kk + K_TILE]
                 bb = b[kk : kk + K_TILE, col : col + 64]
                 aa = F.pad(aa, (0, K_TILE - aa.shape[1], 0, ROW_TILE - aa.shape[0]))
                 bb = F.pad(bb, (0, 64 - bb.shape[1], 0, K_TILE - bb.shape[0]))
-                acc = acc + aa @ bb
-            columns.append(acc[: min(ROW_TILE, m - start), : min(64, n - col)])
+                acc = acc + aa.to(dtype) @ bb.to(dtype)
+            columns.append(
+                acc[: min(ROW_TILE, m - start), : min(64, n - col)].to(a.dtype)
+            )
         rows.append(torch.cat(columns, dim=1))
     return torch.cat(rows) if rows else a.new_empty((m, n))
 

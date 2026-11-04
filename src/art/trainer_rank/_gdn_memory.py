@@ -242,6 +242,11 @@ def model_shapes(
             return None
         forward = getattr(norm, "forward", None)
         physical = getattr(norm, "_art_empty_safe_norm_physical_forward", None)
+        from art.megatron.batch_invariant.modules import (
+            _rms_forward,
+            has_invariant_forward,
+        )
+
         if (
             gdn.conv1d.weight.dtype is not torch.bfloat16
             or tuple(gdn.conv1d.weight.shape) != (conv, 1, kernel)
@@ -251,6 +256,7 @@ def model_shapes(
             # Its nonempty path delegates unchanged to the saved bound method.
             or (
                 "forward" in vars(norm)
+                and not has_invariant_forward(norm, _rms_forward)
                 and not (
                     type(forward) is MethodType
                     and forward.__self__ is norm
@@ -259,7 +265,7 @@ def model_shapes(
                     and physical is not None
                     and type(physical) is MethodType
                     and physical.__self__ is norm
-                    and physical.__func__ is RMSNorm.forward
+                    and physical.__func__ in (RMSNorm.forward, _rms_forward)
                 )
             )
             or gdn.out_norm._forward_hooks

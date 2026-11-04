@@ -32,6 +32,57 @@ def observe(rank, plan, compute):
     )
 
 
+@pytest.mark.parametrize("install_hooks", (False, True))
+def test_invariant_moe_keeps_bounded_admission_and_gdn_floor(layer, install_hooks):
+    from test_trainer_rank_moe_memory import _enclosing_moe
+    from test_trainer_rank_pending_memory import rank_with_moe
+
+    from art.trainer_rank import _gdn_memory
+
+    rank, _ = rank_with_moe(
+        _enclosing_moe(layer), install_hooks=install_hooks, invariant=True
+    )
+    assert rank._moe_output_bytes_per_token == 188416
+    shapes = _gdn_memory.model_shapes(rank)
+    assert shapes is not None
+    assert shapes[1][0].moe_bytes_per_row == 188416
+    with bounded_forward_peaks():
+        plans = [rank._plan_flat_forward([request(n)]) for n in (1, 4, 63, 129, 1000)]
+    assert all(plan.signature.bounded_forward_peak for plan in plans)
+    # A 300 MiB cold intercept becomes >300 GiB at T1000 in the rejected
+    # ordinary slope profile. Calibration must keep the analytic floors.
+    for plan in plans[:-1]:
+        observe(rank, plan, 300 * 2**20)
+    long = plans[-1]
+    calibrated = rank._memory_check(long).estimated_required_bytes
+    assert calibrated < 4 * 2**30
+    rank._memory_profiles.clear()
+    assert calibrated >= rank._memory_check(long).estimated_required_bytes
+
+
+@pytest.mark.parametrize("defect", ("override", "wrong_owner", "hook", "pre_hook"))
+def test_invariant_marker_does_not_admit_unknown_expert_code(layer, defect):
+    from types import MethodType
+
+    from art.megatron.batch_invariant.modules import _te_grouped, install
+    from art.trainer_rank._planner_cost import ParallelShape
+
+    shape = ParallelShape(tp=1, cp=1)
+    install([layer])
+    assert _impl._moe_output_bytes_per_token([layer], shape) > 0
+    expert = layer.experts.linear_fc2.linear_fc2
+    assert expert._art_batch_invariant
+    if defect == "override":
+        expert.forward = lambda x, *args: x
+    elif defect == "wrong_owner":
+        expert.forward = MethodType(_te_grouped, torch.nn.Identity())
+    elif defect == "hook":
+        expert.register_forward_hook(lambda *args: None)
+    else:
+        expert.register_forward_pre_hook(lambda *args: None)
+    assert _impl._moe_output_bytes_per_token([layer], shape) == 0
+
+
 @pytest.mark.parametrize("cp", (2, 4, 8))
 @pytest.mark.parametrize("grad", (False, True))
 @pytest.mark.parametrize("kind", ("dense", "moe"))
