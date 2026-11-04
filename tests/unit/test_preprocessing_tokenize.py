@@ -30,6 +30,11 @@ pytest.importorskip("transformers")
         "{{ arguments | items }}",
         "{% for key, value in arguments.items() %}",
         "{% if function['arguments'] is mapping %}",
+        "{{ tool_call.arguments | tojson }}",
+        "{{ tool_call.function.arguments|tojson }}",
+        "{{ tool_call['arguments'] | tojson }}",
+        '{{ function["arguments"]|tojson }}',
+        "{{ arguments | tojson }}",
         (
             "{% set structured = tool_call.arguments %}"
             "{% for key, value in structured.items() %}"
@@ -63,6 +68,43 @@ def test_empty_structured_tool_arguments_are_normalized() -> None:
     )
 
     assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {}
+
+
+@pytest.mark.parametrize("access", ["tool_call.arguments", "function['arguments']"])
+@pytest.mark.parametrize("condition", ["is string", "is not string"])
+def test_string_aware_tojson_templates_preserve_sampled_arguments(
+    access: str, condition: str
+) -> None:
+    arguments = '{ "location" : "Hobart", "count":1 }'
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"arguments": arguments}}],
+        }
+    ]
+    template = (
+        f"{{% if {access} {condition} %}}{{{{ {access} }}}}"
+        f"{{% else %}}{{{{ {access} | tojson }}}}{{% endif %}}"
+    )
+
+    normalized = normalize_tool_call_arguments_for_chat_template(messages, template)
+
+    assert normalized is messages
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == arguments
+
+
+def test_unrelated_tojson_does_not_normalize_tool_arguments() -> None:
+    messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{"function": {"arguments": '{"id": 3}'}}],
+        }
+    ]
+    template = "{{ schema.tool_call.arguments | tojson }}{{ tool_call.arguments }}"
+
+    assert (
+        normalize_tool_call_arguments_for_chat_template(messages, template) is messages
+    )
 
 
 def test_unrelated_items_iteration_does_not_normalize_tool_arguments() -> None:
@@ -499,6 +541,66 @@ def test_tokenize_sft_batch_masks_response_tokens_without_unsloth_import() -> No
     trainable_token_ids = [token_id for token_id in labels if token_id != -100]
     assert tokenizer.decode(trainable_token_ids) == "OK"
     assert batch.num_trainable_tokens == 2
+
+
+@pytest.mark.parametrize("assistant_turns", ["all", "last"])
+def test_sft_tojson_tool_arguments_are_objects(assistant_turns) -> None:
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    # A real byte-level tokenizer keeps the rendered JSON inspectable offline.
+    byte_tokenizer = Tokenizer(
+        models.BPE(
+            {char: i for i, char in enumerate(pre_tokenizers.ByteLevel.alphabet())}, []
+        )
+    )
+    byte_tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    byte_tokenizer.decoder = decoders.ByteLevel()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=byte_tokenizer)
+    tokenizer.chat_template = (
+        "{% for message in messages %}{{ '<' + message.role + '>' }}"
+        "{{ message.content or '' }}"
+        "{% for tool_call in message.tool_calls | default([]) %}"
+        "{% set tool_call = tool_call.function %}"
+        '{"name": {{ tool_call.name | tojson }}, '
+        '"arguments": {{ tool_call.arguments | tojson }}}'
+        "{% endfor %}{% endfor %}"
+        "{% if add_generation_prompt %}<assistant>{% endif %}"
+    )
+    arguments = '{ "location": "Hobart", "count": 1 }'
+    messages: list[dict[str, Any]] = [
+        {"role": "user", "content": "Weather?"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": arguments},
+                }
+            ],
+        },
+    ]
+
+    batch = tokenize_sft_batch(
+        trajectory_batch=[
+            Trajectory(messages_and_choices=cast(MessagesAndChoices, messages))
+        ],
+        learning_rate=1e-5,
+        tokenizer=tokenizer,
+        instruction_part="<user>",
+        response_part="<assistant>",
+        assistant_turns=assistant_turns,
+    )
+
+    labels = batch.trajectory_tensors[0]["labels"][0].tolist()
+    target = tokenizer.decode([token for token in labels if token != -100])
+    assert isinstance(target, str)
+    assert json.loads(target) == {
+        "name": "get_weather",
+        "arguments": {"location": "Hobart", "count": 1},
+    }
+    assert messages[1]["tool_calls"][0]["function"]["arguments"] == arguments
 
 
 def test_tokenize_sft_batch_all_trains_every_assistant_turn() -> None:
