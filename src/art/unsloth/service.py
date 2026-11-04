@@ -36,6 +36,7 @@ from ..vllm_runtime import (
 from .train import (
     UnslothTrainContext,
     create_unsloth_train_context,
+    drop_unused_adapters,
     gc_and_empty_cuda_cache,
     run_unsloth_rl_training,
     run_unsloth_sft_training,
@@ -75,23 +76,8 @@ def save_checkpoint(
         peft_model = trainer.accelerator.unwrap_model(  # type: ignore[attr-defined]
             trainer.model, keep_fp32_wrapper=False
         )
-        active_adapters = peft_model.active_adapter
-        if isinstance(active_adapters, str):
-            keep_adapters = {active_adapters}
-        else:
-            keep_adapters = set(active_adapters)
-
-        before_adapters = list(peft_model.peft_config.keys())
-        print(f"Adapters before cleanup: {before_adapters}")
-        print(f"Keeping active adapter(s): {sorted(keep_adapters)}")
-
-        for adapter_name in before_adapters:
-            if adapter_name not in keep_adapters:
-                peft_model.delete_adapter(adapter_name)
-                print(f"Deleted unused adapter: {adapter_name}")
-
-        after_adapters = list(peft_model.peft_config.keys())
-        print(f"Adapters after cleanup: {after_adapters}")
+        for adapter_name in drop_unused_adapters(peft_model):
+            print(f"Deleted unused adapter: {adapter_name}")
     except Exception as e:
         print(f"Warning: failed to cleanup unused adapters: {e}")
 
