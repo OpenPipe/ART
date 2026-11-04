@@ -14,7 +14,7 @@ dependencies = [
     "typing-extensions>=4.13",
     "typer>=0.15.2",
     "litellm>=1.71.1,<=1.82.0",
-    "weave>=0.52.41",
+    "weave>=0.54.0",
     "polars>=1.26.0",
     "tblib>=3.0.0",
     "nest-asyncio>=1.6.0",
