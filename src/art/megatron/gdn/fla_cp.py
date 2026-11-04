@@ -329,7 +329,7 @@ def _fwd_summary(
     summary = k.new_zeros(*summary_shape, dtype=torch.float32)
     block_size = 32 if key_dim <= 64 else 64
     grid = (
-        triton.cdiv(value_dim, block_size) + triton.cdiv(key_dim, block_size),
+        triton.cdiv(value_dim, block_size),
         head_count,
         *(() if cu_seqlens is None else (sequence_count,)),
     )
@@ -353,6 +353,11 @@ def _fwd_summary(
         USE_EXP2=False,
         BLOCK_SIZE=block_size,
         MULTI_SEQS=cu_seqlens is not None,
+    )
+    from .fla_cp_kernels import fill_summary_transition
+
+    fill_summary_transition(
+        summary, k=k, w=w, g=g, cu_seqlens=cu_seqlens, reverse=False
     )
     return summary
 
@@ -396,7 +401,7 @@ def _bwd_summary(
     summary = q.new_zeros(*summary_shape, dtype=torch.float32)
     block_size = 32 if key_dim <= 64 else 64
     grid = (
-        triton.cdiv(value_dim, block_size) + triton.cdiv(key_dim, block_size),
+        triton.cdiv(value_dim, block_size),
         head_count,
         *(() if cu_seqlens is None else (sequence_count,)),
     )
@@ -422,6 +427,9 @@ def _bwd_summary(
         USE_EXP2=False,
         BLOCK_SIZE=block_size,
     )
+    from .fla_cp_kernels import fill_summary_transition
+
+    fill_summary_transition(summary, k=k, w=w, g=g, cu_seqlens=cu_seqlens, reverse=True)
     return summary
 
 

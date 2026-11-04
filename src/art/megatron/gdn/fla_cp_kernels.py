@@ -1,6 +1,8 @@
 # ruff: noqa: E501, PLR0913, PLR0915
 from __future__ import annotations
 
+from typing import Any, cast
+
 from fla.ops.utils.op import exp, exp2
 import torch
 from torch import Tensor
@@ -33,7 +35,7 @@ def pre_process_bwd_summary_multi(
     )
     block_size = 32 if key_dim <= 64 else 64
     grid = (
-        triton.cdiv(value_dim, block_size) + triton.cdiv(key_dim, block_size),
+        triton.cdiv(value_dim, block_size),
         head_count,
         sequence_count,
     )
@@ -57,7 +59,125 @@ def pre_process_bwd_summary_multi(
         USE_EXP2=False,
         BLOCK_SIZE=block_size,
     )
+    fill_summary_transition(summary, k=k, w=w, g=g, cu_seqlens=cu_seqlens, reverse=True)
     return summary
+
+
+def fill_summary_transition(
+    summary: Tensor,
+    *,
+    k: Tensor,
+    w: Tensor,
+    g: Tensor,
+    cu_seqlens: Tensor | None,
+    reverse: bool,
+) -> None:
+    """Form the rank carry in FP32 without rounding decays or matrix products.
+
+    FLA still computes the affine offset with its production local recurrence.
+    Only the transition matrix uses IEEE FP32 contractions. Apply its
+    low-rank factors directly to avoid materializing a dense chunk matrix.
+    """
+    _, tokens, heads, key_dim = k.shape
+    value_dim = summary.shape[-1] - key_dim
+    sequences = 1 if cu_seqlens is None else cu_seqlens.numel() - 1
+    key_block = max(16, triton.next_power_of_2(key_dim))
+    properties = torch.cuda.get_device_properties(k.device)
+    # SM120 has less shared memory than Hopper and datacenter Blackwell.
+    # Stage one token tile at a time. Bound the FP32 operand staging,
+    # the carry/product tiles when splitting a
+    # chunk, and BT x (BK + BC) for small keys, plus scratch.
+    token_block = 32 if properties.major >= 12 and key_block >= 256 else 64
+    shared_limit = properties.shared_memory_per_block_optin
+    while (
+        4
+        * max(
+            2 * token_block * key_block,
+            key_block * (token_block + 2 * 32),
+            token_block * (key_block + 32) + key_block * 32,
+        )
+        + 512
+        > shared_limit
+    ):
+        token_block //= 2
+        if token_block < 16:
+            raise ValueError("Insufficient device shared memory for GDN transition")
+    kernel = cast(Any, _summary_transition_kernel)
+    kernel[(triton.cdiv(key_dim, 32), heads, sequences)](
+        k,
+        w,
+        g,
+        summary,
+        cu_seqlens,
+        tokens,
+        heads,
+        key_dim,
+        value_dim,
+        BK=key_block,
+        BC=32,
+        BT=token_block,
+        IS_VARLEN=cu_seqlens is not None,
+        REVERSE=reverse,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+@triton.jit(do_not_specialize=["T"])
+def _summary_transition_kernel(
+    K_ptr,
+    W_ptr,
+    G_ptr,
+    Summary,
+    Cu,
+    T,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BC: tl.constexpr,
+    BT: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+    REVERSE: tl.constexpr,
+):
+    column, head = tl.program_id(0), tl.program_id(1)
+    sequence = tl.program_id(2).to(tl.int64)
+    if IS_VARLEN:
+        bos = tl.load(Cu + sequence).to(tl.int64)
+        eos = tl.load(Cu + sequence + 1).to(tl.int64)
+    else:
+        bos, eos = tl.full((), 0, tl.int64), T.to(tl.int64)
+    length = eos - bos
+    row = tl.arange(0, BK)
+    col = column * BC + tl.arange(0, BC)
+    token = tl.arange(0, BT)
+    matrix = tl.where(row[:, None] == col[None, :], 1.0, 0.0)
+    for step in range(tl.cdiv(length, 64)):
+        chunk = tl.cdiv(length, 64) - step - 1 if REVERSE else step
+        last = tl.minimum((chunk + 1) * 64, length) - 1
+        gate_last = tl.load(G_ptr + (bos + last) * H + head)
+        product = tl.full((BK, BC), 0, tl.float32)
+        for part in range(64 // BT):
+            positions = chunk * 64 + part * BT + token
+            valid = positions < length
+            offsets = ((bos + positions[:, None]) * H + head) * K + row[None, :]
+            key = tl.load(
+                K_ptr + offsets, valid[:, None] & (row[None, :] < K), other=0
+            ).to(tl.float32)
+            wy = tl.load(
+                W_ptr + offsets, valid[:, None] & (row[None, :] < K), other=0
+            ).to(tl.float32)
+            gates = tl.load(G_ptr + (bos + positions) * H + head, valid, other=0)
+            key = key * tl.where(valid, exp(gate_last - gates), 0)[:, None]
+            if REVERSE:
+                projected = tl.dot(key, matrix, input_precision="ieee")
+                product += tl.dot(tl.trans(wy), projected, input_precision="ieee")
+            else:
+                projected = tl.dot(wy, matrix, input_precision="ieee")
+                product += tl.dot(tl.trans(key), projected, input_precision="ieee")
+        matrix = exp(gate_last) * matrix - product
+    offsets = ((sequence * H + head) * K + row[:, None]) * (V + K) + V + col[None, :]
+    tl.store(Summary + offsets, matrix, (row[:, None] < K) & (col[None, :] < K))
 
 
 @triton.heuristics(
