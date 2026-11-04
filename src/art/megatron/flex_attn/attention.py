@@ -13,6 +13,7 @@ import torch
 from torch import Tensor
 from torch.nn.attention.flex_attention import AuxOutput, AuxRequest, BlockMask
 
+from art.megatron.batch_invariant.packing import canonical_contiguous
 from art.megatron.flex_attn.compiled import (
     flex_backend_for_head_dims,
     get_dense_compiled_flex_attention,
@@ -31,6 +32,69 @@ class PrefixTreeAttentionState(BaseModel):
         if window is None:
             return self.block_mask
         return self.sliding_block_masks[int(window)]
+
+
+def root_local_attention(kernel, q, k, v, state, *, window=None, **kwargs):
+    """Keep independent packed roots on their standalone softmax tile origins.
+
+    A block mask excludes other roots but does not rebase FLASH's reduction
+    tiles. In particular, offset 65 splits a length-64 root across two tiles.
+    Shared trees and distributed attention retain their separate execution paths.
+    """
+    groups = getattr(state, "group_ids", None)
+    parents = getattr(state, "parent_ids", None)
+    if groups is None or parents is None or not torch.equal(groups, parents):
+        return None
+    if tuple(groups.shape) != (q.shape[0], q.shape[2]):
+        raise ValueError("packed attention metadata does not cover Q/K/V")
+    ranges = []
+    for row in groups:
+        ends = (row[1:] != row[:-1]).nonzero().flatten().add(1).tolist()
+        bounds = [0, *ends, len(row)]
+        ranges.append(list(zip(bounds[:-1], bounds[1:], strict=True)))
+    if all(len(parts) == 1 for parts in ranges):
+        return None
+    from art.megatron.prefix_tree_state import create_prefix_tree_state
+
+    cache = state.model_state.setdefault("_art_invariant_root_attention", {})
+    cache_key = (q.shape[-1], v.shape[-1], window, str(q.device))
+    if cache_key not in cache:
+        cache[cache_key] = [
+            [
+                create_prefix_tree_state(
+                    groups[b : b + 1, start:stop],
+                    parents[b : b + 1, start:stop],
+                    input_pos=torch.arange(stop - start).unsqueeze(0),
+                    target_device=q.device,
+                    sliding_windows=() if window is None else (window,),
+                    attention_head_dim=q.shape[-1],
+                    attention_value_head_dim=v.shape[-1],
+                ).block_mask_for_window(window)
+                for start, stop in parts
+            ]
+            for b, parts in enumerate(ranges)
+        ]
+    return torch.cat(
+        [
+            torch.cat(
+                [
+                    kernel(
+                        q[b : b + 1, :, start:stop].contiguous(),
+                        k[b : b + 1, :, start:stop].contiguous(),
+                        v[b : b + 1, :, start:stop].contiguous(),
+                        block_mask=mask,
+                        **kwargs,
+                    )
+                    for (start, stop), mask in zip(parts, masks, strict=True)
+                ],
+                dim=2,
+            )
+            for b, (parts, masks) in enumerate(
+                zip(ranges, cache[cache_key], strict=True)
+            )
+        ],
+        dim=0,
+    )
 
 
 class FlexAttentionWrapper(torch.nn.Module):
@@ -58,6 +122,7 @@ class FlexAttentionWrapper(torch.nn.Module):
         softmax_offset: Tensor | None = None,
     ) -> Tensor:
         # q, k, v are [B, H, S, D] tensors expected by torch.flex_attention.
+        q, k, v = (canonical_contiguous(tensor) for tensor in (q, k, v))
         backend = flex_backend_for_head_dims(
             head_dim=int(q.shape[-1]),
             head_dim_v=int(v.shape[-1]),
@@ -245,16 +310,29 @@ class FlexDotProductAttention(torch.nn.Module):
         k = key.permute(1, 2, 0, 3)
         v = value.permute(1, 2, 0, 3)
 
-        out = self.flex_attention(
-            q,
-            k,
-            v,
-            block_mask=block_mask,
+        options = dict(
             scale=self.softmax_scale,
             enable_gqa=self.num_attention_heads_per_partition
             != self.num_query_groups_per_partition,
             softmax_offset=cast(Tensor | None, getattr(self, "softmax_offset")),
         )
+        out = root_local_attention(
+            self.flex_attention,
+            q,
+            k,
+            v,
+            attention_bias,
+            window=getattr(self, "art_sliding_window", None),
+            **options,
+        )
+        if out is None:
+            out = self.flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                **options,
+            )
 
         # Return to Megatron's expected layout [S, B, Hq*D].
         out = out.permute(2, 0, 1, 3).contiguous()

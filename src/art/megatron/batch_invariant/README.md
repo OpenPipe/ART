@@ -38,16 +38,21 @@ Attention is a separate reduction domain. Existing SM90 block-sparse FLASH uses
 head-width-only tiles (128x128 up to D=128), and `_flash_attn_fwd` defaults to
 `num_splits=1`; the Torch call supplies no adaptive split. This proves fixed tile
 selection, **not arbitrary packed-offset invariance**. Dense canonical execution
-isolates/pads roots. Native sparse packing and CP state composition still need
-the GPU gates below. FLASH backward now always uses ART's existing Triton
+isolates/pads roots. Independent unshared packed roots now use root-local native attention subkernels
+with canonical contiguous strides in both ART attention entrypoints. This keeps
+the whole decoder packed while removing global softmax tile offsets. Shared
+trees and CP state composition still need the GPU gates below. FLASH backward now always uses ART's existing Triton
 lowering with fixed 32x32 tiles and the required natural-log/log2 LSE and dLSE
 conversion, without relying on a process-wide determinism opt-in.
 
 FLA GDN chunks are 64 tokens from each segment's origin. ART supplies segment
 `cu_seqlens` (or a uniform dense bucket), and CP explicitly refuses non-final
 rank boundaries not divisible by 64. Padding/another segment cannot change a
-valid segment's chunk origin. This is a boundary proof, not a backward accuracy
-qualification: floating-point cross-rank state composition and kernel dispatch
+valid segment's chunk origin. CP1 now invokes the same B=1 dense FLA recurrence
+per segment for both uniform and varlen buckets: FLA's gate cumsum autotunes on
+B and IS_VARLEN, so chunk alignment alone did not fix its reduction tree. The
+autograd context retains this geometry in backward. This is a boundary proof
+and CPU regression result, not CUDA numerical or backward accuracy qualification: floating-point cross-rank state composition and kernel dispatch
 still need matched-input GPU tests.
 
 The retained GPU3 base FLA chunk accuracy failures (1.405% worst relative L2;

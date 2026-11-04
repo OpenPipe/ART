@@ -9,7 +9,7 @@ from art.megatron.gdn import operator
 
 @pytest.mark.parametrize("lengths", [(2, 3), (1, 64, 65), (3, 3)])
 @pytest.mark.parametrize("output_final_state", [False, True])
-def test_bucket_passes_matching_cpu_boundaries_only_for_packed_fla(
+def test_bucket_rebases_every_local_segment_to_standalone_fla(
     lengths, output_final_state, monkeypatch
 ):
     cpu_boundaries = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
@@ -55,8 +55,8 @@ def test_bucket_passes_matching_cpu_boundaries_only_for_packed_fla(
     calls = []
 
     def recurrent(query, key, value, **kwargs):
-        calls.append(kwargs)
-        return value, initial if kwargs["output_final_state"] else None
+        calls.append((query.shape, kwargs))
+        return value, kwargs["initial_state"] if kwargs["output_final_state"] else None
 
     monkeypatch.setattr(operator, "_chunk_gated_delta_rule", recurrent)
     result, _, final = operator.run_gdn_bucket(
@@ -66,13 +66,18 @@ def test_bucket_passes_matching_cpu_boundaries_only_for_packed_fla(
         gdn=gdn,
         output_final_state=output_final_state,
     )
-    assert len(calls) == 1
-    call = calls[0]
-    dense = len(set(lengths)) == 1
-    assert call["cu_seqlens"] is (None if dense else device_boundaries)
-    assert call.get("cu_seqlens_cpu") is (None if dense else cpu_boundaries)
-    assert call["output_final_state"] is output_final_state
-    assert final is (initial if output_final_state else None)
+    assert len(calls) == len(lengths)
+    assert [shape[1] for shape, _ in calls] == list(lengths)
+    for shape, call in calls:
+        assert shape[0] == 1
+        assert call.get("cu_seqlens") is None
+        assert call.get("cu_seqlens_cpu") is None
+        assert call["output_final_state"] is output_final_state
+        assert call["initial_state"].shape[0] == 1
+    if output_final_state:
+        torch.testing.assert_close(final, initial, rtol=0, atol=0)
+    else:
+        assert final is None
     torch.testing.assert_close(result.flatten(), qkv[:, 2], rtol=0, atol=0)
     result.sum().backward()
     expected = torch.zeros_like(qkv)

@@ -14,6 +14,7 @@ import triton.language as tl
 
 from art.megatron.batch_invariant.ops import linear as invariant_linear
 from art.megatron.batch_invariant.ops import rms_norm
+from art.megatron.batch_invariant.packing import root_local_gdn
 from art.megatron.canonical.layout import current_layout
 
 from .conv_gelu import packed_varlen_causal_conv
@@ -2339,7 +2340,8 @@ def run_gdn_bucket(
             lengths_by_rank_cpu=bucket.lengths_by_rank_cpu,
         )
     else:
-        recurrent_out, recurrent_final = _chunk_gated_delta_rule(
+        recurrent_out, recurrent_final = root_local_gdn(
+            _chunk_gated_delta_rule,
             query,
             key,
             value,

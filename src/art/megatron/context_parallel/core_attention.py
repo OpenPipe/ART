@@ -17,6 +17,7 @@ from art.megatron.flex_attn.attention import (
     PrefixTreeAttentionState,
     _configure_softmax_offset,
     _triton_num_stages_2_head_dims,
+    root_local_attention,
 )
 
 from .executor import run_context_parallel
@@ -121,16 +122,29 @@ class ArtContextParallelCoreAttention(torch.nn.Module):
             q = query.permute(1, 2, 0, 3)
             k = key.permute(1, 2, 0, 3)
             v = value.permute(1, 2, 0, 3)
-            out_dense = self.dense_kernel(
-                q,
-                k,
-                v,
-                block_mask=block_mask,
+            options = dict(
                 scale=self.softmax_scale,
                 enable_gqa=self.num_attention_heads_per_partition
                 != self.num_query_groups_per_partition,
                 softmax_offset=cast(Tensor | None, getattr(self, "softmax_offset")),
             )
+            out_dense = root_local_attention(
+                self.dense_kernel,
+                q,
+                k,
+                v,
+                attention_bias,
+                window=getattr(self, "art_sliding_window", None),
+                **options,
+            )
+            if out_dense is None:
+                out_dense = self.dense_kernel(
+                    q,
+                    k,
+                    v,
+                    block_mask=block_mask,
+                    **options,
+                )
             out = out_dense.permute(2, 0, 1, 3).contiguous()
 
         out = out.reshape(out.size(0), out.size(1), self.hidden_size_per_partition)
