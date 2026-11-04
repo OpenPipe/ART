@@ -1917,6 +1917,31 @@ def _search_chunk_assignment(
         cp_size=cp_size,
         config=config,
     )
+    if config.planner_max_owned_tokens is not None:
+        from ._ownership import capped_owners
+
+        if config.workload_profile is not None:
+            raise ValueError("CP ownership ceiling does not support profiled layouts")
+        lengths = [int(range_.size()) for range_ in chunk_ranges]
+        owners = capped_owners(
+            generic[0],
+            _contiguous_chunk_assignment(q_weights=lengths, cp_size=cp_size),
+            lengths,
+            cp_size,
+            config.planner_max_owned_tokens,
+        )
+        if owners != generic[0]:
+            return (
+                owners,
+                generic[1],
+                _evaluate_plan(
+                    program=_pair_program(pair_matrix, chunk_ranges=chunk_ranges),
+                    owners=owners,
+                    wave_assignment=generic[1],
+                    cp_size=cp_size,
+                    config=config,
+                ),
+            )
     profile = config.workload_profile
     if profile is None:
         return generic

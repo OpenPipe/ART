@@ -104,6 +104,9 @@ class ContextParallelConfig:
     # search balances attention pairs at the expense of token balance; see
     # estimate_owned_token_ms. Zero disables the term.
     planner_owned_token_ms: float = 0.0
+    # Opt-in memory repair: cap attention ownership before pricing admission.
+    # GDN's separate physical layout remains independently priced as usual.
+    planner_max_owned_tokens: int | None = None
     planner_comm_stage_overhead_ms: float = 0.143576
     planner_interval_overhead_ms: float = 0.11486
     planner_merge_q_token_ms: float = 0.00011486
