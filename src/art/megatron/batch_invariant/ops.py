@@ -1,9 +1,11 @@
 """Differentiable row-invariant primitives, including a CPU contract oracle."""
 
+from typing import Any, cast
+
 import torch
 import torch.nn.functional as F
 
-POLICY_VERSION = "fixed-tree-rows-v1"
+POLICY_VERSION = "fixed-tree-rows-v2"
 ROW_TILE = 128
 K_TILE = 32
 
@@ -46,23 +48,9 @@ def _cpu_mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def _mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     if a.device.type != "cuda" or a.dtype == torch.float64:
         return _cpu_mm(a, b)
-    from .kernels import mm_kernel
+    from .fast_ops import persistent
 
-    out = a.new_empty((a.shape[0], b.shape[1]))
-    if out.numel():
-        mm_kernel[((a.shape[0] + 127) // 128, (b.shape[1] + 63) // 64)](
-            a,
-            b,
-            out,
-            a.shape[0],
-            b.shape[1],
-            a.shape[1],
-            *a.stride(),
-            *b.stride(),
-            num_warps=4,
-            num_stages=2,
-        )
-    return out
+    return persistent(a, b)
 
 
 class _Matmul(torch.autograd.Function):
@@ -77,7 +65,11 @@ class _Matmul(torch.autograd.Function):
         a, b = ctx.saved_tensors
         return (
             _mm(dy, b.T) if ctx.needs_input_grad[0] else None,
-            _mm(a.T, dy) if ctx.needs_input_grad[1] else None,
+            _mm(a.T.float(), dy.float()).to(b.dtype)
+            if ctx.needs_input_grad[1] and b.dtype != torch.float64
+            else _mm(a.T, dy)
+            if ctx.needs_input_grad[1]
+            else None,
         )
 
 
@@ -128,7 +120,7 @@ class _RMSNorm(torch.autograd.Function):
         r = torch.empty(flat.shape[0], dtype=torch.float32, device=x.device)
         width = x.shape[-1]
         if flat.shape[0]:
-            rms_forward[(flat.shape[0],)](
+            cast(Any, rms_forward)[(flat.shape[0],)](
                 flat,
                 weight,
                 out,
@@ -157,7 +149,7 @@ class _RMSNorm(torch.autograd.Function):
         width = x.shape[-1]
         if x.shape[0]:
             if ctx.needs_input_grad[0]:
-                rms_backward[(x.shape[0],)](
+                cast(Any, rms_backward)[(x.shape[0],)](
                     x,
                     weight,
                     r,
@@ -170,7 +162,7 @@ class _RMSNorm(torch.autograd.Function):
                     enable_fp_fusion=False,
                 )
             if ctx.needs_input_grad[1]:
-                rms_weight_backward[((width + 31) // 32,)](
+                cast(Any, rms_weight_backward)[((width + 31) // 32,)](
                     x,
                     r,
                     dy,
@@ -201,21 +193,151 @@ def rms_norm(x, weight, eps, *, zero_centered=False):
     return ((xx * r) * (weight.to(dtype) + int(zero_centered))).to(x.dtype)
 
 
-def grouped_lora(x, a, b, counts, *, scale=1.0):
-    """Expert/adapter rows stay local; no grouped shape-dependent GEMM choice."""
-    if isinstance(counts, torch.Tensor):
-        if counts.device.type != "cpu":
-            raise ValueError("expert counts must be prepared on CPU")
-        counts = counts.tolist()
-    if sum(counts) != x.shape[0]:
-        raise ValueError("expert counts do not cover the input rows")
-    out = [
-        matmul(
-            matmul(part, a[0 if a.shape[0] == 1 else i]), b[0 if b.shape[0] == 1 else i]
+class _GroupedMatmul(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, counts, *weights):
+        from .fast_ops import experts
+
+        ctx.counts = counts
+        ctx.save_for_backward(x, *weights)
+        return experts(x, weights, counts)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        (dy,) = grad_outputs
+        from .fast_ops import experts
+
+        x, *weights = ctx.saved_tensors
+        dx = (
+            experts(dy, [w.T for w in weights], ctx.counts)
+            if ctx.needs_input_grad[0]
+            else None
         )
-        for i, part in enumerate(x.split(counts))
-    ]
-    return torch.cat(out) * scale
+        dw = []
+        for i, (part, grad, w) in enumerate(
+            zip(x.split(ctx.counts), dy.split(ctx.counts), weights, strict=True)
+        ):
+            dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+            dw.append(
+                _mm(part.to(dtype).T, grad.to(dtype)).to(w.dtype)
+                if ctx.needs_input_grad[i + 2]
+                else None
+            )
+        return dx, None, *dw
+
+
+def grouped_matmul(x, weights, counts):
+    return _GroupedMatmul.apply(x, tuple(counts), *weights)
+
+
+def _project(x, weight, counts):
+    if counts is None:
+        return _mm(x, weight)
+    if weight.shape[0] == 1:
+        return _mm(x, weight[0])
+    from .fast_ops import experts
+
+    return experts(x, tuple(weight.unbind()), counts)
+
+
+def _project_wgrad(x, dy, counts, shared):
+    dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    if counts is None:
+        return _mm(x.to(dtype).T, dy.to(dtype))
+    if shared:
+        return _mm(x.to(dtype).T, dy.to(dtype)).unsqueeze(0)
+    return torch.stack(
+        [
+            _mm(a.to(dtype).T, b.to(dtype))
+            for a, b in zip(x.split(counts), dy.split(counts), strict=True)
+        ]
+    )
+
+
+def _parameter_gradient(parameter, gradient):
+    if getattr(parameter, "_stark_fp32_gradients", False):
+        if getattr(parameter, "main_grad", None) is None:
+            parameter.main_grad = gradient.float().clone()
+        else:
+            parameter.main_grad.add_(gradient.float())
+        return None
+    return gradient.to(parameter.dtype)
+
+
+class _LoRA(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, a, b, counts, scale):
+        flat = x.reshape(-1, x.shape[-1])
+        ctx.save_for_backward(flat, a, b)
+        ctx.parameters = a, b
+        ctx.counts, ctx.scale, ctx.shape = counts, scale, x.shape
+        out = _project(_project(flat, a, counts), b, counts)
+        return (out if scale == 1 else out * scale).reshape(*x.shape[:-1], b.shape[-1])
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        (dy,) = grad_outputs
+        x, a, b = ctx.saved_tensors
+        counts, scale = ctx.counts, ctx.scale
+        dy = dy.reshape(-1, dy.shape[-1])
+        # Scale once in the cotangent, matching the two rounded forward GEMMs.
+        scaled = dy if scale == 1 else dy * scale
+        tmp = _project(x, a, counts)
+        dt = _project(scaled, b.transpose(-1, -2), counts)
+        dx = (
+            _project(dt, a.transpose(-1, -2), counts)
+            if ctx.needs_input_grad[0]
+            else None
+        )
+        da = _project_wgrad(x, dt, counts, counts is not None and a.shape[0] == 1)
+        db = _project_wgrad(tmp, scaled, counts, counts is not None and b.shape[0] == 1)
+        return (
+            None if dx is None else dx.reshape(ctx.shape),
+            _parameter_gradient(ctx.parameters[0], da)
+            if ctx.needs_input_grad[1]
+            else None,
+            _parameter_gradient(ctx.parameters[1], db)
+            if ctx.needs_input_grad[2]
+            else None,
+            None,
+            None,
+        )
+
+
+def lora(x, a, b, counts=None, *, scale=1.0):
+    if counts is not None:
+        if isinstance(counts, torch.Tensor):
+            if counts.device.type != "cpu":
+                raise ValueError("expert counts must be prepared on CPU")
+            counts = counts.tolist()
+        counts = tuple(counts)
+        if sum(counts) != x.reshape(-1, x.shape[-1]).shape[0] or any(
+            c < 0 for c in counts
+        ):
+            raise ValueError("expert counts do not cover the input rows")
+        if a.shape[0] not in (1, len(counts)) or b.shape[0] not in (1, len(counts)):
+            raise ValueError("expert factors differ from counts")
+    return _LoRA.apply(x, a, b, counts, scale)
+
+
+def grouped_lora(x, a, b, counts, *, scale=1.0):
+    return lora(x, a, b, counts, scale=scale)
+
+
+class _ParameterFloat(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, parameter):
+        ctx.parameter = parameter
+        return parameter.float()
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        (gradient,) = grad_outputs
+        return _parameter_gradient(ctx.parameter, gradient)
+
+
+def parameter_float(parameter):
+    return None if parameter is None else _ParameterFloat.apply(parameter)
 
 
 class _LogSumExp(torch.autograd.Function):
@@ -226,7 +348,7 @@ class _LogSumExp(torch.autograd.Function):
         flat = x.reshape(-1, x.shape[-1]).contiguous()
         out = torch.empty((flat.shape[0], 1), dtype=torch.float32, device=x.device)
         if flat.shape[0]:
-            lse_forward[(flat.shape[0],)](
+            cast(Any, lse_forward)[(flat.shape[0],)](
                 flat, out, flat.shape[-1], num_warps=4, enable_fp_fusion=False
             )
         ctx.save_for_backward(x, out.reshape(*x.shape[:-1], 1))
@@ -255,7 +377,7 @@ class _Sum(torch.autograd.Function):
         flat = x.reshape(-1, x.shape[-1]).contiguous()
         out = torch.empty((flat.shape[0], 1), dtype=torch.float32, device=x.device)
         if flat.shape[0]:
-            sum_forward[(flat.shape[0],)](
+            cast(Any, sum_forward)[(flat.shape[0],)](
                 flat, out, flat.shape[-1], num_warps=4, enable_fp_fusion=False
             )
         ctx.shape, ctx.dtype = x.shape, x.dtype

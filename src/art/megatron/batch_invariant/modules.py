@@ -89,14 +89,23 @@ def _te_grouped(module, x, m_splits, is_first_microbatch=None):
     del is_first_microbatch
     if sum(m_splits) != x.shape[0] or len(m_splits) != module.num_gemms:
         raise ValueError("grouped GEMM splits must cover every input row")
-    outputs, biases = [], []
-    for i, part in enumerate(x.split(m_splits)):
-        weight = getattr(module, f"weight{i}").to(x.dtype)
-        bias = getattr(module, f"bias{i}", None) if module.use_bias else None
-        bias = None if bias is None else bias.to(x.dtype)
-        outputs.append(linear(part, weight, bias if module.apply_bias else None))
-        biases.append(bias)
-    out = torch.cat(outputs)
+    from .ops import _Bias, grouped_matmul
+
+    weights = [
+        getattr(module, f"weight{i}").to(x.dtype).T for i in range(module.num_gemms)
+    ]
+    out = grouped_matmul(x, weights, m_splits)
+    biases = [
+        getattr(module, f"bias{i}").to(x.dtype) if module.use_bias else None
+        for i in range(module.num_gemms)
+    ]
+    if module.apply_bias and module.use_bias:
+        out = torch.cat(
+            [
+                _Bias.apply(part, bias)
+                for part, bias in zip(out.split(m_splits), biases, strict=True)
+            ]
+        )
     module.is_first_microbatch = False
     if module.return_bias:
         return out, biases

@@ -178,6 +178,8 @@ def test_install_preserves_parameters_hooks_and_rejects_before_mutation(monkeypa
     setattr(layers, "ColumnParallelLinear", Native)
     router = ModuleType("megatron.core.transformer.moe.router")
     setattr(router, "TopKRouter", Native)
+    shared = ModuleType("megatron.core.transformer.moe.shared_experts")
+    setattr(shared, "SharedExpertMLP", type("SharedExpertMLP", (torch.nn.Module,), {}))
     te = ModuleType("transformer_engine.pytorch")
     for name in ("LayerNormLinear", "Linear", "GroupedLinear", "RMSNorm"):
         setattr(te, name, type(name, (torch.nn.Module,), {}))
@@ -195,6 +197,7 @@ def test_install_preserves_parameters_hooks_and_rejects_before_mutation(monkeypa
     for name, module in (
         (layers.__name__, layers),
         (router.__name__, router),
+        (shared.__name__, shared),
         (te.__name__, te),
     ):
         monkeypatch.setitem(sys.modules, name, module)

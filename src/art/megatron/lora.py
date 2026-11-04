@@ -33,7 +33,7 @@ from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 import torch
 
-from .batch_invariant.ops import grouped_lora, matmul
+from .batch_invariant.ops import grouped_lora, lora
 from .canonical.layout import capture as capture_canonical
 from .expert_parallel import get_expert_parallel_layout
 from .lora_config import (
@@ -1163,8 +1163,7 @@ class LoRA(torch.nn.Module):
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
             return grouped_lora(x, a_t, b_t, bsz, scale=scale)
-        out = matmul(matmul(x, a_t), b_t)
-        return out if scale == 1.0 else out * scale
+        return lora(x, a_t, b_t, scale=scale)
 
 
 def _bind_expert_lora_layout(experts: Any, *loras: LoRA) -> None:
