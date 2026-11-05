@@ -33,7 +33,19 @@ def pad_single_roots(batch: PrefixTreePack, *, cp_size: int) -> PrefixTreePack:
         source = batch.tokens[0, segment.packed_start : segment.packed_start + length]
         tokens.append(torch.cat((source, source.new_zeros(padded - length))))
         groups.append(source.new_full((padded,), segment.group_id))
-        positions.append(torch.arange(padded, device=source.device))
+        # Keep the same complete-pool candidate width at every CP size. Extra
+        # CP alignment is physical storage, not part of the indexer's document:
+        # torch.topk resolves tied visible pool scores differently when even
+        # masked future candidates change width.
+        pool_aligned = length + (-length % 4)
+        positions.append(
+            torch.cat(
+                (
+                    torch.arange(pool_aligned, device=source.device),
+                    source.new_full((padded - pool_aligned,), -1),
+                )
+            )
+        )
         mapping[segment.sequence_indices[0]] = torch.arange(
             cursor, cursor + length, device=source.device
         )
