@@ -260,7 +260,7 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
                 if lane == "dsa"
                 else {}
             )
-            script = "glm5next_kda_cp.py" if lane == "kda" else "glm5next_dsa_parity.py"
+            script = f"glm5next_{lane}_cp.py"
             argv = [
                 python,
                 "-m",

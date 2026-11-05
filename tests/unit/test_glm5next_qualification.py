@@ -234,3 +234,21 @@ def test_kda_mvp_numeric_gradient_failure_does_not_block():
     gate_policy(row, 8)
     assert row["blocking_pass"] and not row["report_only_pass"]
     assert row["gradients"]["A"]["rel_l2"] == 0.003
+
+
+@pytest.mark.parametrize("forward_error,blocking", [(1e-4, True), (0.003, False)])
+def test_dsa_numeric_gradient_failure_retains_forward_gate(forward_error, blocking):
+    from tests.integration.megatron.glm5next_dsa_cp import apply_gate_policy
+
+    row = {
+        "passed": False,
+        "selection_matching_fraction": 1.0,
+        "output": {"cosine": 1.0, "rel_l2": 1e-4},
+        "lora_gradients": {"A": {"rel_l2": 0.03}},
+        "cp1": {"output": {"rel_l2": forward_error}, "A": {"rel_l2": 0.003}},
+    }
+    apply_gate_policy(row)
+    assert row["passed"] is blocking
+    assert row["blocking_pass"] is blocking
+    assert not row["report_only_pass"] and not row["original_all_tolerances_passed"]
+    assert row["lora_gradients"]["A"]["rel_l2"] == 0.03
