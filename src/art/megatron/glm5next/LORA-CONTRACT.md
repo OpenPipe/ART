@@ -120,7 +120,12 @@ serving_r = r; serving_alpha = alpha; A_export = A; B_export = B
 ```
 
 vLLM folds its scale into B in `PackedLoRALayerWeights.optimize`, exactly
-once. Export does not pre-scale B. Router top-k=8 and routed scaling=2.5 act
+once. Export does not pre-scale B and owns its tensor storage, so the loader
+cannot mutate native factors. M6 publishes immutable safetensors bytes; each
+load/reload reads fresh tensors. An in-memory loader must likewise make a
+fresh copy per load, rather than pass previously optimized B again (SkyRL's
+separate `fold_lora_alpha_for_vllm` handles that different in-memory protocol).
+Router top-k=8 and routed scaling=2.5 act
 on expert outputs in both bases; neither divides LoRA rank or scale. Reject
 `rank_pattern`, `alpha_pattern`, rsLoRA and a reduced expert rank on this
 interface. SkyRL's reduced expert rank `r/8` gives trainer scale `8alpha/r`;

@@ -173,6 +173,26 @@ def test_vllm_stack_names_shapes_and_alpha_over_rank():
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_vllm_inplace_scale_cannot_mutate_native_snapshot():
+    state = native_state()
+    original = {k: v.clone() for k, v in state.items()}
+    exported, config = to_vllm_lora_tensors(
+        state, adapter_config=adapter_config(8, dimensions=TINY)
+    )
+    for key, tensor in exported.items():
+        if key.endswith(".lora_B.weight"):
+            tensor.mul_(config["lora_alpha"] / config["r"])
+    for key in state:
+        torch.testing.assert_close(state[key], original[key], rtol=0, atol=0)
+    # A reload starts from immutable artifact bytes, or a fresh export/copy.
+    again, _ = to_vllm_lora_tensors(
+        state, adapter_config=adapter_config(8, dimensions=TINY)
+    )
+    restored = from_vllm_lora_tensors(again, adapter_config=config)
+    for key in state:
+        torch.testing.assert_close(restored[key], original[key], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "mutation", ("missing", "extra", "shape", "independent", "nan", "expert_rank")
 )
