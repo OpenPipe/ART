@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import inspect
+import json
+import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -11,6 +14,7 @@ from art.megatron.gdn.gdn_prefix_tree import parse_gdn_prefix_tree_segments
 from art.megatron.glm5next.kda import KimiDeltaAttention
 from art.megatron.glm5next.kda_cp import build_prefix_plan
 from art.megatron.glm5next.kda_reference import recurrent_kda
+from tests.integration.megatron import kda_parity as parity
 
 
 def config(**kwargs):
@@ -50,6 +54,202 @@ def adapt(module):
     module.requires_grad_(False)
     for name in module.lora_targets:
         setattr(module, name, Adapter(getattr(module, name)))
+
+
+@pytest.mark.parametrize("failed", ["packed_pass", "gradients_pass"])
+def test_cp1_numeric_failure_is_report_only(failed):
+    record = dict(
+        forward_pass=True,
+        causality_pass=True,
+        leakage_pass=True,
+        packed_pass=True,
+        gradients_pass=True,
+        packing={"hard_leakage_failure": False},
+    )
+    record[failed] = False
+    parity.apply_gate_policy(record, 1)
+    assert record["blocking_pass"]
+    assert not record["pass"] and not record["report_only_pass"]
+
+
+@pytest.mark.parametrize("failed", ["forward_pass", "causality_pass", "leakage_pass"])
+def test_cp1_correctness_failure_blocks(failed):
+    record = dict(
+        forward_pass=True,
+        causality_pass=True,
+        leakage_pass=True,
+        packed_pass=True,
+        gradients_pass=True,
+        packing={"hard_leakage_failure": False},
+    )
+    record[failed] = False
+    parity.apply_gate_policy(record, 1)
+    assert not record["blocking_pass"] and not record["pass"]
+
+
+@pytest.mark.parametrize("world", [2, 8])
+@pytest.mark.parametrize(
+    "case", ["output", "tree_output", "gradients", "tree_gradients"]
+)
+def test_cp_output_blocks_but_gradient_failure_is_reported(world, case):
+    record: dict[str, Any] = {
+        "output": {"rel_l2": 1e-3},
+        "tree_output": {"rel_l2": 1e-3},
+        "gradients": {"q_proj.A": {"rel_l2": 1e-3}},
+        "tree_gradients": {"q_proj.A": {"rel_l2": 1e-3}},
+    }
+    parity.apply_gate_policy(record, world)
+    assert record["pass"] and record["blocking_pass"]
+    if case.endswith("gradients"):
+        record[case]["q_proj.A"]["rel_l2"] = 0.005
+        parity.apply_gate_policy(record, world)
+        assert record["blocking_pass"] and not record["report_only_pass"]
+        assert not record["pass"] and not record["probable_gradient_bugs"]
+        record[case]["q_proj.A"]["rel_l2"] = 0.01001
+        parity.apply_gate_policy(record, world)
+        assert record["blocking_pass"] and not record["pass"]
+        assert record["probable_gradient_bugs"] == [
+            {"case": case, "tensor": "q_proj.A", "rel_l2": 0.01001}
+        ]
+    else:
+        record[case]["rel_l2"] = 0.001001
+        parity.apply_gate_policy(record, world)
+        assert not record["blocking_pass"] and not record["pass"]
+
+
+@pytest.mark.parametrize("blocking", [True, False])
+def test_worker_exit_uses_correctness_and_preserves_numeric_fail(
+    tmp_path, monkeypatch, blocking
+):
+    output = tmp_path / "worker.json"
+    monkeypatch.setattr(
+        sys, "argv", ["kda_parity.py", "--device", "cpu", "--output", str(output)]
+    )
+    monkeypatch.setattr(
+        parity,
+        "run",
+        lambda args: {
+            "pass": False,
+            "blocking_pass": blocking,
+            "report_only_pass": False,
+        },
+    )
+    if blocking:
+        parity.main()
+    else:
+        with pytest.raises(SystemExit, match="blocking correctness"):
+            parity.main()
+    receipt = json.loads((tmp_path / "worker-rank0.json").read_text())
+    assert not receipt["pass"] and receipt["blocking_pass"] is blocking
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_comparisons_raise_even_for_report_only_gradients(value):
+    with pytest.raises(AssertionError, match="Nonfinite"):
+        parity.metrics(torch.tensor([value]), torch.ones(1))
+
+
+def test_cross_shape_variants_preserve_target_and_exclude_neighbors_from_loss():
+    module = layer()
+    parity.adapt(module)
+    target = torch.randn(9, 1, 8)
+    probe = torch.randn_like(target)
+    variants = parity.shape_variants(target)
+    assert [tuple(value.shape[:2]) for value in variants] == [
+        (9, 1),
+        (16, 1),
+        (23, 2),
+        (30, 3),
+    ]
+    baseline = module(target)[0]
+    baseline_grad = parity.gradients(module, baseline, probe)
+    for value in variants:
+        torch.testing.assert_close(value[:9, :1], target, rtol=0, atol=0)
+        output = module(value)[0][:9, :1]
+        actual_grad = parity.gradients(module, output, probe)
+        torch.testing.assert_close(output, baseline, rtol=1e-5, atol=1e-6)
+        assert len(actual_grad) == 8
+        for name in baseline_grad:
+            torch.testing.assert_close(
+                actual_grad[name], baseline_grad[name], rtol=1e-5, atol=1e-6
+            )
+
+
+def test_pairwise_envelope_and_both_metric_thresholds():
+    values = [
+        torch.tensor([1.0 + step, 2.0], dtype=torch.float64)
+        for step in (0, 0.1, 0.2, 0.3)
+    ]
+    envelope = parity.pairwise_envelope(values)
+    assert len(envelope["pairs"]) == 6
+    assert envelope["max_abs"] == pytest.approx(0.3)
+    assert envelope["rel_l2"] == pytest.approx(0.3 / 5**0.5)
+    with pytest.raises(ValueError, match="K >= 4"):
+        parity.pairwise_envelope(values[:3])
+    expected, actual = torch.tensor([0.0, 4.0]), torch.tensor([3.0, 4.0])
+    assert parity.envelope_comparison(
+        actual, expected, {"max_abs": 1.5, "rel_l2": 0.375}
+    )["pass"]
+    for bound in (
+        {"max_abs": 1.49, "rel_l2": 0.375},
+        {"max_abs": 1.5, "rel_l2": 0.374},
+    ):
+        result = parity.envelope_comparison(actual, expected, bound)
+        assert not result["pass"] and not result["hard_leakage_failure"]
+    result = parity.envelope_comparison(actual, expected, {"max_abs": 0, "rel_l2": 0})
+    assert not result["pass"] and result["hard_leakage_failure"]
+    assert parity.envelope_comparison(expected, expected, {"max_abs": 0, "rel_l2": 0})[
+        "pass"
+    ]
+    with pytest.raises(AssertionError, match="Nonfinite"):
+        parity.envelope_comparison(torch.tensor([float("nan"), 4]), expected, envelope)
+
+
+def test_perturb_pack_keeps_each_target_and_changes_every_neighbor():
+    parts = [
+        torch.full((length, 1, 8), float(index + 10))
+        for index, length in enumerate((9, 10, 13))
+    ]
+    for index, target in enumerate(parts):
+        for delta in (0, 7, -7):
+            value, cu, selected = parity.perturb_pack(parts, index, delta)
+            lengths = [
+                part.shape[0] + (0 if other == index else delta)
+                for other, part in enumerate(parts)
+            ]
+            assert (cu[1:] - cu[:-1]).tolist() == lengths
+            torch.testing.assert_close(value[selected], target, rtol=0, atol=0)
+            for other, part in enumerate(value.split(lengths)):
+                if other != index:
+                    assert not torch.any(part == float(other + 10))
+
+
+def test_packing_gate_detects_cross_sequence_leakage():
+    class Layer(nn.Module):
+        def __init__(self, leak):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(1.0))
+            self.leak = leak
+
+        def forward(self, x, packed_seq_params=None):  # ty: ignore[invalid-mutable-override]
+            assert torch.is_grad_enabled()  # Exercise the same training dispatch.
+            output = self.weight * x
+            if self.leak and packed_seq_params is not None:
+                output = output + x.sum()  # Deliberate wrong cross-sequence dependency.
+            return output, None
+
+    x = torch.ones(32, 1, 2)
+    cu = torch.tensor([0, 9, 19, 32], dtype=torch.int32)
+    for leak in (False, True):
+        result = parity.packing_checks(Layer(leak), x, cu, torch.ones_like(x))
+        assert result["packed_pass"] is (not leak)
+        assert result["leakage_pass"] is (not leak)
+        assert result["hard_leakage_failure"] is leak
+        assert len(result["targets"]) == 3
+        for target in result["targets"]:
+            assert len(set(target["gemm_rows"])) == 4
+            assert set(target["leakage"]) == {"0", "7", "-7"}
+            assert target["output_envelope"]["max_abs"] == 0
 
 
 def test_recurrence_derivatives():

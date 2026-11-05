@@ -15,6 +15,7 @@ from contextlib import contextmanager, nullcontext
 import copy
 from datetime import timedelta
 import inspect
+from itertools import combinations
 import json
 import os
 from pathlib import Path
@@ -29,6 +30,8 @@ import torch.distributed as dist
 from art.megatron.context_parallel.layout_index import TokenLayoutIndex
 from art.megatron.gdn.gdn_prefix_tree import parse_gdn_prefix_tree_segments
 from art.megatron.glm5next.kda import KimiDeltaAttention
+
+UNPACKED_SHAPES = ((0, 1), (7, 1), (14, 2), (21, 3))
 
 
 @contextmanager
@@ -137,30 +140,155 @@ def forward_checks(module: Any, reference: Any, x: Tensor, cu: Tensor) -> dict:
             ]
         )
         base = metrics(actual, reference_output)
-        # Independent calls from identical weights/inputs define the envelope.
-        repeats = [module(x, packed_seq_params=packed(cu))[0] for _ in range(3)]
-        envelope = max(metrics(repeat, actual)["max_abs"] for repeat in repeats)
-        unpacked = torch.cat(
-            [module(part)[0] for part in x.split((cu[1:] - cu[:-1]).tolist())]
-        )
-        packing = metrics(actual, unpacked)
-        # No tolerance floor: a deterministic same-state repeat yields zero.
-        packed_pass = (
-            packing["max_abs"] <= envelope
-            if x.dtype == torch.bfloat16
-            else bool(torch.allclose(actual, unpacked, rtol=1e-5, atol=1e-6))
-        )
         changed = x.clone()
         changed[8:] += 1
         causal = metrics(module(x)[0][:8], module(changed)[0][:8])
     return {
         "forward": base,
-        "packed": packing,
-        "repeat_max_abs_envelope": envelope,
-        "packed_pass": packed_pass,
         "causality": causal,
         "forward_pass": base["cosine"] >= 0.9999 and base["rel_l2"] <= 1e-2,
         "causality_pass": causal["max_abs"] == 0,
+    }
+
+
+def shape_variants(target: Tensor) -> list[Tensor]:
+    """Four unpacked GEMM shapes; target is always [:L, :1], loss excludes rest."""
+    length, _, width = target.shape
+    variants = []
+    for extra, batch in UNPACKED_SHAPES:
+        value = torch.randn(
+            length + extra, batch, width, device=target.device, dtype=target.dtype
+        )
+        value[:length, :1] = target
+        variants.append(value)
+    return variants
+
+
+def pairwise_envelope(values: list[Tensor]) -> dict[str, Any]:
+    """Per-tensor E, with both relative-L2 denominators and no tolerance floor."""
+    if len(values) < 4:
+        raise ValueError("Cross-shape envelope requires K >= 4")
+    pairs: list[dict[str, Any]] = []
+    for first, second in combinations(range(len(values)), 2):
+        pairs.append(
+            {
+                "variants": [first, second],
+                "forward": metrics(values[first], values[second]),
+                "reverse": metrics(values[second], values[first]),
+            }
+        )
+    return {
+        key: max(
+            pair[direction][key]
+            for pair in pairs
+            for direction in ("forward", "reverse")
+        )
+        for key in ("max_abs", "rel_l2")
+    } | {"pairs": pairs}
+
+
+def envelope_comparison(
+    actual: Tensor, expected: Tensor, envelope: dict[str, Any]
+) -> dict[str, Any]:
+    comparison: dict[str, Any] = metrics(actual, expected)
+    comparison["limits"] = {key: 2 * envelope[key] for key in ("max_abs", "rel_l2")}
+    comparison["pass"] = all(
+        comparison[key] <= comparison["limits"][key] for key in ("max_abs", "rel_l2")
+    )
+    comparison["hard_leakage_failure"] = any(
+        comparison[key] > 10 * envelope[key] for key in ("max_abs", "rel_l2")
+    )
+    return comparison
+
+
+def perturb_pack(
+    parts: list[Tensor], target: int, delta: int
+) -> tuple[Tensor, Tensor, slice]:
+    """Replace every neighbor, change its length, and relocate the intact target."""
+    changed = [
+        part
+        if index == target
+        else torch.randn(
+            part.shape[0] + delta,
+            *part.shape[1:],
+            device=part.device,
+            dtype=part.dtype,
+        )
+        for index, part in enumerate(parts)
+    ]
+    boundaries = [0]
+    for part in changed:
+        boundaries.append(boundaries[-1] + part.shape[0])
+    cu = torch.tensor(boundaries, device=parts[0].device, dtype=torch.int32)
+    return torch.cat(changed), cu, slice(boundaries[target], boundaries[target + 1])
+
+
+def packing_checks(module: Any, x: Tensor, cu: Tensor, probe: Tensor) -> dict[str, Any]:
+    """Window-2 gates; every comparison has its own target-only output/LoRA E."""
+    lengths = (cu[1:] - cu[:-1]).tolist()
+    parts = list(x.split(lengths))
+    targets = []
+    for index, (target, target_probe) in enumerate(
+        zip(parts, probe.split(lengths), strict=True)
+    ):
+        variants = shape_variants(target)
+        outputs, grads = [], []
+        for value in variants:
+            output = module(value)[0][: target.shape[0], :1]
+            grads.append(gradients(module, output, target_probe))
+            outputs.append(output.detach().clone())
+        output_e = pairwise_envelope(outputs)
+        gradient_e = {
+            name: pairwise_envelope([value[name] for value in grads])
+            for name in grads[0]
+        }
+        target_slice = slice(int(cu[index]), int(cu[index + 1]))
+        packed_output = module(x, packed_seq_params=packed(cu))[0][target_slice]
+        packed_grads = gradients(module, packed_output, target_probe)
+        packed_output = packed_output.detach().clone()
+        output_comparison = envelope_comparison(packed_output, outputs[0], output_e)
+        gradient_comparisons = {
+            name: envelope_comparison(value, grads[0][name], gradient_e[name])
+            for name, value in packed_grads.items()
+        }
+        leakage = {}
+        # Keep training dispatch identical: no_grad could select FlashKDA instead.
+        for delta in (0, 7, -7):
+            changed, changed_cu, changed_slice = perturb_pack(parts, index, delta)
+            changed_output = module(changed, packed_seq_params=packed(changed_cu))[0][
+                changed_slice
+            ].detach()
+            leakage[str(delta)] = {
+                "lengths": (changed_cu[1:] - changed_cu[:-1]).tolist(),
+                **envelope_comparison(changed_output, packed_output, output_e),
+            }
+        targets.append(
+            {
+                "target": index,
+                "length": target.shape[0],
+                "shapes": [list(value.shape) for value in variants],
+                "gemm_rows": [value.shape[0] * value.shape[1] for value in variants],
+                "output_envelope": output_e,
+                "gradient_envelopes": gradient_e,
+                "packed_output": output_comparison,
+                "packed_gradients": gradient_comparisons,
+                "leakage": leakage,
+                "packed_pass": output_comparison["pass"]
+                and all(value["pass"] for value in gradient_comparisons.values()),
+                "leakage_pass": all(value["pass"] for value in leakage.values()),
+                "hard_leakage_failure": any(
+                    value["hard_leakage_failure"] for value in leakage.values()
+                ),
+            }
+        )
+    return {
+        "gate": "window2-cross-shape-2E",
+        "targets": targets,
+        "packed_pass": all(target["packed_pass"] for target in targets),
+        "leakage_pass": all(target["leakage_pass"] for target in targets),
+        "hard_leakage_failure": any(
+            target["hard_leakage_failure"] for target in targets
+        ),
     }
 
 
@@ -216,24 +344,48 @@ def cp_checks(module: Any, x: Tensor, cu: Tensor, group: Any) -> dict:
     for name, grad in tree_grads.items():
         dist.all_reduce(grad, group=group)
         tree_comparisons[name] = metrics(grad, tree_expected[name])
-    passed = (
-        max(
-            output_metrics["rel_l2"],
-            tree_metrics["rel_l2"],
-            *(v["rel_l2"] for v in comparisons.values()),
-            *(v["rel_l2"] for v in tree_comparisons.values()),
-        )
-        <= 1e-3
-    )
     return {
+        "gate": "rel-l2-1e-3-no-envelope-fallback",
+        "output_policy": "blocking",
+        "gradient_policy": "report-only; >1e-2 rel-L2 is a probable bug",
         "world_size": world,
         "rank": rank,
         "output": output_metrics,
         "gradients": comparisons,
         "tree_output": tree_metrics,
         "tree_gradients": tree_comparisons,
-        "pass": passed,
     }
+
+
+def apply_gate_policy(record: dict[str, Any], world: int) -> None:
+    """Keep numeric FAILs intact; only correctness controls continuation."""
+    if world > 1:
+        record["output_pass"] = all(
+            record[key]["rel_l2"] <= 1e-3 for key in ("output", "tree_output")
+        )
+        record["gradients_pass"] = all(
+            value["rel_l2"] <= 1e-3
+            for key in ("gradients", "tree_gradients")
+            for value in record[key].values()
+        )
+        record["probable_gradient_bugs"] = [
+            {"case": key, "tensor": name, **value}
+            for key in ("gradients", "tree_gradients")
+            for name, value in record[key].items()
+            if value["rel_l2"] > 1e-2
+        ]
+        record["blocking_pass"] = record["output_pass"]
+        record["report_only_pass"] = record["gradients_pass"]
+    else:
+        record["blocking_pass"] = (
+            all(
+                record[key]
+                for key in ("forward_pass", "causality_pass", "leakage_pass")
+            )
+            and not record["packing"]["hard_leakage_failure"]
+        )
+        record["report_only_pass"] = record["packed_pass"] and record["gradients_pass"]
+    record["pass"] = record["blocking_pass"] and record["report_only_pass"]
 
 
 def run(args: Any) -> dict:
@@ -265,7 +417,7 @@ def run(args: Any) -> dict:
         cfg = Glm5NextTextConfig(**values)
     assert cfg.layer_types is not None
     layers = [
-        i for i, kind in enumerate(cfg.layer_types) if kind == "linear_attention"
+        i for i, kind in enumerate(values["layer_types"]) if kind == "linear_attention"
     ][:3]
     records = {}
     try:
@@ -325,6 +477,11 @@ def run(args: Any) -> dict:
                     records[str(layer)]["gradients_pass"] = all(
                         value["rel_l2"] <= 2e-2 for value in comparisons.values()
                     )
+                    packing = packing_checks(module, x, cu, probe)
+                    records[str(layer)]["packing"] = packing
+                    records[str(layer)]["packed_pass"] = packing["packed_pass"]
+                    records[str(layer)]["leakage_pass"] = packing["leakage_pass"]
+                apply_gate_policy(records[str(layer)], world)
                 print(
                     json.dumps(
                         {"layer": layer, "rank": rank, "results": records[str(layer)]}
@@ -335,27 +492,18 @@ def run(args: Any) -> dict:
     finally:
         if world > 1:
             dist.destroy_process_group()
-    passed = all(
-        record.get(
-            "pass",
-            all(
-                record.get(key, False)
-                for key in (
-                    "packed_pass",
-                    "gradients_pass",
-                    "forward_pass",
-                    "causality_pass",
-                )
-            ),
-        )
-        for record in records.values()
-    )
     return {
         "device": str(device),
         "fixture": args.fixture,
         "world_size": world,
         "kernel_evidence": args.device == "cuda",
-        "pass": passed,
+        "seed": 20261105,
+        "layer_seed": "seed + layer index",
+        "gate_policy": "Updates 13/27: numeric tolerances report-only",
+        **{
+            key: bool(records) and all(record[key] for record in records.values())
+            for key in ("pass", "blocking_pass", "report_only_pass")
+        },
         "layers": records,
     }
 
@@ -378,12 +526,26 @@ def schema_only(args: Any) -> dict:
                 value.shape,
                 expected[name].shape,
             )
+        boundaries = [0, args.tokens // 4 + 1, args.tokens // 2 + 3, args.tokens]
+        target_shapes = [
+            [length + extra, batch, cfg.hidden_size]
+            for start, end in zip(boundaries[:-1], boundaries[1:], strict=True)
+            for length in [end - start]
+            for extra, batch in UNPACKED_SHAPES
+        ]
         records[str(index)] = {
             "checkpoint_bytes": sum(
                 t.numel() * t.element_size() for t in weights.values()
             ),
             "parameter_elements": sum(t.numel() for t in weights.values()),
             "bf16_input_bytes": args.tokens * cfg.hidden_size * 2,
+            "unpacked_target_shapes": target_shapes,
+            "unpacked_target_bf16_input_bytes": [
+                sequence * batch * width * 2 for sequence, batch, width in target_shapes
+            ],
+            "largest_perturbed_pack_bf16_input_bytes": (args.tokens + 14)
+            * cfg.hidden_size
+            * 2,
             "fp32_recurrent_state_bytes": cfg.linear_num_heads
             * cfg.linear_head_dim**2
             * 4,
@@ -419,8 +581,8 @@ def main() -> None:
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(result, indent=2) + "\n")
-    if not result["pass"]:
-        raise SystemExit("KDA parity gate failed; see receipt")
+    if not result.get("blocking_pass", result["pass"]):
+        raise SystemExit("KDA blocking correctness gate failed; see receipt")
 
 
 if __name__ == "__main__":
