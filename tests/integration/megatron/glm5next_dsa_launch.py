@@ -219,6 +219,11 @@ def execute(seal_path: Path, approved: str, output: Path, recording: bool) -> No
         ]
         if not lifecycle or f"{after_event} {predecessor} " not in lifecycle[-1]:
             raise PermissionError(f"Wait for {predecessor}'s BOARD {after_event} line.")
+        cleanup_marker = seal["admission"].get("after_cleanup_contains", "")
+        if cleanup_marker not in lifecycle[-1]:
+            raise PermissionError(
+                f"Wait for the sealed predecessor window: {cleanup_marker}"
+            )
     output.mkdir(parents=True, exist_ok=True)
     (output / "STARTED").open("x").close()
     receipt: dict[str, Any] = {

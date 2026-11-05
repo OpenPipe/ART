@@ -79,7 +79,9 @@ def _backward(
     cp_state = cast(ArtContextParallelState, state.context_parallel_state)
     valid = int(sum(cp_state.rank_plan.local_valid_lengths))
     kv_flat = kv[0, :valid].contiguous()
-    dkv = torch.zeros_like(kv_flat)
+    # GLM-5.3 opts in through its state; GLM-5.2 keeps its original dtype.
+    dkv_dtype = getattr(state, "cp_dkv_accumulation_dtype", kv.dtype)
+    dkv = torch.zeros_like(kv_flat, dtype=dkv_dtype)
     combined_kv, stage_sizes = _combined_stage_kv(kv_flat, cp_state)
     dq, combined_dkv = sparse_mla_backward(
         q[:, :valid].contiguous(),
@@ -91,7 +93,7 @@ def _backward(
         scale=scale,
     )
     combined_dkv = reduce_tensor_parallel_dkv(
-        combined_dkv, tp_group=tp_group, dtype=kv.dtype
+        combined_dkv, tp_group=tp_group, dtype=dkv_dtype
     )
     stage_starts = [0]
     for size in stage_sizes:
@@ -109,6 +111,8 @@ def _backward(
             )
     for reduction in reductions:
         reduction.wait_post_process()
+    # Round only after all local and remote contributions have been summed.
+    dkv = dkv.to(kv.dtype)
     if valid == q.shape[1]:
         return dq, dkv.unsqueeze(0)
     dq_padded, dkv_padded = torch.zeros_like(q), torch.zeros_like(kv)

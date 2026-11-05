@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -39,6 +39,8 @@ class KPoolQueryPlan:
 
 
 class Glm5NextDsaState(Glm52PrefixTreeState):
+    # GLM-5.3 keeps sparse-kernel FP32 dKV partials through every CP sum.
+    cp_dkv_accumulation_dtype: ClassVar[torch.dtype] = torch.float32
     pool_plans: tuple[KPoolQueryPlan, ...] = ()
     combined_global_ids: torch.Tensor | None = None
 

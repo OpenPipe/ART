@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sys
@@ -58,3 +59,31 @@ def test_admission_requires_zero_memory_and_no_processes(
 
     monkeypatch.setattr(launch.subprocess, "check_output", query)
     assert launch.gpu_idle(["GPU-test"]) is idle
+
+
+def test_admission_rejects_cleanup_from_an_earlier_window(tmp_path: Path) -> None:
+    board, seal_path = tmp_path / "BOARD.md", tmp_path / "seal.json"
+    seal_path.write_text(
+        json.dumps(
+            {
+                "holds": [],
+                "launch_ready": True,
+                "repo": str(tmp_path),
+                "board": str(board),
+                "scripts": {},
+                "fixture_files": [],
+                "admission": {
+                    "after_lane": "glm-m2-kda",
+                    "after_event": "CLEANUP-DONE",
+                    "after_cleanup_contains": "CLEANUP-DONE glm-m2-kda window2",
+                },
+            }
+        )
+    )
+    digest = launch.sha256(seal_path)
+    board.write_text(
+        f"GRANT glm-m3-dsa seal_sha256={digest}\nCLEANUP-DONE glm-m2-kda window1 idle\n"
+    )
+    with pytest.raises(PermissionError, match="sealed predecessor window"):
+        launch.execute(seal_path, digest, tmp_path / "output", recording=False)
+    assert not (tmp_path / "output").exists()
