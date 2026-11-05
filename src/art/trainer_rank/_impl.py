@@ -1982,6 +1982,7 @@ from art.trainer_rank import _memory, _micro_batch_planner, _optimizer, _slots
 
 class TrainerRank:
     def __init__(self, runtime: TrainingRuntime) -> None:
+        self._forward_replica_group: dist.ProcessGroup | None = None
         options = _planner_misses.parse_options(os.environ)
         self._allow_oversized_batches = options.allow_oversized_batches
         self._planner_reporter = _planner_misses.Reporter(options.threshold_pct)
@@ -3335,15 +3336,50 @@ class TrainerRank:
             coalesced_all_reduce(bucket_grads, group=group, op=op)
         return grads
 
+    @property
+    def forward_replica_group(self) -> dist.ProcessGroup | None:
+        return getattr(self, "_forward_replica_group", None)
+
+    def set_forward_replica_group(self, group: dist.ProcessGroup | None) -> None:
+        """Scope forward admission and input distribution to a pure-DP replica.
+
+        Configure only while this trainer is idle, on every replica member.
+        All TP/CP/EP sizes must be one; model and optimizer process groups are
+        unchanged. None restores WORLD admission and Megatron DP assignment.
+        A Gloo group uses CPU admission votes even for a CUDA model.
+        """
+        if group is not None:
+            if any(
+                getattr(self._parallel_shape, key) != 1
+                for key in ("tp", "cp", "ep", "etp")
+            ):
+                raise ValueError("forward replica groups require TP1/CP1/EP1")
+            if dist.get_rank(group) < 0:
+                raise ValueError("rank is not a member of the forward replica group")
+        self._forward_replica_group = group
+
+    def _forward_collective_device(self) -> torch.device | str:
+        group = getattr(self, "_forward_replica_group", None)
+        if group is not None and dist.get_backend(group) == "gloo":
+            return "cpu"
+        return self.device if self.device.type == "cuda" else "cpu"
+
     def _validate_replicated_top_level_count(
         self, count: int, *, yield_empty: bool
     ) -> None:
         if not (dist.is_available() and dist.is_initialized()):
             return
         configurations: list[tuple[int, bool] | None] = [
-            None for _ in range(dist.get_world_size())
+            None
+            for _ in range(
+                dist.get_world_size(getattr(self, "_forward_replica_group", None))
+            )
         ]
-        dist.all_gather_object(configurations, (int(count), yield_empty))
+        dist.all_gather_object(
+            configurations,
+            (int(count), yield_empty),
+            group=getattr(self, "_forward_replica_group", None),
+        )
         if len(set(configurations)) == 1:
             return
         raise ValueError(
@@ -3354,6 +3390,9 @@ class TrainerRank:
         )
 
     def _dp_rank_and_size(self) -> tuple[int, int]:
+        group = getattr(self, "_forward_replica_group", None)
+        if group is not None:
+            return dist.get_rank(group), dist.get_world_size(group)
         try:
             from megatron.core import parallel_state as ps
 
@@ -3898,13 +3937,15 @@ class TrainerRank:
             return values
         tensor = torch.tensor(
             values,
-            device=self.device if self.device.type == "cuda" else "cpu",
+            device=self._forward_collective_device() if sync_across_dp else self.device,
             dtype=torch.float64,
         )
         dist.all_reduce(
             tensor,
             op=getattr(dist.ReduceOp, op),
-            group=None if sync_across_dp else self._forward_memory_group(),
+            group=getattr(self, "_forward_replica_group", None)
+            if sync_across_dp
+            else self._forward_memory_group(),
         )
         return [float(value) for value in tensor.tolist()]
 
@@ -4218,10 +4259,14 @@ class TrainerRank:
             return local
         value = torch.tensor(
             int(local),
-            device=self.device if self.device.type == "cuda" else "cpu",
+            device=self._forward_collective_device(),
             dtype=torch.int32,
         )
-        dist.all_reduce(value, op=dist.ReduceOp.MIN)
+        dist.all_reduce(
+            value,
+            op=dist.ReduceOp.MIN,
+            group=getattr(self, "_forward_replica_group", None),
+        )
         return bool(value.item())
 
     def _forward_item(self, request: AnyForwardInput) -> _ForwardItem:
