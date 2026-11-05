@@ -119,3 +119,30 @@ def test_layer_capture_unwraps_ddp_and_precision_wrappers():
     torch.testing.assert_close(sample, x[:4])
     for handle in handles:
         handle.remove()
+
+
+def test_qualification_pins_rank32_and_preserves_cp_ep():
+    from types import SimpleNamespace
+
+    from tests.integration.megatron.glm5next_qualification import (
+        configure_qualification_provider,
+    )
+
+    cfg = SimpleNamespace(
+        _art_lora_rank=1,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        expert_tensor_parallel_size=2,
+        context_parallel_size=8,
+        expert_model_parallel_size=8,
+        _art_model_support_spec=SimpleNamespace(default_target_modules=("lm_head",)),
+    )
+    configure_qualification_provider(cfg)
+    assert cfg._art_lora_rank == 32
+    assert (
+        cfg.tensor_model_parallel_size,
+        cfg.pipeline_model_parallel_size,
+        cfg.expert_tensor_parallel_size,
+    ) == (1, 1, 1)
+    assert (cfg.context_parallel_size, cfg.expert_model_parallel_size) == (8, 8)
+    assert cfg._art_lora_target_modules == ["lm_head"]

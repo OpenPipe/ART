@@ -172,6 +172,16 @@ def identity(model: Path, output: Path) -> None:
     save_vllm_lora_tensors(output, tensors, config)
 
 
+def configure_qualification_provider(provider: Any) -> None:
+    provider._art_lora_rank = 32
+    provider._art_lora_target_modules = list(
+        provider._art_model_support_spec.default_target_modules
+    )
+    provider.tensor_model_parallel_size = 1
+    provider.pipeline_model_parallel_size = 1
+    provider.expert_tensor_parallel_size = 1
+
+
 def capture_layer_outputs(chunks: Any, values: dict) -> list[Any]:
     """Capture outside the layer forward, through DDP/Float16 wrappers."""
     handles = []
@@ -198,14 +208,23 @@ class TinyEngine:
     """Native ART LoRA storage on a tiny CPU projection; real token volumes."""
 
     def __init__(self, model: Path, output: Path):
+        from types import SimpleNamespace
+
         from art.megatron.glm5next.lora_layers import _attach_projection
+
+        provider = SimpleNamespace(
+            _art_model_support_spec=SimpleNamespace(default_target_modules=["lm_head"])
+        )
+        configure_qualification_provider(provider)
 
         self.rank, self.device = 0, torch.device("cpu")
         torch.manual_seed(42)
         self.embedding = torch.nn.Embedding(257, 16)
         self.head: Any = torch.nn.Linear(16, 257, bias=False)
         self.head.requires_grad_(False)
-        _attach_projection(self.head, "base_model.model.lm_head", 32, 32)
+        _attach_projection(
+            self.head, "base_model.model.lm_head", provider._art_lora_rank, 32
+        )
         self.params = [
             p for n, p in self.head.named_parameters() if n.endswith(("A_T", "B_T"))
         ]
@@ -344,6 +363,7 @@ class ArtEngine:
             allow_unvalidated_arch=True,
             build_optimizer=False,
             lora_layout=LoraLayout(expert="shared_outer"),
+            provider_configure=configure_qualification_provider,
         )
         self.trainer = TrainerRank(self.runtime)
         self.trainer.load_checkpoint(str(output.parents[1] / "initial"))
