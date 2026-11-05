@@ -186,7 +186,13 @@ def to_vllm_lora_tensors(
                 "{expert}." + t.name.rsplit(".", 1)[-1], _W[t.name.rsplit(".", 1)[-1]]
             )
         for suffix, value in zip(_SUFFIXES, pairs[t.name], strict=True):
-            result[name + suffix] = value.contiguous()
+            # vLLM optimize() multiplies B in place. Ordinary factors may be
+            # live snapshot views; never let a consumer mutate that source.
+            result[name + suffix] = (
+                value.contiguous()
+                if t.experts
+                else value.detach().clone(memory_format=torch.contiguous_format)
+            )
     config = {
         **adapter_config,
         META: {**adapter_config[META], "format": "vllm"},

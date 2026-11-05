@@ -59,8 +59,11 @@ HF/PEFT uses `P = base_model.model.model.language_model.layers.{L}`.
 vLLM artifacts use **runtime** names under
 `V = base_model.model.language_model.model.layers.{L}`; stripping
 `base_model.model.` gives actual conditional-generation module names. M8 must
-not prepend `model.language_model.` a second time. The `language_model_only`
-entrypoint needs a separate namespace conversion and is not this artifact.
+not prepend `model.language_model.` a second time. M8's conditional-generation
+wrapper preserves this namespace with `--language-model-only`. A direct bare
+`Glm5NextForCausalLM` entrypoint needs a separate namespace conversion and is
+not this artifact. The export's `art_glm5next_vllm.language_model_only=False`
+records that namespace choice; it does not forbid M8's wrapper-preserving flag.
 
 | Trainer logical projection | vLLM 0.32 runtime module / slot | PEFT projection |
 |---|---|---|
@@ -120,7 +123,12 @@ serving_r = r; serving_alpha = alpha; A_export = A; B_export = B
 ```
 
 vLLM folds its scale into B in `PackedLoRALayerWeights.optimize`, exactly
-once. Export does not pre-scale B. Router top-k=8 and routed scaling=2.5 act
+once. Export does not pre-scale B and owns its tensor storage, so the loader
+cannot mutate native factors. M6 publishes immutable safetensors bytes; each
+load/reload reads fresh tensors. An in-memory loader must likewise make a
+fresh copy per load, rather than pass previously optimized B again (SkyRL's
+separate `fold_lora_alpha_for_vllm` handles that different in-memory protocol).
+Router top-k=8 and routed scaling=2.5 act
 on expert outputs in both bases; neither divides LoRA rank or scale. Reject
 `rank_pattern`, `alpha_pattern`, rsLoRA and a reduced expert rank on this
 interface. SkyRL's reduced expert rank `r/8` gives trainer scale `8alpha/r`;
