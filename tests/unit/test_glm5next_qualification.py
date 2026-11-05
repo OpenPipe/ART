@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from tests.integration.megatron.glm5next_qualification_launch import (
+    KubeClient,
     manifest,
     preflight,
     process_tree_pss,
@@ -68,12 +69,19 @@ def test_cluster_manifest_uses_amended_b300_placement(gpu):
     assert spec["activeDeadlineSeconds"] <= 14400
 
 
-def test_pss_reads_rollup_and_timeout_cleans_worker(tmp_path):
+def test_pss_reads_rollup_and_timeout_cleans_worker(tmp_path, monkeypatch):
+    original = Path.read_text
+    observed = []
+
+    def read(path, *args, **kwargs):
+        if path.name == "smaps_rollup":
+            observed.append(path)
+            return "Rss: 10000000 kB\nPss: 3000 kB\n"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
     value = process_tree_pss(os.getpid(), {})
-    rss = int(Path(f"/proc/{os.getpid()}/statm").read_text().split()[1]) * os.sysconf(
-        "SC_PAGE_SIZE"
-    )
-    assert 0 < value <= rss + (1 << 20)
+    assert observed and value == len(observed) * 3000 * 1024
     with pytest.raises(TimeoutError):
         run(
             [sys.executable, "-c", "import time; time.sleep(20)"],
@@ -155,6 +163,7 @@ def test_qualification_pins_rank32_and_preserves_cp_ep():
         "volumes",
         "acquire",
         "oracle-setup",
+        "hybridep-setup",
         "identity",
         "identity-F4",
         "identity-F8",
@@ -167,3 +176,61 @@ def test_cpu_stages_never_receive_gpu_visibility(step):
     assert visible_devices(seal, step, tiny=False) == ""
     assert visible_devices(seal, "F4", tiny=False) == "GPU-two,GPU-three"
     assert visible_devices(seal, "F4", tiny=True) == ""
+
+
+def test_b200_manifest_uses_primary_pool_and_cuda13():
+    seal = {
+        "namespace": "qual-flash",
+        "chunks": ["source"],
+        "source_sha256": "0" * 64,
+        "pool": "caladan-b200-spot",
+        "pool_selector": "compute.coreweave.com/node-pool",
+        "priorityClassName": "yield",
+        "pod_cpu": 96,
+        "image": "ghcr.io/openpipe/caladan-stark-trainer-cuda13@sha256:" + "0" * 64,
+    }
+    pod = manifest(seal, "gpu", True)
+    assert pod["spec"]["priorityClassName"] == "yield"
+    assert pod["spec"]["nodeSelector"] == {
+        "compute.coreweave.com/node-pool": "caladan-b200-spot"
+    }
+    assert pod["spec"]["containers"][0]["image"] == seal["image"]
+    assert "preemptionPolicy" not in pod["spec"]
+    assert manifest(seal, "cpu-stage0", False)["spec"]["activeDeadlineSeconds"] >= 1800
+
+
+def test_cluster_cleanup_only_deletes_owned_resources(tmp_path):
+    class Client(KubeClient):
+        def __init__(self):
+            super().__init__(
+                {"window_seconds": 14400, "namespace": "qual-flash"}, tmp_path
+            )
+            self.calls = []
+
+        def call(self, args, data=None, seconds=120):
+            self.calls.append(args)
+            return ""
+
+    client = Client()
+    client.create({"kind": "ConfigMap", "metadata": {"name": "m4-source"}})
+    client.create({"kind": "Pod", "metadata": {"name": "m4-worker"}})
+    client.cleanup()
+    deletes = [args[:3] for args in client.calls if args[0] == "delete"]
+    assert deletes == [
+        ["delete", "pod", "m4-worker"],
+        ["delete", "configmap", "m4-source"],
+    ]
+    assert all("namespace" not in args for args in client.calls)
+
+
+def test_kda_mvp_numeric_gradient_failure_does_not_block():
+    from tests.integration.megatron.glm5next_kda_cp import gate_policy
+
+    row = {
+        "packing": "single-root",
+        "output": {"rel_l2": 1e-4},
+        "gradients": {"A": {"rel_l2": 0.003, "max_abs": 0.01}},
+    }
+    gate_policy(row, 8)
+    assert row["blocking_pass"] and not row["report_only_pass"]
+    assert row["gradients"]["A"]["rel_l2"] == 0.003

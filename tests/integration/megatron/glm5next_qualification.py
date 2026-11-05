@@ -53,11 +53,25 @@ def acquire(record: dict, destination: Path) -> dict:
     return {"path": path.name, "size": path.stat().st_size, "sha256": record["sha256"]}
 
 
-def stage0(output: Path, expected_cuda: str = "12.8") -> None:
+def stage0(
+    output: Path, expected_cuda: str | None = None, *, require_toolkit: bool = False
+) -> None:
     from art.megatron.model_support.handlers.glm5next import GLM5NEXT_HANDLER
     from art.megatron.train import build_training_runtime
     from art.trainer_rank import TrainerRank
 
+    expected_cuda = expected_cuda or os.environ.get("M4_EXPECTED_CUDA", "12.8")
+    require_toolkit = require_toolkit or os.environ.get("M4_REQUIRE_TOOLKIT") == "1"
+    toolkit = None
+    if require_toolkit:
+        import shutil
+        import subprocess
+
+        cuda_home = Path(os.environ.get("CUDA_HOME", "/missing"))
+        assert (cuda_home / "bin/nvcc").is_file() and shutil.which("nvcc")
+        toolkit = subprocess.check_output(
+            [str(cuda_home / "bin/nvcc"), "--version"], text=True, timeout=30
+        )
     assert torch.version.cuda == expected_cuda
     assert GLM5NEXT_HANDLER.single_root_packing
     assert callable(build_training_runtime)
@@ -71,10 +85,61 @@ def stage0(output: Path, expected_cuda: str = "12.8") -> None:
             "cuda": torch.version.cuda,
             "torch": torch.__version__,
             "cuda_initialized": False,
+            "toolkit": toolkit,
+            "toolkit_simulated": os.environ.get("M4_FAKE_TOOLKIT") == "1",
             "art_source": str(Path(__import__("art").__file__).resolve()),
         },
     )
     print("M4_STAGE0_PASS", flush=True)
+
+
+def hybrid_ep_stage(output: Path, *, tiny: bool) -> None:
+    import subprocess
+
+    from art.megatron import hybrid_ep_setup as setup
+
+    arch = os.environ["TORCH_CUDA_ARCH_LIST"]
+    assert setup._arch_list() == arch
+    assert os.environ["HYBRID_EP_MULTINODE"] == "0" and os.environ["USE_NIXL"] == "0"
+    assert callable(setup.setup_hybrid_ep) and callable(setup.validate_hybrid_ep)
+    validation = (
+        "from art.megatron.hybrid_ep_setup import validate_hybrid_ep; validate_hybrid_ep(); import hybrid_ep_cpp; assert hybrid_ep_cpp.SM_ARCH == "
+        + repr(arch)
+    )
+    commands = [
+        [sys.executable, "-m", "art.megatron.hybrid_ep_setup"],
+        [sys.executable, "-c", validation],
+    ]
+    records = []
+    started = time.monotonic()
+    for argv in commands:
+        if tiny:
+            # Build/validation are external CUDA-toolchain operations. Exercise the
+            # exact command schema; compilation remains an explicit GPU-window output.
+            if "-c" in argv:
+                compile(argv[-1], "hybridep-validation", "exec")
+            actual = [
+                sys.executable,
+                "-c",
+                "print('CPU HybridEP command-plan validation')",
+            ]
+        else:
+            actual = argv
+        subprocess.run(
+            actual, check=True, timeout=max(1, 1780 - (time.monotonic() - started))
+        )
+        records.append({"argv": argv, "executed": actual, "simulation": tiny})
+    write(
+        output / "hybridep.json",
+        {
+            "status": "pass",
+            "simulation": tiny,
+            "source_sha256": setup._source_hash(),
+            "arch": arch,
+            "seconds": time.monotonic() - started,
+            "commands": records,
+        },
+    )
 
 
 def volumes(inputs: Path, output: Path) -> None:
@@ -649,6 +714,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tiny", action="store_true")
     args = parser.parse_args()
+    torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "2")))
+    torch.set_num_interop_threads(1)
     args.output.mkdir(parents=True, exist_ok=True)
     if args.task == "stage0":
         stage0(args.output / "stage0.json")
@@ -661,6 +728,8 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda r: acquire(r, args.model), records))
         write(args.output / "acquisition.json", results)
+    elif args.task == "hybridep-setup":
+        hybrid_ep_stage(args.output, tiny=args.tiny)
     elif args.task == "oracle-setup":
         from tests.integration.megatron.glm5next_qualification_launch import (
             prepare_worker_fixtures,

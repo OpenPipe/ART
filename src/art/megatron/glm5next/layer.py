@@ -69,3 +69,44 @@ class Glm5NextTransformerLayer(Dsv4TransformerLayer):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.hc_util = _Glm5NextHyperConnectionUtil(self.config)
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Any = None,
+        context: Any = None,
+        context_mask: Any = None,
+        rotary_pos_emb: Any = None,
+        rotary_pos_cos: Any = None,
+        rotary_pos_sin: Any = None,
+        rotary_pos_cos_sin: Any = None,
+        attention_bias: Any = None,
+        inference_context: Any = None,
+        packed_seq_params: Any = None,
+        sequence_len_offset: Any = None,
+        padding_mask: Any = None,
+        input_ids: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        # Also fence direct model calls: KDA is the first layer, before any DSA.
+        if attention_bias is not None and hasattr(attention_bias, "group_ids"):
+            from art.megatron.glm5next.packing import validate_single_roots
+
+            validate_single_roots(attention_bias.group_ids, attention_bias.parent_ids)
+        return super().forward(
+            hidden_states,
+            attention_mask=attention_mask,
+            context=context,
+            context_mask=context_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            rotary_pos_cos_sin=rotary_pos_cos_sin,
+            attention_bias=attention_bias,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+            **kwargs,
+        )

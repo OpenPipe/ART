@@ -9,7 +9,7 @@ from art.megatron.prefix_tree_packing import PrefixTreePack
 
 def validate_single_roots(group_ids: torch.Tensor, parent_ids: torch.Tensor) -> None:
     valid = group_ids >= 0
-    if bool((group_ids[valid] != parent_ids[valid]).any()):
+    if bool(((group_ids[valid] != parent_ids[valid]) & (parent_ids[valid] >= 0)).any()):
         raise ValueError(
             "GLM-5.3 Flash MVP requires single-root packing; trees are unsupported."
         )

@@ -76,3 +76,25 @@ def test_unaligned_datums_build_native_dsa_state():
         device=torch.device("cpu"),
     )
     assert state is not None
+
+
+@pytest.mark.parametrize("layer_number", [1, 4])
+def test_branching_never_reaches_kda_or_dsa_layer(layer_number):
+    from art.megatron.glm5next.layer import Glm5NextTransformerLayer
+
+    layer = Glm5NextTransformerLayer.__new__(Glm5NextTransformerLayer)
+    torch.nn.Module.__init__(layer)
+    layer.layer_number = layer_number
+    layer.config = SimpleNamespace(cuda_graph_impl="none")
+
+    class ForbiddenAttention(torch.nn.Module):
+        def forward(self, *args, **kwargs):
+            raise AssertionError("tree reached attention")
+
+    layer.self_attention = ForbiddenAttention()
+    state = SimpleNamespace(
+        group_ids=torch.tensor([[0, 0, 1, 1]]),
+        parent_ids=torch.tensor([[-1, -1, 0, 0]]),
+    )
+    with pytest.raises(ValueError, match="single-root"):
+        layer(torch.zeros(4, 1, 4, 16), attention_bias=state)

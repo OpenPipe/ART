@@ -231,7 +231,7 @@ def test_packing_gate_detects_cross_sequence_leakage():
             self.weight = nn.Parameter(torch.tensor(1.0))
             self.leak = leak
 
-        def forward(self, x, packed_seq_params=None):  # ty: ignore[invalid-mutable-override]
+        def forward(self, x, packed_seq_params=None):
             assert torch.is_grad_enabled()  # Exercise the same training dispatch.
             output = self.weight * x
             if self.leak and packed_seq_params is not None:

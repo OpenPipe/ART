@@ -23,7 +23,7 @@ os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 
 ROOT = Path(__file__).resolve().parents[3]
 WORKER = "tests/integration/megatron/glm5next_qualification.py"
-IMAGE = "ghcr.io/openpipe/caladan-stark-trainer@sha256:7bebcc01d83c60b1d019cef07637339690730649684d5a49a88f30ccdaa1f6ae"
+IMAGE = "ghcr.io/openpipe/caladan-stark-trainer-cuda13@sha256:9b66db12efc279cd64dc6576f03bc3dd188555d5f6eec16cee96eac77ff9cbbd"
 BOARD = Path("/home/brad/.local/share/stark-v0/2026-10-20/workstreams/_shared/BOARD.md")
 
 
@@ -241,6 +241,7 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
             add(f"identity-{fixture}", "identity", 300, source=path)
             add(fixture, "parity", 2100, count=2, source=path)
     else:
+        add("hybridep-setup", "hybridep-setup", 1800)
         add("acquire", "acquire", 4200)
         add("oracle-setup", "oracle-setup", 600)
         add("identity", "identity", 600)
@@ -259,7 +260,7 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
                 if lane == "dsa"
                 else {}
             )
-            script = "kda_parity.py" if lane == "kda" else "glm5next_dsa_parity.py"
+            script = "glm5next_kda_cp.py" if lane == "kda" else "glm5next_dsa_parity.py"
             argv = [
                 python,
                 "-m",
@@ -337,7 +338,7 @@ def prepare_worker_fixtures(root: Path, work: Path, *, tiny: bool) -> None:
 def visible_devices(seal: dict, name: str, *, tiny: bool) -> str:
     if (
         tiny
-        or name in ("stage0", "volumes", "acquire", "oracle-setup")
+        or name in ("stage0", "volumes", "acquire", "oracle-setup", "hybridep-setup")
         or name.startswith("identity")
     ):
         return ""
@@ -361,6 +362,16 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
             PYTHONPATH=str(root / "src") + os.pathsep + str(root),
             OMP_NUM_THREADS="2",
             MKL_NUM_THREADS="2",
+            OPENBLAS_NUM_THREADS="2",
+            NUMEXPR_NUM_THREADS="2",
+            TORCHINDUCTOR_COMPILE_THREADS="1",
+            MAX_JOBS="8",
+            TORCH_CUDA_ARCH_LIST=seal.get("arch", "10.0"),
+            HYBRID_EP_MULTINODE="0",
+            USE_NIXL="0",
+            M4_EXPECTED_CUDA="12.8" if tiny else seal.get("torch_cuda", "12.8"),
+            M4_REQUIRE_TOOLKIT="1" if seal["kind"] == "cluster" else "0",
+            ART_MEGATRON_CACHE_ROOT=str(work / "art-cache"),
             HF_HOME=str(work / "hf"),
             HF_HUB_DISABLE_TELEMETRY="1",
             HF_HUB_DISABLE_IMPLICIT_TOKEN="1",
@@ -414,7 +425,7 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
 
 def manifest(seal: dict, name: str, gpu: bool) -> dict:
     resources = {
-        "cpu": "96" if gpu else "4",
+        "cpu": str(seal.get("pod_cpu", 96)) if gpu else "4",
         "memory": "1400Gi" if gpu else "16Gi",
         "ephemeral-storage": "1200Gi" if gpu else "8Gi",
     }
@@ -429,7 +440,12 @@ def manifest(seal: dict, name: str, gpu: bool) -> dict:
         {"name": "shm", "mountPath": "/dev/shm"},
     ]
     for i, _ in enumerate(seal["chunks"]):
-        volumes.append({"name": f"input-{i}", "configMap": {"name": f"m4-source-{i}"}})
+        volumes.append(
+            {
+                "name": f"input-{i}",
+                "configMap": {"name": f"m4-{seal['source_sha256'][:10]}-source-{i}"},
+            }
+        )
         mounts.append(
             {"name": f"input-{i}", "mountPath": f"/sealed/{i}", "readOnly": True}
         )
@@ -453,9 +469,13 @@ def manifest(seal: dict, name: str, gpu: bool) -> dict:
         },
         "spec": {
             "restartPolicy": "Never",
-            "activeDeadlineSeconds": 13200 if gpu else 600,
-            "priorityClassName": "caladan-serving",
-            "nodeSelector": {"caladan.openpipe.ai/pool": "caladan-b300-spot"},
+            "activeDeadlineSeconds": 13200 if gpu else 1800,
+            "priorityClassName": seal.get("priorityClassName", "caladan-serving"),
+            "nodeSelector": {
+                seal.get("pool_selector", "caladan.openpipe.ai/pool"): seal.get(
+                    "pool", "caladan-b300-spot"
+                )
+            },
             "tolerations": [
                 {
                     "key": "caladan.openpipe.ai/spot",
@@ -464,11 +484,11 @@ def manifest(seal: dict, name: str, gpu: bool) -> dict:
                 }
             ],
             "imagePullSecrets": [{"name": "caladan-ghcr-pull"}],
-            "securityContext": {"fsGroup": 1000},
+            "securityContext": {"runAsUser": 0, "fsGroup": 0},
             "containers": [
                 {
                     "name": "qualification",
-                    "image": IMAGE,
+                    "image": seal.get("image", IMAGE),
                     "command": [
                         "/opt/art/megatron_runtime/.venv/bin/python",
                         "-u",
@@ -488,6 +508,17 @@ class KubeClient:
     def __init__(self, seal: dict, output: Path):
         self.seal, self.output = seal, output
         self.deadline = time.monotonic() + seal["window_seconds"] - 300
+        self.owned: list[tuple[str, str]] = []
+        self.stage0_node: str | None = None
+        self.gpu_started: float | None = None
+
+    @property
+    def gpu_hours(self) -> float:
+        return (
+            0.0
+            if self.gpu_started is None
+            else 8 * (time.monotonic() - self.gpu_started) / 3600
+        )
 
     def call(
         self, args: list[str], data: dict | None = None, seconds: int = 120
@@ -510,11 +541,21 @@ class KubeClient:
         return value.stdout
 
     def create(self, value: dict) -> None:
+        if value["kind"] not in ("Pod", "ConfigMap"):
+            raise ValueError(
+                "M4 owns only Pods and ConfigMaps in the standing namespace"
+            )
         self.call(["create", "-f", "-"], value)
+        self.owned.append((value["kind"].lower(), value["metadata"]["name"]))
 
     def pod(self, value: dict, root: Path, work: Path, seal: dict) -> None:
         self.create(value)
         name = value["metadata"]["name"]
+        gpu = (
+            "nvidia.com/gpu" in value["spec"]["containers"][0]["resources"]["requests"]
+        )
+        if gpu:
+            self.gpu_started = time.monotonic()
         deadline = min(
             time.monotonic() + value["spec"]["activeDeadlineSeconds"] + 60,
             self.deadline,
@@ -522,7 +563,7 @@ class KubeClient:
         while time.monotonic() < deadline:
             status = json.loads(self.call(["get", "pod", name, "-o", "json"]))
             phase = status.get("status", {}).get("phase")
-            if phase == "Running" and name == "m4-qualification":
+            if phase == "Running" and gpu:
                 try:
                     done = json.loads(
                         self.call(["exec", name, "--", "cat", "/work/done.json"])
@@ -550,39 +591,35 @@ class KubeClient:
                     raise RuntimeError(f"Pod failed: {name}")
                 if name.endswith("stage0") and "M4_STAGE0_PASS" not in logs:
                     raise RuntimeError("stage0 missing success marker")
+                if name.endswith("stage0"):
+                    self.stage0_node = status["spec"]["nodeName"]
                 return
             time.sleep(5)
         raise TimeoutError(name)
 
     def cleanup(self) -> None:
-        self.call(
-            [
-                "delete",
-                "namespace",
-                self.seal["namespace"],
-                "--wait=true",
-                "--timeout=180s",
-            ],
-            seconds=210,
-        )
-        result = self.call(
-            [
-                "get",
-                "namespace",
-                self.seal["namespace"],
-                "--ignore-not-found",
-                "-o",
-                "name",
-            ]
-        )
-        if result.strip():
-            raise RuntimeError("namespace cleanup incomplete")
+        for kind, name in reversed(self.owned):
+            self.call(
+                [
+                    "delete",
+                    kind,
+                    name,
+                    "--ignore-not-found",
+                    "--wait=true",
+                    "--timeout=180s",
+                ],
+                seconds=210,
+            )
+            result = self.call(["get", kind, name, "--ignore-not-found", "-o", "name"])
+            if result.strip():
+                raise RuntimeError(f"M4 cleanup incomplete: {kind}/{name}")
 
 
 class RecordingClient:
     def __init__(self):
         self.events: list[dict] = []
         self.ran = False
+        self.stage0_node: str | None = None
 
     def create(self, value: dict) -> None:
         self.events.append({"create": value})
@@ -590,9 +627,10 @@ class RecordingClient:
     def pod(self, value: dict, root: Path, work: Path, seal: dict) -> None:
         self.create(value)
         assert "preemptionPolicy" not in value["spec"]
-        assert value["spec"]["nodeSelector"] == {
-            "caladan.openpipe.ai/pool": "caladan-b300-spot"
-        }
+        pool_key = seal.get("pool_selector", "caladan.openpipe.ai/pool")
+        assert value["spec"]["nodeSelector"][pool_key] == seal.get(
+            "pool", "caladan-b300-spot"
+        )
         if value["metadata"]["name"].endswith("stage0"):
             run(
                 task_argv(
@@ -613,12 +651,19 @@ class RecordingClient:
                 ),
                 cwd=root,
             )
+            self.stage0_node = "recording-stage0-node"
         else:
+            assert (
+                value["spec"]["nodeSelector"]["kubernetes.io/hostname"]
+                == self.stage0_node
+            )
             self.result = pipeline(seal, root, work, tiny=True)
             self.ran = True
 
     def cleanup(self) -> None:
-        self.events.append({"delete_namespace": True, "verified_absent": True})
+        self.events.append(
+            {"delete_owned_pods_and_configmaps": True, "verified_absent": True}
+        )
 
 
 def idle(uuids: list[str]) -> None:
@@ -664,6 +709,18 @@ def execute(
             path.chmod(0o444)
     work = output / "work"
     work.mkdir()
+    if recording and seal["kind"] == "cluster":
+        toolkit = work / "fake-cuda" / "bin"
+        toolkit.mkdir(parents=True)
+        nvcc = toolkit / "nvcc"
+        nvcc.write_text("#!/bin/sh\nprintf 'Cuda compilation tools, release 13.0\\n'\n")
+        nvcc.chmod(0o555)
+        os.environ.update(
+            CUDA_HOME=str(toolkit.parent),
+            PATH=str(toolkit) + os.pathsep + os.environ.get("PATH", ""),
+            M4_FAKE_TOOLKIT="1",
+            M4_REQUIRE_TOOLKIT="1",
+        )
     receipt: dict = {
         "seal_sha256": approved,
         "kind": seal["kind"],
@@ -686,7 +743,7 @@ def execute(
                         "apiVersion": "v1",
                         "kind": "ConfigMap",
                         "metadata": {
-                            "name": f"m4-source-{i}",
+                            "name": f"m4-{seal['source_sha256'][:10]}-source-{i}",
                             "namespace": seal["namespace"],
                         },
                         "immutable": True,
@@ -695,12 +752,18 @@ def execute(
                         },
                     }
                 )
-            client.pod(manifest(seal, "m4-stage0", False), source, work, seal)
+            prefix = f"m4-{seal['source_sha256'][:10]}"
+            client.pod(manifest(seal, prefix + "-stage0", False), source, work, seal)
             if not recording:
                 board(
-                    f"GPU-START glm-m4-model b300 namespace={seal['namespace']} seal={approved}"
+                    f"GPU-START glm-m4-model node namespace={seal['namespace']} seal={approved}"
                 )
-            client.pod(manifest(seal, "m4-qualification", True), source, work, seal)
+            gpu_pod = manifest(seal, prefix + "-qualification", True)
+            assert client.stage0_node
+            gpu_pod["spec"]["nodeSelector"]["kubernetes.io/hostname"] = (
+                client.stage0_node
+            )
+            client.pod(gpu_pod, source, work, seal)
             if recording:
                 receipt["science"] = cast(RecordingClient, client).result
         receipt["status"] = "pass"
@@ -715,7 +778,7 @@ def execute(
                     ]
                 else:
                     board(
-                        f"CLEANUP-DONE glm-m4-model namespace={seal['namespace']} verified absent"
+                        f"CLEANUP-DONE glm-m4-model namespace={seal['namespace']} own Pods/ConfigMaps verified absent gpu_hours={client.gpu_hours:.6f}"
                     )
         elif not recording:
             idle(seal["uuids"])
@@ -744,7 +807,11 @@ def main() -> None:
         if args.pod_mode == "stage0":
             from tests.integration.megatron.glm5next_qualification import stage0
 
-            stage0(args.output / "stage0.json")
+            stage0(
+                args.output / "stage0.json",
+                expected_cuda=seal.get("torch_cuda", "13.0"),
+                require_toolkit=True,
+            )
         else:
             status = {"status": "failed"}
             try:
