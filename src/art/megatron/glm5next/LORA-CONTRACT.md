@@ -157,6 +157,8 @@ orientations are not interchangeable. Metadata records native rank/alpha,
 flags, dimensions and format; import verifies zero padding, block diagonals,
 and identical shared factors before collapsing. Modified independent factors
 must raise rather than be silently averaged.
+All-false flags use PEFT's `dummy-target-modules` sentinel for a loadable
+identity adapter with no tensors.
 
 ## EP gather interface and validation ownership
 
@@ -170,10 +172,46 @@ function does no collective itself: M6 uses ART's existing manifest/tensor
 transport; every participating rank must complete transport before rank zero
 converts. Ordinary CP/DP replica selection remains ART's existing policy.
 
-`glm5next.lora` exposes flag selection, shape/count derivation, and the M4
-installation entrypoint. M2/M3 IFACE and M1 F4 parity are required to claim
-implementation READY. This document freezes tensor semantics now; it does not
-claim a GPU load or full-model parity measurement.
+The concrete entrypoints are:
+
+```python
+from art.megatron.glm5next.lora import (
+    LoraDimensions, LoraFlags, apply_glm5next_lora, parameter_counts,
+)
+from art.megatron.glm5next.lora_export import (
+    adapter_config, gather_and_export_lora,
+    to_vllm_lora_tensors, from_vllm_lora_tensors,
+    to_peft_lora_tensors, from_peft_lora_tensors,
+)
+
+flags = LoraFlags(train_attn=True, train_mlp=True, train_unembed=True)
+config = adapter_config(8, dimensions=LoraDimensions.from_config(hf_config), flags=flags)
+apply_glm5next_lora(model_chunks, provider, rank=8, alpha=32, flags=flags)
+serving_tensors, serving_config = gather_and_export_lora(
+    entries_by_key, adapter_config=config, format="vllm",
+)
+```
+
+`adapter_config` records `art_glm5next_lora` with version `shared_outer_v1`,
+format (`art`, `vllm`, `peft`), native `rank`, native `alpha`, `dimensions`
+and the three `flags`. Preserve this metadata for validated import. The native
+revision is the BF16 training revision; serving may normalize identity to its
+pinned FP8 sibling through M6/M8's existing model identity checks.
+
+M2's posted IFACE uses separate `q_proj/k_proj/v_proj/o_proj`. M3's posted
+IFACE preserves GLM52's `q_a_lora`, `kv_a_lora` and `linear_proj`. KDA/head
+residual hooks register ART `LoRA` children while preserving the original base
+parameter paths for Bridge. M4's merged-weight exporter calls
+`glm5next.lora_layers.build_glm5next_adapter_weights_by_base(model_chunks)`.
+All installed LoRA modules carry the shared-outer layout metadata. M4/M6 must
+also bind runtime/snapshot layout to shared_outer_v1; ART's generic non-Qwen
+explicit-layout fence is outside these lane-owned files.
+
+M1 F4 passes the predeclared rank-8 BF16 merged-versus-low-rank-branch logits
+gate (relative L2 **0.00753053**, threshold **0.01**). That CPU reference uses
+HF base modules and the same factors exported to vLLM; M4 owns the separate
+complete MCore pipeline qualification. This does not claim a GPU sampler load
+or full 45-layer parity measurement.
 
 Pinned source references: vLLM tag `v0.32.0`,
 `vllm/models/glm5next/common/{model,kda,attention}.py`,
