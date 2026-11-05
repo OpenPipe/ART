@@ -135,7 +135,8 @@ def glm5next_mapping_registry() -> MegatronMappingRegistry:
 
 
 class ArtGlm5NextBridge(MegatronModelBridge[Any, GPTModelProvider, GPTModel]):
-    art_stream_host_import = True
+    # Two F8 DP replicas must not pin two complete 73-GiB checkpoints at once.
+    art_stream_import = True
 
     def hf_config_to_provider_kwargs(self, hf_config: Any) -> dict[str, Any]:
         cfg = text_config(hf_config)

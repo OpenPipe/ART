@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 from typing import Any
 
+from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.hf_pretrained.state import StateDict
+from megatron.bridge.models.conversion.param_mapping import ReplicatedMapping
+from megatron.bridge.models.hf_pretrained.state import StateDict, StateSource
 from megatron.core import parallel_state
 from megatron.core.transformer.transformer_config import TransformerConfig
 import pytest
@@ -12,7 +14,10 @@ import torch.distributed as dist
 
 from art.megatron.glm5next.bridge import ArtGlm5NextBridge
 from art.megatron.glm5next.source import Glm5NextTaskSource, materialize_hf_weight
-from art.megatron.runtime.bridge_runtime import _validate_local_pretrained_tasks
+from art.megatron.runtime.bridge_runtime import (
+    _optimized_load_weights_hf_to_megatron,
+    _validate_local_pretrained_tasks,
+)
 
 
 def test_real_bridge_task_planner_accepts_only_backed_transformers_aliases(tmp_path):
@@ -103,3 +108,55 @@ def test_task_source_never_invents_unbacked_aliases():
     assert "x.mlp.experts.2.up_proj.weight" not in logical
     assert "x.mlp.experts.0.down_proj.weight" not in logical
     assert "x.self_attn.k_conv1d.weight" not in logical
+
+
+def test_glm_import_copies_each_task_before_staging_the_next(tmp_path, monkeypatch):
+    model: Any = nn.Module()
+    model.config = SimpleNamespace(share_embeddings_and_output_weights=False)
+    model.local = nn.Linear(1, 1, bias=False)
+    model.second = nn.Linear(1, 1, bias=False)
+    reads = []
+
+    class OrderedSource(StateSource):
+        def get_all_keys(self):
+            return ["a", "b"]
+
+        def load_tensors(self, keys):
+            for key in keys:
+                if key == "b":
+                    # Bulk prefetch reaches b before a has been copied. One
+                    # task at a time bounds staging for both DP replicas.
+                    assert float(model.local.weight.detach()[0, 0]) == 1.5
+                reads.append(key)
+            return {key: torch.full((1, 1), 1.5 if key == "a" else 2.5) for key in keys}
+
+    bridge = ArtGlm5NextBridge()
+    monkeypatch.setattr(
+        bridge,
+        "mapping_registry",
+        lambda: MegatronMappingRegistry(
+            ReplicatedMapping("local.weight", "a"),
+            ReplicatedMapping("second.weight", "b"),
+        ),
+    )
+    pretrained = SimpleNamespace(
+        config=SimpleNamespace(n_routed_experts=1),
+        state=StateDict(OrderedSource()),
+        model_name_or_path=str(tmp_path),
+    )
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path}/rdzv", rank=0, world_size=1
+    )
+    try:
+        parallel_state.initialize_model_parallel()
+        monkeypatch.setattr(bridge, "art_stream_import", False)
+        with pytest.raises(AssertionError):
+            _optimized_load_weights_hf_to_megatron(bridge, pretrained, [model])
+        reads.clear()
+        monkeypatch.setattr(bridge, "art_stream_import", True)
+        _optimized_load_weights_hf_to_megatron(bridge, pretrained, [model])
+        assert reads == ["a", "b"]
+        assert float(model.second.weight.detach()[0, 0]) == 2.5
+    finally:
+        parallel_state.destroy_model_parallel()
+        dist.destroy_process_group()
