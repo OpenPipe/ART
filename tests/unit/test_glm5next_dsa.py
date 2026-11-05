@@ -93,7 +93,7 @@ class _Norm(nn.LayerNorm):
         super().__init__(hidden_size, eps=eps)
 
 
-def _attention() -> Glm5NextSelfAttention:
+def _attention(index_head_dim: int = 8) -> Glm5NextSelfAttention:
     config = MLATransformerConfig(
         num_layers=4,
         hidden_size=32,
@@ -111,7 +111,7 @@ def _attention() -> Glm5NextSelfAttention:
         add_bias_linear=False,
         use_cpu_initialization=True,
         dsa_indexer_n_heads=2,
-        dsa_indexer_head_dim=8,
+        dsa_indexer_head_dim=index_head_dim,
         dsa_indexer_topk=8,
         dsa_indexer_loss_coeff=0.0,
     )
@@ -146,6 +146,46 @@ def _dense_sparse(
     scores = torch.einsum("bqhd,bkd->bhqk", q, kv) * scale
     probs = scores.masked_fill(~mask[:, None], -torch.inf).softmax(-1).nan_to_num()
     return torch.einsum("bhqk,bkd->bqhd", probs, kv[..., :512])
+
+
+def test_sampler_indexer_preserves_attention_gradient_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(823)
+    attention = _attention(index_head_dim=128)
+    assert isinstance(attention.core_attention, Glm5NextSparseCore)
+    indexer = attention.core_attention.indexer
+    assert isinstance(indexer, KPoolIndexer)
+    assert indexer.selection_policy == "vllm_fp8"
+    monkeypatch.setattr(glm52_attention, "sparse_mla", _dense_sparse)
+    length = 24
+    state = build_glm5next_dsa_state(
+        position_ids=torch.arange(length)[None],
+        group_ids=torch.zeros(1, length, dtype=torch.long),
+        parent_ids=torch.full((1, length), -1),
+        device=torch.device("cpu"),
+    )
+    x = torch.randn(length, 1, 32, requires_grad=True)
+    before = {name: p.detach().clone() for name, p in indexer.named_parameters()}
+    out, _ = attention(
+        x, attention_bias=SimpleNamespace(model_state={"glm5next_dsa": state})
+    )
+    out.square().mean().backward()
+    assert (
+        x.grad is not None and torch.isfinite(x.grad).all() and x.grad.abs().sum() > 0
+    )
+    for module in (
+        attention.linear_q_down_proj,
+        attention.linear_kv_down_proj,
+        attention.linear_proj,
+    ):
+        assert module.weight.grad is not None
+        assert (
+            torch.isfinite(module.weight.grad).all()
+            and module.weight.grad.abs().sum() > 0
+        )
+    assert all(not p.requires_grad and p.grad is None for p in indexer.parameters())
+    assert all(torch.equal(before[name], p) for name, p in indexer.named_parameters())
 
 
 def test_mcore_nope_forward_backward_matches_hf(
