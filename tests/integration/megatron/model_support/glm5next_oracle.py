@@ -350,6 +350,8 @@ def dump(
     *,
     lengths: tuple[int, ...] = LENGTHS,
     full_volume_rehearsal: bool = False,
+    all_layer_outputs: bool = False,
+    gradients: bool = True,
 ) -> None:
     model = oracle.load_fixture(name, root=root, device=device, verify=True)
     if full_volume_rehearsal:
@@ -425,7 +427,7 @@ def dump(
 
                 for index, layer in enumerate(model.model.language_model.layers):
                     prefix = f"layers.{index}"
-                    if name in ("F4", "R2"):
+                    if all_layer_outputs or name in ("F4", "R2"):
                         handles.append(
                             layer.register_forward_pre_hook(
                                 input_hook(prefix + ".input_streams"), with_kwargs=True
@@ -591,7 +593,7 @@ def dump(
                     }
                 )
                 print(f"dumped {path.name}", flush=True)
-        if name in ("F4", "R2"):
+        if gradients and name in ("F4", "R2"):
             files.extend(gradient_dump(model, prompt_set, root, out, device))
     data = manifest(root)
     data["dumps"][name] = {

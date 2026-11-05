@@ -42,6 +42,10 @@ class Glm5NextRouter(TopKRouter):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._keep_fp32_parameters = ("weight",)
+        # MCore stores noaux_tc's correction bias as a buffer. Its forward
+        # promotes the dtype again, but cannot recover bits lost when the
+        # mixed-precision wrapper casts the model. Preserve the loaded values.
+        self._keep_fp32_buffers = ("expert_bias",)
         setattr(self.weight, "_keep_fp32", True)
         self.weight.data = self.weight.data.float()
 

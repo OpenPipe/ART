@@ -84,7 +84,7 @@ def validate_plan(spec: dict, tokens: list[int], *, backward: bool) -> dict:
         request = ForwardInput(
             input_tokens=torch.tensor(tokens[:-1]),
             target_tokens=torch.tensor(tokens[1:]),
-            top_k=1,
+            top_k=2,
             no_grad=not backward,
             logits=spec["task"] == "parity" and len(tokens) <= 128,
         )

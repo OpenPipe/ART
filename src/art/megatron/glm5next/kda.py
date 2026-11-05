@@ -373,6 +373,8 @@ class KimiDeltaAttention(nn.Module):
             part.reshape(shape).contiguous() for part in convolved.chunk(3, dim=-1)
         ]
         raw_g = _tensor(self.f_b_proj(_tensor(self.f_a_proj(x))))
+        # Match vLLM common/kda.py:132-134,471-476: raw BF16 logits,
+        # FP32 sigmoid. HF's BF16 sigmoid has different rounding.
         beta = _tensor(self.b_proj(x)).float().sigmoid()
         if self.backend == "reference" and cp_size > 1:
             from .kda_cp import reference_gather
