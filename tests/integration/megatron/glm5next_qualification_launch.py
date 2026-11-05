@@ -16,6 +16,8 @@ import tarfile
 import time
 from typing import Any, cast
 
+GPU_VISIBLE_DEVICES = os.environ.get("CUDA_VISIBLE_DEVICES") or "0,1,2,3,4,5,6,7"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
 
@@ -326,6 +328,16 @@ def prepare_worker_fixtures(root: Path, work: Path, *, tiny: bool) -> None:
         archive.extractall(work / "oracle-site")
 
 
+def visible_devices(seal: dict, name: str, *, tiny: bool) -> str:
+    if tiny or name in ("stage0", "volumes", "acquire") or name.startswith("identity"):
+        return ""
+    return (
+        ",".join(seal["uuids"])
+        if seal["kind"] == "workstation"
+        else GPU_VISIBLE_DEVICES
+    )
+
+
 def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
     from tests.integration.megatron.glm5next_qualification import compare
 
@@ -349,8 +361,7 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
             **{},
         )
         env.update(step["env"])
-        if tiny:
-            env["CUDA_VISIBLE_DEVICES"] = ""
+        env["CUDA_VISIBLE_DEVICES"] = visible_devices(seal, step["name"], tiny=tiny)
         if step["name"] == "dsa-cp8" and tiny:
             env["PYTHONPATH"] = (
                 str(work / "oracle-site")
@@ -655,7 +666,6 @@ def execute(
         if seal["kind"] == "workstation":
             if not recording:
                 idle(seal["uuids"])
-                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(seal["uuids"])
                 board(
                     f"GPU-START glm-m4-model workstation seal={approved} uuids={seal['uuids']}"
                 )

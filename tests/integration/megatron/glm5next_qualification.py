@@ -349,13 +349,13 @@ class ArtEngine:
     def __init__(self, model: Path, output: Path):
         import torch.distributed as dist
 
+        self.rank = int(os.environ["RANK"])
+        self.device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        torch.cuda.set_device(self.device)
         from art.megatron.lora import LoraLayout
         from art.megatron.train import build_training_runtime
         from art.trainer_rank import TrainerRank
 
-        self.rank = int(os.environ["RANK"])
-        self.device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-        torch.cuda.set_device(self.device)
         dist.init_process_group("nccl", timeout=timedelta(seconds=300))  # ty: ignore[possibly-missing-attribute]
         self.runtime = build_training_runtime(
             model_identifier=str(model),

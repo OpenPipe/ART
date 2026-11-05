@@ -146,3 +146,15 @@ def test_qualification_pins_rank32_and_preserves_cp_ep():
     ) == (1, 1, 1)
     assert (cfg.context_parallel_size, cfg.expert_model_parallel_size) == (8, 8)
     assert cfg._art_lora_target_modules == ["lm_head"]
+
+
+@pytest.mark.parametrize(
+    "step", ["stage0", "volumes", "acquire", "identity", "identity-F4", "identity-F8"]
+)
+def test_cpu_stages_never_receive_gpu_visibility(step):
+    from tests.integration.megatron.glm5next_qualification_launch import visible_devices
+
+    seal = {"kind": "workstation", "uuids": ["GPU-two", "GPU-three"]}
+    assert visible_devices(seal, step, tiny=False) == ""
+    assert visible_devices(seal, "F4", tiny=False) == "GPU-two,GPU-three"
+    assert visible_devices(seal, "F4", tiny=True) == ""
