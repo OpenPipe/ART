@@ -59,8 +59,11 @@ HF/PEFT uses `P = base_model.model.model.language_model.layers.{L}`.
 vLLM artifacts use **runtime** names under
 `V = base_model.model.language_model.model.layers.{L}`; stripping
 `base_model.model.` gives actual conditional-generation module names. M8 must
-not prepend `model.language_model.` a second time. The `language_model_only`
-entrypoint needs a separate namespace conversion and is not this artifact.
+not prepend `model.language_model.` a second time. M8's conditional-generation
+wrapper preserves this namespace with `--language-model-only`. A direct bare
+`Glm5NextForCausalLM` entrypoint needs a separate namespace conversion and is
+not this artifact. The export's `art_glm5next_vllm.language_model_only=False`
+records that namespace choice; it does not forbid M8's wrapper-preserving flag.
 
 | Trainer logical projection | vLLM 0.32 runtime module / slot | PEFT projection |
 |---|---|---|
