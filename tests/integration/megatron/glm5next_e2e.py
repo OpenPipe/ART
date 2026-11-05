@@ -119,7 +119,9 @@ def install_capture(trainer: Any, path: Path) -> None:
                 )
             else:
                 uids = prepared.token_uids.reshape(-1)
-            records[name] = value.detach().cpu().clone().reshape(-1, value.shape[-1])
+            # mHC can retain an explicit four-stream axis. It belongs to the
+            # channel vector, never to token identity.
+            records[name] = value.detach().cpu().clone().reshape(uids.numel(), -1)
             records[name + ".uids"] = uids.detach().cpu().reshape(-1)
 
         model = trainer.runtime.model[0]

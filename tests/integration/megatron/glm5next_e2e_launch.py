@@ -182,6 +182,9 @@ class Kube(NATIVE_KUBE):
 
 def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
     return [
+        {"name": name, "trainer_plan": None}
+        for name in ("volumes", "hybridep-setup", "acquire", "identity")
+    ] + [
         {
             "name": variant,
             "trainer_plan": {
@@ -259,20 +262,19 @@ def pipeline(
         )
         write(work / "results/stages.json", records)
 
-    if not tiny:
-        for task in ("hybridep-setup", "acquire", "identity"):
-            run(
+    for task in ("volumes", "hybridep-setup", "acquire", "identity"):
+        run(
+            task,
+            base.task_argv(
+                python,
+                root,
                 task,
-                base.task_argv(
-                    python,
-                    root,
-                    task,
-                    inputs,
-                    work / "model",
-                    work / f"results/{task}",
-                    False,
-                ),
-            )
+                inputs,
+                work / "model",
+                work / f"results/{task}",
+                tiny and task != "identity",
+            ),
+        )
     for variant, world in (("B0", 1), ("B1", 8)):
         run(
             variant,
