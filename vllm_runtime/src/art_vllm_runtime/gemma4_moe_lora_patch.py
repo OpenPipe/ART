@@ -12,9 +12,6 @@ def patch_gemma4_moe_lora_support() -> None:
     from vllm.model_executor.models.gemma4_mm import Gemma4ForConditionalGeneration
 
     # Remove this shim when upstream vLLM Gemma4 MoE defines these natively.
-    Gemma4ForCausalLM.is_3d_moe_weight = True
-    Gemma4ForConditionalGeneration.is_3d_moe_weight = True
-
     if not hasattr(Gemma4ForCausalLM, "get_expert_mapping"):
 
         def get_causal_expert_mapping(
