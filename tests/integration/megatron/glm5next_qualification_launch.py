@@ -230,6 +230,9 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
                     "ART_MEGATRON_CONTEXT_PARALLEL_SIZE": str(cp),
                     "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE": str(ep),
                 },
+                "trainer_plan": {"task": task, "cp": cp, "ep": ep, "world_size": count}
+                if task in ("forward", "parity", "learn") or task.startswith("context-")
+                else None,
             }
         )
 
@@ -245,7 +248,8 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
         add("acquire", "acquire", 4200)
         add("oracle-setup", "oracle-setup", 600)
         add("identity", "identity", 600)
-        add("EP8-CP1", "forward", 1200, ep=8, count=8)
+        add("CP8-EP8", "forward", 1200, cp=8, ep=8, count=8)
+        add("rank32", "learn", 1200, cp=8, ep=8, count=8)
         # Pinned, lane-owned operator workers, using the separate HF overlay only for M3.
         for lane in ("kda", "dsa"):
             oracle = str(work / "oracle-site")
@@ -290,8 +294,6 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
             commands.append(
                 {"name": f"{lane}-cp8", "argv": argv, "seconds": 900, "env": env}
             )
-        add("CP8-EP8", "forward", 1200, cp=8, ep=8, count=8)
-        add("rank32", "learn", 1200, cp=8, ep=8, count=8)
         for length in (32768, 65536, 131072, 262144):
             add(f"context-{length}", f"context-{length}", 600, cp=8, ep=8, count=8)
     return commands
@@ -356,7 +358,25 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
     deadline = time.monotonic() + min(
         seal["window_seconds"] - 600, 12800 if seal["kind"] == "cluster" else 6600
     )
+    context_summary: dict = {
+        "largest_fit": None,
+        "first_oom": None,
+        "execution": "tiny_cpu" if tiny else "native_gpu",
+    }
     for step in steps(seal, root, work, tiny=tiny):
+        if (
+            step["name"].startswith("context-")
+            and context_summary["first_oom"] is not None
+        ):
+            records.append(
+                {
+                    "name": step["name"],
+                    "status": "not_run",
+                    "reason": "stopped at first context OOM",
+                }
+            )
+            write(work / "results/pipeline.json", records)
+            continue
         env = dict(
             os.environ,
             PYTHONPATH=str(root / "src") + os.pathsep + str(root),
@@ -403,6 +423,8 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
                 else seal["pss_limit_bytes"],
             )
             records.append({"name": step["name"], "status": "pass", **receipt})
+            if step["name"].startswith("context-"):
+                context_summary["largest_fit"] = int(step["name"].split("-")[1])
             if step["name"] in ("F4", "F8"):
                 compare(
                     work / "results" / step["name"],
@@ -416,11 +438,21 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
                 {"name": step["name"], "status": "failed", "error": str(exc)}
             )
             write(work / "results/pipeline.json", records)
-            # Each context is isolated in its own torchrun; OOM/refusal is a measured result.
-            if not step["name"].startswith("context-"):
+            oom = any(
+                json.loads(path.read_text()).get("status") == "oom"
+                for path in (work / "results" / step["name"]).glob("failure-rank*.json")
+            )
+            if not step["name"].startswith("context-") or not oom:
                 raise
+            records[-1]["status"] = "oom"
+            context_summary["first_oom"] = int(step["name"].split("-")[1])
+        write(work / "results/context-summary.json", context_summary)
         write(work / "results/pipeline.json", records)
-    return {"steps": records, "execution": "tiny_cpu" if tiny else "native_gpu"}
+    return {
+        "steps": records,
+        "context": context_summary,
+        "execution": "tiny_cpu" if tiny else "native_gpu",
+    }
 
 
 def manifest(seal: dict, name: str, gpu: bool) -> dict:
@@ -696,6 +728,7 @@ def execute(
     *,
     controller_owner: str | None = None,
 ) -> None:
+    window_started = time.monotonic()
     seal = preflight(seal_path, approved)
     recording = isinstance(client, RecordingClient)
     if not recording and not has_grant(seal, approved, BOARD.read_text()):
@@ -745,6 +778,38 @@ def execute(
         "cleanup_done": False,
     }
     try:
+        expected_plans = [
+            {"name": step["name"], **step["trainer_plan"]}
+            for step in steps(seal, source, work, tiny=False)
+            if step.get("trainer_plan") is not None
+        ]
+        if expected_plans != json.loads(
+            (source / "qualification-inputs/stage-plans.json").read_text()
+        ):
+            raise ValueError("sealed TrainerRank stage plans differ from execute steps")
+        receipt["topology_validation"] = run(
+            task_argv(
+                seal["native_python"],
+                source,
+                "topology-plans",
+                source / "qualification-inputs",
+                work / "model",
+                work / "topology-plans",
+                True,
+            ),
+            600,
+            work / "topology-plans.log",
+            env=dict(
+                os.environ,
+                CUDA_VISIBLE_DEVICES="",
+                PYTHONPATH=str(source / "src") + os.pathsep + str(source),
+                OMP_NUM_THREADS="2",
+                MKL_NUM_THREADS="2",
+                OPENBLAS_NUM_THREADS="2",
+            ),
+            cwd=source,
+            pss_limit=120 << 30,
+        )
         if seal["kind"] == "workstation":
             if not recording:
                 idle(seal["uuids"])
@@ -754,6 +819,10 @@ def execute(
             receipt["science"] = pipeline(seal, source, work, tiny=recording)
         else:
             client = client or KubeClient(seal, output)
+            if not recording:
+                client.deadline = min(
+                    client.deadline, window_started + seal["window_seconds"] - 600
+                )
             for i, chunk in enumerate(seal["chunks"]):
                 client.create(
                     {

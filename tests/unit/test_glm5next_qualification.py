@@ -248,6 +248,148 @@ def test_literal_grant_and_atomic_single_controller(tmp_path):
         claim_controller(seal, approved, "named-continuation", tmp_path, tmp_path)
 
 
+def test_old_ep8_cp1_is_refused_by_real_trainer_on_cpu():
+    from tests.integration.megatron.glm5next_topology import validate_plan
+
+    with pytest.raises(
+        NotImplementedError, match="combining data parallelism with expert"
+    ):
+        validate_plan(
+            dict(name="old-EP8-CP1", task="forward", cp=1, ep=8, world_size=8),
+            [1, 2, 3],
+            backward=False,
+        )
+
+
+@pytest.mark.parametrize("ep", [1, 8])
+@pytest.mark.parametrize("backward", [False, True])
+def test_cp8_real_trainer_plans_pass_on_cpu(ep, backward):
+    from tests.integration.megatron.glm5next_topology import validate_plan
+
+    row = validate_plan(
+        dict(name="CP8", task="learn", cp=8, ep=ep, world_size=8),
+        [154820, 2, 3],
+        backward=backward,
+    )
+    assert row["dp"] == 1 and row["packed_tokens"] == 64
+    assert row["topology"] == (1, 1, 8, 1)
+    assert not row["cuda_initialized"]
+
+
+@pytest.mark.parametrize("mean,hard_bug", [(0.05, False), (0.11, True)])
+def test_first_forward_repeat_preserves_evidence_and_stops(tmp_path, mean, hard_bug):
+    import torch
+
+    from tests.integration.megatron.glm5next_qualification import first_forward_repeat
+
+    class Engine:
+        rank = 0
+        calls = 0
+
+        def forward(self, ids):
+            self.calls += 1
+            assert ids == [1, 2, 3]
+            return {
+                "logprobs": torch.tensor([0.0, 0.0]) + (mean if self.calls == 2 else 0)
+            }
+
+    engine = Engine()
+    if hard_bug:
+        with pytest.raises(RuntimeError, match="repeat hard bug"):
+            first_forward_repeat(engine, [1, 2, 3], tmp_path)
+    else:
+        first_forward_repeat(engine, [1, 2, 3], tmp_path)
+    assert engine.calls == 2
+    report = json.loads((tmp_path / "first-forward-repeat-rank0.json").read_text())
+    assert report["hard_bug"] == hard_bug
+    assert report["mean"] == pytest.approx(mean)
+    assert (tmp_path / "first-forward-repeat-rank0.safetensors").exists()
+
+
+def test_b200_blocks_before_context_and_has_no_dp8_stage():
+    from tests.integration.megatron.glm5next_qualification_launch import steps
+
+    commands = steps(
+        {"kind": "cluster", "fixtures": "/fixtures"},
+        Path("/source"),
+        Path("/work"),
+        tiny=False,
+    )
+    names = [step["name"] for step in commands]
+    assert "EP8-CP1" not in names
+    assert (
+        names.index("CP8-EP8")
+        < names.index("rank32")
+        < names.index("kda-cp8")
+        < names.index("context-32768")
+    )
+    for step in commands:
+        if (plan := step.get("trainer_plan")) is not None:
+            assert (plan["world_size"], plan["cp"], plan["ep"]) == (8, 8, 8)
+
+
+@pytest.mark.parametrize("oom", [False, True])
+def test_context_stops_at_first_oom_and_other_errors_block(tmp_path, monkeypatch, oom):
+    import tests.integration.megatron.glm5next_qualification_launch as launch
+
+    commands = [
+        {"name": f"context-{length}", "argv": [str(length)], "seconds": 10, "env": {}}
+        for length in (32768, 65536, 131072, 262144)
+    ]
+    monkeypatch.setattr(launch, "steps", lambda *_args, **_kwargs: commands)
+    calls = []
+
+    def run(argv, *_args, **_kwargs):
+        calls.append(int(argv[0]))
+        if argv == ["65536"]:
+            if oom:
+                launch.write(
+                    tmp_path / "results/context-65536/failure-rank0.json",
+                    {"status": "oom"},
+                )
+            raise RuntimeError("failed")
+        return {}
+
+    monkeypatch.setattr(launch, "run", run)
+    seal = {"kind": "cluster", "window_seconds": 14400, "pss_limit_bytes": 120 << 30}
+    if oom:
+        result = launch.pipeline(seal, tmp_path, tmp_path, tiny=False)
+        assert result["context"]["largest_fit"] == 32768
+        assert result["context"]["first_oom"] == 65536
+        assert [s["status"] for s in result["steps"]] == [
+            "pass",
+            "oom",
+            "not_run",
+            "not_run",
+        ]
+    else:
+        with pytest.raises(RuntimeError, match="failed"):
+            launch.pipeline(seal, tmp_path, tmp_path, tiny=False)
+    assert calls == [32768, 65536]
+
+
+def test_context_recognizes_wrapped_cuda_oom_but_not_admission_refusal():
+    import torch
+
+    from art.trainer_rank import TrainerRankMemoryError
+    from tests.integration.megatron.glm5next_qualification import oom_evidence
+
+    raw = torch.cuda.OutOfMemoryError("allocation failed")
+    wrapped = TrainerRankMemoryError("CUDA OOM occurred despite planner estimate")
+    wrapped.__cause__ = raw
+    record = oom_evidence(wrapped, "context-65536")
+    assert record is not None and record["status"] == "oom"
+    assert record["chain"][1]["type"] == "OutOfMemoryError"
+    assert oom_evidence(raw, "context-65536") is not None
+    assert (
+        oom_evidence(
+            TrainerRankMemoryError("predicted to exceed available memory"),
+            "context-65536",
+        )
+        is None
+    )
+
+
 def test_kda_mvp_numeric_gradient_failure_does_not_block():
     from tests.integration.megatron.glm5next_kda_cp import gate_policy
 
