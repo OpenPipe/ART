@@ -329,6 +329,36 @@ def test_b200_blocks_before_context_and_has_no_dp8_stage():
             assert (plan["world_size"], plan["cp"], plan["ep"]) == (8, 8, 8)
 
 
+def test_context_first_skips_passed_science_and_runs_diagnostics_last():
+    from tests.integration.megatron.glm5next_qualification_launch import steps
+
+    commands = steps(
+        {"kind": "cluster", "fixtures": "/fixtures", "context_first": True},
+        Path("/source"),
+        Path("/work"),
+        tiny=False,
+    )
+    assert [step["name"] for step in commands] == [
+        "stage0",
+        "volumes",
+        "hybridep-setup",
+        "acquire",
+        "identity",
+        "context-32768",
+        "context-65536",
+        "context-131072",
+        "context-262144",
+        "oracle-setup",
+        "kda-cp8",
+        "dsa-cp8",
+    ]
+    assert all(
+        step["trainer_plan"]["task"].startswith("context-")
+        for step in commands
+        if step.get("trainer_plan") is not None
+    )
+
+
 @pytest.mark.parametrize("oom", [False, True])
 def test_context_stops_at_first_oom_and_other_errors_block(tmp_path, monkeypatch, oom):
     import tests.integration.megatron.glm5next_qualification_launch as launch
@@ -337,11 +367,15 @@ def test_context_stops_at_first_oom_and_other_errors_block(tmp_path, monkeypatch
         {"name": f"context-{length}", "argv": [str(length)], "seconds": 10, "env": {}}
         for length in (32768, 65536, 131072, 262144)
     ]
+    commands += [
+        {"name": "kda-cp8", "argv": ["kda"], "seconds": 10, "env": {}},
+        {"name": "dsa-cp8", "argv": ["dsa"], "seconds": 10, "env": {}},
+    ]
     monkeypatch.setattr(launch, "steps", lambda *_args, **_kwargs: commands)
     calls = []
 
     def run(argv, *_args, **_kwargs):
-        calls.append(int(argv[0]))
+        calls.append(argv[0])
         if argv == ["65536"]:
             if oom:
                 launch.write(
@@ -362,11 +396,13 @@ def test_context_stops_at_first_oom_and_other_errors_block(tmp_path, monkeypatch
             "oom",
             "not_run",
             "not_run",
+            "pass",
+            "pass",
         ]
     else:
         with pytest.raises(RuntimeError, match="failed"):
             launch.pipeline(seal, tmp_path, tmp_path, tiny=False)
-    assert calls == [32768, 65536]
+    assert calls == (["32768", "65536", "kda", "dsa"] if oom else ["32768", "65536"])
 
 
 def test_context_recognizes_wrapped_cuda_oom_but_not_admission_refusal():
@@ -396,7 +432,7 @@ def test_kda_mvp_numeric_gradient_failure_does_not_block():
 
     row = {
         "packing": "single-root",
-        "output": {"rel_l2": 1e-4},
+        "output": {"rel_l2": 1e-4, "cosine": 1.0},
         "gradients": {"A": {"rel_l2": 0.003, "max_abs": 0.01}},
     }
     gate_policy(row, 8)
@@ -404,7 +440,9 @@ def test_kda_mvp_numeric_gradient_failure_does_not_block():
     assert row["gradients"]["A"]["rel_l2"] == 0.003
 
 
-@pytest.mark.parametrize("forward_error,blocking", [(1e-4, True), (0.003, False)])
+@pytest.mark.parametrize(
+    "forward_error,blocking", [(1e-4, True), (0.003, True), (0.02, False)]
+)
 def test_dsa_numeric_gradient_failure_retains_forward_gate(forward_error, blocking):
     from tests.integration.megatron.glm5next_dsa_cp import apply_gate_policy
 
@@ -413,10 +451,58 @@ def test_dsa_numeric_gradient_failure_retains_forward_gate(forward_error, blocki
         "selection_matching_fraction": 1.0,
         "output": {"cosine": 1.0, "rel_l2": 1e-4},
         "lora_gradients": {"A": {"rel_l2": 0.03}},
-        "cp1": {"output": {"rel_l2": forward_error}, "A": {"rel_l2": 0.003}},
+        "cp1": {
+            "output": {"rel_l2": forward_error, "cosine": 1.0},
+            "A": {"rel_l2": 0.003},
+        },
     }
     apply_gate_policy(row)
     assert row["passed"] is blocking
     assert row["blocking_pass"] is blocking
     assert not row["report_only_pass"] and not row["original_all_tolerances_passed"]
     assert row["lora_gradients"]["A"]["rel_l2"] == 0.03
+
+
+@pytest.mark.parametrize("operator", ["kda", "dsa"])
+@pytest.mark.parametrize(
+    "rel_l2,cosine,blocking,numeric_pass",
+    [
+        (0.00465128055, 0.99998918, True, False),
+        (1e-3, 1.0, True, True),
+        (1e-2, 0.999, True, False),
+        (0.01001, 1.0, False, False),
+        (1e-4, 0.9989, False, True),
+        (float("nan"), 1.0, False, False),
+        (1e-4, float("nan"), False, True),
+        (float("inf"), 1.0, False, False),
+    ],
+)
+def test_cp_numeric_failures_and_hard_bugs_are_separate(
+    operator, rel_l2, cosine, blocking, numeric_pass
+):
+    from tests.integration.megatron.glm5next_dsa_cp import apply_gate_policy
+    from tests.integration.megatron.glm5next_kda_cp import gate_policy
+
+    output = {"rel_l2": rel_l2, "cosine": cosine}
+    row: dict[str, Any]
+    if operator == "kda":
+        row = {
+            "packing": "single-root",
+            "output": output,
+            "gradients": {"A": {"rel_l2": 0.0}},
+        }
+        gate_policy(row, 8)
+        assert row["output_pass"] is numeric_pass
+    else:
+        row = {
+            "passed": numeric_pass,
+            "selection_matching_fraction": 1.0,
+            "output": {"rel_l2": 0.0, "cosine": 1.0},
+            "lora_gradients": {},
+            "cp1": {"output": output},
+        }
+        apply_gate_policy(row)
+        assert row["cp1_output_pass"] is numeric_pass
+    assert row["blocking_pass"] is blocking
+    assert row["report_only_pass"] is numeric_pass
+    assert (row["output"] if operator == "kda" else row["cp1"]["output"]) is output

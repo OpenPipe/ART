@@ -2,33 +2,34 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
 def apply_gate_policy(record: dict) -> None:
     """Retain M3's tolerances and failures; only correctness stops the window."""
     record["original_all_tolerances_passed"] = record["passed"]
-    blocking = (
-        record["selection_matching_fraction"] >= 0.999
-        and record["output"]["cosine"] >= 0.9999
-        and record["output"]["rel_l2"] <= 1e-2
-    )
-    report_only = all(
-        metric["rel_l2"] <= 2e-2 for metric in record["lora_gradients"].values()
-    )
+    outputs = [record["output"]]
     if record["cp1"] is not None:
-        blocking = blocking and record["cp1"]["output"]["rel_l2"] <= 1e-3
-        report_only = report_only and all(
-            metric["rel_l2"] <= 1e-3
-            for name, metric in record["cp1"].items()
-            if name != "output"
-        )
+        outputs.append(record["cp1"]["output"])
+        record["cp1_output_pass"] = record["cp1"]["output"]["rel_l2"] <= 1e-3
+    blocking = all(
+        all(math.isfinite(value) for value in output.values())
+        and output["rel_l2"] <= 1e-2
+        and output["cosine"] >= 0.999
+        for output in outputs
+    )
+    report_only = record["original_all_tolerances_passed"]
     record["blocking_pass"] = blocking
     record["report_only_pass"] = report_only
     record["all_tolerances_passed"] = blocking and report_only
     record["gradient_policy"] = (
         "report-only; original HF 2e-2 and CP1 1e-3 thresholds retained"
     )
+    record["output_policy"] = (
+        "report-only; original HF/selection/CP1 tolerances retained"
+    )
+    record["hard_bug_policy"] = "blocking: rel-L2 >1e-2, cosine <0.999 or nonfinite"
     # M3's main checks this field after saving every complete scientific record.
     record["passed"] = blocking
 

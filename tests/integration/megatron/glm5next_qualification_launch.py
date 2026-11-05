@@ -262,10 +262,16 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
     else:
         add("hybridep-setup", "hybridep-setup", 1800)
         add("acquire", "acquire", 4200)
-        add("oracle-setup", "oracle-setup", 600)
+        if not seal.get("context_first"):
+            add("oracle-setup", "oracle-setup", 600)
         add("identity", "identity", 600)
-        add("CP8-EP8", "forward", 1200, cp=8, ep=8, count=8)
-        add("rank32", "learn", 1200, cp=8, ep=8, count=8)
+        if seal.get("context_first"):
+            for length in (32768, 65536, 131072, 262144):
+                add(f"context-{length}", f"context-{length}", 600, cp=8, ep=8, count=8)
+            add("oracle-setup", "oracle-setup", 600)
+        else:
+            add("CP8-EP8", "forward", 1200, cp=8, ep=8, count=8)
+            add("rank32", "learn", 1200, cp=8, ep=8, count=8)
         # Pinned, lane-owned operator workers, using the separate HF overlay only for M3.
         for lane in ("kda", "dsa"):
             oracle = str(work / "oracle-site")
@@ -310,8 +316,9 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
             commands.append(
                 {"name": f"{lane}-cp8", "argv": argv, "seconds": 900, "env": env}
             )
-        for length in (32768, 65536, 131072, 262144):
-            add(f"context-{length}", f"context-{length}", 600, cp=8, ep=8, count=8)
+        if not seal.get("context_first"):
+            for length in (32768, 65536, 131072, 262144):
+                add(f"context-{length}", f"context-{length}", 600, cp=8, ep=8, count=8)
     return commands
 
 

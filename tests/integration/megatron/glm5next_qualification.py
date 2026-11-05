@@ -745,6 +745,7 @@ def experiment(engine: Any, task: str, inputs: Path, output: Path) -> None:
                 "status": "pass",
                 "tokens": length,
                 "seconds": seconds,
+                "tokens_s": length / seconds,
                 "tokens_s_gpu": length
                 / seconds
                 / int(os.environ.get("WORLD_SIZE", "1")),
@@ -968,6 +969,17 @@ def main() -> None:
             experiment(engine, args.task, args.inputs, args.output)
         except Exception as exc:
             if (evidence := oom_evidence(exc, args.task)) is not None:
+                evidence.update(
+                    memory={
+                        "allocated": torch.cuda.max_memory_allocated(),
+                        "reserved": torch.cuda.max_memory_reserved(),
+                    }
+                    if torch.cuda.is_initialized()
+                    else None,
+                    tokens_s=None,
+                    tokens_s_gpu=None,
+                    throughput_reason="OOM: training probe did not complete",
+                )
                 write(
                     args.output / f"failure-rank{os.environ.get('RANK', '0')}.json",
                     evidence,

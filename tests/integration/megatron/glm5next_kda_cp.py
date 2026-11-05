@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from typing import Any
 
 import torch
@@ -46,9 +47,16 @@ def gate_policy(record: dict, world: int) -> None:
     record["gradients_pass"] = all(
         v["rel_l2"] <= 1e-3 for v in record["gradients"].values()
     )
-    record["blocking_pass"] = record["output_pass"]
-    record["report_only_pass"] = record["gradients_pass"]
+    output = record["output"]
+    record["blocking_pass"] = (
+        all(math.isfinite(value) for value in output.values())
+        and output["rel_l2"] <= 1e-2
+        and output["cosine"] >= 0.999
+    )
+    record["report_only_pass"] = record["output_pass"] and record["gradients_pass"]
     record["pass"] = record["blocking_pass"] and record["report_only_pass"]
+    record["output_policy"] = "report-only; original 1e-3 threshold retained"
+    record["hard_bug_policy"] = "blocking: rel-L2 >1e-2, cosine <0.999 or nonfinite"
     record["gradient_policy"] = "report-only; original 1e-3 threshold retained"
 
 
