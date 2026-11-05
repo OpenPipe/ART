@@ -266,6 +266,19 @@ _GLM52_FUNCTIONAL_RESOURCES = WorkflowStageResources(
     megatron=_GLM52_REDUCED_MEGATRON,
     vllm=_GLM52_REDUCED_VLLM,
 )
+_GLM5NEXT_FUNCTIONAL_RESOURCES = WorkflowStageResources(
+    required_world_size=2,
+    required_physical_gpus=2,
+    megatron=MegatronWorkflowResources(
+        gpu_ids=[0],
+        topology=MegatronWorkflowTopology(),
+    ),
+    vllm=VllmWorkflowResources(
+        gpu_ids=[1],
+        tensor_parallel_size=1,
+        extra_engine_args={"max_model_len": 1024, "moe_backend": "triton"},
+    ),
+)
 # Explicitly for large models which do not fit in the default topology.
 HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
     "dsv4": HandlerWorkflowResources(
@@ -278,6 +291,12 @@ HANDLER_WORKFLOW_RESOURCES: dict[str, HandlerWorkflowResources] = {
         train_inf_mismatch=_GLM52_FUNCTIONAL_RESOURCES,
         yes_no_trainability=_GLM52_FUNCTIONAL_RESOURCES,
         length_trainability=_GLM52_FUNCTIONAL_RESOURCES,
+        yes_no_trainability_variant="megatron_dedicated",
+    ),
+    "glm5next": HandlerWorkflowResources(
+        train_inf_mismatch=_GLM5NEXT_FUNCTIONAL_RESOURCES,
+        yes_no_trainability=_GLM5NEXT_FUNCTIONAL_RESOURCES,
+        length_trainability=_GLM5NEXT_FUNCTIONAL_RESOURCES,
         yes_no_trainability_variant="megatron_dedicated",
     ),
     "gpt_oss_moe": HandlerWorkflowResources(

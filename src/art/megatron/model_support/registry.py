@@ -17,6 +17,7 @@ _GEMMA4_DENSE_HANDLER_KEY = "gemma4_dense"
 _GEMMA4_MOE_HANDLER_KEY = "gemma4_moe"
 _DSV4_HANDLER_KEY = "dsv4"
 _GLM52_HANDLER_KEY = "glm52"
+_GLM5NEXT_HANDLER_KEY = "glm5next"
 _GPT_OSS_MOE_HANDLER_KEY = "gpt_oss_moe"
 _NEMOTRON_H_HANDLER_KEY = "nemotron_h_moe"
 _VALIDATED_NATIVE_VLLM_LORA_STATUS: NativeVllmLoraStatus = "validated"
@@ -261,6 +262,28 @@ GLM52_SPEC = ModelSupportSpec(
     ),
 )
 
+GLM5NEXT_SPEC = ModelSupportSpec(
+    key="glm5next",
+    handler_key=_GLM5NEXT_HANDLER_KEY,
+    is_moe=True,
+    model_names=("zai-org/GLM-5.3-Flash", "zai-org/GLM-5.3-Flash-BF16"),
+    default_target_modules=(
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "q_a_proj",
+        "kv_a_proj_with_mqa",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "experts",
+        "lm_head",
+    ),
+    native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
+    dependency_floor=DependencyFloor(transformers="5.17.0", vllm="0.32.0"),
+)
+
 GPT_OSS_MOE_SPEC = ModelSupportSpec(
     key="gpt_oss_moe",
     handler_key=_GPT_OSS_MOE_HANDLER_KEY,
@@ -305,7 +328,7 @@ VALIDATED_MODEL_SUPPORT_SPECS = (
     GPT_OSS_MOE_SPEC,
     NEMOTRON_H_SPEC,
 )
-PROBE_ONLY_MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = ()
+PROBE_ONLY_MODEL_SUPPORT_SPECS: tuple[ModelSupportSpec, ...] = (GLM5NEXT_SPEC,)
 _ALL_MODEL_SUPPORT_SPECS = (
     DEFAULT_DENSE_SPEC,
     *VALIDATED_MODEL_SUPPORT_SPECS,
@@ -363,6 +386,10 @@ _HANDLER_IMPORTS: dict[str, tuple[str, str]] = {
         "art.megatron.model_support.handlers.glm52",
         "GLM52_HANDLER",
     ),
+    _GLM5NEXT_HANDLER_KEY: (
+        "art.megatron.model_support.handlers.glm5next",
+        "GLM5NEXT_HANDLER",
+    ),
     _GPT_OSS_MOE_HANDLER_KEY: (
         "art.megatron.model_support.handlers.gpt_oss",
         "GPT_OSS_MOE_HANDLER",
@@ -392,6 +419,10 @@ _BRIDGE_REGISTRATION_IMPORTS: dict[str, tuple[str, str]] = {
     "dsv4": (
         "art.megatron.model_support.handlers.dsv4",
         "ensure_dsv4_bridge_registered",
+    ),
+    "glm5next": (
+        "art.megatron.model_support.handlers.glm5next",
+        "ensure_glm5next_bridge_registered",
     ),
 }
 _HANDLERS_BY_KEY: dict[str, ModelSupportHandler] = {}
