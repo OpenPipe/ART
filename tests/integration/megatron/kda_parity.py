@@ -294,6 +294,7 @@ def run(args: Any) -> dict:
                     module.cp_group = dist.group.WORLD
                     records[str(layer)] = cp_checks(module, x, cu, dist.group.WORLD)
                 else:
+                    assert hf is not None
                     reference = hf.Glm5NextTextLinearAttention(cfg, layer_idx=layer).to(
                         device=device, dtype=dtype
                     )

@@ -28,35 +28,63 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
-def group_rss(group: int) -> int:
-    total = 0
+def tree_rss(root: int, owned: dict[int, int]) -> int:
+    """Track descendants across setsid(), retaining PID start times on exit."""
+    processes: dict[int, tuple[int, int, int]] = {}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdecimal():
             continue
         try:
             fields = (entry / "stat").read_text().rpartition(")")[2].split()
-            if int(fields[2]) == group:
-                total += int((entry / "statm").read_text().split()[1]) * os.sysconf(
-                    "SC_PAGE_SIZE"
+            if fields[0] != "Z":
+                processes[int(entry.name)] = (
+                    int(fields[1]),
+                    int(fields[19]),
+                    int((entry / "statm").read_text().split()[1])
+                    * os.sysconf("SC_PAGE_SIZE"),
                 )
         except (OSError, ValueError, IndexError):
             continue
-    return total
+    if root not in owned and root in processes:
+        owned[root] = processes[root][1]
+    live = {
+        pid
+        for pid, start in owned.items()
+        if pid in processes and processes[pid][1] == start
+    }
+    while True:
+        children = {
+            pid
+            for pid, (parent, _, _) in processes.items()
+            if parent in live and pid not in live
+        }
+        if not children:
+            break
+        live.update(children)
+        for pid in children:
+            owned[pid] = processes[pid][1]
+    return sum(processes[pid][2] for pid in live)
 
 
-def stop_group(group: int) -> None:
+def stop_tree(root: int, owned: dict[int, int]) -> None:
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(group, sig)
-        except ProcessLookupError:
-            return
+        tree_rss(root, owned)
+        for pid, start in list(owned.items()):
+            try:
+                fields = (
+                    Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+                )
+                if int(fields[19]) == start:
+                    os.kill(pid, sig)
+            except (ProcessLookupError, FileNotFoundError):
+                pass
         limit = time.monotonic() + 5
         while time.monotonic() < limit:
-            if group_rss(group) == 0:
+            if tree_rss(root, owned) == 0:
                 return
             time.sleep(0.1)
-    if group_rss(group):
-        raise RuntimeError(f"Owned process group {group} survived cleanup")
+    if tree_rss(root, owned):
+        raise RuntimeError(f"Owned process tree {root} survived cleanup")
 
 
 def run_step(
@@ -65,7 +93,7 @@ def run_step(
     env: dict[str, str],
     output: Path,
     timeout: int,
-    owned_groups: list[int],
+    owned_groups: list[tuple[int, dict[int, int]]],
 ) -> dict[str, Any]:
     started = time.monotonic()
     peak = 0
@@ -73,10 +101,12 @@ def run_step(
         child = subprocess.Popen(
             argv, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
-        owned_groups.append(child.pid)
+        owned: dict[int, int] = {}
+        owned_groups.append((child.pid, owned))
+        tree_rss(child.pid, owned)
         try:
             while child.poll() is None:
-                peak = max(peak, group_rss(child.pid))
+                peak = max(peak, tree_rss(child.pid, owned))
                 if peak > 120 * (1 << 30):
                     raise RuntimeError("KDA process tree exceeded 120 GiB RSS")
                 if time.monotonic() - started > timeout:
@@ -85,7 +115,7 @@ def run_step(
             if child.returncode:
                 raise RuntimeError(f"KDA worker exited {child.returncode}: {output}")
         finally:
-            stop_group(child.pid)
+            stop_tree(child.pid, owned)
             child.wait(timeout=15)
     return {
         "argv": argv,
@@ -152,7 +182,7 @@ def execute(args: Any) -> dict[str, Any]:
     python = seal["python"]
     worker = seal["worker"]
     started = time.monotonic()
-    owned_groups: list[int] = []
+    owned_groups: list[tuple[int, dict[int, int]]] = []
     with ExitStack() as locks:
         # Rehearsal exercises real lock acquisition/release as well.
         for uuid in seal["gpu_uuids"]:
@@ -230,10 +260,10 @@ def execute(args: Any) -> dict[str, Any]:
             raise
         finally:
             receipt["cleanup_done"] = True
-            for group in owned_groups:
-                if group_rss(group):
+            for root, owned in owned_groups:
+                if tree_rss(root, owned):
                     receipt["cleanup_done"] = False
-                    receipt["cleanup_error"] = f"Surviving owned process group {group}"
+                    receipt["cleanup_error"] = f"Surviving owned process tree {root}"
             if not args.rehearsal:
                 try:
                     receipt["after"] = idle(seal["gpu_uuids"])
