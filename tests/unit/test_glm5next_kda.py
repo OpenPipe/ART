@@ -39,6 +39,28 @@ def layer():
     return KimiDeltaAttention(config(), backend="reference")
 
 
+def test_bf16_input_gate_matches_hf_before_recurrent_promotion(monkeypatch):
+    """HF computes sigmoid in the projection dtype, then FLA promotes beta."""
+    torch.manual_seed(17)
+    module = KimiDeltaAttention(config(), backend="reference").to(torch.bfloat16)
+    value = torch.randn(7, 1, 8, dtype=torch.bfloat16)
+    projection = module.b_proj(value.transpose(0, 1))
+    expected = projection.sigmoid()
+    assert not torch.equal(expected.float(), projection.float().sigmoid())
+    captured = []
+
+    def recurrence(q, k, v, g, beta, **kwargs):
+        captured.append(beta.detach().clone())
+        return recurrent_kda(q, k, v, g, beta, **kwargs)
+
+    monkeypatch.setattr("art.megatron.glm5next.kda_reference.recurrent_kda", recurrence)
+    actual = module(value)[0]
+    assert torch.isfinite(actual).all()
+    assert len(captured) == 1
+    assert captured[0].dtype == torch.bfloat16
+    assert torch.equal(captured[0], expected)
+
+
 class Adapter(nn.Module):
     def __init__(self, base):
         super().__init__()
