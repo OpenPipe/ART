@@ -236,9 +236,7 @@ def test_wrapper_input_vjp(family, fused, tp, sp, owner, arm):
     for grad, ref in zip(actual[tp:], expected[1:], strict=True):
         torch.testing.assert_close(grad, ref, atol=1e-12, rtol=1e-12)
     expected_call = "gather" if sp else "copy"
-    assert calls == (
-        [] if tp == 1 or outer else [(expected_call, group if fused else None)] * tp
-    )
+    assert calls == ([] if tp == 1 or outer else [(expected_call, group)] * tp)
     assert not torch.cuda.is_initialized()
 
 

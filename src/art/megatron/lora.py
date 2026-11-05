@@ -468,22 +468,18 @@ def _column_parallel_lora_input(
     tp_size = int(getattr(linear, "tp_size", 1))
     if tp_size <= 1:
         return x
-    group = getattr(linear, "tp_group", None) if returned_norm else None
-    if returned_norm and (group is None or group.size() != tp_size):
+    group = getattr(linear, "tp_group", None)
+    if group is None or group.size() != tp_size:
         raise RuntimeError(
             "Returned-norm LoRA requires the linear's initialized TP group"
         )
     if bool(getattr(linear, "sequence_parallel", False)):
         # Torch 2.11 compiled autograd drops the gather's input-gradient edge.
-        if returned_norm:
-            return _gather_lora_sequence_parallel_region(
-                x, group=group, tensor_parallel_output_grad=True
-            )
-        return _gather_lora_sequence_parallel_region(x)
+        return _gather_lora_sequence_parallel_region(
+            x, group=group, tensor_parallel_output_grad=True
+        )
     # TE reduces only the base cotangent before adding the adapter branch.
-    if returned_norm:
-        return _copy_lora_tensor_model_parallel_region(x, group=group)
-    return _copy_lora_tensor_model_parallel_region(x)
+    return _copy_lora_tensor_model_parallel_region(x, group=group)
 
 
 def _set_lora_parallel_metadata(
