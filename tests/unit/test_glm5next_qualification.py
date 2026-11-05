@@ -149,7 +149,16 @@ def test_qualification_pins_rank32_and_preserves_cp_ep():
 
 
 @pytest.mark.parametrize(
-    "step", ["stage0", "volumes", "acquire", "identity", "identity-F4", "identity-F8"]
+    "step",
+    [
+        "stage0",
+        "volumes",
+        "acquire",
+        "oracle-setup",
+        "identity",
+        "identity-F4",
+        "identity-F8",
+    ],
 )
 def test_cpu_stages_never_receive_gpu_visibility(step):
     from tests.integration.megatron.glm5next_qualification_launch import visible_devices

@@ -661,6 +661,14 @@ def main() -> None:
         with ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(lambda r: acquire(r, args.model), records))
         write(args.output / "acquisition.json", results)
+    elif args.task == "oracle-setup":
+        from tests.integration.megatron.glm5next_qualification_launch import (
+            prepare_worker_fixtures,
+        )
+
+        prepare_worker_fixtures(
+            Path(__file__).resolve().parents[3], args.output.parents[1], tiny=args.tiny
+        )
     elif args.task == "identity":
         # Identical CPU construction/codec/file IO in rehearsal and GPU execution.
         # This materializes the actual rank32 adapter volume, even for a tiny engine.

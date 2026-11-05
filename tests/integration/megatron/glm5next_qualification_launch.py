@@ -242,6 +242,7 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
             add(fixture, "parity", 2100, count=2, source=path)
     else:
         add("acquire", "acquire", 4200)
+        add("oracle-setup", "oracle-setup", 600)
         add("identity", "identity", 600)
         add("EP8-CP1", "forward", 1200, ep=8, count=8)
         # Pinned, lane-owned operator workers, using the separate HF overlay only for M3.
@@ -313,23 +314,32 @@ def prepare_worker_fixtures(root: Path, work: Path, *, tiny: bool) -> None:
         if not tiny:
             for path in (work / "model").glob("*.safetensors*"):
                 (target / path.name).symlink_to(path)
-    wheel = json.loads((root / "qualification-inputs/oracle-wheel.json").read_text())
-    path = work / wheel["filename"]
-    with (
-        urllib.request.urlopen(wheel["url"], timeout=120) as src,
-        path.open("wb") as dst,
-    ):
-        shutil.copyfileobj(src, dst)
-    if sha(path) != wheel["sha256"]:
-        raise ValueError("oracle wheel hash mismatch")
+    manifest = json.loads((root / "qualification-inputs/oracle-wheel.json").read_text())
+    from concurrent.futures import ThreadPoolExecutor
     import zipfile
 
-    with zipfile.ZipFile(path) as archive:
-        archive.extractall(work / "oracle-site")
+    def install(wheel: dict) -> None:
+        path = work / wheel["filename"]
+        with (
+            urllib.request.urlopen(wheel["url"], timeout=120) as src,
+            path.open("wb") as dst,
+        ):
+            shutil.copyfileobj(src, dst)
+        if sha(path) != wheel["sha256"]:
+            raise ValueError("oracle wheel hash mismatch: " + wheel["filename"])
+        with zipfile.ZipFile(path) as archive:
+            archive.extractall(work / "oracle-site")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(install, [manifest, *manifest.get("dependencies", [])]))
 
 
 def visible_devices(seal: dict, name: str, *, tiny: bool) -> str:
-    if tiny or name in ("stage0", "volumes", "acquire") or name.startswith("identity"):
+    if (
+        tiny
+        or name in ("stage0", "volumes", "acquire", "oracle-setup")
+        or name.startswith("identity")
+    ):
         return ""
     return (
         ",".join(seal["uuids"])
@@ -382,8 +392,6 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
                 else seal["pss_limit_bytes"],
             )
             records.append({"name": step["name"], "status": "pass", **receipt})
-            if step["name"] == "acquire":
-                prepare_worker_fixtures(root, work, tiny=tiny)
             if step["name"] in ("F4", "F8"):
                 compare(
                     work / "results" / step["name"],
