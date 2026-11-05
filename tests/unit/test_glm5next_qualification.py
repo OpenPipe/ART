@@ -224,6 +224,124 @@ def test_cluster_cleanup_only_deletes_owned_resources(tmp_path):
     assert all("namespace" not in args for args in client.calls)
 
 
+@pytest.mark.parametrize(
+    "output,matched",
+    [
+        ("", {}),
+        ("qual-flash yield-placeholder <none>\n", {}),
+        ("other ordinary map[app:healthy job:unrelated]\n", {}),
+        (
+            "cw cw-hpc-verification-123 <none>\n",
+            {"metadata.name": "cw-hpc-verification-123"},
+        ),
+        (
+            "cw ordinary map[app:cw-hpc-verification]\n",
+            {"metadata.labels.app": "cw-hpc-verification"},
+        ),
+        (
+            "cw ordinary map[cw-hpc-verification/enabled:true]\n",
+            {"metadata.labels.cw-hpc-verification/enabled": "true"},
+        ),
+        (
+            "cw-hpc-verification hpc-verification-medium-1793880000-ctrl-1581957991 map[hpc-verification.coreweave.com/active-test:false]\n",
+            {
+                "metadata.namespace": "cw-hpc-verification",
+                "metadata.name": "hpc-verification-medium-1793880000-ctrl-1581957991",
+                "metadata.labels.hpc-verification.coreweave.com/active-test": "false",
+            },
+        ),
+        (
+            "cw-hpc-verification ordinary <none>\n",
+            {"metadata.namespace": "cw-hpc-verification"},
+        ),
+    ],
+)
+def test_node_health_check_lists_all_namespaces_and_records_exact_matches(
+    output, matched
+):
+    from tests.integration.megatron.glm5next_qualification_launch import (
+        node_health_precheck,
+    )
+
+    class Client:
+        def call(self, args, seconds):
+            assert args[:3] == ["get", "pods", "--all-namespaces"]
+            assert args[3:5] == ["--field-selector", "spec.nodeName=ss948338x5a07659"]
+            assert "--chunk-size=0" in args and seconds == 30
+            assert args[-1].endswith("LABELS:.metadata.labels")
+            return output
+
+    result = node_health_precheck(Client(), "ss948338x5a07659")
+    assert result["status"] == ("NEEDS-LEAD" if matched else "pass")
+    assert [m["matched_fields"] for m in result["matches"]] == (
+        [matched] if matched else []
+    )
+
+
+@pytest.mark.parametrize("response", ["forbidden", "malformed", "unavailable"])
+def test_node_health_check_fails_closed(response):
+    import subprocess
+
+    from tests.integration.megatron.glm5next_qualification_launch import (
+        node_health_precheck,
+    )
+
+    class Client:
+        def call(self, args, seconds):
+            if response == "forbidden":
+                raise subprocess.CalledProcessError(1, args, stderr="Forbidden")
+            if response == "unavailable":
+                raise OSError("cluster unavailable")
+            return "cannot parse this Pod list"
+
+    result = node_health_precheck(Client(), "ss948338x5a07659")
+    assert result["status"] == "NEEDS-LEAD"
+    assert "fail closed" in result["message"] and "Jarvis" in result["message"]
+
+
+@pytest.mark.parametrize("branch", ["match-name", "match-label", "permission-denied"])
+def test_execute_health_refusal_precedes_cpu_work_and_every_create(
+    tmp_path, monkeypatch, branch
+):
+    import tarfile
+
+    import tests.integration.megatron.glm5next_qualification_launch as launch
+
+    archive = tmp_path / "source.tar.gz"
+    with tarfile.open(archive, "w:gz"):
+        pass
+    seal = {
+        "kind": "cluster",
+        "controller_owner": "glm-m4-model-context-run-2",
+        "target_node": "ss948338x5a07659",
+        "holds": [],
+        "launch_ready": True,
+        "files": [],
+        "chunks": [str(archive)],
+        "source_sha256": launch.sha(archive),
+    }
+    seal_path = tmp_path / "seal.json"
+    launch.write(seal_path, seal)
+    client = launch.RecordingClient(branch)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("health refusal must precede CPU/science stages")
+
+    monkeypatch.setattr(launch, "steps", unexpected)
+    with pytest.raises(RuntimeError, match="NEEDS-LEAD"):
+        launch.execute(
+            seal_path,
+            launch.sha(seal_path),
+            tmp_path / "out",
+            client,
+            controller_owner=seal["controller_owner"],
+        )
+    receipt = json.loads((tmp_path / "out/receipt.json").read_text())
+    assert receipt["status"] == "NEEDS-LEAD" and receipt["cleanup_done"]
+    assert not client.ran and not any("create" in event for event in client.events)
+    assert receipt["node_health_prechecks"][0]["phase"] == "stage0-precheck"
+
+
 def test_literal_grant_and_atomic_single_controller(tmp_path):
     from tests.integration.megatron.glm5next_qualification_launch import (
         claim_controller,

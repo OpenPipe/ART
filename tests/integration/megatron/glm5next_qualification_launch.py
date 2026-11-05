@@ -617,6 +617,65 @@ def manifest(seal: dict, name: str, gpu: bool) -> dict:
     }
 
 
+def node_health_precheck(client: Any, target_node: str) -> dict:
+    """Read only Pod names/labels cluster-wide; an incomplete view never passes."""
+    args = [
+        "get",
+        "pods",
+        "--all-namespaces",
+        "--field-selector",
+        f"spec.nodeName={target_node}",
+        "--chunk-size=0",
+        "--no-headers",
+        "-o",
+        "custom-columns=NAMESPACE:.metadata.namespace,NAME:.metadata.name,LABELS:.metadata.labels",
+    ]
+    result: dict = {
+        "target_node": target_node,
+        "args": args,
+        "match_rule": "case-sensitive substring hpc-verification (includes cw-hpc-verification) in metadata.name or any metadata.labels key/value, or metadata.namespace == cw-hpc-verification; any Pod phase, including controllers",
+        "status": "NEEDS-LEAD",
+        "matches": [],
+    }
+    try:
+        if not target_node:
+            raise ValueError("target_node is required for the all-namespace check")
+        output = client.call(args, seconds=30)
+        pods = []
+        for line in output.splitlines():
+            namespace, name, raw_labels = line.split(None, 2)
+            labels = {}
+            if raw_labels != "<none>":
+                if not (raw_labels.startswith("map[") and raw_labels.endswith("]")):
+                    raise ValueError("unrecognized Pod labels output")
+                labels = dict(pair.split(":", 1) for pair in raw_labels[4:-1].split())
+            fields = {}
+            if namespace == "cw-hpc-verification":
+                fields["metadata.namespace"] = namespace
+            if "hpc-verification" in name:
+                fields["metadata.name"] = name
+            for key, value in labels.items():
+                if "hpc-verification" in key or "hpc-verification" in value:
+                    fields[f"metadata.labels.{key}"] = value
+            pod = {"namespace": namespace, "name": name, "labels": labels}
+            pods.append(pod)
+            if fields:
+                result["matches"].append({**pod, "matched_fields": fields})
+        result["pods"] = pods
+        if result["matches"]:
+            result["message"] = (
+                f"NEEDS-LEAD: CoreWeave cw-hpc-verification Pod present on {target_node}; do not create Pods or preempt the health check"
+            )
+        else:
+            result["status"] = "pass"
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        result["error_type"] = type(exc).__name__
+        result["message"] = (
+            f"NEEDS-LEAD: cannot verify all-namespace Pods on {target_node} (permission denied, unavailable list, or invalid response); fail closed before creating Pods. Flash must obtain Jarvis's confirmation; check was not skipped."
+        )
+    return result
+
+
 class KubeClient:
     def __init__(self, seal: dict, output: Path):
         self.seal, self.output = seal, output
@@ -729,10 +788,23 @@ class KubeClient:
 
 
 class RecordingClient:
-    def __init__(self):
+    def __init__(self, node_health: str = "pass"):
         self.events: list[dict] = []
         self.ran = False
         self.stage0_node: str | None = None
+        self.node_health = node_health
+
+    def call(self, args: list[str], seconds: int = 30) -> str:
+        self.events.append({"list_target_node_pods": args})
+        if self.node_health == "permission-denied":
+            raise subprocess.CalledProcessError(
+                1, ["kubectl", *args], stderr="Forbidden"
+            )
+        if self.node_health == "match-name":
+            return "coreweave-system cw-hpc-verification-example <none>\n"
+        if self.node_health == "match-label":
+            return "coreweave-system node-check-example map[app.kubernetes.io/name:cw-hpc-verification]\n"
+        return "qual-flash yield-placeholder map[app:placeholder]\n"
 
     def create(self, value: dict) -> None:
         self.events.append({"create": value})
@@ -855,6 +927,19 @@ def execute(
         "cleanup_done": False,
     }
     try:
+
+        def check_node(phase: str) -> None:
+            check = node_health_precheck(client, seal.get("target_node", ""))
+            receipt.setdefault("node_health_prechecks", []).append(
+                {"phase": phase, **check}
+            )
+            if check["status"] != "pass":
+                receipt["status"] = "NEEDS-LEAD"
+                raise RuntimeError(check["message"])
+
+        if seal["kind"] == "cluster":
+            client = client or KubeClient(seal, output)
+            check_node("stage0-precheck")
         expected_plans = [
             {"name": step["name"], **step["trainer_plan"]}
             for step in steps(seal, source, work, tiny=False)
@@ -950,11 +1035,14 @@ def execute(
                 - seal["cleanup_reserve_seconds"],
             )
         else:
-            client = client or KubeClient(seal, output)
+            assert client is not None
             if not recording:
                 client.deadline = min(
                     client.deadline, window_started + seal["window_seconds"] - 600
                 )
+            # CPU validation can take minutes; refresh immediately before writes,
+            # and again before the GPU Pod after the CPU stage0 Pod finishes.
+            check_node("before-resource-creation")
             for i, chunk in enumerate(seal["chunks"]):
                 client.create(
                     {
@@ -981,6 +1069,11 @@ def execute(
             gpu_pod["spec"]["nodeSelector"]["kubernetes.io/hostname"] = (
                 client.stage0_node
             )
+            if client.stage0_node != seal["target_node"]:
+                raise RuntimeError(
+                    "NEEDS-LEAD: stage0 ran outside the checked target node"
+                )
+            check_node("before-gpu-pod")
             client.pod(gpu_pod, source, work, seal)
             if recording:
                 receipt["science"] = cast(RecordingClient, client).result
@@ -1050,12 +1143,20 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--recording", action="store_true")
+    parser.add_argument(
+        "--recording-node-health",
+        choices=("pass", "match-name", "match-label", "permission-denied"),
+        default="pass",
+        help="synthetic all-namespace Pod-list response, recording only",
+    )
     parser.add_argument("--approved-seal")
     parser.add_argument("--controller-owner")
     parser.add_argument("--seal", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pod-mode", choices=("stage0", "pipeline"))
     args = parser.parse_args()
+    if args.recording_node_health != "pass" and not args.recording:
+        parser.error("--recording-node-health requires --recording")
     if args.pod_mode:
         seal = json.loads(args.seal.read_text())
         if args.pod_mode == "stage0":
@@ -1086,7 +1187,7 @@ def main() -> None:
             args.seal,
             args.approved_seal,
             args.output,
-            RecordingClient() if args.recording else None,
+            RecordingClient(args.recording_node_health) if args.recording else None,
             controller_owner=args.controller_owner,
         )
     else:
