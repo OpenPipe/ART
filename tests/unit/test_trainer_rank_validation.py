@@ -3808,10 +3808,11 @@ def test_forward_micro_batches_rejects_mismatched_replicated_counts(
 
     monkeypatch.setattr(trainer_rank.dist, "is_available", lambda: True)
     monkeypatch.setattr(trainer_rank.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(trainer_rank.dist, "get_world_size", lambda: 2)
+    monkeypatch.setattr(trainer_rank.dist, "get_world_size", lambda group=None: 2)
     monkeypatch.setattr(trainer_rank.dist, "all_reduce", lambda *_args, **_kwargs: None)
 
-    def gather(output, value):
+    def gather(output, value, *, group=None):
+        assert group is None
         output[:] = [value, (value[0] + 1, value[1])]
 
     monkeypatch.setattr(trainer_rank.dist, "all_gather_object", gather)
