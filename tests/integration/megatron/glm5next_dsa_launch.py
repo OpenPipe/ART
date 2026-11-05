@@ -55,28 +55,34 @@ def gpu_idle(uuids: list[str]) -> bool:
     return all(memory.get(uuid) == 0 and uuid not in processes for uuid in uuids)
 
 
-def tree_rss(pid: int) -> int:
-    total, pending, seen = 0, [pid], set()
+def tree_memory(pid: int, *, proc: Path = Path("/proc")) -> tuple[int, int]:
+    """Sum PSS and RSS across descendants, including separate process sessions."""
+    pss, rss, pending, seen = 0, 0, [pid], set()
     while pending:
         current = pending.pop()
         if current in seen:
             continue
         seen.add(current)
         try:
-            for line in Path(f"/proc/{current}/status").read_text().splitlines():
-                if line.startswith("VmRSS:"):
-                    total += int(line.split()[1]) * 1024
+            rollup = (proc / str(current) / "smaps_rollup").read_text()
+            values = {
+                line.split(":", 1)[0]: int(line.split()[1]) * 1024
+                for line in rollup.splitlines()
+                if line.startswith(("Pss:", "Rss:"))
+            }
+            pss += values["Pss"]
+            rss += values["Rss"]
             pending.extend(
                 map(
                     int,
-                    Path(f"/proc/{current}/task/{current}/children")
+                    (proc / str(current) / "task" / str(current) / "children")
                     .read_text()
                     .split(),
                 )
             )
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             pass
-    return total
+    return pss, rss
 
 
 def run_step(
@@ -86,9 +92,9 @@ def run_step(
     cwd: Path,
     log: Path,
     timeout: int,
-    rss_limit: int,
+    pss_limit: int,
 ) -> dict[str, Any]:
-    start, peak = time.monotonic(), 0
+    start, peak_pss, peak_rss = time.monotonic(), 0, 0
     with log.open("w") as stream:
         process = subprocess.Popen(
             argv,
@@ -100,11 +106,12 @@ def run_step(
         )
         try:
             while process.poll() is None:
-                peak = max(peak, tree_rss(process.pid))
+                pss, rss = tree_memory(process.pid)
+                peak_pss, peak_rss = max(peak_pss, pss), max(peak_rss, rss)
                 if time.monotonic() - start > timeout:
                     raise TimeoutError(f"Step exceeded {timeout}s: {argv}")
-                if peak > rss_limit:
-                    raise RuntimeError("Process tree exceeded sealed RSS limit.")
+                if pss > pss_limit:
+                    raise RuntimeError("Process tree exceeded sealed PSS limit.")
                 time.sleep(0.5)
             if process.returncode:
                 raise RuntimeError(f"Step failed ({process.returncode}); see {log}")
@@ -135,7 +142,8 @@ def run_step(
         "argv": argv,
         "log": str(log),
         "elapsed_seconds": time.monotonic() - start,
-        "peak_tree_rss_bytes": peak,
+        "peak_tree_pss_bytes": peak_pss,
+        "peak_tree_rss_bytes": peak_rss,
         "exit_code": process.returncode,
     }
 
@@ -198,11 +206,33 @@ def execute(seal_path: Path, approved: str, output: Path, recording: bool) -> No
         for line in board.read_text().splitlines()
     ):
         raise PermissionError("No matching GRANT glm-m3-dsa seal on BOARD.")
+    if not recording:
+        predecessor = seal["admission"]["after_lane"]
+        after_event = seal["admission"]["after_event"]
+        lifecycle = [
+            line
+            for line in board.read_text().splitlines()
+            if any(
+                f"{event} {predecessor} " in line
+                for event in ("GRANT", "GPU-START", "RELEASED", "CLEANUP-DONE")
+            )
+        ]
+        if not lifecycle or f"{after_event} {predecessor} " not in lifecycle[-1]:
+            raise PermissionError(f"Wait for {predecessor}'s BOARD {after_event} line.")
+        cleanup_marker = seal["admission"].get("after_cleanup_contains", "")
+        if cleanup_marker not in lifecycle[-1]:
+            raise PermissionError(
+                f"Wait for the sealed predecessor window: {cleanup_marker}"
+            )
     output.mkdir(parents=True, exist_ok=True)
     (output / "STARTED").open("x").close()
     receipt: dict[str, Any] = {
         "seal_sha256": digest,
         "recording": recording,
+        "memory_guard": "process-tree PSS from /proc/<pid>/smaps_rollup",
+        "pss_limit_bytes": seal["pss_limit_bytes"],
+        "gpu_uuids": seal["gpu_uuids"],
+        "admission": seal["admission"],
         "steps": [],
         "cleanup_done": False,
         "passed": False,
@@ -226,7 +256,9 @@ def execute(seal_path: Path, approved: str, output: Path, recording: bool) -> No
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 locks.append(lock)
             if not gpu_idle(seal["gpu_uuids"]):
-                raise RuntimeError("Requested GPUs are not idle at admission.")
+                raise RuntimeError(
+                    "Requested GPUs require 0 MiB and no compute processes at admission."
+                )
             admitted = True
             board_line(
                 board,
@@ -242,7 +274,7 @@ def execute(seal_path: Path, approved: str, output: Path, recording: bool) -> No
             cwd=repo,
             log=output / "runtime.log",
             timeout=120,
-            rss_limit=seal["rss_limit_bytes"],
+            pss_limit=seal["pss_limit_bytes"],
         )
         receipt["steps"].append(runtime)
         for fixture in ("F4", "F8"):
@@ -262,7 +294,7 @@ def execute(seal_path: Path, approved: str, output: Path, recording: bool) -> No
                     cwd=repo,
                     log=output / f"meta-{fixture}.log",
                     timeout=180,
-                    rss_limit=seal["rss_limit_bytes"],
+                    pss_limit=seal["pss_limit_bytes"],
                 )
             )
         for stage in seal["stages"]:
@@ -284,7 +316,7 @@ def execute(seal_path: Path, approved: str, output: Path, recording: bool) -> No
                     fixture="R2",
                     cp=stage["cp"],
                     device="cpu",
-                    lengths="64,68",
+                    lengths=seal["recording_lengths"],
                     output=path,
                 )
                 if recording
@@ -302,7 +334,7 @@ def execute(seal_path: Path, approved: str, output: Path, recording: bool) -> No
                 cwd=repo,
                 log=output / f"{stage['name']}.log",
                 timeout=min(stage["timeout_seconds"], int(remaining)),
-                rss_limit=seal["rss_limit_bytes"],
+                pss_limit=seal["pss_limit_bytes"],
             )
             result["planned_argv"] = planned
             receipt["steps"].append(result)
@@ -314,6 +346,9 @@ def execute(seal_path: Path, approved: str, output: Path, recording: bool) -> No
                     case["passed"] for case in worker["cases"]
                 ):
                     raise RuntimeError("Worker parity receipt failed.")
+        for name, expected in seal["scripts"].items():
+            if sha256(repo / name) != expected:
+                raise ValueError(f"Sealed source changed during execution: {name}")
         receipt["passed"] = True
     finally:
         if recording:

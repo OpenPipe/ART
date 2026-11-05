@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -39,6 +39,8 @@ class KPoolQueryPlan:
 
 
 class Glm5NextDsaState(Glm52PrefixTreeState):
+    # GLM-5.3 keeps sparse-kernel FP32 dKV partials through every CP sum.
+    cp_dkv_accumulation_dtype: ClassVar[torch.dtype] = torch.float32
     pool_plans: tuple[KPoolQueryPlan, ...] = ()
     combined_global_ids: torch.Tensor | None = None
 
@@ -54,8 +56,10 @@ def build_glm5next_dsa_state(
     """Build once in M4's handler, stored at attention_bias.model_state['glm5next_dsa'].
 
     CP uses its original global tree metadata and exact stage token ids. Segment
-    starts and ancestor ends must align to four; pad packing to 8*CP. Padding is
-    identified by tree metadata, never by the model's pad/EOS token id.
+    starts and ancestor ends must align to four; only causal segment tails may
+    be partial pools. Pad packing to 8*CP. Padding is identified by tree
+    metadata, never by the model's pad/EOS token id. The MVP uses independent
+    roots; pooling across an unaligned shared-prefix branch is post-MVP.
     """
     cp = context_parallel_state
     combined_ids = None
@@ -72,6 +76,21 @@ def build_glm5next_dsa_state(
             position_ids=position_ids, context_parallel_state=cp, device=device
         )
         group_ids, parent_ids = cp.group_ids[None], cp.parent_ids[None]
+        spec = build_prefix_tree_attention_spec(
+            group_ids=group_ids.cpu(), parent_ids=parent_ids.cpu()
+        )
+        partial_tails = {
+            (slice_.k_range.end // 4 * 4, slice_.k_range.end)
+            for row in spec.rows
+            for slice_ in row.slices
+            if slice_.mask_kind is AttnMaskKind.CAUSAL and slice_.k_range.end % 4
+        }
+
+        def aligned_or_tail(boundary: int) -> bool:
+            return boundary % 4 == 0 or any(
+                start <= boundary <= end for start, end in partial_tails
+            )
+
         global_to_local = torch.full(
             (cp.rank_plan.original_seq_len,), -1, dtype=torch.long
         )
@@ -94,9 +113,13 @@ def build_glm5next_dsa_state(
             ids = metadata.k_token_indices[:nk].cpu().long()
             # Individual stages may contain several separated aligned ranges.
             for ranges in (plan.global_q_ranges, plan.global_k_ranges):
-                if any(r.start % 4 or r.end % 4 for r in ranges):
+                if any(
+                    not aligned_or_tail(r.start) or not aligned_or_tail(r.end)
+                    for r in ranges
+                ):
                     raise ValueError(
-                        "Flash CP stage boundaries must align to four-token pools."
+                        "Flash CP stage boundaries must align to four-token pools "
+                        "except at a causal segment tail."
                     )
             k_ids.append(ids)
         combined_ids = torch.cat(k_ids) if k_ids else torch.empty(0, dtype=torch.long)
@@ -133,7 +156,9 @@ def build_glm5next_dsa_state(
                 start, end = slice_.k_range.start, slice_.k_range.end
                 if start % 4 or (slice_.mask_kind is AttnMaskKind.FULL and end % 4):
                     raise ValueError(
-                        "Flash tree segments/ancestors must align to four-token pools."
+                        "Flash tree segments/ancestors must align to four-token "
+                        "pools; use single-root packing for the MVP. Unaligned "
+                        "shared-prefix k-pools are post-MVP."
                     )
                 pools = torch.arange((end - start) // 4) * 4 + start
                 if available is not None and pools.numel():

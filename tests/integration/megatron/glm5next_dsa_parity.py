@@ -44,6 +44,7 @@ from art.megatron.glm5next.dsa_cp import (
 from art.megatron.glm5next.kpool_indexer import KPoolIndexer
 from art.megatron.glm52 import attention as glm52_attention
 from art.megatron.glm52 import cp_attention
+from art.megatron.training.finalize_grads import coalesced_all_reduce
 
 DIST: Any = torch.distributed
 
@@ -285,6 +286,29 @@ def metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
     }
 
 
+def lora_gradients(
+    adapters: dict[str, LowRank], *, cp_group: Any | None = None
+) -> dict[str, torch.Tensor]:
+    """Mirror TrainerRank._reduce_dynamic_grads, TP1 and scale_grads=1.
+
+    Local autograd gradients retain the parameter dtype, including BF16
+    rounding. TrainerRank promotes those to FP32 before its DP+CP SUM and
+    returns FP32 gradients to the optimizer, without casting back to BF16.
+    """
+    grads = {
+        f"{name}.{factor}": (
+            torch.zeros_like(param, dtype=torch.float32)
+            if param.grad is None
+            else param.grad.detach().float().mul(1.0)
+        )
+        for name, adapter in adapters.items()
+        for factor, param in adapter.named_parameters()
+    }
+    if cp_group is not None and cp_group.size() > 1:
+        coalesced_all_reduce(list(grads.values()), group=cp_group, op=DIST.ReduceOp.SUM)
+    return grads
+
+
 def meta_plan(
     root: Path, config: Any, lengths: list[int], lora_rank: int
 ) -> dict[str, Any]:
@@ -486,20 +510,16 @@ def run_case(
         hidden, attention_bias=SimpleNamespace(model_state={"glm5next_dsa": state})
     )[0]
     actual_out.backward(dy[:, local_ids].transpose(0, 1))
-    if world > 1:
-        for adapter in adapters.values():
-            for param in adapter.parameters():
-                DIST.all_reduce(param.grad)
+    actual_grads = lora_gradients(
+        adapters, cp_group=DIST.group.WORLD if world > 1 else None
+    )
     expected_out = reference_step(
         reference, ref_adapters, x, dy, expected_ids, query_chunk_size
     )
     output_metrics = metrics(actual_out.transpose(0, 1), expected_out[:, local_ids])
+    ref_grads = lora_gradients(ref_adapters)
     gradients = {
-        f"{name}.{param}": metrics(
-            getattr(adapter, param).grad, getattr(ref_adapters[name], param).grad
-        )
-        for name, adapter in adapters.items()
-        for param in ("a", "b")
+        key: metrics(grad, ref_grads[key]) for key, grad in actual_grads.items()
     }
     cp_metrics = None
     if world > 1:
@@ -514,15 +534,10 @@ def run_case(
             attention_bias=SimpleNamespace(model_state={"glm5next_dsa": state1}),
         )[0]
         cp1_out.backward(dy.transpose(0, 1))
+        cp1_grads = lora_gradients(cp1_adapters)
         cp_metrics = {"output": metrics(actual_out, cp1_out[local_ids])}
         cp_metrics.update(
-            {
-                f"{name}.{p}": metrics(
-                    getattr(adapter, p).grad, getattr(cp1_adapters[name], p).grad
-                )
-                for name, adapter in adapters.items()
-                for p in ("a", "b")
-            }
+            {key: metrics(grad, cp1_grads[key]) for key, grad in actual_grads.items()}
         )
     passed = (
         selection >= 0.999
@@ -546,6 +561,14 @@ def run_case(
         "hf_boundary_tie_query_ids": tie_query_ids,
         "output": output_metrics,
         "lora_gradients": gradients,
+        "gradient_reduction": {
+            "path": "TrainerRank._reduce_dynamic_grads",
+            "local_dtype": str(dtype),
+            "reduction_dtype": "torch.float32",
+            "comparison_dtype": "torch.float32",
+            "op": "SUM",
+            "cp_dkv_accumulation_dtype": str(state.cp_dkv_accumulation_dtype),
+        },
         "cp1": cp_metrics,
         "passed": passed,
     }
