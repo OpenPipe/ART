@@ -112,6 +112,8 @@ class AdamParams:
 class TopK:
     logprobs: torch.Tensor
     tokens: torch.Tensor
+    # Detached raw scores retain the absolute magnitude lost by log_softmax.
+    logits: torch.Tensor | None = None
 
 
 LogprobsT = TypeVar("LogprobsT", bound=torch.Tensor | None, covariant=True)
@@ -4337,6 +4339,7 @@ class TrainerRank:
                 output.hidden_states,
                 None if output.top_k is None else output.top_k.logprobs,
                 None if output.top_k is None else output.top_k.tokens,
+                None if output.top_k is None else output.top_k.logits,
             )
             if tensor is not None
         ]
@@ -4355,10 +4358,15 @@ class TrainerRank:
             grad_flags = flags.tolist()
         needs_grad = iter(grad_flags)
 
-        def gather(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        def gather(
+            tensor: torch.Tensor | None, *, detached: bool = False
+        ) -> torch.Tensor | None:
             if tensor is None:
                 return None
-            if next(needs_grad) and not tensor.requires_grad:
+            requires_grad = next(needs_grad)
+            if detached:
+                tensor = tensor.detach()
+            elif requires_grad and not tensor.requires_grad:
                 # Empty shards must still enter decoder backward collectives.
                 # A frozen decoder with a trainable head only needs a leaf.
                 tensor = tensor + hidden_by_row.reshape(-1)[:1].sum() * 0.0
@@ -4379,6 +4387,7 @@ class TrainerRank:
                     TopK(
                         cast(torch.Tensor, gather(output.top_k.logprobs)),
                         cast(torch.Tensor, gather(output.top_k.tokens)),
+                        gather(output.top_k.logits, detached=True),
                     )
                     if output.top_k is not None
                     else None
@@ -4488,6 +4497,7 @@ class TrainerRank:
                 top_k[index] = TopK(
                     logprobs=torch.empty(shape, device=device, dtype=torch.float32),
                     tokens=torch.empty(shape, device=device, dtype=torch.long),
+                    logits=torch.empty(shape, device=device, dtype=torch.float32),
                 )
 
         row_tensor = (
@@ -4685,6 +4695,11 @@ class TrainerRank:
                         raise RuntimeError("top_k output was not allocated")
                     current.logprobs[offsets] = values.logprobs
                     current.tokens[offsets] = values.tokens
+                    if current.logits is not None:
+                        if values.logits is None:
+                            top_k[index] = replace(current, logits=None)
+                        else:
+                            current.logits[offsets] = values.logits
                     del local_values, local_tokens, selected_values, selected_tokens
                     del selected_log_z, values
             # Do not retain prior chunk buffers while the next stats RHS runs.
@@ -5947,7 +5962,7 @@ def _anchor_disconnected_outputs(
             target_logprobs[index] = anchor_tensor(logprobs)
     for index, item in enumerate(top_k):
         if item is not None:
-            top_k[index] = TopK(anchor_tensor(item.logprobs), item.tokens)
+            top_k[index] = TopK(anchor_tensor(item.logprobs), item.tokens, item.logits)
     return target_logprobs, top_k
 
 
@@ -6064,6 +6079,7 @@ def _vocab_parallel_topk_from_local(
         return TopK(
             logprobs=local_values - log_z.unsqueeze(1),
             tokens=local_tokens,
+            logits=local_values.detach().float(),
         )
 
     from megatron.core import tensor_parallel
@@ -6083,6 +6099,7 @@ def _vocab_parallel_topk_from_local(
     return TopK(
         logprobs=top_values - log_z.unsqueeze(1),
         tokens=tokens.gather(1, top_offsets),
+        logits=top_values.detach().float(),
     )
 
 

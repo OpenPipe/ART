@@ -433,6 +433,7 @@ class TinyEngine:
             "logits": torch.cat(sampled_logits) if logits else None,
             "top1": torch.cat([top.indices[:, 0] for top in all_top]),
             "top2.values": torch.cat([top.values for top in all_top]),
+            "top2.logits": torch.cat([top.values for top in all_top]),
         }
 
     def step(self) -> dict:
@@ -588,6 +589,12 @@ class ArtEngine:
                     .reshape(-1, 2)
                     if out.top_k is not None
                     else None,
+                    "top2.logits": out.top_k.logits.detach()
+                    .float()
+                    .cpu()
+                    .reshape(-1, 2)
+                    if out.top_k is not None and out.top_k.logits is not None
+                    else None,
                     "logits": out.logits.detach().float().cpu()
                     if out.logits is not None
                     else None,
@@ -674,6 +681,8 @@ def experiment(engine: Any, task: str, inputs: Path, output: Path) -> None:
                 values["top1"] = result["top1"]
             if result.get("top2.values") is not None:
                 values["top2.values"] = result["top2.values"].contiguous()
+            if result.get("top2.logits") is not None:
+                values["top2.logits"] = result["top2.logits"].contiguous()
             if result["logits"] is not None:
                 values["logits"] = result["logits"].reshape(len(ids) - 1, -1)
             nonfinite = [
@@ -861,7 +870,26 @@ def compare(
             **lp,
             "top1": int((native_top1 == hf_top1).sum()) / native_top1.numel(),
             "policy": "blocking; uninstrumented production forward",
+            "top1_policy": "report-only; all-position raw agreement",
         }
+        from tests.integration.megatron.glm5next_parity_diagnostics import (
+            margin_top1_gate,
+        )
+
+        try:
+            record["margin_top1_gate"] = margin_top1_gate(a, b)
+        except Exception as exc:
+            record["margin_top1_gate"] = {
+                "status": "fail",
+                "policy": "blocking; fail closed on unavailable margin data",
+                "error": str(exc),
+            }
+        record["finite"] = all(
+            bool(torch.isfinite(value).all())
+            for tensors in (a, b)
+            for key, value in tensors.items()
+            if not key.startswith("layers.") and value.is_floating_point()
+        )
         try:
             from tests.integration.megatron.glm5next_parity_diagnostics import (
                 top1_diagnostics,
@@ -878,12 +906,13 @@ def compare(
     passed = all(
         r["logprob_abs_mean"] <= 0.02
         and r["logprob_abs_p99"] <= 0.2
-        and r["top1"] >= 0.99
+        and r["finite"]
+        and r["margin_top1_gate"]["status"] == "pass"
         for r in rows
     )
     report = {
         "status": "pass" if passed else "fail",
-        "hard_bug": any(r["logprob_abs_mean"] > 0.1 for r in rows),
+        "hard_bug": any(not r["finite"] or r["logprob_abs_mean"] > 0.1 for r in rows),
         "rows": rows,
         "execution": "tiny_cpu_self_comparison" if tiny else "native_vs_original_m1_hf",
     }
@@ -1002,6 +1031,12 @@ def main() -> None:
             args.tiny,
             args.supplemental,
         )
+    elif args.task == "cpu-load":
+        from tests.integration.megatron.glm5next_pretrained_load import (
+            rehearse_pretrained_load,
+        )
+
+        rehearse_pretrained_load(args.model, args.output)
     elif args.task == "hf-reference-F8":
         from tests.integration.megatron.glm5next_parity_diagnostics import (
             supplemental_reference,

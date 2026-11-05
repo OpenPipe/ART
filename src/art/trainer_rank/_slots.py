@@ -811,6 +811,7 @@ def _track_slot_graph_outputs(
                 else _impl.TopK(
                     logprobs=cast(_impl.torch.Tensor, track(output.top_k.logprobs)),
                     tokens=output.top_k.tokens,
+                    logits=output.top_k.logits,
                 )
             ),
             logits=track(output.logits),

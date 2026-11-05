@@ -1604,7 +1604,7 @@ def _estimate_group_request_output_bytes(
                 seq_len
                 * int(request.top_k)
                 * (
-                    _impl._dtype_size(_impl.torch.float32)
+                    2 * _impl._dtype_size(_impl.torch.float32)
                     + _impl._dtype_size(_impl.torch.long)
                 )
             )

@@ -9,10 +9,87 @@ import torch
 
 from tests.integration.megatron.glm5next_parity_diagnostics import (
     capture_sublayers,
+    margin_top1_gate,
     sublayer_metrics,
     top1_diagnostics,
 )
 from tests.integration.megatron.glm5next_qualification_launch import has_grant, pipeline
+
+
+@pytest.mark.parametrize(
+    "native,hf,eligible",
+    [
+        ([16.0, 15.75], [16.0, 15.75], False),  # exactly 2 ULPs: strict >
+        ([16.0, 15.5], [16.0, 15.5], True),
+        ([16.0, 15.5], [16.0, 16.0], False),  # BOTH margins required
+        ([-16.0, -16.25], [-16.0, -16.25], False),
+        ([0.0, 0.0], [0.0, 0.0], False),
+        ([2.0**-133, -(2.0**-133)], [2.0**-133, -(2.0**-133)], False),
+        ([2.0**-131, 0.0], [2.0**-131, 0.0], True),
+        ([128.0, 127.0], [128.0, 127.0], False),  # logprob ULP would be wrong
+    ],
+)
+def test_margin_gate_requires_both_raw_margins_strictly_above_two_ulps(
+    native, hf, eligible
+):
+    actual = {"top1": torch.tensor([0]), "top2.logits": torch.tensor([native])}
+    reference = {"top1": torch.tensor([1]), "top2.logits": torch.tensor([hf])}
+    report = margin_top1_gate(actual, reference)
+    assert report["eligible_positions"] == int(eligible)
+    assert report["eligible_disagreements"] == int(eligible)
+    assert report["status"] == ("fail" if eligible else "pass")
+    actual["top1"] = reference["top1"]
+    assert margin_top1_gate(actual, reference)["status"] == "pass"
+
+
+@pytest.mark.parametrize(
+    "values", [None, [[float("nan"), 0.0]], [[0.0, 1.0]], [[1.0, 0.0], [1.0, 0.0]]]
+)
+def test_margin_gate_fails_closed_on_bad_or_logprob_only_data(values):
+    actual = {"top1": torch.tensor([0]), "top2.values": torch.tensor([[-1.0, -2.0]])}
+    if values is not None:
+        actual["top2.logits"] = torch.tensor(values)
+    with pytest.raises(ValueError):
+        margin_top1_gate(actual, actual)
+
+
+def test_raw_top1_miss_is_report_only_but_margin_and_logprob_gates_block(tmp_path):
+    from safetensors.torch import save_file
+
+    from tests.integration.megatron.glm5next_qualification import compare
+
+    candidate = tmp_path / "candidate"
+    oracle = tmp_path / "dumps/F8"
+    candidate.mkdir()
+    oracle.mkdir(parents=True)
+    actual = {
+        "target_logprobs": torch.tensor([-2.0]),
+        "top1": torch.tensor([0]),
+        "top2.logits": torch.tensor([[128.0, 127.0]]),
+    }
+    reference = {
+        "target_logprobs": torch.tensor([-2.0]),
+        "top64.indices": torch.ones(1, 2, 64, dtype=torch.int64),
+        "top64.values": torch.zeros(1, 2, 64),
+    }
+    reference["top64.values"][0, 0, :2] = torch.tensor([128.0, 127.0])
+    save_file(actual, str(candidate / "doc-rank0.safetensors"))
+    save_file(reference, str(oracle / "doc.safetensors"))
+    report = compare(candidate, tmp_path, "F8", tmp_path / "report.json")
+    assert report["status"] == "pass" and report["rows"][0]["top1"] == 0.0
+    actual["target_logprobs"] = torch.tensor([-2.03])
+    save_file(actual, str(candidate / "doc-rank0.safetensors"))
+    assert (
+        compare(candidate, tmp_path, "F8", tmp_path / "report.json")["status"] == "fail"
+    )
+    actual["target_logprobs"] = torch.tensor([-2.0])
+    actual["top2.logits"][0] = torch.tensor([128.0, 124.0])
+    reference["top64.values"][0, 0, :2] = torch.tensor([128.0, 124.0])
+    save_file(actual, str(candidate / "doc-rank0.safetensors"))
+    save_file(reference, str(oracle / "doc.safetensors"))
+    assert (
+        compare(candidate, tmp_path, "F8", tmp_path / "report.json")["status"] == "fail"
+    )
 
 
 def test_top1_reports_long_document_counts_and_both_margins():
@@ -62,13 +139,14 @@ def test_routing_compares_sets_and_weights_aligned_by_id():
 
 
 @pytest.mark.parametrize("hard_bug", [False, True])
+@pytest.mark.parametrize("order", [("F4", "F8"), ("F8", "F4")])
 def test_pipeline_keeps_f4_failure_and_runs_f8_unless_hard_bug(
-    tmp_path, monkeypatch, hard_bug
+    tmp_path, monkeypatch, hard_bug, order
 ):
     import tests.integration.megatron.glm5next_qualification_launch as launch
 
     commands = [
-        {"name": name, "argv": [name], "seconds": 1, "env": {}} for name in ("F4", "F8")
+        {"name": name, "argv": [name], "seconds": 1, "env": {}} for name in order
     ]
     monkeypatch.setattr(launch, "steps", lambda *_args, **_kwargs: commands)
     calls = []
@@ -94,18 +172,24 @@ def test_pipeline_keeps_f4_failure_and_runs_f8_unless_hard_bug(
         "pss_limit_bytes": 120 << 30,
         "native_python": "python",
         "fixtures": str(tmp_path),
+        "fixture_order": order,
     }
     if hard_bug:
         with pytest.raises(ValueError, match="hard bug"):
             pipeline(seal, tmp_path, tmp_path, tiny=True)
-        assert calls == ["F4", "compare-F4"]
+        assert calls == [order[0], "compare-" + order[0]]
         assert any(
-            row["name"] == "F8" and row["status"] == "not_run"
+            row["name"] == order[1] and row["status"] == "not_run"
             for row in json.loads((tmp_path / "results/pipeline.json").read_text())
         )
     else:
         result = pipeline(seal, tmp_path, tmp_path, tiny=True)
-        assert calls == ["F4", "compare-F4", "F8", "compare-F8"]
+        assert calls == [
+            order[0],
+            "compare-" + order[0],
+            order[1],
+            "compare-" + order[1],
+        ]
         assert result["status"] == "fail"
         assert [row["comparison"] for row in result["steps"]] == ["fail", "fail"]
 
@@ -329,7 +413,7 @@ def test_repeat_delta_is_report_only_and_missing_diagnostic_file_is_recorded(
     )
 
 
-def test_blocking_comparator_needs_no_sublayers_supplement_or_margin_tensors(tmp_path):
+def test_blocking_comparator_fails_closed_without_raw_margins(tmp_path):
     from safetensors.torch import save_file
 
     from tests.integration.megatron.glm5next_qualification import compare
@@ -354,6 +438,8 @@ def test_blocking_comparator_needs_no_sublayers_supplement_or_margin_tensors(tmp
     )
     assert report["status"] == "fail" and not report["hard_bug"]
     assert report["rows"][0]["top1"] == 0.5
+    assert report["rows"][0]["margin_top1_gate"]["status"] == "fail"
+    assert "raw top-2 logits" in report["rows"][0]["margin_top1_gate"]["error"]
     assert report["rows"][0]["top1_diagnostics"]["policy"] == "report-only"
 
 

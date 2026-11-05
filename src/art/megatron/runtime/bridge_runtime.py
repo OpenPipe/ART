@@ -895,11 +895,21 @@ def _optimized_load_weights_hf_to_megatron(
         _validate_local_pretrained_tasks(self, megatron_model, tasks)
         tasks = _prepare_nonuniform_expert_tasks(tasks)
     hf_state_dict = hf_pretrained.state
-    raw_cache = load_unique_hf_keys_once(
-        tasks,
-        hf_state_dict,
-        bridge=self,
-        extra_keys=getattr(self, "art_extra_hf_prefetch_keys", None),
+    # CPU/meta imports need no pinned staging of the entire checkpoint beside
+    # the destination model. Keep exactly the same source and conversion path,
+    # but bound staging to one task. CUDA retains its existing bulk prefetch.
+    stream_on_host = bool(getattr(self, "art_stream_host_import", False)) and all(
+        param.device.type != "cuda"
+        for model in megatron_model
+        for param in model.parameters()
+    )
+    extra_keys = getattr(self, "art_extra_hf_prefetch_keys", None)
+    raw_cache = (
+        {}
+        if stream_on_host
+        else load_unique_hf_keys_once(
+            tasks, hf_state_dict, bridge=self, extra_keys=extra_keys
+        )
     )
     cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
     description = f"Loading from {hf_pretrained.model_name_or_path}"
@@ -907,6 +917,11 @@ def _optimized_load_weights_hf_to_megatron(
     for task in self._with_progress_tracking(tasks, description):
         if task is None or task.megatron_module is None:
             continue
+        if stream_on_host:
+            raw_cache = load_unique_hf_keys_once(
+                [task], hf_state_dict, bridge=self, extra_keys=extra_keys
+            )
+            cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
         hf_param = task.mapping.hf_param
         if (
             isinstance(hf_param, str)

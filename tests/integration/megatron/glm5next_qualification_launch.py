@@ -248,9 +248,11 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
     add("volumes", "volumes", 180)
     if seal["kind"] == "workstation":
         # Preserve both blocking results before starting ANY report-only work.
-        for fixture in ("F4", "F8"):
+        for fixture in seal.get("fixture_order", ("F4", "F8")):
             path = Path(seal["fixtures"]) / fixture
             add(f"identity-{fixture}", "identity", 300, source=path)
+            if tiny and fixture == "F8" and seal.get("cpu_pretrained_load"):
+                add("cpu-load-F8", "cpu-load", 1800, source=path)
             add(fixture, "parity", 2100, count=2, source=path)
         if seal.get("supplemental_f8"):
             add("hf-stage0", "hf-stage0", 120, report_only=True)
@@ -263,7 +265,7 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
                 report_only=True,
             )
             commands[-1]["argv"][0] = seal["oracle_python"]
-        for fixture in ("F4", "F8"):
+        for fixture in seal.get("fixture_order", ("F4", "F8")):
             path = Path(seal["fixtures"]) / fixture
             # The rank32 identity adapter is fixture-shaped; restore it before
             # reloading this model in a fresh, isolated diagnostics worker.
@@ -502,28 +504,24 @@ def pipeline(
                 )
                 records[-1]["comparison"] = comparison["status"]
                 if comparison["hard_bug"]:
-                    if step["name"] == "F4":
-                        records.append(
-                            {
-                                "name": "F8",
-                                "status": "not_run",
-                                "reason": "F4 hard bug: mean > 0.1",
-                            }
-                        )
-                    raise ValueError(f"{step['name']} hard bug: mean > 0.1")
+                    raise ValueError(
+                        f"{step['name']} hard bug: nonfinite or mean > 0.1"
+                    )
         except Exception as exc:
             records.append(
                 {"name": step["name"], "status": "failed", "error": str(exc)}
             )
-            if step["name"] == "F4" and not any(row["name"] == "F8" for row in records):
-                records.append(
-                    {
-                        "name": "F8",
-                        "status": "not_run",
-                        "reason": "F4 hard bug or execution exception",
-                        "error": str(exc),
-                    }
-                )
+            if seal["kind"] == "workstation" and not step.get("report_only"):
+                for fixture in seal.get("fixture_order", ("F4", "F8")):
+                    if not any(row["name"] == fixture for row in records):
+                        records.append(
+                            {
+                                "name": fixture,
+                                "status": "not_run",
+                                "reason": f"{step['name']} hard bug or execution exception",
+                                "error": str(exc),
+                            }
+                        )
             write(work / "results/pipeline.json", records)
             if step.get("report_only"):
                 records[-1]["policy"] = "report-only"

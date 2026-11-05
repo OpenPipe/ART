@@ -8,6 +8,54 @@ import torch
 from art.megatron.model_support.spec import HfWeightSource
 
 
+class Glm5NextTaskSource:
+    """Expose materializable names to Bridge's task planner, without weight I/O.
+
+    The actual StateDict keeps its physical inventory for reads and prefetch.
+    In particular, an expert slice is not a physical safetensors key.
+    """
+
+    def __init__(self, source: Any, num_experts: int) -> None:
+        keys = set(source.get_all_keys())
+        candidates = set(keys)
+        for key in keys:
+            for site in ("attn", "ffn"):
+                for field in ("fn", "base", "scale"):
+                    candidates.add(
+                        key.replace(f".{site}_hc.{field}", f".hc_{site}_{field}")
+                    )
+            candidates.add(key.replace(".self_attn.forget_gate.", ".self_attn."))
+            if key.endswith(".self_attn.conv1d.weight"):
+                candidates.update(
+                    key.removesuffix("conv1d.weight") + f"{part}_conv1d.weight"
+                    for part in ("q", "k", "v")
+                )
+            match = re.fullmatch(r"(.+\.mlp\.experts)\.(gate_up_proj|down_proj)", key)
+            if match:
+                prefix, packed = match.groups()
+                projections = (
+                    ("gate_proj", "up_proj")
+                    if packed == "gate_up_proj"
+                    else ("down_proj",)
+                )
+                candidates.update(
+                    f"{prefix}.{expert}.{projection}.weight"
+                    for expert in range(num_experts)
+                    for projection in projections
+                )
+        self.keys = sorted(
+            name
+            for name in candidates
+            if any(
+                all(key in keys for key in option)
+                for option in hf_weight_source(name).physical_key_options
+            )
+        )
+
+    def get_all_keys(self) -> list[str]:
+        return self.keys
+
+
 def hf_weight_source(name: str) -> HfWeightSource:
     """Support both released checkpoint names and the native HF oracle layout."""
     alternatives: list[tuple[str, ...]] = [(name,)]
