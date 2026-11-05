@@ -36,6 +36,23 @@ if TYPE_CHECKING:
 class _ScopedMemorySignature(_impl._MemorySignature):
     checkpoint_partition: tuple[int, tuple[int, int, int]] | None = None
     bounded_forward_peak: bool = False
+    bounded_caller_peak: bool = False
+
+
+@dataclass(frozen=True)
+class _CallerMemoryProfile(_impl._MemoryProfile):
+    caller_compute_peaks: tuple[tuple[int, int], ...] = ()
+    compute_peak_floor: int = 0
+
+    def compute_peak(self, tokens: int | float) -> float:
+        # Only a complete covering caller can justify discounting the pinned
+        # max rate. Forward/split/incomplete readings never extend this range.
+        for length, peak in self.caller_compute_peaks:
+            if tokens <= length:
+                return max(peak, self.compute_peak_floor)
+        # No discounted extrapolation: even a higher short reload cannot erase
+        # earlier growth constraints beyond the measured caller extent.
+        return max(self.bytes_per_token * tokens, self.compute_peak_floor)
 
 
 @dataclass(frozen=True)
@@ -220,7 +237,13 @@ def _split_memory_key(plan: _impl._SplitForwardPlan) -> bytes | None:
                 )
             )
             if isinstance(signature, _ScopedMemorySignature):
-                feed((signature.checkpoint_partition, signature.bounded_forward_peak))
+                feed(
+                    (
+                        signature.checkpoint_partition,
+                        signature.bounded_forward_peak,
+                        signature.bounded_caller_peak,
+                    )
+                )
             for g in p.groups:
                 slot = (
                     None
@@ -1684,11 +1707,27 @@ def _memory_signature_from_requests(
             else self._dense_fc1_adapted and bool(self._geometry.ffn_hidden_size)
         )
     )
-    if partition is not None or bounded:
+    # Single-root checkpointed MoE training has fixed head/adapter workspace.
+    # Keep its complete caller peaks separate from multi-root/forward profiles.
+    caller_bounded = (
+        len(requests) == slot_group_count == 1
+        and requests[0].input_tokens.ndim == 1
+        and modes == (True,)
+        and _impl._request_mix_key(requests[0]) == "target:single"
+        and topology == (1, 1, 1, 1)
+        and self._parallel_shape.ep == self._parallel_shape.etp == 1
+        and self._moe_layers
+        and self._moe_memory_supported
+        and bool(
+            _checkpoint_layers(self, ((int(requests[0].input_tokens.numel()), True),))
+        )
+    )
+    if partition is not None or bounded or caller_bounded:
         return _ScopedMemorySignature(
             **vars(signature),
             checkpoint_partition=partition,
             bounded_forward_peak=bounded,
+            bounded_caller_peak=bool(caller_bounded),
         )
     return signature
 
@@ -2123,7 +2162,11 @@ def _estimate_required_memory_bytes_from_values(
         profiled_bytes = profiled.bytes_per_token * profiled_tokens(
             profiled.logical_per_packed
         )
-        if (
+        if isinstance(profiled, _CallerMemoryProfile):
+            profiled_bytes = profiled.compute_peak(
+                profiled_tokens(profiled.logical_per_packed)
+            )
+        elif (
             isinstance(profiled, _BoundedMemoryProfile)
             and profiled.forward_compute_peaks
         ):
@@ -2332,6 +2375,36 @@ def _update_memory_profile(
         warm_logical_per_packed=warm_sharing,
         caller_plans=caller_plans,
     )
+    if (
+        isinstance(plan.signature, _ScopedMemorySignature)
+        and plan.signature.bounded_caller_peak
+    ):
+        peaks = dict(
+            previous.caller_compute_peaks
+            if isinstance(previous, _CallerMemoryProfile)
+            else ()
+        )
+        if caller_phase:
+            peaks[plan.packed_tokens] = max(
+                compute_delta, peaks.get(plan.packed_tokens, 0)
+            )
+        observations = []
+        peak = 0
+        for length, compute in sorted(peaks.items()):
+            peak = max(peak, compute)
+            observations.append((length, peak))
+        if len(observations) > 8:
+            observations = [observations[0], *observations[-7:]]
+        self._memory_profiles[plan.signature] = _CallerMemoryProfile(
+            **vars(self._memory_profiles[plan.signature]),
+            caller_compute_peaks=tuple(observations),
+            compute_peak_floor=max(
+                compute_delta,
+                previous.compute_peak_floor
+                if isinstance(previous, _CallerMemoryProfile)
+                else 0,
+            ),
+        )
     if (
         isinstance(plan.signature, _ScopedMemorySignature)
         and plan.signature.bounded_forward_peak
