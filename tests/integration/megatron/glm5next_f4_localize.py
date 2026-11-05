@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import json
 import os
 from pathlib import Path
@@ -67,7 +68,175 @@ def sparse_reference(
 
 
 @torch.no_grad()
-def replay(root: Path, dump: Path, native_dir: Path | None = None) -> dict[str, Any]:
+def replay_layers(
+    w: Weights,
+    cfg: Any,
+    data: dict[str, Tensor],
+    hc: Any,
+    attention3: Callable[[Tensor], Tensor],
+    mlp3: Callable[[Tensor], Tensor],
+) -> dict[str, Any]:
+    """Same-input components, whole layers, and a CPU-only prediction aid."""
+    from unittest.mock import patch
+
+    from art.megatron.glm5next.hf_oracle import logprob_metrics
+    from art.megatron.glm5next.kda import KimiDeltaAttention
+    from art.megatron.glm5next.kda_reference import recurrent_kda
+
+    def delta_rel(a: Tensor, b: Tensor, target: Tensor) -> float:
+        return float((a.double() - b.double()).norm() / target.double().norm())
+
+    def rounded_beta(q, k, v, g, beta, **kwargs):
+        return recurrent_kda(q, k, v, g, beta.bfloat16(), **kwargs)
+
+    chains = {name: data["layers.0.input_streams"] for name in ("FP32", "BF16")}
+    rows = []
+    for layer in range(4):
+        prefix = f"model.language_model.layers.{layer}."
+        if layer < 3:
+            with torch.device("meta"):
+                kda = KimiDeltaAttention(
+                    cfg,
+                    layer_number=layer + 1,
+                    backend="reference",
+                    dtype=torch.bfloat16,
+                )
+            kda.load_state_dict(
+                {k: w.get(prefix + "self_attn." + k) for k in kda.state_dict()},
+                assign=True,
+            )
+            kda.eval()
+
+            def attention(value: Tensor) -> Tensor:
+                return kda(value.transpose(0, 1))[0].transpose(0, 1)
+
+            gu = torch.cat(
+                [
+                    w.get(prefix + "mlp.gate_proj.weight"),
+                    w.get(prefix + "mlp.up_proj.weight"),
+                ]
+            )
+            down = w.get(prefix + "mlp.down_proj.weight")
+
+            def mlp(value: Tensor) -> Tensor:
+                return F.linear(swiglu(F.linear(value, gu), cfg.swiglu_limit), down)
+
+        else:
+            attention, mlp = attention3, mlp3
+
+        hp = {
+            site: tuple(
+                w.get(prefix + f"{site}_hc.{field}")
+                for field in ("fn", "scale", "base")
+            )
+            for site in ("attn", "ffn")
+        }
+        norms = {
+            site: w.get(prefix + name + ".weight")
+            for site, name in (
+                ("attn", "input_layernorm"),
+                ("ffn", "post_attention_layernorm"),
+            )
+        }
+
+        def block(stream: Tensor) -> Tensor:
+            for site, operation in (("attn", attention), ("ffn", mlp)):
+                collapsed, post, comb = hc.hc_pre_raw(stream, *hp[site])
+                value = norm(collapsed, norms[site], cfg.rms_norm_eps)
+                stream = hc.hc_post_raw(operation(value), stream, post, comb)
+            return stream
+
+        target_attention = data[f"layers.{layer}.attention"]
+        target_stream = data[f"layers.{layer}.streams"]
+        original_stream = data[f"layers.{layer}.input_streams"]
+        actual_attention = attention(data[f"layers.{layer}.attention_input"])
+        actual_mlp = mlp(data[f"layers.{layer}.mlp_input"])
+        actual_stream = block(original_stream)
+        chains["FP32"] = block(chains["FP32"])
+        with patch("art.megatron.glm5next.kda_reference.recurrent_kda", rounded_beta):
+            control_attention = attention(data[f"layers.{layer}.attention_input"])
+            control_stream = block(original_stream)
+            chains["BF16"] = block(chains["BF16"])
+        rows.append(
+            {
+                "layer": layer,
+                "attention": metrics(actual_attention, target_attention),
+                "mlp": metrics(actual_mlp, data[f"layers.{layer}.mlp"]),
+                "streams": metrics(actual_stream, target_stream),
+                "BF16_beta_attention": metrics(control_attention, target_attention),
+                "BF16_beta_streams": metrics(control_stream, target_stream),
+                "beta_only_attention_delta_over_HF_norm": delta_rel(
+                    actual_attention, control_attention, target_attention
+                ),
+                "beta_only_stream_delta_over_HF_norm": delta_rel(
+                    actual_stream, control_stream, target_stream
+                ),
+                "cumulative_FP32_beta_streams": metrics(chains["FP32"], target_stream),
+                "cumulative_BF16_beta_streams": metrics(chains["BF16"], target_stream),
+                "cumulative_beta_delta_over_HF_norm": delta_rel(
+                    chains["FP32"], chains["BF16"], target_stream
+                ),
+            }
+        )
+        print(json.dumps({"layer_progress": rows[-1]}), flush=True)
+
+    head = w.get("lm_head.weight")
+    norm_weight = w.get("model.language_model.norm.weight")
+    input_ids = data["input_ids"].long()
+    predictions = {}
+    logits_by_mode = {}
+    for mode, streams in chains.items():
+        hidden = norm(streams.mean(-2), norm_weight, cfg.rms_norm_eps)
+        logits = F.linear(hidden, head).float()
+        logits_by_mode[mode] = logits
+        lp = (
+            logits[:, :-1]
+            .log_softmax(-1)
+            .gather(-1, input_ids[:, 1:, None])
+            .squeeze(-1)
+        )
+        predictions[mode] = {
+            "target_logprobs": logprob_metrics(lp, data["target_logprobs"]),
+            "top1_agreement": float(
+                (logits[:, :-1].argmax(-1) == data["top64.indices"][:, :-1, 0])
+                .float()
+                .mean()
+            ),
+            "sampled_logits": metrics(
+                logits[:, data["full_logits.positions"].long()], data["full_logits"]
+            ),
+        }
+    lp = {
+        mode: logits[:, :-1]
+        .log_softmax(-1)
+        .gather(-1, input_ids[:, 1:, None])
+        .squeeze(-1)
+        for mode, logits in logits_by_mode.items()
+    }
+    predictions["beta_only"] = {
+        "target_logprobs": logprob_metrics(lp["FP32"], lp["BF16"]),
+        "top1_agreement": float(
+            (
+                logits_by_mode["FP32"][:, :-1].argmax(-1)
+                == logits_by_mode["BF16"][:, :-1].argmax(-1)
+            )
+            .float()
+            .mean()
+        ),
+    }
+    return {
+        "layers": rows,
+        "CPU_short_document_prediction_aid_NOT_GPU_F4": predictions,
+        "stream_method": "Each isolated layer starts at original HF input streams; downstream mHC/norm/MLP recomputed. Cumulative chains start at HF layer0 input streams.",
+        "beta_control": "Round only FP32 sigmoid beta to BF16 before the same recurrence; router bias stays original FP32 in both chains.",
+        "limitations": "CPU GEMMs, reference recurrence and sparse MLA, explicit MoE combine. Short packs select all causal tokens. Not GPU parity and not a full HF FP32 reference.",
+    }
+
+
+@torch.no_grad()
+def replay(
+    root: Path, dump: Path, native_dir: Path | None = None, *, all_layers: bool = False
+) -> dict[str, Any]:
     from unittest.mock import patch
 
     from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -86,6 +255,8 @@ def replay(root: Path, dump: Path, native_dir: Path | None = None) -> dict[str, 
     cfg = Glm5NextTextConfig.from_pretrained(root, local_files_only=True)
     cfg._attn_implementation = "sdpa"
     data = load_file(dump)
+    if all_layers and data["input_ids"].shape[1] > 128:
+        raise ValueError("All-layer prediction aid requires a <=128-token document")
     prefix = "model.language_model.layers.3."
     result: dict[str, Any] = {
         "dump": str(dump),
@@ -300,6 +471,48 @@ def replay(root: Path, dump: Path, native_dir: Path | None = None) -> dict[str, 
     result["mhc"]["layer_output_with_HF_sublayers"] = metrics(
         residual, data["layers.3.streams"]
     )
+    if all_layers:
+
+        def attention3(value: Tensor) -> Tensor:
+            with (
+                patch.object(native, "_attention_state", return_value=None),
+                patch("art.megatron.glm52.attention.sparse_mla", sparse_reference),
+            ):
+                return native(value.transpose(0, 1))[0].transpose(0, 1)
+
+        def mlp3(value: Tensor) -> Tensor:
+            v = value.reshape(-1, cfg.hidden_size)
+            route_probs, route_ids = topk_routing_with_score_function(
+                router.gating(v),
+                cfg.num_experts_per_tok,
+                score_function="sigmoid",
+                expert_bias=w.get(prefix + "mlp.gate.e_score_correction_bias").float(),
+                scaling_factor=cfg.routed_scaling_factor,
+                dense_output=True,
+            )
+            acc = torch.zeros_like(v, dtype=torch.float32)
+            for expert in route_ids.unique().tolist():
+                tokens, slots = torch.where(route_ids == expert)
+                ep = prefix + f"mlp.experts.{expert}."
+                gu = torch.cat(
+                    [w.get(ep + "gate_proj.weight"), w.get(ep + "up_proj.weight")]
+                )
+                act = TEGroupedMLP.bias_act_func(
+                    native_act,
+                    F.linear(v[tokens], gu),
+                    None,
+                    route_probs[tokens, slots, None],
+                )
+                acc.index_add_(
+                    0, tokens, F.linear(act, w.get(ep + "down_proj.weight")).float()
+                )
+            shared = F.linear(
+                swiglu(F.linear(v, shared_gu), cfg.swiglu_limit),
+                w.get(shared_prefix + "down_proj.weight"),
+            )
+            return (acc.to(v.dtype) + shared).view_as(value)
+
+        result["all_layers"] = replay_layers(w, cfg, data, hc, attention3, mlp3)
     if native_dir is not None:
         candidate = load_file(
             native_dir / dump.name.replace(".safetensors", "-rank0.safetensors")
@@ -429,12 +642,17 @@ def main() -> None:
     parser.add_argument("--dump", type=Path, action="append", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--native-dir", type=Path)
+    parser.add_argument(
+        "--layers-0-3",
+        action="store_true",
+        help="Include beta control and CPU prediction aid",
+    )
     args = parser.parse_args()
     torch.set_num_threads(4)
     torch.set_num_interop_threads(1)
     results = []
     for dump in args.dump:
-        result = replay(args.fixture, dump, args.native_dir)
+        result = replay(args.fixture, dump, args.native_dir, all_layers=args.layers_0_3)
         results.append(result)
         args.output.write_text(json.dumps(results, indent=2) + "\n")
         print(json.dumps(result), flush=True)

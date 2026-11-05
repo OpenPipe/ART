@@ -39,14 +39,27 @@ def layer():
     return KimiDeltaAttention(config(), backend="reference")
 
 
-def test_bf16_input_gate_matches_hf_before_recurrent_promotion(monkeypatch):
-    """HF computes sigmoid in the projection dtype, then FLA promotes beta."""
-    torch.manual_seed(17)
+def test_bf16_input_gate_matches_vllm_fp32_sigmoid(monkeypatch):
+    """vLLM common/kda.py:132-134,471-476 promotes raw BF16 beta logits."""
     module = KimiDeltaAttention(config(), backend="reference").to(torch.bfloat16)
-    value = torch.randn(7, 1, 8, dtype=torch.bfloat16)
-    projection = module.b_proj(value.transpose(0, 1))
-    expected = projection.sigmoid()
-    assert not torch.equal(expected.float(), projection.float().sigmoid())
+    value = torch.arange(56, dtype=torch.bfloat16).reshape(7, 1, 8) / 16
+    raw_beta = torch.tensor(
+        [
+            [
+                [-3.0, -1.0],
+                [-0.25, 0.0],
+                [0.125, 0.5],
+                [1.0, 2.0],
+                [3.0, -2.0],
+                [0.75, -0.5],
+                [1.5, -1.5],
+            ]
+        ],
+        dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(module.b_proj, "forward", lambda _: raw_beta)
+    expected = raw_beta.float().sigmoid()
+    assert not torch.equal(expected, raw_beta.sigmoid().float())
     captured = []
 
     def recurrence(q, k, v, g, beta, **kwargs):
@@ -57,7 +70,7 @@ def test_bf16_input_gate_matches_hf_before_recurrent_promotion(monkeypatch):
     actual = module(value)[0]
     assert torch.isfinite(actual).all()
     assert len(captured) == 1
-    assert captured[0].dtype == torch.bfloat16
+    assert captured[0].dtype == torch.float32
     assert torch.equal(captured[0], expected)
 
 
