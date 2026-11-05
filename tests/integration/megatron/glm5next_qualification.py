@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import sys
 import time
-from typing import Any, cast
+from typing import Any
 import urllib.request
 
 import torch
@@ -172,6 +172,28 @@ def identity(model: Path, output: Path) -> None:
     save_vllm_lora_tensors(output, tensors, config)
 
 
+def capture_layer_outputs(chunks: Any, values: dict) -> list[Any]:
+    """Capture outside the layer forward, through DDP/Float16 wrappers."""
+    handles = []
+    for wrapped in chunks:
+        chunk = wrapped
+        while hasattr(chunk, "module"):
+            chunk = chunk.module
+        for layer in chunk.decoder.layers:
+
+            def capture(
+                module: Any,
+                args: Any,
+                result: Any,
+                key: str = f"layers.{layer.layer_number - 1}.streams",
+            ) -> None:
+                value = result[0] if isinstance(result, tuple) else result
+                values[key] = value[:4].detach().float().cpu()
+
+            handles.append(layer.register_forward_hook(capture))
+    return handles
+
+
 class TinyEngine:
     """Native ART LoRA storage on a tiny CPU projection; real token volumes."""
 
@@ -190,6 +212,19 @@ class TinyEngine:
         self.optimizer = torch.optim.AdamW(self.params, lr=1e-3, weight_decay=0)
         self.output = output
         self.layers: dict = {}
+        from types import SimpleNamespace
+
+        self.head.layer_number = 1
+        wrapped = SimpleNamespace(
+            module=SimpleNamespace(
+                module=SimpleNamespace(decoder=SimpleNamespace(layers=[self.head]))
+            )
+        )
+        self.handles = (
+            capture_layer_outputs([wrapped], self.layers)
+            if output.name in ("F4", "F8")
+            else []
+        )
 
     def forward(
         self, tokens: list[int], backward: bool = False, logits: bool = False
@@ -287,7 +322,8 @@ class TinyEngine:
         return None
 
     def close(self) -> None:
-        return None
+        for handle in self.handles:
+            handle.remove()
 
 
 class ArtEngine:
@@ -312,21 +348,12 @@ class ArtEngine:
         self.trainer = TrainerRank(self.runtime)
         self.trainer.load_checkpoint(str(output.parents[1] / "initial"))
         self.layers: dict = {}
-        self.handles = []
-        # Samples only: hooks stay bounded independently of context length.
-        for chunk in cast(Any, self.runtime.model):
-            for layer in chunk.decoder.layers:
-
-                def capture(
-                    module: Any,
-                    args: Any,
-                    result: Any,
-                    key: str = f"layers.{layer.layer_number - 1}.streams",
-                ) -> None:
-                    value = result[0] if isinstance(result, tuple) else result
-                    self.layers[key] = value[:4].detach().float().cpu()
-
-                self.handles.append(layer.register_forward_hook(capture))
+        # Do not add D2H capture synchronization to performance/context measurements.
+        self.handles = (
+            capture_layer_outputs(self.runtime.model, self.layers)
+            if output.name in ("F4", "F8")
+            else []
+        )
         self.output = output
         write(
             output / f"topology-rank{self.rank}.json",

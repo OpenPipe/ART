@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import sys
+from typing import Any
 
 import pytest
 
@@ -91,3 +92,30 @@ def test_pss_allows_kernel_confirmed_process_exit(monkeypatch):
 
     monkeypatch.setattr(Path, "read_text", read)
     assert process_tree_pss(os.getpid(), {}) == 0
+
+
+def test_layer_capture_unwraps_ddp_and_precision_wrappers():
+    from types import SimpleNamespace
+
+    import torch
+
+    from tests.integration.megatron.glm5next_qualification import capture_layer_outputs
+
+    layer: Any = torch.nn.Linear(2, 2, bias=False)
+    layer.layer_number = 1
+    with torch.no_grad():
+        layer.weight.copy_(torch.eye(2))
+    wrapped = SimpleNamespace(
+        module=SimpleNamespace(
+            module=SimpleNamespace(decoder=SimpleNamespace(layers=[layer]))
+        )
+    )
+    values = {}
+    handles = capture_layer_outputs([wrapped], values)
+    x = torch.arange(16, dtype=torch.float32).reshape(8, 2).requires_grad_()
+    layer(x)
+    sample = values["layers.0.streams"]
+    assert sample.shape == (4, 2) and not sample.requires_grad
+    torch.testing.assert_close(sample, x[:4])
+    for handle in handles:
+        handle.remove()
