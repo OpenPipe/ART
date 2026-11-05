@@ -324,6 +324,35 @@ class Glm52SelfAttention(Attention):
             return gather_from_sequence_parallel_region(tensor, group=self.tp_group)
         return copy_to_tensor_model_parallel_region(tensor, group=self.tp_group)
 
+    def _attention_state(self, attention_bias: Any) -> Glm52PrefixTreeState:
+        return require_glm52_state(attention_bias)
+
+    def _normalize_latent(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return _latent_rms_norm(x, weight)
+
+    def _latent_output(self, latent_out: torch.Tensor) -> torch.Tensor:
+        return latent_out
+
+    def _rotary_slices(
+        self,
+        q_rope: torch.Tensor,
+        k_rope: torch.Tensor,
+        state: Glm52PrefixTreeState,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        seq_len, batch = k_rope.shape[:2]
+        if state.rope_cos.shape[:2] != (batch, seq_len):
+            raise RuntimeError(
+                "GLM-5.2 RoPE state does not match the attention tokens: "
+                f"layer={self.layer_number}, rope={tuple(state.rope_cos.shape[:2])}, "
+                f"tokens={(batch, seq_len)}"
+            )
+        cos = state.rope_cos.permute(1, 0, 2).unsqueeze(2).to(q_rope.dtype)
+        sin = state.rope_sin.permute(1, 0, 2).unsqueeze(2).to(q_rope.dtype)
+        return (
+            _interleaved_rope(q_rope, cos, sin),
+            _interleaved_rope(k_rope.unsqueeze(2), cos, sin).squeeze(2),
+        )
+
     @torch.compiler.disable
     def forward(  # ty: ignore[invalid-method-override]
         self,
@@ -333,11 +362,11 @@ class Glm52SelfAttention(Attention):
         **_: Any,
     ) -> tuple[torch.Tensor, None]:
         del attention_mask
-        state = require_glm52_state(attention_bias)
+        state = self._attention_state(attention_bias)
         q_compressed = _tensor(self.linear_q_down_proj(hidden_states))
         if self.q_a_lora is not None:
             q_compressed = q_compressed + self.q_a_lora(hidden_states)
-        q_residual = _latent_rms_norm(q_compressed, self.q_layernorm.weight)
+        q_residual = self._normalize_latent(q_compressed, self.q_layernorm.weight)
         q = _tensor(self.linear_q_up_proj(q_residual))
         if self.q_b_lora is not None:
             q = q + self.q_b_lora(self._column_lora_input(q_residual))
@@ -347,7 +376,7 @@ class Glm52SelfAttention(Attention):
         kv_compressed, k_rope = kv_combined.split(
             (self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim), dim=-1
         )
-        kv_compressed = _latent_rms_norm(kv_compressed, self.kv_layernorm.weight)
+        kv_compressed = self._normalize_latent(kv_compressed, self.kv_layernorm.weight)
         kv_compressed = self._gather_replicated_sequence(kv_compressed)
         k_rope = self._gather_replicated_sequence(k_rope)
         seq_len, batch = kv_compressed.shape[:2]
@@ -361,16 +390,7 @@ class Glm52SelfAttention(Attention):
         q_nope, q_rope = q.split(
             (self.config.qk_head_dim, self.config.qk_pos_emb_head_dim), dim=-1
         )
-        if state.rope_cos.shape[:2] != (batch, seq_len):
-            raise RuntimeError(
-                "GLM-5.2 RoPE state does not match the attention tokens: "
-                f"layer={self.layer_number}, rope={tuple(state.rope_cos.shape[:2])}, "
-                f"tokens={(batch, seq_len)}, hidden={tuple(hidden_states.shape)}"
-            )
-        cos = state.rope_cos.permute(1, 0, 2).unsqueeze(2).to(q.dtype)
-        sin = state.rope_sin.permute(1, 0, 2).unsqueeze(2).to(q.dtype)
-        q_rope = _interleaved_rope(q_rope, cos, sin)
-        k_rope = _interleaved_rope(k_rope.unsqueeze(2), cos, sin).squeeze(2)
+        q_rope, k_rope = self._rotary_slices(q_rope, k_rope, state)
 
         kv_weight = self.linear_kv_up_proj.weight.view(
             heads,
@@ -407,7 +427,9 @@ class Glm52SelfAttention(Attention):
                 tp_group=self.tp_group if get_pg_size(self.tp_group) > 1 else None,
             )
         )
-        value_out = torch.einsum("bshm,hdm->bshd", latent_out, value_weight)
+        value_out = torch.einsum(
+            "bshm,hdm->bshd", self._latent_output(latent_out), value_weight
+        )
         value_out = value_out.permute(1, 0, 2, 3).reshape(
             seq_len, batch, heads * self.config.v_head_dim
         )
