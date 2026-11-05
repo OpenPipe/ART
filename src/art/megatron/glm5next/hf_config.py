@@ -18,12 +18,25 @@ class Glm5NextTextConfig(PretrainedConfig):
     model_type = "glm5_next_text"
 
     def __init__(self, **kwargs: Any) -> None:
+        # 5.12's validator predates HF's indexed_attention spelling. Keep the
+        # original pattern for ART; only the HF/Bridge view uses its valid alias.
+        original = kwargs.pop("art_layer_types", kwargs.get("layer_types"))
+        if original is not None:
+            normalized = [
+                "full_attention" if kind == "indexed_attention" else kind
+                for kind in original
+            ]
+            if kwargs.get("layer_types") not in (list(original), normalized):
+                raise ValueError("Conflicting GLM attention patterns in config.")
+            kwargs["layer_types"] = normalized
         # Bridge validates architecture suffixes before dispatch. M1's oracle
         # saves a custom class name, but uses the same text tensor namespace.
         # Normalize only the in-memory config; the fixture stays untouched.
         if kwargs.get("architectures") == ["Glm5NextTextOracle"]:
             kwargs["architectures"] = ["Glm5NextForConditionalGeneration"]
         super().__init__(**kwargs)
+        if original is not None:
+            self.art_layer_types = list(original)
 
 
 class Glm5NextConfig(PretrainedConfig):

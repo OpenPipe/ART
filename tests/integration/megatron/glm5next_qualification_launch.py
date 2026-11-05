@@ -472,9 +472,14 @@ def manifest(seal: dict, name: str, gpu: bool) -> dict:
             "activeDeadlineSeconds": 13200 if gpu else 1800,
             "priorityClassName": seal.get("priorityClassName", "caladan-serving"),
             "nodeSelector": {
+                **(
+                    {"kubernetes.io/hostname": seal["target_node"]}
+                    if seal.get("target_node")
+                    else {}
+                ),
                 seal.get("pool_selector", "caladan.openpipe.ai/pool"): seal.get(
                     "pool", "caladan-b300-spot"
-                )
+                ),
             },
             "tolerations": [
                 {
@@ -651,7 +656,7 @@ class RecordingClient:
                 ),
                 cwd=root,
             )
-            self.stage0_node = "recording-stage0-node"
+            self.stage0_node = seal.get("target_node", "recording-stage0-node")
         else:
             assert (
                 value["spec"]["nodeSelector"]["kubernetes.io/hostname"]
@@ -811,6 +816,7 @@ def main() -> None:
                 args.output / "stage0.json",
                 expected_cuda=seal.get("torch_cuda", "13.0"),
                 require_toolkit=True,
+                inputs=ROOT / "qualification-inputs",
             )
         else:
             status = {"status": "failed"}

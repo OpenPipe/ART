@@ -54,7 +54,11 @@ def acquire(record: dict, destination: Path) -> dict:
 
 
 def stage0(
-    output: Path, expected_cuda: str | None = None, *, require_toolkit: bool = False
+    output: Path,
+    expected_cuda: str | None = None,
+    *,
+    require_toolkit: bool = False,
+    inputs: Path | None = None,
 ) -> None:
     from art.megatron.model_support.handlers.glm5next import GLM5NEXT_HANDLER
     from art.megatron.train import build_training_runtime
@@ -78,6 +82,11 @@ def stage0(
     for name in ("forward_micro_batches", "backward", "optim_step", "export_lora"):
         assert callable(getattr(TrainerRank, name))
     assert not torch.cuda.is_initialized()
+    real_configs = None
+    if inputs is not None:
+        from tests.integration.megatron.glm5next_real_config import check_real_configs
+
+        real_configs = check_real_configs(inputs / "real-configs")
     write(
         output,
         {
@@ -85,6 +94,7 @@ def stage0(
             "cuda": torch.version.cuda,
             "torch": torch.__version__,
             "cuda_initialized": False,
+            "real_configs": real_configs,
             "toolkit": toolkit,
             "toolkit_simulated": os.environ.get("M4_FAKE_TOOLKIT") == "1",
             "art_source": str(Path(__import__("art").__file__).resolve()),
@@ -102,10 +112,7 @@ def hybrid_ep_stage(output: Path, *, tiny: bool) -> None:
     assert setup._arch_list() == arch
     assert os.environ["HYBRID_EP_MULTINODE"] == "0" and os.environ["USE_NIXL"] == "0"
     assert callable(setup.setup_hybrid_ep) and callable(setup.validate_hybrid_ep)
-    validation = (
-        "from art.megatron.hybrid_ep_setup import validate_hybrid_ep; validate_hybrid_ep(); import hybrid_ep_cpp; assert hybrid_ep_cpp.SM_ARCH == "
-        + repr(arch)
-    )
+    validation = "import json,sys,os,subprocess,torch,deep_ep,hybrid_ep_cpp; from importlib.metadata import version; from art.megatron.hybrid_ep_setup import validate_hybrid_ep; validate_hybrid_ep(); assert hybrid_ep_cpp.SM_ARCH == '10.0'; assert torch.version.cuda == '13.0'; print(json.dumps({'python':sys.version,'torch':torch.__version__,'cuda':torch.version.cuda,'art-deep-ep':version('art-deep-ep'),'SM_ARCH':hybrid_ep_cpp.SM_ARCH,'nvcc':subprocess.check_output([os.environ['CUDA_HOME']+'/bin/nvcc','--version'],text=True)}))"
     commands = [
         [sys.executable, "-m", "art.megatron.hybrid_ep_setup"],
         [sys.executable, "-c", validation],
@@ -126,7 +133,7 @@ def hybrid_ep_stage(output: Path, *, tiny: bool) -> None:
         else:
             actual = argv
         subprocess.run(
-            actual, check=True, timeout=max(1, 1780 - (time.monotonic() - started))
+            actual, check=True, timeout=max(1, 1800 - (time.monotonic() - started))
         )
         records.append({"argv": argv, "executed": actual, "simulation": tiny})
     write(
@@ -718,7 +725,7 @@ def main() -> None:
     torch.set_num_interop_threads(1)
     args.output.mkdir(parents=True, exist_ok=True)
     if args.task == "stage0":
-        stage0(args.output / "stage0.json")
+        stage0(args.output / "stage0.json", inputs=args.inputs)
     elif args.task == "volumes":
         volumes(args.inputs, args.output / "volumes.json")
     elif args.task == "acquire":

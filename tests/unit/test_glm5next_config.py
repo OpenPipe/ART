@@ -88,7 +88,17 @@ def test_production_topology_and_frozen_router_contract() -> None:
 
 
 @pytest.mark.parametrize(
-    "field,value", [("qk_rope_head_dim", 64), ("topk_method", "greedy"), ("n_group", 2)]
+    "field,value",
+    [
+        ("qk_rope_head_dim", 64),
+        ("topk_method", "greedy"),
+        ("n_group", 2),
+        ("index_kpool", 8),
+        ("index_kpool_compress", False),
+        ("index_kpool_always_select_tail", False),
+        ("mhc", False),
+        ("moe_router_dtype", "bfloat16"),
+    ],
 )
 def test_reject_unsupported_architecture(field: str, value: object) -> None:
     config = production_config()

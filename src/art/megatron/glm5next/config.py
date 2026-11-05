@@ -20,7 +20,7 @@ def configure_glm5next_provider(provider: Any, config: Any) -> None:
     """
     cfg = text_config(config)
     count = int(cfg.num_hidden_layers)
-    attention = tuple(cfg.layer_types)
+    attention = tuple(getattr(cfg, "art_layer_types", cfg.layer_types))
     mlp = tuple(cfg.mlp_layer_types)
     if len(attention) != count or len(mlp) != count:
         raise ValueError("GLM-5.3 Flash layer patterns must cover num_hidden_layers.")
@@ -39,6 +39,15 @@ def configure_glm5next_provider(provider: Any, config: Any) -> None:
         raise ValueError("GLM-5.3 Flash requires normalized top-k probabilities.")
     if int(getattr(cfg, "n_group", 1) or 1) != 1:
         raise ValueError("GLM-5.3 Flash currently requires one routing group.")
+    # Native Flash implements compressed four-token pools with a causal tail.
+    # Reject unsupported HF switches here instead of silently ignoring them.
+    if int(cfg.index_kpool) != 4:
+        raise ValueError("GLM-5.3 Flash requires index_kpool=4.")
+    for field in ("index_kpool_compress", "index_kpool_always_select_tail", "mhc"):
+        if not getattr(cfg, field, True):
+            raise ValueError(f"GLM-5.3 Flash requires {field}=True.")
+    if getattr(cfg, "moe_router_dtype", "float32") not in ("float32", "fp32"):
+        raise ValueError("GLM-5.3 Flash requires an FP32 router.")
     if any(
         kind != "full"
         for kind, layer in zip(cfg.indexer_types, attention, strict=True)
@@ -93,6 +102,7 @@ def configure_glm5next_provider(provider: Any, config: Any) -> None:
         "dsa_indexer_head_dim": int(cfg.index_head_dim),
         "dsa_indexer_topk": int(cfg.index_topk),
         "dsa_indexer_kpool": int(cfg.index_kpool),
+        "dsa_indexer_kpool_compress": True,
         "dsa_indexer_kpool_always_select_tail": bool(
             cfg.index_kpool_always_select_tail
         ),
