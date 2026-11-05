@@ -78,3 +78,11 @@ checkpoint conversion and independently check document-local CE and gradients.
 For the sealed CPU rehearsal, `dump R2 --full-volume-rehearsal` exercises all
 six lengths with index_topk=2048 on the tiny model. It changes no fixture weights
 or saved config. Capture validates causal selection counts at boundary probes.
+
+Real-weight GPU references are now available under `dumps/F4/` and `dumps/F8/`
+at the shared fixture root. F4 has 18 document files and 15 gradient-family
+files; F8 has 18 document files. Both cover all six pack totals through 16384.
+All 51 payloads passed independent SHA-256, size, shape and finite-value checks.
+The manifest snapshot includes each payload's digest and document/key mapping.
+Run evidence: `/tmp/stark-gpu/glm-m1/gpu-20261105T034910Z/`.
+Full-model M7 reference logprobs remain a later follow-up.
