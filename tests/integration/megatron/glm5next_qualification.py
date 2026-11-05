@@ -615,21 +615,10 @@ def main() -> None:
             results = list(pool.map(lambda r: acquire(r, args.model), records))
         write(args.output / "acquisition.json", results)
     elif args.task == "identity":
-        if args.tiny:
-            from art.megatron.glm5next.lora import LoraDimensions
-            from art.megatron.glm5next.lora_export import adapter_config
+        # Identical CPU construction/codec/file IO in rehearsal and GPU execution.
+        # This materializes the actual rank32 adapter volume, even for a tiny engine.
+        identity(args.model, args.output.parents[1] / "initial")
 
-            write(
-                args.output / "identity-contract.json",
-                adapter_config(
-                    32,
-                    dimensions=LoraDimensions.from_config(
-                        json.loads((args.inputs / "config.json").read_text())
-                    ),
-                ),
-            )
-        else:
-            identity(args.model, args.output.parents[1] / "initial")
     else:
         engine = (TinyEngine if args.tiny else ArtEngine)(args.model, args.output)
         try:
