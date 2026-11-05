@@ -247,12 +247,18 @@ def pipeline(
     records = []
 
     def run(name: str, argv: list[str], visible: str = "") -> None:
+        native_cap = seal["caps_s"][name]
+        # CPU import/reference arithmetic is not a native timing calibration.
+        # Native execution retains the doubled receipt cap exactly.
+        execution_cap = max(600, native_cap) if tiny else native_cap
         records.append(
             {
                 "name": name,
+                "native_cap_s": native_cap,
+                "execution_cap_s": execution_cap,
                 **base.run(
                     argv,
-                    max(1, min(seal["caps_s"][name], int(deadline - time.monotonic()))),
+                    max(1, min(execution_cap, int(deadline - time.monotonic()))),
                     work / "logs" / f"{name}.log",
                     env={**env, "CUDA_VISIBLE_DEVICES": visible},
                     cwd=root,

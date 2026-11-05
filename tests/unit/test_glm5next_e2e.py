@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 
-from tests.integration.megatron.glm5next_e2e import metrics
+from tests.integration.megatron.glm5next_e2e import install_capture, metrics
 from tests.integration.megatron.glm5next_e2e_launch import (
     has_grant,
     literals,
@@ -23,6 +26,27 @@ def test_positive_control_detects_m0_signature_and_nonfinite() -> None:
     assert not metrics(x, x, [1024, 1024])["hard_bug"]
     y[0] = torch.nan
     assert metrics(x, y, [1024, 1024])["hard_bug"]
+
+
+def test_capture_keeps_mhc_streams_in_channel_axis(tmp_path: Path) -> None:
+    layer = torch.nn.Identity()
+    values = torch.arange(32).reshape(4, 1, 4, 2)
+    trainer = SimpleNamespace(
+        runtime=SimpleNamespace(
+            model=[SimpleNamespace(decoder=SimpleNamespace(layers=[layer]))]
+        ),
+        _decoder_hidden=lambda prepared: layer(values),
+    )
+    prepared = SimpleNamespace(
+        token_uids=torch.arange(4),
+        position_ids=torch.arange(4),
+        attention_state=SimpleNamespace(),
+    )
+    install_capture(trainer, tmp_path / "capture.pt")
+    trainer._decoder_hidden(prepared)
+    saved = torch.load(tmp_path / "capture.pt", weights_only=True)
+    torch.testing.assert_close(saved["layer-0"], values.reshape(4, 8))
+    assert saved["layer-0.uids"].tolist() == [0, 1, 2, 3]
 
 
 def test_exact_grant_requires_every_literal() -> None:
