@@ -85,6 +85,9 @@ def stage0(
     real_configs = None
     te_architecture = None
     if inputs is not None:
+        from tests.integration.megatron.glm5next_topology import validate_stage_plans
+
+        validate_stage_plans(inputs, output.parent / "topology-plans.json")
         from tests.integration.megatron.glm5next_constructors import (
             check_native_construction,
             check_te_sm100,
@@ -564,6 +567,8 @@ def experiment(engine: Any, task: str, inputs: Path, output: Path) -> None:
 
     output.mkdir(parents=True, exist_ok=True)
     docs = documents(inputs)
+    if task in ("forward", "learn"):
+        first_forward_repeat(engine, docs[0][1], output)
     if task in ("forward", "parity"):
         for name, ids in docs:
             # Dense logits only on short docs; long prompts save target LP and sampled hidden states.
@@ -640,6 +645,41 @@ def experiment(engine: Any, task: str, inputs: Path, output: Path) -> None:
         )
     else:
         raise ValueError(task)
+
+
+def first_forward_repeat(engine: Any, ids: list[int], output: Path) -> dict:
+    """First two operations on each fresh forward/learning engine, before training."""
+    from safetensors.torch import save_file
+
+    with torch.no_grad():
+        arrays = [
+            engine.forward(ids)["logprobs"].detach().float().cpu() for _ in range(2)
+        ]
+    save_file(
+        {"first": arrays[0], "second": arrays[1]},
+        str(output / f"first-forward-repeat-rank{engine.rank}.safetensors"),
+    )
+    finite = all(bool(torch.isfinite(value).all()) for value in arrays)
+    delta = (arrays[0] - arrays[1]).abs().reshape(-1)
+    metrics = {
+        "mean": float(delta.mean()) if finite else None,
+        "p99": float(torch.quantile(delta, 0.99)) if finite else None,
+        "max": float(delta.max()) if finite else None,
+    }
+    hard_bug = not finite or float(delta.mean()) > 0.1
+    report = {
+        "status": "fail" if hard_bug else "pass",
+        "finite": finite,
+        "hard_bug": hard_bug,
+        "threshold_mean": 0.1,
+        "p99_max_policy": "report-only",
+        "tokens_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest(),
+        **metrics,
+    }
+    write(output / f"first-forward-repeat-rank{engine.rank}.json", report)
+    if hard_bug:
+        raise RuntimeError(f"first-forward repeat hard bug: {report}")
+    return report
 
 
 def compare(
@@ -738,6 +778,10 @@ def main() -> None:
     args.output.mkdir(parents=True, exist_ok=True)
     if args.task == "stage0":
         stage0(args.output / "stage0.json", inputs=args.inputs)
+    elif args.task == "topology-plans":
+        from tests.integration.megatron.glm5next_topology import validate_stage_plans
+
+        validate_stage_plans(args.inputs, args.output / "plans.json")
     elif args.task == "volumes":
         volumes(args.inputs, args.output / "volumes.json")
     elif args.task == "acquire":
@@ -763,11 +807,24 @@ def main() -> None:
         identity(args.model, args.output.parents[1] / "initial")
 
     else:
-        engine = (TinyEngine if args.tiny else ArtEngine)(args.model, args.output)
+        engine = None
         try:
+            engine = (TinyEngine if args.tiny else ArtEngine)(args.model, args.output)
             experiment(engine, args.task, args.inputs, args.output)
+        except torch.cuda.OutOfMemoryError as exc:
+            write(
+                args.output / f"failure-rank{os.environ.get('RANK', '0')}.json",
+                {
+                    "status": "oom",
+                    "task": args.task,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            )
+            raise
         finally:
-            engine.close()
+            if engine is not None:
+                engine.close()
 
 
 if __name__ == "__main__":
