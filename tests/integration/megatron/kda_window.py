@@ -28,9 +28,9 @@ def digest(path: Path) -> str:
     return result.hexdigest()
 
 
-def tree_rss(root: int, owned: dict[int, int]) -> int:
+def tree_pids(root: int, owned: dict[int, int]) -> set[int]:
     """Track descendants across setsid(), retaining PID start times on exit."""
-    processes: dict[int, tuple[int, int, int]] = {}
+    processes: dict[int, tuple[int, int]] = {}
     for entry in Path("/proc").iterdir():
         if not entry.name.isdecimal():
             continue
@@ -40,8 +40,6 @@ def tree_rss(root: int, owned: dict[int, int]) -> int:
                 processes[int(entry.name)] = (
                     int(fields[1]),
                     int(fields[19]),
-                    int((entry / "statm").read_text().split()[1])
-                    * os.sysconf("SC_PAGE_SIZE"),
                 )
         except (OSError, ValueError, IndexError):
             continue
@@ -55,7 +53,7 @@ def tree_rss(root: int, owned: dict[int, int]) -> int:
     while True:
         children = {
             pid
-            for pid, (parent, _, _) in processes.items()
+            for pid, (parent, _) in processes.items()
             if parent in live and pid not in live
         }
         if not children:
@@ -63,12 +61,32 @@ def tree_rss(root: int, owned: dict[int, int]) -> int:
         live.update(children)
         for pid in children:
             owned[pid] = processes[pid][1]
-    return sum(processes[pid][2] for pid in live)
+    return live
+
+
+def tree_memory(root: int, owned: dict[int, int]) -> tuple[int, int]:
+    """Sum PSS for admission and RSS for reference over the same live tree."""
+    pss = rss = 0
+    for pid in tree_pids(root, owned):
+        try:
+            fields = {}
+            for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
+                key, separator, value = line.partition(":")
+                if separator and key in ("Pss", "Rss"):
+                    fields[key] = int(value.split()[0]) * 1024
+            if fields.keys() != {"Pss", "Rss"}:
+                raise RuntimeError(f"Incomplete smaps_rollup memory counters for {pid}")
+            pss += fields["Pss"]
+            rss += fields["Rss"]
+        except (FileNotFoundError, ProcessLookupError):
+            # A worker may exit between discovery and opening its rollup.
+            continue
+    return pss, rss
 
 
 def stop_tree(root: int, owned: dict[int, int]) -> None:
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        tree_rss(root, owned)
+        tree_pids(root, owned)
         for pid, start in list(owned.items()):
             try:
                 fields = (
@@ -80,10 +98,10 @@ def stop_tree(root: int, owned: dict[int, int]) -> None:
                 pass
         limit = time.monotonic() + 5
         while time.monotonic() < limit:
-            if tree_rss(root, owned) == 0:
+            if not tree_pids(root, owned):
                 return
             time.sleep(0.1)
-    if tree_rss(root, owned):
+    if tree_pids(root, owned):
         raise RuntimeError(f"Owned process tree {root} survived cleanup")
 
 
@@ -93,22 +111,35 @@ def run_step(
     env: dict[str, str],
     output: Path,
     timeout: int,
+    max_pss_bytes: int,
     owned_groups: list[tuple[int, dict[int, int]]],
+    step_receipts: list[dict[str, Any]],
 ) -> dict[str, Any]:
     started = time.monotonic()
-    peak = 0
+    record: dict[str, Any] = {
+        "argv": argv,
+        "log": str(output),
+        "peak_tree_pss_bytes": 0,
+        "peak_tree_rss_bytes": 0,
+        "exit_code": None,
+    }
+    step_receipts.append(record)
     with output.open("w") as log:
         child = subprocess.Popen(
             argv, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
         )
         owned: dict[int, int] = {}
         owned_groups.append((child.pid, owned))
-        tree_rss(child.pid, owned)
+        tree_pids(child.pid, owned)
         try:
             while child.poll() is None:
-                peak = max(peak, tree_rss(child.pid, owned))
-                if peak > 120 * (1 << 30):
-                    raise RuntimeError("KDA process tree exceeded 120 GiB RSS")
+                pss, rss = tree_memory(child.pid, owned)
+                record["peak_tree_pss_bytes"] = max(record["peak_tree_pss_bytes"], pss)
+                record["peak_tree_rss_bytes"] = max(record["peak_tree_rss_bytes"], rss)
+                if pss > max_pss_bytes:
+                    raise RuntimeError(
+                        f"KDA process tree exceeded {max_pss_bytes} bytes PSS"
+                    )
                 if time.monotonic() - started > timeout:
                     raise TimeoutError(f"KDA step exceeded {timeout}s")
                 time.sleep(0.25)
@@ -117,13 +148,9 @@ def run_step(
         finally:
             stop_tree(child.pid, owned)
             child.wait(timeout=15)
-    return {
-        "argv": argv,
-        "log": str(output),
-        "elapsed_seconds": time.monotonic() - started,
-        "peak_tree_rss_bytes": peak,
-        "exit_code": child.returncode,
-    }
+            record["elapsed_seconds"] = time.monotonic() - started
+            record["exit_code"] = child.returncode
+    return record
 
 
 def verify(seal: dict[str, Any]) -> None:
@@ -165,6 +192,13 @@ def execute(args: Any) -> dict[str, Any]:
     receipt: dict[str, Any] = {
         "seal_sha256": seal_sha,
         "rehearsal": args.rehearsal,
+        "gpu_uuids": seal["gpu_uuids"],
+        "memory_guard": {
+            "metric": "sum of descendant Pss from /proc/<pid>/smaps_rollup",
+            "max_tree_pss_bytes": seal["max_tree_pss_bytes"],
+            "rss": "reference only",
+            "sampling_interval_seconds": 0.25,
+        },
         "steps": [],
         "pass": False,
         "cleanup_done": False,
@@ -205,14 +239,14 @@ def execute(args: Any) -> dict[str, Any]:
                 str(output / "schema.json"),
             ]
             schema_env = dict(env, CUDA_VISIBLE_DEVICES="")
-            receipt["steps"].append(
-                run_step(
-                    schema,
-                    env=schema_env,
-                    output=output / "schema.log",
-                    timeout=120,
-                    owned_groups=owned_groups,
-                )
+            run_step(
+                schema,
+                env=schema_env,
+                output=output / "schema.log",
+                timeout=120,
+                max_pss_bytes=seal["max_tree_pss_bytes"],
+                owned_groups=owned_groups,
+                step_receipts=receipt["steps"],
             )
             for step in seal["steps"]:
                 world = step["world_size"]
@@ -238,14 +272,14 @@ def execute(args: Any) -> dict[str, Any]:
                 remaining = (
                     seal["window_seconds"] - 120 - int(time.monotonic() - started)
                 )
-                receipt["steps"].append(
-                    run_step(
-                        argv,
-                        env=env,
-                        output=output / f"cp{world}.log",
-                        timeout=min(step["timeout_seconds"], remaining),
-                        owned_groups=owned_groups,
-                    )
+                run_step(
+                    argv,
+                    env=env,
+                    output=output / f"cp{world}.log",
+                    timeout=min(step["timeout_seconds"], remaining),
+                    max_pss_bytes=seal["max_tree_pss_bytes"],
+                    owned_groups=owned_groups,
+                    step_receipts=receipt["steps"],
                 )
                 for rank in range(world):
                     result = json.loads(
@@ -261,7 +295,7 @@ def execute(args: Any) -> dict[str, Any]:
         finally:
             receipt["cleanup_done"] = True
             for root, owned in owned_groups:
-                if tree_rss(root, owned):
+                if tree_pids(root, owned):
                     receipt["cleanup_done"] = False
                     receipt["cleanup_error"] = f"Surviving owned process tree {root}"
             if not args.rehearsal:
@@ -271,6 +305,9 @@ def execute(args: Any) -> dict[str, Any]:
                     receipt["cleanup_done"] = False
                     receipt["cleanup_error"] = str(exc)
             receipt["elapsed_seconds"] = time.monotonic() - started
+            for metric in ("pss", "rss"):
+                key = f"peak_tree_{metric}_bytes"
+                receipt[key] = max((step[key] for step in receipt["steps"]), default=0)
             (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
     return receipt
 
