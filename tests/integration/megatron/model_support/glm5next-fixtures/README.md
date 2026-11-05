@@ -74,3 +74,7 @@ indices and duplicate indices are excluded from sets; two empty sets agree.
 Numerical distances are report-only. Nonfinite tensors, missing keys, changed
 artifact hashes, and incompatible shapes fail. The CPU tests enforce exact
 checkpoint conversion and independently check document-local CE and gradients.
+
+For the sealed CPU rehearsal, `dump R2 --full-volume-rehearsal` exercises all
+six lengths with index_topk=2048 on the tiny model. It changes no fixture weights
+or saved config. Capture validates causal selection counts at boundary probes.

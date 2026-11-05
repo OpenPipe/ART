@@ -344,9 +344,21 @@ def save_tensors(values: dict[str, torch.Tensor], path: Path) -> None:
 
 
 def dump(
-    name: str, root: Path, device: str, *, lengths: tuple[int, ...] = LENGTHS
+    name: str,
+    root: Path,
+    device: str,
+    *,
+    lengths: tuple[int, ...] = LENGTHS,
+    full_volume_rehearsal: bool = False,
 ) -> None:
     model = oracle.load_fixture(name, root=root, device=device, verify=True)
+    if full_volume_rehearsal:
+        if name != "R2" or device != "cpu":
+            raise ValueError("Full-volume rehearsal requires R2 on CPU")
+        model.config.index_topk = 2048
+        for layer in model.model.language_model.layers:
+            if getattr(layer.self_attn, "indexer", None) is not None:
+                layer.self_attn.indexer.index_topk = 2048
     model.requires_grad_(False)
     context = (
         oracle.cpu_reference_kernels()
@@ -535,6 +547,37 @@ def dump(
                     for handle in handles:
                         handle.remove()
                 path = out / f"{pack['id']}-doc{doc}.safetensors"
+                for key, selection in values.items():
+                    if not key.endswith("indexer.indices"):
+                        continue
+                    budget, pool = model.config.index_topk, model.config.index_kpool
+                    if selection.shape[-1] != budget + pool - 1:
+                        raise ValueError(f"Invalid KPool output width: {key}")
+                    for position in (
+                        0,
+                        2,
+                        3,
+                        7,
+                        2047,
+                        2048,
+                        2050,
+                        2051,
+                        end - start - 1,
+                    ):
+                        if position >= end - start:
+                            continue
+                        row = selection[0, position]
+                        valid = row[row >= 0].tolist()
+                        expected_count = (
+                            min(budget, (position + 1) // pool * pool)
+                            + (position + 1) % pool
+                        )
+                        if len(set(valid)) != expected_count or any(
+                            i > position for i in valid
+                        ):
+                            raise ValueError(
+                                f"Invalid causal KPool selection at {key}:{position}"
+                            )
                 save_tensors(values, path)
                 files.append(oracle.file_record(path, root))
                 document_records.append(
@@ -560,6 +603,8 @@ def dump(
         "backend": "HF torch fallback"
         if device == "cpu"
         else "HF with FLA KDA; SDPA DSA (flash/efficient/cuDNN; math disabled)",
+        "full_volume_cpu_rehearsal": full_volume_rehearsal,
+        "index_topk": model.config.index_topk,
     }
     write_json(root / "MANIFEST.json", data)
 
@@ -722,6 +767,7 @@ def main() -> None:
     capture = sub.add_parser("dump")
     capture.add_argument("name", choices=("R2", "F4", "F8"))
     capture.add_argument("--device", default="cpu")
+    capture.add_argument("--full-volume-rehearsal", action="store_true")
     client = sub.add_parser("vllm")
     client.add_argument("--base-url", required=True)
     client.add_argument("--model", required=True)
@@ -738,7 +784,10 @@ def main() -> None:
             args.name,
             args.root,
             args.device,
-            lengths=(128,) if args.name == "R2" else LENGTHS,
+            lengths=(128,)
+            if args.name == "R2" and not args.full_volume_rehearsal
+            else LENGTHS,
+            full_volume_rehearsal=args.full_volume_rehearsal,
         )
     elif args.command == "prompts":
         prompts(args.root)
