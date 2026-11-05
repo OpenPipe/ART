@@ -16,6 +16,9 @@ import tarfile
 import time
 from typing import Any, cast
 
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+os.environ["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "1"
+
 ROOT = Path(__file__).resolve().parents[3]
 WORKER = "tests/integration/megatron/glm5next_qualification.py"
 IMAGE = "ghcr.io/openpipe/caladan-stark-trainer@sha256:7bebcc01d83c60b1d019cef07637339690730649684d5a49a88f30ccdaa1f6ae"
@@ -265,7 +268,7 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
                 "R2" if tiny else "F4" if lane == "kda" else "F8",
                 "--device",
                 "cpu" if tiny else "cuda",
-                "--fixtures",
+                "--fixtures" if lane == "kda" else "--root",
                 str(Path(seal["fixtures"]) if tiny else work / "fixtures"),
                 "--output",
                 str(work / "results" / f"{lane}-cp8"),
@@ -294,18 +297,18 @@ def prepare_worker_fixtures(root: Path, work: Path, *, tiny: bool) -> None:
     import shutil
     import urllib.request
 
-    if not tiny:
-        # M2/M3 read one layer from the full snapshot; no second weight download.
-        config = json.loads((work / "model/config.json").read_text())
-        config = config.get("text_config", config)
-        for name, layers in (("F4", 4), ("F8", 8)):
-            target = work / "fixtures" / name
-            target.mkdir(parents=True, exist_ok=True)
-            value = {**config, "num_hidden_layers": layers}
-            for key in ("layer_types", "mlp_layer_types"):
-                if key in value:
-                    value[key] = value[key][:layers]
-            write(target / "config.json", value)
+    # M1's normalized configs preserve the released KDA/DSA geometry and HF names.
+    # Exercise these real configs in CPU rehearsal as well as in the Pod.
+    for name in ("F4", "F8"):
+        target = work / "fixtures" / name
+        target.mkdir(parents=True, exist_ok=True)
+        value = json.loads(
+            (root / "qualification-inputs" / (name + "-config.json")).read_text()
+        )
+        assert value["linear_num_heads"] == 64 and value["linear_head_dim"] == 128
+        assert "deepseek_sparse_attention" not in value["layer_types"]
+        write(target / "config.json", value)
+        if not tiny:
             for path in (work / "model").glob("*.safetensors*"):
                 (target / path.name).symlink_to(path)
     wheel = json.loads((root / "qualification-inputs/oracle-wheel.json").read_text())
