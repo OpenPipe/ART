@@ -223,6 +223,31 @@ def test_cluster_cleanup_only_deletes_owned_resources(tmp_path):
     assert all("namespace" not in args for args in client.calls)
 
 
+def test_literal_grant_and_atomic_single_controller(tmp_path):
+    from tests.integration.megatron.glm5next_qualification_launch import (
+        claim_controller,
+        has_grant,
+    )
+
+    approved = "f" * 64
+    seal = {"kind": "cluster", "controller_owner": "named-continuation"}
+    grant = f"GRANT glm-m4-model B200 seal_sha256={approved} — Jarvis: exact terms"
+    assert has_grant(seal, approved, grant)
+    for invalid in (
+        grant.replace("GRANT", "AMEND"),
+        "NEEDS-LEAD " + grant,
+        grant.replace("B200", "workstation"),
+        grant.replace(approved, "0" * 64),
+    ):
+        assert not has_grant(seal, approved, invalid)
+    with pytest.raises(ValueError, match="sealed controller owner"):
+        claim_controller(seal, approved, "other-continuation", tmp_path, tmp_path)
+    assert not list(tmp_path.iterdir())
+    claim_controller(seal, approved, "named-continuation", tmp_path, tmp_path)
+    with pytest.raises(FileExistsError):
+        claim_controller(seal, approved, "named-continuation", tmp_path, tmp_path)
+
+
 def test_kda_mvp_numeric_gradient_failure_does_not_block():
     from tests.integration.megatron.glm5next_kda_cp import gate_policy
 

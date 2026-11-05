@@ -139,6 +139,7 @@ class KimiDeltaAttention(nn.Module):
                 init_method=config.init_method,
                 bias=False,
                 skip_bias_add=False,
+                is_expert=False,
             )
             if name == "o_proj":
                 options.update(

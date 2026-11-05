@@ -83,10 +83,21 @@ def stage0(
         assert callable(getattr(TrainerRank, name))
     assert not torch.cuda.is_initialized()
     real_configs = None
+    te_architecture = None
     if inputs is not None:
+        from tests.integration.megatron.glm5next_constructors import (
+            check_native_construction,
+            check_te_sm100,
+        )
         from tests.integration.megatron.glm5next_real_config import check_real_configs
 
         real_configs = check_real_configs(inputs / "real-configs")
+        for name in ("full", "F4", "F8"):
+            real_configs[name]["native_construction"] = check_native_construction(
+                inputs / "real-configs" / name / "config.json"
+            )
+        if expected_cuda == "13.0" and os.environ.get("M4_FAKE_TOOLKIT") != "1":
+            te_architecture = check_te_sm100()
     write(
         output,
         {
@@ -95,6 +106,7 @@ def stage0(
             "torch": torch.__version__,
             "cuda_initialized": False,
             "real_configs": real_configs,
+            "te_architecture": te_architecture,
             "toolkit": toolkit,
             "toolkit_simulated": os.environ.get("M4_FAKE_TOOLKIT") == "1",
             "art_source": str(Path(__import__("art").__file__).resolve()),

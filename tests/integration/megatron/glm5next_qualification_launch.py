@@ -689,16 +689,27 @@ def idle(uuids: list[str]) -> None:
 
 
 def execute(
-    seal_path: Path, approved: str, output: Path, client: Any | None = None
+    seal_path: Path,
+    approved: str,
+    output: Path,
+    client: Any | None = None,
+    *,
+    controller_owner: str | None = None,
 ) -> None:
     seal = preflight(seal_path, approved)
     recording = isinstance(client, RecordingClient)
-    if not recording and not any(
-        "GRANT" in line and "glm-m4-model" in line and approved in line
-        for line in BOARD.read_text().splitlines()
-    ):
+    if not recording and not has_grant(seal, approved, BOARD.read_text()):
         raise ValueError("no BOARD grant for this exact seal")
     output.mkdir(parents=True, exist_ok=False)
+    claim = claim_controller(
+        seal,
+        approved,
+        controller_owner,
+        output / "controller-claims"
+        if recording
+        else seal_path.parent / "controller-claims",
+        output,
+    )
     # Exercise the actual sealed-source acquisition and bootstrap extraction on CPU too.
     source = output / "source"
     archive_path = output / "sealed-source.tar.gz"
@@ -730,6 +741,7 @@ def execute(
         "seal_sha256": approved,
         "kind": seal["kind"],
         "recording": recording,
+        "controller_claim": claim,
         "cleanup_done": False,
     }
     try:
@@ -798,11 +810,41 @@ def execute(
             board(f"RESULT-LINK glm-m4-model {output / 'receipt.json'} seal={approved}")
 
 
+def has_grant(seal: dict, approved: str, contents: str) -> bool:
+    window = "workstation" if seal["kind"] == "workstation" else "B200"
+    return any(
+        line.startswith(f"GRANT glm-m4-model {window} ")
+        and f"seal_sha256={approved}" in line.split()
+        for line in contents.splitlines()
+    )
+
+
+def claim_controller(
+    seal: dict, approved: str, owner: str | None, directory: Path, output: Path
+) -> dict:
+    """An atomic, durable one-shot claim prevents same-seal continuation races."""
+    if not owner or owner != seal["controller_owner"]:
+        raise ValueError("only the continuation's sealed controller owner may launch")
+    directory.mkdir(parents=True, exist_ok=True)
+    claim = {
+        "seal_sha256": approved,
+        "owner": owner,
+        "pid": os.getpid(),
+        "output": str(output),
+    }
+    path = directory / f"{approved}.json"
+    with path.open("x") as stream:
+        stream.write(json.dumps(claim, indent=2) + "\n")
+    path.chmod(0o444)
+    return claim
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--recording", action="store_true")
     parser.add_argument("--approved-seal")
+    parser.add_argument("--controller-owner")
     parser.add_argument("--seal", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pod-mode", choices=("stage0", "pipeline"))
@@ -838,6 +880,7 @@ def main() -> None:
             args.approved_seal,
             args.output,
             RecordingClient() if args.recording else None,
+            controller_owner=args.controller_owner,
         )
     else:
         parser.error("--execute and --approved-seal required")

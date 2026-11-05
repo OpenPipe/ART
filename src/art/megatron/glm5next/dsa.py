@@ -85,6 +85,7 @@ class Glm5NextSparseCore(Glm52SparseCore):
                 init_method=config.init_method,
                 bias=False,
                 skip_bias_add=False,
+                is_expert=False,
                 skip_weight_param_allocation=False,
                 parallel_mode="duplicated",
             )
