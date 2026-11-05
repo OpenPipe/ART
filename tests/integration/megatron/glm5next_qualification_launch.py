@@ -880,6 +880,37 @@ def execute(
             cwd=source,
             pss_limit=120 << 30,
         )
+        if seal.get("real_trainer_cpu"):
+            # Use the extracted, sealed source and real distributed model path
+            # before creating any resource. Recording and execution share this
+            # fence; the existing scientific stage order is unchanged.
+            receipt["trainer_cpu_validation"] = run(
+                [
+                    seal["native_python"],
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    "--nproc-per-node=8",
+                    "--module",
+                    "tests.integration.megatron.glm5next_trainer_cpu",
+                    "--inputs",
+                    str(source / "qualification-inputs"),
+                    "--output",
+                    str(work / "trainer-cpu"),
+                ],
+                900,
+                work / "trainer-cpu.log",
+                env=dict(
+                    os.environ,
+                    CUDA_VISIBLE_DEVICES="",
+                    PYTHONPATH=str(source / "src") + os.pathsep + str(source),
+                    OMP_NUM_THREADS="1",
+                    MKL_NUM_THREADS="1",
+                    OPENBLAS_NUM_THREADS="1",
+                ),
+                cwd=source,
+                pss_limit=120 << 30,
+            )
         if seal["kind"] == "workstation":
             if not recording:
                 idle(seal["uuids"])

@@ -138,6 +138,9 @@ def _prepare_vllm_lora_publish(
 ) -> _VllmLoraPublishPlan:
     from art.megatron.weights import lora_publish
 
+    prepare_config = getattr(handler, "prepare_adapter_config", None)
+    if prepare_config is not None:
+        adapter_config = prepare_config(adapter_config, model)
     for module in lora_publish.iter_lora_modules(model):
         adapter_config = module.lora_layout.record_config(adapter_config)
         break
