@@ -1849,10 +1849,14 @@ def _admission_outcome(self: TrainerRank, local: int) -> int:
         return local
     value = _impl.torch.tensor(
         local,
-        device=self.device if self.device.type == "cuda" else "cpu",
+        device=self._forward_collective_device(),
         dtype=_impl.torch.int32,
     )
-    _impl.dist.all_reduce(value, op=_impl.dist.ReduceOp.MIN)
+    _impl.dist.all_reduce(
+        value,
+        op=_impl.dist.ReduceOp.MIN,
+        group=getattr(self, "_forward_replica_group", None),
+    )
     return int(value.item())
 
 

@@ -1839,11 +1839,15 @@ def _memory_check_required(
     details: dict[str, Any] | None = {} if decision is not None else None
     local_required, scope = required, "local"
     if _impl.dist.is_available() and _impl.dist.is_initialized():
-        group = None if sync_across_dp else self._forward_memory_group()
+        group = (
+            getattr(self, "_forward_replica_group", None)
+            if sync_across_dp
+            else self._forward_memory_group()
+        )
         scope = "world" if group is None else "tp_cp"
         values = _impl.torch.tensor(
             [float(required), 0.0, 0.0],
-            device=self.device if self.device.type == "cuda" else "cpu",
+            device=self._forward_collective_device() if sync_across_dp else self.device,
             dtype=_impl.torch.float64,
         )
         _impl.dist.all_reduce(values[0], op=_impl.dist.ReduceOp.MAX, group=group)
