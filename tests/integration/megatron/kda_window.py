@@ -200,7 +200,10 @@ def execute(args: Any) -> dict[str, Any]:
             "sampling_interval_seconds": 0.25,
         },
         "steps": [],
+        "rank_results": [],
         "pass": False,
+        "blocking_pass": False,
+        "report_only_pass": True,
         "cleanup_done": False,
     }
     env = dict(os.environ)
@@ -270,8 +273,12 @@ def execute(args: Any) -> dict[str, Any]:
                     str(output / f"cp{world}.json"),
                 ]
                 remaining = (
-                    seal["window_seconds"] - 120 - int(time.monotonic() - started)
+                    seal["window_seconds"]
+                    - seal["cleanup_reserve_seconds"]
+                    - int(time.monotonic() - started)
                 )
+                if remaining <= 0:
+                    raise TimeoutError("KDA window has no remaining compute time")
                 run_step(
                     argv,
                     env=env,
@@ -285,10 +292,24 @@ def execute(args: Any) -> dict[str, Any]:
                     result = json.loads(
                         (output / f"cp{world}-rank{rank}.json").read_text()
                     )
-                    if not result["pass"]:
-                        raise RuntimeError(f"CP{world} rank {rank} failed")
+                    receipt["rank_results"].append(
+                        {
+                            "world_size": world,
+                            "rank": rank,
+                            **{
+                                key: result[key]
+                                for key in ("pass", "blocking_pass", "report_only_pass")
+                            },
+                        }
+                    )
+                    receipt["report_only_pass"] &= result["report_only_pass"]
+                    if not result["blocking_pass"]:
+                        raise RuntimeError(
+                            f"CP{world} rank {rank} failed blocking correctness"
+                        )
             verify(seal)
-            receipt["pass"] = True
+            receipt["blocking_pass"] = True
+            receipt["pass"] = receipt["report_only_pass"]
         except BaseException as exc:
             receipt["error"] = f"{type(exc).__name__}: {exc}"
             raise
@@ -329,6 +350,8 @@ def main() -> None:
                     "seal_sha256",
                     "rehearsal",
                     "pass",
+                    "blocking_pass",
+                    "report_only_pass",
                     "cleanup_done",
                     "elapsed_seconds",
                 )

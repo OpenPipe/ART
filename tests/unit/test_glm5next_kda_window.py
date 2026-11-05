@@ -1,13 +1,92 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from tests.integration.megatron import kda_window as window
+
+
+@pytest.mark.parametrize("blocking_world", [None, 1, 2])
+def test_controller_continues_report_only_failures_and_stops_correctness(
+    tmp_path, blocking_world
+):
+    # A real subprocess substitutes only the numerical workload. Exercise the
+    # controller, receipt reads, exit handling, PSS guard and cleanup together.
+    worker = tmp_path / "fixture-python"
+    worker.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, pathlib, sys\n"
+        "assert os.environ['CUDA_VISIBLE_DEVICES'] == ''\n"
+        "argv = sys.argv[1:]\n"
+        "world = next((int(a.split('=')[1]) for a in argv "
+        "if a.startswith('--nproc-per-node=')), 1)\n"
+        "output = pathlib.Path(argv[argv.index('--output') + 1])\n"
+        "schema = '--schema-only' in argv\n"
+        f"blocking = schema or world != {blocking_world!r}\n"
+        "result = dict(pass_=False, blocking_pass=blocking, report_only_pass=False)\n"
+        "result['pass'] = result.pop('pass_')\n"
+        "for rank in range(world):\n"
+        "    path = output.with_name(output.stem + f'-rank{rank}.json')\n"
+        "    path.write_text(json.dumps(result))\n"
+    )
+    worker.chmod(0o755)
+    seal = tmp_path / "seal.json"
+    seal.write_text(
+        json.dumps(
+            {
+                "holds": [],
+                "launch_ready": True,
+                "files": [
+                    {
+                        "path": str(worker),
+                        "size": worker.stat().st_size,
+                        "sha256": window.digest(worker),
+                    }
+                ],
+                "gpu_uuids": [],
+                "max_tree_pss_bytes": 120 * (1 << 30),
+                "environment": {},
+                "python": str(worker),
+                "worker": "fixture-worker",
+                "tokens": 128,
+                "window_seconds": 60,
+                "cleanup_reserve_seconds": 5,
+                "steps": [
+                    {"world_size": world, "timeout_seconds": 10} for world in (1, 2, 8)
+                ],
+            }
+        )
+    )
+    args = SimpleNamespace(
+        seal=seal,
+        approved_seal=window.digest(seal),
+        output=tmp_path / "run",
+        rehearsal=True,
+    )
+    expectation = (
+        nullcontext()
+        if blocking_world is None
+        else pytest.raises(RuntimeError, match="failed blocking correctness")
+    )
+    with expectation:
+        window.execute(args)
+    receipt = json.loads((args.output / "receipt.json").read_text())
+    assert receipt["cleanup_done"]
+    assert receipt["blocking_pass"] is (blocking_world is None)
+    assert not receipt["pass"] and not receipt["report_only_pass"]
+    expected_worlds = (
+        {1, 2, 8} if blocking_world is None else set(range(1, blocking_world + 1))
+    )
+    assert {value["world_size"] for value in receipt["rank_results"]} == expected_worlds
+    if blocking_world is None:
+        assert len(receipt["rank_results"]) == 11
+    assert receipt["peak_tree_pss_bytes"] > 0
 
 
 def test_tree_pss_counts_descendants_and_retains_reparented_workers(

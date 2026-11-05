@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import inspect
+import json
+import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -51,6 +54,99 @@ def adapt(module):
     module.requires_grad_(False)
     for name in module.lora_targets:
         setattr(module, name, Adapter(getattr(module, name)))
+
+
+@pytest.mark.parametrize("failed", ["packed_pass", "gradients_pass"])
+def test_cp1_numeric_failure_is_report_only(failed):
+    record = dict(
+        forward_pass=True,
+        causality_pass=True,
+        leakage_pass=True,
+        packed_pass=True,
+        gradients_pass=True,
+        packing={"hard_leakage_failure": False},
+    )
+    record[failed] = False
+    parity.apply_gate_policy(record, 1)
+    assert record["blocking_pass"]
+    assert not record["pass"] and not record["report_only_pass"]
+
+
+@pytest.mark.parametrize("failed", ["forward_pass", "causality_pass", "leakage_pass"])
+def test_cp1_correctness_failure_blocks(failed):
+    record = dict(
+        forward_pass=True,
+        causality_pass=True,
+        leakage_pass=True,
+        packed_pass=True,
+        gradients_pass=True,
+        packing={"hard_leakage_failure": False},
+    )
+    record[failed] = False
+    parity.apply_gate_policy(record, 1)
+    assert not record["blocking_pass"] and not record["pass"]
+
+
+@pytest.mark.parametrize("world", [2, 8])
+@pytest.mark.parametrize(
+    "case", ["output", "tree_output", "gradients", "tree_gradients"]
+)
+def test_cp_output_blocks_but_gradient_failure_is_reported(world, case):
+    record: dict[str, Any] = {
+        "output": {"rel_l2": 1e-3},
+        "tree_output": {"rel_l2": 1e-3},
+        "gradients": {"q_proj.A": {"rel_l2": 1e-3}},
+        "tree_gradients": {"q_proj.A": {"rel_l2": 1e-3}},
+    }
+    parity.apply_gate_policy(record, world)
+    assert record["pass"] and record["blocking_pass"]
+    if case.endswith("gradients"):
+        record[case]["q_proj.A"]["rel_l2"] = 0.005
+        parity.apply_gate_policy(record, world)
+        assert record["blocking_pass"] and not record["report_only_pass"]
+        assert not record["pass"] and not record["probable_gradient_bugs"]
+        record[case]["q_proj.A"]["rel_l2"] = 0.01001
+        parity.apply_gate_policy(record, world)
+        assert record["blocking_pass"] and not record["pass"]
+        assert record["probable_gradient_bugs"] == [
+            {"case": case, "tensor": "q_proj.A", "rel_l2": 0.01001}
+        ]
+    else:
+        record[case]["rel_l2"] = 0.001001
+        parity.apply_gate_policy(record, world)
+        assert not record["blocking_pass"] and not record["pass"]
+
+
+@pytest.mark.parametrize("blocking", [True, False])
+def test_worker_exit_uses_correctness_and_preserves_numeric_fail(
+    tmp_path, monkeypatch, blocking
+):
+    output = tmp_path / "worker.json"
+    monkeypatch.setattr(
+        sys, "argv", ["kda_parity.py", "--device", "cpu", "--output", str(output)]
+    )
+    monkeypatch.setattr(
+        parity,
+        "run",
+        lambda args: {
+            "pass": False,
+            "blocking_pass": blocking,
+            "report_only_pass": False,
+        },
+    )
+    if blocking:
+        parity.main()
+    else:
+        with pytest.raises(SystemExit, match="blocking correctness"):
+            parity.main()
+    receipt = json.loads((tmp_path / "worker-rank0.json").read_text())
+    assert not receipt["pass"] and receipt["blocking_pass"] is blocking
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_nonfinite_comparisons_raise_even_for_report_only_gradients(value):
+    with pytest.raises(AssertionError, match="Nonfinite"):
+        parity.metrics(torch.tensor([value]), torch.ones(1))
 
 
 def test_cross_shape_variants_preserve_target_and_exclude_neighbors_from_loss():
