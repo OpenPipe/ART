@@ -120,6 +120,10 @@ class ModelSupportHandler(Protocol):
 
     def identity_lora_model_config(self, base_config: Any) -> Any: ...
 
+    def prepare_adapter_config(
+        self, adapter_config: dict[str, Any], model_chunks: Sequence[Any]
+    ) -> dict[str, Any]: ...
+
     def identity_lora_model_context(self) -> AbstractContextManager[None]: ...
 
     def identity_lora_target_parameters(

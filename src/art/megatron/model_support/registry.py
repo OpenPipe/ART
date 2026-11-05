@@ -281,7 +281,7 @@ GLM5NEXT_SPEC = ModelSupportSpec(
         "lm_head",
     ),
     native_vllm_lora_status=_WIP_NATIVE_VLLM_LORA_STATUS,
-    dependency_floor=DependencyFloor(transformers="5.17.0", vllm="0.32.0"),
+    dependency_floor=DependencyFloor(transformers="5.12.1", vllm="0.32.0"),
 )
 
 GPT_OSS_MOE_SPEC = ModelSupportSpec(

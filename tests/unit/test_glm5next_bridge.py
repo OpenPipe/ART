@@ -143,3 +143,110 @@ def test_handler_export_identity_is_serving_model() -> None:
         "grouped_moe_mlp",
         "shared_experts_mlp",
     }
+
+
+def test_handler_wraps_kda_and_head_and_roundtrips_serving_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from torch import nn
+
+    from art.megatron import lora as lm
+    from art.megatron.glm5next.kda import KimiDeltaAttention
+    from art.megatron.model_support.handlers.glm5next import GLM5NEXT_HANDLER
+
+    for name in (
+        "get_expert_model_parallel_rank",
+        "get_expert_data_parallel_rank",
+        "get_data_parallel_rank",
+    ):
+        monkeypatch.setattr(lm.ps, name, lambda **_: 0)
+    monkeypatch.setattr(lm.ps, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        lm.ps, "get_expert_tensor_and_model_parallel_group", lambda **_: None
+    )
+    cfg = production_config()
+    cfg.num_hidden_layers = 1
+    cfg.hidden_size, cfg.vocab_size = 8, 16
+    cfg.layer_types, cfg.mlp_layer_types, cfg.indexer_types = (
+        ["linear_attention"],
+        ["dense"],
+        ["full"],
+    )
+    cfg.linear_attn_config = {
+        "num_heads": 1,
+        "head_dim": 8,
+        "short_conv_kernel_size": 4,
+        "gate_lower_bound": -5.0,
+    }
+    from art.megatron.glm5next.config import configure_glm5next_provider
+
+    provider = SimpleNamespace(
+        params_dtype=torch.float32,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+    )
+    configure_glm5next_provider(provider, cfg)
+    chunk = nn.Module()
+    chunk.decoder = nn.Module()
+    layer = nn.Module()
+    setattr(layer, "layer_number", 1)
+    layer.self_attention = KimiDeltaAttention(provider, backend="reference")
+    layer.mlp = nn.Identity()
+    chunk.decoder.layers = nn.ModuleList([layer])
+    chunk.output_layer = nn.Linear(8, 16, bias=False)
+    q_weight = layer.self_attention.q_proj.weight
+    targets = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "q_a_proj",
+        "kv_a_proj_with_mqa",
+        "lm_head",
+    ]
+    GLM5NEXT_HANDLER.apply_lora_adapters(
+        [chunk], provider, target_modules=targets, rank=32, alpha=32
+    )
+    assert layer.self_attention.q_proj.weight is q_weight
+    assert not q_weight.requires_grad
+    assert not layer.self_attention.b_proj.weight.requires_grad
+    optimizer = torch.optim.AdamW(
+        [p for p in chunk.parameters() if p.requires_grad], lr=0.001
+    )
+    torch.manual_seed(19)
+    inputs = torch.randn(8, 1, 8)
+    losses = []
+    for _ in range(3):
+        optimizer.zero_grad()
+        logits = chunk.output_layer(layer.self_attention(inputs)[0]).flatten(0, 1)
+        loss = torch.nn.functional.cross_entropy(logits, torch.arange(8))
+        loss.backward()
+        assert torch.isfinite(loss)
+        assert all(
+            p.grad is None or torch.isfinite(p.grad).all() for p in chunk.parameters()
+        )
+        losses.append(loss.item())
+        optimizer.step()
+    assert losses[-1] < losses[0]
+    native = {}
+    for module in chunk.modules():
+        if isinstance(module, lm.LoRA):
+            native.update(module.sharded_lora_state_dict())
+    assert len(native) == 10
+    wrapped = nn.Module()
+    wrapped.module = chunk
+    config = GLM5NEXT_HANDLER.prepare_adapter_config(
+        {"r": 32, "lora_alpha": 32}, [wrapped]
+    )
+    serving, serving_config = GLM5NEXT_HANDLER.to_vllm_lora_tensors(
+        native, adapter_config=config
+    )
+    assert serving_config["base_model_name_or_path"] == SERVING_MODEL
+    restored = GLM5NEXT_HANDLER.from_vllm_lora_tensors(
+        serving, adapter_config=serving_config
+    )
+    assert restored.keys() == native.keys()
+    for key in native:
+        torch.testing.assert_close(restored[key], native[key], rtol=0, atol=0)
+    with pytest.raises(ValueError, match="changed r"):
+        GLM5NEXT_HANDLER.prepare_adapter_config({"r": 8}, [chunk])

@@ -88,7 +88,7 @@ class Adapter(nn.Module):
             torch.randn(base.out_features, rank, device=base.weight.device) * 0.01
         )
 
-    def forward(self, x: Tensor) -> Tensor:  # ty: ignore[invalid-mutable-override]
+    def forward(self, x: Tensor) -> Tensor:  # ty: ignore[invalid-method-override]
         return self.base(x) + ((x.float() @ self.A.T) @ self.B.T).to(x.dtype)
 
 
@@ -258,6 +258,7 @@ def run(args: Any) -> dict:
     torch.manual_seed(20261105)
     root = args.fixtures / args.fixture
     cfg = Glm5NextTextConfig.from_pretrained(root)
+    assert cfg.layer_types is not None
     layers = [
         i for i, kind in enumerate(cfg.layer_types) if kind == "linear_attention"
     ][:3]
@@ -359,6 +360,7 @@ def schema_only(args: Any) -> dict:
 
     root = args.fixtures / args.fixture
     cfg = Glm5NextTextConfig.from_pretrained(root)
+    assert cfg.layer_types is not None
     records = {}
     for index, kind in enumerate(cfg.layer_types):
         if kind != "linear_attention":

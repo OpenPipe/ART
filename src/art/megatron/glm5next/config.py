@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 SERVING_MODEL = "zai-org/GLM-5.3-Flash"
+SERVING_REVISION = "46a050bec13002ad29ee795c16e61cf4fa3c4a9c"
 TRAINING_MODEL = "zai-org/GLM-5.3-Flash-BF16"
 TRAINING_REVISION = "f9fed3bbc82291073373d67452e9f25317ef7577"
 

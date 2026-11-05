@@ -7,6 +7,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from art.megatron.dsv4.hyper_connection import DeepSeekV4HyperConnectionUtil
 from art.megatron.dsv4.layer import Dsv4TransformerLayer
 
 
@@ -46,7 +47,16 @@ class Glm5NextRouter(TopKRouter):
 
     def gating(self, input: Tensor) -> Tensor:
         bias = None if self.bias is None else self.bias.float()
-        return F.linear(input.float(), self.weight.float(), bias)
+        with torch.autocast(device_type=input.device.type, enabled=False):
+            return F.linear(input.float(), self.weight.float(), bias)
+
+
+class _Glm5NextHyperConnectionUtil(DeepSeekV4HyperConnectionUtil):
+    def hc_pre_raw(
+        self, x: Tensor, hc_fn: Tensor, hc_scale: Tensor, hc_base: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            return super().hc_pre_raw(x, hc_fn, hc_scale, hc_base)
 
 
 class Glm5NextTransformerLayer(Dsv4TransformerLayer):
@@ -55,3 +65,7 @@ class Glm5NextTransformerLayer(Dsv4TransformerLayer):
     DSV4's layer owns the same six FP32 parameters and pre/post equations.
     Its learned final head and hash router are deliberately absent here.
     """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.hc_util = _Glm5NextHyperConnectionUtil(self.config)

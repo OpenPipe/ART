@@ -2612,12 +2612,13 @@ def apply_lora_adapters(
     spec = provider._art_model_support_spec
     target_modules = _configured_lora_target_modules(provider, spec)
     rank = _configured_lora_rank(provider, handler)
-    layout = lora_layout or LoraLayout()
-    if layout != LoraLayout() and not handler.key.startswith("qwen3_5_"):
-        raise ValueError(f"LoRA layout {layout} is unsupported by {handler.key}")
-    layout_kwargs = (
-        {"lora_layout": layout} if handler.key.startswith("qwen3_5_") else {}
+    supports_layout = handler.key.startswith("qwen3_5_") or handler.key == "glm5next"
+    layout = lora_layout or (
+        LoraLayout(expert="shared_outer") if handler.key == "glm5next" else LoraLayout()
     )
+    if layout != LoraLayout() and not supports_layout:
+        raise ValueError(f"LoRA layout {layout} is unsupported by {handler.key}")
+    layout_kwargs = {"lora_layout": layout} if supports_layout else {}
     handler.apply_lora_adapters(
         model,
         provider,

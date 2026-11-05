@@ -17,6 +17,14 @@ class Glm5NextTextOracle:
 class Glm5NextTextConfig(PretrainedConfig):
     model_type = "glm5_next_text"
 
+    def __init__(self, **kwargs: Any) -> None:
+        # Bridge validates architecture suffixes before dispatch. M1's oracle
+        # saves a custom class name, but uses the same text tensor namespace.
+        # Normalize only the in-memory config; the fixture stays untouched.
+        if kwargs.get("architectures") == ["Glm5NextTextOracle"]:
+            kwargs["architectures"] = ["Glm5NextForConditionalGeneration"]
+        super().__init__(**kwargs)
+
 
 class Glm5NextConfig(PretrainedConfig):
     """Config-only fallback for ART's Transformers 5.12 runtime.

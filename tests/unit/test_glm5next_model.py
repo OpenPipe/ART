@@ -181,6 +181,10 @@ def test_router_gemm_uses_float32_operands() -> None:
         router.gating(x), torch.nn.functional.linear(x.float(), router.weight)
     )
     assert router.gating(x).dtype == torch.float32
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = router.gating(x)
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, router.gating(x))
 
 
 class _CpuModel(nn.Module):

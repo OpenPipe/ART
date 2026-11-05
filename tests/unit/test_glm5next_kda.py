@@ -42,7 +42,7 @@ class Adapter(nn.Module):
         self.A = nn.Parameter(torch.randn(2, base.in_features) * 0.1)
         self.B = nn.Parameter(torch.randn(base.out_features, 2) * 0.1)
 
-    def forward(self, x):  # ty: ignore[invalid-mutable-override]
+    def forward(self, x):  # ty: ignore[invalid-method-override]
         return self.base(x) + (x @ self.A.T) @ self.B.T
 
 

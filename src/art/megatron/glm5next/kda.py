@@ -39,7 +39,7 @@ class _HeadNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(width, **kwargs))
         self.variance_epsilon = eps
 
-    def forward(self, value: Tensor, gate: Tensor) -> Tensor:  # ty: ignore[invalid-mutable-override]
+    def forward(self, value: Tensor, gate: Tensor) -> Tensor:  # ty: ignore[invalid-method-override]
         dtype = torch.float64 if value.dtype == torch.float64 else torch.float32
         work = value.to(dtype)
         work = work * torch.rsqrt(
@@ -251,7 +251,7 @@ class KimiDeltaAttention(nn.Module):
             if callback is not None:
                 callback()
 
-    def forward(  # ty: ignore[invalid-mutable-override]
+    def forward(  # ty: ignore[invalid-method-override]
         self,
         hidden_states: Tensor,
         attention_mask: Tensor | None = None,

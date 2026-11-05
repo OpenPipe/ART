@@ -772,6 +772,9 @@ def stage_vllm_lora_snapshot_from_model(
     stager: PinnedCpuSnapshotStager,
     slot_ref: LoRASlotRef | None = None,
 ) -> PendingCpuSnapshot[LoraSnapshot] | None:
+    prepare_config = getattr(handler, "prepare_adapter_config", None)
+    if prepare_config is not None:
+        adapter_config = prepare_config(adapter_config, model)
     for module in iter_lora_modules(model):
         adapter_config = module.lora_layout.record_config(adapter_config)
         break
