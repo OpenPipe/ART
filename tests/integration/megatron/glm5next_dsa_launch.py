@@ -314,6 +314,9 @@ def execute(seal_path: Path, approved: str, output: Path, recording: bool) -> No
                     case["passed"] for case in worker["cases"]
                 ):
                     raise RuntimeError("Worker parity receipt failed.")
+        for name, expected in seal["scripts"].items():
+            if sha256(repo / name) != expected:
+                raise ValueError(f"Sealed source changed during execution: {name}")
         receipt["passed"] = True
     finally:
         if recording:

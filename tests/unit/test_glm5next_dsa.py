@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -17,6 +18,7 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from art.megatron.glm5next.dsa import (
     Glm5NextSelfAttention,
     Glm5NextSparseCore,
+    apply_glm5next_dsa_lora,
     glm5next_core_builder,
 )
 from art.megatron.glm5next.dsa_cp import (
@@ -25,6 +27,55 @@ from art.megatron.glm5next.dsa_cp import (
     tree_pooled_indexer_topk,
 )
 from art.megatron.glm5next.kpool_indexer import KPoolIndexer
+
+
+@pytest.mark.parametrize(
+    "requested,expected",
+    [
+        (set(), {"q_a_proj", "kv_a_proj_with_mqa", "o_proj"}),
+        ({"q_b_proj"}, set()),
+        ({"q_a_proj", "q_b_proj", "indexer"}, {"q_a_proj"}),
+        ({"o_proj"}, {"o_proj"}),
+    ],
+)
+def test_lora_hook_cannot_enable_excluded_targets(
+    monkeypatch: pytest.MonkeyPatch, requested: set[str], expected: set[str]
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def install(attention: Any, **kwargs: Any) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "art.megatron.glm52.lora",
+        cast(Any, SimpleNamespace(apply_glm52_attention_lora=install)),
+    )
+    apply_glm5next_dsa_lora(
+        SimpleNamespace(),
+        adapter_model_prefix="layer",
+        provider=None,
+        target_modules=requested,
+        rank=8,
+        alpha=8,
+    )
+    assert [call["target_modules"] for call in calls] == (
+        [expected] if expected else []
+    )
+
+
+def test_lora_hook_rejects_rank_above_tinker_limit() -> None:
+    with pytest.raises(ValueError, match="rank"):
+        apply_glm5next_dsa_lora(
+            SimpleNamespace(),
+            adapter_model_prefix="layer",
+            provider=None,
+            target_modules=set(),
+            rank=33,
+            alpha=33,
+        )
+
+
 from art.megatron.glm52 import attention as glm52_attention
 
 

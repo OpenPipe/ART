@@ -28,15 +28,22 @@ def apply_glm5next_dsa_lora(
     alpha: int,
 ) -> None:
     """M5 adapter hook: preserve GLM-5.2 slots/export, restrict Flash targets."""
-    from art.megatron.glm52.lora import apply_glm52_attention_lora
-
     if not 1 <= rank <= 32:
         raise ValueError("Flash's Tinker adapter contract requires rank in [1,32].")
+    # ART interprets an empty target set as all targets. Never pass an empty
+    # intersection to GLM-5.2, where that would also install q_b LoRA.
+    targets = set(
+        DSA_LORA_TARGETS if not target_modules else DSA_LORA_TARGETS & target_modules
+    )
+    if not targets:
+        return
+    from art.megatron.glm52.lora import apply_glm52_attention_lora
+
     apply_glm52_attention_lora(
         attention,
         adapter_model_prefix=adapter_model_prefix,
         provider=provider,
-        target_modules=set(DSA_LORA_TARGETS & target_modules),
+        target_modules=targets,
         rank=rank,
         alpha=alpha,
     )
