@@ -860,6 +860,22 @@ def execute(
             for step in steps(seal, source, work, tiny=False)
             if step.get("trainer_plan") is not None
         ]
+        if seal["kind"] == "cluster":
+            pod_plan = json.loads(
+                (source / "qualification-inputs/pod-plan.json").read_text()
+            )
+            # The real Pod reads its embedded plan; recording must bind that
+            # schedule too, including setup and operator stages.
+            schedules = [
+                [
+                    (step["name"], step.get("trainer_plan"))
+                    for step in steps(plan, source, work, tiny=False)
+                ]
+                for plan in (seal, pod_plan)
+            ]
+            if schedules[0] != schedules[1]:
+                raise ValueError("sealed Pod schedule differs from execute steps")
+            receipt["pod_stage_order"] = [name for name, _ in schedules[0]]
         if expected_plans != json.loads(
             (source / "qualification-inputs/stage-plans.json").read_text()
         ):
