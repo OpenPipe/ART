@@ -3324,6 +3324,9 @@ class TrainerRank:
                     grad.div_(ps.get_context_parallel_world_size())
             else:
                 group = ps.get_expert_data_parallel_group()
+            replica = getattr(self, "_forward_replica_group", None)
+            if replica is not None:
+                group = replica
             if group is not None and group.size() > 1:
                 add(group, dist.ReduceOp.SUM, grad)
 
@@ -3341,11 +3344,12 @@ class TrainerRank:
         return getattr(self, "_forward_replica_group", None)
 
     def set_forward_replica_group(self, group: dist.ProcessGroup | None) -> None:
-        """Scope forward admission and input distribution to a pure-DP replica.
+        """Scope admission, input distribution and gradient sums to a DP replica.
 
         Configure only while this trainer is idle, on every replica member.
-        All TP/CP/EP sizes must be one; model and optimizer process groups are
-        unchanged. None restores WORLD admission and Megatron DP assignment.
+        All TP/CP/EP sizes must be one. Global optimizer norm collectives still
+        require every model rank; this is not an independent optimizer instance.
+        None restores WORLD admission and Megatron DP assignment.
         A Gloo group uses CPU admission votes even for a CUDA model.
         """
         if group is not None:

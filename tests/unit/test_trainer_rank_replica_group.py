@@ -1,8 +1,10 @@
 """Forward admission of one replica cannot communicate with idle replicas."""
 
 from datetime import timedelta
+import sys
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -40,6 +42,28 @@ def _worker(rank, rendezvous):
             check = trainer._memory_check_required(128, sync_across_dp=True)
             assert check.estimated_required_bytes == 128
         dist.barrier()
+        # Elastic transfer replicates each coordinate onto every node. Adam
+        # must sum within the node, without counting those copies again.
+        ps = SimpleNamespace(get_data_parallel_group=lambda **_: dist.group.WORLD)
+
+        def reduce(grads, *, group, op):
+            for grad in grads:
+                dist.all_reduce(grad, group=group, op=op)
+
+        finalize = SimpleNamespace(
+            coalesced_all_reduce=reduce, tensor_parallel_grad_sync=lambda *a, **k: None
+        )
+        with patch.dict(
+            sys.modules,
+            {
+                "megatron.core": SimpleNamespace(parallel_state=ps),
+                "art.megatron.training.finalize_grads": finalize,
+            },
+        ):
+            parameter = torch.nn.Parameter(torch.ones(1))
+            parameter.grad = torch.full((1,), float(rank % 2 + 1))
+            (grad,) = trainer._reduce_dynamic_grads([parameter], scale_grads=1.0)
+            torch.testing.assert_close(grad, torch.tensor([3.0]))
     finally:
         dist.destroy_process_group()
 
