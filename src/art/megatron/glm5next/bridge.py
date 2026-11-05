@@ -135,6 +135,9 @@ def glm5next_mapping_registry() -> MegatronMappingRegistry:
 
 
 class ArtGlm5NextBridge(MegatronModelBridge[Any, GPTModelProvider, GPTModel]):
+    # Two F8 DP replicas must not pin two complete 73-GiB checkpoints at once.
+    art_stream_import = True
+
     def hf_config_to_provider_kwargs(self, hf_config: Any) -> dict[str, Any]:
         cfg = text_config(hf_config)
         values = super().hf_config_to_provider_kwargs(cfg)
@@ -152,6 +155,28 @@ class ArtGlm5NextBridge(MegatronModelBridge[Any, GPTModelProvider, GPTModel]):
 
     def mapping_registry(self) -> MegatronMappingRegistry:
         return glm5next_mapping_registry()
+
+    def build_conversion_tasks(self, hf_pretrained: Any, megatron_model: Any) -> Any:
+        from art.megatron.glm5next.source import Glm5NextTaskSource
+
+        state = getattr(hf_pretrained, "state", None)
+        source = getattr(state, "source", None)
+        if state is None or source is None:
+            return super().build_conversion_tasks(hf_pretrained, megatron_model)
+        # Bridge checks key existence before calling our materializer. F8's HF
+        # layout has nested mHC/forget-gate names and fused conv/expert tensors.
+        # Advertise only aliases backed by real keys, during planning only.
+        cfg = text_config(hf_pretrained.config)
+        state.source = Glm5NextTaskSource(source, int(cfg.n_routed_experts))
+        try:
+            return super().build_conversion_tasks(hf_pretrained, megatron_model)
+        finally:
+            state.source = source
+
+    def _art_hf_weight_source(self, key: str, *, task: Any = None) -> Any:
+        from art.megatron.glm5next.source import hf_weight_source
+
+        return hf_weight_source(key)
 
     def load_weights_hf_to_megatron(
         self,

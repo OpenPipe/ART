@@ -86,7 +86,8 @@ def validate_plan(spec: dict, tokens: list[int], *, backward: bool) -> dict:
             target_tokens=torch.tensor(tokens[1:]),
             top_k=2,
             no_grad=not backward,
-            logits=spec["task"] == "parity" and len(tokens) <= 128,
+            logits=spec["task"] in ("parity", "parity-diagnostics")
+            and len(tokens) <= 128,
         )
         # The worker sends one request per DP rank; retain that exact multiplicity
         # so the old CP1/EP8 plan reaches the actual DP8 refusal.

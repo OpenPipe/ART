@@ -97,6 +97,10 @@ class Glm5NextSparseCore(Glm52SparseCore):
             head_dim=config.dsa_indexer_head_dim,
             topk=config.dsa_indexer_topk,
             pool_size=pool_size,
+            # Real GLM uses D=128. R2's synthetic D=8 has no serving FP8 policy.
+            selection_policy=(
+                "vllm_fp8" if config.dsa_indexer_head_dim == 128 else "hf"
+            ),
             linear_factory=linear,
             norm_factory=lambda n: build_module(
                 norm_builder, config=norm_config, hidden_size=n, eps=1e-6

@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 
+@torch.compiler.disable
 def cpu(value: torch.Tensor) -> torch.Tensor:
     return value.detach().to(device="cpu", copy=True).contiguous()
 
@@ -28,6 +29,7 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
     handles = []
 
     def hook(key: str):
+        @torch.compiler.disable
         def capture(_module: Any, _args: Any, result: Any) -> None:
             value = result[0] if isinstance(result, tuple) else result
             values[prefix + key] = cpu(value.transpose(0, 1))
@@ -39,10 +41,14 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
 
     util = layer.hc_util
     original_pre, original_post = util.layer_pre, util.layer_post
+    # Resolve identity before entering Dynamo. Never close over the layer (which
+    # is an OptimizedModule on the production path) from a patched function.
+    attn_fn_id = id(layer.hc_attn_fn)
     site = ["attn_hc"]
 
+    @torch.compiler.disable
     def pre(hidden: Any, fn: Any, scale: Any, base: Any) -> Any:
-        site[0] = "attn_hc" if fn is layer.hc_attn_fn else "ffn_hc"
+        site[0] = "attn_hc" if id(fn) == attn_fn_id else "ffn_hc"
         result = original_pre(hidden, fn, scale, base)
         for field, value in zip(("collapsed", "post", "comb"), result, strict=True):
             values[f"{prefix}.{site[0]}.{field}"] = cpu(
@@ -50,6 +56,7 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
             )
         return result
 
+    @torch.compiler.disable
     def post(*args: Any, **kwargs: Any) -> Any:
         result = original_post(*args, **kwargs)
         values[f"{prefix}.{site[0]}.streams"] = cpu(result.transpose(0, 1))
@@ -63,12 +70,14 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
     )
     router = getattr(layer.mlp, "router", None)
     if router is not None:
+        topk = router.topk
 
-        def routing(module: Any, _args: Any, result: Any) -> None:
+        @torch.compiler.disable
+        def routing(_module: Any, _args: Any, result: Any) -> None:
             probabilities, routing_map = result
             # MCore returns a dense routing map. Read selected IDs from that map,
             # including zero-weight selections; compare sets, not top-k ordering.
-            ids = routing_map.int().topk(module.topk, dim=-1).indices
+            ids = routing_map.int().topk(topk, dim=-1).indices
             values[prefix + ".router.indices"] = cpu(ids.to(torch.int32))
             values[prefix + ".router.weights"] = cpu(probabilities.gather(-1, ids))
 
@@ -77,6 +86,7 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
     indexer = getattr(core, "indexer", None)
     if indexer is not None:
 
+        @torch.compiler.disable
         def selection(_module: Any, _args: Any, result: Any) -> None:
             # This window is CP1; native's invalid sentinel is padded S, HF's -1.
             values[prefix + ".indexer.indices"] = cpu(
@@ -188,6 +198,70 @@ def sublayer_metrics(actual: dict, reference: dict, positions: int) -> dict:
             # All full captures use HF's B,S,... orientation.
             report[key] = {"positions": positions, **tensor_metrics(value, expected)}
     return report
+
+
+def margin_top1_gate(actual: dict, reference: dict) -> dict:
+    """Preregistered strict >2 BF16 ULP gate, using raw logit magnitudes."""
+    native_ids = actual["top1"].reshape(-1)
+    count = native_ids.numel()
+    if count == 0:
+        raise ValueError("No top-1 positions")
+    reference_ids = (
+        reference["top1"].reshape(-1)
+        if "top1" in reference
+        else reference["top64.indices"].reshape(-1, 64)[:count, 0]
+    )
+    if reference_ids.numel() != count:
+        raise ValueError("Top-1 position count differs")
+    margins, thresholds, raw = {}, {}, {}
+    for label, tensors in (("native", actual), ("hf", reference)):
+        if "top2.logits" in tensors:
+            logits = tensors["top2.logits"].reshape(-1, 2)
+        elif "top64.values" in tensors:
+            logits = tensors["top64.values"].reshape(-1, 64)[:count, :2]
+        elif "logits" in tensors:
+            logits = tensors["logits"].reshape(count, -1).topk(2).values
+        else:
+            raise ValueError(
+                f"Missing {label} raw top-2 logits (logprobs are insufficient)"
+            )
+        logits = logits.double()
+        if logits.shape != (count, 2) or not bool(torch.isfinite(logits).all()):
+            raise ValueError(f"Invalid {label} raw top-2 logits")
+        margin = logits[:, 0] - logits[:, 1]
+        if bool((margin < 0).any()):
+            raise ValueError(f"Unsorted {label} top-2 logits")
+        # frexp is exact at powers of two and handles BF16 subnormals/zero.
+        _, exponent = torch.frexp(logits.abs())
+        ulps = torch.exp2((exponent.double() - 8).clamp(min=-133))
+        ulps = torch.where(logits == 0, 2.0**-133, ulps)
+        raw[label], margins[label] = logits, margin
+        thresholds[label] = 2 * ulps.amax(-1)
+    eligible = (margins["native"] > thresholds["native"]) & (
+        margins["hf"] > thresholds["hf"]
+    )
+    misses = (native_ids != reference_ids) & eligible
+    details = []
+    for position in misses.nonzero().flatten().tolist():
+        item = {
+            "position": position,
+            "native_id": int(native_ids[position]),
+            "hf_id": int(reference_ids[position]),
+        }
+        for label in ("native", "hf"):
+            item[label + "_logits"] = raw[label][position].tolist()
+            item[label + "_margin"] = float(margins[label][position])
+            item[label + "_two_ulp_threshold"] = float(thresholds[label][position])
+        details.append(item)
+    return {
+        "status": "fail" if details else "pass",
+        "policy": "blocking; every position with BOTH margins strictly >2 BF16 ULPs",
+        "positions": count,
+        "eligible_positions": int(eligible.sum()),
+        "near_tie_positions": int((~eligible).sum()),
+        "eligible_disagreements": len(details),
+        "disagreement_details": details,
+    }
 
 
 def top1_diagnostics(actual: dict, reference: dict) -> dict:

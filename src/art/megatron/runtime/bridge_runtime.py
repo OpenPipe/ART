@@ -895,11 +895,17 @@ def _optimized_load_weights_hf_to_megatron(
         _validate_local_pretrained_tasks(self, megatron_model, tasks)
         tasks = _prepare_nonuniform_expert_tasks(tasks)
     hf_state_dict = hf_pretrained.state
-    raw_cache = load_unique_hf_keys_once(
-        tasks,
-        hf_state_dict,
-        bridge=self,
-        extra_keys=getattr(self, "art_extra_hf_prefetch_keys", None),
+    # GLM can exceed the aggregate host-PSS budget when DP replicas each pin a
+    # full checkpoint. Keep source resolution/conversion and task ordering,
+    # but bound staging to one task on every device for opted-in bridges.
+    stream_import = bool(getattr(self, "art_stream_import", False))
+    extra_keys = getattr(self, "art_extra_hf_prefetch_keys", None)
+    raw_cache = (
+        {}
+        if stream_import
+        else load_unique_hf_keys_once(
+            tasks, hf_state_dict, bridge=self, extra_keys=extra_keys
+        )
     )
     cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
     description = f"Loading from {hf_pretrained.model_name_or_path}"
@@ -907,6 +913,11 @@ def _optimized_load_weights_hf_to_megatron(
     for task in self._with_progress_tracking(tasks, description):
         if task is None or task.megatron_module is None:
             continue
+        if stream_import:
+            raw_cache = load_unique_hf_keys_once(
+                [task], hf_state_dict, bridge=self, extra_keys=extra_keys
+            )
+            cached_state = _CachedStateLookup(cache=raw_cache, source=hf_state_dict)
         hf_param = task.mapping.hf_param
         if (
             isinstance(hf_param, str)
@@ -947,7 +958,15 @@ def _optimized_load_weights_hf_to_megatron(
         if converted_weights.data_ptr() != task.param_weight.data.data_ptr():
             task.param_weight.data.copy_(converted_weights, non_blocking=True)
         if task.param_weight.device.type == "cuda":
-            pending_device_copy = True
+            if stream_import:
+                # Finish H2D before releasing this task's pinned staging. This
+                # also prevents an async-copy backlog from defeating the bound.
+                torch.cuda.synchronize(task.param_weight.device)
+            else:
+                pending_device_copy = True
+        if stream_import:
+            raw_cache.clear()
+            del converted_weights, hf_weights
     if pending_device_copy and torch.cuda.is_available():
         torch.cuda.synchronize()
     self._broadcast_shared_embeddings(_shared_embedding_broadcast_model(megatron_model))

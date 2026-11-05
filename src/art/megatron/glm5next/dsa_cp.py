@@ -249,6 +249,7 @@ def tree_pooled_indexer_topk(
             query_ids=plan.query_ids,
             tail_origin=plan.tail_origin,
             topk=indexer.topk,
+            selection_policy=indexer.selection_policy,
         )
         result[plan.batch, plan.owner_rows] = selected
     if cp is None:

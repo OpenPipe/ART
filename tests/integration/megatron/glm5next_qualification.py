@@ -210,6 +210,10 @@ def volumes(inputs: Path, output: Path) -> None:
                 "ep": 8,
             }
         )
+    try:
+        diagnostics: Any = diagnostic_volumes(inputs)
+    except Exception as exc:
+        diagnostics = {"status": "fail", "policy": "report-only", "error": str(exc)}
     write(
         output,
         {
@@ -221,7 +225,7 @@ def volumes(inputs: Path, output: Path) -> None:
             "base_bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
             "rank32_elements": sum(t.numel() for t in adapter),
             "contexts": contexts,
-            "parity_diagnostics": diagnostic_volumes(inputs),
+            "parity_diagnostics": diagnostics,
             "cuda_initialized": torch.cuda.is_initialized(),
             "execution": "meta",
         },
@@ -331,6 +335,7 @@ def capture_layer_outputs(chunks: Any, values: dict) -> list[Any]:
             chunk = chunk.module
         for layer in chunk.decoder.layers:
 
+            @torch.compiler.disable
             def capture(
                 module: Any,
                 args: Any,
@@ -389,11 +394,11 @@ class TinyEngine:
                 module=SimpleNamespace(decoder=SimpleNamespace(layers=[self.head]))
             )
         )
-        self.handles = (
-            capture_layer_outputs([wrapped], self.layers)
-            if output.name in ("F4", "F8")
-            else []
-        )
+        self.capture_chunks = [wrapped]
+        self.handles: list[Any] = []
+
+    def enable_diagnostics(self) -> None:
+        self.handles = capture_layer_outputs(self.capture_chunks, self.layers)
 
     def forward(
         self, tokens: list[int], backward: bool = False, logits: bool = False
@@ -428,6 +433,7 @@ class TinyEngine:
             "logits": torch.cat(sampled_logits) if logits else None,
             "top1": torch.cat([top.indices[:, 0] for top in all_top]),
             "top2.values": torch.cat([top.values for top in all_top]),
+            "top2.logits": torch.cat([top.values for top in all_top]),
         }
 
     def step(self) -> dict:
@@ -526,12 +532,9 @@ class ArtEngine:
         self.trainer = TrainerRank(self.runtime)
         self.trainer.load_checkpoint(str(output.parents[1] / "initial"))
         self.layers: dict = {}
-        # Do not add D2H capture synchronization to performance/context measurements.
-        self.handles = (
-            capture_layer_outputs(self.runtime.model, self.layers)
-            if output.name in ("F4", "F8")
-            else []
-        )
+        # Blocking parity always uses the uninstrumented production path.
+        # Only the separate report-only worker may install observers.
+        self.handles: list[Any] = []
         self.output = output
         write(
             output / f"topology-rank{self.rank}.json",
@@ -543,6 +546,9 @@ class ArtEngine:
                 "recompute_num_layers": self.runtime.provider.recompute_num_layers,
             },
         )
+
+    def enable_diagnostics(self) -> None:
+        self.handles = capture_layer_outputs(self.runtime.model, self.layers)
 
     def forward(
         self, tokens: list[int], backward: bool = False, logits: bool = False
@@ -582,6 +588,12 @@ class ArtEngine:
                     .cpu()
                     .reshape(-1, 2)
                     if out.top_k is not None
+                    else None,
+                    "top2.logits": out.top_k.logits.detach()
+                    .float()
+                    .cpu()
+                    .reshape(-1, 2)
+                    if out.top_k is not None and out.top_k.logits is not None
                     else None,
                     "logits": out.logits.detach().float().cpu()
                     if out.logits is not None
@@ -652,29 +664,25 @@ def experiment(engine: Any, task: str, inputs: Path, output: Path) -> None:
     docs = documents(inputs)
     if task in ("forward", "learn"):
         first_forward_repeat(engine, docs[0][1], output)
-    if task in ("forward", "parity"):
-        from tests.integration.megatron.glm5next_parity_diagnostics import trim_captures
+    if task in ("forward", "parity", "parity-diagnostics"):
+        diagnostic = task == "parity-diagnostics"
+        if diagnostic:
+            from tests.integration.megatron.glm5next_parity_diagnostics import (
+                trim_captures,
+            )
 
+            engine.enable_diagnostics()
         for name, ids in docs:
-            # Dense logits only on short docs; every doc retains all component
-            # positions and top-2 summaries, including the long prompts.
-            result = engine.forward(ids, logits=task == "parity" and len(ids) <= 128)
-            values = {
-                "target_logprobs": result["logprobs"],
-                **trim_captures(engine.layers, len(ids) - 1),
-            }
-            if task == "parity" and isinstance(engine, ArtEngine):
-                from tests.integration.megatron.glm5next_parity_diagnostics import (
-                    validate_captures,
-                )
-
-                validate_captures(
-                    values, engine.runtime.provider.num_layers, len(ids) - 1
-                )
+            result = engine.forward(ids, logits=task != "forward" and len(ids) <= 128)
+            values = {"target_logprobs": result["logprobs"]}
+            if diagnostic:
+                values.update(trim_captures(engine.layers, len(ids) - 1))
             if result.get("top1") is not None:
                 values["top1"] = result["top1"]
             if result.get("top2.values") is not None:
                 values["top2.values"] = result["top2.values"].contiguous()
+            if result.get("top2.logits") is not None:
+                values["top2.logits"] = result["top2.logits"].contiguous()
             if result["logits"] is not None:
                 values["logits"] = result["logits"].reshape(len(ids) - 1, -1)
             nonfinite = [
@@ -683,10 +691,23 @@ def experiment(engine: Any, task: str, inputs: Path, output: Path) -> None:
                 if value.is_floating_point() and not bool(torch.isfinite(value).all())
             ]
             save_file(values, str(output / f"{name}-rank{engine.rank}.safetensors"))
+            if diagnostic and isinstance(engine, ArtEngine):
+                from tests.integration.megatron.glm5next_parity_diagnostics import (
+                    validate_captures,
+                )
+
+                validate_captures(
+                    values, engine.runtime.provider.num_layers, len(ids) - 1
+                )
             if nonfinite:
                 write(
                     output / f"failure-rank{engine.rank}.json",
-                    {"status": "hard_bug", "document": name, "nonfinite": nonfinite},
+                    {
+                        "status": "fail" if diagnostic else "hard_bug",
+                        "policy": "report-only" if diagnostic else "blocking",
+                        "document": name,
+                        "nonfinite": nonfinite,
+                    },
                 )
                 raise ValueError(f"Non-finite output: {nonfinite}")
         write(
@@ -824,10 +845,6 @@ def compare(
     from safetensors.torch import load_file
 
     from art.megatron.glm5next.hf_oracle import logprob_metrics
-    from tests.integration.megatron.glm5next_parity_diagnostics import (
-        sublayer_metrics,
-        top1_diagnostics,
-    )
 
     paths = sorted(candidate.glob("*-rank0.safetensors"))
     if not paths:
@@ -843,48 +860,143 @@ def compare(
         lp = logprob_metrics(
             a["target_logprobs"].reshape(-1), b["target_logprobs"].reshape(-1)
         )
-        top = top1_diagnostics(a, b)
-        diagnostics_reference = dict(b)
-        reference_source = "original M1 dump"
-        if supplemental is not None and not tiny:
-            extra_path = supplemental / "dumps" / name / expected_path.name
-            extra = load_file(str(extra_path))
-            diagnostics_reference.update(
-                {key: value for key, value in extra.items() if key not in b}
-            )
-            reference_source = (
-                "original M1 dump; missing F8 sublayers from supplemental M1 HF capture"
-            )
+        native_top1 = a["top1"].reshape(-1)
+        hf_top1 = (
+            b["top1"].reshape(-1)
+            if "top1" in b
+            else b["top64.indices"].reshape(-1, 64)[: native_top1.numel(), 0]
+        )
         record = {
             "document": actual_path.name,
             **lp,
-            "top1": top["agreements"] / top["positions"],
-            "top1_diagnostics": top,
-            "layers": sublayer_metrics(a, diagnostics_reference, top["positions"]),
-            "diagnostics_reference": reference_source,
-            "diagnostics_policy": "report-only",
+            "top1": int((native_top1 == hf_top1).sum()) / native_top1.numel(),
+            "policy": "blocking; uninstrumented production forward",
+            "top1_policy": "report-only; all-position raw agreement",
         }
-        if supplemental is not None and not tiny:
-            record["supplemental_vs_original_logprobs"] = logprob_metrics(
-                extra["target_logprobs"].reshape(-1), b["target_logprobs"].reshape(-1)
+        from tests.integration.megatron.glm5next_parity_diagnostics import (
+            margin_top1_gate,
+        )
+
+        try:
+            record["margin_top1_gate"] = margin_top1_gate(a, b)
+        except Exception as exc:
+            record["margin_top1_gate"] = {
+                "status": "fail",
+                "policy": "blocking; fail closed on unavailable margin data",
+                "error": str(exc),
+            }
+        record["finite"] = all(
+            bool(torch.isfinite(value).all())
+            for tensors in (a, b)
+            for key, value in tensors.items()
+            if not key.startswith("layers.") and value.is_floating_point()
+        )
+        try:
+            from tests.integration.megatron.glm5next_parity_diagnostics import (
+                top1_diagnostics,
             )
-            record["supplemental_vs_original_top1"] = float(
-                (extra["top64.indices"][..., 0] == b["top64.indices"][..., 0])
-                .float()
-                .mean()
-            )
+
+            record["top1_diagnostics"] = top1_diagnostics(a, b)
+        except Exception as exc:
+            record["top1_diagnostics"] = {
+                "status": "fail",
+                "policy": "report-only",
+                "error": str(exc),
+            }
         rows.append(record)
     passed = all(
         r["logprob_abs_mean"] <= 0.02
         and r["logprob_abs_p99"] <= 0.2
-        and r["top1"] >= 0.99
+        and r["finite"]
+        and r["margin_top1_gate"]["status"] == "pass"
         for r in rows
     )
     report = {
         "status": "pass" if passed else "fail",
-        "hard_bug": any(r["logprob_abs_mean"] > 0.1 for r in rows),
+        "hard_bug": any(not r["finite"] or r["logprob_abs_mean"] > 0.1 for r in rows),
         "rows": rows,
         "execution": "tiny_cpu_self_comparison" if tiny else "native_vs_original_m1_hf",
+    }
+    write(output, report)
+    return report
+
+
+def compare_diagnostics(
+    candidate: Path,
+    fixtures: Path,
+    name: str,
+    output: Path,
+    tiny: bool = False,
+    supplemental: Path | None = None,
+) -> dict:
+    """Independent report; no failure here can change a blocking comparison."""
+    from safetensors.torch import load_file
+
+    from art.megatron.glm5next.hf_oracle import logprob_metrics
+    from tests.integration.megatron.glm5next_parity_diagnostics import sublayer_metrics
+
+    rows = []
+    blocking = candidate.with_name(name)
+    for path in sorted(blocking.glob("*-rank0.safetensors")):
+        row: dict = {"document": path.name, "status": "fail"}
+        try:
+            clean = load_file(str(path))
+            actual = load_file(str(candidate / path.name))
+            nonfinite = [
+                key
+                for key, value in actual.items()
+                if value.is_floating_point() and not bool(torch.isfinite(value).all())
+            ]
+            if "target_logprobs" in nonfinite:
+                raise ValueError("Non-finite diagnostic logprobs (report-only)")
+            repeat = logprob_metrics(
+                actual["target_logprobs"].reshape(-1),
+                clean["target_logprobs"].reshape(-1),
+            )
+            row["repeat_logprobs"] = repeat
+            row["repeat_hard_bug"] = repeat["logprob_abs_mean"] > 0.1
+            if nonfinite:
+                raise ValueError(
+                    f"Non-finite diagnostic captures (report-only): {nonfinite}"
+                )
+            expected_path = fixtures / "dumps" / name / path.name.replace("-rank0", "")
+            reference = clean if tiny else load_file(str(expected_path))
+            if supplemental is not None and not tiny:
+                extra = load_file(
+                    str(supplemental / "dumps" / name / expected_path.name)
+                )
+                row["supplemental_vs_original_logprobs"] = logprob_metrics(
+                    extra["target_logprobs"].reshape(-1),
+                    reference["target_logprobs"].reshape(-1),
+                )
+                row["supplemental_vs_original_top1"] = float(
+                    (
+                        extra["top64.indices"][..., 0]
+                        == reference["top64.indices"][..., 0]
+                    )
+                    .float()
+                    .mean()
+                )
+                reference.update({k: v for k, v in extra.items() if k not in reference})
+            # Tiny CPU observes a projection, rather than the full real layer.
+            if tiny:
+                reference = actual
+            row["layers"] = sublayer_metrics(
+                actual, reference, clean["target_logprobs"].numel()
+            )
+            row["status"] = "fail" if row["repeat_hard_bug"] else "pass"
+        except Exception as exc:
+            row["error"] = f"{type(exc).__name__}: {exc}"
+        rows.append(row)
+    report = {
+        "status": "pass"
+        if rows and all(r["status"] == "pass" for r in rows)
+        else "fail",
+        "policy": "report-only; blocking files and gate decisions are immutable",
+        "repeat_kind": "uninstrumented first pass vs instrumented second worker pass",
+        "repeat_hard_bug_mean_threshold": 0.1,
+        "hard_bug": any(r.get("repeat_hard_bug", False) for r in rows),
+        "rows": rows,
     }
     write(output, report)
     return report
@@ -902,7 +1014,16 @@ def main() -> None:
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "2")))
     torch.set_num_interop_threads(1)
     args.output.mkdir(parents=True, exist_ok=True)
-    if args.task.startswith("compare-"):
+    if args.task.startswith("compare-diagnostics-"):
+        compare_diagnostics(
+            args.model,
+            args.inputs,
+            args.task.removeprefix("compare-diagnostics-"),
+            args.output / "diagnostics.json",
+            args.tiny,
+            args.supplemental,
+        )
+    elif args.task.startswith("compare-"):
         compare(
             args.model,
             args.inputs,
@@ -911,6 +1032,12 @@ def main() -> None:
             args.tiny,
             args.supplemental,
         )
+    elif args.task == "cpu-load":
+        from tests.integration.megatron.glm5next_pretrained_load import (
+            rehearse_pretrained_load,
+        )
+
+        rehearse_pretrained_load(args.model, args.output)
     elif args.task == "hf-reference-F8":
         from tests.integration.megatron.glm5next_parity_diagnostics import (
             supplemental_reference,

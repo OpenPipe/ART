@@ -42,7 +42,9 @@ def _patch_local_head(monkeypatch):
         _impl,
         "_vocab_parallel_topk_from_local",
         lambda values, tokens, *, k, log_z, vocab_start: _impl.TopK(
-            values[:, :k] - log_z[:, None], tokens[:, :k]
+            values[:, :k] - log_z[:, None],
+            tokens[:, :k],
+            values[:, :k].detach().float(),
         ),
     )
     monkeypatch.setattr(
@@ -114,6 +116,13 @@ def test_recomputed_head_preserves_outputs_and_arbitrary_loss_gradients(
                     ),
                     value,
                 )
+            for output, rows in zip(outputs, positions, strict=True):
+                if output.top_k is not None:
+                    expected = (value[rows] @ model.output_layer.weight.T).topk(
+                        top_k, dim=-1
+                    )
+                    torch.testing.assert_close(output.top_k.logits, expected.values)
+                    assert not output.top_k.logits.requires_grad
             tensors = [output.target_logprobs for output in outputs]
             tensors += [output.hidden_states for output in outputs]
             tensors += [
