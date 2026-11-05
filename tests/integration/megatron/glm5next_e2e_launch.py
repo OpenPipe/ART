@@ -14,8 +14,13 @@ import time
 from typing import Any
 from unittest.mock import patch
 
-from tests.integration.megatron import glm5next_qualification_launch as base
-from tests.integration.megatron.glm5next_qualification import sha, write
+# Standalone sealed invocation imports its own helpers before installed ART or
+# the caller's checkout. Workers use this same root through PYTHONPATH.
+SEALED_ROOT = Path(__file__).resolve().parents[3]
+sys.path[:0] = [str(SEALED_ROOT / "src"), str(SEALED_ROOT)]
+
+from tests.integration.megatron import glm5next_qualification_launch as base  # noqa: E402
+from tests.integration.megatron.glm5next_qualification import sha, write  # noqa: E402
 
 GRANT_REGEX = r"^(?:[0-9-]+ [0-9:]+ [AP]M MST )?GRANT glm-m4-model\b"
 NATIVE_MANIFEST = base.manifest
@@ -261,6 +266,9 @@ def pipeline(
         "OPENBLAS_NUM_THREADS": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "ART_MEGATRON_RANDOM_STATE": "20261105",
+        "TORCH_CUDA_ARCH_LIST": "10.0",
+        "HYBRID_EP_MULTINODE": "0",
+        "USE_NIXL": "0",
     }
     python = (
         seal["native_python"] if tiny else "/opt/art/megatron_runtime/.venv/bin/python"
