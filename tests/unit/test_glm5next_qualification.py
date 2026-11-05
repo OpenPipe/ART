@@ -79,3 +79,15 @@ def test_pss_reads_rollup_and_timeout_cleans_worker(tmp_path):
             1,
             tmp_path / "timeout.log",
         )
+
+
+def test_pss_allows_kernel_confirmed_process_exit(monkeypatch):
+    original = Path.read_text
+
+    def read(path, *args, **kwargs):
+        if path.name == "smaps_rollup":
+            raise ProcessLookupError("process exited after discovery")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    assert process_tree_pss(os.getpid(), {}) == 0

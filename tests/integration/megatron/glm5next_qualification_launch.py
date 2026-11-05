@@ -74,8 +74,11 @@ def process_tree_pss(root: int, owned: dict[int, int]) -> int:
                 int(next(line for line in lines if line.startswith("Pss:")).split()[1])
                 * 1024
             )
+        except (FileNotFoundError, ProcessLookupError):
+            # Kernel confirms the address space exited between enumeration and read.
+            continue
         except (OSError, StopIteration):
-            # Exited/zombie processes have no mappings. A live unreadable worker is unsafe.
+            # A live unreadable worker is unsafe.
             try:
                 state = (
                     Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
@@ -324,7 +327,9 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
     from tests.integration.megatron.glm5next_qualification import compare
 
     records = []
-    deadline = time.monotonic() + seal["window_seconds"] - 600
+    deadline = time.monotonic() + min(
+        seal["window_seconds"] - 600, 12800 if seal["kind"] == "cluster" else 6600
+    )
     for step in steps(seal, root, work, tiny=tiny):
         env = dict(
             os.environ,
@@ -336,6 +341,8 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
             HF_HUB_DISABLE_IMPLICIT_TOKEN="1",
             PYTHON_DOTENV_DISABLED="1",
             FLA_TILELANG="0",
+            TORCH_EXTENSIONS_DIR=str(work / "torch-extensions"),
+            TRITON_CACHE_DIR=str(work / "triton-cache"),
             **{},
         )
         env.update(step["env"])
@@ -458,6 +465,7 @@ def manifest(seal: dict, name: str, gpu: bool) -> dict:
 class KubeClient:
     def __init__(self, seal: dict, output: Path):
         self.seal, self.output = seal, output
+        self.deadline = time.monotonic() + seal["window_seconds"] - 300
 
     def call(
         self, args: list[str], data: dict | None = None, seconds: int = 120
@@ -485,7 +493,10 @@ class KubeClient:
     def pod(self, value: dict, root: Path, work: Path, seal: dict) -> None:
         self.create(value)
         name = value["metadata"]["name"]
-        deadline = time.monotonic() + value["spec"]["activeDeadlineSeconds"] + 60
+        deadline = min(
+            time.monotonic() + value["spec"]["activeDeadlineSeconds"] + 60,
+            self.deadline,
+        )
         while time.monotonic() < deadline:
             status = json.loads(self.call(["get", "pod", name, "-o", "json"]))
             phase = status.get("status", {}).get("phase")
