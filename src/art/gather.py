@@ -270,7 +270,6 @@ class GatherContext:
         self.pbar = None
         self.metric_sums = Counter()
         self.metric_divisors = Counter()
-        self.max_exceptions = 0
 
 
 gather_context_var = contextvars.ContextVar("gather_context", default=GatherContext())
