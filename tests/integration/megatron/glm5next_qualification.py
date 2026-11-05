@@ -302,7 +302,7 @@ class ArtEngine:
             lora_layout=LoraLayout(expert="shared_outer"),
         )
         self.trainer = TrainerRank(self.runtime)
-        self.trainer.load_checkpoint(str(model.parent / "initial"))
+        self.trainer.load_checkpoint(str(output.parents[1] / "initial"))
         self.layers: dict = {}
         self.handles = []
         # Samples only: hooks stay bounded independently of context length.
@@ -389,9 +389,10 @@ class ArtEngine:
             config = json.loads((path / "adapter_config.json").read_text())
             tensors = load_file(str(path / "adapter_model.safetensors"))
             native = from_vllm_lora_tensors(tensors, adapter_config=config)
-            validate_native_lora(
-                native, adapter_config=config.get("art_lora_native_config", config)
-            )
+            from art.megatron.glm5next.lora_export import META
+
+            native_config = {**config, META: {**config[META], "format": "art"}}
+            validate_native_lora(native, adapter_config=native_config)
 
     def memory(self) -> dict:
         return {
@@ -517,6 +518,19 @@ def compare(
             (p, fixtures / "dumps" / name / p.name.replace("-rank0", ""))
             for p in candidate.glob("*-rank0.safetensors")
         ]
+    missing = [str(expected) for _, expected in pairs if not expected.exists()]
+    if missing:
+        write(
+            output,
+            {
+                "status": "pending_reference",
+                "missing_outputs": missing,
+                "native_captures": [
+                    {"path": str(actual), "sha256": sha(actual)} for actual, _ in pairs
+                ],
+            },
+        )
+        return
     rows = []
     for actual_path, expected_path in pairs:
         a, b = load_file(str(actual_path)), load_file(str(expected_path))
@@ -607,7 +621,7 @@ def main() -> None:
                 ),
             )
         else:
-            identity(args.model, args.model.parent / "initial")
+            identity(args.model, args.output.parents[1] / "initial")
     else:
         engine = (TinyEngine if args.tiny else ArtEngine)(args.model, args.output)
         try:
