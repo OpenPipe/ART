@@ -80,7 +80,12 @@ def stage0(output: Path, expected_cuda: str = "12.8") -> None:
 def volumes(inputs: Path, output: Path) -> None:
     from art.megatron.glm5next.lora import LoraDimensions, lora_targets
 
-    shapes = json.loads((inputs / "shapes.json").read_text())
+    shapes = json.loads((inputs / "text-shapes.json").read_text())
+    index = json.loads((inputs / "index.json").read_text())
+    checkpoint = torch.empty(
+        index["metadata"]["total_size"], dtype=torch.uint8, device="meta"
+    )
+    assert len(shapes) == 37534 and checkpoint.numel() == 642646653816
     dtype_map = {
         "BF16": torch.bfloat16,
         "F32": torch.float32,
@@ -123,6 +128,9 @@ def volumes(inputs: Path, output: Path) -> None:
         {
             "status": "pass",
             "base_tensors": len(tensors),
+            "checkpoint_tensor_count": len(index["weight_map"]),
+            "checkpoint_payload_bytes": checkpoint.numel(),
+            "excluded_from_training": "MTP and vision; full download volume retained",
             "base_bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
             "rank32_elements": sum(t.numel() for t in adapter),
             "contexts": contexts,
