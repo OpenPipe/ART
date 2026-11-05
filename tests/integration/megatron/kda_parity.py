@@ -11,7 +11,7 @@ FP32 recurrence. They do not qualify FLA kernels or convolution halos.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import copy
 from datetime import timedelta
 import inspect
@@ -237,8 +237,6 @@ def cp_checks(module: Any, x: Tensor, cu: Tensor, group: Any) -> dict:
 
 
 def run(args: Any) -> dict:
-    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
-
     world = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("LOCAL_RANK", "0"))
     if args.device == "cuda":
@@ -257,14 +255,21 @@ def run(args: Any) -> dict:
         )
     torch.manual_seed(20261105)
     root = args.fixtures / args.fixture
-    cfg = Glm5NextTextConfig.from_pretrained(root)
+    values = json.loads((root / "config.json").read_text())
+    cfg: Any = SimpleNamespace(**values)
+    if world == 1:
+        from transformers.models.glm5_next.configuration_glm5_next import (
+            Glm5NextTextConfig,
+        )
+
+        cfg = Glm5NextTextConfig(**values)
     assert cfg.layer_types is not None
     layers = [
         i for i, kind in enumerate(cfg.layer_types) if kind == "linear_attention"
     ][:3]
     records = {}
     try:
-        with hf_torch_kernels() as hf:
+        with hf_torch_kernels() if world == 1 else nullcontext() as hf:
             for layer in layers:
                 torch.manual_seed(20261105 + layer)
                 state = load_weights(root, layer)
@@ -290,6 +295,7 @@ def run(args: Any) -> dict:
                     module.cp_group = dist.group.WORLD
                     records[str(layer)] = cp_checks(module, x, cu, dist.group.WORLD)
                 else:
+                    assert hf is not None
                     reference = hf.Glm5NextTextLinearAttention(cfg, layer_idx=layer).to(
                         device=device, dtype=dtype
                     )
@@ -356,11 +362,8 @@ def run(args: Any) -> dict:
 
 def schema_only(args: Any) -> dict:
     """Exercise real F4 tensor volumes on meta, without any CUDA admission."""
-    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
-
     root = args.fixtures / args.fixture
-    cfg = Glm5NextTextConfig.from_pretrained(root)
-    assert cfg.layer_types is not None
+    cfg = SimpleNamespace(**json.loads((root / "config.json").read_text()))
     records = {}
     for index, kind in enumerate(cfg.layer_types):
         if kind != "linear_attention":
