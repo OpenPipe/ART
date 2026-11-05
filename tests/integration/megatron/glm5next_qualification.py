@@ -221,10 +221,63 @@ def volumes(inputs: Path, output: Path) -> None:
             "base_bytes": sum(t.numel() * t.element_size() for t in tensors.values()),
             "rank32_elements": sum(t.numel() for t in adapter),
             "contexts": contexts,
+            "parity_diagnostics": diagnostic_volumes(inputs),
             "cuda_initialized": torch.cuda.is_initialized(),
             "execution": "meta",
         },
     )
+
+
+def diagnostic_volumes(inputs: Path) -> list[dict]:
+    """Represent every document/layer/position at real F4/F8 geometry on meta."""
+    rows: list[dict] = []
+    for layers in (4, 8):
+        for document, ids in documents(inputs):
+            positions = len(ids) - 1
+            tensors = []
+            for layer in range(layers):
+                # attention, MLP, 2 collapsed mHC, 3 stream outputs,
+                # 2 FP32 post/comb maps, and selected IDs/weights.
+                tensors += [
+                    torch.empty(
+                        (1, positions, 4096), dtype=torch.bfloat16, device="meta"
+                    )
+                    for _ in range(4)
+                ]
+                tensors += [
+                    torch.empty(
+                        (1, positions, 4, 4096), dtype=torch.bfloat16, device="meta"
+                    )
+                    for _ in range(3)
+                ]
+                tensors += [
+                    torch.empty(
+                        (1, positions, width), dtype=torch.float32, device="meta"
+                    )
+                    for width in (4, 16, 4, 16)
+                ]
+                if layer >= 3:
+                    tensors += [
+                        torch.empty((positions, 8), dtype=dtype, device="meta")
+                        for dtype in (torch.int32, torch.float32)
+                    ]
+                if layer % 4 == 3:
+                    tensors.append(
+                        torch.empty(
+                            (1, positions, 2112), dtype=torch.int32, device="meta"
+                        )
+                    )
+            rows.append(
+                {
+                    "fixture": f"F{layers}",
+                    "document": document,
+                    "positions": positions,
+                    "layers": layers,
+                    "capture_bytes": sum(t.numel() * t.element_size() for t in tensors),
+                    "execution": "meta",
+                }
+            )
+    return rows
 
 
 def identity(model: Path, output: Path) -> None:
@@ -285,9 +338,19 @@ def capture_layer_outputs(chunks: Any, values: dict) -> list[Any]:
                 key: str = f"layers.{layer.layer_number - 1}.streams",
             ) -> None:
                 value = result[0] if isinstance(result, tuple) else result
-                values[key] = value[:4].detach().float().cpu()
+                # All real positions, with HF's B,S,... orientation. Keep BF16
+                # captures compact; the comparator promotes its arithmetic.
+                if value.ndim >= 3:
+                    value = value.transpose(0, 1)
+                values[key] = value.detach().to(device="cpu", copy=True).contiguous()
 
             handles.append(layer.register_forward_hook(capture))
+            if hasattr(layer, "hc_util"):
+                from tests.integration.megatron.glm5next_parity_diagnostics import (
+                    capture_sublayers,
+                )
+
+                handles.extend(capture_sublayers(layer, values))
     return handles
 
 
@@ -338,12 +401,15 @@ class TinyEngine:
         ids = torch.tensor(tokens, dtype=torch.long).remainder(257)
         if backward:
             self.optimizer.zero_grad()
-        all_lp, sampled_logits = [], []
+        self.layers.clear()
+        all_lp, sampled_logits, all_top, streams = [], [], [], []
         # Bound actual CPU memory while traversing all real-context tokens.
         for begin in range(0, len(tokens) - 1, 512):
             x = self.embedding(ids[begin : begin + 512]).detach()
             count = min(len(x), len(ids) - begin - 1)
             out = self.head(x[:count]).float()
+            if self.layers:
+                streams.append(self.layers["layers.0.streams"])
             lp = (
                 out.log_softmax(-1)
                 .gather(1, ids[begin + 1 : begin + 1 + count, None])
@@ -352,11 +418,16 @@ class TinyEngine:
             if backward:
                 (-lp.sum() / (len(tokens) - 1)).backward()
             all_lp.append(lp.detach())
+            all_top.append(out.detach().topk(2, dim=-1))
             if logits:
                 sampled_logits.append(out.detach())
+        if streams:
+            self.layers["layers.0.streams"] = torch.cat(streams)
         return {
             "logprobs": torch.cat(all_lp),
             "logits": torch.cat(sampled_logits) if logits else None,
+            "top1": torch.cat([top.indices[:, 0] for top in all_top]),
+            "top2.values": torch.cat([top.values for top in all_top]),
         }
 
     def step(self) -> dict:
@@ -479,11 +550,12 @@ class ArtEngine:
         from art.trainer_rank import ForwardInput
 
         self.trainer.zero_grad()
+        self.layers.clear()
         request = ForwardInput(
             input_tokens=torch.tensor(tokens[:-1]),
             target_tokens=torch.tensor(tokens[1:]),
             logits=logits,
-            top_k=1,
+            top_k=2,
         )
         from megatron.core import parallel_state as ps
 
@@ -497,7 +569,18 @@ class ArtEngine:
             results.append(
                 {
                     "logprobs": out.target_logprobs.detach().float().cpu().reshape(-1),
-                    "top1": out.top_k.tokens.detach().cpu().reshape(-1)
+                    "top1": out.top_k.tokens.detach()
+                    .cpu()
+                    .reshape(-1, 2)[:, 0]
+                    .contiguous()
+                    if out.top_k is not None
+                    else None,
+                    # A shared logsumexp cancels: top-2 logprob differences
+                    # are logit margins, including on long documents.
+                    "top2.values": out.top_k.logprobs.detach()
+                    .float()
+                    .cpu()
+                    .reshape(-1, 2)
                     if out.top_k is not None
                     else None,
                     "logits": out.logits.detach().float().cpu()
@@ -570,16 +653,42 @@ def experiment(engine: Any, task: str, inputs: Path, output: Path) -> None:
     if task in ("forward", "learn"):
         first_forward_repeat(engine, docs[0][1], output)
     if task in ("forward", "parity"):
+        from tests.integration.megatron.glm5next_parity_diagnostics import trim_captures
+
         for name, ids in docs:
-            # Dense logits only on short docs; long prompts save target LP and sampled hidden states.
+            # Dense logits only on short docs; every doc retains all component
+            # positions and top-2 summaries, including the long prompts.
             result = engine.forward(ids, logits=task == "parity" and len(ids) <= 128)
-            assert bool(torch.isfinite(result["logprobs"]).all())
-            values = {"target_logprobs": result["logprobs"], **engine.layers}
+            values = {
+                "target_logprobs": result["logprobs"],
+                **trim_captures(engine.layers, len(ids) - 1),
+            }
+            if task == "parity" and isinstance(engine, ArtEngine):
+                from tests.integration.megatron.glm5next_parity_diagnostics import (
+                    validate_captures,
+                )
+
+                validate_captures(
+                    values, engine.runtime.provider.num_layers, len(ids) - 1
+                )
             if result.get("top1") is not None:
                 values["top1"] = result["top1"]
+            if result.get("top2.values") is not None:
+                values["top2.values"] = result["top2.values"].contiguous()
             if result["logits"] is not None:
                 values["logits"] = result["logits"].reshape(len(ids) - 1, -1)
+            nonfinite = [
+                key
+                for key, value in values.items()
+                if value.is_floating_point() and not bool(torch.isfinite(value).all())
+            ]
             save_file(values, str(output / f"{name}-rank{engine.rank}.safetensors"))
+            if nonfinite:
+                write(
+                    output / f"failure-rank{engine.rank}.json",
+                    {"status": "hard_bug", "document": name, "nonfinite": nonfinite},
+                )
+                raise ValueError(f"Non-finite output: {nonfinite}")
         write(
             output / f"result-rank{engine.rank}.json",
             {
@@ -704,86 +813,80 @@ def oom_evidence(error: BaseException, task: str) -> dict | None:
 
 
 def compare(
-    candidate: Path, fixtures: Path, name: str, output: Path, tiny: bool = False
-) -> None:
+    candidate: Path,
+    fixtures: Path,
+    name: str,
+    output: Path,
+    tiny: bool = False,
+    supplemental: Path | None = None,
+) -> dict:
     from safetensors.torch import load_file
 
-    from art.megatron.glm5next.hf_oracle import logprob_metrics, tensor_metrics
+    from art.megatron.glm5next.hf_oracle import logprob_metrics
+    from tests.integration.megatron.glm5next_parity_diagnostics import (
+        sublayer_metrics,
+        top1_diagnostics,
+    )
 
-    if tiny:
-        # CPU engine still exercises the exact comparison and gate arithmetic.
-        pairs = [(p, p) for p in candidate.glob("*-rank0.safetensors")]
-    else:
-        pairs = [
-            (p, fixtures / "dumps" / name / p.name.replace("-rank0", ""))
-            for p in candidate.glob("*-rank0.safetensors")
-        ]
-    missing = [str(expected) for _, expected in pairs if not expected.exists()]
-    if missing:
-        write(
-            output,
-            {
-                "status": "pending_reference",
-                "missing_outputs": missing,
-                "native_captures": [
-                    {"path": str(actual), "sha256": sha(actual)} for actual, _ in pairs
-                ],
-            },
+    paths = sorted(candidate.glob("*-rank0.safetensors"))
+    if not paths:
+        raise ValueError("No native parity captures")
+    rows: list[dict] = []
+    for actual_path in paths:
+        expected_path = (
+            actual_path
+            if tiny
+            else fixtures / "dumps" / name / actual_path.name.replace("-rank0", "")
         )
-        return
-    rows = []
-    for actual_path, expected_path in pairs:
         a, b = load_file(str(actual_path)), load_file(str(expected_path))
         lp = logprob_metrics(
             a["target_logprobs"].reshape(-1), b["target_logprobs"].reshape(-1)
         )
-        record: dict = {"document": actual_path.name, **lp, "layers": {}}
-        if "top1" in a:
-            expected_top1 = (
-                b["top1"] if "top1" in b else b["top64.indices"].reshape(-1, 64)[:-1, 0]
+        top = top1_diagnostics(a, b)
+        diagnostics_reference = dict(b)
+        reference_source = "original M1 dump"
+        if supplemental is not None and not tiny:
+            extra_path = supplemental / "dumps" / name / expected_path.name
+            extra = load_file(str(extra_path))
+            diagnostics_reference.update(
+                {key: value for key, value in extra.items() if key not in b}
             )
-            record["top1"] = float(
-                (a["top1"].reshape(-1) == expected_top1.reshape(-1)).float().mean()
+            reference_source = (
+                "original M1 dump; missing F8 sublayers from supplemental M1 HF capture"
             )
-        if "logits" in a:
-            expected = b.get("logits", b.get("full_logits"))
-            assert expected is not None
-            if "logits" not in b:
-                positions = b["full_logits.positions"].long()
-                positions = positions[positions < a["logits"].shape[0]]
-                expected = expected.reshape(-1, a["logits"].shape[-1])[: len(positions)]
-                actual_logits = a["logits"][positions]
-            else:
-                actual_logits = a["logits"]
-            record["sample_top1"] = float(
-                (actual_logits.argmax(-1) == expected.argmax(-1)).float().mean()
+        record = {
+            "document": actual_path.name,
+            **lp,
+            "top1": top["agreements"] / top["positions"],
+            "top1_diagnostics": top,
+            "layers": sublayer_metrics(a, diagnostics_reference, top["positions"]),
+            "diagnostics_reference": reference_source,
+            "diagnostics_policy": "report-only",
+        }
+        if supplemental is not None and not tiny:
+            record["supplemental_vs_original_logprobs"] = logprob_metrics(
+                extra["target_logprobs"].reshape(-1), b["target_logprobs"].reshape(-1)
             )
-            record.setdefault("top1", record["sample_top1"])
-        for key, value in a.items():
-            if key.startswith("layers.") and key in b:
-                expected = b[key]
-                # HF is B,S,streams,H; native is S,B,streams,H.
-                expected = expected.transpose(0, 1) if expected.ndim == 4 else expected
-                record["layers"][key] = tensor_metrics(
-                    value, expected[: value.shape[0]]
-                )
+            record["supplemental_vs_original_top1"] = float(
+                (extra["top64.indices"][..., 0] == b["top64.indices"][..., 0])
+                .float()
+                .mean()
+            )
         rows.append(record)
-    assert rows
     passed = all(
         r["logprob_abs_mean"] <= 0.02
         and r["logprob_abs_p99"] <= 0.2
-        and r.get("top1", 1) >= 0.99
+        and r["top1"] >= 0.99
         for r in rows
     )
-    write(
-        output,
-        {
-            "status": "pass" if passed else "fail",
-            "rows": rows,
-            "execution": "tiny_cpu_self_comparison" if tiny else "native_vs_hf",
-        },
-    )
-    assert passed
+    report = {
+        "status": "pass" if passed else "fail",
+        "hard_bug": any(r["logprob_abs_mean"] > 0.1 for r in rows),
+        "rows": rows,
+        "execution": "tiny_cpu_self_comparison" if tiny else "native_vs_original_m1_hf",
+    }
+    write(output, report)
+    return report
 
 
 def main() -> None:
@@ -793,11 +896,42 @@ def main() -> None:
     parser.add_argument("--model", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tiny", action="store_true")
+    parser.add_argument("--supplemental", type=Path)
     args = parser.parse_args()
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "2")))
     torch.set_num_interop_threads(1)
     args.output.mkdir(parents=True, exist_ok=True)
-    if args.task == "stage0":
+    if args.task.startswith("compare-"):
+        compare(
+            args.model,
+            args.inputs,
+            args.task.removeprefix("compare-"),
+            args.output / "comparison.json",
+            args.tiny,
+            args.supplemental,
+        )
+    elif args.task == "hf-reference-F8":
+        from tests.integration.megatron.glm5next_parity_diagnostics import (
+            supplemental_reference,
+        )
+
+        supplemental_reference(args.model, args.output, tiny=args.tiny)
+    elif args.task == "hf-stage0":
+        from tests.integration.megatron.model_support.glm5next_oracle import versions
+
+        runtime = versions()
+        assert runtime["cuda"] == "12.8"
+        assert runtime["transformers"] == "5.20.2"
+        assert (
+            runtime["modeling_sha256"]
+            == "2e8a08614860e5117a410080df42e67e7947bfdd116e90c19e46229c2d7ea645"
+        )
+        assert not torch.cuda.is_initialized()
+        write(
+            args.output / "stage0.json",
+            {"status": "pass", "cuda_initialized": False, **runtime},
+        )
+    elif args.task == "stage0":
         stage0(args.output / "stage0.json", inputs=args.inputs)
     elif args.task == "topology-plans":
         from tests.integration.megatron.glm5next_topology import validate_stage_plans

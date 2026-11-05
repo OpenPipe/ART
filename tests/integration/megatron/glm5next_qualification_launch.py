@@ -132,7 +132,12 @@ def run(
     ):
         try:
             while proc.poll() is None:
-                peak = max(peak, process_tree_pss(proc.pid, owned))
+                parent_pss = sum(
+                    int(line.split()[1]) * 1024
+                    for line in Path("/proc/self/smaps_rollup").read_text().splitlines()
+                    if line.startswith("Pss:")
+                )
+                peak = max(peak, process_tree_pss(proc.pid, owned) + parent_pss)
                 if peak > pss_limit:
                     raise MemoryError(f"process tree PSS {peak} exceeds {pss_limit}")
                 if time.monotonic() - started > seconds:
@@ -198,7 +203,7 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
         python = seal["native_python"]
     inputs = root / "qualification-inputs"
     model = work / "model"
-    commands = []
+    commands: list[dict] = []
 
     def add(
         name: str,
@@ -237,9 +242,20 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
         )
 
     add("stage0", "stage0", 600)
+    if seal["kind"] == "workstation" and seal.get("supplemental_f8"):
+        add("hf-stage0", "hf-stage0", 120)
+        commands[-1]["argv"][0] = seal["oracle_python"]
     add("volumes", "volumes", 180)
     if seal["kind"] == "workstation":
         for fixture in ("F4", "F8"):
+            if fixture == "F8" and seal.get("supplemental_f8"):
+                add(
+                    "hf-reference-F8",
+                    "hf-reference-F8",
+                    900,
+                    source=Path(seal["fixtures"]),
+                )
+                commands[-1]["argv"][0] = seal["oracle_python"]
             path = Path(seal["fixtures"]) / fixture
             add(f"identity-{fixture}", "identity", 300, source=path)
             add(fixture, "parity", 2100, count=2, source=path)
@@ -340,7 +356,15 @@ def prepare_worker_fixtures(root: Path, work: Path, *, tiny: bool) -> None:
 def visible_devices(seal: dict, name: str, *, tiny: bool) -> str:
     if (
         tiny
-        or name in ("stage0", "volumes", "acquire", "oracle-setup", "hybridep-setup")
+        or name
+        in (
+            "stage0",
+            "hf-stage0",
+            "volumes",
+            "acquire",
+            "oracle-setup",
+            "hybridep-setup",
+        )
         or name.startswith("identity")
     ):
         return ""
@@ -351,12 +375,16 @@ def visible_devices(seal: dict, name: str, *, tiny: bool) -> str:
     )
 
 
-def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
-    from tests.integration.megatron.glm5next_qualification import compare
-
-    records = []
-    deadline = time.monotonic() + min(
-        seal["window_seconds"] - 600, 12800 if seal["kind"] == "cluster" else 6600
+def pipeline(
+    seal: dict, root: Path, work: Path, *, tiny: bool, deadline: float | None = None
+) -> dict:
+    records: list[dict] = []
+    deadline = min(
+        deadline or float("inf"),
+        time.monotonic()
+        + min(
+            seal["window_seconds"] - 600, 12800 if seal["kind"] == "cluster" else 6600
+        ),
     )
     context_summary: dict = {
         "largest_fit": None,
@@ -426,17 +454,55 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
             if step["name"].startswith("context-"):
                 context_summary["largest_fit"] = int(step["name"].split("-")[1])
             if step["name"] in ("F4", "F8"):
-                compare(
-                    work / "results" / step["name"],
+                comparison_dir = work / "results" / (step["name"] + "-comparison")
+                argv = task_argv(
+                    seal["native_python"],
+                    root,
+                    "compare-" + step["name"],
                     Path(seal["fixtures"]),
-                    step["name"],
-                    work / "results" / (step["name"] + "-comparison.json"),
+                    work / "results" / step["name"],
+                    comparison_dir,
                     tiny,
                 )
+                if step["name"] == "F8" and seal.get("supplemental_f8"):
+                    argv += ["--supplemental", str(work / "results/hf-reference-F8")]
+                records[-1]["comparison_run"] = run(
+                    argv,
+                    max(1, int(deadline - time.monotonic())),
+                    work / "logs" / (step["name"] + "-comparison.log"),
+                    env={**env, "CUDA_VISIBLE_DEVICES": ""},
+                    cwd=root,
+                    pss_limit=seal["pss_limit_bytes"],
+                )
+                comparison_path = comparison_dir / "comparison.json"
+                comparison = json.loads(comparison_path.read_text())
+                write(
+                    work / "results" / (step["name"] + "-comparison.json"), comparison
+                )
+                records[-1]["comparison"] = comparison["status"]
+                if comparison["hard_bug"]:
+                    if step["name"] == "F4":
+                        records.append(
+                            {
+                                "name": "F8",
+                                "status": "not_run",
+                                "reason": "F4 hard bug: mean > 0.1",
+                            }
+                        )
+                    raise ValueError(f"{step['name']} hard bug: mean > 0.1")
         except Exception as exc:
             records.append(
                 {"name": step["name"], "status": "failed", "error": str(exc)}
             )
+            if step["name"] == "F4" and not any(row["name"] == "F8" for row in records):
+                records.append(
+                    {
+                        "name": "F8",
+                        "status": "not_run",
+                        "reason": "F4 hard bug or execution exception",
+                        "error": str(exc),
+                    }
+                )
             write(work / "results/pipeline.json", records)
             oom = any(
                 json.loads(path.read_text()).get("status") == "oom"
@@ -449,6 +515,9 @@ def pipeline(seal: dict, root: Path, work: Path, *, tiny: bool) -> dict:
         write(work / "results/context-summary.json", context_summary)
         write(work / "results/pipeline.json", records)
     return {
+        "status": "fail"
+        if any(s.get("comparison") == "fail" for s in records)
+        else "pass",
         "steps": records,
         "context": context_summary,
         "execution": "tiny_cpu" if tiny else "native_gpu",
@@ -775,6 +844,7 @@ def execute(
         "kind": seal["kind"],
         "recording": recording,
         "controller_claim": claim,
+        "status": "failed",
         "cleanup_done": False,
     }
     try:
@@ -814,9 +884,17 @@ def execute(
             if not recording:
                 idle(seal["uuids"])
                 board(
-                    f"GPU-START glm-m4-model workstation seal={approved} uuids={seal['uuids']}"
+                    f"GPU-START {seal.get('lane', 'glm-m4-model')} workstation seal={approved} uuids={seal['uuids']}"
                 )
-            receipt["science"] = pipeline(seal, source, work, tiny=recording)
+            receipt["science"] = pipeline(
+                seal,
+                source,
+                work,
+                tiny=recording,
+                deadline=window_started
+                + seal["window_seconds"]
+                - seal["cleanup_reserve_seconds"],
+            )
         else:
             client = client or KubeClient(seal, output)
             if not recording:
@@ -852,7 +930,11 @@ def execute(
             client.pod(gpu_pod, source, work, seal)
             if recording:
                 receipt["science"] = cast(RecordingClient, client).result
-        receipt["status"] = "pass"
+        receipt["status"] = receipt.get("science", {}).get("status", "pass")
+        if receipt["status"] != "pass":
+            raise RuntimeError(
+                "workstation parity gates failed; both F4 and F8 recorded"
+            )
     finally:
         if seal["kind"] == "cluster":
             if client is not None:
@@ -869,20 +951,22 @@ def execute(
         elif not recording:
             idle(seal["uuids"])
             board(
-                "RELEASED glm-m4-model workstation verified 0 MiB and no compute processes"
+                f"RELEASED {seal.get('lane', 'glm-m4-model')} workstation verified 0 MiB and no compute processes"
             )
         receipt["cleanup_done"] = True
         if sha(archive_path) != seal["source_sha256"]:
             raise ValueError("sealed source changed during run")
         write(output / "receipt.json", receipt)
         if not recording:
-            board(f"RESULT-LINK glm-m4-model {output / 'receipt.json'} seal={approved}")
+            board(
+                f"RESULT-LINK {seal.get('lane', 'glm-m4-model')} {output / 'receipt.json'} seal={approved}"
+            )
 
 
 def has_grant(seal: dict, approved: str, contents: str) -> bool:
     window = "workstation" if seal["kind"] == "workstation" else "B200"
     return any(
-        line.startswith(f"GRANT glm-m4-model {window} ")
+        line.startswith(f"GRANT {seal.get('lane', 'glm-m4-model')} {window} ")
         and f"seal_sha256={approved}" in line.split()
         for line in contents.splitlines()
     )

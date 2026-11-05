@@ -123,8 +123,8 @@ def test_layer_capture_unwraps_ddp_and_precision_wrappers():
     x = torch.arange(16, dtype=torch.float32).reshape(8, 2).requires_grad_()
     layer(x)
     sample = values["layers.0.streams"]
-    assert sample.shape == (4, 2) and not sample.requires_grad
-    torch.testing.assert_close(sample, x[:4])
+    assert sample.shape == (8, 2) and not sample.requires_grad
+    torch.testing.assert_close(sample, x)
     for handle in handles:
         handle.remove()
 
@@ -167,6 +167,7 @@ def test_qualification_pins_rank32_and_preserves_cp_ep():
         "identity",
         "identity-F4",
         "identity-F8",
+        "hf-stage0",
     ],
 )
 def test_cpu_stages_never_receive_gpu_visibility(step):
