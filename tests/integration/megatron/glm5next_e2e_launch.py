@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,36 @@ def has_grant(seal: dict, approved: str, contents: str) -> bool:
 
 def pending_stop(age: float, *, gpu: bool, own_scaleup: bool) -> bool:
     return age >= (2700 if own_scaleup and not gpu else 300)
+
+
+def pending_state(pod: dict, events: dict, *, now: datetime | None = None) -> dict:
+    """Use API timestamps and this Pod's UID; assigned startup gets 300 seconds."""
+    uid = pod["metadata"]["uid"]
+    gpu = pod["metadata"]["name"].endswith("qualification")
+    own = any(
+        e.get("involvedObject", {}).get("uid") == uid
+        and e.get("reason") == "TriggeredScaleUp"
+        for e in events["items"]
+    )
+    since = pod["metadata"]["creationTimestamp"]
+    if pod.get("spec", {}).get("nodeName") and not gpu:
+        scheduled = next(
+            c
+            for c in pod["status"]["conditions"]
+            if c["type"] == "PodScheduled" and c["status"] == "True"
+        )
+        since = scheduled["lastTransitionTime"]
+        own = False
+    age = (
+        (now or datetime.now(timezone.utc))
+        - datetime.fromisoformat(since.replace("Z", "+00:00"))
+    ).total_seconds()
+    return {
+        "age_s": age,
+        "own_TriggeredScaleUp": own,
+        "gpu": gpu,
+        "stopped": pending_stop(age, gpu=gpu, own_scaleup=own),
+    }
 
 
 class Recording(base.RecordingClient):
@@ -135,23 +166,15 @@ class Kube(NATIVE_KUBE):
                         seconds=30,
                     )
                 )
-                own = any(
-                    e.get("involvedObject", {}).get("uid") == uid
-                    and e.get("reason") == "TriggeredScaleUp"
-                    for e in events["items"]
-                )
-                age = time.monotonic() - self.pending.setdefault(uid, time.monotonic())
-                gpu = name.endswith("qualification")
-                if pending_stop(age, gpu=gpu, own_scaleup=own):
+                state = pending_state(pod, events)
+                if state["stopped"]:
                     write(
                         self.output / "pending-stop.json",
                         {
                             "status": "NEEDS-LEAD",
                             "pod": name,
                             "uid": uid,
-                            "age_s": age,
-                            "own_TriggeredScaleUp": own,
-                            "gpu": gpu,
+                            **state,
                             "events": events,
                         },
                     )

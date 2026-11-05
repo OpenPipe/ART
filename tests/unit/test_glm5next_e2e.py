@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +11,7 @@ from tests.integration.megatron.glm5next_e2e import install_capture, metrics
 from tests.integration.megatron.glm5next_e2e_launch import (
     has_grant,
     literals,
+    pending_state,
     pending_stop,
 )
 
@@ -73,3 +75,37 @@ def test_exact_grant_requires_every_literal() -> None:
 def test_split_pending_boundaries(gpu: bool, scaleup: bool, limit: int) -> None:
     assert not pending_stop(limit - 1, gpu=gpu, own_scaleup=scaleup)
     assert pending_stop(limit, gpu=gpu, own_scaleup=scaleup)
+
+
+def test_pending_uses_own_uid_and_assigned_startup_clock() -> None:
+    pod = {
+        "metadata": {
+            "uid": "own",
+            "name": "run-stage0",
+            "creationTimestamp": "2026-11-05T14:00:00Z",
+        },
+        "spec": {},
+        "status": {
+            "conditions": [
+                {
+                    "type": "PodScheduled",
+                    "status": "True",
+                    "lastTransitionTime": "2026-11-05T14:28:00Z",
+                }
+            ]
+        },
+    }
+    now = datetime(2026, 11, 5, 14, 30, tzinfo=timezone.utc)
+    events = {
+        "items": [{"involvedObject": {"uid": "foreign"}, "reason": "TriggeredScaleUp"}]
+    }
+    assert pending_state(pod, events, now=now)["stopped"]
+    events["items"][0]["involvedObject"]["uid"] = "own"
+    assert not pending_state(pod, events, now=now)["stopped"]
+    pod["spec"]["nodeName"] = "node"
+    assigned = pending_state(pod, events, now=now)
+    assert (
+        assigned["age_s"] == 120
+        and not assigned["own_TriggeredScaleUp"]
+        and not assigned["stopped"]
+    )

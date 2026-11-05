@@ -199,6 +199,7 @@ def metrics(
 def worker(args: Any) -> None:
     from megatron.core import parallel_state as ps
 
+    import art
     from art.megatron.lora import LoraLayout
     from art.trainer_rank import ForwardInput, TrainerRank
     from tests.integration.megatron.glm5next_qualification import (
@@ -206,6 +207,11 @@ def worker(args: Any) -> None:
     )
 
     world = int(os.environ["WORLD_SIZE"])
+    assert (
+        Path(art.__file__)
+        .resolve()
+        .is_relative_to(Path(__file__).resolve().parents[3] / "src")
+    )
     rank = int(os.environ["RANK"])
     assert world == (1 if args.variant == "B0" else 8)
     if args.cpu:
@@ -264,6 +270,9 @@ def worker(args: Any) -> None:
                 configure_qualification_provider(provider)
                 provider.context_parallel_size = world
                 provider.expert_model_parallel_size = world
+                provider.recompute_granularity = "full"
+                provider.recompute_method = "uniform"
+                provider.recompute_num_layers = 1
 
             if world == 1:
                 from megatron.bridge.models import model_provider
