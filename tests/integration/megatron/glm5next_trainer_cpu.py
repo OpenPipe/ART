@@ -10,12 +10,14 @@ import argparse
 from collections import Counter
 from contextlib import ExitStack, contextmanager
 from datetime import timedelta
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import tempfile
-from typing import Any, Iterator
+from typing import Any, Generator
 from unittest.mock import patch
 
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
@@ -32,7 +34,7 @@ SUBSTITUTIONS = [
     "Shared-outer routed-expert LoRA CUDA GEMMs -> per-expert torch matmuls; compact storage, wrappers and gradient synchronization retained",
     "FLA KDA convolution/recurrence -> KimiDeltaAttention backend=reference; real Gloo autograd exchanges",
     "TileLang sparse MLA forward/backward -> masked torch attention/autograd; real CP stage fetch/dKV reductions",
-    "HybridEP CUDA buffer/dispatcher -> MCore allgather dispatcher on real EP Gloo groups; topology guard retained",
+    "HybridEP CUDA buffer/dispatcher -> MCore alltoall dispatcher on real EP Gloo groups; CPU counts copied synchronously; topology guard retained",
     "MCore CUDA RNG checkpoint primitive -> torch checkpoint (full/uniform/one layer policy retained)",
     "CUDA constructor allocation -> meta then deterministic CPU materialization; tiny random weights, no BF16 download",
     "MCore current-device and global communication buffer CUDA allocation -> CPU allocation",
@@ -52,17 +54,29 @@ GPU_ONLY = [
 def sparse_math(
     q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, *, scale: float, **_: Any
 ) -> torch.Tensor:
-    mask = (indices[..., None] == torch.arange(kv.shape[1])[None, None, None, :]).any(
-        -2
+    valid = (indices >= 0) & (indices < kv.shape[1])
+    # Match the dense set mask, including repeated / padded indices, without
+    # allocating [queries, topk, all_keys] for long packed CPU probes.
+    duplicate = (indices[..., :, None] == indices[..., None, :]).tril(-1).any(-1)
+    mask = valid & ~duplicate
+    selected = (
+        kv[:, None]
+        .expand(-1, q.shape[1], -1, -1)
+        .gather(
+            2,
+            indices.clamp(0, kv.shape[1] - 1)[..., None].expand(
+                -1, -1, -1, kv.shape[-1]
+            ),
+        )
     )
-    scores = torch.einsum("bqhd,bkd->bhqk", q, kv) * scale
+    scores = torch.einsum("bqhd,bqkd->bhqk", q, selected) * scale
     # Empty padded queries must have zero gradients as well as zero outputs.
     masked = scores.masked_fill(~mask[:, None], -torch.inf)
     masked = torch.where(
         mask[:, None].any(-1, keepdim=True), masked, torch.zeros_like(masked)
     )
     probs = masked.softmax(-1) * mask[:, None]
-    return torch.einsum("bhqk,bkd->bqhd", probs, kv[..., :512])
+    return torch.einsum("bhqk,bqkd->bqhd", probs, selected[..., :512])
 
 
 def sparse_forward(q: Any, kv: Any, indices: Any, *, scale: float) -> Any:
@@ -110,10 +124,23 @@ def shared_outer(
     )
 
 
+def cpu_dispatch_sync(self: Any, point: str, tokens_per_expert: Any = None) -> Any:
+    """CPU copies are synchronous; preserve MCore's count/split conversions."""
+    if point == self.cuda_dtoh_point:
+        for name in ("input_splits", "output_splits", "output_splits_tp"):
+            value = getattr(self, name, None)
+            if isinstance(value, torch.Tensor):
+                setattr(self, name, value.numpy())
+    return tokens_per_expert
+
+
 @contextmanager
-def cpu_kernels() -> Iterator[None]:
+def cpu_kernels() -> Generator[None]:
     from megatron.core import tensor_parallel
     from megatron.core.extensions import transformer_engine as te
+    from megatron.core.transformer.moe.token_dispatcher import (
+        MoEAlltoAllTokenDispatcher,
+    )
     from megatron.core.utils import GlobalMemoryBuffer
     from torch.utils.checkpoint import checkpoint
     import transformer_engine.pytorch as tep
@@ -152,6 +179,16 @@ def cpu_kernels() -> Iterator[None]:
         )
         stack.enter_context(patch.object(tensor_parallel, "checkpoint", cpu_checkpoint))
         stack.enter_context(patch.object(GlobalMemoryBuffer, "get_tensor", cpu_buffer))
+        stack.enter_context(
+            patch.object(MoEAlltoAllTokenDispatcher, "cuda_dtoh_stream", object())
+        )
+        stack.enter_context(
+            patch.object(
+                MoEAlltoAllTokenDispatcher,
+                "_maybe_dtoh_and_synchronize",
+                cpu_dispatch_sync,
+            )
+        )
         stack.enter_context(patch.object(attention, "sparse_mla", sparse_math))
         stack.enter_context(
             patch.object(lora_projection, "_forward", lambda x, a: x @ a)
@@ -168,7 +205,9 @@ def cpu_kernels() -> Iterator[None]:
         yield
 
 
-def build_trainer(world: int, config_path: Path) -> Any:
+def build_trainer(
+    world: int, config_path: Path, *, expert_parallel: int | None = None
+) -> Any:
     from megatron.core.models.gpt.gpt_model import GPTModel
     from megatron.core.optimizer import OptimizerConfig
 
@@ -196,14 +235,19 @@ def build_trainer(world: int, config_path: Path) -> Any:
     provider.tensor_model_parallel_size = provider.pipeline_model_parallel_size = (
         provider.expert_tensor_parallel_size
     ) = 1
-    provider.context_parallel_size = provider.expert_model_parallel_size = world
+    provider.context_parallel_size = world
+    provider.expert_model_parallel_size = (
+        world if expert_parallel is None else expert_parallel
+    )
     # Match native meta construction; CPU-init would copy a meta master into
     # explicitly CPU TE parameters before materialization.
     provider.use_cpu_initialization = False
     provider.init_model_with_meta_device = True
     provider.params_dtype = torch.float32
     provider.bf16 = provider.fp16 = False
-    provider.moe_token_dispatcher_type = "allgather"
+    provider.moe_token_dispatcher_type = (
+        "alltoall" if provider.expert_model_parallel_size > 1 else "allgather"
+    )
     provider.moe_permute_fusion = False
     provider.bias_dropout_fusion = False
     provider.gradient_accumulation_fusion = False
@@ -225,9 +269,29 @@ def build_trainer(world: int, config_path: Path) -> Any:
             share_embeddings_and_output_weights=False,
         )
     model.to_empty(device="cpu")
-    torch.manual_seed(20261105)
     with torch.no_grad():
         for name, param in model.named_parameters():
+            from megatron.core import parallel_state as ps
+
+            ep = int(provider.expert_model_parallel_size)
+            canonical = re.sub(
+                r"(\.experts\.linear_fc[12]\.weight)(\d+)$",
+                lambda match: (
+                    match[1]
+                    + str(
+                        int(match[2])
+                        + ps.get_expert_model_parallel_rank()
+                        * int(provider.num_moe_experts)
+                        // ep
+                    )
+                ),
+                name,
+            )
+            torch.manual_seed(
+                int.from_bytes(
+                    hashlib.sha256(canonical.encode()).digest()[:4], "little"
+                )
+            )
             if "hc_" in name:
                 param.zero_()
                 if name.endswith("scale"):

@@ -1,6 +1,7 @@
 """The GLM MVP cannot admit prefix trees, even under memory pressure."""
 
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -78,17 +79,37 @@ def test_unaligned_datums_build_native_dsa_state():
     assert state is not None
 
 
+@pytest.mark.parametrize("cp", [2, 4, 8])
+def test_cp_alignment_does_not_change_indexer_candidate_width(cp):
+    from art.megatron.glm5next.dsa_cp import build_glm5next_dsa_state
+
+    widths = []
+    for size in (1, cp):
+        packed = pad_single_roots(
+            prefix_tree_pack([torch.arange(503)], max_depth=0), cp_size=size
+        )
+        state = build_glm5next_dsa_state(
+            position_ids=packed.position_ids,
+            group_ids=packed.group_ids,
+            parent_ids=packed.parent_ids,
+            device=torch.device("cpu"),
+        )
+        assert state.pool_plans[0].query_ids.numel() == 504
+        widths.append(state.pool_plans[0].pool_starts.numel())
+    assert widths == [126, 126]
+
+
 @pytest.mark.parametrize("layer_number", [1, 4])
 def test_branching_never_reaches_kda_or_dsa_layer(layer_number):
     from art.megatron.glm5next.layer import Glm5NextTransformerLayer
 
-    layer = Glm5NextTransformerLayer.__new__(Glm5NextTransformerLayer)
+    layer = cast(Any, Glm5NextTransformerLayer.__new__(Glm5NextTransformerLayer))
     torch.nn.Module.__init__(layer)
     layer.layer_number = layer_number
     layer.config = SimpleNamespace(cuda_graph_impl="none")
 
     class ForbiddenAttention(torch.nn.Module):
-        def forward(self, *args, **kwargs):
+        def forward(self, *args, **kwargs):  # ty: ignore[invalid-mutable-override]
             raise AssertionError("tree reached attention")
 
     layer.self_attention = ForbiddenAttention()

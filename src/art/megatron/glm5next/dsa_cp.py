@@ -62,6 +62,7 @@ def build_glm5next_dsa_state(
     roots; pooling across an unaligned shared-prefix branch is post-MVP.
     """
     cp = context_parallel_state
+    global_positions = (position_ids if cp is None else cp.input_pos).reshape(-1).cpu()
     combined_ids = None
     global_to_local = None
     if cp is None:
@@ -147,13 +148,19 @@ def build_glm5next_dsa_state(
             owners = (
                 query_ids if global_to_local is None else global_to_local[query_ids]
             )
-            query_ids, owners = query_ids[owners >= 0], owners[owners >= 0]
+            real = (owners >= 0) & (global_positions[query_ids] >= 0)
+            query_ids, owners = query_ids[real], owners[real]
             if not query_ids.numel():
                 continue
             starts = []
             tail_origin = None
             for slice_ in slices:
                 start, end = slice_.k_range.start, slice_.k_range.end
+                # GLM packing marks only the extra CP alignment with negative
+                # positions; up to three pool-closing tokens remain in every
+                # topology. Keep masked future pools for HF's top-k ordering,
+                # but never let CP-only storage change the candidate width.
+                end = start + int((global_positions[start:end] >= 0).sum())
                 if start % 4 or (slice_.mask_kind is AttnMaskKind.FULL and end % 4):
                     raise ValueError(
                         "Flash tree segments/ancestors must align to four-token "
