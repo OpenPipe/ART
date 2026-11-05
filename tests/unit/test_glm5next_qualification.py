@@ -368,6 +368,28 @@ def test_context_stops_at_first_oom_and_other_errors_block(tmp_path, monkeypatch
     assert calls == [32768, 65536]
 
 
+def test_context_recognizes_wrapped_cuda_oom_but_not_admission_refusal():
+    import torch
+
+    from art.trainer_rank import TrainerRankMemoryError
+    from tests.integration.megatron.glm5next_qualification import oom_evidence
+
+    raw = torch.cuda.OutOfMemoryError("allocation failed")
+    wrapped = TrainerRankMemoryError("CUDA OOM occurred despite planner estimate")
+    wrapped.__cause__ = raw
+    record = oom_evidence(wrapped, "context-65536")
+    assert record is not None and record["status"] == "oom"
+    assert record["chain"][1]["type"] == "OutOfMemoryError"
+    assert oom_evidence(raw, "context-65536") is not None
+    assert (
+        oom_evidence(
+            TrainerRankMemoryError("predicted to exceed available memory"),
+            "context-65536",
+        )
+        is None
+    )
+
+
 def test_kda_mvp_numeric_gradient_failure_does_not_block():
     from tests.integration.megatron.glm5next_kda_cp import gate_policy
 

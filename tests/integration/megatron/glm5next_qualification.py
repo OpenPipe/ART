@@ -682,6 +682,27 @@ def first_forward_repeat(engine: Any, ids: list[int], output: Path) -> dict:
     return report
 
 
+def oom_evidence(error: BaseException, task: str) -> dict | None:
+    """TrainerRank wraps execution OOMs; admission refusals are distinct errors."""
+    chain, seen = [], set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    if not any(isinstance(item, torch.cuda.OutOfMemoryError) for item in chain):
+        return None
+    return {
+        "status": "oom",
+        "task": task,
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "chain": [
+            {"type": type(item).__name__, "message": str(item)} for item in chain
+        ],
+    }
+
+
 def compare(
     candidate: Path, fixtures: Path, name: str, output: Path, tiny: bool = False
 ) -> None:
@@ -811,16 +832,12 @@ def main() -> None:
         try:
             engine = (TinyEngine if args.tiny else ArtEngine)(args.model, args.output)
             experiment(engine, args.task, args.inputs, args.output)
-        except torch.cuda.OutOfMemoryError as exc:
-            write(
-                args.output / f"failure-rank{os.environ.get('RANK', '0')}.json",
-                {
-                    "status": "oom",
-                    "task": args.task,
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                },
-            )
+        except Exception as exc:
+            if (evidence := oom_evidence(exc, args.task)) is not None:
+                write(
+                    args.output / f"failure-rank{os.environ.get('RANK', '0')}.json",
+                    evidence,
+                )
             raise
         finally:
             if engine is not None:
