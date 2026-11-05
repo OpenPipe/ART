@@ -206,9 +206,15 @@ def _extract_direct_response_cost(response: Any) -> float | None:
 def _extract_openai_token_counts(response: Any) -> _OpenAITokenUsage | None:
     usage = _response_usage(response)
     prompt_tokens = _read_usage_field(usage, "prompt_tokens")
+    if prompt_tokens is None:
+        prompt_tokens = _read_usage_field(usage, "input_tokens")
     completion_tokens = _read_usage_field(usage, "completion_tokens")
+    if completion_tokens is None:
+        completion_tokens = _read_usage_field(usage, "output_tokens")
     cached_prompt_tokens = (
-        _read_usage_nested_field(usage, "prompt_tokens_details", "cached_tokens") or 0.0
+        _read_usage_nested_field(usage, "prompt_tokens_details", "cached_tokens")
+        or _read_usage_nested_field(usage, "input_tokens_details", "cached_tokens")
+        or 0.0
     )
     if (
         prompt_tokens is None
