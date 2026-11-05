@@ -1028,6 +1028,8 @@ def _planner_topology_facts(
 def _layout_anchor(self: TrainerRank, *, memory_minimal: bool) -> str | None:
     """Resolve the layout anchor: test forcing wins, else memory policy."""
 
+    if getattr(self.runtime.model_support_handler, "single_root_packing", False):
+        return "no_sharing"
     forced = self._forced_test_anchor()
     if forced is not None:
         return forced
@@ -1332,6 +1334,11 @@ def _plan_flat_forward(
             packed = _impl.materialize_prefix_tree_layout(
                 group_input_ids, tree, layout, verify_shared_tokens=False
             )
+            prepare = getattr(
+                self.runtime.model_support_handler, "prepare_packed_batch", None
+            )
+            if prepare is not None:
+                packed = prepare(packed, cp_size=self._topology_key()[2])
             self._planning_seconds_accum += _impl.time.perf_counter() - started
             plans.append(
                 _impl._ForwardGroupPlan(

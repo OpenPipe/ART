@@ -17,6 +17,8 @@ from art.megatron.model_support.spec import HfWeightSource, LayerFamilyInstance
 
 class Glm5NextHandler(Glm52Handler):
     key = "glm5next"
+    # K-pool tree compression is deferred until after the MVP.
+    single_root_packing = True
     build_gdn_execution_spec = True
     has_recurrent_layers = True
     native_vllm_lora_status = "wip"
@@ -55,9 +57,15 @@ class Glm5NextHandler(Glm52Handler):
 
     def build_prefix_tree_model_state(self, context: Any) -> dict[str, Any]:
         from art.megatron.glm5next.dsa_cp import build_glm5next_dsa_state
+        from art.megatron.glm5next.packing import validate_single_roots
 
         if context.input_pos is None:
             raise ValueError("GLM-5.3 Flash packed attention requires position IDs.")
+        cp = context.context_parallel_state
+        validate_single_roots(
+            context.group_ids if cp is None else cp.group_ids,
+            context.parent_ids if cp is None else cp.parent_ids,
+        )
         return {
             "glm5next_dsa": build_glm5next_dsa_state(
                 position_ids=context.input_pos,
@@ -67,6 +75,11 @@ class Glm5NextHandler(Glm52Handler):
                 context_parallel_state=context.context_parallel_state,
             )
         }
+
+    def prepare_packed_batch(self, packed: Any, *, cp_size: int) -> Any:
+        from art.megatron.glm5next.packing import pad_single_roots
+
+        return pad_single_roots(packed, cp_size=cp_size)
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         families = [LayerFamilyInstance(key="mhc", layer_index=0)]
