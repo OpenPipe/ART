@@ -8,6 +8,7 @@ from typing import Any
 import torch
 
 
+@torch.compiler.disable
 def cpu(value: torch.Tensor) -> torch.Tensor:
     return value.detach().to(device="cpu", copy=True).contiguous()
 
@@ -28,6 +29,7 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
     handles = []
 
     def hook(key: str):
+        @torch.compiler.disable
         def capture(_module: Any, _args: Any, result: Any) -> None:
             value = result[0] if isinstance(result, tuple) else result
             values[prefix + key] = cpu(value.transpose(0, 1))
@@ -39,10 +41,14 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
 
     util = layer.hc_util
     original_pre, original_post = util.layer_pre, util.layer_post
+    # Resolve identity before entering Dynamo. Never close over the layer (which
+    # is an OptimizedModule on the production path) from a patched function.
+    attn_fn_id = id(layer.hc_attn_fn)
     site = ["attn_hc"]
 
+    @torch.compiler.disable
     def pre(hidden: Any, fn: Any, scale: Any, base: Any) -> Any:
-        site[0] = "attn_hc" if fn is layer.hc_attn_fn else "ffn_hc"
+        site[0] = "attn_hc" if id(fn) == attn_fn_id else "ffn_hc"
         result = original_pre(hidden, fn, scale, base)
         for field, value in zip(("collapsed", "post", "comb"), result, strict=True):
             values[f"{prefix}.{site[0]}.{field}"] = cpu(
@@ -50,6 +56,7 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
             )
         return result
 
+    @torch.compiler.disable
     def post(*args: Any, **kwargs: Any) -> Any:
         result = original_post(*args, **kwargs)
         values[f"{prefix}.{site[0]}.streams"] = cpu(result.transpose(0, 1))
@@ -63,12 +70,14 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
     )
     router = getattr(layer.mlp, "router", None)
     if router is not None:
+        topk = router.topk
 
-        def routing(module: Any, _args: Any, result: Any) -> None:
+        @torch.compiler.disable
+        def routing(_module: Any, _args: Any, result: Any) -> None:
             probabilities, routing_map = result
             # MCore returns a dense routing map. Read selected IDs from that map,
             # including zero-weight selections; compare sets, not top-k ordering.
-            ids = routing_map.int().topk(module.topk, dim=-1).indices
+            ids = routing_map.int().topk(topk, dim=-1).indices
             values[prefix + ".router.indices"] = cpu(ids.to(torch.int32))
             values[prefix + ".router.weights"] = cpu(probabilities.gather(-1, ids))
 
@@ -77,6 +86,7 @@ def capture_sublayers(layer: Any, values: dict) -> list[Any]:
     indexer = getattr(core, "indexer", None)
     if indexer is not None:
 
+        @torch.compiler.disable
         def selection(_module: Any, _args: Any, result: Any) -> None:
             # This window is CP1; native's invalid sentinel is padded S, HF's -1.
             values[prefix + ".indexer.indices"] = cpu(

@@ -213,6 +213,7 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
         ep: int = 1,
         count: int = 1,
         source: Path | None = None,
+        report_only: bool = False,
     ) -> None:
         argv = task_argv(
             python, root, task, inputs, source or model, work / "results" / name, tiny
@@ -231,34 +232,56 @@ def steps(seal: dict, root: Path, work: Path, *, tiny: bool) -> list[dict]:
                 "name": name,
                 "argv": argv,
                 "seconds": seconds,
+                "report_only": report_only,
                 "env": {
                     "ART_MEGATRON_CONTEXT_PARALLEL_SIZE": str(cp),
                     "ART_MEGATRON_EXPERT_MODEL_PARALLEL_SIZE": str(ep),
                 },
                 "trainer_plan": {"task": task, "cp": cp, "ep": ep, "world_size": count}
-                if task in ("forward", "parity", "learn") or task.startswith("context-")
+                if task in ("forward", "parity", "parity-diagnostics", "learn")
+                or task.startswith("context-")
                 else None,
             }
         )
 
     add("stage0", "stage0", 600)
-    if seal["kind"] == "workstation" and seal.get("supplemental_f8"):
-        add("hf-stage0", "hf-stage0", 120)
-        commands[-1]["argv"][0] = seal["oracle_python"]
     add("volumes", "volumes", 180)
     if seal["kind"] == "workstation":
+        # Preserve both blocking results before starting ANY report-only work.
         for fixture in ("F4", "F8"):
-            if fixture == "F8" and seal.get("supplemental_f8"):
-                add(
-                    "hf-reference-F8",
-                    "hf-reference-F8",
-                    900,
-                    source=Path(seal["fixtures"]),
-                )
-                commands[-1]["argv"][0] = seal["oracle_python"]
             path = Path(seal["fixtures"]) / fixture
             add(f"identity-{fixture}", "identity", 300, source=path)
             add(fixture, "parity", 2100, count=2, source=path)
+        if seal.get("supplemental_f8"):
+            add("hf-stage0", "hf-stage0", 120, report_only=True)
+            commands[-1]["argv"][0] = seal["oracle_python"]
+            add(
+                "hf-reference-F8",
+                "hf-reference-F8",
+                900,
+                source=Path(seal["fixtures"]),
+                report_only=True,
+            )
+            commands[-1]["argv"][0] = seal["oracle_python"]
+        for fixture in ("F4", "F8"):
+            path = Path(seal["fixtures"]) / fixture
+            # The rank32 identity adapter is fixture-shaped; restore it before
+            # reloading this model in a fresh, isolated diagnostics worker.
+            add(
+                f"identity-{fixture}-diagnostics",
+                "identity",
+                300,
+                source=path,
+                report_only=True,
+            )
+            add(
+                fixture + "-diagnostics",
+                "parity-diagnostics",
+                900,
+                count=2,
+                source=path,
+                report_only=True,
+            )
     else:
         add("hybridep-setup", "hybridep-setup", 1800)
         add("acquire", "acquire", 4200)
@@ -464,8 +487,6 @@ def pipeline(
                     comparison_dir,
                     tiny,
                 )
-                if step["name"] == "F8" and seal.get("supplemental_f8"):
-                    argv += ["--supplemental", str(work / "results/hf-reference-F8")]
                 records[-1]["comparison_run"] = run(
                     argv,
                     max(1, int(deadline - time.monotonic())),
@@ -504,14 +525,50 @@ def pipeline(
                     }
                 )
             write(work / "results/pipeline.json", records)
-            oom = any(
-                json.loads(path.read_text()).get("status") == "oom"
-                for path in (work / "results" / step["name"]).glob("failure-rank*.json")
+            if step.get("report_only"):
+                records[-1]["policy"] = "report-only"
+            else:
+                oom = any(
+                    json.loads(path.read_text()).get("status") == "oom"
+                    for path in (work / "results" / step["name"]).glob(
+                        "failure-rank*.json"
+                    )
+                )
+                if not step["name"].startswith("context-") or not oom:
+                    raise
+                records[-1]["status"] = "oom"
+                context_summary["first_oom"] = int(step["name"].split("-")[1])
+        if step["name"] in ("F4-diagnostics", "F8-diagnostics"):
+            # Even a failed worker may have saved partial repeat evidence. This
+            # comparator is CPU-only and cannot mutate the blocking reports.
+            name = step["name"].removesuffix("-diagnostics")
+            comparison_dir = work / "results" / (step["name"] + "-comparison")
+            argv = task_argv(
+                seal["native_python"],
+                root,
+                "compare-diagnostics-" + name,
+                Path(seal["fixtures"]),
+                work / "results" / step["name"],
+                comparison_dir,
+                tiny,
             )
-            if not step["name"].startswith("context-") or not oom:
-                raise
-            records[-1]["status"] = "oom"
-            context_summary["first_oom"] = int(step["name"].split("-")[1])
+            if name == "F8" and seal.get("supplemental_f8"):
+                argv += ["--supplemental", str(work / "results/hf-reference-F8")]
+            try:
+                records[-1]["diagnostics_run"] = run(
+                    argv,
+                    max(1, min(300, int(deadline - time.monotonic()))),
+                    work / "logs" / (step["name"] + "-comparison.log"),
+                    env={**env, "CUDA_VISIBLE_DEVICES": ""},
+                    cwd=root,
+                    pss_limit=seal["pss_limit_bytes"],
+                )
+                report = json.loads((comparison_dir / "diagnostics.json").read_text())
+                write(work / "results" / (step["name"] + ".json"), report)
+                records[-1]["diagnostics"] = report["status"]
+                records[-1]["repeat_hard_bug"] = report["hard_bug"]
+            except Exception as exc:
+                records[-1].update(diagnostics="fail", diagnostics_error=str(exc))
         write(work / "results/context-summary.json", context_summary)
         write(work / "results/pipeline.json", records)
     return {
@@ -519,6 +576,13 @@ def pipeline(
         if any(s.get("comparison") == "fail" for s in records)
         else "pass",
         "steps": records,
+        "diagnostics_status": "fail"
+        if any(
+            s.get("diagnostics") == "fail"
+            or (s.get("policy") == "report-only" and s["status"] == "failed")
+            for s in records
+        )
+        else "pass",
         "context": context_summary,
         "execution": "tiny_cpu" if tiny else "native_gpu",
     }

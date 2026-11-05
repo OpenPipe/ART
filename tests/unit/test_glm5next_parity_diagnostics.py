@@ -153,7 +153,7 @@ def test_hooks_observe_all_positions_without_replaying_router():
         topk = 2
         calls = 0
 
-        def forward(self, x):
+        def forward(self, x):  # ty: ignore[invalid-mutable-override]
             self.calls += 1
             probabilities = torch.tensor([[0.1, 0.0, 0.9]]).repeat(x.shape[0], 1)
             return probabilities, probabilities != 0
@@ -194,6 +194,167 @@ def test_hooks_observe_all_positions_without_replaying_router():
     for handle in handles:
         handle.remove()
     assert layer.hc_util.layer_pre == original
+
+
+def test_blocking_pass_never_installs_observers_and_survives_diagnostic_failure(
+    tmp_path, monkeypatch
+):
+    from safetensors.torch import load_file
+
+    import tests.integration.megatron.glm5next_qualification as worker
+
+    (tmp_path / "prompts.json").write_text(
+        json.dumps(
+            {
+                "packs": [
+                    {
+                        "id": "packed-3",
+                        "input_ids": [1, 2, 3],
+                        "cu_seqlens": [0, 3],
+                    }
+                ]
+            }
+        )
+    )
+    engine = worker.TinyEngine(tmp_path, tmp_path / "F4")
+    production_hooks = dict(engine.head._forward_hooks)
+    assert not engine.handles
+    worker.experiment(engine, "parity", tmp_path, tmp_path / "F4")
+    path = tmp_path / "F4/packed-3-doc0-rank0.safetensors"
+    before = path.read_bytes()
+    assert not any(k.startswith("layers.") for k in load_file(str(path)))
+    assert dict(engine.head._forward_hooks) == production_hooks
+
+    def fail(*_args):
+        raise AssertionError("diagnostic hook failed")
+
+    monkeypatch.setattr(worker, "capture_layer_outputs", fail)
+    with pytest.raises(AssertionError, match="diagnostic hook failed"):
+        worker.experiment(
+            engine, "parity-diagnostics", tmp_path, tmp_path / "F4-diagnostics"
+        )
+    assert path.read_bytes() == before
+    assert (
+        json.loads((tmp_path / "F4/result-rank0.json").read_text())["status"] == "pass"
+    )
+
+
+@pytest.mark.parametrize("diagnostic_failure", ["worker", "comparison", "repeat"])
+def test_report_only_worker_and_comparator_cannot_invalidate_blocking_results(
+    tmp_path, monkeypatch, diagnostic_failure
+):
+    import tests.integration.megatron.glm5next_qualification_launch as launch
+
+    seal = {
+        "kind": "workstation",
+        "window_seconds": 7200,
+        "pss_limit_bytes": 120 << 30,
+        "native_python": "python",
+        "oracle_python": "python",
+        "fixtures": str(tmp_path),
+        "supplemental_f8": True,
+    }
+    commands = launch.steps(seal, tmp_path, tmp_path, tiny=True)
+    names = [s["name"] for s in commands]
+    assert (
+        names.index("F4")
+        < names.index("F8")
+        < names.index("hf-stage0")
+        < names.index("F4-diagnostics")
+    )
+    assert all(s["report_only"] for s in commands[names.index("hf-stage0") :])
+    calls = []
+
+    def run(argv, *_args, **kwargs):
+        assert kwargs["env"]["CUDA_VISIBLE_DEVICES"] == ""
+        task = argv[argv.index("--task") + 1]
+        output = launch.Path(argv[argv.index("--output") + 1])
+        calls.append((task, output.name))
+        if task == "parity-diagnostics" and diagnostic_failure == "worker":
+            raise AssertionError("legacy Dynamo assertion")
+        if task.startswith("compare-diagnostics-"):
+            if diagnostic_failure == "comparison":
+                raise ValueError("missing diagnostic reference")
+            launch.write(
+                output / "diagnostics.json",
+                {"status": "fail", "hard_bug": diagnostic_failure == "repeat"},
+            )
+        elif task.startswith("compare-"):
+            launch.write(
+                output / "comparison.json", {"status": "pass", "hard_bug": False}
+            )
+        return {}
+
+    monkeypatch.setattr(launch, "run", run)
+    result = launch.pipeline(seal, tmp_path, tmp_path, tiny=True)
+    assert result["status"] == "pass" and result["diagnostics_status"] == "fail"
+    assert len([row for row in result["steps"] if row.get("comparison") == "pass"]) == 2
+    assert ("parity", "F8") in calls and (
+        "parity-diagnostics",
+        "F8-diagnostics",
+    ) in calls
+    assert (
+        json.loads((tmp_path / "results/F4-comparison.json").read_text())["status"]
+        == "pass"
+    )
+
+
+@pytest.mark.parametrize("delta, hard_bug", [(0.0, False), (0.2, True)])
+def test_repeat_delta_is_report_only_and_missing_diagnostic_file_is_recorded(
+    tmp_path, delta, hard_bug
+):
+    from safetensors.torch import save_file
+
+    from tests.integration.megatron.glm5next_qualification import compare_diagnostics
+
+    blocking, diagnostic = tmp_path / "F4", tmp_path / "F4-diagnostics"
+    blocking.mkdir()
+    diagnostic.mkdir()
+    clean = {"target_logprobs": torch.full((2,), -1.0)}
+    for name in ("present", "missing"):
+        save_file(clean, str(blocking / f"{name}-rank0.safetensors"))
+    save_file(
+        {"target_logprobs": torch.full((2,), -1.0 + delta)},
+        str(diagnostic / "present-rank0.safetensors"),
+    )
+    report = compare_diagnostics(
+        diagnostic, tmp_path, "F4", tmp_path / "diagnostics.json", tiny=True
+    )
+    assert report["status"] == "fail" and report["hard_bug"] == hard_bug
+    present = next(r for r in report["rows"] if r["document"].startswith("present"))
+    assert present["repeat_logprobs"]["logprob_abs_mean"] == pytest.approx(delta)
+    assert (
+        next(r for r in report["rows"] if r["document"].startswith("missing"))["status"]
+        == "fail"
+    )
+
+
+def test_blocking_comparator_needs_no_sublayers_supplement_or_margin_tensors(tmp_path):
+    from safetensors.torch import save_file
+
+    from tests.integration.megatron.glm5next_qualification import compare
+
+    candidate, reference = tmp_path / "F4", tmp_path / "dumps/F4"
+    candidate.mkdir()
+    reference.mkdir(parents=True)
+    save_file(
+        {"target_logprobs": torch.full((2,), -1.0), "top1": torch.tensor([0, 1])},
+        str(candidate / "doc-rank0.safetensors"),
+    )
+    save_file(
+        {"target_logprobs": torch.full((2,), -1.0), "top1": torch.tensor([0, 0])},
+        str(reference / "doc.safetensors"),
+    )
+    report = compare(
+        candidate,
+        tmp_path,
+        "F4",
+        tmp_path / "comparison.json",
+        supplemental=tmp_path / "absent",
+    )
+    assert report["status"] == "fail" and not report["hard_bug"]
+    assert report["rows"][0]["top1"] == 0.5
+    assert report["rows"][0]["top1_diagnostics"]["policy"] == "report-only"
 
 
 @pytest.mark.parametrize("index", [0, 3])
