@@ -1,7 +1,8 @@
-"""Frozen Flash k-pool selection, ported from slime and HF Glm5NextTextIndexer.
+"""Frozen Flash k-pool selection with explicit HF and serving policies.
 
 The budget counts tokens: 2048 means 512 complete pools plus at most three tail
-tokens. No FP8/Hadamard quantization is used by the HF training oracle.
+tokens. The production DSA caller selects the serving FP8/Hadamard equation;
+the unquantized HF policy remains available for oracle and tiny-fixture tests.
 """
 
 from __future__ import annotations
@@ -71,6 +72,7 @@ def select_pools(
     tail_origin: int,
     topk: int = 2048,
     query_chunk_size: int = 128,
+    selection_policy: str = "hf",
 ) -> torch.Tensor:
     """Select from one query segment's complete ancestor and own pools.
 
@@ -87,7 +89,18 @@ def select_pools(
     if keys.ndim != 2 or gates.shape != keys.shape or ape.shape[1] != keys.shape[1]:
         raise ValueError("Expected matching keys/gates[K,D] and ape[pool_size,D].")
     result = torch.full((q.shape[0], width), -1, device=q.device, dtype=torch.int32)
-    pools = compress_keys(keys, gates, ape, pool_starts)
+    if selection_policy == "vllm_fp8":
+        from art.megatron.glm5next import indexer_policy
+
+        if pool_size != 4 or q.shape[-1] != 128:
+            raise ValueError("Serving policy requires four-token pools and D=128")
+        pools, pool_scales = indexer_policy.quantize(
+            indexer_policy.compress(keys, gates, ape, pool_starts)
+        )
+    elif selection_policy == "hf":
+        pools = compress_keys(keys, gates, ape, pool_starts)
+    else:
+        raise ValueError(f"Unknown indexer selection policy: {selection_policy}")
     count = min(topk // pool_size, int(pool_starts.numel()))
     slots = torch.arange(pool_size, device=q.device)
     # Score storage is [chunk,pools], rather than [heads,sequence,sequence].
@@ -95,7 +108,12 @@ def select_pools(
         last = min(first + query_chunk_size, q.shape[0])
         ids = query_ids[first:last]
         if count:
-            scores = _pool_scores(q[first:last], pools, weights[first:last])
+            if selection_policy == "vllm_fp8":
+                scores = indexer_policy.scores(
+                    q[first:last], pools, pool_scales, weights[first:last]
+                )
+            else:
+                scores = _pool_scores(q[first:last], pools, weights[first:last])
             visible = pool_starts[None] + pool_size - 1 <= ids[:, None]
             scores.masked_fill_(~visible, torch.finfo(scores.dtype).min)
             selected = scores.topk(count, dim=-1).indices
@@ -192,9 +210,15 @@ class KPoolIndexer(nn.Module):
         pool_size: int = 4,
         linear_factory: Callable[[int, int], nn.Module] | None = None,
         norm_factory: Callable[[int], nn.Module] | None = None,
+        selection_policy: str = "hf",
     ) -> None:
         super().__init__()
         index_width(topk, pool_size)
+        if selection_policy not in ("hf", "vllm_fp8"):
+            raise ValueError(f"Unknown indexer selection policy: {selection_policy}")
+        if selection_policy == "vllm_fp8" and (head_dim != 128 or pool_size != 4):
+            raise ValueError("Serving policy requires four-token pools and D=128")
+        self.selection_policy = selection_policy
         self.heads, self.head_dim = num_heads, head_dim
         self.topk, self.pool_size = topk, pool_size
         linear = linear_factory or (lambda n, m: nn.Linear(n, m, bias=False))
@@ -210,6 +234,20 @@ class KPoolIndexer(nn.Module):
         self.index_kpool_compress_ape = nn.Parameter(
             weight.new_zeros(pool_size, head_dim)
         )
+        if selection_policy == "vllm_fp8":
+            # Bridge's mixed-precision wrapper consumes these markers, preserving
+            # values before casting. Promoting already-rounded values is too late.
+            self._keep_fp32_parameters = ("index_kpool_compress_ape",)
+            self.index_kpool_compress_ape.data = (
+                self.index_kpool_compress_ape.data.float()
+            )
+            for module in (self.k_norm, self.linear_weights_proj):
+                module.float()
+                setattr(
+                    module,
+                    "_keep_fp32_parameters",
+                    tuple(name for name, _ in module.named_parameters(recurse=False)),
+                )
         self.requires_grad_(False)
 
     @torch.no_grad()
@@ -219,10 +257,26 @@ class KPoolIndexer(nn.Module):
         q = _tensor(self.linear_wq_b(q_residual)).unflatten(
             -1, (self.heads, self.head_dim)
         )
-        keys = _tensor(self.k_norm(_tensor(self.linear_wk(hidden_states)))).to(q.dtype)
-        weights = (
-            _tensor(self.linear_weights_proj(hidden_states)).float() * self.heads**-0.5
-        )
+        raw_keys = _tensor(self.linear_wk(hidden_states))
+        if self.selection_policy == "vllm_fp8":
+            with torch.autocast(device_type=hidden_states.device.type, enabled=False):
+                keys = F.layer_norm(
+                    raw_keys.float(),
+                    (self.head_dim,),
+                    cast(torch.Tensor, self.k_norm.weight).float(),
+                    cast(torch.Tensor, self.k_norm.bias).float(),
+                    1e-6,
+                ).to(q.dtype)
+                weights = F.linear(
+                    hidden_states.float(),
+                    cast(torch.Tensor, self.linear_weights_proj.weight).float(),
+                )
+        else:
+            keys = _tensor(self.k_norm(raw_keys)).to(q.dtype)
+            weights = (
+                _tensor(self.linear_weights_proj(hidden_states)).float()
+                * self.heads**-0.5
+            )
         gates = F.linear(hidden_states, self.index_kpool_compress_gate)
         return (
             q.transpose(0, 1).contiguous(),
