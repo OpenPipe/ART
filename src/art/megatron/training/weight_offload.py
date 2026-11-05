@@ -77,6 +77,15 @@ class WeightOffloadManager:
         )
 
     def install(self) -> None:
+        from art.megatron.kernels.frozen_grouped_linear import FrozenGroupedBase
+
+        for chunk in self.model:
+            for module in chunk.modules():
+                if isinstance(module, FrozenGroupedBase) and (
+                    self.offload_between_jobs or self.streaming_config.enabled
+                ):
+                    module._grouped_resident = False
+                    module._prepare_grouped_base(False)
         self.streaming = install_streaming_weight_offload(
             model=self.model,
             rank=self.rank,
