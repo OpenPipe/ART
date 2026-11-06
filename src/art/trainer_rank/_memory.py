@@ -44,11 +44,13 @@ class _CallerMemoryProfile(_impl._MemoryProfile):
     caller_compute_peaks: tuple[tuple[int, int], ...] = ()
     compute_peak_floor: int = 0
 
-    def compute_peak(self, tokens: int | float) -> float:
+    def compute_peak(self, tokens: int | float, *, exact_length: bool = False) -> float:
         # Only a complete covering caller can justify discounting the pinned
         # max rate. Forward/split/incomplete readings never extend this range.
+        # CP additionally requires identical extent: shorter global roots can
+        # increase a rank's local ownership and change workspace geometry.
         for length, peak in self.caller_compute_peaks:
-            if tokens <= length:
+            if tokens == length or (not exact_length and tokens < length):
                 return max(peak, self.compute_peak_floor)
         # No discounted extrapolation: even a higher short reload cannot erase
         # earlier growth constraints beyond the measured caller extent.
@@ -1710,7 +1712,12 @@ def _memory_signature_from_requests(
     # Single-root checkpointed MoE training has fixed head/adapter workspace.
     # Keep its complete caller peaks separate by topology and from forward or
     # multi-root profiles. CP observations use global TP-padded packed tokens,
-    # as admission does; per-rank CP rows independently price analytic floors.
+    # as admission does. CP ownership need not be monotone in global length:
+    # a shorter root can give a rank more model rows and different workspace.
+    # CP discounts therefore require an exact-length caller (below). For this
+    # single causal root, equal length under the rank's fixed runtime config
+    # reproduces every rank's ownership and attention/GDN geometry. Each rank
+    # uses its own complete peak; collective admission checks every local fit.
     caller_bounded = (
         len(requests) == slot_group_count == 1
         and requests[0].input_tokens.ndim == 1
@@ -2168,7 +2175,8 @@ def _estimate_required_memory_bytes_from_values(
         )
         if isinstance(profiled, _CallerMemoryProfile):
             profiled_bytes = profiled.compute_peak(
-                profiled_tokens(profiled.logical_per_packed)
+                profiled_tokens(profiled.logical_per_packed),
+                exact_length=signature.topology[2] > 1,
             )
         elif (
             isinstance(profiled, _BoundedMemoryProfile)

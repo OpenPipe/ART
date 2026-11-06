@@ -206,6 +206,32 @@ def test_static_floor_and_safety_factor_are_retained(caller_rank, caller_signatu
     assert required == int(24 * 2**30 * 1.1)
 
 
+def test_only_cp1_can_discount_an_unmeasured_shorter_root(
+    caller_rank, caller_signature
+):
+    rank, sig = caller_rank, caller_signature
+    observe(rank, sig, 128, 16 * 2**30)
+    observe(rank, sig, 8192, 4 * 2**30)
+
+    def required(tokens):
+        return m._estimate_required_memory_bytes_from_values(
+            cast(Any, rank),
+            packed_tokens=tokens,
+            logical_tokens=tokens,
+            output_bytes=0,
+            signature=sig,
+            group_rows=((tokens // sig.topology[2] + 128, True),),
+        )
+
+    assert required(8192) == int(24 * 2**30 * 1.1)
+    shorter = required(8191)
+    if sig.topology[2] == 1:
+        assert shorter == int(24 * 2**30 * 1.1)
+    else:
+        assert shorter >= int(rank._memory_profiles[sig].bytes_per_token * 8191 * 1.1)
+        assert shorter > required(8192)
+
+
 @pytest.mark.parametrize("forward_peak", [1_000_000_000, 20 * 2**30])
 def test_forward_only_long_root_cannot_lower_requirement(
     forward_peak, caller_signature
