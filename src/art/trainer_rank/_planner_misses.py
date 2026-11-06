@@ -731,6 +731,11 @@ def _memory_profile(values: dict[str, Any]) -> Any:
         if field in values:
             values[field] = tuple(tuple(point) for point in values[field])
             cls = profile_cls
+    if "caller_cp_peaks" in values:
+        values["caller_cp_peaks"] = tuple(
+            (length, peak, family, tuple(tuple(rank) for rank in loads))
+            for length, peak, family, loads in values["caller_cp_peaks"]
+        )
     return cls(**values)
 
 
@@ -892,7 +897,13 @@ def replay(
     for estimate_index, item in enumerate(state["estimates"]):
         if "cost_components" not in item:
             raise ValueError("incomplete replay: expected cost components unavailable")
-        arguments = item["arguments"]
+        arguments = dict(item["arguments"])
+        if arguments.get("caller_cp_workload") is not None:
+            family, loads = arguments["caller_cp_workload"]
+            arguments["caller_cp_workload"] = (
+                family,
+                tuple(tuple(rank) for rank in loads),
+            )
         grouped = arguments.get("group_rows") not in ([], ())
         if (
             item.get("missing_inputs")

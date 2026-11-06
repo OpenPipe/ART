@@ -66,11 +66,16 @@ def caller_signature(caller_rank):
     return sig
 
 
+def synthetic_workload(cp, rows):
+    return ("synthetic", tuple((rows // cp + 128,) for _ in range(cp)))
+
+
 def observe(rank, sig, rows, peak, caller=True):
     plan = cast(
         Any,
         SimpleNamespace(
             packed_tokens=rows,
+            caller_cp_workload=synthetic_workload(sig.topology[2], rows),
             active_logical_tokens=rows,
             output_bytes=0,
             signature=sig,
@@ -198,6 +203,7 @@ def test_static_floor_and_safety_factor_are_retained(caller_rank, caller_signatu
     required = m._estimate_required_memory_bytes_from_values(
         cast(Any, r),
         packed_tokens=8192,
+        caller_cp_workload=synthetic_workload(sig.topology[2], 8192),
         logical_tokens=8192,
         output_bytes=0,
         signature=sig,
@@ -206,7 +212,7 @@ def test_static_floor_and_safety_factor_are_retained(caller_rank, caller_signatu
     assert required == int(24 * 2**30 * 1.1)
 
 
-def test_only_cp1_can_discount_an_unmeasured_shorter_root(
+def test_covering_local_workload_discounts_an_unmeasured_shorter_root(
     caller_rank, caller_signature
 ):
     rank, sig = caller_rank, caller_signature
@@ -217,6 +223,7 @@ def test_only_cp1_can_discount_an_unmeasured_shorter_root(
         return m._estimate_required_memory_bytes_from_values(
             cast(Any, rank),
             packed_tokens=tokens,
+            caller_cp_workload=synthetic_workload(sig.topology[2], tokens),
             logical_tokens=tokens,
             output_bytes=0,
             signature=sig,
@@ -225,11 +232,13 @@ def test_only_cp1_can_discount_an_unmeasured_shorter_root(
 
     assert required(8192) == int(24 * 2**30 * 1.1)
     shorter = required(8191)
-    if sig.topology[2] == 1:
-        assert shorter == int(24 * 2**30 * 1.1)
-    else:
-        assert shorter >= int(rank._memory_profiles[sig].bytes_per_token * 8191 * 1.1)
-        assert shorter > required(8192)
+    assert shorter == int(24 * 2**30 * 1.1)
+    if sig.topology[2] > 1:
+        profile = rank._memory_profiles[sig]
+        assert (
+            profile.compute_peak(8191, context_parallel=True)
+            >= profile.bytes_per_token * 8191
+        )
 
 
 @pytest.mark.parametrize("forward_peak", [1_000_000_000, 20 * 2**30])
@@ -333,6 +342,7 @@ def test_forward_only_root_cannot_turn_refusal_into_admission(
         return m._estimate_required_memory_bytes_from_values(
             cast(Any, r),
             packed_tokens=32768,
+            caller_cp_workload=synthetic_workload(sig.topology[2], 32768),
             logical_tokens=32768,
             output_bytes=0,
             signature=sig,
@@ -371,6 +381,7 @@ def test_tiny_callers_cannot_poison_a_measured_long_root(caller_rank, caller_sig
         return m._estimate_required_memory_bytes_from_values(
             cast(Any, r),
             packed_tokens=tokens,
+            caller_cp_workload=synthetic_workload(sig.topology[2], tokens),
             logical_tokens=tokens,
             output_bytes=0,
             signature=sig,

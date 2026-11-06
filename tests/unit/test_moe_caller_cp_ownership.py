@@ -38,8 +38,11 @@ def counts(cp, length):
 
 
 def observe(rank, signature, length, peak):
+    from test_moe_caller_cp_coverage import workload
+
     plan = SimpleNamespace(
         signature=signature,
+        caller_cp_workload=workload(signature.topology[2], length),
         packed_tokens=length,
         active_logical_tokens=length,
         output_bytes=4 * length,
@@ -90,6 +93,8 @@ def test_new_ownership_load_needs_covering_measurement(cp, tmp_path, monkeypatch
     short, long = cp * 512, cp * 512 + 128
     requested, measured = counts(cp, short), counts(cp, long)
     assert requested[-1] == 512 == 4 * measured[-1]
+    from test_moe_caller_cp_coverage import workload
+
     demands = []
     for local_rows in measured:
         rank = memory_rank()
@@ -110,6 +115,7 @@ def test_new_ownership_load_needs_covering_measurement(cp, tmp_path, monkeypatch
                 logical_tokens=short,
                 output_bytes=4 * short,
                 signature=signature,
+                caller_cp_workload=workload(cp, short),
                 group_rows=((max(requested), True),),
             )
         )
