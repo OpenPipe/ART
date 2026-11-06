@@ -30,6 +30,7 @@ def load_slot(rank, name, selected_rank):
                 continue
             lora.shared_factor = None
             expert = lora.A_T.ndim == 3
+            lora._is_expert = expert
             lora.adapter_model_prefix = f"layer{index}" + (
                 ".{expert}" if expert else ""
             )

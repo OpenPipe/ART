@@ -630,6 +630,9 @@ class LoRA(torch.nn.Module):
                 "adapter_model_prefix when greater than one"
             )
         self.adapter_model_prefix = adapter_model_prefix
+        # Forward must not inspect the export prefix: Dynamo would specialize
+        # on its full value and compile a separate graph for every layer.
+        self._is_expert = is_expert
         self.lora_layout = lora_layout or LoraLayout()
         self.expert_layout = self.lora_layout.expert if is_expert else "per_expert"
         self._num_local_experts = num_local_experts
@@ -638,6 +641,9 @@ class LoRA(torch.nn.Module):
             if self.expert_layout == "shared_outer"
             else None
         )
+        self._shared_a = self.shared_factor == "A"
+        self._shared_b = self.shared_factor == "B"
+        self._shared_outer_kernel = self.lora_layout.shared_outer_kernel
         self.alpha = float(alpha)
         self.in_features = int(in_features)
         self.out_features = int(out_features)
@@ -688,11 +694,11 @@ class LoRA(torch.nn.Module):
 
     @property
     def num_local_experts(self) -> int:
-        return self._num_local_experts if self.is_expert else 1
+        return self._num_local_experts
 
     @property
     def is_expert(self) -> bool:
-        return "{expert}" in self.adapter_model_prefix
+        return self._is_expert
 
     @property
     def expert_ids(self) -> tuple[int | None, ...]:
@@ -1114,9 +1120,9 @@ class LoRA(torch.nn.Module):
         # QuACK. The compact caller bypasses the views entirely: slicing an
         # expanded view back to one expert still allocates an E-sized gradient
         # in SliceBackward before ExpandBackward sums it.
-        if self.shared_factor == "A":
+        if self._shared_a:
             a_t = a_t.expand(self.num_local_experts, -1, -1)
-        elif self.shared_factor == "B":
+        elif self._shared_b:
             b_t = b_t.expand(self.num_local_experts, -1, -1)
         return a_t, b_t, scale
 
@@ -1154,7 +1160,7 @@ class LoRA(torch.nn.Module):
                     factors,
                     expert_plan,
                     out_features=self.out_features,
-                    shared_outer_kernel=self.lora_layout.shared_outer_kernel,
+                    shared_outer_kernel=self._shared_outer_kernel,
                 )
         if segments is not None:
             if self.is_expert or tokens_per_expert is not None:
@@ -1166,8 +1172,8 @@ class LoRA(torch.nn.Module):
             )
         compact_experts = (
             tokens_per_expert is not None
-            and self.shared_factor is not None
-            and self.lora_layout.shared_outer_kernel
+            and (self._shared_a or self._shared_b)
+            and self._shared_outer_kernel
         )
         active = (
             self._active_lora_storage()
@@ -1191,7 +1197,7 @@ class LoRA(torch.nn.Module):
                     b_t,
                     bsz,
                     scale=scale,
-                    shared_factor=self.shared_factor,
+                    shared_factor="A" if self._shared_a else "B",
                 )
             if x.shape[0] == 0:
                 return x.new_zeros((*x.shape[:-1], self.out_features))
