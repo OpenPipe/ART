@@ -433,6 +433,127 @@ def context_parallel_rank_model_token_counts(
     )
 
 
+def context_parallel_memory_workload(
+    *,
+    group_ids: torch.Tensor,
+    parent_ids: torch.Tensor,
+    topology: ParallelTopology,
+    config: ContextParallelConfig,
+    original_seq_len: int,
+    build_gdn_execution_spec: bool,
+    gdn_planner_config: Any | None = None,
+) -> tuple[str, tuple[tuple[int, ...], ...]]:
+    """Rank-wise caller coverage from the same cached plans as execution.
+
+    The family fixes the attention algorithm/configuration and GDN chain/local
+    decisions, without fixing length. Numeric dimensions cover both model rows
+    and attention/GDN workspace. Keep ranks separate: caller peaks are local,
+    so a measurement's busiest rank cannot cover another rank's larger request.
+    """
+    planning_key, bundle, _, _ = _get_or_build_planning_bundle(
+        group_ids=group_ids,
+        parent_ids=parent_ids,
+        topology=topology,
+        config=config,
+        original_seq_len=original_seq_len,
+        build_gdn_execution_spec=build_gdn_execution_spec,
+    )
+    decision = (
+        _plan_gdn_global_execution(
+            planning_key=planning_key,
+            bundle=bundle,
+            topology=topology,
+            gdn_planner_config=gdn_planner_config,
+        )
+        if build_gdn_execution_spec
+        else None
+    )
+    loads = []
+    masks = []
+    for rank, attention_rows in enumerate(
+        bundle.token_layout_index.token_counts_by_rank
+    ):
+        plan = _get_or_build_bundle_rank_plan(
+            planning_key=planning_key,
+            bundle=bundle,
+            original_seq_len=original_seq_len,
+            target_rank=rank,
+            block_size=config.block_size,
+        )
+        stages = [s for s in plan.stage_plans if s.q_len and s.k_len and s.slices]
+        qs = [s.q_len for s in stages]
+        ks = [s.k_len for s in stages]
+        pairs = [q * k for q, k in zip(qs, ks, strict=True)]
+        masks.append(
+            sorted({s.mask_kind.value for stage in stages for s in stage.slices})
+        )
+        gdn_rows = bucket_rows = bucket_count = segments = states = 0
+        max_bucket = exchange_send = exchange_recv = 0
+        if decision is not None:
+            gdn_rows = decision.gdn_token_counts_by_rank[rank]
+            gdn = _plan_gdn_rank_execution(
+                planning_key=planning_key,
+                bundle=bundle,
+                topology=topology,
+                cp_rank=rank,
+                gdn_planner_config=gdn_planner_config,
+            )
+            buckets = [
+                bucket
+                for depth in gdn.tree_segment_buckets_by_depth
+                + gdn.tree_chain_buckets_by_depth
+                for bucket in depth
+            ]
+            bucket_rows = sum(b.length * b.segment_count for b in buckets)
+            max_bucket = max((b.length for b in buckets), default=0)
+            bucket_count = len(buckets)
+            segments = sum(b.segment_count for b in buckets)
+            states = sum(b.segment_count * int(b.needs_final_state) for b in buckets)
+            if gdn.attention_to_gdn is not None:
+                exchange_send = gdn.attention_to_gdn.source_token_counts_by_rank[rank]
+                exchange_recv = gdn.attention_to_gdn.dest_token_counts_by_rank[rank]
+        loads.append(
+            (
+                max(attention_rows, gdn_rows),
+                attention_rows,
+                gdn_rows,
+                max(qs, default=0),
+                max(ks, default=0),
+                sum(qs),
+                sum(ks),
+                sum(pairs),
+                max(pairs, default=0),
+                sum(plan.remote_dkv_reduce_plan.recv_splits),
+                sum(plan.remote_dkv_reduce_plan.send_splits),
+                len(stages),
+                len(plan.local_row_ranges),
+                bucket_rows,
+                max_bucket,
+                bucket_count,
+                segments,
+                states,
+                exchange_send,
+                exchange_recv,
+            )
+        )
+    family = _json_cache_key(
+        {
+            "version": 1,
+            "attention_config": _dataclass_payload(config),
+            "masks": masks,
+            "gdn_config": _gdn_planner_config_cache_key(gdn_planner_config),
+            "gdn": None
+            if decision is None
+            else (
+                decision.depth_count,
+                decision.chained_nodes,
+                decision.tree_has_children,
+            ),
+        }
+    )
+    return family, tuple(loads)
+
+
 def _normalized_chunk_size(
     *,
     valid_tokens: int,

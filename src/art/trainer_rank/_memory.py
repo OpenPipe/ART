@@ -39,17 +39,46 @@ class _ScopedMemorySignature(_impl._MemorySignature):
     bounded_caller_peak: bool = False
 
 
+_CPWorkload = tuple[str, tuple[tuple[int, ...], ...]]
+_CPCallerPeak = tuple[int, int, str, tuple[tuple[int, ...], ...]]
+
+
 @dataclass(frozen=True)
 class _CallerMemoryProfile(_impl._MemoryProfile):
     caller_compute_peaks: tuple[tuple[int, int], ...] = ()
     compute_peak_floor: int = 0
+    caller_cp_peaks: tuple[_CPCallerPeak, ...] = ()
 
-    def compute_peak(self, tokens: int | float) -> float:
-        # Only a complete covering caller can justify discounting the pinned
-        # max rate. Forward/split/incomplete readings never extend this range.
-        for length, peak in self.caller_compute_peaks:
-            if tokens <= length:
-                return max(peak, self.compute_peak_floor)
+    def compute_peak(
+        self,
+        tokens: int | float,
+        *,
+        context_parallel: bool = False,
+        cp_workload: _CPWorkload | None = None,
+    ) -> float:
+        # CP peaks are rank-local. Require componentwise coverage on every
+        # rank, including workspace geometry; a max-rank comparison could reuse
+        # another rank's larger reading without ever measuring this rank's load.
+        if context_parallel:
+            if cp_workload is not None:
+                family, loads = cp_workload
+                for length, peak, measured_family, measured in self.caller_cp_peaks:
+                    if (
+                        tokens <= length
+                        and family == measured_family
+                        and len(loads) == len(measured)
+                        and all(
+                            len(want) == len(have)
+                            and all(w <= h for w, h in zip(want, have, strict=True))
+                            for want, have in zip(loads, measured, strict=True)
+                        )
+                    ):
+                        return max(peak, self.compute_peak_floor)
+        else:
+            # Preserve #1165's CP1 curve and arithmetic exactly.
+            for length, peak in self.caller_compute_peaks:
+                if tokens <= length:
+                    return max(peak, self.compute_peak_floor)
         # No discounted extrapolation: even a higher short reload cannot erase
         # earlier growth constraints beyond the measured caller extent.
         return max(self.bytes_per_token * tokens, self.compute_peak_floor)
@@ -1708,13 +1737,21 @@ def _memory_signature_from_requests(
         )
     )
     # Single-root checkpointed MoE training has fixed head/adapter workspace.
-    # Keep its complete caller peaks separate from multi-root/forward profiles.
+    # Keep its complete caller peaks separate by topology and from forward or
+    # multi-root profiles. CP observations use global TP-padded packed tokens,
+    # as admission does. CP ownership need not be monotone in global length:
+    # a shorter root can give a rank more model rows and different workspace.
+    # CP discounts require a covering global length AND per-rank ownership
+    # and workspace in the same attention/GDN family. Each rank uses its own
+    # complete peak; collective admission still checks every local fit.
     caller_bounded = (
         len(requests) == slot_group_count == 1
         and requests[0].input_tokens.ndim == 1
         and modes == (True,)
         and _impl._request_mix_key(requests[0]) == "target:single"
-        and topology == (1, 1, 1, 1)
+        and topology[0] == topology[1] == topology[3] == 1
+        and topology[2] >= 1
+        and self._parallel_shape.cp == topology[2]
         and self._parallel_shape.ep == self._parallel_shape.etp == 1
         and self._moe_layers
         and self._moe_memory_supported
@@ -1849,6 +1886,7 @@ def _memory_check(
             head_workspace_bytes=self._plan_head_workspace_bytes(forward),
             checkpoint_floor=_impl._gdn_memory.plan_floor(self, forward),
             retained_tokens=self._plan_retained_tokens(forward),
+            caller_cp_workload=getattr(forward, "caller_cp_workload", None),
         ) + int(self._plan_hybridep_growth_bytes(forward) * _impl._MEMORY_SAFETY_FACTOR)
     return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
@@ -1977,6 +2015,7 @@ def _estimate_required_memory_bytes_from_values(
     retained_tokens: int | None = None,
     include_checkpoint_input_gradient: bool = True,
     checkpoint_memory: tuple[int, int] | None = None,
+    caller_cp_workload: _CPWorkload | None = None,
 ) -> int:
     if packed_tokens <= 0:
         return output_bytes
@@ -2164,7 +2203,9 @@ def _estimate_required_memory_bytes_from_values(
         )
         if isinstance(profiled, _CallerMemoryProfile):
             profiled_bytes = profiled.compute_peak(
-                profiled_tokens(profiled.logical_per_packed)
+                profiled_tokens(profiled.logical_per_packed),
+                context_parallel=signature.topology[2] > 1,
+                cp_workload=caller_cp_workload,
             )
         elif (
             isinstance(profiled, _BoundedMemoryProfile)
@@ -2395,9 +2436,32 @@ def _update_memory_profile(
             observations.append((length, peak))
         if len(observations) > 8:
             observations = [observations[0], *observations[-7:]]
+        cp_peaks = {
+            (length, family, loads): compute
+            for length, compute, family, loads in (
+                previous.caller_cp_peaks
+                if isinstance(previous, _CallerMemoryProfile)
+                else ()
+            )
+        }
+        cp_workload = getattr(plan, "caller_cp_workload", None)
+        if caller_phase and plan.signature.topology[2] > 1 and cp_workload is not None:
+            family, loads = cp_workload
+            key = (plan.packed_tokens, family, loads)
+            cp_peaks[key] = max(compute_delta, cp_peaks.get(key, 0))
+        cp_observations = sorted(
+            (length, compute, family, loads)
+            for (length, family, loads), compute in cp_peaks.items()
+        )
+        # Never merge different ownership vectors into a synthetic measurement.
+        # Evicting evidence only removes permission to discount, not the shared
+        # max rate or floor. Bound storage like the CP1 curve.
+        if len(cp_observations) > 8:
+            cp_observations = [cp_observations[0], *cp_observations[-7:]]
         self._memory_profiles[plan.signature] = _CallerMemoryProfile(
             **vars(self._memory_profiles[plan.signature]),
             caller_compute_peaks=tuple(observations),
+            caller_cp_peaks=tuple(cp_observations),
             compute_peak_floor=max(
                 compute_delta,
                 previous.compute_peak_floor

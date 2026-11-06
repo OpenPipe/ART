@@ -548,6 +548,7 @@ def _plan_cost(self: TrainerRank, plan: _FlatForwardPlan) -> _SubforwardCost:
         checkpoint_floor=_impl._gdn_memory.plan_floor(self, plan),
         retained_tokens=self._plan_retained_tokens(plan),
         hybridep_growth_bytes=self._plan_hybridep_growth_bytes(plan),
+        caller_cp_workload=getattr(plan, "caller_cp_workload", None),
     )
 
 
@@ -1358,7 +1359,7 @@ def _plan_flat_forward(
                 )
             )
 
-        return _impl._FlatForwardPlan(
+        plan = _impl._FlatForwardPlan(
             request_count=len(requests),
             output_metadata=tuple(
                 self._forward_output_metadata(request, checkpoint=checkpoint)
@@ -1380,6 +1381,39 @@ def _plan_flat_forward(
             inactive_logical_tokens=logical_tokens
             - _impl._active_logical_tokens(requests),
         )
+        if (
+            getattr(plan.signature, "bounded_caller_peak", False)
+            and plan.signature.topology[2] > 1
+        ):
+            from art.megatron.context_parallel.runtime import (
+                context_parallel_memory_workload,
+            )
+            from art.megatron.training.microbatches import (
+                _context_parallel_config_for_provider,
+                _gdn_planner_config_for_provider,
+            )
+
+            batch = _impl._pad_packed_batch(
+                plan.groups[0].packed, multiple=plan.signature.topology[1]
+            )
+            handler = self.runtime.model_support_handler
+            plan = replace(
+                plan,
+                caller_cp_workload=context_parallel_memory_workload(
+                    group_ids=batch.group_ids,
+                    parent_ids=batch.parent_ids,
+                    topology=self._topology(),
+                    config=_context_parallel_config_for_provider(
+                        self.runtime.provider, self.device, handler
+                    ),
+                    original_seq_len=int(batch.tokens.shape[1]),
+                    build_gdn_execution_spec=handler.build_gdn_execution_spec,
+                    gdn_planner_config=_gdn_planner_config_for_provider(
+                        self.runtime.provider, handler
+                    ),
+                ),
+            )
+        return plan
 
 
 def _fill_planner_snapshot(
@@ -1422,6 +1456,9 @@ def _fill_planner_snapshot(
                         "logical_tokens": child.active_logical_tokens,
                         "gdn_segments": child.grad_segment_count,
                         "retained_tokens": self._plan_retained_tokens(child),
+                        "caller_cp_workload": getattr(
+                            child, "caller_cp_workload", None
+                        ),
                         "group_rows": self._plan_group_rows(child),
                         "hybridep_growth_bytes": (
                             self._plan_hybridep_growth_bytes(child)

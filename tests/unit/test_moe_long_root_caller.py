@@ -1,6 +1,8 @@
 """CPU learning contract; no claim about unobserved CUDA workspace."""
 
-from dataclasses import replace
+from dataclasses import asdict, replace
+import pickle
+import sys
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -23,11 +25,57 @@ def signature():
     )
 
 
+def classify(rank, requests=None, *, mode=True, groups=1):
+    if requests is None:
+        requests = [
+            ForwardInput(
+                input_tokens=torch.arange(128), target_tokens=torch.arange(128)
+            )
+        ]
+    return m._memory_signature_from_requests(
+        cast(Any, rank), requests, slot_group_count=groups, grad_modes=(mode,)
+    )
+
+
+@pytest.fixture(params=(1, 2, 4, 8), ids=lambda cp: f"cp{cp}")
+def caller_rank(request, monkeypatch):
+    cp = request.param
+    monkeypatch.setitem(
+        sys.modules,
+        "art.megatron.context_parallel.checkpoint",
+        SimpleNamespace(current_checkpoint_partition=lambda: None),
+    )
+    monkeypatch.setattr(m, "_checkpoint_layers", lambda *args: 40)
+    rank = memory_rank()
+    rank._topology_key = lambda: (1, 1, cp, 1)
+    rank._coefficient_version = 2
+    rank._coefficient_table = "test"
+    rank._slot_memory_shapes = lambda _: ()
+    rank._parallel_shape = SimpleNamespace(ep=1, etp=1, cp=cp)
+    rank._moe_layers = 40
+    rank._moe_memory_supported = True
+    rank._dense_fc1_adapted = False
+    return rank
+
+
+@pytest.fixture
+def caller_signature(caller_rank):
+    sig = classify(caller_rank)
+    assert isinstance(sig, m._ScopedMemorySignature) and sig.bounded_caller_peak
+    assert not sig.bounded_forward_peak
+    return sig
+
+
+def synthetic_workload(cp, rows):
+    return ("synthetic", tuple((rows // cp + 128,) for _ in range(cp)))
+
+
 def observe(rank, sig, rows, peak, caller=True):
     plan = cast(
         Any,
         SimpleNamespace(
             packed_tokens=rows,
+            caller_cp_workload=synthetic_workload(sig.topology[2], rows),
             active_logical_tokens=rows,
             output_bytes=0,
             signature=sig,
@@ -36,8 +84,8 @@ def observe(rank, sig, rows, peak, caller=True):
     m._update_memory_profile(rank, plan, peak, retained_bytes=None, caller_phase=caller)
 
 
-def test_caller_seed_and_reload_transients_remain_bounded():
-    r, sig = SimpleNamespace(_memory_profiles={}), signature()
+def test_caller_seed_and_reload_transients_remain_bounded(caller_signature):
+    r, sig = SimpleNamespace(_memory_profiles={}), caller_signature
     observe(r, sig, 128, 1_075_000_000, caller=False)
     assert r._memory_profiles[sig].caller_compute_peaks == ()
     observe(r, sig, 128, 1_075_000_000)
@@ -54,8 +102,8 @@ def test_caller_seed_and_reload_transients_remain_bounded():
     assert p.compute_peak(131073) >= p.compute_peak(131072)
 
 
-def test_higher_forward_cannot_be_lost_after_caller_seed():
-    r, sig = SimpleNamespace(_memory_profiles={}), signature()
+def test_higher_forward_cannot_be_lost_after_caller_seed(caller_signature):
+    r, sig = SimpleNamespace(_memory_profiles={}), caller_signature
     observe(r, sig, 8192, 4_000_000_000)
     observe(r, sig, 8192, 6_000_000_000, caller=False)
     assert r._memory_profiles[sig].compute_peak(8192) == 6_000_000_000
@@ -65,38 +113,67 @@ def test_higher_forward_cannot_be_lost_after_caller_seed():
     assert not isinstance(r._memory_profiles[other], m._BoundedMemoryProfile)
 
 
-def test_only_supported_single_root_training_gets_a_caller_profile(monkeypatch):
-    import sys
-
-    monkeypatch.setitem(
-        sys.modules,
-        "art.megatron.context_parallel.checkpoint",
-        SimpleNamespace(current_checkpoint_partition=lambda: None),
-    )
-    monkeypatch.setattr(m, "_checkpoint_layers", lambda *args: 40)
-    r = SimpleNamespace(
-        _topology_key=lambda: (1, 1, 1, 1),
-        _coefficient_version=2,
-        _coefficient_table="test",
-        _slot_memory_shapes=lambda _: (),
-        _parallel_shape=SimpleNamespace(ep=1, etp=1, cp=1),
-        _moe_layers=40,
-        _moe_memory_supported=True,
-    )
+def test_only_supported_single_root_training_gets_a_caller_profile(caller_rank):
     request = ForwardInput(
         input_tokens=torch.arange(128), target_tokens=torch.arange(128)
     )
 
-    def classify(requests, mode=True):
-        return m._memory_signature_from_requests(
-            cast(Any, r), requests, slot_group_count=1, grad_modes=(mode,)
+    assert classify(caller_rank, [request]).bounded_caller_peak
+    for requests, mode, groups in (
+        ([request], False, 1),
+        ([request, request], True, 1),
+        ([request], True, 2),
+        ([replace(request, input_tokens=torch.arange(128).reshape(1, -1))], True, 1),
+        ([ForwardInput(input_tokens=torch.arange(128), hidden_states=True)], True, 1),
+    ):
+        assert not getattr(
+            classify(caller_rank, requests, mode=mode, groups=groups),
+            "bounded_caller_peak",
+            False,
         )
 
-    assert classify([request]).bounded_caller_peak
-    assert not getattr(classify([request], False), "bounded_caller_peak", False)
-    assert not getattr(classify([request, request]), "bounded_caller_peak", False)
-    r._topology_key = lambda: (1, 1, 2, 1)
-    assert not getattr(classify([request]), "bounded_caller_peak", False)
+
+@pytest.mark.parametrize(
+    "scope",
+    (
+        "dp",
+        "tp",
+        "pp",
+        "ep",
+        "etp",
+        "cp-mismatch",
+        "cp-zero",
+        "dense",
+        "unsupported",
+        "recompute",
+    ),
+)
+def test_unsupported_geometry_keeps_ordinary_profile(caller_rank, monkeypatch, scope):
+    rank = caller_rank
+    topology = list(rank._topology_key())
+    if scope in ("dp", "tp", "pp"):
+        topology[{"dp": 0, "tp": 1, "pp": 3}[scope]] = 2
+    elif scope in ("ep", "etp"):
+        setattr(rank._parallel_shape, scope, 2)
+    elif scope == "cp-mismatch":
+        rank._parallel_shape.cp = topology[2] * 2
+    elif scope == "cp-zero":
+        topology[2] = rank._parallel_shape.cp = 0
+    elif scope == "dense":
+        rank._moe_layers = 0
+    elif scope == "unsupported":
+        rank._moe_memory_supported = False
+    else:
+        monkeypatch.setattr(m, "_checkpoint_layers", lambda *args: 0)
+    rank._topology_key = lambda: tuple(topology)
+    assert not getattr(classify(rank), "bounded_caller_peak", False)
+
+
+@pytest.mark.parametrize("cp", (3, 16))
+def test_caller_coverage_does_not_need_a_fixed_cp_degree(caller_rank, cp):
+    caller_rank._topology_key = lambda: (1, 1, cp, 1)
+    caller_rank._parallel_shape.cp = cp
+    assert classify(caller_rank).bounded_caller_peak
 
 
 def memory_rank():
@@ -120,38 +197,70 @@ def memory_rank():
     return r
 
 
-def test_static_floor_and_safety_factor_are_retained():
-    r, sig = memory_rank(), signature()
+def test_static_floor_and_safety_factor_are_retained(caller_rank, caller_signature):
+    r, sig = caller_rank, caller_signature
     observe(r, sig, 8192, 4_000_000_000)
     required = m._estimate_required_memory_bytes_from_values(
         cast(Any, r),
         packed_tokens=8192,
+        caller_cp_workload=synthetic_workload(sig.topology[2], 8192),
         logical_tokens=8192,
         output_bytes=0,
         signature=sig,
-        group_rows=((8192, True),),
+        group_rows=((8192 // sig.topology[2] + 128, True),),
     )
     assert required == int(24 * 2**30 * 1.1)
 
 
+def test_covering_local_workload_discounts_an_unmeasured_shorter_root(
+    caller_rank, caller_signature
+):
+    rank, sig = caller_rank, caller_signature
+    observe(rank, sig, 128, 16 * 2**30)
+    observe(rank, sig, 8192, 4 * 2**30)
+
+    def required(tokens):
+        return m._estimate_required_memory_bytes_from_values(
+            cast(Any, rank),
+            packed_tokens=tokens,
+            caller_cp_workload=synthetic_workload(sig.topology[2], tokens),
+            logical_tokens=tokens,
+            output_bytes=0,
+            signature=sig,
+            group_rows=((tokens // sig.topology[2] + 128, True),),
+        )
+
+    assert required(8192) == int(24 * 2**30 * 1.1)
+    shorter = required(8191)
+    assert shorter == int(24 * 2**30 * 1.1)
+    if sig.topology[2] > 1:
+        profile = rank._memory_profiles[sig]
+        assert (
+            profile.compute_peak(8191, context_parallel=True)
+            >= profile.bytes_per_token * 8191
+        )
+
+
 @pytest.mark.parametrize("forward_peak", [1_000_000_000, 20 * 2**30])
-def test_forward_only_long_root_cannot_lower_requirement(forward_peak):
-    r, sig = SimpleNamespace(_memory_profiles={}), signature()
+def test_forward_only_long_root_cannot_lower_requirement(
+    forward_peak, caller_signature
+):
+    r, sig = SimpleNamespace(_memory_profiles={}), caller_signature
     observe(r, sig, 8192, 16 * 2**30)
     before = r._memory_profiles[sig].compute_peak(32768)
     observe(r, sig, 32768, forward_peak, caller=False)
     assert r._memory_profiles[sig].compute_peak(32768) >= before
 
 
-def test_first_incomplete_forward_survives_complete_seed():
-    r, sig = SimpleNamespace(_memory_profiles={}), signature()
+def test_first_incomplete_forward_survives_complete_seed(caller_signature):
+    r, sig = SimpleNamespace(_memory_profiles={}), caller_signature
     observe(r, sig, 8192, 12_000_000_000, caller=False)
     observe(r, sig, 8192, 4_000_000_000)
     assert r._memory_profiles[sig].compute_peak(8192) >= 12_000_000_000
 
 
-def test_short_reload_never_lowers_extrapolated_requirement():
-    r, sig = SimpleNamespace(_memory_profiles={}), signature()
+def test_short_reload_never_lowers_extrapolated_requirement(caller_signature):
+    r, sig = SimpleNamespace(_memory_profiles={}), caller_signature
     observe(r, sig, 2048, 4_000_000_000)
     observe(r, sig, 8192, 12_000_000_000)
     before = r._memory_profiles[sig].compute_peak(32768)
@@ -159,8 +268,8 @@ def test_short_reload_never_lowers_extrapolated_requirement():
     assert r._memory_profiles[sig].compute_peak(32768) >= before
 
 
-def test_no_discount_beyond_complete_caller_extent():
-    r, sig = SimpleNamespace(_memory_profiles={}), signature()
+def test_no_discount_beyond_complete_caller_extent(caller_signature):
+    r, sig = SimpleNamespace(_memory_profiles={}), caller_signature
     pinned = replace(sig, bounded_caller_peak=False)
     for rows, peak, caller in (
         (128, 1_075_000_000, False),
@@ -224,17 +333,20 @@ def test_incomplete_caller_never_extends_backward_curve(monkeypatch, termination
     assert r._memory_profiles[sig].compute_peak(32768) >= before
 
 
-def test_forward_only_root_cannot_turn_refusal_into_admission():
-    r, sig = memory_rank(), signature()
+def test_forward_only_root_cannot_turn_refusal_into_admission(
+    caller_rank, caller_signature
+):
+    r, sig = caller_rank, caller_signature
 
     def required():
         return m._estimate_required_memory_bytes_from_values(
             cast(Any, r),
             packed_tokens=32768,
+            caller_cp_workload=synthetic_workload(sig.topology[2], 32768),
             logical_tokens=32768,
             output_bytes=0,
             signature=sig,
-            group_rows=((32768, True),),
+            group_rows=((32768 // sig.topology[2] + 128, True),),
         )
 
     observe(r, sig, 8192, 16 * 2**30)
@@ -248,8 +360,8 @@ def test_forward_only_root_cannot_turn_refusal_into_admission():
     assert int(24 * 2**30 * 1.1) <= required() < 40 * 2**30
 
 
-def test_observation_pruning_preserves_all_peak_floors():
-    r, sig = SimpleNamespace(_memory_profiles={}), signature()
+def test_observation_pruning_preserves_all_peak_floors(caller_signature):
+    r, sig = SimpleNamespace(_memory_profiles={}), caller_signature
     observe(r, sig, 8192, 50_000_000_000, caller=False)
     for length in range(128, 32769, 128):
         observe(r, sig, length, 1_000_000_000 + length * 300_000)
@@ -259,3 +371,95 @@ def test_observation_pruning_preserves_all_peak_floors():
     values = [profile.compute_peak(n) for n in range(128, 131073, 128)]
     assert min(values) >= 50_000_000_000
     assert values == sorted(values)
+
+
+def test_tiny_callers_cannot_poison_a_measured_long_root(caller_rank, caller_signature):
+    r, sig = caller_rank, caller_signature
+    cp, tokens = sig.topology[2], 9216
+
+    def required():
+        return m._estimate_required_memory_bytes_from_values(
+            cast(Any, r),
+            packed_tokens=tokens,
+            caller_cp_workload=synthetic_workload(sig.topology[2], tokens),
+            logical_tokens=tokens,
+            output_bytes=0,
+            signature=sig,
+            # Ownership can be uneven; packed length is still the global 9K.
+            group_rows=((tokens // cp + 128, True),),
+        )
+
+    for _ in range(2):
+        observe(r, sig, 128, 1_075_000_000)
+    assert required() > 40 * 2**30
+    observe(r, sig, tokens, 4_000_000_000, caller=False)
+    assert required() > 40 * 2**30
+    # Measuring 1.1K packed tokens on CP8 cannot cover a 9K packed root.
+    observe(r, sig, tokens // cp, 4_000_000_000)
+    if cp > 1:
+        assert required() > 40 * 2**30
+    observe(r, sig, tokens, 4_000_000_000)
+    assert required() == int(24 * 2**30 * 1.1) < 40 * 2**30
+    # A later tiny caller/reload remains a fixed floor within this coverage.
+    observe(r, sig, 128, 12_000_000_000)
+    profile = r._memory_profiles[sig]
+    assert profile.compute_peak(tokens) == 12_000_000_000
+    assert required() < 40 * 2**30
+    assert profile.compute_peak(tokens + 1) >= profile.bytes_per_token * (tokens + 1)
+
+
+def test_profile_roundtrip_preserves_topology_coverage_and_floors(
+    caller_rank, caller_signature, tmp_path
+):
+    r, sig = caller_rank, caller_signature
+    observe(r, sig, 128, 1_075_000_000)
+    observe(r, sig, 8192, 4_000_000_000)
+    observe(r, sig, 32768, 6_000_000_000, caller=False)
+    # Profiles are rank-local in memory; exercise their serialization without
+    # claiming ART saves/loads caller calibration with model checkpoints.
+    path = tmp_path / "profiles.pkl"
+    path.write_bytes(pickle.dumps(r._memory_profiles))
+    restored = pickle.loads(path.read_bytes())
+    assert restored == r._memory_profiles
+    profile = restored[sig]
+    assert isinstance(profile, m._CallerMemoryProfile)
+    assert asdict(sig)["topology"] == r._topology_key()
+    assert asdict(profile)["caller_compute_peaks"] == (
+        (128, 1_075_000_000),
+        (8192, 4_000_000_000),
+    )
+    assert profile.compute_peak(8192) == 6_000_000_000
+    assert profile.compute_peak(8193) >= profile.bytes_per_token * 8193
+    # No curve crosses into another CP cohort or an ordinary signature.
+    assert replace(sig, topology=(1, 1, sig.topology[2] * 2, 1)) not in restored
+    assert replace(sig, bounded_caller_peak=False) not in restored
+    r._memory_profiles = restored
+    observe(r, sig, 8192, 7_000_000_000)
+    assert r._memory_profiles[sig].compute_peak(8192) == 7_000_000_000
+
+
+def test_split_digest_distinguishes_cp_and_caller_scope(caller_signature, monkeypatch):
+    from test_trainer_rank_split_peak import _counter_split
+
+    from art.trainer_rank import _impl
+
+    r, requests, _ = _counter_split(monkeypatch)
+    flat = replace(r._plan_flat_forward(requests[:1]), signature=caller_signature)
+
+    def key(sig):
+        child = replace(flat, signature=sig)
+        return m._split_memory_key(_impl._SplitForwardPlan((child,), ((0,),), 1))
+
+    original = key(caller_signature)
+    assert original is not None and len(original) == 32
+    assert key(pickle.loads(pickle.dumps(caller_signature))) == original
+    assert key(replace(caller_signature, bounded_caller_peak=False)) != original
+    assert key(replace(caller_signature, bounded_forward_peak=True)) != original
+    assert (
+        key(
+            replace(
+                caller_signature, topology=(1, 1, caller_signature.topology[2] * 2, 1)
+            )
+        )
+        != original
+    )

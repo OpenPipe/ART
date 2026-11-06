@@ -1028,6 +1028,7 @@ class _FlatForwardPlan:
     signature: _MemorySignature
     selected_max_depth: int = 0
     inactive_logical_tokens: int = 0
+    caller_cp_workload: _memory._CPWorkload | None = None
 
     @property
     def active_logical_tokens(self) -> int:
@@ -3032,6 +3033,7 @@ class TrainerRank:
         checkpoint_floor: tuple[int, int] = (0, 0),
         retained_tokens: int | None = None,
         hybridep_growth_bytes: int = 0,
+        caller_cp_workload: _memory._CPWorkload | None = None,
     ) -> _SubforwardCost:
         checkpoint_memory = self._sequence_parallel_lora_floor(
             self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments),
@@ -3051,6 +3053,7 @@ class TrainerRank:
             retained_tokens=retained_tokens,
             include_checkpoint_input_gradient=False,
             checkpoint_memory=checkpoint_memory,
+            caller_cp_workload=caller_cp_workload,
         )
         checkpoint_retained, checkpoint_workspace = checkpoint_memory
         retained = self._retained_memory_bytes(

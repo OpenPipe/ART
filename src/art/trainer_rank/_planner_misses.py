@@ -695,7 +695,48 @@ def _signature_values(values: dict[str, Any]) -> dict[str, Any]:
             normalized.append(tuple(shape))
         slots.append((enabled, tuple(normalized)))
     values["slot_shapes"] = tuple(slots)
+    if values.get("checkpoint_partition") is not None:
+        degree, shape = values["checkpoint_partition"]
+        values["checkpoint_partition"] = (degree, tuple(shape))
     return values
+
+
+def _memory_signature(values: dict[str, Any]) -> Any:
+    from . import _impl, _memory
+
+    cls = (
+        _memory._ScopedMemorySignature
+        if any(
+            name in values
+            for name in (
+                "checkpoint_partition",
+                "bounded_forward_peak",
+                "bounded_caller_peak",
+            )
+        )
+        else _impl._MemorySignature
+    )
+    return cls(**_signature_values(values))
+
+
+def _memory_profile(values: dict[str, Any]) -> Any:
+    from . import _impl, _memory
+
+    values = dict(values)
+    cls = _impl._MemoryProfile
+    for field, profile_cls in (
+        ("caller_compute_peaks", _memory._CallerMemoryProfile),
+        ("forward_compute_peaks", _memory._BoundedMemoryProfile),
+    ):
+        if field in values:
+            values[field] = tuple(tuple(point) for point in values[field])
+            cls = profile_cls
+    if "caller_cp_peaks" in values:
+        values["caller_cp_peaks"] = tuple(
+            (length, peak, family, tuple(tuple(rank) for rank in loads))
+            for length, peak, family, loads in values["caller_cp_peaks"]
+        )
+    return cls(**values)
 
 
 def replay(
@@ -856,7 +897,13 @@ def replay(
     for estimate_index, item in enumerate(state["estimates"]):
         if "cost_components" not in item:
             raise ValueError("incomplete replay: expected cost components unavailable")
-        arguments = item["arguments"]
+        arguments = dict(item["arguments"])
+        if arguments.get("caller_cp_workload") is not None:
+            family, loads = arguments["caller_cp_workload"]
+            arguments["caller_cp_workload"] = (
+                family,
+                tuple(tuple(rank) for rank in loads),
+            )
         grouped = arguments.get("group_rows") not in ([], ())
         if (
             item.get("missing_inputs")
@@ -907,13 +954,13 @@ def replay(
                 request_cursor += count
                 group_cursor += 1
             arguments = rank.verified_arguments(arguments)
-        key = _impl._MemorySignature(**_signature_values(item["signature"]))
+        key = _memory_signature(item["signature"])
         if grouped and _adapter_ranks_unavailable(
             rank._topology_key(), item["runtime_facts"], key
         ):
             raise ValueError("incomplete replay: TP x SP adapter ranks unavailable")
         rank._memory_profiles = (
-            {key: _impl._MemoryProfile(**item["profile"])}
+            {key: _memory_profile(item["profile"])}
             if item["profile"] is not None
             else {}
         )
