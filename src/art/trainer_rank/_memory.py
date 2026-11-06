@@ -1708,13 +1708,17 @@ def _memory_signature_from_requests(
         )
     )
     # Single-root checkpointed MoE training has fixed head/adapter workspace.
-    # Keep its complete caller peaks separate from multi-root/forward profiles.
+    # Keep its complete caller peaks separate by topology and from forward or
+    # multi-root profiles. CP observations use global TP-padded packed tokens,
+    # as admission does; per-rank CP rows independently price analytic floors.
     caller_bounded = (
         len(requests) == slot_group_count == 1
         and requests[0].input_tokens.ndim == 1
         and modes == (True,)
         and _impl._request_mix_key(requests[0]) == "target:single"
-        and topology == (1, 1, 1, 1)
+        and topology[0] == topology[1] == topology[3] == 1
+        and topology[2] >= 1
+        and self._parallel_shape.cp == topology[2]
         and self._parallel_shape.ep == self._parallel_shape.etp == 1
         and self._moe_layers
         and self._moe_memory_supported
