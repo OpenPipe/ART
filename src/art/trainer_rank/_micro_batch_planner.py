@@ -548,7 +548,7 @@ def _plan_cost(self: TrainerRank, plan: _FlatForwardPlan) -> _SubforwardCost:
         checkpoint_floor=_impl._gdn_memory.plan_floor(self, plan),
         retained_tokens=self._plan_retained_tokens(plan),
         hybridep_growth_bytes=self._plan_hybridep_growth_bytes(plan),
-        caller_cp_workload=plan.caller_cp_workload,
+        caller_cp_workload=getattr(plan, "caller_cp_workload", None),
     )
 
 
@@ -1456,7 +1456,9 @@ def _fill_planner_snapshot(
                         "logical_tokens": child.active_logical_tokens,
                         "gdn_segments": child.grad_segment_count,
                         "retained_tokens": self._plan_retained_tokens(child),
-                        "caller_cp_workload": child.caller_cp_workload,
+                        "caller_cp_workload": getattr(
+                            child, "caller_cp_workload", None
+                        ),
                         "group_rows": self._plan_group_rows(child),
                         "hybridep_growth_bytes": (
                             self._plan_hybridep_growth_bytes(child)

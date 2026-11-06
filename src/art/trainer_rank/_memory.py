@@ -1886,7 +1886,7 @@ def _memory_check(
             head_workspace_bytes=self._plan_head_workspace_bytes(forward),
             checkpoint_floor=_impl._gdn_memory.plan_floor(self, forward),
             retained_tokens=self._plan_retained_tokens(forward),
-            caller_cp_workload=forward.caller_cp_workload,
+            caller_cp_workload=getattr(forward, "caller_cp_workload", None),
         ) + int(self._plan_hybridep_growth_bytes(forward) * _impl._MEMORY_SAFETY_FACTOR)
     return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
