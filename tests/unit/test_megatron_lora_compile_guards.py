@@ -331,3 +331,26 @@ def test_state_dict_and_export_names(lm, kind):
     slot_exports = restored.sharded_lora_state_dict(ref)
     assert slot_exports.keys() == exports.keys()
     assert all(torch.equal(slot_exports[key], value) for key, value in exports.items())
+
+
+@pytest.mark.parametrize("kind", ["dense", "expert", "shared_a", "shared_b"])
+def test_reassigned_metadata_refreshes_forward_flags(lm, kind):
+    # Fixtures and handlers reassign these after construction; forward's cached
+    # booleans must follow, as the attributes they replace did.
+    lora = make_lora(lm, 0, kind)
+    assert (lora._shared_a, lora._shared_b) == (kind == "shared_a", kind == "shared_b")
+    assert lora.num_local_experts == (1 if kind == "dense" else 3)
+    lora.shared_factor = None
+    assert not lora._shared_a and not lora._shared_b
+    lora.shared_factor = "B"
+    assert lora._shared_b and not lora._shared_a
+    assert not lora._shared_outer_kernel
+    lora.lora_layout = replace(lora.lora_layout, shared_outer_kernel=True)
+    assert lora._shared_outer_kernel and lora.lora_layout.shared_outer_kernel
+    lora.adapter_model_prefix = "layer0"
+    assert not lora.is_expert and lora.num_local_experts == 1
+    lora.adapter_model_prefix = "layer0.{expert}"
+    assert lora.is_expert
+    assert lora.num_local_experts == (1 if kind == "dense" else 3)
+    assert "_adapter_model_prefix" not in dict(lora.named_buffers())
+    assert set(lora.state_dict()) == {"A_T", "B_T"}
