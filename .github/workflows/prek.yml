@@ -239,6 +239,11 @@ jobs:
             tests/unit/test_trainer_rank_adapter_gradient_memory.py \
             tests/unit/test_trainer_rank_slot_memory.py \
             tests/unit/test_trainer_rank_moe_memory.py \
+            tests/unit/test_moe_caller_cp_coverage.py \
+            tests/unit/test_moe_caller_cp_invariants.py \
+            tests/unit/test_moe_caller_cp_ownership.py \
+            tests/unit/test_moe_caller_report_replay.py \
+            tests/unit/test_moe_long_root_caller.py \
             tests/unit/test_trainer_rank_head_memory.py \
             tests/unit/test_trainer_rank_eager_head_memory.py::test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound \
             tests/unit/test_grouped_planner_replay.py \
@@ -255,6 +260,7 @@ jobs:
             tests/unit/test_canonical_numerics.py \
             tests/unit/test_segmented_expert_lora.py \
             tests/unit/test_segmented_gdn.py \
+            tests/unit/test_gdn_empty_shards.py \
             tests/unit/test_segmented_router.py \
             tests/unit/test_lora_layouts.py \
             tests/unit/test_trainer_rank_forward_profile.py \
@@ -303,11 +309,17 @@ jobs:
             --ignore=tests/unit/test_trainer_rank_adapter_gradient_memory.py \
             --ignore=tests/unit/test_trainer_rank_slot_memory.py \
             --ignore=tests/unit/test_trainer_rank_moe_memory.py \
+            --ignore=tests/unit/test_moe_caller_cp_coverage.py \
+            --ignore=tests/unit/test_moe_caller_cp_invariants.py \
+            --ignore=tests/unit/test_moe_caller_cp_ownership.py \
+            --ignore=tests/unit/test_moe_caller_report_replay.py \
+            --ignore=tests/unit/test_moe_long_root_caller.py \
             --ignore=tests/unit/test_trainer_rank_head_memory.py \
             --ignore=tests/unit/test_grouped_planner_replay.py \
             --ignore=tests/unit/test_canonical_numerics.py \
             --ignore=tests/unit/test_segmented_expert_lora.py \
             --ignore=tests/unit/test_segmented_gdn.py \
+            --ignore=tests/unit/test_gdn_empty_shards.py \
             --ignore=tests/unit/test_segmented_router.py \
             --ignore=tests/unit/test_lora_layouts.py \
             --ignore=tests/unit/test_trainer_rank_forward_profile.py \

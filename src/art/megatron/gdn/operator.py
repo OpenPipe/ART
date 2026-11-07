@@ -1580,8 +1580,10 @@ def _restore_hidden_from_cp_flat(
         )
     if int(flat.shape[0]) < token_count:
         padded = flat.new_zeros((token_count, hidden_size))
-        if int(flat.shape[0]) > 0:
-            padded[: int(flat.shape[0])] = flat
+        # Even an empty copy must retain the layout exchange's autograd edge.
+        # Otherwise an empty CP rank returns detached padding from a GDN island,
+        # and reentrant checkpoint backward has no differentiable outputs.
+        padded[: int(flat.shape[0])] = flat
         flat = padded
     return flat.reshape(batch_size, seq_len, hidden_size).transpose(0, 1).contiguous()
 
