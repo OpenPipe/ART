@@ -47,6 +47,102 @@ _FIXED_SLOPE_PROFILES: ContextVar[bool] = ContextVar(
 )
 
 
+@dataclass(frozen=True)
+class CalibrationRungDecision:
+    """Replicated admission evidence, available before a calibration rung runs.
+
+    Byte values describe the incremental allocation above resident model state,
+    as does the admission budget. The 1.5 margin multiplies only the fitted
+    increment; ordinary analytic floors and the admission safety factor remain.
+    Components are conservative cohort maxima, not a single rank's measurement.
+    Fit components are None unless a qualified extrapolation is used; the
+    effective requirement and final decision are always available.
+    """
+
+    signature_id: str
+    candidate_packed_tokens: int
+    largest_observed_packed_tokens: int
+    observed_rungs: int
+    extrapolated: bool
+    eligible: bool
+    measured_base_bytes: int | None
+    slope_bytes_per_token: int | None
+    delta_tokens: int
+    margin: float
+    output_bytes: int
+    safety_factor: float
+    predicted_peak_bytes: int | None
+    estimated_required_bytes: int
+    available_bytes: int
+    fits: bool
+
+
+@dataclass
+class _CalibrationEstimate:
+    signature_id: str
+    candidate: int
+    largest: int = 0
+    count: int = 0
+    base: int = 0
+    slope: int = 0
+    delta: int = 0
+    output: int = 0
+    eligible: bool = False
+    extrapolated: bool = False
+    decision: CalibrationRungDecision | None = None
+
+    @property
+    def peak(self) -> int:
+        return self.base + (3 * self.slope * self.delta + 1) // 2 + self.output
+
+
+def _calibration_estimate(self: TrainerRank, plan: _impl._FlatForwardPlan):
+    """Use live, complete rungs, never a pruned hull or borrowed signature.
+
+    This bounded journal is intentionally not persisted. A restored profile
+    needs two new observations before extrapolation; serialized upper hulls
+    cannot recover the last-two-rung marginal slope.
+    """
+    if plan.packed_tokens <= 0:
+        raise ValueError("calibration rung must contain an active request")
+    profile = self._memory_profiles.get(plan.signature)
+    entry = self.__dict__.get("_calibration_memory_rungs", {}).get(plan.signature)
+    points: tuple[tuple[int, int], ...] = (
+        () if entry is None or entry[0] is not profile else entry[1]
+    )
+    result = _CalibrationEstimate(
+        signature_id=hashlib.sha256(repr(plan.signature).encode()).hexdigest(),
+        candidate=plan.packed_tokens,
+        largest=points[-1][0] if points else 0,
+        count=len(points),
+        output=plan.output_bytes,
+    )
+    result.extrapolated = result.candidate > result.largest
+    if not result.extrapolated:
+        result.eligible = True
+        return result
+    if (
+        not _fixed_slope_enabled(profile)
+        or profile is None
+        or profile.peak_model_version != 2
+        or len(points) < 2
+        or result.candidate > 2 * result.largest
+    ):
+        return result
+    # Match the existing fixed+slope fit, but retain the last two actual rungs
+    # independently of its hull. Round the rate upward to whole bytes/token.
+    _, (numerator, denominator) = _memory_model.fit_points(points)
+    low, low_peak = points[-2]
+    high, high_peak = points[-1]
+    if 4 * (high_peak - low_peak) * denominator > 5 * numerator * (high - low):
+        return result
+    result.base = high_peak
+    result.slope = (numerator + denominator - 1) // denominator
+    result.delta = result.candidate - result.largest
+    result.eligible = True
+    return result
+
+
 @contextmanager
 def fixed_slope_memory_profiles(enabled: bool = True) -> Iterator[None]:
     """Collect fresh v2 profiles; existing v2 profiles retain their model outside this scope."""
@@ -2243,6 +2339,8 @@ def _try_update_caller_memory_profile(
     try:
         if isinstance(plan, _impl._FlatForwardPlan):
             previous = self._memory_profiles.get(plan.signature)
+            journal = self.__dict__.get("_calibration_memory_rungs", {})
+            previous_rungs = journal.get(plan.signature)
             reading = self._peak_reading
             observation = self._planner_observation
             had_peak = observation is not None and "peak" in observation
@@ -2256,6 +2354,11 @@ def _try_update_caller_memory_profile(
                     self._memory_profiles.pop(plan.signature, None)
                 else:
                     self._memory_profiles[plan.signature] = previous
+                live_journal = self.__dict__.get("_calibration_memory_rungs", {})
+                if previous_rungs is None:
+                    live_journal.pop(plan.signature, None)
+                else:
+                    live_journal[plan.signature] = previous_rungs
                 self._peak_reading = reading
                 if observation is not None:
                     if had_peak:
@@ -2573,8 +2676,11 @@ def _memory_check(
     *,
     sync_across_dp: bool = False,
     sync_planning_errors: bool = False,
+    _calibration: _CalibrationEstimate | None = None,
 ) -> _impl._MemoryCheck:
     with self._planning_status(sync_planning_errors):
+        if _calibration is not None:
+            _calibration.__dict__.update(vars(_calibration_estimate(self, forward)))
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=forward.packed_tokens,
             output_bytes=forward.output_bytes,
@@ -2587,11 +2693,18 @@ def _memory_check(
             checkpoint_floor=_impl._gdn_memory.plan_floor(self, forward),
             retained_tokens=self._plan_retained_tokens(forward),
             caller_cp_workload=getattr(forward, "caller_cp_workload", None),
+            **(
+                {"_calibration_compute_bytes": _calibration.peak - forward.output_bytes}
+                if _calibration is not None
+                and _calibration.extrapolated
+                and _calibration.eligible
+                else {}
+            ),
         )
         growth = int(
             self._plan_hybridep_growth_bytes(forward) * _impl._MEMORY_SAFETY_FACTOR
         )
-        if growth:
+        if growth and not (_calibration is not None and _calibration.extrapolated):
             growth = math.ceil(
                 growth
                 * _cold_extrapolation_factor(
@@ -2599,7 +2712,17 @@ def _memory_check(
                 )
             )
         required += growth
-    return self._memory_check_required(required, sync_across_dp=sync_across_dp)
+        if (
+            _calibration is not None
+            and _calibration.extrapolated
+            and not _calibration.eligible
+        ):
+            required = max(required, _MEMORY_DEFERRED_BYTES)
+    return self._memory_check_required(
+        required,
+        sync_across_dp=sync_across_dp,
+        **({"_calibration": _calibration} if _calibration is not None else {}),
+    )
 
 
 def _refresh_memory_check(
@@ -2622,6 +2745,7 @@ def _memory_check_required(
     required: int,
     *,
     sync_across_dp: bool = False,
+    _calibration: _CalibrationEstimate | None = None,
 ) -> _impl._MemoryCheck:
     decision = _impl._planner_evidence.current(self)
     details: dict[str, Any] | None = {} if decision is not None else None
@@ -2633,13 +2757,76 @@ def _memory_check_required(
             else self._forward_memory_group()
         )
         scope = "world" if group is None else "tp_cp"
+        operands = [float(required), 0.0, 0.0]
+        if _calibration is not None:
+            operands.extend(
+                [
+                    _calibration.base,
+                    _calibration.slope,
+                    _calibration.delta,
+                    _calibration.output,
+                    -_calibration.largest,
+                    -_calibration.count,
+                    float(not _calibration.eligible),
+                    float(_calibration.extrapolated),
+                    _calibration.candidate,
+                    -_calibration.candidate,
+                ]
+            )
+            identity = [
+                int(_calibration.signature_id[i : i + 8], 16) for i in range(0, 64, 8)
+            ]
+            operands.extend(identity + [-part for part in identity])
         values = _impl.torch.tensor(
-            [float(required), 0.0, 0.0],
+            operands,
             device=self._forward_collective_device() if sync_across_dp else self.device,
             dtype=_impl.torch.float64,
         )
-        _impl.dist.all_reduce(values[0], op=_impl.dist.ReduceOp.MAX, group=group)
+        _impl.dist.all_reduce(
+            values[0] if _calibration is None else values,
+            op=_impl.dist.ReduceOp.MAX,
+            group=group,
+        )
         required = int(values[0].item())
+        if _calibration is not None:
+            (
+                base,
+                slope,
+                delta,
+                output,
+                largest,
+                count,
+                invalid,
+                extrapolated,
+                candidate,
+                negative_candidate,
+            ) = values[3:13].tolist()
+            _calibration.base, _calibration.slope = int(base), int(slope)
+            _calibration.delta, _calibration.output = int(delta), int(output)
+            _calibration.largest, _calibration.count = -int(largest), -int(count)
+            _calibration.eligible = not invalid and candidate == -negative_candidate
+            _calibration.extrapolated = bool(extrapolated)
+            _calibration.candidate = int(candidate)
+            maxima, minima = values[13:21].tolist(), values[21:29].tolist()
+            matching_signature = all(
+                high == -low for high, low in zip(maxima, minima, strict=True)
+            )
+            _calibration.signature_id = (
+                "".join(f"{int(part):08x}" for part in maxima)
+                if matching_signature
+                else ""
+            )
+            _calibration.eligible &= matching_signature
+            # Componentwise maxima give every rank the same conservative
+            # intent record, even when its learned bytes differ. This uses
+            # the existing admission MAX; its following MIN is unchanged.
+            if _calibration.extrapolated:
+                required = max(
+                    required, math.ceil(_calibration.peak * _impl._MEMORY_SAFETY_FACTOR)
+                )
+            if not _calibration.eligible:
+                required = max(required, _MEMORY_DEFERRED_BYTES)
+            local_required = required
         error: BaseException | None = None
         try:
             available = (
@@ -2658,7 +2845,7 @@ def _memory_check_required(
             # Extrema can come from different DP ranks. Agree that every rank
             # fits its own demand while retaining extrema for diagnostics.
             values[2] = available >= local_required
-            _impl.dist.all_reduce(values[1:], op=_impl.dist.ReduceOp.MIN, group=group)
+            _impl.dist.all_reduce(values[1:3], op=_impl.dist.ReduceOp.MIN, group=group)
             available = int(values[1].item())
             fits = bool(values[2].item())
         except BaseException as exc:
@@ -2677,6 +2864,27 @@ def _memory_check_required(
         )
         local_available = available
         fits = required <= available
+    if _calibration is not None:
+        extrapolating = _calibration.eligible and _calibration.extrapolated
+        _calibration.decision = CalibrationRungDecision(
+            signature_id=_calibration.signature_id,
+            candidate_packed_tokens=_calibration.candidate,
+            largest_observed_packed_tokens=_calibration.largest,
+            observed_rungs=_calibration.count,
+            extrapolated=_calibration.extrapolated,
+            eligible=_calibration.eligible,
+            measured_base_bytes=_calibration.base if extrapolating else None,
+            slope_bytes_per_token=_calibration.slope if extrapolating else None,
+            delta_tokens=_calibration.delta,
+            margin=1.5,
+            output_bytes=_calibration.output,
+            safety_factor=_impl._MEMORY_SAFETY_FACTOR,
+            predicted_peak_bytes=_calibration.peak if extrapolating else None,
+            estimated_required_bytes=required,
+            available_bytes=available,
+            fits=fits and _calibration.eligible,
+        )
+        fits = _calibration.decision.fits
     sample = None
     if decision is not None:
         try:
@@ -2728,6 +2936,7 @@ def _estimate_required_memory_bytes_from_values(
     checkpoint_memory: tuple[int, int] | None = None,
     caller_cp_workload: _CPWorkload | None = None,
     include_cold_extrapolation: bool = True,
+    _calibration_compute_bytes: int | None = None,
 ) -> int:
     if packed_tokens <= 0:
         return output_bytes
@@ -2911,7 +3120,17 @@ def _estimate_required_memory_bytes_from_values(
         profiled_bytes = _profile_compute_peak(
             profiled, profiled_tokens(profiled.logical_per_packed)
         )
-        if isinstance(profiled, _CallerMemoryProfile):
+        if _calibration_compute_bytes is not None:
+            # Only the prepared calibration API supplies this bounded
+            # extrapolation. Ordinary caller/CP coverage is unchanged.
+            profiled_bytes = max(
+                _calibration_compute_bytes,
+                profiled.absolute_compute_floor,
+                max((peak for _, peak in profiled.compute_observations), default=0),
+                profiled.legacy_bytes_per_token
+                * profiled_tokens(profiled.logical_per_packed),
+            )
+        elif isinstance(profiled, _CallerMemoryProfile):
             profiled_bytes = profiled.compute_peak(
                 profiled_tokens(profiled.logical_per_packed),
                 context_parallel=signature.topology[2] > 1,
@@ -2959,7 +3178,11 @@ def _estimate_required_memory_bytes_from_values(
     compute = (
         static_compute if profiled is None else max(static_compute, empirical(profiled))
     )
-    if _fixed_slope_enabled(profiled) and _unanchored(profiled):
+    if (
+        _calibration_compute_bytes is None
+        and _fixed_slope_enabled(profiled)
+        and _unanchored(profiled)
+    ):
         floor = _rate_floor_tokens(signature)
         tokens = profiled_tokens(
             1.0 if profiled is None else profiled.logical_per_packed
@@ -2986,12 +3209,12 @@ def _estimate_required_memory_bytes_from_values(
             )
     factor = (
         _cold_extrapolation_factor(profiled, packed_tokens)
-        if include_cold_extrapolation
+        if include_cold_extrapolation and _calibration_compute_bytes is None
         else 1.0
     )
     return (
         math.ceil((output_bytes + compute) * _impl._MEMORY_SAFETY_FACTOR * factor)
-        if factor != 1
+        if factor != 1 or _calibration_compute_bytes is not None
         else int((output_bytes + compute) * _impl._MEMORY_SAFETY_FACTOR)
     )
 
@@ -3322,3 +3545,21 @@ def _update_memory_profile(
         )
     # Publish only after every specialization has been constructed successfully.
     self._memory_profiles[plan.signature] = profile
+    if fixed_slope:
+        journal = self.__dict__.setdefault("_calibration_memory_rungs", {})
+        entry = journal.get(plan.signature)
+        peaks = dict(entry[1] if entry is not None and entry[0] is previous else ())
+        # Rungs need the whole caller interval, not an intermediate forward
+        # sample. Tiny or ineligible waves never extend this trust region.
+        if (
+            qualifies
+            and plan.packed_tokens >= _memory_model._MEMORY_SLOPE_MIN_TOKENS
+            and caller_phase
+        ):
+            peaks[plan.packed_tokens] = max(
+                peaks.get(plan.packed_tokens, 0), compute_delta
+            )
+        points = tuple(sorted(peaks.items()))
+        if len(points) > 8:
+            points = (points[0], *points[-7:])
+        journal[plan.signature] = (profile, points)

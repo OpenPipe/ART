@@ -2668,6 +2668,7 @@ class TrainerRank:
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
+        _calibration_candidate: _CandidateMicroBatch | None = None,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
         """Yield admitted micro-batches; the caller runs its loss and backward.
 
@@ -2694,7 +2695,14 @@ class TrainerRank:
             raise TypeError("yield_empty must be a bool")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         batches = self._forward_micro_batches(
-            inputs, checkpoint=checkpoint, yield_empty=yield_empty
+            inputs,
+            checkpoint=checkpoint,
+            yield_empty=yield_empty,
+            **(
+                {"calibration_candidate": _calibration_candidate}
+                if _calibration_candidate is not None
+                else {}
+            ),
         )
         token = object()
         try:

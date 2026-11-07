@@ -18,12 +18,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import (
     asdict,
+    dataclass,
     replace,
 )
 import hashlib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
-from art.trainer_rank import _impl
+from art.trainer_rank import _impl, _memory
 from art.trainer_rank._backward_work import region as _backward_region
 from art.trainer_rank._planner_cost import COEFFICIENT_VERSION_FALLBACK
 from art.trainer_rank._prefix_tree_planner import (
@@ -37,9 +38,9 @@ if TYPE_CHECKING:
         Callable,
         Generator,
         Iterable,
+        Iterator,
         Sequence,
     )
-    from typing import Any
 
     import torch
 
@@ -72,12 +73,113 @@ if TYPE_CHECKING:
     )
 
 
+@dataclass
+class CalibrationRung:
+    """One prepared, unsplit calibration wave; execute only after durable intent.
+
+    This object expires when its ``calibration_rung`` context exits. It cannot
+    change inputs, choose another layout, split, or retry the admitted rung.
+    Exhaust or explicitly close its iterator, as with normal microbatches.
+    """
+
+    decision: _memory.CalibrationRungDecision
+    _rank: TrainerRank
+    _candidate: _CandidateMicroBatch
+    _checkpoint: AdapterSelection
+    _no_grad: bool
+    _active: bool = True
+    _used: bool = False
+
+    def forward_micro_batches(
+        self,
+    ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        """Execute the exact prepared wave, once, within the owning context."""
+        if not self._active or self._used:
+            raise RuntimeError("calibration rung is expired or already executed")
+        if not self.decision.fits:
+            raise _impl.TrainerRankMemoryError("calibration rung admission refused")
+        self._used = True
+        return self._execute()
+
+    def _execute(self) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        # Iterator creation must not let execution escape the explicit scope.
+        if not self._active:
+            raise RuntimeError("calibration rung is expired")
+        yield from cast(Any, _impl.TrainerRank.forward_micro_batches)(
+            self._rank,
+            self._candidate.inputs,
+            checkpoint=self._checkpoint,
+            no_grad=self._no_grad,
+            yield_empty=True,
+            _calibration_candidate=self._candidate,
+        )
+
+
+@contextmanager
+def calibration_rung(
+    self: TrainerRank,
+    inputs: Iterable[ForwardInputs],
+    *,
+    checkpoint: AdapterSelection = _impl.Unset,
+    no_grad: bool | None = None,
+) -> Generator[CalibrationRung, None, None]:
+    """Prepare one calibration-only wave before executing any model work.
+
+    The caller must durably record an extrapolated intent before calling the
+    returned object's ``forward_micro_batches``. Incomplete intents must block
+    that extent and larger extents on restart, without automatic retry. Do not
+    change inputs, checkpoint state, profiles or GPU allocations between prepare
+    and execute. This API targets one DP replica (with any supported TP/CP).
+    It grants no extrapolation permission to ordinary forward calls.
+    """
+    self._guard_forward_collective("calibration_rung")
+    enabled = _impl.torch.is_grad_enabled() if no_grad is None else not no_grad
+    with _impl.torch.set_grad_enabled(enabled):
+        if self._dp_rank_and_size()[1] != 1:
+            raise ValueError("calibration_rung requires one data-parallel replica")
+        items = tuple(_impl._materialize(item) for item in inputs)
+        if not items:
+            raise ValueError("calibration rung must contain an active request")
+        requests = list(_impl._flatten(items))
+        plan = self._plan_flat_forward(
+            requests, checkpoint=checkpoint, sync_planning_errors=True
+        )
+        estimate = _memory._CalibrationEstimate(
+            signature_id="", candidate=plan.packed_tokens
+        )
+        check = self._memory_check(
+            plan, sync_across_dp=True, sync_planning_errors=True, _calibration=estimate
+        )
+    assert estimate.decision is not None
+    rung = CalibrationRung(
+        decision=estimate.decision,
+        _rank=self,
+        _candidate=_impl._CandidateMicroBatch(
+            inputs=items,
+            indices=tuple(range(len(items))),
+            plan=plan,
+            check=check,
+            stats_global_count=len(items),
+            rejected_candidates=0,
+            cold_start=estimate.extrapolated,
+        ),
+        _checkpoint=checkpoint,
+        _no_grad=not enabled,
+    )
+    try:
+        yield rung
+    finally:
+        # Pure local expiry: no destructor-time sampling or collective.
+        rung._active = False
+
+
 def _forward_micro_batches(
     self: TrainerRank,
     inputs: Iterable[ForwardInputs],
     *,
     checkpoint: AdapterSelection,
     yield_empty: bool,
+    calibration_candidate: _CandidateMicroBatch | None = None,
 ) -> Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None]:
     backward = self._backward_work()
     if backward is not None:
@@ -97,8 +199,10 @@ def _forward_micro_batches(
             "plan",
             {"global_start": start, "global_remaining": len(items) - start},
         ):
-            candidate = self._select_next_micro_batch(
-                items, start, checkpoint=checkpoint
+            candidate = (
+                self._select_next_micro_batch(items, start, checkpoint=checkpoint)
+                if calibration_candidate is None
+                else calibration_candidate
             )
         self._snapshot_planning_telemetry(candidate.plan, candidate.check)
         tracked_outputs: list[AnyForwardOutput] = []

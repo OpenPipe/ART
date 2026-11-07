@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
 
 import torch
@@ -9,7 +10,8 @@ import torch.distributed as dist
 
 from . import _impl
 from ._checkpoint import CheckpointManifest, materialize_lora, validate_checkpoint
-from ._memory import bounded_forward_peaks
+from ._memory import CalibrationRungDecision, bounded_forward_peaks
+from ._micro_batch_planner import CalibrationRung, calibration_rung
 
 AdapterSelection = _impl.AdapterSelection
 AdamParams = _impl.AdamParams
@@ -80,6 +82,21 @@ class TrainerRank(_impl.TrainerRank):
 
     def zero_grad(self) -> None:
         super().zero_grad()
+
+    def calibration_rung(
+        self,
+        inputs: Iterable[ForwardInputs],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
+    ) -> AbstractContextManager[CalibrationRung]:
+        """Prepare an exact calibration wave and expose its pre-execution decision.
+
+        Call ``rung.forward_micro_batches()`` only after recording durable intent
+        for an extrapolated decision. See ``CalibrationRung`` for its lifetime.
+        Ordinary forwards never use this calibration-only extrapolation.
+        """
+        return calibration_rung(self, inputs, checkpoint=checkpoint, no_grad=no_grad)
 
     def module(
         self,
@@ -420,6 +437,8 @@ __all__ = [
     "AdapterSelection",
     "AdamParams",
     "CheckpointManifest",
+    "CalibrationRung",
+    "CalibrationRungDecision",
     "bounded_forward_peaks",
     "ForwardInput",
     "ForwardOutput",
