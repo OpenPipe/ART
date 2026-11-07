@@ -10,7 +10,11 @@ import torch.distributed as dist
 
 from . import _impl
 from ._checkpoint import CheckpointManifest, materialize_lora, validate_checkpoint
-from ._memory import CalibrationRungDecision, bounded_forward_peaks
+from ._memory import (
+    CalibrationCoverageViolation,
+    CalibrationRungDecision,
+    bounded_forward_peaks,
+)
 from ._micro_batch_planner import CalibrationRung, calibration_rung
 
 AdapterSelection = _impl.AdapterSelection
@@ -53,6 +57,7 @@ for _public_type in (
     TrainerRankPartialExecutionError,
     TrainerRankRuntimeSupportError,
     TrainerRankSlotStateError,
+    CalibrationCoverageViolation,
     MaterializedCheckpoint,
     PushedCheckpoint,
 ):
@@ -439,6 +444,7 @@ __all__ = [
     "CheckpointManifest",
     "CalibrationRung",
     "CalibrationRungDecision",
+    "CalibrationCoverageViolation",
     "bounded_forward_peaks",
     "ForwardInput",
     "ForwardOutput",
