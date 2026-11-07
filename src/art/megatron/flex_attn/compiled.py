@@ -1,6 +1,9 @@
-"""Compiled flex attention entrypoints."""
+"""Compiled flex attention entrypoints.
 
-from collections import Counter
+Production uses Inductor; eager/aot_eager capture backends lack its FLASH LSE contract.
+"""
+
+from collections import OrderedDict
 import json
 import logging
 import math
@@ -34,7 +37,8 @@ apply_deterministic_flash_backward_patch()
 _FORCED_FLEX_BACKEND = "FLASH"
 _FLASH_LSE_RESCALE = math.log(2.0)
 _logger = logging.getLogger(__name__)
-_FLASH_EAGER_FALLBACK_KEYS: Counter[tuple[object, ...]] = Counter()
+_FLASH_EAGER_FALLBACK_KEYS: OrderedDict[tuple[object, ...], int] = OrderedDict()
+_FLASH_EAGER_FALLBACK_WARNINGS = 0
 FlexBackend: TypeAlias = Literal["FLASH", "TRITON"]
 SparseBlockSize: TypeAlias = int | tuple[int, int]
 
@@ -135,6 +139,7 @@ def flash_sparse_block_size_for_head_dim(
 
 
 def _flash_eager_fallback(backend: object, frame: str, q, k, v) -> bool:
+    global _FLASH_EAGER_FALLBACK_WARNINGS
     if backend != "FLASH" or torch.compiler.is_compiling():
         return False
     rank = (
@@ -144,19 +149,25 @@ def _flash_eager_fallback(backend: object, frame: str, q, k, v) -> bool:
     )
     shapes = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
     key = (frame, rank, shapes, q.dtype, q.device, torch.is_grad_enabled())
-    _FLASH_EAGER_FALLBACK_KEYS[key] += 1
-    count = _FLASH_EAGER_FALLBACK_KEYS[key]
+    count = _FLASH_EAGER_FALLBACK_KEYS.pop(key, 0) + 1
+    if len(_FLASH_EAGER_FALLBACK_KEYS) == 64:
+        _FLASH_EAGER_FALLBACK_KEYS.popitem(last=False)
+        counters["art"]["flex_flash_eager_fallback_overflow"] += 1
+    _FLASH_EAGER_FALLBACK_KEYS[key] = count
     counters["art"]["flex_flash_eager_fallback"] += 1
-    # First use and powers of two keep repeated recomputation low-volume while
-    # retaining a running per-shape count. No communication is needed here.
-    if count & (count - 1) == 0:
+    total = counters["art"]["flex_flash_eager_fallback"]
+    # Bound both shape cardinality and process-wide warning volume. Evicted
+    # shapes restart their key count; the total and overflow counters are exact.
+    if _FLASH_EAGER_FALLBACK_WARNINGS < 8 or total % 1000 == 0:
+        _FLASH_EAGER_FALLBACK_WARNINGS += 1
         _logger.warning(
             "ART_FLEX_ATTENTION_EVENT %s",
             json.dumps(
                 {
                     "event": "flex_flash_eager_fallback",
                     "counter": "flex_flash_eager_fallback",
-                    "count": counters["art"]["flex_flash_eager_fallback"],
+                    "count": total,
+                    "overflow": counters["art"]["flex_flash_eager_fallback_overflow"],
                     "key_count": count,
                     "rank": rank,
                     "frame": frame,
@@ -221,19 +232,22 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
     resolved_options["OUTPUT_MAX"] = False
 
     def _flex_attention(q, k, v, *, block_mask, scale, enable_gqa):
-        eager_flash = _flash_eager_fallback(
-            resolved_options.get("BACKEND"), "sparse_flex_attention", q, k, v
-        )
         del enable_gqa
         for tensor in (q, k, v):
             torch._dynamo.mark_static(tensor, -3)
             torch._dynamo.mark_static(tensor, -1)
+        # Materialize potentially graph-breaking metadata before detection, so
+        # a resumed HOP frame cannot carry a captured, stale False flag.
+        mask_tuple = (q.shape[-2], k.shape[-2], *block_mask.as_tuple()[2:])
+        eager_flash = _flash_eager_fallback(
+            resolved_options.get("BACKEND"), "sparse_flex_attention", q, k, v
+        )
         out, lse, _max_scores = flex_attention_hop(
             q,
             k,
             v,
             _identity_score,
-            (q.shape[-2], k.shape[-2], *block_mask.as_tuple()[2:]),
+            mask_tuple,
             scale,
             resolved_options,
         )

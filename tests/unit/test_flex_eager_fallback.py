@@ -68,6 +68,8 @@ def _cpu_math(monkeypatch):
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     counters["art"]["flex_flash_eager_fallback"] = 0
+    counters["art"]["flex_flash_eager_fallback_overflow"] = 0
+    monkeypatch.setattr(compiled, "_FLASH_EAGER_FALLBACK_WARNINGS", 0, raising=False)
     if hasattr(compiled, "_FLASH_EAGER_FALLBACK_KEYS"):
         compiled._FLASH_EAGER_FALLBACK_KEYS.clear()
     try:
@@ -250,7 +252,7 @@ def test_eager_flash_warning_and_counter_are_ranked_and_low_volume(monkeypatch, 
         for row in caplog.records
         if "ART_FLEX_ATTENTION_EVENT " in row.message
     ]
-    assert [event["key_count"] for event in events] == [1, 2, 4]
+    assert [event["key_count"] for event in events] == [1, 2, 3, 4, 5]
     assert all(
         event["rank"] == "7"
         and event["frame"] == "sparse_flex_attention"
@@ -258,6 +260,112 @@ def test_eager_flash_warning_and_counter_are_ranked_and_low_volume(monkeypatch, 
         for event in events
     )
     assert counters["art"]["flex_flash_eager_fallback"] == 5
+
+
+def test_fallback_telemetry_growth_is_bounded_and_lru(caplog):
+    with caplog.at_level(logging.WARNING):
+        for length in range(1, 1001):
+            q = torch.empty(1, 1, length, 8, device="meta")
+            assert compiled._flash_eager_fallback("FLASH", "growth", q, q, q)
+        table = compiled._FLASH_EAGER_FALLBACK_KEYS
+        assert len(table) == 64
+        assert counters["art"]["flex_flash_eager_fallback"] == 1000
+        assert counters["art"]["flex_flash_eager_fallback_overflow"] == 936
+        first, second = list(table)[:2]
+        q = torch.empty(1, 1, 937, 8, device="meta")
+        compiled._flash_eager_fallback("FLASH", "growth", q, q, q)
+        q = torch.empty(1, 1, 1001, 8, device="meta")
+        compiled._flash_eager_fallback("FLASH", "growth", q, q, q)
+    assert first in table and second not in table and len(table) == 64
+    assert counters["art"]["flex_flash_eager_fallback"] == 1002
+    assert counters["art"]["flex_flash_eager_fallback_overflow"] == 937
+    assert len(caplog.records) == 9
+
+
+def test_fallback_warning_budget_is_process_wide(caplog):
+    q = torch.empty(1, 1, 2, 8, device="meta")
+    with caplog.at_level(logging.WARNING):
+        for _ in range(2005):
+            compiled._flash_eager_fallback("FLASH", "budget", q, q, q)
+    events = [
+        json.loads(row.message.split("ART_FLEX_ATTENTION_EVENT ", 1)[1])
+        for row in caplog.records
+    ]
+    assert [event["count"] for event in events] == [*range(1, 9), 1000, 2000]
+    assert counters["art"]["flex_flash_eager_fallback"] == 2005
+    assert counters["art"]["flex_flash_eager_fallback_overflow"] == 0
+    assert len(compiled._FLASH_EAGER_FALLBACK_KEYS) == 1
+
+
+@pytest.mark.parametrize("entry", ["forced_dense", "sparse", "dense"])
+def test_flash_wrappers_have_no_graph_breaks(entry):
+    torch._dynamo.reset()
+    q = torch.ones(1, 1, 2, 8, requires_grad=True)
+    k = torch.ones(1, 1, 1, 8, requires_grad=True)
+    mask = create_block_mask(
+        lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=2, KV_LEN=1, device="cpu"
+    )
+    if entry == "sparse":
+        fn = compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"})
+        extra = {}
+    else:
+        fn = (
+            compiled._forced_flex_attention_dense
+            if entry == "forced_dense"
+            else compiled._flex_attention_with_options({"BACKEND": "FLASH"})
+        )
+        extra = {"return_aux": AuxRequest(lse=True)}
+    try:
+        explanation = torch._dynamo.explain(fn)(
+            q, k, k, block_mask=mask, scale=0.125, enable_gqa=False, **extra
+        )
+        assert explanation.graph_count == 1
+        assert explanation.graph_break_count == 0, explanation.break_reasons
+    finally:
+        torch._dynamo.reset()
+
+
+class _FlashContract(torch.fx.Interpreter):
+    """CPU contract backend: real math, compiled FLASH's natural HOP LSE."""
+
+    def call_function(self, target, args, kwargs):
+        result = super().call_function(target, args, kwargs)
+        if target is torch.ops.higher_order.flex_attention:
+            out, lse, maximum = result
+            return out, lse * math.log(2), maximum * math.log(2)
+        return result
+
+
+def test_resumed_sparse_hop_fallback_rechecks_execution_mode(monkeypatch):
+    torch._dynamo.reset()
+    mask = create_block_mask(
+        lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=128, KV_LEN=128, device="cpu"
+    )
+    original = mask.as_tuple
+
+    def as_tuple():
+        torch._dynamo.graph_break()
+        return original()
+
+    monkeypatch.setattr(mask, "as_tuple", as_tuple)
+    fn = torch.compile(
+        compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"}),
+        backend=lambda graph, _: _FlashContract(graph).run,
+        dynamic=False,
+    )
+    q = torch.ones(1, 1, 2, 8, requires_grad=True)
+    k = torch.ones(1, 1, 1, 8, requires_grad=True)
+    try:
+        with torch._dynamo.config.patch(recompile_limit=1):
+            for scale, expected in [(0.125, 1.0), (0.25, 2.0)]:
+                out, lse = fn(q, k, k, block_mask=mask, scale=scale, enable_gqa=False)
+                natural = compiled.normalize_flex_lse(lse, backend="FLASH")
+                torch.testing.assert_close(natural, torch.full_like(natural, expected))
+                grad = torch.autograd.grad(natural.sum(), q)[0]
+                torch.testing.assert_close(grad, torch.full_like(q, scale))
+        assert counters["art"]["flex_flash_eager_fallback"] > 0
+    finally:
+        torch._dynamo.reset()
 
 
 def test_actual_sparse_hop_cache_fallback_keeps_lse_units():
