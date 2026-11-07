@@ -1,0 +1,9 @@
+{
+  "cases": 60,
+  "unanchored_guard_min": 1.0760560682836844,
+  "unanchored_guard_max": 7.3357035521702585,
+  "seven_old_under_min": 1.0760560682836844,
+  "seven_old_under_max": 1.7493865637748134,
+  "anchored_min": 1.099999998963006,
+  "anchored_max": 4.191830601037355
+}

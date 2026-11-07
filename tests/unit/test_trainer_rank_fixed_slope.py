@@ -188,7 +188,7 @@ def test_monotone_through_threshold_trust_extent_and_logical_rows(profile_type):
     )
 
 
-def test_v1_roundtrip_and_update_keep_missing_evidence_as_a_floor():
+def test_v1_floor_is_only_inherited_by_explicit_legacy_merge():
     r = _rank()
     sig = signature()
     old = _impl._MemoryProfile(60_000_000, 8192)
@@ -210,8 +210,11 @@ def test_v1_roundtrip_and_update_keep_missing_evidence_as_a_floor():
     assert _memory._profile_compute_peak(old, 32768) == 60_000_000 * 32768
     observe(r, sig, 32768, 2**30)
     p = r._memory_profiles[sig]
-    assert p.peak_model_version == 2 and p.legacy_bytes_per_token == old.bytes_per_token
-    assert _memory._profile_compute_peak(p, 32768) >= old.bytes_per_token * 32768
+    assert p.peak_model_version == 2 and p.legacy_bytes_per_token == 0
+    assert p.bytes_per_token < old.bytes_per_token
+    restored = replace(p, **_memory._merge_memory_profile_model_fields(old, p))
+    assert restored.legacy_bytes_per_token == old.bytes_per_token
+    assert _memory._profile_compute_peak(restored, 32768) >= old.bytes_per_token * 32768
 
 
 def test_distributed_refusal_keeps_max_then_min_and_local_fit_predicate(monkeypatch):
@@ -322,3 +325,105 @@ def test_collective_exhausted_reject_site_preserves_peer_scope(
             if len(values) == 3 and op == _impl.dist.ReduceOp.MIN
         ]
         assert votes == [None if api == "forward_micro_batches" else local_group]
+
+
+@pytest.mark.parametrize(
+    "row",
+    SWEEPS,
+    ids=lambda r: f"m{r['model']}-{r['operation']}-r{r['lora_rank']}-{r['length']}",
+)
+def test_unanchored_guard_covers_all_recorded_peaks_including_seven_old_under(row):
+    import math
+
+    r = _rank()
+    sig = signature((row["model"], row["operation"], row["lora_rank"]))
+    observe(r, sig, 128, 1)
+    old = row["ART_predicted_increment_bytes"]
+    n = row["length"]
+    out = n * 4
+    # The fixture does not serialize native floor inputs. Reconstruct its
+    # recorded OLD demand as a floor, including CP's second output charge.
+    floor = math.ceil(old / 1.1) - 2 * out
+    args = dict(
+        packed_tokens=n, output_bytes=out, signature=sig, checkpoint_floor=(floor, 0)
+    )
+    effective = r._estimate_required_memory_bytes_from_values(**args)
+    assert effective >= math.ceil(old * 1.75)
+    assert effective >= row["measured_increment_bytes"]
+    # No profile at all must also take the first-unmeasured-shape cold guard.
+    r._memory_profiles.clear()
+    assert (
+        r._estimate_required_memory_bytes_from_values(**args)
+        >= row["measured_increment_bytes"]
+    )
+
+
+def test_unanchored_range_boundary_and_anchor_transition():
+    r = _rank()
+    sig = signature()
+    observe(r, sig, 128, 2**30)
+    p = r._memory_profiles[sig]
+    assert _memory._cold_extrapolation_factor(p, 128) == 1
+    assert _memory._cold_extrapolation_factor(p, 129) == 1.75
+    ns = [1, 64, 127, 128, 129, 1024, 8191, 8192, 65536]
+    prices = [
+        r._estimate_required_memory_bytes_from_values(
+            packed_tokens=n, output_bytes=0, signature=sig
+        )
+        for n in ns
+    ]
+    assert prices == sorted(prices)
+    observe(r, sig, 8192, 2 * 2**30)
+    anchored = r._memory_profiles[sig]
+    assert _memory._cold_extrapolation_factor(anchored, 65536) == 1
+    assert _memory._profile_compute_peak(anchored, 128) >= 2**30
+    assert _memory._profile_compute_peak(anchored, 8192) >= 2 * 2**30
+
+
+def test_runtime_growth_only_learns_within_trust_until_anchor(monkeypatch):
+    r = _rank()
+    sig = signature()
+    observe(r, sig, 128, 2**20)
+    plan = cast(
+        Any,
+        SimpleNamespace(
+            signature=sig,
+            packed_tokens=8192,
+            active_logical_tokens=8192,
+            output_bytes=0,
+        ),
+    )
+    monkeypatch.setattr(_impl.torch.cuda, "max_memory_allocated", lambda _: 2**30)
+    before = r._memory_profiles[sig]
+    _memory._update_peak_memory_profile(r, plan, 0)
+    assert r._memory_profiles[sig] == before
+    for n in [1024, 8192]:
+        plan.packed_tokens = plan.active_logical_tokens = n
+        _memory._update_peak_memory_profile(r, plan, 0)
+    assert r._memory_profiles[sig].compute_slope == (2**30, 8192)
+
+
+def test_unanchored_coefficient_and_prediction_order_independence():
+    points = ((1, 1000), (128, 2000), (2048, 5000), (4096, 6000))
+    expected = None
+    r = _rank()
+    sig = signature()
+    for order in itertools.permutations(points):
+        r._memory_profiles.clear()
+        for n, peak in order:
+            observe(r, sig, n, peak, caller=True)
+        p = r._memory_profiles[sig]
+        state = (
+            p.compute_observations,
+            p.compute_slope,
+            p.fixed_compute_bytes,
+            tuple(
+                r._estimate_required_memory_bytes_from_values(
+                    packed_tokens=n, output_bytes=0, signature=sig
+                )
+                for n in (1, 4096, 4097, 8192)
+            ),
+        )
+        if expected is None:
+            expected = state
+        assert state == expected

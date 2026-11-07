@@ -1,6 +1,0 @@
-{
-  "source": "/tmp/stark-work/perf-memory-model/caladan/src/caladan/stark/trainer/calibration.py",
-  "sha256": "4bdc6c867ef42479d389518e01fe078ac8bca7afbc5c496f9a1de9a2e6d188dc",
-  "base": "2d9a19489",
-  "scope": "Reviewable format/key/merge companion; runtime v2 activation is a later coordinated step."
-}

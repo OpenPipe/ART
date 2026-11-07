@@ -7,6 +7,7 @@ import math
 
 _MEMORY_PROFILE_VERSION = 2
 _MEMORY_SLOPE_MIN_TOKENS = 8192
+_MEMORY_COLD_EXTRAPOLATION_FACTOR = 1.75
 MemoryPoint = tuple[int, int]
 
 

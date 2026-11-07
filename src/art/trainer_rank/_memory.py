@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import math
 from types import MethodType
@@ -59,6 +59,35 @@ def fixed_slope_memory_profiles() -> Iterator[None]:
         yield
     finally:
         _FIXED_SLOPE_PROFILES.reset(token)
+
+
+def _fixed_slope_enabled(profile: _impl._MemoryProfile | None) -> bool:
+    return _FIXED_SLOPE_PROFILES.get() or (
+        profile is not None
+        and profile.peak_model_version == _memory_model._MEMORY_PROFILE_VERSION
+    )
+
+
+def _unanchored(profile: _impl._MemoryProfile | None) -> bool:
+    return (
+        profile is None
+        or not profile.compute_observations
+        or (
+            profile.compute_observations[-1][0] < _memory_model._MEMORY_SLOPE_MIN_TOKENS
+        )
+    )
+
+
+def _cold_extrapolation_factor(
+    profile: _impl._MemoryProfile | None, packed_tokens: int
+) -> float:
+    if (
+        _fixed_slope_enabled(profile)
+        and _unanchored(profile)
+        and packed_tokens > (0 if profile is None else profile.packed_tokens)
+    ):
+        return _memory_model._MEMORY_COLD_EXTRAPOLATION_FACTOR
+    return 1.0
 
 
 def _profile_compute_peak(profile: _impl._MemoryProfile, tokens: int | float) -> float:
@@ -1711,6 +1740,17 @@ def _update_peak_memory_profile(
         observation["peak"] = max(observation["peak"], peak)
     resets = self.__dict__.get("_peak_resets", 0)
     self._peak_reading = (resets, peak)
+    profile = self._memory_profiles.get(plan.signature)
+    if (
+        profile is not None
+        and _fixed_slope_enabled(profile)
+        and _unanchored(profile)
+        and plan.packed_tokens
+        > profile.packed_tokens * _impl._MEMORY_PROFILE_TRUST_GROWTH
+    ):
+        # A forced minimum wave outside trust cannot silently establish an
+        # anchor. Offline/restore merges remain set-based and order independent.
+        return
     self._update_memory_profile(
         plan,
         max(0, peak - baseline),
@@ -1977,7 +2017,18 @@ def _memory_check(
             checkpoint_floor=_impl._gdn_memory.plan_floor(self, forward),
             retained_tokens=self._plan_retained_tokens(forward),
             caller_cp_workload=getattr(forward, "caller_cp_workload", None),
-        ) + int(self._plan_hybridep_growth_bytes(forward) * _impl._MEMORY_SAFETY_FACTOR)
+        )
+        growth = int(
+            self._plan_hybridep_growth_bytes(forward) * _impl._MEMORY_SAFETY_FACTOR
+        )
+        if growth:
+            growth = math.ceil(
+                growth
+                * _cold_extrapolation_factor(
+                    self._memory_profiles.get(forward.signature), forward.packed_tokens
+                )
+            )
+        required += growth
     return self._memory_check_required(required, sync_across_dp=sync_across_dp)
 
 
@@ -2106,6 +2157,7 @@ def _estimate_required_memory_bytes_from_values(
     include_checkpoint_input_gradient: bool = True,
     checkpoint_memory: tuple[int, int] | None = None,
     caller_cp_workload: _CPWorkload | None = None,
+    include_cold_extrapolation: bool = True,
 ) -> int:
     if packed_tokens <= 0:
         return output_bytes
@@ -2285,9 +2337,7 @@ def _estimate_required_memory_bytes_from_values(
     # The trust window limits calibration growth, not the empirical floor.
     # Dropping that floor beyond the window can admit a larger request that
     # was refused just inside it, even below a previously observed peak.
-    if profiled is None:
-        compute = static_compute
-    else:
+    def empirical(profiled: _impl._MemoryProfile) -> int:
         profiled_bytes = _profile_compute_peak(
             profiled, profiled_tokens(profiled.logical_per_packed)
         )
@@ -2324,21 +2374,45 @@ def _estimate_required_memory_bytes_from_values(
                     profiled_tokens(profiled.warm_logical_per_packed),
                 ),
             )
-        compute = max(
-            static_compute,
-            int(
-                profiled_bytes
-                + (
-                    _impl._PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
-                    # Branch states grow with segments, not packed rows;
-                    # backward recomputes one layer at a time.
-                    + gdn_segments * self._gdn_segment_layer_bytes()
-                    if packed_priced and logical_tokens is not None
-                    else 0
-                )
-            ),
+        return int(
+            profiled_bytes
+            + (
+                _impl._PACKED_PRICED_LOGICAL_ROW_BYTES * logical_tokens
+                # Branch states grow with segments, not packed rows;
+                # backward recomputes one layer at a time.
+                + gdn_segments * self._gdn_segment_layer_bytes()
+                if packed_priced and logical_tokens is not None
+                else 0
+            )
         )
-    return int((output_bytes + compute) * _impl._MEMORY_SAFETY_FACTOR)
+
+    compute = (
+        static_compute if profiled is None else max(static_compute, empirical(profiled))
+    )
+    if (
+        profiled is not None
+        and _fixed_slope_enabled(profiled)
+        and _unanchored(profiled)
+    ):
+        # The original max-rate line upper-bounds its warm/scoped discounts.
+        # Use that set-based envelope: excluding a caller's first observation
+        # from a warm fit would make the cold guard depend on arrival order.
+        old = _impl._MemoryProfile(
+            profiled.bytes_per_token,
+            profiled.packed_tokens,
+            profiled.logical_per_packed,
+        )
+        compute = max(compute, empirical(old))
+    factor = (
+        _cold_extrapolation_factor(profiled, packed_tokens)
+        if include_cold_extrapolation
+        else 1.0
+    )
+    return (
+        math.ceil((output_bytes + compute) * _impl._MEMORY_SAFETY_FACTOR * factor)
+        if factor != 1
+        else int((output_bytes + compute) * _impl._MEMORY_SAFETY_FACTOR)
+    )
 
 
 def _gdn_segment_layer_bytes(self: TrainerRank) -> float:
@@ -2451,10 +2525,11 @@ def _update_memory_profile(
     compute_delta = max(0, peak_delta_bytes - plan.output_bytes)
     bytes_per_token = compute_delta / max(1, plan.packed_tokens)
     previous = self._memory_profiles.get(plan.signature)
-    fixed_slope = _FIXED_SLOPE_PROFILES.get() or (
-        previous is not None
-        and previous.peak_model_version == _memory_model._MEMORY_PROFILE_VERSION
-    )
+    fixed_slope = _fixed_slope_enabled(previous)
+    if fixed_slope and previous is not None and previous.peak_model_version == 1:
+        # Explicit legacy restoration uses the merge helper. Fresh collection
+        # must not import a scalar v1 poison rate into v2 diagnostic guards.
+        previous = None
     model_fields: dict[str, Any] = {}
     if fixed_slope:
         observations = _memory_model.merge_points(
@@ -2463,8 +2538,6 @@ def _update_memory_profile(
         )
         fixed, slope = _memory_model.fit_points(observations)
         legacy_rate = 0.0 if previous is None else previous.legacy_bytes_per_token
-        if previous is not None and previous.peak_model_version == 1:
-            legacy_rate = max(legacy_rate, previous.bytes_per_token)
         model_fields = dict(
             peak_model_version=_memory_model._MEMORY_PROFILE_VERSION,
             compute_observations=observations,

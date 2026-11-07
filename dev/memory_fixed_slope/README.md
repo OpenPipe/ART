@@ -1,6 +1,6 @@
 # CPU memory-model prototype artifacts
 
-See ../../DESIGN.md for decisions, scope and results. No GPU execution is part
+See ../../DESIGN.md for the approved Phase 1 design and PHASE-2.md for the current cold guard, migration, coverage and estimates. No GPU execution is part
 of these scripts. All GPU measurements are supplied fixtures. `COMPARISON.md`
 and `comparison.csv` contain every OLD/NEW raw and effective ratio; `RUN6.md`
 separates refusals from actual fit evidence. `wave.json` records the approximate
@@ -24,7 +24,6 @@ Run from the ART worktree:
 python3 dev/memory_fixed_slope/analyze_old.py
 dev/memory_fixed_slope/cpu.sh python dev/memory_fixed_slope/replay.py
 dev/memory_fixed_slope/cpu.sh python dev/memory_fixed_slope/wave.py
-dev/memory_fixed_slope/cpu.sh python dev/memory_fixed_slope/check_caladan.py
 dev/memory_fixed_slope/cpu.sh python -m pytest tests/unit/test_trainer_rank_fixed_slope.py -q
 ```
 
@@ -36,11 +35,10 @@ lane's harness. Planner search, packing, memory pricing and width selection are
 ART implementations. These shims are for CPU experiments, not native execution
 qualification.
 
-`caladan-v4.patch` is a companion format/key/merge change for the Caladan base
-recorded in `caladan-provenance.json`; it is not applied to that worktree.
-`check_caladan.py` applies it to a temporary copy and exercises real codecs.
-Coordinated startup/calibration collection activation is still required after
-GPU review: the internal fixed-slope context is opt-in in this Phase 1 branch.
+The separate Caladan companion branch `stark/memory-fixed-slope` now contains
+the real v4 key/merge, default-off flag and multi-segment calibration code. It
+supersedes the Phase 1 sample patch and temporary-codec checker, which remain
+available in commit 36a46dc27's history. See PHASE-2.md for coupling requirements.
 
 The original poison regression failed before implementation; its transcript
 is `poisoning-before.txt`. `agreement-parity.json` records unchanged agreement,

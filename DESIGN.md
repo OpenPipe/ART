@@ -1,4 +1,7 @@
-# ART fixed workspace plus token slope: Phase 1 CPU prototype
+# ART fixed workspace plus token slope: approved design
+
+Current Phase 2 implementation and results: `dev/memory_fixed_slope/PHASE-2.md`.
+The sections below record the approved Phase 1 design and its measurements.
 
 Owner: Performance investigation, Aragorn perf fork. Admission/review owner:
 Aragorn. Base ART ee91943cd; Caladan inspected at 2d9a19489. No GPU runs,
@@ -176,8 +179,8 @@ so a zero empirical slope does not require weakening its positive-rate check.
 Required coordinated changes: (1) key version 3 -> 4; (2) validate v2 observation
 hulls and exact coefficients; (3) merge observation sets using ART's helper and
 refit, never max the new slope/fixed independently; (4) preserve legacy floors
-and scoped evidence; (5) round-trip and merge tests. A reviewable companion patch
-is supplied as `dev/memory_fixed_slope/caladan-v4.patch`; the Caladan worktree is read-only here.
+and scoped evidence; (5) round-trip and merge tests. The original sample companion patch is preserved in commit 36a46dc27.
+Phase 2 supersedes it with the separate Caladan companion branch.
 Old v3 rows remain decodable with ART's v1 defaults, but must not seed a v4
 calibration intended to discard poisoning. ART source/runtime pins must move
 together during subsequent admission, preserving explicitly frozen runs.

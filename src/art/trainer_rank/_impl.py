@@ -3063,6 +3063,7 @@ class TrainerRank:
             include_checkpoint_input_gradient=False,
             checkpoint_memory=checkpoint_memory,
             caller_cp_workload=caller_cp_workload,
+            include_cold_extrapolation=False,
         )
         checkpoint_retained, checkpoint_workspace = checkpoint_memory
         retained = self._retained_memory_bytes(
@@ -3116,15 +3117,20 @@ class TrainerRank:
             )
         # HybridEP buffer growth stays allocated through the forward and
         # backward peaks, but is not forward retention.
+        cold = _memory._cold_extrapolation_factor(
+            self._memory_profiles.get(signature), packed_tokens
+        )
         return _SubforwardCost(
-            required=required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR),
-            retained=retained,
-            checkpoint_retained=checkpoint_retained,
-            checkpoint_workspace=checkpoint_workspace,
-            checkpoint_input_gradient=gradient,
-            checkpoint_peak_increment=required - forward_required,
-            hybridep_growth=hybridep_growth_bytes,
-            checkpoint_adapter_gradient=adapter_gradient,
+            required=math.ceil(
+                (required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR)) * cold
+            ),
+            retained=math.ceil(retained * cold),
+            checkpoint_retained=math.ceil(checkpoint_retained * cold),
+            checkpoint_workspace=math.ceil(checkpoint_workspace * cold),
+            checkpoint_input_gradient=math.ceil(gradient * cold),
+            checkpoint_peak_increment=math.ceil((required - forward_required) * cold),
+            hybridep_growth=math.ceil(hybridep_growth_bytes * cold),
+            checkpoint_adapter_gradient=math.ceil(adapter_gradient * cold),
             checkpoint_adapter_gradient_slots=json.dumps(
                 [
                     [ref.kind, ref.name]
