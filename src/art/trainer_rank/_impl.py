@@ -705,7 +705,7 @@ class _MemoryProfileV2(_MemoryProfile):
     # A v1 scalar has lost its observations. Never silently discard its bound
     # on update; a fresh calibration/cache key is needed to remove poisoning.
     legacy_bytes_per_token: float = 0.0
-    # Fresh collection writes format 4. Formats 2/3 remain readable; independent
+    # Fresh collection writes format 5. Earlier formats remain readable; independent
     # token extents and retained floors cannot be recovered from their hulls.
     profile_format_version: int = 2
     rate_floor_tokens: int = 0

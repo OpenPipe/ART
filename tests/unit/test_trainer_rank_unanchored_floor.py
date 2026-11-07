@@ -329,13 +329,13 @@ def test_all_measured_fixture_peaks_remain_raw_and_effective_bounds(key, rows):
             assert required(rank, sig, row["length"]) >= max(row["rank_peak_bytes"])
 
 
-def test_format4_roundtrips_and_old_v2_defaults_remain_readable():
+def test_format5_roundtrips_and_old_v2_defaults_remain_readable():
     rank, key = _rank(), signature()
     with m.fixed_slope_memory_profiles():
         observe(rank, key, 3, 300_000_000)
         observe(rank, key, 8192, 1_000_000_000)
     p = rank._memory_profiles[key]
-    assert p.profile_format_version == 4
+    assert p.profile_format_version == 5
     assert reports._memory_profile(json.loads(json.dumps(asdict(p)))) == p
     assert pickle.loads(pickle.dumps(p)) == p
     old = asdict(p)

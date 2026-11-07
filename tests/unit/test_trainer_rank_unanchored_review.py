@@ -250,11 +250,12 @@ def test_independent_extents_and_retained_floors_merge_and_roundtrip():
         assert fields["eligible_packed_tokens"] == 512
         assert fields["subfloor_packed_tokens"] == 256
         assert fields["retained_rate_tokens"] == 512
-        assert fields["retained_compute_peaks"] == (
+        for n, peak in (
             (3, 200_000_000),
             (256, 300_000_000),
             (8192, 8_000_000_000),
-        )
+        ):
+            assert m._retained_floor_peak(fields["retained_compute_peaks"], n) >= peak
         merged = replace(profiles[0], **fields, packed_tokens=8192)
         restored = reports._memory_profile(json.loads(json.dumps(asdict(merged))))
         assert restored == merged and pickle.loads(pickle.dumps(merged)) == merged

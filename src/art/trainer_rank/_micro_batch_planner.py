@@ -182,7 +182,21 @@ def _forward_micro_batches(
         # otherwise admit a later micro-batch that leaves no collective or
         # optimizer headroom. Peak only: the retained observation belongs
         # to the forward's return, already recorded for this same plan.
-        if isinstance(candidate.plan, _impl._FlatForwardPlan):
+        from . import _memory
+
+        if _memory._FIXED_SLOPE_PROFILES.get():
+            # This opt-in is replicated by the caller, never inferred from a
+            # rank-local profile. Every plan kind reaches the same MIN vote.
+            _memory._complete_caller_memory_profile(
+                self,
+                candidate.plan,
+                memory_baseline,
+                interval,
+                0
+                if isinstance(candidate.plan, _impl._FlatForwardPlan)
+                else forward_peak,
+            )
+        elif isinstance(candidate.plan, _impl._FlatForwardPlan):
             self._update_peak_memory_profile(
                 candidate.plan,
                 memory_baseline,
