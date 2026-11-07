@@ -105,14 +105,40 @@ class CalibrationRung:
         # Iterator creation must not let execution escape the explicit scope.
         if not self._active:
             raise RuntimeError("calibration rung is expired")
-        yield from cast(Any, _impl.TrainerRank.forward_micro_batches)(
-            self._rank,
-            self._candidate.inputs,
-            checkpoint=self._checkpoint,
-            no_grad=self._no_grad,
-            yield_empty=True,
-            _calibration_candidate=self._candidate,
-        )
+        previous = None
+        if self.decision.seed:
+            if not _memory._FIXED_SLOPE_PROFILES.get():
+                raise RuntimeError("calibration seed requires the fixed-slope scope")
+            used = self._rank.__dict__.setdefault(
+                "_calibration_seeded_signatures", set()
+            )
+            if self._candidate.plan.signature in used:
+                raise RuntimeError(
+                    "calibration seed already attempted for this signature"
+                )
+            used.add(self._candidate.plan.signature)
+            previous = self._rank.__dict__.get("_calibration_seed_plan")
+            self._rank.__dict__["_calibration_seed_plan"] = self._candidate.plan
+        try:
+            yield from cast(Any, _impl.TrainerRank.forward_micro_batches)(
+                self._rank,
+                self._candidate.inputs,
+                checkpoint=self._checkpoint,
+                no_grad=self._no_grad,
+                yield_empty=True,
+                _calibration_candidate=self._candidate,
+            )
+        finally:
+            # Only local permission cleanup, including throw/close/finalization.
+            if (
+                self.decision.seed
+                and self._rank.__dict__.get("_calibration_seed_plan")
+                is self._candidate.plan
+            ):
+                if previous is None:
+                    self._rank.__dict__.pop("_calibration_seed_plan", None)
+                else:
+                    self._rank.__dict__["_calibration_seed_plan"] = previous
 
 
 @contextmanager

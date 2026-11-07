@@ -459,7 +459,7 @@ def test_gloo_replicates_decision_and_components_without_another_exchange(
     ]
     assert len(changed) == 1
     assert changed[0][0][1:] == [[], "torch.float64"]
-    assert changed[0][1][1:] == [[29], "torch.float64"]
+    assert changed[0][1][1:] == [[32], "torch.float64"]
     if variant == "admit":
         assert a["decision"]["measured_base_bytes"] == 5_100_000_000
         assert a["decision"]["estimated_required_bytes"] > 14_000_000_000

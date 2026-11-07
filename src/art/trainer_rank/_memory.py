@@ -46,6 +46,16 @@ _FIXED_SLOPE_PROFILES: ContextVar[bool] = ContextVar(
     "art_fixed_slope_profiles", default=False
 )
 
+_CALIBRATION_SEED_TOKENS = 2 * _memory_model._MEMORY_SLOPE_MIN_TOKENS
+assert _CALIBRATION_SEED_TOKENS == 16384
+# 2026-11-07 fixture maxima, measured / recorded admission prediction:
+# tokens | ratio    | fixture model, operation, adapter rank
+#  8192  | 1.626309 | 1, forward_backward, 1
+# 16384  | 0.782535 | 0, forward_backward, 8
+# Recorded predictions are not today's static term. This provisional margin
+# requires a GPU recompute for both models; fail if measured > margin * static.
+_CALIBRATION_SEED_MARGIN = max(2.0, 1.2 * 0.782534579646491)
+
 
 @dataclass(frozen=True)
 class CalibrationRungDecision:
@@ -75,6 +85,9 @@ class CalibrationRungDecision:
     estimated_required_bytes: int
     available_bytes: int
     fits: bool
+    seed: bool = False
+    seed_margin: float | None = None
+    static_compute_bytes: int | None = None
 
 
 @dataclass
@@ -89,10 +102,17 @@ class _CalibrationEstimate:
     output: int = 0
     eligible: bool = False
     extrapolated: bool = False
+    seed: bool = False
+    static_compute_bytes: int = 0
     decision: CalibrationRungDecision | None = None
 
     @property
     def peak(self) -> int:
+        if self.seed:
+            return (
+                math.ceil(_CALIBRATION_SEED_MARGIN * self.static_compute_bytes)
+                + self.output
+            )
         return self.base + (3 * self.slope * self.delta + 1) // 2 + self.output
 
 
@@ -118,6 +138,25 @@ def _calibration_estimate(self: TrainerRank, plan: _impl._FlatForwardPlan):
         output=plan.output_bytes,
     )
     result.extrapolated = result.candidate > result.largest
+    if (
+        _FIXED_SLOPE_PROFILES.get()
+        and result.candidate == _CALIBRATION_SEED_TOKENS
+        and _unanchored(profile)
+        and plan.signature
+        not in self.__dict__.get("_calibration_seeded_signatures", ())
+        and _rate_reference(
+            self,
+            plan.signature,
+            profile,
+            packed_tokens=plan.packed_tokens,
+            caller_cp_workload=getattr(plan, "caller_cp_workload", None),
+        )
+        is None
+    ):
+        result.seed = result.extrapolated = result.eligible = True
+        result.count = result.largest = 0
+        result.delta = result.candidate
+        return result
     if not result.extrapolated:
         result.eligible = True
         return result
@@ -2421,8 +2460,23 @@ def _update_peak_memory_profile(
     self._peak_reading = (resets, peak)
     profile = self._memory_profiles.get(plan.signature)
     rate_eligible = True
+    complete = (
+        caller_phase
+        and interval is not None
+        and interval[0] == resets
+        and peak >= interval[1]
+    )
     if _fixed_slope_enabled(profile):
         rate_eligible = _rate_learning_eligible(self, plan)
+        if (
+            complete
+            and _FIXED_SLOPE_PROFILES.get()
+            and plan.packed_tokens == _CALIBRATION_SEED_TOKENS
+            and self.__dict__.get("_calibration_seed_plan") is plan
+        ):
+            # The admitted seed alone may establish the first rate. Intermediate
+            # forward readings and interrupted caller intervals cannot anchor it.
+            rate_eligible = True
     self._update_memory_profile(
         plan,
         max(0, peak - baseline),
@@ -2432,10 +2486,7 @@ def _update_peak_memory_profile(
         # Only a whole wave: a nested forward resetting the counter during
         # the yield, or an untracked reset (the counter fell below this
         # wave's forward peak), leaves the peak since then short of it.
-        caller_phase=caller_phase
-        and interval is not None
-        and interval[0] == resets
-        and peak >= interval[1],
+        caller_phase=complete,
         **({"rate_eligible": rate_eligible} if _fixed_slope_enabled(profile) else {}),
     )
 
@@ -2694,7 +2745,13 @@ def _memory_check(
             retained_tokens=self._plan_retained_tokens(forward),
             caller_cp_workload=getattr(forward, "caller_cp_workload", None),
             **(
-                {"_calibration_compute_bytes": _calibration.peak - forward.output_bytes}
+                {
+                    "_calibration_compute_bytes": (
+                        _calibration
+                        if _calibration.seed
+                        else _calibration.peak - forward.output_bytes
+                    )
+                }
                 if _calibration is not None
                 and _calibration.extrapolated
                 and _calibration.eligible
@@ -2777,6 +2834,13 @@ def _memory_check_required(
                 int(_calibration.signature_id[i : i + 8], 16) for i in range(0, 64, 8)
             ]
             operands.extend(identity + [-part for part in identity])
+            operands.extend(
+                [
+                    float(_calibration.seed),
+                    -float(_calibration.seed),
+                    _calibration.static_compute_bytes,
+                ]
+            )
         values = _impl.torch.tensor(
             operands,
             device=self._forward_collective_device() if sync_across_dp else self.device,
@@ -2817,6 +2881,10 @@ def _memory_check_required(
                 else ""
             )
             _calibration.eligible &= matching_signature
+            seed, negative_seed, static = values[29:32].tolist()
+            _calibration.seed = bool(seed) and seed == -negative_seed
+            _calibration.static_compute_bytes = int(static)
+            _calibration.eligible &= seed == -negative_seed
             # Componentwise maxima give every rank the same conservative
             # intent record, even when its learned bytes differ. This uses
             # the existing admission MAX; its following MIN is unchanged.
@@ -2876,13 +2944,18 @@ def _memory_check_required(
             measured_base_bytes=_calibration.base if extrapolating else None,
             slope_bytes_per_token=_calibration.slope if extrapolating else None,
             delta_tokens=_calibration.delta,
-            margin=1.5,
+            margin=_CALIBRATION_SEED_MARGIN if _calibration.seed else 1.5,
             output_bytes=_calibration.output,
             safety_factor=_impl._MEMORY_SAFETY_FACTOR,
             predicted_peak_bytes=_calibration.peak if extrapolating else None,
             estimated_required_bytes=required,
             available_bytes=available,
             fits=fits and _calibration.eligible,
+            seed=_calibration.seed,
+            seed_margin=_CALIBRATION_SEED_MARGIN if _calibration.seed else None,
+            static_compute_bytes=_calibration.static_compute_bytes
+            if _calibration.seed
+            else None,
         )
         fits = _calibration.decision.fits
     sample = None
@@ -2936,7 +3009,7 @@ def _estimate_required_memory_bytes_from_values(
     checkpoint_memory: tuple[int, int] | None = None,
     caller_cp_workload: _CPWorkload | None = None,
     include_cold_extrapolation: bool = True,
-    _calibration_compute_bytes: int | None = None,
+    _calibration_compute_bytes: int | _CalibrationEstimate | None = None,
 ) -> int:
     if packed_tokens <= 0:
         return output_bytes
@@ -3092,6 +3165,15 @@ def _estimate_required_memory_bytes_from_values(
         # Local head results coexist with full CP outputs during gathering.
         # Uneven rank plans can assign all of an item's rows to one rank.
         static_compute += output_bytes
+    if isinstance(_calibration_compute_bytes, _CalibrationEstimate):
+        # A prepared seed receives exactly the ordinary static term, before
+        # empirical pricing and the deferred floor. No ordinary call supplies it.
+        assert _calibration_compute_bytes.seed
+        assert packed_tokens == _CALIBRATION_SEED_TOKENS
+        _calibration_compute_bytes.static_compute_bytes = math.ceil(static_compute)
+        _calibration_compute_bytes = math.ceil(
+            _CALIBRATION_SEED_MARGIN * _calibration_compute_bytes.static_compute_bytes
+        )
     # Memory that grows with logical rows makes a profile learned under
     # lighter sharing underestimate a deeper-shared plan; scale the trusted
     # estimate up by the ratio gap. Packed pricing instead charges head and
@@ -3178,6 +3260,8 @@ def _estimate_required_memory_bytes_from_values(
     compute = (
         static_compute if profiled is None else max(static_compute, empirical(profiled))
     )
+    if _calibration_compute_bytes is not None:
+        compute = max(compute, _calibration_compute_bytes)
     if (
         _calibration_compute_bytes is None
         and _fixed_slope_enabled(profiled)
