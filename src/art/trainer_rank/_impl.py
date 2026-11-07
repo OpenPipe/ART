@@ -14,7 +14,7 @@ from collections.abc import (
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import lru_cache, partial
 import hashlib
@@ -64,6 +64,7 @@ from art.trainer_rank._backward_work import region as _backward_region
 from art.trainer_rank._planner_cost import (
     ModelGeometry,
     ParallelShape,
+    ScoringSelection,
     select_scoring,
 )
 from art.trainer_rank._prefix_tree_materializer import (  # noqa: F401  # read as ``_impl.X`` by _memory / _micro_batch_planner
@@ -2135,6 +2136,12 @@ class TrainerRank:
             geometry=self._geometry,
             shape=self._parallel_shape,
         )
+        self._validate_planner_cohort(
+            selection,
+            device_capability=capability,
+            device_memory_bytes=device_memory,
+            param_dtype=str(parameter.dtype),
+        )
         self._coefficient_version = selection.version
         self._coefficient_table = selection.table_id
         self._planner_coefficients = selection.coefficients
@@ -2215,6 +2222,92 @@ class TrainerRank:
         self._last_forward_telemetry_snapshot: dict[str, Any] | None = None
         _configure_moe_dispatcher_caches(runtime.model)
         self.zero_grad()
+
+    def _expert_admission_scope_error(
+        self, cohort: dist.ProcessGroup | None
+    ) -> str | None:
+        shape = self._parallel_shape
+        if shape.ep == shape.etp == 1:
+            return None
+        message = (
+            "TrainerRank requires the expert tensor/model group "
+            f"(EP={shape.ep}, ETP={shape.etp}) to be contained in the TP x CP "
+            f"forward-memory admission group (TP={shape.tp}, CP={shape.cp})"
+        )
+        if dist.is_available() and dist.is_initialized():
+            try:
+                from megatron.core import parallel_state as ps
+
+                expert = ps.get_expert_tensor_and_model_parallel_group(
+                    check_initialized=False
+                )
+                if expert is not None:
+                    expert_ranks = dist.get_process_group_ranks(expert)
+                    cohort_ranks = dist.get_process_group_ranks(
+                        cohort if cohort is not None else dist.group.WORLD
+                    )
+                    if set(expert_ranks) <= set(cohort_ranks):
+                        return None
+                    return (
+                        f"{message}; got expert ranks={expert_ranks}, "
+                        f"admission ranks={cohort_ranks}"
+                    )
+            except (
+                AssertionError,
+                AttributeError,
+                ImportError,
+                RuntimeError,
+                ValueError,
+            ):
+                pass
+        return f"{message}; group membership is unavailable"
+
+    def _validate_planner_cohort(
+        self,
+        selection: ScoringSelection,
+        *,
+        device_capability: tuple[int, int] | None,
+        device_memory_bytes: int | None,
+        param_dtype: str,
+    ) -> None:
+        # Agree once, before layout selection, slot setup or model execution.
+        # A local scope error joins the exchange so no cohort peer waits alone.
+        cohort = self._forward_memory_group()
+        scope_error = self._expert_admission_scope_error(cohort)
+        identity = json.dumps(
+            {
+                "scoring": asdict(selection),
+                "device_capability": device_capability,
+                "device_memory_bytes": device_memory_bytes,
+                "param_dtype": param_dtype,
+                "geometry": asdict(self._geometry),
+                "shape": asdict(self._parallel_shape),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        local = (identity, scope_error)
+        peers = [local]
+        if dist.is_available() and dist.is_initialized():
+            peers = [local] * dist.get_world_size(cohort)
+            # Object collectives use CPU under Gloo and the current CUDA
+            # device under NCCL, which must be this rank's model device.
+            with (
+                torch.cuda.device(self.device)
+                if dist.get_backend(cohort) == "nccl"
+                else nullcontext()
+            ):
+                dist.all_gather_object(peers, local, group=cohort)
+        errors = sorted({error for _, error in peers if error is not None})
+        if errors:
+            raise TrainerRankRuntimeSupportError("; ".join(errors))
+        identities = sorted({value for value, _ in peers})
+        if len(identities) != 1:
+            raise TrainerRankRuntimeSupportError(
+                "TrainerRank requires identical layout-scoring identities and "
+                "accelerator facts within the TP x CP forward-memory admission "
+                f"group; got {identities}"
+            )
 
     def zero_grad(self) -> None:
         for chunk in self.runtime.model:

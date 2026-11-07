@@ -68,6 +68,11 @@ class TrainerRank(_impl.TrainerRank):
     the MCore pipeline schedule); PP>1 raises ``TrainerRankRuntimeSupportError``
     at construction. Tensor parallelism is supported; the planner's memory
     profile is keyed by topology and calibrates itself online.
+
+    Construction is collective within the TP x CP admission group. Expert
+    tensor/model groups must be contained in that group, whose members must
+    agree on layout scoring and accelerator facts; unsupported configurations
+    raise ``TrainerRankRuntimeSupportError`` before any forward.
     """
 
     def __init__(self, runtime: TrainingRuntime) -> None:
