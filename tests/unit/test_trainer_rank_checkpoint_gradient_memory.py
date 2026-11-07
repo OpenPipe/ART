@@ -179,7 +179,7 @@ def test_finite_backward_profile_is_not_added_to_static_gradient_extent():
     )
 
 
-def test_unequal_checkpoint_gradients_preserve_cold_split_execution_order():
+def test_unequal_checkpoint_gradients_use_replicated_split_execution_order():
     r = rank()
     req = [
         ForwardInput(input_tokens=torch.arange(rows), hidden_states=True)
@@ -188,8 +188,8 @@ def test_unequal_checkpoint_gradients_preserve_cold_split_execution_order():
     costs = [r._plan_cost(r._plan_flat_forward([q])) for q in req]
     assert 0 < costs[0].checkpoint_input_gradient < costs[1].checkpoint_input_gradient
     assert costs[0].ephemeral < costs[1].ephemeral
-    # Cold forward retention was the entire pre-gradient requirement: both
-    # original priorities are zero, so the stable original order must survive.
+    # Cold forward retention is the entire pre-gradient requirement. Even when
+    # both old cost priorities are zero, replicated packed size orders children.
     assert all(c.ephemeral == c.checkpoint_peak_increment for c in costs)
     r._available_memory_bytes = lambda: 1 << 60
     split, check = r._admit_split_rung(
@@ -197,7 +197,8 @@ def test_unequal_checkpoint_gradients_preserve_cold_split_execution_order():
     )
     assert split is not None and check.fits
     assert check.estimated_required_bytes == r._split_required_memory(costs)
-    assert split.request_indices == ((0,), (1,)), split.request_indices
+    assert split.request_indices == ((1,), (0,)), split.request_indices
+    assert tuple(child.packed_tokens for child in split.subforwards) == (29, 17)
 
 
 @pytest.mark.parametrize("fully_masked", [False, True])

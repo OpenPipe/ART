@@ -386,13 +386,11 @@ def _admit_split_rung(
             for chunk in chunks
         ]
         costs = [self._plan_cost(plan) for plan in plans]
-        # Bind original request mappings; floor keys normalize execution order.
+        # Global pre-shard packed sizes are replicated; learned memory costs
+        # are rank-local and must not determine the order of collectives.
         order = sorted(
             range(len(plans)),
-            key=lambda i: (
-                -(costs[i].ephemeral - costs[i].checkpoint_peak_increment),
-                i,
-            ),
+            key=lambda i: (-plans[i].packed_tokens, i),
         )
         split = _impl._SplitForwardPlan(
             subforwards=tuple(plans[i] for i in order),
