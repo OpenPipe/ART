@@ -1,0 +1,246 @@
+{
+  "rank_zero_refusals": [
+    {
+      "error_type": "TrainerRankMemoryError",
+      "event": "refused",
+      "first_occurrence": true,
+      "input_bytes": 1310828,
+      "lengths": [
+        81920
+      ],
+      "max_rank_seconds": 1.5233458530001371,
+      "name": "calibration/forward_backward",
+      "pid": 1798,
+      "predicted_peak_bytes": 76464393420,
+      "python": "/opt/art/megatron_runtime/.venv/bin/python",
+      "rank": 0,
+      "reason": "forward_micro_batches: smallest DP microbatch is predicted to exceed available memory; a single request cannot be split. packed_tokens=81920 logical_tokens=81920 predicted_peak_gb=71.213 usable_limit_gb=61.104. rank_required_gb=71.213 rank_available_gb=61.104 Use smaller top-level items, reduce output requests, or call dp_rank_forward with already-DP-local smaller inputs.",
+      "time": 1794030073.2223008,
+      "usable_limit_bytes": 65609541223,
+      "warm_rank": 8
+    },
+    {
+      "error_type": "TrainerRankMemoryError",
+      "event": "refused",
+      "first_occurrence": false,
+      "input_bytes": 1310828,
+      "lengths": [
+        81920
+      ],
+      "max_rank_seconds": 0.3336332199996832,
+      "name": "calibration/forward_backward",
+      "pid": 1798,
+      "predicted_peak_bytes": 76464393420,
+      "python": "/opt/art/megatron_runtime/.venv/bin/python",
+      "rank": 0,
+      "reason": "forward_micro_batches: smallest DP microbatch is predicted to exceed available memory; a single request cannot be split. packed_tokens=81920 logical_tokens=81920 predicted_peak_gb=71.213 usable_limit_gb=61.102. rank_required_gb=71.213 rank_available_gb=61.102 Use smaller top-level items, reduce output requests, or call dp_rank_forward with already-DP-local smaller inputs.",
+      "time": 1794030078.496658,
+      "usable_limit_bytes": 65607444071,
+      "warm_rank": 8
+    },
+    {
+      "error_type": "TrainerRankMemoryError",
+      "event": "refused",
+      "first_occurrence": true,
+      "input_bytes": 524397,
+      "lengths": [
+        32768
+      ],
+      "max_rank_seconds": 0.2231296840000141,
+      "name": "calibration/forward_backward",
+      "pid": 1798,
+      "predicted_peak_bytes": 88469041971,
+      "python": "/opt/art/megatron_runtime/.venv/bin/python",
+      "rank": 0,
+      "reason": "forward_micro_batches: smallest DP microbatch is predicted to exceed available memory; a single request cannot be split. packed_tokens=32768 logical_tokens=32768 predicted_peak_gb=82.393 usable_limit_gb=54.027. rank_required_gb=82.393 rank_available_gb=54.027 Use smaller top-level items, reduce output requests, or call dp_rank_forward with already-DP-local smaller inputs.",
+      "time": 1794030092.5073347,
+      "usable_limit_bytes": 58011559527,
+      "warm_rank": 32
+    },
+    {
+      "error_type": "TrainerRankMemoryError",
+      "event": "refused",
+      "first_occurrence": false,
+      "input_bytes": 524397,
+      "lengths": [
+        32768
+      ],
+      "max_rank_seconds": 0.2663951909999014,
+      "name": "calibration/forward_backward",
+      "pid": 1798,
+      "predicted_peak_bytes": 88469041971,
+      "python": "/opt/art/megatron_runtime/.venv/bin/python",
+      "rank": 0,
+      "reason": "forward_micro_batches: smallest DP microbatch is predicted to exceed available memory; a single request cannot be split. packed_tokens=32768 logical_tokens=32768 predicted_peak_gb=82.393 usable_limit_gb=54.027. rank_required_gb=82.393 rank_available_gb=54.027 Use smaller top-level items, reduce output requests, or call dp_rank_forward with already-DP-local smaller inputs.",
+      "time": 1794030095.760263,
+      "usable_limit_bytes": 58011559527,
+      "warm_rank": 32
+    },
+    {
+      "calibrated_limit": 51811,
+      "error_type": "TrainerRankMemoryError",
+      "event": "refused",
+      "expected_shared_packed_tokens": 12544,
+      "first_matrix_occurrence": true,
+      "first_occurrence": true,
+      "lengths": [
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944
+      ],
+      "logical_tokens": 47104,
+      "lora_rank": 8,
+      "max_rank_seconds": 0.8149530730006518,
+      "name": "wanda",
+      "operation": "forward_backward",
+      "persistent_cache_process": false,
+      "pid": 1798,
+      "post_calibration": true,
+      "predicted_peak_bytes": 125678891008,
+      "python": "/opt/art/megatron_runtime/.venv/bin/python",
+      "rank": 0,
+      "reason": "forward_micro_batches: smallest DP microbatch is predicted to exceed available memory; a single request cannot be split. packed_tokens=2944 logical_tokens=2944 predicted_peak_gb=117.048 usable_limit_gb=61.086. rank_required_gb=117.048 rank_available_gb=61.088 Use smaller top-level items, reduce output requests, or call dp_rank_forward with already-DP-local smaller inputs.",
+      "repeat": 0,
+      "time": 1794030643.0271199,
+      "usable_limit_bytes": 65590666855
+    },
+    {
+      "calibrated_limit": 81920,
+      "error_type": "TrainerRankMemoryError",
+      "event": "refused",
+      "expected_shared_packed_tokens": 8192,
+      "first_matrix_occurrence": true,
+      "first_occurrence": false,
+      "lengths": [
+        8192
+      ],
+      "logical_tokens": 8192,
+      "lora_rank": 8,
+      "max_rank_seconds": 0.13057250600104453,
+      "name": "forward-8192",
+      "operation": "forward",
+      "persistent_cache_process": false,
+      "pid": 1798,
+      "post_calibration": true,
+      "predicted_peak_bytes": 568361327001,
+      "python": "/opt/art/megatron_runtime/.venv/bin/python",
+      "rank": 0,
+      "reason": "forward_micro_batches: smallest DP microbatch is predicted to exceed available memory; a single request cannot be split. packed_tokens=8192 logical_tokens=8192 predicted_peak_gb=529.328 usable_limit_gb=61.086. rank_required_gb=529.328 rank_available_gb=61.088 Use smaller top-level items, reduce output requests, or call dp_rank_forward with already-DP-local smaller inputs.",
+      "repeat": 0,
+      "time": 1794030643.3444414,
+      "usable_limit_bytes": 65590666855
+    },
+    {
+      "calibrated_limit": 81920,
+      "error_type": "TrainerRankMemoryError",
+      "event": "refused",
+      "expected_shared_packed_tokens": 32768,
+      "first_matrix_occurrence": true,
+      "first_occurrence": false,
+      "lengths": [
+        32768
+      ],
+      "logical_tokens": 32768,
+      "lora_rank": 8,
+      "max_rank_seconds": 0.14288986599967757,
+      "name": "forward-32768",
+      "operation": "forward",
+      "persistent_cache_process": false,
+      "pid": 1798,
+      "post_calibration": true,
+      "predicted_peak_bytes": 2273445308006,
+      "python": "/opt/art/megatron_runtime/.venv/bin/python",
+      "rank": 0,
+      "reason": "forward_micro_batches: smallest DP microbatch is predicted to exceed available memory; a single request cannot be split. packed_tokens=32768 logical_tokens=32768 predicted_peak_gb=2117.311 usable_limit_gb=61.086. rank_required_gb=2117.311 rank_available_gb=61.088 Use smaller top-level items, reduce output requests, or call dp_rank_forward with already-DP-local smaller inputs.",
+      "repeat": 0,
+      "time": 1794030643.6785417,
+      "usable_limit_bytes": 65590666855
+    },
+    {
+      "case": "wanda",
+      "error_type": "TrainerRankMemoryError",
+      "event": "refused",
+      "lengths": [
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944,
+        2944
+      ],
+      "max_rank_seconds": 1.0014913420000084,
+      "name": "numerics/forward_backward",
+      "pid": 1798,
+      "predicted_peak_bytes": 125678891008,
+      "python": "/opt/art/megatron_runtime/.venv/bin/python",
+      "rank": 0,
+      "reason": "forward_micro_batches: smallest DP microbatch is predicted to exceed available memory; a single request cannot be split. packed_tokens=2944 logical_tokens=2944 predicted_peak_gb=117.048 usable_limit_gb=60.137. rank_required_gb=117.048 rank_available_gb=60.137 Use smaller top-level items, reduce output requests, or call dp_rank_forward with already-DP-local smaller inputs.",
+      "time": 1794031403.3217196,
+      "usable_limit_bytes": 64571450983
+    }
+  ],
+  "successful_81920_forward": [
+    {
+      "name": "calibration/forward",
+      "lengths": [
+        81920
+      ],
+      "warm_rank": 1,
+      "time": 1794030061.6330771,
+      "status": "ok",
+      "wall_seconds": 1.6495886200009409,
+      "peak_memory_bytes": null,
+      "baseline_bytes": null,
+      "max_memory_allocated_bytes": null
+    },
+    {
+      "name": "calibration/forward",
+      "lengths": [
+        81920
+      ],
+      "warm_rank": 8,
+      "time": 1794030085.1727948,
+      "status": "ok",
+      "wall_seconds": 1.6773565459989186,
+      "peak_memory_bytes": null,
+      "baseline_bytes": null,
+      "max_memory_allocated_bytes": null
+    },
+    {
+      "name": "calibration/forward",
+      "lengths": [
+        81920
+      ],
+      "warm_rank": 32,
+      "time": 1794030102.334824,
+      "status": "ok",
+      "wall_seconds": 1.6575199469989457,
+      "peak_memory_bytes": null,
+      "baseline_bytes": null,
+      "max_memory_allocated_bytes": null
+    }
+  ]
+}

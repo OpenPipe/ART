@@ -1,0 +1,51 @@
+/tmp/stark-work/perf-memory-model/art/.venv/lib/python3.12/site-packages/megatron/core/hyper_comm_grid.py:26: UserWarning: absl.logging is not installed. Using logging.getLogger(__name__) instead. Please install absl.logging with `pip install absl-py` to use absl.logging.
+  warnings.warn(
+/tmp/stark-work/perf-memory-model/art/.venv/lib/python3.12/site-packages/megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py:115: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier and multi_tensor_scale
+  warnings.warn(
+/tmp/stark-work/perf-memory-model/art/.venv/lib/python3.12/site-packages/megatron/core/optimizer/__init__.py:24: UserWarning: Transformer Engine and Apex are not installed. Falling back to Torch optimizers.
+  warnings.warn(
+/tmp/stark-work/perf-memory-model/art/.venv/lib/python3.12/site-packages/megatron/core/optimizer/optimizer.py:29: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier and multi_tensor_scale
+  warnings.warn(
+/tmp/stark-work/perf-memory-model/art/.venv/lib/python3.12/site-packages/megatron/core/optimizer/clip_grads.py:32: UserWarning: Transformer Engine and Apex are not installed. Falling back to local implementations of multi_tensor_applier, multi_tensor_l2norm, and multi_tensor_scale
+  warnings.warn(
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_____________ test_run6_tiny_forward_does_not_poison_large_forward _____________
+
+    def test_run6_tiny_forward_does_not_poison_large_forward():
+        rank = _rank()
+        seed = rank._plan_flat_forward(
+            [ForwardInput(input_tokens=torch.arange(8), hidden_states=True, no_grad=True)]
+        )
+        # Reconstruct run6's 529.328 GiB / 8192-token refusal rate. This is a
+        # synthetic eight-token workspace observation, not a new GPU measurement.
+        poisoned_rate = (568_361_327_001 / 1.1 - 8192 * 4096) / 8192
+        large = replace(seed, packed_tokens=81920, logical_tokens=81920, output_bytes=0)
+        tiny = replace(seed, output_bytes=0)
+        # A large root had already fitted before the tiny observation in run6.
+        rank._update_memory_profile(large, 8 * 2**30, retained_bytes=None)
+        rank._update_memory_profile(
+            tiny, round(poisoned_rate * tiny.packed_tokens), retained_bytes=None
+        )
+        required = rank._estimate_required_memory_bytes_from_values(
+            packed_tokens=8192, output_bytes=8192 * 4096, signature=seed.signature
+        )
+>       assert required < 61 * 2**30, f"tiny workspace poisoned prediction: {required}"
+E       AssertionError: tiny workspace poisoned prediction: 568361327001
+E       assert 568361327001 < (61 * (2 ** 30))
+
+tests/unit/test_trainer_rank_fixed_slope.py:29: AssertionError
+=============================== warnings summary ===============================
+.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1636
+  /tmp/stark-work/perf-memory-model/art/.venv/lib/python3.12/site-packages/_pytest/config/__init__.py:1636: PytestConfigWarning: Unknown config option: asyncio_mode
+
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+tests/unit/test_trainer_rank_fixed_slope.py::test_run6_tiny_forward_does_not_poison_large_forward
+  /tmp/stark-work/perf-memory-model/art/.venv/lib/python3.12/site-packages/fla/utils.py:425: UserWarning: Triton is not supported on current platform, roll back to CPU.
+    warnings.warn(('Triton is not supported on current platform, roll back to CPU.'), stacklevel=1)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/unit/test_trainer_rank_fixed_slope.py::test_run6_tiny_forward_does_not_poison_large_forward
+1 failed, 2 warnings in 1.62s

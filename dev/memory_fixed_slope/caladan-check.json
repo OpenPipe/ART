@@ -1,0 +1,5 @@
+{
+  "passed": 16,
+  "source_modified": false,
+  "checks": "real Caladan patch round-trip, order-independent merge, observation coverage, v3 field defaults, invalid slope rejection, v4 key"
+}

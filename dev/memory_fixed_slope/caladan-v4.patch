@@ -1,0 +1,38 @@
+--- a/src/caladan/stark/trainer/calibration.py
++++ b/src/caladan/stark/trainer/calibration.py
+@@ -84,9 +84,14 @@
+                 )
+             ):
+                 raise ValueError("invalid calibration CP evidence")
+-        profiles[signature] = types[row["profile_type"]](
++        profile = types[row["profile_type"]](
+             **{k: tuples(v) for k, v in data.items()}
+         )
++        if hasattr(profile, "peak_model_version"):
++            from art.trainer_rank._memory import _validate_memory_profile_model
++
++            _validate_memory_profile_model(profile)
++        profiles[signature] = profile
+     if not profiles:
+         raise ValueError("empty calibration")
+     return profiles
+@@ -129,6 +134,10 @@
+                 fields["caller_cp_peaks"] = tuple(
+                     [evidence[0], *evidence[-7:]] if len(evidence) > 8 else evidence
+                 )
++            if hasattr(profile, "peak_model_version"):
++                from art.trainer_rank._memory import _merge_memory_profile_model_fields
++
++                fields.update(_merge_memory_profile_model_fields(previous, profile))
+             profile = type(profile)(**fields)
+         current[signature] = profile
+
+@@ -202,7 +211,7 @@
+         self.key = hashlib.sha256(
+             json.dumps(
+                 {
+-                    "version": 3,
++                    "version": 4,
+                     "model": model,
+                     "bundle": bundle,
+                     "kernel": memory_identity(executor.backend.identity),

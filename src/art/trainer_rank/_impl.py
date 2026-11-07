@@ -670,6 +670,15 @@ class _MemoryProfile:
     warm_packed_tokens: int | None = None
     warm_logical_per_packed: float | None = None
     caller_plans: int = 0
+    # Missing fields in persisted records mean the original scalar-rate model.
+    # bytes_per_token and warm_* remain legacy diagnostics for v2 records.
+    peak_model_version: int = 1
+    compute_observations: tuple[tuple[int, int], ...] = ()
+    fixed_compute_bytes: int = 0
+    compute_slope: tuple[int, int] = (0, 1)
+    # A v1 scalar has lost its observations. Never silently discard its bound
+    # on update; a fresh calibration/cache key is needed to remove poisoning.
+    legacy_bytes_per_token: float = 0.0
 
 
 @dataclass(frozen=True)

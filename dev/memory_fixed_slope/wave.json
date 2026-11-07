@@ -1,0 +1,168 @@
+{
+  "approximate": true,
+  "description": "Approximate dense RL width: production CPU planner, supplied root peak fit.\n\n568 datums, families of 16 sharing a 240-token prompt, independent 213-token\ncompletions. CP8, LoRA 8, 24 GiB usable (host-overhead harness budget). A synthetic\n8-token 2 MB/token observation reconstructs that harness's poisoned OLD rate.\nThe root-sweep fit is transferred to the RL signature for this what-if only;\nthis transfer is NOT permitted by production signature matching or a GPU bound.\n",
+  "usable_bytes": 25769803776,
+  "lora_rank": 8,
+  "cp": 8,
+  "results": {
+    "old": {
+      "selected_width": 32,
+      "seconds": 0.30706390365958214,
+      "prices": [
+        {
+          "width": 32,
+          "packed_tokens": 14496,
+          "logical_tokens": 14496,
+          "required_bytes": 32215018176,
+          "usable_bytes": 25769803776,
+          "fits": false
+        },
+        {
+          "width": 64,
+          "packed_tokens": 14592,
+          "logical_tokens": 28992,
+          "required_bytes": 32778259430,
+          "usable_bytes": 25769803776,
+          "fits": false
+        },
+        {
+          "width": 128,
+          "packed_tokens": 29184,
+          "logical_tokens": 57984,
+          "required_bytes": 65556518860,
+          "usable_bytes": 25769803776,
+          "fits": false
+        },
+        {
+          "width": 256,
+          "packed_tokens": 58368,
+          "logical_tokens": 115968,
+          "required_bytes": 131113037721,
+          "usable_bytes": 25769803776,
+          "fits": false
+        },
+        {
+          "width": 512,
+          "packed_tokens": 116736,
+          "logical_tokens": 231936,
+          "required_bytes": 262226075443,
+          "usable_bytes": 25769803776,
+          "fits": false
+        },
+        {
+          "width": 568,
+          "packed_tokens": 129624,
+          "logical_tokens": 257304,
+          "required_bytes": 291174580329,
+          "usable_bytes": 25769803776,
+          "fits": false
+        }
+      ],
+      "selected_packed_tokens": 7296,
+      "selected_required_bytes": 16389129715,
+      "profile": {
+        "bytes_per_token": 2000000.0,
+        "packed_tokens": 131072,
+        "logical_per_packed": 1.0,
+        "retained_fraction": null,
+        "retained_compute_bytes_per_token": null,
+        "warm_bytes_per_token": null,
+        "warm_packed_tokens": null,
+        "warm_logical_per_packed": null,
+        "caller_plans": 0,
+        "peak_model_version": 1,
+        "compute_observations": [],
+        "fixed_compute_bytes": 0,
+        "compute_slope": [
+          0,
+          1
+        ],
+        "legacy_bytes_per_token": 0.0
+      }
+    },
+    "new": {
+      "selected_width": 384,
+      "seconds": 2.0796720758080482,
+      "prices": [
+        {
+          "width": 32,
+          "packed_tokens": 14496,
+          "logical_tokens": 14496,
+          "required_bytes": 4056645401,
+          "usable_bytes": 25769803776,
+          "fits": true
+        },
+        {
+          "width": 64,
+          "packed_tokens": 14592,
+          "logical_tokens": 28992,
+          "required_bytes": 4310780672,
+          "usable_bytes": 25769803776,
+          "fits": true
+        },
+        {
+          "width": 128,
+          "packed_tokens": 29184,
+          "logical_tokens": 57984,
+          "required_bytes": 8619650969,
+          "usable_bytes": 25769803776,
+          "fits": true
+        },
+        {
+          "width": 256,
+          "packed_tokens": 58368,
+          "logical_tokens": 115968,
+          "required_bytes": 16782350014,
+          "usable_bytes": 25769803776,
+          "fits": true
+        },
+        {
+          "width": 512,
+          "packed_tokens": 116736,
+          "logical_tokens": 231936,
+          "required_bytes": 33549027554,
+          "usable_bytes": 25769803776,
+          "fits": false
+        },
+        {
+          "width": 568,
+          "packed_tokens": 129624,
+          "logical_tokens": 257304,
+          "required_bytes": 38366312864,
+          "usable_bytes": 25769803776,
+          "fits": false
+        }
+      ],
+      "selected_packed_tokens": 87552,
+      "selected_required_bytes": 25165688784,
+      "profile": {
+        "bytes_per_token": 2000000.0,
+        "packed_tokens": 131072,
+        "logical_per_packed": 1.0,
+        "retained_fraction": null,
+        "retained_compute_bytes_per_token": null,
+        "warm_bytes_per_token": null,
+        "warm_packed_tokens": null,
+        "warm_logical_per_packed": null,
+        "caller_plans": 0,
+        "peak_model_version": 2,
+        "compute_observations": [
+          [
+            8,
+            16000000
+          ],
+          [
+            131072,
+            28709644288
+          ]
+        ],
+        "fixed_compute_bytes": 14247703,
+        "compute_slope": [
+          28709644288,
+          131072
+        ],
+        "legacy_bytes_per_token": 0.0
+      }
+    }
+  }
+}
