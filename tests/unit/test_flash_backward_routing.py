@@ -1,6 +1,7 @@
 """Compiled backward routing and LSE units without CUDA or kernel execution."""
 
 from collections import Counter, defaultdict
+import importlib
 import json
 import logging
 import math
@@ -9,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 import torch
+from torch.nn.attention.flex_attention import AuxRequest, create_block_mask
 
 from art.megatron.flex_attn import compiled
 from art.megatron.flex_attn import flash_dlse_patch as patch
@@ -147,3 +149,75 @@ def test_forward_stays_flash_and_override_set_is_explicit(monkeypatch, dim):
         == "FLASH"
     )
     assert patch._FLASH_TRITON_BACKWARD_HEAD_DIMS == {64}
+
+
+@pytest.mark.parametrize("dim", [32, 64, 96, 128, 256])
+@pytest.mark.parametrize("backend", ["FLASH", "TRITON"])
+def test_only_affected_hop_cache_inputs_are_versioned(dim, backend):
+    options = {"BACKEND": backend, "PRESCALE_QK": False}
+    actual = patch.flash_backward_compatibility_options(options, dim)
+    if dim == 64 and backend == "FLASH":
+        assert actual == {**options, patch._FLASH_BACKWARD_COMPATIBILITY_KEY: 1}
+    else:
+        assert actual is options
+    assert options == {"BACKEND": backend, "PRESCALE_QK": False}
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_cache_version_is_removed_before_kernel_selection(
+    lowering, monkeypatch, deterministic
+):
+    monkeypatch.setattr(
+        torch, "are_deterministic_algorithms_enabled", lambda: deterministic
+    )
+    incoming = _arguments(64, "FLASH", True)
+    options = dict(
+        patch.flash_backward_compatibility_options(incoming["kernel_options"], 64)
+    )
+    incoming["kernel_options"] = options
+    actual = lowering(**incoming)
+    assert actual[11] == {"BACKEND": "TRITON", "PRESCALE_QK": False}
+    assert options[patch._FLASH_BACKWARD_COMPATIBILITY_KEY] == 1
+
+
+@pytest.mark.parametrize("entry", ["forced_dense", "sparse", "dense"])
+@pytest.mark.parametrize("dim", [64, 128, 256])
+def test_capture_versions_affected_cache_without_graph_breaks(monkeypatch, entry, dim):
+    # Explain captures real HOP inputs without running CUDA or the lowering.
+    flex = importlib.import_module("torch.nn.attention.flex_attention")
+    monkeypatch.setattr(flex, "_validate_device", lambda *args: None)
+    torch._dynamo.reset()
+    q = torch.ones(1, 1, 2, dim, requires_grad=True)
+    k = torch.ones(1, 1, 1, dim, requires_grad=True)
+    mask = create_block_mask(
+        lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=2, KV_LEN=1, device="cpu"
+    )
+    if entry == "sparse":
+        fn = compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"})
+        extra = {}
+    else:
+        fn = (
+            compiled._forced_flex_attention_dense
+            if entry == "forced_dense"
+            else compiled._flex_attention_with_options({"BACKEND": "FLASH"})
+        )
+        extra = {"return_aux": AuxRequest(lse=True)}
+    try:
+        explanation = torch._dynamo.explain(fn)(
+            q, k, k, block_mask=mask, scale=dim**-0.5, enable_gqa=False, **extra
+        )
+        assert explanation.graph_count == 1
+        assert explanation.graph_break_count == 0, explanation.break_reasons
+        hops = [
+            node
+            for node in explanation.graphs[0].graph.nodes
+            if node.target is torch.ops.higher_order.flex_attention
+        ]
+        assert len(hops) == 1
+        options = hops[0].args[6]
+        assert options["BACKEND"] == "FLASH"
+        assert options.get(patch._FLASH_BACKWARD_COMPATIBILITY_KEY) == (
+            1 if dim == 64 else None
+        )
+    finally:
+        torch._dynamo.reset()

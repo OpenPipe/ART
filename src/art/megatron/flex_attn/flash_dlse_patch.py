@@ -7,6 +7,7 @@ public autograd-compatible tile override for CUTE flex attention.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import inspect
 import json
 import logging
@@ -22,12 +23,26 @@ _TILE_PATCH_APPLIED = False
 _DQ_POSTPROCESS_PATCH_APPLIED = False
 _DETERMINISTIC_BWD_PATCH_APPLIED = False
 _FLASH_TRITON_BACKWARD_HEAD_DIMS = frozenset({64})
+_FLASH_BACKWARD_COMPATIBILITY_KEY = "bwd_ART_TRITON_BACKWARD_VERSION"
 _FLASH_BACKWARD_OVERRIDE_LOGGED: set[int] = set()
 _logger = logging.getLogger(__name__)
 
 
 def _use_triton_flash_backward(head_dim: int, deterministic: bool) -> bool:
     return deterministic or head_dim in _FLASH_TRITON_BACKWARD_HEAD_DIMS
+
+
+def flash_backward_compatibility_options(
+    kernel_options: Mapping[str, Any], head_dim: int
+) -> Mapping[str, Any]:
+    # A cached Inductor graph skips lowering. Version affected HOP inputs so
+    # an older compiled FLASH backward cannot bypass the new routing rule.
+    if (
+        kernel_options.get("BACKEND") == "FLASH"
+        and head_dim in _FLASH_TRITON_BACKWARD_HEAD_DIMS
+    ):
+        return {**kernel_options, _FLASH_BACKWARD_COMPATIBILITY_KEY: 1}
+    return kernel_options
 
 
 def _record_flash_backward_override(head_dim: int) -> None:
@@ -676,6 +691,8 @@ def apply_deterministic_flash_backward_patch() -> None:
                 if grad_logsumexp is not None:
                     grad_logsumexp = multiply(grad_logsumexp, math.log(2.0))
                 kernel_options = {**kernel_options, "BACKEND": "TRITON"}
+                # This is graph-cache metadata, not a Triton tuning option.
+                kernel_options.pop(_FLASH_BACKWARD_COMPATIBILITY_KEY, None)
         # Normalize keyword calls too; the underlying lowering unpacks
         # positional HOP arguments. Neither form may bypass the dim guard.
         return original(

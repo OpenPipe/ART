@@ -26,6 +26,7 @@ from torch.nn.attention.flex_attention import (
 from art.megatron.flex_attn.flash_dlse_patch import (
     apply_deterministic_flash_backward_patch,
     apply_flash_flex_dlse_patch,
+    flash_backward_compatibility_options,
 )
 
 apply_flash_flex_dlse_patch()
@@ -202,6 +203,10 @@ def _forced_flex_attention_dense(
     enable_gqa,
     return_aux: AuxRequest | None = None,
 ):
+    kernel_options = cast(
+        FlexKernelOptions,
+        flash_backward_compatibility_options(_FORCED_FLEX_KERNEL_OPTIONS, q.shape[-1]),
+    )
     eager_flash = _flash_eager_fallback(
         _FORCED_FLEX_BACKEND, "_forced_flex_attention_dense", q, k, v
     )
@@ -212,7 +217,7 @@ def _forced_flex_attention_dense(
         block_mask=block_mask,
         scale=scale,
         enable_gqa=enable_gqa,
-        kernel_options=_FORCED_FLEX_KERNEL_OPTIONS,
+        kernel_options=kernel_options,
         return_aux=return_aux,
     )
     return _adapt_eager_flash_aux(result) if eager_flash else result
@@ -239,6 +244,10 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
         # Materialize potentially graph-breaking metadata before detection, so
         # a resumed HOP frame cannot carry a captured, stale False flag.
         mask_tuple = (q.shape[-2], k.shape[-2], *block_mask.as_tuple()[2:])
+        options = cast(
+            dict[str, Any],
+            flash_backward_compatibility_options(resolved_options, q.shape[-1]),
+        )
         eager_flash = _flash_eager_fallback(
             resolved_options.get("BACKEND"), "sparse_flex_attention", q, k, v
         )
@@ -249,7 +258,7 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
             _identity_score,
             mask_tuple,
             scale,
-            resolved_options,
+            options,
         )
         lse = lse * _FLASH_LSE_RESCALE
         if eager_flash:
@@ -307,6 +316,10 @@ def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
         enable_gqa,
         return_aux: AuxRequest | None = None,
     ):
+        options = cast(
+            FlexKernelOptions,
+            flash_backward_compatibility_options(kernel_options, q.shape[-1]),
+        )
         eager_flash = _flash_eager_fallback(
             kernel_options.get("BACKEND"), "dense_flex_attention", q, k, v
         )
@@ -317,7 +330,7 @@ def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
             block_mask=block_mask,
             scale=scale,
             enable_gqa=enable_gqa,
-            kernel_options=kernel_options,
+            kernel_options=options,
             return_aux=return_aux,
         )
         return _adapt_eager_flash_aux(result) if eager_flash else result
