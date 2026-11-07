@@ -67,6 +67,9 @@ def metadata_rank(kind):
             torch.nn.Module.__init__(owner)
             owner.non_gated = False
             layer.mlp.linear_fc1 = owner
+    cfg.kv_channels = 256
+    cfg.num_attention_heads = 16 if kind == "moe" else 24
+    cfg.num_query_groups = 2 if kind == "moe" else 4
     cfg.context_parallel_size = 8
     cfg.tensor_model_parallel_size = cfg.expert_model_parallel_size = 1
     cfg.expert_tensor_parallel_size = cfg.pipeline_model_parallel_size = 1
@@ -253,7 +256,7 @@ def test_cold_user_paths_keep_the_floor_and_cannot_construct_seed(monkeypatch, g
 
 
 @pytest.mark.parametrize("n", [512, 2048])
-def test_documents_expected_moe_short_root_family_refusal_after_seed(monkeypatch, n):
+def test_moe_short_root_family_dominance_coverage_after_seed(monkeypatch, n):
     rank = metadata_rank("moe")
     monkeypatch.setattr(
         rank, "_available_memory_bytes", lambda sample=None: 71_000_000_000
@@ -267,9 +270,9 @@ def test_documents_expected_moe_short_root_family_refusal_after_seed(monkeypatch
         assert isinstance(profile, memory._CallerMemoryProfile)
         assert (
             profile.covering_cp_peak(plan.packed_tokens, plan.caller_cp_workload)
-            is None
+            is not None
         )
-        assert not rank._memory_check(plan).fits
+        assert rank._memory_check(plan).fits
 
 
 def _seed_worker(index, directory, variant):

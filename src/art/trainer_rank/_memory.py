@@ -18,6 +18,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 import hashlib
+import json
 import math
 from types import MethodType
 from typing import TYPE_CHECKING, Any
@@ -55,6 +56,152 @@ assert _CALIBRATION_SEED_TOKENS == 16384
 # Recorded predictions are not today's static term. This provisional margin
 # requires a GPU recompute for both models; fail if measured > margin * static.
 _CALIBRATION_SEED_MARGIN = max(2.0, 1.2 * 0.782534579646491)
+_CP_BLOCKED_PAIR_BUDGET = 64
+
+
+class CalibrationCoverageViolation(RuntimeError):
+    """A calibration measurement disproved a CP mask-family coverage pair."""
+
+    def __init__(
+        self,
+        requested_family: str,
+        observed_family: str,
+        measured_peak_bytes: int,
+        covering_peak_bytes: int,
+        signature_id: str,
+    ) -> None:
+        super().__init__(
+            "Calibration CP mask-family dominance exceeded its covering peak"
+        )
+        self.requested_family = requested_family
+        self.observed_family = observed_family
+        self.measured_peak_bytes = measured_peak_bytes
+        self.covering_peak_bytes = covering_peak_bytes
+        self.signature_id = signature_id
+
+    def __reduce__(self):
+        return type(self), (
+            self.requested_family,
+            self.observed_family,
+            self.measured_peak_bytes,
+            self.covering_peak_bytes,
+            self.signature_id,
+        )
+
+
+@dataclass
+class _CalibrationCoverageGuard:
+    plan: Any
+    observed_family: str
+    covering_compute_bytes: int
+    violation: CalibrationCoverageViolation | None = None
+
+
+def _cp_pair(requested: str, observed: str) -> tuple[str, str]:
+    return (
+        hashlib.sha256(requested.encode()).hexdigest(),
+        hashlib.sha256(observed.encode()).hexdigest(),
+    )
+
+
+def _cp_family_dominates(requested: str, observed: str) -> bool:
+    """Only mask kinds may shrink; all execution qualifications must match."""
+    try:
+        want, have = json.loads(requested), json.loads(observed)
+        if not isinstance(want, dict) or not isinstance(have, dict):
+            return False
+        wm, hm = want.pop("masks"), have.pop("masks")
+        qualification = want.get("execution_qualification")
+        return (
+            want == have
+            and isinstance(qualification, dict)
+            and qualification.get("backend") in ("FLASH", "TRITON")
+            and bool(qualification.get("kernels"))
+            and isinstance(wm, list)
+            and isinstance(hm, list)
+            and len(wm) == len(hm)
+            and all(
+                isinstance(w, list)
+                and isinstance(h, list)
+                and all(isinstance(k, str) for k in (*w, *h))
+                and set(w) <= set(h)
+                for w, h in zip(wm, hm, strict=True)
+            )
+        )
+    except (ValueError, KeyError, TypeError):
+        return False
+
+
+def _qualified_cp_workload(
+    self: TrainerRank, plan: _impl._FlatForwardPlan
+) -> _CPWorkload:
+    from dataclasses import asdict
+
+    from art.megatron.flex_attn import compiled
+    from art.megatron.flex_attn.attention import _triton_num_stages_2_head_dims
+
+    assert plan.caller_cp_workload is not None
+    family, loads = plan.caller_cp_workload
+    value = json.loads(family)
+    head = self._geometry.kv_channels
+    backend = (
+        compiled.flex_backend_for_head_dims(
+            head_dim=head, head_dim_v=head, device=self.device
+        )
+        if head
+        else None
+    )
+    kernels = []
+    if backend is not None:
+        options: dict[str, Any] = dict(
+            backend=backend,
+            head_dim=head,
+            head_dim_v=head,
+            triton_num_stages_2_head_dims=_triton_num_stages_2_head_dims(
+                self.runtime.provider
+            ),
+            device=self.device,
+        )
+        for function in (
+            compiled.get_dense_compiled_flex_attention(**options),
+            compiled.get_sparse_compiled_flex_attention(family_key="sparse", **options),
+        ):
+            original = getattr(function, "_torchdynamo_orig_callable", function)
+            code = getattr(original, "__code__", None)
+            kernels.append(
+                (
+                    original.__module__,
+                    original.__qualname__,
+                    None if code is None else hashlib.sha256(code.co_code).hexdigest(),
+                    hasattr(function, "_torchdynamo_orig_callable"),
+                )
+            )
+    value["execution_qualification"] = dict(
+        signature=hashlib.sha256(repr(plan.signature).encode()).hexdigest(),
+        geometry=asdict(self._geometry),
+        layers=self._num_layers,
+        gdn_layers=self._gdn_layers,
+        moe_layers=self._moe_layers,
+        parallel_shape=asdict(self._parallel_shape),
+        backend=backend,
+        kernels=kernels,
+        forced_options=dict(compiled._FORCED_FLEX_KERNEL_OPTIONS),
+        deterministic=_impl.torch.are_deterministic_algorithms_enabled(),
+        torch=_impl.torch.__version__,
+        dtype_bytes=self._param_dtype_size,
+    )
+    return json.dumps(value, sort_keys=True, separators=(",", ":")), loads
+
+
+def _block_cp_pair(profile: _CallerMemoryProfileV2, requested: str, observed: str):
+    pairs = set(profile.non_dominant_cp_pairs) | {_cp_pair(requested, observed)}
+    return replace(
+        profile,
+        profile_format_version=6,
+        non_dominant_cp_pairs=tuple(sorted(pairs)[:_CP_BLOCKED_PAIR_BUDGET]),
+        dominance_disabled=profile.dominance_disabled
+        or len(pairs) > _CP_BLOCKED_PAIR_BUDGET,
+    )
 
 
 @dataclass(frozen=True)
@@ -511,6 +658,19 @@ def _merge_memory_profile_model_fields(
         )
     else:
         fixed, slope = _memory_model.fit_points(observations)
+    if any(isinstance(p, _CallerMemoryProfileV2) for p in profiles):
+        pairs = set().union(
+            *(getattr(p, "non_dominant_cp_pairs", ()) for p in profiles)
+        )
+        extra.update(
+            non_dominant_cp_pairs=tuple(sorted(pairs)[:_CP_BLOCKED_PAIR_BUDGET]),
+            dominance_disabled=any(
+                getattr(p, "dominance_disabled", False) for p in profiles
+            )
+            or len(pairs) > _CP_BLOCKED_PAIR_BUDGET,
+        )
+        if formats:
+            extra["profile_format_version"] = 6
     return dict(
         peak_model_version=_memory_model._MEMORY_PROFILE_VERSION,
         compute_observations=observations,
@@ -553,7 +713,7 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
     points = profile.compute_observations
     if not points or _memory_model.merge_points(points) != points:
         raise ValueError("invalid memory observation hull")
-    if profile.profile_format_version in (3, 4, 5):
+    if profile.profile_format_version in (3, 4, 5, 6):
         floor, rates, absolute = (
             profile.rate_floor_tokens,
             profile.rate_observations,
@@ -611,7 +771,7 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
                 )
             )
             or (
-                profile.profile_format_version == 5
+                profile.profile_format_version >= 5
                 and (
                     len(profile.retained_compute_peaks) > _RETAINED_POINT_BUDGET
                     or _merge_retained_peaks(profile.retained_compute_peaks)
@@ -623,6 +783,30 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
             raise ValueError("invalid independent memory extents or retained floors")
     elif any(extents) or profile.retained_compute_peaks:
         raise ValueError("unexpected independent memory evidence in old format")
+    if isinstance(profile, _CallerMemoryProfileV2):
+        pairs = profile.non_dominant_cp_pairs
+        if (
+            type(pairs) is not tuple
+            or len(pairs) > _CP_BLOCKED_PAIR_BUDGET
+            or any(
+                type(pair) is not tuple
+                or len(pair) != 2
+                or any(
+                    not isinstance(v, str)
+                    or len(v) != 64
+                    or any(c not in "0123456789abcdef" for c in v)
+                    for v in pair
+                )
+                for pair in pairs
+            )
+            or tuple(sorted(set(pairs))) != pairs
+            or type(profile.dominance_disabled) is not bool
+            or (
+                (pairs or profile.dominance_disabled)
+                and profile.profile_format_version < 6
+            )
+        ):
+            raise ValueError("invalid CP dominance revocations")
     if (
         type(profile.fixed_compute_bytes) is not int
         or profile.fixed_compute_bytes != fixed
@@ -642,24 +826,46 @@ class _CallerMemoryProfile(_impl._MemoryProfile):
     compute_peak_floor: int = 0
     caller_cp_peaks: tuple[_CPCallerPeak, ...] = ()
 
+    def covering_cp_observation(
+        self, tokens: int | float, cp_workload: _CPWorkload | None
+    ) -> _CPCallerPeak | None:
+        if cp_workload is None:
+            return None
+        family, loads = cp_workload
+        covered = [
+            p
+            for p in self.caller_cp_peaks
+            if tokens <= p[0]
+            and len(loads) == len(p[3])
+            and all(
+                len(want) == len(have)
+                and all(w <= h for w, h in zip(want, have, strict=True))
+                for want, have in zip(loads, p[3], strict=True)
+            )
+        ]
+        # Prefer existing equality coverage before considering a new dominance.
+        for point in covered:
+            if family == point[2]:
+                return point
+        if (
+            isinstance(self, _CallerMemoryProfileV2)
+            and self.profile_format_version >= 6
+            and not self.dominance_disabled
+        ):
+            for point in covered:
+                if _cp_pair(
+                    family, point[2]
+                ) not in self.non_dominant_cp_pairs and _cp_family_dominates(
+                    family, point[2]
+                ):
+                    return point
+        return None
+
     def covering_cp_peak(
         self, tokens: int | float, cp_workload: _CPWorkload | None
     ) -> int | None:
-        if cp_workload is not None:
-            family, loads = cp_workload
-            for length, peak, measured_family, measured in self.caller_cp_peaks:
-                if (
-                    tokens <= length
-                    and family == measured_family
-                    and len(loads) == len(measured)
-                    and all(
-                        len(want) == len(have)
-                        and all(w <= h for w, h in zip(want, have, strict=True))
-                        for want, have in zip(loads, measured, strict=True)
-                    )
-                ):
-                    return peak
-        return None
+        point = self.covering_cp_observation(tokens, cp_workload)
+        return None if point is None else point[1]
 
     def compute_peak(
         self,
@@ -730,7 +936,9 @@ class _BoundedMemoryProfile(_impl._MemoryProfile):
 
 @dataclass(frozen=True)
 class _CallerMemoryProfileV2(_impl._MemoryProfileV2, _CallerMemoryProfile):
-    pass
+    profile_format_version: int = 6
+    non_dominant_cp_pairs: tuple[tuple[str, str], ...] = ()
+    dominance_disabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -741,9 +949,16 @@ class _BoundedMemoryProfileV2(_impl._MemoryProfileV2, _BoundedMemoryProfile):
 def _memory_profile_from_values(values: dict[str, Any]) -> _impl._MemoryProfile:
     """Decode the versioned state while preserving the legacy record classes."""
     values = dict(values)
+    if "non_dominant_cp_pairs" in values:
+        values["non_dominant_cp_pairs"] = tuple(
+            tuple(p) for p in values["non_dominant_cp_pairs"]
+        )
     version = values.get("peak_model_version", 1)
     if type(version) is not int or version not in (1, 2):
         raise ValueError("unsupported memory profile version")
+    if version == 2:
+        # Early v2 records predate the evidence-format tag and rate fields.
+        values.setdefault("profile_format_version", 2)
     if version == 1:
         # Accept earlier v1 encoders that explicitly emitted inert v2 defaults.
         for name in (
@@ -2466,6 +2681,24 @@ def _update_peak_memory_profile(
         and interval[0] == resets
         and peak >= interval[1]
     )
+    guard = self.__dict__.get("_calibration_coverage_guard")
+    violation = None
+    if isinstance(guard, _CalibrationCoverageGuard) and guard.plan is plan:
+        measured, covering = (
+            max(0, peak - baseline),
+            guard.covering_compute_bytes + plan.output_bytes,
+        )
+        if measured > covering:
+            assert plan.caller_cp_workload is not None
+            violation = CalibrationCoverageViolation(
+                plan.caller_cp_workload[0],
+                guard.observed_family,
+                measured,
+                covering,
+                hashlib.sha256(repr(plan.signature).encode()).hexdigest(),
+            )
+        elif guard.violation is not None:
+            violation = guard.violation
     if _fixed_slope_enabled(profile):
         rate_eligible = _rate_learning_eligible(self, plan)
         if (
@@ -2486,9 +2719,22 @@ def _update_peak_memory_profile(
         # Only a whole wave: a nested forward resetting the counter during
         # the yield, or an untracked reset (the counter fell below this
         # wave's forward peak), leaves the peak since then short of it.
-        caller_phase=complete,
+        caller_phase=complete and violation is None,
         **({"rate_eligible": rate_eligible} if _fixed_slope_enabled(profile) else {}),
     )
+    if violation is not None:
+        assert isinstance(guard, _CalibrationCoverageGuard)
+        updated = self._memory_profiles[plan.signature]
+        assert isinstance(updated, _CallerMemoryProfileV2)
+        blocked = _block_cp_pair(
+            updated, violation.requested_family, violation.observed_family
+        )
+        self._memory_profiles[plan.signature] = blocked
+        journal = self.__dict__.get("_calibration_memory_rungs", {})
+        entry = journal.get(plan.signature)
+        if entry is not None and entry[0] is updated:
+            journal[plan.signature] = (blocked, entry[1])
+        guard.violation = violation
 
 
 def _estimate_group_request_output_bytes(
@@ -3594,8 +3840,15 @@ def _update_memory_profile(
         if len(cp_observations) > 8:
             cp_observations = [cp_observations[0], *cp_observations[-7:]]
         caller_cls = _CallerMemoryProfileV2 if fixed_slope else _CallerMemoryProfile
+        caller_fields: dict[str, Any] = dict(vars(profile))
+        if fixed_slope:
+            caller_fields.update(
+                profile_format_version=6,
+                non_dominant_cp_pairs=getattr(previous, "non_dominant_cp_pairs", ()),
+                dominance_disabled=getattr(previous, "dominance_disabled", False),
+            )
         profile = caller_cls(
-            **vars(profile),
+            **caller_fields,
             caller_compute_peaks=tuple(observations),
             caller_cp_peaks=tuple(cp_observations),
             compute_peak_floor=max(
