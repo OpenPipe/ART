@@ -629,6 +629,7 @@ class LoRA(torch.nn.Module):
                 "num_local_experts must be positive and requires an '{expert}' "
                 "adapter_model_prefix when greater than one"
             )
+        # These setters also cache the booleans forward reads (see below).
         self.adapter_model_prefix = adapter_model_prefix
         self.lora_layout = lora_layout or LoraLayout()
         self.expert_layout = self.lora_layout.expert if is_expert else "per_expert"
@@ -686,13 +687,44 @@ class LoRA(torch.nn.Module):
         self._expert_layout: tuple[int | None, ...] = ()
         self.reset_lora_parameters()
 
+    # Forward reads only cached booleans. Reading the export prefix there would
+    # make Dynamo guard on its full value and compile a graph for every layer.
+    # The setters keep each cache in step with later reassignment.
+    @property
+    def adapter_model_prefix(self) -> str:
+        return self._adapter_model_prefix
+
+    @adapter_model_prefix.setter
+    def adapter_model_prefix(self, value: str) -> None:
+        self._adapter_model_prefix = value
+        self._is_expert = "{expert}" in value
+
+    @property
+    def lora_layout(self) -> LoraLayout:
+        return self._lora_layout
+
+    @lora_layout.setter
+    def lora_layout(self, value: LoraLayout) -> None:
+        self._lora_layout = value
+        self._shared_outer_kernel = bool(value.shared_outer_kernel)
+
+    @property
+    def shared_factor(self) -> str | None:
+        return self._shared_factor
+
+    @shared_factor.setter
+    def shared_factor(self, value: str | None) -> None:
+        self._shared_factor = value
+        self._shared_a = value == "A"
+        self._shared_b = value == "B"
+
     @property
     def num_local_experts(self) -> int:
-        return self._num_local_experts if self.is_expert else 1
+        return self._num_local_experts if self._is_expert else 1
 
     @property
     def is_expert(self) -> bool:
-        return "{expert}" in self.adapter_model_prefix
+        return self._is_expert
 
     @property
     def expert_ids(self) -> tuple[int | None, ...]:
@@ -1114,9 +1146,9 @@ class LoRA(torch.nn.Module):
         # QuACK. The compact caller bypasses the views entirely: slicing an
         # expanded view back to one expert still allocates an E-sized gradient
         # in SliceBackward before ExpandBackward sums it.
-        if self.shared_factor == "A":
+        if self._shared_a:
             a_t = a_t.expand(self.num_local_experts, -1, -1)
-        elif self.shared_factor == "B":
+        elif self._shared_b:
             b_t = b_t.expand(self.num_local_experts, -1, -1)
         return a_t, b_t, scale
 
@@ -1154,7 +1186,7 @@ class LoRA(torch.nn.Module):
                     factors,
                     expert_plan,
                     out_features=self.out_features,
-                    shared_outer_kernel=self.lora_layout.shared_outer_kernel,
+                    shared_outer_kernel=self._shared_outer_kernel,
                 )
         if segments is not None:
             if self.is_expert or tokens_per_expert is not None:
@@ -1166,8 +1198,8 @@ class LoRA(torch.nn.Module):
             )
         compact_experts = (
             tokens_per_expert is not None
-            and self.shared_factor is not None
-            and self.lora_layout.shared_outer_kernel
+            and (self._shared_a or self._shared_b)
+            and self._shared_outer_kernel
         )
         active = (
             self._active_lora_storage()
@@ -1191,7 +1223,7 @@ class LoRA(torch.nn.Module):
                     b_t,
                     bsz,
                     scale=scale,
-                    shared_factor=self.shared_factor,
+                    shared_factor="A" if self._shared_a else "B",
                 )
             if x.shape[0] == 0:
                 return x.new_zeros((*x.shape[:-1], self.out_features))
