@@ -56,9 +56,11 @@ def _root_blocks(model, hidden, lengths):
 def _worker(rank, cp_size, init_method):
     from megatron.core.tensor_parallel import random
 
-    random._get_all_rng_states = lambda: ()
-    random._set_all_rng_states = lambda *args: None
-    random._fork_rng = nullcontext
+    # Spawned workers have no fixtures; this patch lives as long as the process.
+    patch = pytest.MonkeyPatch()
+    patch.setattr(random, "_get_all_rng_states", lambda: ())
+    patch.setattr(random, "_set_all_rng_states", lambda *args: None)
+    patch.setattr(random, "_fork_rng", nullcontext)
     torch.set_num_threads(1)
     init_process_group(
         "gloo",
