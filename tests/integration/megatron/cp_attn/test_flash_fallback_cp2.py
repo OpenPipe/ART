@@ -323,23 +323,10 @@ def _worker(rank, rendezvous, dim, deterministic, fallback):
         dist.destroy_process_group()
 
 
-# Stock non-deterministic compiled FLASH backward returns uncorrelated BF16
-# gradients at head_dim 64 before any eager fallback runs (warm pass); see
-# https://github.com/OpenPipe/ART/issues/1179. Strict: an XPASS must remove this.
+# The 64-wide non-deterministic case must use ART's Triton backward routing;
+# every case is required to pass, including the warm plain-compiled pass.
 _FLASH_CP2_CASES = [
-    pytest.param(
-        False,
-        64,
-        id="False-64",
-        marks=pytest.mark.xfail(
-            strict=True,
-            raises=torch.multiprocessing.ProcessRaisedException,
-            reason=(
-                "non-deterministic compiled FLASH backward at head_dim 64 "
-                "(OpenPipe/ART#1179)"
-            ),
-        ),
-    ),
+    pytest.param(False, 64, id="False-64"),
     pytest.param(False, 256, id="False-256"),
     pytest.param(True, 64, id="True-64"),
     pytest.param(True, 256, id="True-256"),
