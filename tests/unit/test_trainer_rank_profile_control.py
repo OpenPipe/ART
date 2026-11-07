@@ -1,4 +1,4 @@
-"""Cohort learning control and bounded conservative retention evidence."""
+"""Independent learning control and bounded conservative retention evidence."""
 
 from dataclasses import asdict, replace
 from datetime import timedelta
@@ -143,7 +143,11 @@ def _cohort_worker(index, rendezvous, output, variant):
                 rank._available_memory_bytes = lambda sample=None: 70_000_000_000
                 check = rank._memory_check_required(demand)
                 result.update(
-                    rates=profile.rate_observations, demand=demand, fits=check.fits
+                    rates=profile.rate_observations,
+                    target_callers=profile.caller_plans,
+                    trusted=m._trusted_extent(profile),
+                    demand=demand,
+                    fits=check.fits,
                 )
             Path(output, f"rank{index}.json").write_text(json.dumps(result))
     finally:
@@ -151,7 +155,7 @@ def _cohort_worker(index, rendezvous, output, variant):
 
 
 @pytest.mark.parametrize("variant", ["reset", "decrease", "missing", "error", "valid"])
-def test_borrowed_learning_agrees_at_common_caller_boundary(tmp_path, variant):
+def test_borrowed_learning_needs_no_caller_agreement(tmp_path, variant):
     _rank()  # Prime optional runtime imports before starting the short timeout.
     context = mp.start_processes(
         _cohort_worker,
@@ -171,35 +175,82 @@ def test_borrowed_learning_agrees_at_common_caller_boundary(tmp_path, variant):
                 process.terminate()
                 process.join(timeout=2)
     rows = [json.loads((tmp_path / f"rank{i}.json").read_text()) for i in range(2)]
-    # Only flags are reduced. The actual per-rank peak values remain distinct.
+    # Local readings/complete-caller counts may differ. Neither can extend a
+    # different signature's learning window, so no control vote is needed.
     assert [row["peak"] for row in rows] == [1_000_000_000, 1_100_000_000]
+    assert all(row["trace"] == [] for row in rows)
     if variant == "error":
-        assert all(row["error"] is not None for row in rows)
+        assert [row["error"] for row in rows] == [None, "ValueError"]
     else:
         assert not any(row["error"] for row in rows)
-        assert rows[0]["rates"] == rows[1]["rates"]
+        assert all(row["rates"] == [] and row["target_callers"] == 0 for row in rows)
+        assert all(row["trusted"] == 3 for row in rows)
+        assert [row["callers"] for row in rows] == (
+            [1, 1] if variant == "valid" else [1, 0]
+        )
         if variant == "valid":
-            assert all(row["callers"] == 1 and row["rates"] for row in rows)
             assert all(row["demand"] < m._MEMORY_DEFERRED_BYTES for row in rows)
             assert all(row["fits"] for row in rows)
         else:
-            assert all(row["callers"] == 0 and row["rates"] == [] for row in rows)
-            assert all(row["demand"] >= m._MEMORY_DEFERRED_BYTES for row in rows)
+            # Admission still uses its existing MAX: an uncovered peer refuses.
+            assert rows[1]["demand"] >= m._MEMORY_DEFERRED_BYTES
             assert not any(row["fits"] for row in rows)
-    assert all(len(row["trace"]) == 1 and row["trace"][0][0] == "MIN" for row in rows)
 
 
-def test_split_and_missing_samples_reach_the_control_vote(monkeypatch):
+def test_missing_sample_is_local_and_does_not_learn(monkeypatch):
     rank = _rank()
-    calls = []
     monkeypatch.setattr(
-        rank,
-        "_recovery_reduce",
-        lambda values, **kwargs: calls.append((values, kwargs)) or values,
+        rank, "_recovery_reduce", lambda *a, **k: pytest.fail("profiling exchange")
     )
-    split = m._impl._SplitForwardPlan((), (), 0)
-    m._complete_caller_memory_profile(rank, split, None, None, 0)
-    assert calls == [([1.0, 0.0, 0.0, 0.0], dict(op="MIN", sync_across_dp=True))]
+    monkeypatch.setattr(
+        torch.cuda, "max_memory_allocated", lambda *a: pytest.fail("missing sample")
+    )
+    plan = SimpleNamespace(signature=signature(), packed_tokens=512)
+    rank._update_peak_memory_profile(cast(Any, plan), None)
+    assert rank._memory_profiles == {}
+
+
+def test_own_token_bridge_still_grows_into_an_anchor(monkeypatch):
+    rank, key = _rank(), signature((0, "forward_backward", 8))
+    anchor = replace(key, request_mix=("hidden",))
+
+    def plan(key, n):
+        return cast(
+            Any,
+            SimpleNamespace(
+                signature=key,
+                packed_tokens=n,
+                active_logical_tokens=n,
+                output_bytes=0,
+            ),
+        )
+
+    with m.fixed_slope_memory_profiles():
+        rank._update_memory_profile(
+            plan(anchor, 8192), 1_000_000_000, retained_bytes=None, caller_phase=True
+        )
+        for n, peak in ((3, 300_000_000), (512, 500_000_000)):
+            monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *a: peak)
+            rank._update_peak_memory_profile(
+                plan(key, n), 0, caller_phase=True, interval=(0, 0)
+            )
+        profile = rank._memory_profiles[key]
+        assert profile.rate_observations == ()
+        assert m._trusted_extent(profile) == 3
+        # Borrowing may price the request, but only this signature's own
+        # sub-floor bridge can extend learning into floor-qualified waves.
+        for n in (256, 512, 4096, 8192):
+            monkeypatch.setattr(
+                torch.cuda, "max_memory_allocated", lambda *a: 1_000_000_000
+            )
+            rank._update_peak_memory_profile(
+                plan(key, n), 0, caller_phase=True, interval=(0, 0)
+            )
+            if n == 256:
+                assert rank._memory_profiles[key].rate_observations == ()
+            else:
+                assert rank._memory_profiles[key].eligible_packed_tokens == n
+        assert not m._unanchored(rank._memory_profiles[key])
 
 
 def _floor(points, n):

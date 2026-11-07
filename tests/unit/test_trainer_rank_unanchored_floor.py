@@ -200,7 +200,7 @@ def test_no_compatible_evidence_defers_instead_of_using_fixed_only(bad):
 
 
 @pytest.mark.parametrize("n,effective", [(8192, 2_495_969_931), (32768, 8_249_907_166)])
-def test_cold_tiny_then_large_uses_bounded_reference_and_learns(
+def test_cold_tiny_then_large_uses_reference_without_extending_learning(
     monkeypatch, n, effective
 ):
     with m.fixed_slope_memory_profiles():
@@ -221,8 +221,12 @@ def test_cold_tiny_then_large_uses_bounded_reference_and_learns(
         assert effective - 1 <= demands[-1] <= effective
         assert demands[-1] >= WORKSPACE + RATE * n
         profile = h.rank._memory_profiles[h.plan([n]).signature]
-        assert profile.rate_observations and profile.rate_observations[-1][0] == n
-        assert not m._unanchored(profile)
+        # The compatible reference prices admission, not learning. Until this
+        # signature has its own floor-qualified evidence, real large waves
+        # retain their absolute bound without widening the learning window.
+        assert profile.rate_observations == ()
+        assert m._trusted_extent(profile) == 3
+        assert m._unanchored(profile)
         for plan, peak in h.observations:
             with pytest.MonkeyPatch.context() as patch:
                 patch.setattr(_impl, "_MEMORY_SAFETY_FACTOR", 1)

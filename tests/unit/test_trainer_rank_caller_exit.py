@@ -105,13 +105,28 @@ def _caller_exit_worker(index, cp, tp, dp, directory, case):
                     self.iterator.close()
 
             rank._forward_micro_batches = ClosingIterator
-            iterator = rank.forward_micro_batches(requests, no_grad=False)
+            iterator = rank.forward_micro_batches(
+                requests, no_grad=False, yield_empty=case == "multiwave"
+            )
             caller_error = None
             yielded = 0
             try:
                 for batch in iterator:
                     yielded += 1
-                    batch.outputs[0].hidden_states.sum().backward()
+                    if batch.outputs:
+                        batch.outputs[0].hidden_states.sum().backward()
+                    if case == "multiwave":
+                        # The caller's matched status exchange owns the abort;
+                        # iterator cleanup must add no collective before it.
+                        if index == 0:
+                            caller_error = "ValueError"
+                            iterator.close()
+                        result["outer"] = rank._recovery_reduce(
+                            [float(caller_error is not None)],
+                            op="MAX",
+                            sync_across_dp=True,
+                        )
+                        break
                     if index == 0:
                         if case == "oom":
                             raise torch.cuda.OutOfMemoryError(
@@ -122,8 +137,7 @@ def _caller_exit_worker(index, cp, tp, dp, directory, case):
                         if case == "throw":
                             iterator.throw(ValueError("caller loss failed"))
                         if case == "outside_context":
-                            # Closing after leaving the collection scope must
-                            # still finalize the scope captured before yield.
+                            # Close outside collection remains purely local.
                             with memory.fixed_slope_memory_profiles(False):
                                 iterator.close()
                         break
@@ -144,9 +158,10 @@ def _caller_exit_worker(index, cp, tp, dp, directory, case):
                 if key != source.signature
             ]
             try:
-                result["outer"] = rank._recovery_reduce(
-                    [float(caller_error is not None)], op="MAX", sync_across_dp=True
-                )
+                if case != "multiwave":
+                    result["outer"] = rank._recovery_reduce(
+                        [float(caller_error is not None)], op="MAX", sync_across_dp=True
+                    )
             except Exception as exc:
                 result["outer_error"] = str(exc)
     except Exception as exc:
@@ -192,11 +207,10 @@ def test_caller_exit_precedes_outer_error_exchange(
         rows
     )
     assert all(row["operations"] == rows[0]["operations"] for row in rows), rows
-    assert rows[0]["operations"][-2:] == [
-        ["RedOpType.MIN", [4], "torch.float64"],
-        ["RedOpType.MAX", [1], "torch.float64"],
-    ]
-    assert all(row["outer"] == [1.0] and row["closes"] == 1 for row in rows)
+    assert len(rows[0]["operations"]) == 16
+    assert rows[0]["operations"][-1] == ["RedOpType.MAX", [1], "torch.float64"]
+    failed = case in ("oom", "value", "throw", "multiwave")
+    assert all(row["outer"] == [float(failed)] and row["closes"] == 1 for row in rows)
     assert all(row["callers"] == 0 and not any(row["rates"]) for row in rows)
     assert rows[0]["error"] == (
         "OutOfMemoryError"
@@ -205,5 +219,5 @@ def test_caller_exit_precedes_outer_error_exchange(
         if case in ("value", "throw", "multiwave")
         else None
     )
-    assert all(row["error"] == "RuntimeError" for row in rows[1:])
+    assert all(row["error"] is None for row in rows[1:])
     assert all(row["yielded"] <= 1 for row in rows)

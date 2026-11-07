@@ -2149,105 +2149,16 @@ def _estimate_flat_forward(
         )
 
 
-def _rate_learning_eligible(
-    self: TrainerRank, plan: _impl._FlatForwardPlan, *, borrow: bool
-) -> bool:
+def _rate_learning_eligible(self: TrainerRank, plan: _impl._FlatForwardPlan) -> bool:
+    # Borrowed profiles qualify admission, never learning. Their caller counters
+    # and interval validity can differ locally. Own token extents are independent
+    # of peak hulls and complete-caller qualification, so no agreement is needed.
     profile = self._memory_profiles.get(plan.signature)
     extent = 0 if profile is None else _trusted_extent(profile)
-    if borrow and (
-        reference := _rate_reference(
-            self,
-            plan.signature,
-            profile,
-            packed_tokens=plan.packed_tokens,
-            caller_cp_workload=getattr(plan, "caller_cp_workload", None),
-        )
-    ):
-        extent = max(extent, reference.extent)
     return plan.packed_tokens >= _rate_floor_tokens(plan.signature) and (
         (profile is not None and not _unanchored(profile))
         or plan.packed_tokens <= extent * _impl._MEMORY_PROFILE_TRUST_GROWTH
     )
-
-
-def _complete_caller_memory_profile(
-    self: TrainerRank,
-    plan: _impl._AnyForwardPlan,
-    baseline: int | None,
-    interval: tuple[int, int] | None,
-    forward_peak: int,
-    *,
-    interrupted: bool = False,
-) -> None:
-    """Finalize a yielded interval, including explicit close and throw.
-
-    No plan/sample/error branch bypasses this vote. Handoff's existing status
-    exchange is too early: the caller interval is still open then. Waiting for
-    the next admission is too late and would omit the final wave. Local byte
-    readings are frozen before the vote and are never reduced. The first
-    status is 1 for completion, 0 for interruption, -1 for a sampling error.
-    A peer interruption stops iteration before any next-wave or outer exchange.
-    """
-    error: BaseException | None = None
-    reading = None
-    eligible = complete = False
-    try:
-        if (
-            not interrupted
-            and isinstance(plan, _impl._FlatForwardPlan)
-            and baseline is not None
-        ):
-            peak = int(_impl.torch.cuda.max_memory_allocated(self.device))
-            reading = (
-                self.__dict__.get("_peak_resets", 0),
-                peak,
-            )
-            eligible = _rate_learning_eligible(self, plan, borrow=True)
-            complete = (
-                interval is not None
-                and interval[0] == reading[0]
-                and reading[1] >= interval[1]
-            )
-    except BaseException as exc:
-        error = exc
-    exchange_error: BaseException | None = None
-    try:
-        agreed = self._recovery_reduce(
-            [
-                -1.0 if error is not None else float(not interrupted),
-                float(reading is not None),
-                float(eligible),
-                float(complete),
-            ],
-            op="MIN",
-            sync_across_dp=True,
-        )
-    except BaseException as exc:
-        if error is None:
-            raise
-        exchange_error = exc
-    if interrupted:
-        # Preserve the caller's exception or GeneratorExit. Do not sample an
-        # interrupted allocator interval or learn from any participant.
-        return
-    if error is not None:
-        raise self._memory_error_with_reduction_note(error, exchange_error)
-    if agreed[0] < 0:
-        raise RuntimeError("Memory profile sampling failed on another rank")
-    if not agreed[0]:
-        raise RuntimeError("Caller interval interrupted on another rank")
-    if isinstance(plan, _impl._FlatForwardPlan):
-        if reading is not None:
-            self._update_peak_memory_profile(
-                plan,
-                baseline,
-                caller_phase=True,
-                interval=interval,
-                _reading=reading,
-                _agreed=(bool(agreed[1] and agreed[2]), bool(agreed[1] and agreed[3])),
-            )
-    elif baseline is not None:
-        self._record_split_memory_floor(plan, baseline, forward_peak)
 
 
 def _update_peak_memory_profile(
@@ -2258,16 +2169,11 @@ def _update_peak_memory_profile(
     *,
     caller_phase: bool = False,
     interval: tuple[int, int] | None = None,
-    _reading: tuple[int, int] | None = None,
-    _agreed: tuple[bool, bool] | None = None,
 ) -> None:
     if baseline is None:
         return
-    if _reading is not None:
-        resets, peak = _reading
-    else:
-        peak = int(_impl.torch.cuda.max_memory_allocated(self.device))
-        resets = self.__dict__.get("_peak_resets", 0)
+    peak = int(_impl.torch.cuda.max_memory_allocated(self.device))
+    resets = self.__dict__.get("_peak_resets", 0)
     observation = getattr(self, "_planner_observation", None)
     if observation is not None:
         observation["peak"] = max(observation["peak"], peak)
@@ -2275,14 +2181,7 @@ def _update_peak_memory_profile(
     profile = self._memory_profiles.get(plan.signature)
     rate_eligible = True
     if _fixed_slope_enabled(profile):
-        # Forward children / direct forwards may execute asymmetrically or
-        # fail before peers reach the end. They never vote or borrow a learning
-        # window here; the common caller boundary supplies that permission.
-        rate_eligible = (
-            _rate_learning_eligible(self, plan, borrow=False)
-            if _agreed is None
-            else _agreed[0]
-        )
+        rate_eligible = _rate_learning_eligible(self, plan)
     self._update_memory_profile(
         plan,
         max(0, peak - baseline),
@@ -2295,8 +2194,7 @@ def _update_peak_memory_profile(
         caller_phase=caller_phase
         and interval is not None
         and interval[0] == resets
-        and peak >= interval[1]
-        and (_agreed is None or _agreed[1]),
+        and peak >= interval[1],
         **({"rate_eligible": rate_eligible} if _fixed_slope_enabled(profile) else {}),
     )
 
