@@ -564,8 +564,17 @@ def test_hybridep_validates_topology_for_empty_forward(
 ) -> None:
     runtime = _runtime()
     runtime.provider.expert_model_parallel_size = 4
+    # Isolate the empty-forward DP gate on an assumed contained EP4/CP4 cohort.
+    # Constructor membership checks have separate tests with real Gloo groups.
+    monkeypatch.setattr(
+        TrainerRank,
+        "_topology",
+        lambda self: SimpleNamespace(dp=dp, tp=1, cp=4, pp=1),
+    )
+    monkeypatch.setattr(
+        TrainerRank, "_expert_admission_scope_error", lambda self, cohort: None
+    )
     trainer = TrainerRank(runtime)
-    monkeypatch.setattr(trainer, "_topology", lambda: SimpleNamespace(dp=dp, cp=4))
 
     if dp > 1:
         with pytest.raises(NotImplementedError, match="DP=1"):

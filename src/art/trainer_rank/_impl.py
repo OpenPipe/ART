@@ -14,7 +14,7 @@ from collections.abc import (
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import lru_cache, partial
 import hashlib
@@ -64,6 +64,7 @@ from art.trainer_rank._backward_work import region as _backward_region
 from art.trainer_rank._planner_cost import (
     ModelGeometry,
     ParallelShape,
+    ScoringSelection,
     select_scoring,
 )
 from art.trainer_rank._prefix_tree_materializer import (  # noqa: F401  # read as ``_impl.X`` by _memory / _micro_batch_planner
@@ -2135,6 +2136,12 @@ class TrainerRank:
             geometry=self._geometry,
             shape=self._parallel_shape,
         )
+        self._validate_planner_cohort(
+            selection,
+            device_capability=capability,
+            device_memory_bytes=device_memory,
+            param_dtype=str(parameter.dtype),
+        )
         self._coefficient_version = selection.version
         self._coefficient_table = selection.table_id
         self._planner_coefficients = selection.coefficients
@@ -2215,6 +2222,215 @@ class TrainerRank:
         self._last_forward_telemetry_snapshot: dict[str, Any] | None = None
         _configure_moe_dispatcher_caches(runtime.model)
         self.zero_grad()
+
+    def _expert_admission_scope_error(
+        self, cohort: dist.ProcessGroup | None
+    ) -> str | None:
+        shape = self._parallel_shape
+        if shape.ep == shape.etp == 1:
+            return None
+        message = (
+            "TrainerRank requires the expert tensor/model group "
+            f"(EP={shape.ep}, ETP={shape.etp}) to be contained in the TP x CP "
+            f"forward-memory admission group (TP={shape.tp}, CP={shape.cp})"
+        )
+        if dist.is_available() and dist.is_initialized():
+            try:
+                from megatron.core import parallel_state as ps
+
+                expert = ps.get_expert_tensor_and_model_parallel_group(
+                    check_initialized=False
+                )
+                if expert is not None:
+                    expert_ranks = dist.get_process_group_ranks(expert)
+                    cohort_ranks = dist.get_process_group_ranks(
+                        cohort if cohort is not None else dist.group.WORLD
+                    )
+                    if set(expert_ranks) <= set(cohort_ranks):
+                        return None
+                    return (
+                        f"{message}; got expert ranks={expert_ranks}, "
+                        f"admission ranks={cohort_ranks}"
+                    )
+            except (
+                AssertionError,
+                AttributeError,
+                ImportError,
+                KeyError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ):
+                pass
+        return f"{message}; group membership is unavailable"
+
+    def _global_aux_admission_scope_error(
+        self, cohort: dist.ProcessGroup | None
+    ) -> str | None:
+        message = (
+            "TrainerRank requires the global auxiliary loss TP x DP x CP group "
+            "to be contained in the forward-memory admission group"
+        )
+        try:
+            modules = tuple(
+                module for chunk in self.runtime.model for module in chunk.modules()
+            )
+            routers = []
+            if modules:
+                try:
+                    from megatron.core.transformer.moe.router import Router
+                except ImportError:
+                    pass
+                else:
+                    routers = [
+                        module for module in modules if isinstance(module, Router)
+                    ]
+            # Native routers execute their own layer settings. Provider/parent
+            # values may have been overridden and are only a fallback.
+            configs = (
+                [getattr(router, "config", None) for router in routers]
+                if routers
+                else [
+                    self.runtime.provider,
+                    *(getattr(module, "config", None) for module in modules),
+                ]
+            )
+            has_moe = bool(
+                routers
+                or self._geometry.moe_experts
+                or self._moe_layers
+                or getattr(self.runtime.model_support_handler, "is_moe", False)
+                or getattr(
+                    getattr(self.runtime, "model_support_spec", None), "is_moe", False
+                )
+                or any(getattr(config, "num_moe_experts", None) for config in configs)
+            )
+            configured = enabled = False
+            for config in configs:
+                kind = getattr(config, "moe_router_load_balancing_type", None)
+                coefficient = getattr(config, "moe_aux_loss_coeff", None)
+                if kind is None and coefficient is None:
+                    if routers:
+                        raise ValueError(
+                            "router auxiliary loss configuration is unavailable"
+                        )
+                    continue
+                configured = True
+                # Explicit zero disables every aux loss, even without a type.
+                if coefficient == 0 and not isinstance(kind, list):
+                    continue
+                if isinstance(kind, str):
+                    if kind != "global_aux_loss":
+                        continue
+                elif isinstance(kind, list) and all(isinstance(k, str) for k in kind):
+                    if "global_aux_loss" not in kind:
+                        continue
+                    if not isinstance(coefficient, list) or len(coefficient) != len(
+                        kind
+                    ):
+                        raise ValueError(
+                            "auxiliary loss types and coefficients must align"
+                        )
+                    coefficient = coefficient[kind.index("global_aux_loss")]
+                else:
+                    raise ValueError("auxiliary loss type is unknown")
+                if not isinstance(coefficient, (int, float)) or not math.isfinite(
+                    coefficient
+                ):
+                    raise ValueError("global auxiliary loss coefficient is unknown")
+                enabled |= coefficient != 0
+            # Native TransformerConfig exposes its aux_loss/0.0 defaults.
+            # Missing custom MoE settings cannot establish a disabled loss.
+            if not configured and has_moe:
+                raise ValueError("MoE auxiliary loss configuration is unavailable")
+            if not enabled:
+                return None
+            if dist.is_available() and dist.is_initialized():
+                from megatron.core import parallel_state as ps
+
+                group = ps.get_tensor_and_data_parallel_group(
+                    with_context_parallel=True
+                )
+                if group is not None:
+                    router_ranks = dist.get_process_group_ranks(group)
+                    cohort_ranks = dist.get_process_group_ranks(
+                        cohort if cohort is not None else dist.group.WORLD
+                    )
+                    if set(router_ranks) <= set(cohort_ranks):
+                        return None
+                    return (
+                        f"{message}; got router ranks={router_ranks}, "
+                        f"admission ranks={cohort_ranks}"
+                    )
+            return f"{message}; group membership is unavailable"
+        except (
+            AssertionError,
+            AttributeError,
+            ImportError,
+            KeyError,
+            OverflowError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            return f"{message}; {error}"
+
+    def _validate_planner_cohort(
+        self,
+        selection: ScoringSelection,
+        *,
+        device_capability: tuple[int, int] | None,
+        device_memory_bytes: int | None,
+        param_dtype: str,
+    ) -> None:
+        # Agree once, before layout selection, slot setup or model execution.
+        # A local scope error joins the exchange so no cohort peer waits alone.
+        cohort = self._forward_memory_group()
+        scope_error = (
+            "; ".join(
+                error
+                for error in (
+                    self._expert_admission_scope_error(cohort),
+                    self._global_aux_admission_scope_error(cohort),
+                )
+                if error is not None
+            )
+            or None
+        )
+        identity = json.dumps(
+            {
+                "scoring": asdict(selection),
+                "device_capability": device_capability,
+                "device_memory_bytes": device_memory_bytes,
+                "param_dtype": param_dtype,
+                "geometry": asdict(self._geometry),
+                "shape": asdict(self._parallel_shape),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        local = (identity, scope_error)
+        peers = [local]
+        if dist.is_available() and dist.is_initialized():
+            peers = [local] * dist.get_world_size(cohort)
+            # Pin the model device for every CUDA backend spelling. Gloo
+            # object transport remains on CPU even inside this context.
+            with (
+                torch.cuda.device(self.device)
+                if self.device.type == "cuda"
+                else nullcontext()
+            ):
+                dist.all_gather_object(peers, local, group=cohort)
+        errors = sorted({error for _, error in peers if error is not None})
+        if errors:
+            raise TrainerRankRuntimeSupportError("; ".join(errors))
+        identities = sorted({value for value, _ in peers})
+        if len(identities) != 1:
+            raise TrainerRankRuntimeSupportError(
+                "TrainerRank requires identical layout-scoring identities and "
+                "accelerator facts within the TP x CP forward-memory admission "
+                f"group; got {identities}"
+            )
 
     def zero_grad(self) -> None:
         for chunk in self.runtime.model:

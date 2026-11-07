@@ -27,6 +27,7 @@ def _rank(
             "num_query_groups": 4,
             "kv_channels": 256,
             "recompute_granularity": granularity,
+            "moe_aux_loss_coeff": 0.0,
             **geometry,
         }
     )
