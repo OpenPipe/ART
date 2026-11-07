@@ -375,9 +375,36 @@ def test_unanchored_range_boundary_and_anchor_transition():
     assert prices == sorted(prices)
     observe(r, sig, 8192, 2 * 2**30)
     anchored = r._memory_profiles[sig]
-    assert _memory._cold_extrapolation_factor(anchored, 65536) == 1
+    assert _memory._cold_extrapolation_factor(anchored, 8192) == 1
+    assert _memory._cold_extrapolation_factor(anchored, 8193) == 1.75
+    assert _memory._cold_extrapolation_factor(anchored, 65536) == 1.75
     assert _memory._profile_compute_peak(anchored, 128) >= 2**30
     assert _memory._profile_compute_peak(anchored, 8192) >= 2 * 2**30
+
+
+@pytest.mark.parametrize("anchor_sizes", [(8192,), (8192, 32768)])
+@pytest.mark.parametrize("key,rows", list(GROUPS.items()))
+def test_boot_anchors_cover_held_out_sweep_cells(anchor_sizes, key, rows):
+    r = _rank()
+    sig = signature(key)
+    anchors = [row for row in rows if row["length"] in anchor_sizes]
+    expected = None
+    for order in itertools.permutations(anchors):
+        r._memory_profiles.clear()
+        for row in order:
+            observe(r, sig, row["length"], row["measured_increment_bytes"])
+        prices = []
+        for row in rows:
+            n = row["length"]
+            effective = r._estimate_required_memory_bytes_from_values(
+                packed_tokens=n, output_bytes=0, signature=sig
+            )
+            assert effective >= row["measured_increment_bytes"]
+            prices.append(effective)
+        assert prices == sorted(prices)
+        if expected is None:
+            expected = prices
+        assert prices == expected
 
 
 def test_runtime_growth_only_learns_within_trust_until_anchor(monkeypatch):

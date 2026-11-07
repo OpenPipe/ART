@@ -35,10 +35,13 @@ lane's harness. Planner search, packing, memory pricing and width selection are
 ART implementations. These shims are for CPU experiments, not native execution
 qualification.
 
-The separate Caladan companion branch `stark/memory-fixed-slope` now contains
+The Caladan companion [#2706](https://github.com/OpenPipe/caladan/pull/2706) on
+`stark/memory-fixed-slope-v2` contains
 the real v4 key/merge, default-off flag and multi-segment calibration code. It
 supersedes the Phase 1 sample patch and temporary-codec checker, which remain
 available in commit 36a46dc27's history. See PHASE-2.md for coupling requirements.
+The enabled default is A (8K only), with cold extrapolation after anchoring;
+`ANCHOR-CHOICES.md` and `anchor_choices.py` give the frozen-anchor choice replay.
 
 The original poison regression failed before implementation; its transcript
 is `poisoning-before.txt`. `agreement-parity.json` records unchanged agreement,

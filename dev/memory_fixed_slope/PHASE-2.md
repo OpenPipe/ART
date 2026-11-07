@@ -15,6 +15,12 @@ apply 1.75, in addition to the existing 1.10 safety factor. Outputs, checkpoint
 bounds, retained split costs and HybridEP growth receive the cold charge once.
 The 3% device reserve stays on the usable-budget side; it is never counted twice.
 
+Followup-1 extends the cold factor beyond the last observation **also after
+anchoring**, on NEW rather than the unanchored OLD envelope. An 8K-only anchored
+fit without this factor under-predicts held-out v7 peaks (effective minima
+0.898638 dense and 0.961873 MoE). `anchor_choices.py` freezes boot evidence and
+MAX-reduces rank-local predictions; see `ANCHOR-CHOICES.md` for all choices.
+
 A runtime observation beyond an unanchored profile's existing 8x trust window
 cannot promote an anchor. Offline/restore merges are set-based; admissible real
 wave observations feed the same hull. The trust collective, MAX/MIN admission,
@@ -59,8 +65,10 @@ Hidden versus target outputs and route presence/mixed route presence change
 inventory confirms 64 and 256 roots have equal keys for each family.
 
 Caladan's `STARK_MEMORY_FIXED_SLOPE=1` wraps startup and serving collection,
-selects v4 keys, discards short smoke profiles, starts with 8K/32K roots, then
-collects 64x128 and 256x128 waves for each configured warm LoRA rank and operation.
+selects v4 keys, discards short smoke profiles, and by default measures an 8K
+root plus 64x128 waves for each configured warm LoRA rank and operation (A).
+`STARK_MEMORY_ANCHOR_TOKENS=8192,32768` selects B; an empty value selects the
+configured root-only ladder (C). The choice is part of v4 keys only.
 The bundle probe uses the actual target or StableReinforce head/loss/backward
 paths, including all-present and mixed replay routes on MoE. It checks that the
 exact expected signature actually gained an anchor; a split/unanchored rung
@@ -75,12 +83,19 @@ native probe shapes and route/hidden first-use workspaces before enabling.
 
 `calibration_timing.json` is an estimate, using run6's warm MoE FB 8K/32K
 2.3525/2.8230 s, its warm forward times, v7 dense timings, 0.9 s plan/rung, and
-one full first-8K-call allowance per output family. It adds **465 s dense**
+one full first-8K-call allowance per output family. Option B adds **465 s dense**
 (24 new rungs) and **927 s MoE** (72). At today's approximately 780 s boot that
 is about 1245/1707 s, below `CALIBRATION_SECONDS=3600`. If first-use cost repeats
 for every LoRA rank, the estimates rise to approximately 1241/2408 s extra
 (2021/3188 s total). This is not a deadline guarantee; 64/256-root GDN and
 StableReinforce/route-replay compile costs have not been GPU measured.
+
+A budgets **416 s dense / 827 s MoE** extra without crediting removed v3 root
+rungs; 12/36 added RL rungs. It is selected because none of the twelve measured
+131K cells is memory-refused. The enabled calibrated context bound remains the
+largest actually probed root (8K for A); v9 must bypass Caladan's context cap as
+v7 did. The unchanged ART 8x trust window also still applies: 131K and 262K
+numbers from frozen 8K evidence are numerical extrapolations, not a trust claim.
 
 ## Validation
 
@@ -99,3 +114,17 @@ StableReinforce/route-replay compile costs have not been GPU measured.
 After ART merges, Caladan must move its ART source and runtime/image pins to the
 same reviewed ART commit, rebuild the trainer runtime and publish the matching
 bundle before enabling. Frozen legacy images/runs are not repinned by these PRs.
+
+Followup validation: 123 fixed/slope CPU tests pass, including 24 held-out
+anchor tests. The required all-files prek rerun passes ruff/format/lock; its
+lock-synchronized type environment reports 35 diagnostics, all identical to
+untouched ee91943cd (`followup-typecheck-parity.json`). This is a different
+dependency/tool environment from the earlier 49-diagnostic CPU snapshot, not
+35 new errors. Changed files and the replay separately pass focused type checks.
+Caladan #2706 has clean history: 268 affected tests against proposed ART;
+249 pass / 19 enabled-only skips against the old pin, including the flag-off
+boot, golden key, SQL calibration, executor and planner checks. PostgreSQL is
+stopped. Enabled v4 still requires the coupled source/runtime pin bump.
+An additional 391 ART tests pass (8 optional native-dependency skips), covering
+warm/caller profiles, planner options, CPU Gloo planning status, EP admission,
+split peaks and recompute accounting: 514 passed across the focused/broader runs.

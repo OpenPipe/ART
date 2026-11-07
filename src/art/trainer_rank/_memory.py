@@ -81,11 +81,12 @@ def _unanchored(profile: _impl._MemoryProfile | None) -> bool:
 def _cold_extrapolation_factor(
     profile: _impl._MemoryProfile | None, packed_tokens: int
 ) -> float:
-    if (
-        _fixed_slope_enabled(profile)
-        and _unanchored(profile)
-        and packed_tokens > (0 if profile is None else profile.packed_tokens)
+    if _fixed_slope_enabled(profile) and packed_tokens > (
+        0 if profile is None else profile.packed_tokens
     ):
+        # Anchoring selects NEW's slope; it does not qualify extrapolation.
+        # The 8K-only boot option still needs the cold margin beyond its last
+        # observation (the supplied sweep otherwise under-predicts at 131K).
         return _memory_model._MEMORY_COLD_EXTRAPOLATION_FACTOR
     return 1.0
 
