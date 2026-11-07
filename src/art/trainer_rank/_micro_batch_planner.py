@@ -1770,7 +1770,7 @@ def finish_planner_observation(self: TrainerRank) -> None:
 
     ART compares completed peaks at its existing profiling boundaries:
     dp_rank_forward's return or forward_micro_batches' iterator resume.
-    Caladan calls this at execution end. Direct callers can report a caught
+    The trainer calls this at execution end. Direct callers can report a caught
     caller OOM before cleanup, then call this method to release the context.
     An abandoned microbatch iterator cannot mint a completed comparison.
     """
