@@ -157,7 +157,12 @@ def _worker(index, directory, mode, world_size):
                     ps, "get_expert_tensor_and_model_parallel_group", unavailable
                 )
             runtime = _runtime()
-            if mode in ("global-aux", "global-aux-cp8"):
+            if mode in (
+                "global-aux",
+                "global-aux-cp8",
+                "aux-overflow",
+                "provider-overridden",
+            ):
                 from megatron.core.process_groups_config import ProcessGroupCollection
                 from megatron.core.transformer.moe.router import TopKRouter
                 from megatron.core.transformer.transformer_config import (
@@ -171,7 +176,7 @@ def _worker(index, directory, mode, world_size):
                     num_moe_experts=256,
                     moe_router_topk=8,
                     moe_router_load_balancing_type="global_aux_loss",
-                    moe_aux_loss_coeff=1e-3,
+                    moe_aux_loss_coeff=0.0 if mode == "provider-overridden" else 1e-3,
                     moe_router_fusion=False,
                 )
                 groups = ProcessGroupCollection()
@@ -186,9 +191,20 @@ def _worker(index, directory, mode, world_size):
                         torch.cuda, "current_device", lambda: torch.device("cpu")
                     )
                     runtime.model[0].router = TopKRouter(config, pg_collection=groups)
+                    if mode == "provider-overridden":
+                        runtime.model[0].second_router = TopKRouter(
+                            config, pg_collection=groups
+                        )
+                if mode == "aux-overflow" and index == 0:
+                    config.moe_aux_loss_coeff = 10**400
                 row["router_ranks"] = dist.get_process_group_ranks(groups.tp_dp_cp)
                 row["global_aux_coefficient"] = config.moe_aux_loss_coeff
                 runtime.model_support_handler.is_moe = True
+                if mode == "provider-overridden":
+                    runtime.provider.moe_router_load_balancing_type = "global_aux_loss"
+                    runtime.provider.moe_aux_loss_coeff = 0.3
+                    row["router_count"] = 2
+                    row["provider_coefficient"] = runtime.provider.moe_aux_loss_coeff
                 if mode == "global-aux-cp8":
                     geometry = GDN_MOE_H2048_GEOMETRY
                     runtime.model[0].config.num_layers = 40
@@ -391,4 +407,23 @@ def test_membership_lookup_errors_reject_every_peer(tmp_path, mode):
     rows = _run(tmp_path, mode)
     assert all(not row["constructed"] for row in rows), rows
     assert all("TrainerRankRuntimeSupportError" in row["error"] for row in rows), rows
+    assert all(row["init_exchanges"] == 1 for row in rows), rows
+
+
+def test_huge_aux_coefficient_rejects_every_peer_after_exchange(tmp_path):
+    rows = _run(tmp_path, "aux-overflow")
+    assert all(not row["constructed"] for row in rows), rows
+    assert all("TrainerRankRuntimeSupportError" in row["error"] for row in rows), rows
+    assert all(row["init_exchanges"] == 1 for row in rows), rows
+
+
+def test_disabled_routers_override_enabled_provider(tmp_path):
+    rows = _run(tmp_path, "provider-overridden", 4)
+    assert all(row["router_ranks"] == list(range(4)) for row in rows), rows
+    assert all(len(row["memory_ranks"]) == 2 for row in rows), rows
+    assert all(
+        row["router_count"] == 2 and row["global_aux_coefficient"] == 0 for row in rows
+    ), rows
+    assert all(row["provider_coefficient"] == 0.3 for row in rows), rows
+    assert all(row["constructed"] and row["error"] is None for row in rows), rows
     assert all(row["init_exchanges"] == 1 for row in rows), rows

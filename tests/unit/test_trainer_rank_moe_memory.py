@@ -55,6 +55,7 @@ def layer() -> Any:
     value = module(MoELayer)
     value.config = config
     value.router = module(TopKRouter)
+    value.router.config = config
     value.router.topk = 8
     value.token_dispatcher = object.__new__(MoEAlltoAllTokenDispatcher)
     value.token_dispatcher.config = config

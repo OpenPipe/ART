@@ -123,3 +123,36 @@ def test_incomplete_moe_metadata_is_not_treated_as_default(monkeypatch, indicato
     assert "configuration is unavailable" in trainer._global_aux_admission_scope_error(
         None
     )
+
+
+@pytest.mark.parametrize(
+    "coefficients, refused",
+    [([0.0, 0.0], False), ([0.0, 0.3], True), ([0.0, None], True)],
+)
+def test_native_router_settings_take_precedence(monkeypatch, coefficients, refused):
+    router_module = pytest.importorskip("megatron.core.transformer.moe.router")
+    model = torch.nn.Module()
+    parent_config = SimpleNamespace(
+        moe_router_load_balancing_type="global_aux_loss", moe_aux_loss_coeff=0.3
+    )
+    setattr(model, "config", parent_config)
+    for index, coefficient in enumerate(coefficients):
+        router = router_module.TopKRouter.__new__(router_module.TopKRouter)
+        torch.nn.Module.__init__(router)
+        router.config = (
+            SimpleNamespace(
+                moe_router_load_balancing_type="global_aux_loss",
+                moe_aux_loss_coeff=coefficient,
+            )
+            if coefficient is not None
+            else SimpleNamespace()
+        )
+        model.add_module(f"router{index}", router)
+    trainer = TrainerRank.__new__(TrainerRank)
+    trainer.runtime = SimpleNamespace(
+        provider=parent_config, model=[model], model_support_handler=SimpleNamespace()
+    )
+    trainer._geometry = GDN_MOE_H2048_GEOMETRY
+    trainer._moe_layers = 1
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: False)
+    assert (trainer._global_aux_admission_scope_error(None) is not None) is refused

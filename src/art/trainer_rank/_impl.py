@@ -2272,15 +2272,32 @@ class TrainerRank:
             "to be contained in the forward-memory admission group"
         )
         try:
-            configs = [self.runtime.provider]
-            configs.extend(
-                config
-                for chunk in self.runtime.model
-                for module in chunk.modules()
-                if (config := getattr(module, "config", None)) is not None
+            modules = tuple(
+                module for chunk in self.runtime.model for module in chunk.modules()
+            )
+            routers = []
+            if modules:
+                try:
+                    from megatron.core.transformer.moe.router import Router
+                except ImportError:
+                    pass
+                else:
+                    routers = [
+                        module for module in modules if isinstance(module, Router)
+                    ]
+            # Native routers execute their own layer settings. Provider/parent
+            # values may have been overridden and are only a fallback.
+            configs = (
+                [getattr(router, "config", None) for router in routers]
+                if routers
+                else [
+                    self.runtime.provider,
+                    *(getattr(module, "config", None) for module in modules),
+                ]
             )
             has_moe = bool(
-                self._geometry.moe_experts
+                routers
+                or self._geometry.moe_experts
                 or self._moe_layers
                 or getattr(self.runtime.model_support_handler, "is_moe", False)
                 or getattr(
@@ -2293,6 +2310,10 @@ class TrainerRank:
                 kind = getattr(config, "moe_router_load_balancing_type", None)
                 coefficient = getattr(config, "moe_aux_loss_coeff", None)
                 if kind is None and coefficient is None:
+                    if routers:
+                        raise ValueError(
+                            "router auxiliary loss configuration is unavailable"
+                        )
                     continue
                 configured = True
                 # Explicit zero disables every aux loss, even without a type.
@@ -2347,6 +2368,7 @@ class TrainerRank:
             AttributeError,
             ImportError,
             KeyError,
+            OverflowError,
             RuntimeError,
             TypeError,
             ValueError,
