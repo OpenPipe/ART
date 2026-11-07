@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from art.trainer_rank import _impl
 from art.trainer_rank._backward_work import region as _backward_region
+from art.trainer_rank._memory import _with_planning_inventory
 from art.trainer_rank._planner_cost import COEFFICIENT_VERSION_FALLBACK
 from art.trainer_rank._prefix_tree_planner import (
     build_canonical_prefix_tree,
@@ -645,6 +646,7 @@ def _select_next_micro_batch(
     )
 
 
+@_with_planning_inventory
 def _search_next_micro_batch(
     self: TrainerRank,
     items: Sequence[ForwardInputsT],
