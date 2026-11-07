@@ -239,6 +239,11 @@ jobs:
             tests/unit/test_trainer_rank_adapter_gradient_memory.py \
             tests/unit/test_trainer_rank_slot_memory.py \
             tests/unit/test_trainer_rank_moe_memory.py \
+            tests/unit/test_moe_caller_cp_coverage.py \
+            tests/unit/test_moe_caller_cp_invariants.py \
+            tests/unit/test_moe_caller_cp_ownership.py \
+            tests/unit/test_moe_caller_report_replay.py \
+            tests/unit/test_moe_long_root_caller.py \
             tests/unit/test_trainer_rank_head_memory.py \
             tests/unit/test_trainer_rank_eager_head_memory.py::test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound \
             tests/unit/test_grouped_planner_replay.py \
@@ -303,6 +308,11 @@ jobs:
             --ignore=tests/unit/test_trainer_rank_adapter_gradient_memory.py \
             --ignore=tests/unit/test_trainer_rank_slot_memory.py \
             --ignore=tests/unit/test_trainer_rank_moe_memory.py \
+            --ignore=tests/unit/test_moe_caller_cp_coverage.py \
+            --ignore=tests/unit/test_moe_caller_cp_invariants.py \
+            --ignore=tests/unit/test_moe_caller_cp_ownership.py \
+            --ignore=tests/unit/test_moe_caller_report_replay.py \
+            --ignore=tests/unit/test_moe_long_root_caller.py \
             --ignore=tests/unit/test_trainer_rank_head_memory.py \
             --ignore=tests/unit/test_grouped_planner_replay.py \
             --ignore=tests/unit/test_canonical_numerics.py \
