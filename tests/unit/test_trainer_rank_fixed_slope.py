@@ -28,12 +28,12 @@ def test_tiny_forward_does_not_poison_large_forward():
     seed = rank._plan_flat_forward(
         [ForwardInput(input_tokens=torch.arange(8), hidden_states=True, no_grad=True)]
     )
-    # Reconstruct a production CP8 529.328 GiB / 8192-token refusal rate. This is a
-    # synthetic eight-token workspace observation, not a new GPU measurement.
+    # Synthetic eight-token workspace regression with a fixed long-wave
+    # reference; the large rate deliberately stresses per-token extrapolation.
     poisoned_rate = (568_361_327_001 / 1.1 - 8192 * 4096) / 8192
     large = replace(seed, packed_tokens=81920, logical_tokens=81920, output_bytes=0)
     tiny = replace(seed, output_bytes=0)
-    # A large root had already fitted before the tiny observation.
+    # Seed a long reference before adding the fixed workspace observation.
     rank._update_memory_profile(large, 8 * 2**30, retained_bytes=None)
     rank._update_memory_profile(
         tiny, round(poisoned_rate * tiny.packed_tokens), retained_bytes=None

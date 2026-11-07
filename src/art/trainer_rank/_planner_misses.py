@@ -729,6 +729,7 @@ def _memory_profile(values: dict[str, Any]) -> Any:
         "forward_compute_peaks",
         "compute_observations",
         "rate_observations",
+        "retained_compute_peaks",
     ):
         if field in values and values[field] is not None:
             values[field] = tuple(tuple(point) for point in values[field])

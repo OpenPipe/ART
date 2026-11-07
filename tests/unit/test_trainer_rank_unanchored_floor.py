@@ -19,13 +19,14 @@ from art.trainer_rank import _memory as m
 from art.trainer_rank import _planner_misses as reports
 
 
-def observe(rank, key, n, peak, *, eligible=True, local_tokens=0):
+def observe(rank, key, n, peak, *, eligible=True, local_tokens=0, cp_workload=None):
     plan = SimpleNamespace(
         signature=key,
         packed_tokens=n,
         active_logical_tokens=n,
         output_bytes=0,
         local_packed_tokens=local_tokens,
+        caller_cp_workload=cp_workload,
     )
     m._update_memory_profile(
         rank,
@@ -38,7 +39,7 @@ def observe(rank, key, n, peak, *, eligible=True, local_tokens=0):
     return plan
 
 
-def required(rank, key, n, *, raw=False):
+def required(rank, key, n, *, raw=False, cp_workload=None):
     from unittest.mock import patch
 
     with patch.object(_impl, "_MEMORY_SAFETY_FACTOR", 1 if raw else 1.1):
@@ -48,6 +49,7 @@ def required(rank, key, n, *, raw=False):
             output_bytes=0,
             signature=key,
             include_cold_extrapolation=not raw,
+            caller_cp_workload=cp_workload,
         )
 
 
@@ -103,15 +105,24 @@ def test_root_counterpart_precedes_larger_model_anchor():
     rank, key = _rank(), signature((1, "forward_backward", 8))
     root = m._ScopedMemorySignature(**vars(key), bounded_caller_peak=True)
     other = replace(key, request_mix=("hidden",))
+    workload = ("synthetic", ((64, 64),) * 8)
     with m.fixed_slope_memory_profiles():
-        observe(rank, root, 8192, 1_000_000_000)
+        observe(rank, root, 8192, 1_000_000_000, cp_workload=workload)
         observe(rank, other, 8192, 10_000_000_000)
         observe(rank, key, 3, 300_000_000)
-        reference = m._rate_reference(rank, key, rank._memory_profiles[key])
+        reference = m._rate_reference(
+            rank,
+            key,
+            rank._memory_profiles[key],
+            packed_tokens=8192,
+            caller_cp_workload=workload,
+        )
         assert reference is not None and reference.source == "calibration_root"
         assert reference.rate == (1_000_000_000, 8192)
-        assert required(rank, key, 8192, raw=True) >= 1_300_000_000
-        assert required(rank, key, 8192) < 3_000_000_000
+        assert (
+            required(rank, key, 8192, raw=True, cp_workload=workload) >= 1_300_000_000
+        )
+        assert required(rank, key, 8192, cp_workload=workload) < 3_000_000_000
 
 
 def test_model_fallback_is_the_max_clean_anchored_rate():
@@ -318,13 +329,13 @@ def test_all_measured_fixture_peaks_remain_raw_and_effective_bounds(key, rows):
             assert required(rank, sig, row["length"]) >= max(row["rank_peak_bytes"])
 
 
-def test_format3_roundtrips_and_old_v2_defaults_remain_readable():
+def test_format4_roundtrips_and_old_v2_defaults_remain_readable():
     rank, key = _rank(), signature()
     with m.fixed_slope_memory_profiles():
         observe(rank, key, 3, 300_000_000)
         observe(rank, key, 8192, 1_000_000_000)
     p = rank._memory_profiles[key]
-    assert p.profile_format_version == 3
+    assert p.profile_format_version == 4
     assert reports._memory_profile(json.loads(json.dumps(asdict(p)))) == p
     assert pickle.loads(pickle.dumps(p)) == p
     old = asdict(p)
@@ -333,6 +344,10 @@ def test_format3_roundtrips_and_old_v2_defaults_remain_readable():
         "rate_floor_tokens",
         "rate_observations",
         "absolute_compute_floor",
+        "eligible_packed_tokens",
+        "subfloor_packed_tokens",
+        "retained_rate_tokens",
+        "retained_compute_peaks",
     ):
         old.pop(name)
     from art.trainer_rank import _memory_model

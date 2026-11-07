@@ -223,6 +223,10 @@ def test_earlier_v2_pickle_promotes_without_losing_model_fields(record):
         rate_floor_tokens=0,
         rate_observations=None,
         absolute_compute_floor=0,
+        eligible_packed_tokens=0,
+        subfloor_packed_tokens=0,
+        retained_rate_tokens=0,
+        retained_compute_peaks=(),
     )
     m._validate_memory_profile_model(restored)
 
