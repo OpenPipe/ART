@@ -702,6 +702,7 @@ def test_glm52_lora_subclass_witness_refuses_1150mb(monkeypatch):
     model.config.num_attention_heads = model.config.num_query_groups = 1
     model.config.kv_channels = 256
     model.config.num_moe_experts = 1
+    model.config.moe_aux_loss_coeff = 0.0
     r.runtime.model_support_handler.is_moe = True
     layers = []
     for index in range(128):
@@ -1176,7 +1177,9 @@ def test_megatron_checkpoint_shards_one_boundary_per_layer(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_rank", lambda group: 0)
     model = torch.nn.ModuleList([torch.nn.Linear(7, 7) for _ in range(3)])
     x = torch.randn(5, 1, 7, requires_grad=True)
-    with shard_saved_activations(object(), shape=tuple(x.shape), key="mcore") as stats:
+    with shard_saved_activations(
+        object(), shape=cast(tuple[int, int, int], tuple(x.shape)), key="mcore"
+    ) as stats:
         value = x.sin()  # Ordinary saves of this shape must stay local.
         for layer in model:
             value = random.checkpoint(layer, False, value)

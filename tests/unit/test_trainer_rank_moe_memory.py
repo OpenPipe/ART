@@ -42,6 +42,7 @@ def layer() -> Any:
         num_layers=40,
         num_moe_experts=256,
         moe_router_topk=8,
+        moe_aux_loss_coeff=0.0,
         moe_ffn_hidden_size=512,
         moe_expert_capacity_factor=None,
         moe_pad_expert_input_to_capacity=False,

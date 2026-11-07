@@ -1,6 +1,6 @@
 """CPU/Gloo construction guards for execution scope and layout scoring."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from datetime import timedelta
 import json
@@ -17,6 +17,7 @@ import torch.multiprocessing as mp
 
 from art.trainer_rank import TrainerRank, TrainerRankRuntimeSupportError, _impl
 from art.trainer_rank._planner_cost import (
+    GDN_MOE_H2048_GEOMETRY,
     QWEN35_4B_GEOMETRY,
     ParallelShape,
     select_scoring,
@@ -75,10 +76,14 @@ def _worker(index, directory, mode, world_size):
         tp = 2 if mode == "contained-etp" else 1
         cp = (
             8
-            if mode == "homogeneous-cp8"
-            else (1 if mode in ("etp", "ep", "contained-etp") else 2)
+            if mode in ("homogeneous-cp8", "global-aux-cp8")
+            else (1 if mode in ("etp", "ep", "contained-etp", "global-aux") else 2)
         )
-        ep = 2 if mode in ("ep", "contained-ep") else 1
+        ep = (
+            2
+            if mode in ("ep", "contained-ep", "expert-type-error", "expert-key-error")
+            else 1
+        )
         etp = 2 if mode in ("etp", "contained-etp") else 1
         ps.initialize_model_parallel(
             tensor_model_parallel_size=tp,
@@ -131,6 +136,8 @@ def _worker(index, directory, mode, world_size):
             )
             patch.setattr(dist, "all_gather_object", gather)
             patch.setattr(_impl, "select_scoring", select)
+            # Parameters only expose CUDA metadata; object transport is real Gloo.
+            patch.setattr(torch.cuda, "device", lambda device: nullcontext())
             if mode == "partial-scope-error":
                 patch.setattr(
                     TrainerRank,
@@ -139,7 +146,73 @@ def _worker(index, directory, mode, world_size):
                         "expert group outside admission cohort" if index == 0 else None
                     ),
                 )
-            TrainerRank(_runtime())
+            if mode in ("expert-type-error", "expert-key-error") and index == 0:
+
+                def unavailable(**kwargs):
+                    raise (TypeError if mode == "expert-type-error" else KeyError)(
+                        "group metadata"
+                    )
+
+                patch.setattr(
+                    ps, "get_expert_tensor_and_model_parallel_group", unavailable
+                )
+            runtime = _runtime()
+            if mode in ("global-aux", "global-aux-cp8"):
+                from megatron.core.process_groups_config import ProcessGroupCollection
+                from megatron.core.transformer.moe.router import TopKRouter
+                from megatron.core.transformer.transformer_config import (
+                    TransformerConfig,
+                )
+
+                config = TransformerConfig(
+                    num_layers=40,
+                    hidden_size=2048,
+                    num_attention_heads=16,
+                    num_moe_experts=256,
+                    moe_router_topk=8,
+                    moe_router_load_balancing_type="global_aux_loss",
+                    moe_aux_loss_coeff=1e-3,
+                    moe_router_fusion=False,
+                )
+                groups = ProcessGroupCollection()
+                groups.tp = ps.get_tensor_model_parallel_group()
+                groups.cp = ps.get_context_parallel_group()
+                groups.tp_cp = cohort
+                groups.tp_dp_cp = ps.get_tensor_and_data_parallel_group(
+                    with_context_parallel=True
+                )
+                with patch.context() as router_patch:
+                    router_patch.setattr(
+                        torch.cuda, "current_device", lambda: torch.device("cpu")
+                    )
+                    runtime.model[0].router = TopKRouter(config, pg_collection=groups)
+                row["router_ranks"] = dist.get_process_group_ranks(groups.tp_dp_cp)
+                row["global_aux_coefficient"] = config.moe_aux_loss_coeff
+                runtime.model_support_handler.is_moe = True
+                if mode == "global-aux-cp8":
+                    geometry = GDN_MOE_H2048_GEOMETRY
+                    runtime.model[0].config.num_layers = 40
+                    for name in (
+                        "hidden_size",
+                        "ffn_hidden_size",
+                        "num_attention_heads",
+                        "num_query_groups",
+                        "kv_channels",
+                    ):
+                        setattr(runtime.model[0].config, name, getattr(geometry, name))
+                    runtime.model[0].config.num_moe_experts = geometry.moe_experts
+                    runtime.model[0].config.moe_router_topk = geometry.moe_topk
+                    runtime.model[
+                        0
+                    ].config.moe_ffn_hidden_size = geometry.moe_ffn_hidden_size
+                    runtime.model[
+                        0
+                    ].config.moe_shared_expert_intermediate_size = (
+                        geometry.moe_shared_expert_ffn
+                    )
+            trainer = TrainerRank(runtime)
+            if mode == "global-aux-cp8":
+                assert trainer._geometry == GDN_MOE_H2048_GEOMETRY
             row["constructed"] = True
     except Exception as exc:
         row["error"] = f"{type(exc).__name__}: {exc}"
@@ -234,7 +307,8 @@ def test_local_scope_error_rejects_every_cohort_member(tmp_path):
     assert all(row["init_exchanges"] == 1 for row in rows), rows
 
 
-def test_nccl_identity_exchange_uses_model_device(monkeypatch):
+@pytest.mark.parametrize("backend", ["nccl", "cuda:nccl", "cpu:gloo,cuda:nccl", "gloo"])
+def test_nccl_identity_exchange_uses_model_device(monkeypatch, backend):
     trainer = TrainerRank.__new__(TrainerRank)
     trainer.device = torch.device("cuda", 1)
     trainer._geometry = QWEN35_4B_GEOMETRY
@@ -242,10 +316,11 @@ def test_nccl_identity_exchange_uses_model_device(monkeypatch):
     cohort = object()
     monkeypatch.setattr(trainer, "_forward_memory_group", lambda: cohort)
     monkeypatch.setattr(trainer, "_expert_admission_scope_error", lambda _: None)
+    monkeypatch.setattr(trainer, "_global_aux_admission_scope_error", lambda _: None)
     monkeypatch.setattr(dist, "is_available", lambda: True)
     monkeypatch.setattr(dist, "is_initialized", lambda: True)
     monkeypatch.setattr(dist, "get_world_size", lambda group: 2)
-    monkeypatch.setattr(dist, "get_backend", lambda group: "nccl")
+    monkeypatch.setattr(dist, "get_backend", lambda group: backend)
     active = []
     calls = []
 
@@ -285,3 +360,35 @@ def test_uninitialized_expert_groups_fail_closed():
     runtime.model[0].weight = torch.nn.Parameter(torch.zeros((), dtype=torch.bfloat16))
     with pytest.raises(TrainerRankRuntimeSupportError, match="expert.*admission"):
         TrainerRank(runtime)
+
+
+def test_global_aux_group_outside_admission_rejects_every_rank(tmp_path):
+    rows = _run(tmp_path, "global-aux")
+    assert all(row["memory_ranks"] == [i] for i, row in enumerate(rows)), rows
+    assert all(row["router_ranks"] == [0, 1] for row in rows), rows
+    assert all(not row["constructed"] for row in rows), rows
+    assert all(
+        "TrainerRankRuntimeSupportError" in row["error"] and "global" in row["error"]
+        for row in rows
+    ), rows
+    assert all(row["init_exchanges"] == 1 for row in rows), rows
+
+
+def test_global_aux_production_cp8_constructs(tmp_path):
+    rows = _run(tmp_path, "global-aux-cp8", 8)
+    assert all(row["constructed"] and row["error"] is None for row in rows), rows
+    assert all(
+        row["router_ranks"] == row["memory_ranks"] == list(range(8)) for row in rows
+    ), rows
+    assert all(
+        row["global_aux_coefficient"] == 1e-3 and row["init_exchanges"] == 1
+        for row in rows
+    ), rows
+
+
+@pytest.mark.parametrize("mode", ["expert-type-error", "expert-key-error"])
+def test_membership_lookup_errors_reject_every_peer(tmp_path, mode):
+    rows = _run(tmp_path, mode)
+    assert all(not row["constructed"] for row in rows), rows
+    assert all("TrainerRankRuntimeSupportError" in row["error"] for row in rows), rows
+    assert all(row["init_exchanges"] == 1 for row in rows), rows

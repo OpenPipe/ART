@@ -70,7 +70,8 @@ class TrainerRank(_impl.TrainerRank):
     profile is keyed by topology and calibrates itself online.
 
     Construction is collective within the TP x CP admission group. Expert
-    tensor/model groups must be contained in that group, whose members must
+    tensor/model groups and enabled global router auxiliary-loss groups must
+    be contained in that group, whose members must
     agree on layout scoring and accelerator facts; unsupported configurations
     raise ``TrainerRankRuntimeSupportError`` before any forward.
     """

@@ -2256,11 +2256,102 @@ class TrainerRank:
                 AssertionError,
                 AttributeError,
                 ImportError,
+                KeyError,
                 RuntimeError,
+                TypeError,
                 ValueError,
             ):
                 pass
         return f"{message}; group membership is unavailable"
+
+    def _global_aux_admission_scope_error(
+        self, cohort: dist.ProcessGroup | None
+    ) -> str | None:
+        message = (
+            "TrainerRank requires the global auxiliary loss TP x DP x CP group "
+            "to be contained in the forward-memory admission group"
+        )
+        try:
+            configs = [self.runtime.provider]
+            configs.extend(
+                config
+                for chunk in self.runtime.model
+                for module in chunk.modules()
+                if (config := getattr(module, "config", None)) is not None
+            )
+            has_moe = bool(
+                self._geometry.moe_experts
+                or self._moe_layers
+                or getattr(self.runtime.model_support_handler, "is_moe", False)
+                or getattr(
+                    getattr(self.runtime, "model_support_spec", None), "is_moe", False
+                )
+                or any(getattr(config, "num_moe_experts", None) for config in configs)
+            )
+            configured = enabled = False
+            for config in configs:
+                kind = getattr(config, "moe_router_load_balancing_type", None)
+                coefficient = getattr(config, "moe_aux_loss_coeff", None)
+                if kind is None and coefficient is None:
+                    continue
+                configured = True
+                # Explicit zero disables every aux loss, even without a type.
+                if coefficient == 0 and not isinstance(kind, list):
+                    continue
+                if isinstance(kind, str):
+                    if kind != "global_aux_loss":
+                        continue
+                elif isinstance(kind, list) and all(isinstance(k, str) for k in kind):
+                    if "global_aux_loss" not in kind:
+                        continue
+                    if not isinstance(coefficient, list) or len(coefficient) != len(
+                        kind
+                    ):
+                        raise ValueError(
+                            "auxiliary loss types and coefficients must align"
+                        )
+                    coefficient = coefficient[kind.index("global_aux_loss")]
+                else:
+                    raise ValueError("auxiliary loss type is unknown")
+                if not isinstance(coefficient, (int, float)) or not math.isfinite(
+                    coefficient
+                ):
+                    raise ValueError("global auxiliary loss coefficient is unknown")
+                enabled |= coefficient != 0
+            # Native TransformerConfig exposes its aux_loss/0.0 defaults.
+            # Missing custom MoE settings cannot establish a disabled loss.
+            if not configured and has_moe:
+                raise ValueError("MoE auxiliary loss configuration is unavailable")
+            if not enabled:
+                return None
+            if dist.is_available() and dist.is_initialized():
+                from megatron.core import parallel_state as ps
+
+                group = ps.get_tensor_and_data_parallel_group(
+                    with_context_parallel=True
+                )
+                if group is not None:
+                    router_ranks = dist.get_process_group_ranks(group)
+                    cohort_ranks = dist.get_process_group_ranks(
+                        cohort if cohort is not None else dist.group.WORLD
+                    )
+                    if set(router_ranks) <= set(cohort_ranks):
+                        return None
+                    return (
+                        f"{message}; got router ranks={router_ranks}, "
+                        f"admission ranks={cohort_ranks}"
+                    )
+            return f"{message}; group membership is unavailable"
+        except (
+            AssertionError,
+            AttributeError,
+            ImportError,
+            KeyError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            return f"{message}; {error}"
 
     def _validate_planner_cohort(
         self,
@@ -2273,7 +2364,17 @@ class TrainerRank:
         # Agree once, before layout selection, slot setup or model execution.
         # A local scope error joins the exchange so no cohort peer waits alone.
         cohort = self._forward_memory_group()
-        scope_error = self._expert_admission_scope_error(cohort)
+        scope_error = (
+            "; ".join(
+                error
+                for error in (
+                    self._expert_admission_scope_error(cohort),
+                    self._global_aux_admission_scope_error(cohort),
+                )
+                if error is not None
+            )
+            or None
+        )
         identity = json.dumps(
             {
                 "scoring": asdict(selection),
@@ -2290,11 +2391,11 @@ class TrainerRank:
         peers = [local]
         if dist.is_available() and dist.is_initialized():
             peers = [local] * dist.get_world_size(cohort)
-            # Object collectives use CPU under Gloo and the current CUDA
-            # device under NCCL, which must be this rank's model device.
+            # Pin the model device for every CUDA backend spelling. Gloo
+            # object transport remains on CPU even inside this context.
             with (
                 torch.cuda.device(self.device)
-                if dist.get_backend(cohort) == "nccl"
+                if self.device.type == "cuda"
                 else nullcontext()
             ):
                 dist.all_gather_object(peers, local, group=cohort)
