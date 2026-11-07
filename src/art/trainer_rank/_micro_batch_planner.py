@@ -178,18 +178,18 @@ def _forward_micro_batches(
                 backward.harvest()
             # Normal resume alone closes the caller's measured interval.
             # Close/throw/GC must remain local and preserve pending OOM context.
-            if isinstance(candidate.plan, _impl._FlatForwardPlan):
-                self._update_peak_memory_profile(
-                    candidate.plan,
-                    memory_baseline,
-                    caller_phase=True,
-                    interval=interval,
-                )
-            elif memory_baseline is not None:
-                self._record_split_memory_floor(
-                    candidate.plan, memory_baseline, forward_peak
-                )
-            self._complete_planner_observation()
+            from . import _memory
+
+            if _memory._try_update_caller_memory_profile(
+                self,
+                candidate.plan,
+                memory_baseline,
+                interval,
+                0
+                if isinstance(candidate.plan, _impl._FlatForwardPlan)
+                else forward_peak,
+            ):
+                self._complete_planner_observation()
         finally:
             del tracked_outputs, flat_outputs, outputs
         start = stop

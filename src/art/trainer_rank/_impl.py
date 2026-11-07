@@ -2240,6 +2240,8 @@ class TrainerRank:
         # Tracked peak-counter resets, and the latest (resets, peak) reading.
         self._peak_resets = 0
         self._peak_reading: tuple[int, int] | None = None
+        self._suppressed_caller_memory_samples = 0
+        self._caller_memory_sample_warning_logged = False
         self._split_memory_floors: dict[bytes, int] = {}
         self._split_memory_floor_status = "not_observed"
         self._last_global_micro_batch_size: int | None = None
@@ -2682,6 +2684,9 @@ class TrainerRank:
 
         Close this iterator on early exit to release its local references.
         Closing never samples memory or performs a profiling collective.
+        Post-yield sampling/update exceptions skip learning for that local
+        sample, are counted, and warn once per trainer instance. They do not
+        interrupt the next wave; process-control exceptions still propagate.
         The caller coordinates errors before starting another replicated wave.
         """
         if not isinstance(yield_empty, bool):

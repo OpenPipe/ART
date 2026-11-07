@@ -2161,6 +2161,66 @@ def _rate_learning_eligible(self: TrainerRank, plan: _impl._FlatForwardPlan) -> 
     )
 
 
+def _try_update_caller_memory_profile(
+    self: TrainerRank,
+    plan: _impl._AnyForwardPlan,
+    baseline: int | None,
+    interval: tuple[int, int] | None,
+    forward_peak: int,
+) -> bool:
+    """Commit a local post-yield sample or discard it without communication."""
+    try:
+        if isinstance(plan, _impl._FlatForwardPlan):
+            previous = self._memory_profiles.get(plan.signature)
+            reading = self._peak_reading
+            observation = self._planner_observation
+            had_peak = observation is not None and "peak" in observation
+            observed_peak = None if observation is None else observation.get("peak")
+            try:
+                self._update_peak_memory_profile(
+                    plan, baseline, caller_phase=True, interval=interval
+                )
+            except Exception:
+                if previous is None:
+                    self._memory_profiles.pop(plan.signature, None)
+                else:
+                    self._memory_profiles[plan.signature] = previous
+                self._peak_reading = reading
+                if observation is not None:
+                    if had_peak:
+                        observation["peak"] = observed_peak
+                    else:
+                        observation.pop("peak", None)
+                raise
+        elif baseline is not None:
+            # Split floors are capped at 1024 entries. Preserve this small map
+            # and its status even if a recorder fails after publishing a floor.
+            floors = self._split_memory_floors.copy()
+            status = self._split_memory_floor_status
+            try:
+                self._record_split_memory_floor(plan, baseline, forward_peak)
+            except Exception:
+                self._split_memory_floors.clear()
+                self._split_memory_floors.update(floors)
+                self._split_memory_floor_status = status
+                raise
+    except Exception as error:
+        self._suppressed_caller_memory_samples += 1
+        if not self._caller_memory_sample_warning_logged:
+            self._caller_memory_sample_warning_logged = True
+            try:
+                _impl.logger.warning(
+                    "Skipped unavailable caller memory sample (%s); "
+                    "further sample warnings suppressed",
+                    type(error).__name__,
+                )
+            except Exception:
+                # Auxiliary logging must not interrupt the next replicated wave.
+                pass
+        return False
+    return True
+
+
 def _update_peak_memory_profile(
     self: TrainerRank,
     plan: _impl._FlatForwardPlan,
@@ -3083,7 +3143,7 @@ def _update_memory_profile(
             ),
         )
     profile_cls = _impl._MemoryProfileV2 if fixed_slope else _impl._MemoryProfile
-    self._memory_profiles[plan.signature] = profile_cls(
+    profile = profile_cls(
         # Preserve this legacy diagnostic/transport field. Rate-qualified admission
         # sources rates exclusively from rate_observations, never this maximum.
         bytes_per_token=max(
@@ -3149,8 +3209,8 @@ def _update_memory_profile(
         if len(cp_observations) > 8:
             cp_observations = [cp_observations[0], *cp_observations[-7:]]
         caller_cls = _CallerMemoryProfileV2 if fixed_slope else _CallerMemoryProfile
-        self._memory_profiles[plan.signature] = caller_cls(
-            **vars(self._memory_profiles[plan.signature]),
+        profile = caller_cls(
+            **vars(profile),
             caller_compute_peaks=tuple(observations),
             caller_cp_peaks=tuple(cp_observations),
             compute_peak_floor=max(
@@ -3178,7 +3238,9 @@ def _update_memory_profile(
         if len(observations) > 8:
             observations = [observations[0], *observations[-7:]]
         bounded_cls = _BoundedMemoryProfileV2 if fixed_slope else _BoundedMemoryProfile
-        self._memory_profiles[plan.signature] = bounded_cls(
-            **vars(self._memory_profiles[plan.signature]),
+        profile = bounded_cls(
+            **vars(profile),
             forward_compute_peaks=tuple(observations),
         )
+    # Publish only after every specialization has been constructed successfully.
+    self._memory_profiles[plan.signature] = profile

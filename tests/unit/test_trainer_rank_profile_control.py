@@ -118,6 +118,8 @@ def _cohort_worker(index, rendezvous, output, variant):
                 trace=resume_trace,
                 callers=rank._memory_profiles[source].caller_plans,
                 peak=rank._memory_profiles[source].compute_observations[-1][1],
+                suppressed=rank._suppressed_caller_memory_samples,
+                warned=rank._caller_memory_sample_warning_logged,
             )
             if error is None and variant != "error":
                 target_requests = [
@@ -180,7 +182,10 @@ def test_borrowed_learning_needs_no_caller_agreement(tmp_path, variant):
     assert [row["peak"] for row in rows] == [1_000_000_000, 1_100_000_000]
     assert all(row["trace"] == [] for row in rows)
     if variant == "error":
-        assert [row["error"] for row in rows] == [None, "ValueError"]
+        assert [row["error"] for row in rows] == [None, None]
+        assert [row["suppressed"] for row in rows] == [0, 1]
+        assert [row["warned"] for row in rows] == [False, True]
+        assert [row["callers"] for row in rows] == [1, 0]
     else:
         assert not any(row["error"] for row in rows)
         assert all(row["rates"] == [] and row["target_callers"] == 0 for row in rows)
