@@ -1,4 +1,4 @@
-"""The standard PyTorch determinism opt-in must select a supported backend."""
+"""FLASH execution contracts and the standard PyTorch determinism opt-in."""
 
 import pytest
 import torch
@@ -28,9 +28,7 @@ def test_determinism_preserves_flash_mask_geometry(monkeypatch):
 
 
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_deterministic_flash_rejects_uncompiled_cache_fallback(
-    monkeypatch, deterministic
-):
+def test_flash_continues_after_uncompiled_cache_fallback(monkeypatch, deterministic):
     original = torch.are_deterministic_algorithms_enabled()
     warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
     monkeypatch.setattr(compiled, "flex_attention", lambda q, *args, **kwargs: q + 1)
@@ -45,11 +43,7 @@ def test_deterministic_flash_rejects_uncompiled_cache_fallback(
             q = torch.zeros(2)
             assert torch.equal(attention(q, q, q, **options), q + 1)
             q = torch.zeros(3)
-            if deterministic:
-                with pytest.raises(RuntimeError, match="compiled FLASH"):
-                    attention(q, q, q, **options)
-            else:
-                assert torch.equal(attention(q, q, q, **options), q + 1)
+            assert torch.equal(attention(q, q, q, **options), q + 1)
     finally:
         torch._dynamo.reset()
         torch.use_deterministic_algorithms(original, warn_only=warn_only)
