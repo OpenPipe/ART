@@ -2684,9 +2684,10 @@ class TrainerRank:
 
         Close this iterator on early exit to release its local references.
         Closing never samples memory or performs a profiling collective.
-        Post-yield sampling/update exceptions skip learning for that local
+        Non-device post-yield sampling/update exceptions skip learning for that local
         sample, are counted, and warn once per trainer instance. They do not
-        interrupt the next wave; process-control exceptions still propagate.
+        interrupt the next wave; device faults and process-control exceptions
+        still propagate.
         The caller coordinates errors before starting another replicated wave.
         """
         if not isinstance(yield_empty, bool):

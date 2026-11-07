@@ -2161,6 +2161,77 @@ def _rate_learning_eligible(self: TrainerRank, plan: _impl._FlatForwardPlan) -> 
     )
 
 
+def _is_device_fault(error: BaseException) -> bool:
+    """Recognize device failures across Torch versions and exception wrappers."""
+    device_types = tuple(
+        kind
+        for owner, names in (
+            (_impl.torch, ("OutOfMemoryError", "AcceleratorError")),
+            (
+                _impl.torch.cuda,
+                ("OutOfMemoryError", "CudaError", "DeferredCudaCallError"),
+            ),
+        )
+        for name in names
+        if isinstance(kind := getattr(owner, name, None), type)
+        and issubclass(kind, BaseException)
+    )
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, device_types) or type(current).__module__.startswith(
+            "torch.cuda"
+        ):
+            return True
+        if isinstance(current, RuntimeError):
+            try:
+                message = str(current).casefold()
+            except Exception:
+                return True  # An opaque runtime failure cannot certify a safe sample.
+            # Broad backend/device terms deliberately fail closed on ambiguous
+            # device errors, including older Torch RuntimeError encodings.
+            if not message.strip() or any(
+                term in message
+                for term in (
+                    "cuda",
+                    "cudnn",
+                    "cublas",
+                    "cufft",
+                    "cusolver",
+                    "cusparse",
+                    "curand",
+                    "nccl",
+                    "accelerator",
+                    "device",
+                    "out of memory",
+                    "out_of_memory",
+                    "illegal memory",
+                    "launch failure",
+                    "hip error",
+                    "hiperror",
+                    "rocblas",
+                    "miopen",
+                    "xpu error",
+                    "mps backend",
+                    "sycl",
+                    "metal error",
+                )
+            ):
+                return True
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        pending.extend(
+            nested
+            for nested in (current.__cause__, current.__context__)
+            if nested is not None
+        )
+    return False
+
+
 def _try_update_caller_memory_profile(
     self: TrainerRank,
     plan: _impl._AnyForwardPlan,
@@ -2168,7 +2239,7 @@ def _try_update_caller_memory_profile(
     interval: tuple[int, int] | None,
     forward_peak: int,
 ) -> bool:
-    """Commit a local post-yield sample or discard it without communication."""
+    """Discard non-device sample failures locally; propagate fatal device faults."""
     try:
         if isinstance(plan, _impl._FlatForwardPlan):
             previous = self._memory_profiles.get(plan.signature)
@@ -2205,7 +2276,11 @@ def _try_update_caller_memory_profile(
                 self._split_memory_floor_status = status
                 raise
     except Exception as error:
-        self._suppressed_caller_memory_samples += 1
+        if _is_device_fault(error):
+            # Device faults take the established cohort-death/restart path.
+            # A peer may desynchronize; the NCCL watchdog bounds that failure.
+            # Coordinated device recovery needs a CPU side channel, out of scope.
+            raise
         if not self._caller_memory_sample_warning_logged:
             self._caller_memory_sample_warning_logged = True
             try:
@@ -2214,9 +2289,12 @@ def _try_update_caller_memory_profile(
                     "further sample warnings suppressed",
                     type(error).__name__,
                 )
-            except Exception:
-                # Auxiliary logging must not interrupt the next replicated wave.
-                pass
+            except Exception as warning_error:
+                if _is_device_fault(warning_error):
+                    self._caller_memory_sample_warning_logged = False
+                    raise
+                # Non-device logging failures are auxiliary too.
+        self._suppressed_caller_memory_samples += 1
         return False
     return True
 
