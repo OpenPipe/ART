@@ -2176,19 +2176,27 @@ def _complete_caller_memory_profile(
     baseline: int | None,
     interval: tuple[int, int] | None,
     forward_peak: int,
+    *,
+    interrupted: bool = False,
 ) -> None:
-    """One control-only MIN at the replicated iterator's common resume point.
+    """Finalize a yielded interval, including explicit close and throw.
 
     No plan/sample/error branch bypasses this vote. Handoff's existing status
     exchange is too early: the caller interval is still open then. Waiting for
     the next admission is too late and would omit the final wave. Local byte
-    readings are frozen before the vote and are never reduced.
+    readings are frozen before the vote and are never reduced. The first
+    status is 1 for completion, 0 for interruption, -1 for a sampling error.
+    A peer interruption stops iteration before any next-wave or outer exchange.
     """
     error: BaseException | None = None
     reading = None
     eligible = complete = False
     try:
-        if isinstance(plan, _impl._FlatForwardPlan) and baseline is not None:
+        if (
+            not interrupted
+            and isinstance(plan, _impl._FlatForwardPlan)
+            and baseline is not None
+        ):
             peak = int(_impl.torch.cuda.max_memory_allocated(self.device))
             reading = (
                 self.__dict__.get("_peak_resets", 0),
@@ -2206,7 +2214,7 @@ def _complete_caller_memory_profile(
     try:
         agreed = self._recovery_reduce(
             [
-                float(error is None),
+                -1.0 if error is not None else float(not interrupted),
                 float(reading is not None),
                 float(eligible),
                 float(complete),
@@ -2218,10 +2226,16 @@ def _complete_caller_memory_profile(
         if error is None:
             raise
         exchange_error = exc
+    if interrupted:
+        # Preserve the caller's exception or GeneratorExit. Do not sample an
+        # interrupted allocator interval or learn from any participant.
+        return
     if error is not None:
         raise self._memory_error_with_reduction_note(error, exchange_error)
-    if not agreed[0]:
+    if agreed[0] < 0:
         raise RuntimeError("Memory profile sampling failed on another rank")
+    if not agreed[0]:
+        raise RuntimeError("Caller interval interrupted on another rank")
     if isinstance(plan, _impl._FlatForwardPlan):
         if reading is not None:
             self._update_peak_memory_profile(

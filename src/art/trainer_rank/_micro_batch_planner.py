@@ -150,66 +150,70 @@ def _forward_micro_batches(
             # that slice while this generator is suspended at the yield.
             self._submit_speculative_wave_planning(items, stop, checkpoint=checkpoint)
         self._snapshot_planning_telemetry(candidate.plan, candidate.check)
-        with _impl._telemetry_phase(
-            # This interval is controlled by the caller and normally contains
-            # loss construction and backward for the yielded microbatch.
-            "caller",
-            self._telemetry_signature(candidate.plan),
-            dedup_signature=self._telemetry_plan_signature(candidate.plan),
-        ):
-            yield _impl.MicroBatch(
-                inputs=candidate.inputs,
-                outputs=outputs,
-                indices=candidate.indices,
-                stats=_impl.MicroBatchStats(
-                    global_start=start,
-                    global_stop=stop,
-                    global_count=candidate.stats_global_count,
-                    local_count=len(candidate.inputs),
-                    packed_tokens=candidate.plan.packed_tokens,
-                    logical_tokens=candidate.plan.logical_tokens,
-                    estimated_required_bytes=candidate.check.estimated_required_bytes,
-                    available_bytes=candidate.check.available_bytes,
-                    rejected_candidates=candidate.rejected_candidates,
-                    cold_start=candidate.cold_start,
-                    subforward_count=candidate.plan.subforward_count,
-                ),
-            )
-        if backward is not None:
-            backward.harvest()
-        # The caller normally runs backward while the micro-batch is yielded.
-        # Include that peak in future planning; forward-only profiling can
-        # otherwise admit a later micro-batch that leaves no collective or
-        # optimizer headroom. Peak only: the retained observation belongs
-        # to the forward's return, already recorded for this same plan.
         from . import _memory
 
-        if _memory._FIXED_SLOPE_PROFILES.get():
-            # This opt-in is replicated by the caller, never inferred from a
-            # rank-local profile. Every plan kind reaches the same MIN vote.
-            _memory._complete_caller_memory_profile(
-                self,
-                candidate.plan,
-                memory_baseline,
-                interval,
-                0
-                if isinstance(candidate.plan, _impl._FlatForwardPlan)
-                else forward_peak,
-            )
-        elif isinstance(candidate.plan, _impl._FlatForwardPlan):
-            self._update_peak_memory_profile(
-                candidate.plan,
-                memory_baseline,
-                caller_phase=True,
-                interval=interval,
-            )
-        elif memory_baseline is not None:
-            self._record_split_memory_floor(
-                candidate.plan, memory_baseline, forward_peak
-            )
-        # Only the caller may retain completed outputs into the next wave.
-        self._complete_planner_observation()
-        del tracked_outputs, flat_outputs, outputs
+        # Capture before yielding: close() can arrive after the caller leaves
+        # its collection context. Every yielded interval votes exactly once,
+        # including explicit close/throw, before the caller's outer exchange.
+        profile_mode = _memory._FIXED_SLOPE_PROFILES.get()
+        interrupted = True
+        try:
+            try:
+                with _impl._telemetry_phase(
+                    "caller",
+                    self._telemetry_signature(candidate.plan),
+                    dedup_signature=self._telemetry_plan_signature(candidate.plan),
+                ):
+                    yield _impl.MicroBatch(
+                        inputs=candidate.inputs,
+                        outputs=outputs,
+                        indices=candidate.indices,
+                        stats=_impl.MicroBatchStats(
+                            global_start=start,
+                            global_stop=stop,
+                            global_count=candidate.stats_global_count,
+                            local_count=len(candidate.inputs),
+                            packed_tokens=candidate.plan.packed_tokens,
+                            logical_tokens=candidate.plan.logical_tokens,
+                            estimated_required_bytes=candidate.check.estimated_required_bytes,
+                            available_bytes=candidate.check.available_bytes,
+                            rejected_candidates=candidate.rejected_candidates,
+                            cold_start=candidate.cold_start,
+                            subforward_count=candidate.plan.subforward_count,
+                        ),
+                    )
+                if backward is not None:
+                    backward.harvest()
+                interrupted = False
+            finally:
+                if profile_mode:
+                    with _memory.fixed_slope_memory_profiles():
+                        _memory._complete_caller_memory_profile(
+                            self,
+                            candidate.plan,
+                            memory_baseline,
+                            interval,
+                            0
+                            if isinstance(candidate.plan, _impl._FlatForwardPlan)
+                            else forward_peak,
+                            interrupted=interrupted,
+                        )
+                elif not interrupted:
+                    if isinstance(candidate.plan, _impl._FlatForwardPlan):
+                        self._update_peak_memory_profile(
+                            candidate.plan,
+                            memory_baseline,
+                            caller_phase=True,
+                            interval=interval,
+                        )
+                    elif memory_baseline is not None:
+                        self._record_split_memory_floor(
+                            candidate.plan, memory_baseline, forward_peak
+                        )
+            # Interrupted callers keep their pending OOM-report context.
+            self._complete_planner_observation()
+        finally:
+            del tracked_outputs, flat_outputs, outputs
         start = stop
 
 

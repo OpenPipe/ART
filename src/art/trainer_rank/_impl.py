@@ -2679,6 +2679,9 @@ class TrainerRank:
         a backward deferred past it is not. A wave with another TrainerRank
         forward inside its yield cannot lower later estimates below the
         signature's first wave.
+
+        On early exit, close this iterator in a finally block on every rank,
+        before starting any outer collective or error exchange.
         """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")
