@@ -1,13 +1,19 @@
 """Compiled flex attention entrypoints."""
 
+from collections import Counter
+import json
+import logging
 import math
+import os
 from typing import Any, Literal, TypeAlias, cast
 
 import torch
+from torch._dynamo.utils import counters
 from torch._higher_order_ops.flex_attention import (
     flex_attention as flex_attention_hop,
 )
 from torch.nn.attention.flex_attention import (
+    AuxOutput,
     AuxRequest,
     BlockMask,
     FlexKernelOptions,
@@ -27,6 +33,8 @@ apply_deterministic_flash_backward_patch()
 # backend; production ART uses FLASH except for unsupported wide-head cases.
 _FORCED_FLEX_BACKEND = "FLASH"
 _FLASH_LSE_RESCALE = math.log(2.0)
+_logger = logging.getLogger(__name__)
+_FLASH_EAGER_FALLBACK_KEYS: Counter[tuple[object, ...]] = Counter()
 FlexBackend: TypeAlias = Literal["FLASH", "TRITON"]
 SparseBlockSize: TypeAlias = int | tuple[int, int]
 
@@ -126,14 +134,51 @@ def flash_sparse_block_size_for_head_dim(
     return (128, 64)
 
 
-def _require_compiled_flash(backend: object) -> None:
-    if backend == "FLASH" and not torch.compiler.is_compiling():
-        raise RuntimeError(
-            "Attention requires compiled FLASH execution; "
-            "the uncompiled fallback bypasses its backward lowering and uses "
-            "a different LSE convention. Start a fresh trainer or increase "
-            "torch._dynamo.config.recompile_limit before compiling."
+def _flash_eager_fallback(backend: object, frame: str, q, k, v) -> bool:
+    if backend != "FLASH" or torch.compiler.is_compiling():
+        return False
+    rank = (
+        str(torch.distributed.get_rank())
+        if torch.distributed.is_initialized()
+        else os.environ.get("RANK", "0")
+    )
+    shapes = (tuple(q.shape), tuple(k.shape), tuple(v.shape))
+    key = (frame, rank, shapes, q.dtype, q.device, torch.is_grad_enabled())
+    _FLASH_EAGER_FALLBACK_KEYS[key] += 1
+    count = _FLASH_EAGER_FALLBACK_KEYS[key]
+    counters["art"]["flex_flash_eager_fallback"] += 1
+    # First use and powers of two keep repeated recomputation low-volume while
+    # retaining a running per-shape count. No communication is needed here.
+    if count & (count - 1) == 0:
+        _logger.warning(
+            "ART_FLEX_ATTENTION_EVENT %s",
+            json.dumps(
+                {
+                    "event": "flex_flash_eager_fallback",
+                    "counter": "flex_flash_eager_fallback",
+                    "count": counters["art"]["flex_flash_eager_fallback"],
+                    "key_count": count,
+                    "rank": rank,
+                    "frame": frame,
+                    "shapes": shapes,
+                    "dtype": str(q.dtype),
+                    "grad_enabled": torch.is_grad_enabled(),
+                }
+            ),
         )
+    return True
+
+
+def _adapt_eager_flash_aux(result):
+    if isinstance(result, tuple):
+        out, aux = result
+        if aux.lse is not None:
+            # The public math API returns natural LSE; compiled FLASH's public
+            # result is scaled by ln(2). Match that external contract inside
+            # autograd, without rewriting the HOP's saved log2 statistic.
+            aux = AuxOutput(lse=aux.lse * _FLASH_LSE_RESCALE, max_scores=aux.max_scores)
+        return out, aux
+    return result
 
 
 def _forced_flex_attention_dense(
@@ -146,8 +191,10 @@ def _forced_flex_attention_dense(
     enable_gqa,
     return_aux: AuxRequest | None = None,
 ):
-    _require_compiled_flash(_FORCED_FLEX_BACKEND)
-    return flex_attention(
+    eager_flash = _flash_eager_fallback(
+        _FORCED_FLEX_BACKEND, "_forced_flex_attention_dense", q, k, v
+    )
+    result = flex_attention(
         q,
         k,
         v,
@@ -157,6 +204,7 @@ def _forced_flex_attention_dense(
         kernel_options=_FORCED_FLEX_KERNEL_OPTIONS,
         return_aux=return_aux,
     )
+    return _adapt_eager_flash_aux(result) if eager_flash else result
 
 
 def _identity_score(score, _batch, _head, _query, _key):
@@ -173,7 +221,9 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
     resolved_options["OUTPUT_MAX"] = False
 
     def _flex_attention(q, k, v, *, block_mask, scale, enable_gqa):
-        _require_compiled_flash(resolved_options.get("BACKEND"))
+        eager_flash = _flash_eager_fallback(
+            resolved_options.get("BACKEND"), "sparse_flex_attention", q, k, v
+        )
         del enable_gqa
         for tensor in (q, k, v):
             torch._dynamo.mark_static(tensor, -3)
@@ -187,7 +237,11 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
             scale,
             resolved_options,
         )
-        return out, lse * _FLASH_LSE_RESCALE
+        lse = lse * _FLASH_LSE_RESCALE
+        if eager_flash:
+            # Math HOP LSE is log2; compiled FLASH HOP LSE is natural log.
+            lse = lse * _FLASH_LSE_RESCALE
+        return out, lse
 
     return _flex_attention
 
@@ -239,8 +293,10 @@ def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
         enable_gqa,
         return_aux: AuxRequest | None = None,
     ):
-        _require_compiled_flash(kernel_options.get("BACKEND"))
-        return flex_attention(
+        eager_flash = _flash_eager_fallback(
+            kernel_options.get("BACKEND"), "dense_flex_attention", q, k, v
+        )
+        result = flex_attention(
             q,
             k,
             v,
@@ -250,6 +306,7 @@ def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
             kernel_options=kernel_options,
             return_aux=return_aux,
         )
+        return _adapt_eager_flash_aux(result) if eager_flash else result
 
     return _flex_attention
 
