@@ -13,14 +13,15 @@ also lets the circular import resolve lazily.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import wraps
 import hashlib
 import math
 from types import MethodType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from art.trainer_rank import _impl
 
@@ -30,6 +31,43 @@ if TYPE_CHECKING:
 
     from art.megatron.lora import LoRASlotRef
     from art.trainer_rank._impl import AdapterSelection, AnyForwardInput, TrainerRank
+
+
+@dataclass
+class _PlanningInventory:
+    rank: TrainerRank
+    slot_shapes: dict[LoRASlotRef | None, tuple[tuple[int, ...], ...]] = field(
+        default_factory=dict
+    )
+    pending_gradients: dict[tuple[LoRASlotRef, ...], tuple[int, ...]] = field(
+        default_factory=dict
+    )
+
+
+_PLANNING_INVENTORY: ContextVar[_PlanningInventory | None] = ContextVar(
+    "trainer_rank_planning_inventory", default=None
+)
+_InventoryFunction = TypeVar("_InventoryFunction", bound=Callable[..., Any])
+
+
+def _with_planning_inventory(function: _InventoryFunction) -> _InventoryFunction:
+    """Share model walks across one pure width search, never across execution.
+
+    Candidate widths change token geometry, not slot shapes or which gradients
+    already exist. A recovery retry gets a fresh inventory, as does the next
+    wave after caller backward. Context-local ownership keeps nested ranks and
+    the speculative layout-planning thread independent.
+    """
+
+    @wraps(function)
+    def wrapped(self: TrainerRank, *args: Any, **kwargs: Any) -> Any:
+        token = _PLANNING_INVENTORY.set(_PlanningInventory(self))
+        try:
+            return function(self, *args, **kwargs)
+        finally:
+            _PLANNING_INVENTORY.reset(token)
+
+    return cast(_InventoryFunction, wrapped)
 
 
 @dataclass(frozen=True)
@@ -1252,6 +1290,14 @@ def _pending_adapter_gradient_bytes(
     refs = tuple(dict.fromkeys(refs))
     if not refs or len(self.runtime.model) != 1:
         return ()
+    inventory = _PLANNING_INVENTORY.get()
+    cached = (
+        inventory.pending_gradients.get(refs)
+        if inventory is not None and inventory.rank is self
+        else None
+    )
+    if cached is not None:
+        return cached
     try:
         from art.megatron.lora import LoRA
     except ModuleNotFoundError as error:
@@ -1315,7 +1361,10 @@ def _pending_adapter_gradient_bytes(
             and getattr(param, "main_grad", None) is None
         ):
             sizes[layer_of[param_id]] += param.numel() * param.element_size()
-    return tuple(sizes) if any(sizes) else ()
+    result = tuple(sizes) if any(sizes) else ()
+    if inventory is not None and inventory.rank is self:
+        inventory.pending_gradients[refs] = result
+    return result
 
 
 def _checkpoint_gradient_groups(
@@ -1794,6 +1843,14 @@ def _slot_memory_shapes(
         # Generic/no-component planning must not import Megatron or walk
         # model owners just to construct its existing memory signature.
         return ()
+    inventory = _PLANNING_INVENTORY.get()
+    cached = (
+        inventory.slot_shapes.get(ref)
+        if inventory is not None and inventory.rank is self
+        else None
+    )
+    if cached is not None:
+        return cached
     from art.megatron.lora import LoRA
 
     shapes = []
@@ -1864,7 +1921,10 @@ def _slot_memory_shapes(
                 # Also catch frozen/inactive foreign factor owners. Never infer
                 # completeness from the number of recognized owners alone.
                 shapes.append((0,))
-    return tuple(shapes)
+    result = tuple(shapes)
+    if inventory is not None and inventory.rank is self:
+        inventory.slot_shapes[ref] = result
+    return result
 
 
 def _memory_check(
