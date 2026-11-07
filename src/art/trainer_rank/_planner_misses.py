@@ -728,8 +728,9 @@ def _memory_profile(values: dict[str, Any]) -> Any:
         "caller_compute_peaks",
         "forward_compute_peaks",
         "compute_observations",
+        "rate_observations",
     ):
-        if field in values:
+        if field in values and values[field] is not None:
             values[field] = tuple(tuple(point) for point in values[field])
     if "compute_slope" in values:
         values["compute_slope"] = tuple(values["compute_slope"])
@@ -964,11 +965,20 @@ def replay(
             rank._topology_key(), item["runtime_facts"], key
         ):
             raise ValueError("incomplete replay: TP x SP adapter ranks unavailable")
-        rank._memory_profiles = (
-            {key: _memory_profile(item["profile"])}
-            if item["profile"] is not None
-            else {}
-        )
+        pool = state.get("fixed_slope_profile_pool", [])
+        if type(pool) is not list or any(
+            type(entry) is not dict or set(entry) != {"signature", "profile"}
+            for entry in pool
+        ):
+            raise ValueError("invalid fixed-slope fallback inventory")
+        rank._memory_profiles = {
+            _memory_signature(entry["signature"]): _memory_profile(entry["profile"])
+            for entry in pool
+        }
+        if item["profile"] is not None:
+            rank._memory_profiles[key] = _memory_profile(item["profile"])
+        else:
+            rank._memory_profiles.pop(key, None)
         with _memory.fixed_slope_memory_profiles(collection):
             cost = rank._subforward_cost(signature=key, **arguments)
         costs.append(cost)

@@ -65,13 +65,132 @@ def _fixed_slope_enabled(profile: _impl._MemoryProfile | None) -> bool:
 
 
 def _unanchored(profile: _impl._MemoryProfile | None) -> bool:
+    points = (
+        profile.rate_observations
+        if profile is not None and profile.profile_format_version == 3
+        else profile.compute_observations
+        if profile is not None
+        else ()
+    )
     return (
         profile is None
-        or not profile.compute_observations
-        or (
-            profile.compute_observations[-1][0] < _memory_model._MEMORY_SLOPE_MIN_TOKENS
-        )
+        or not points
+        or points[-1][0] < _memory_model._MEMORY_SLOPE_MIN_TOKENS
     )
+
+
+_MEMORY_DEFERRED_BYTES = 1 << 62
+
+
+def _rate_floor_tokens(signature: _impl._MemorySignature) -> int:
+    # Global pre-shard rows: 64 rows per CP rank, capped so every 8K anchor
+    # qualifies. Neither a local shard nor its ownership vector sets this floor.
+    return min(
+        64 * max(1, signature.topology[2]), _memory_model._MEMORY_SLOPE_MIN_TOKENS
+    )
+
+
+def _rate_points(profile: _impl._MemoryProfile, floor: int):
+    if profile.peak_model_version != 2:
+        return ()
+    if profile.profile_format_version == 3:
+        return tuple(
+            point for point in profile.rate_observations or () if point[0] >= floor
+        )
+    # Earlier v2 hulls may have discarded a qualifying intermediate rate in
+    # favor of a tiny peak. Only their definitely anchored observations seed
+    # the new rate channel; never reuse their max-merged scalar rate.
+    return tuple(point for point in profile.compute_observations if point[0] >= 8192)
+
+
+def _absolute_floor(profile: _impl._MemoryProfile, floor: int) -> int:
+    return max(
+        profile.absolute_compute_floor,
+        max((peak for n, peak in profile.compute_observations if n < floor), default=0),
+    )
+
+
+def _trusted_extent(profile: _impl._MemoryProfile) -> int:
+    if profile.profile_format_version != 3:
+        return profile.packed_tokens
+    return max(
+        max((n for n, _ in profile.rate_observations or ()), default=0),
+        max(
+            (
+                n
+                for n, _ in profile.compute_observations
+                if n < profile.rate_floor_tokens
+            ),
+            default=0,
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class _MemoryRateReference:
+    source: str
+    rate: tuple[int, int]
+    fixed: int
+    minimum: int
+    extent: int
+
+
+def _rate_reference(
+    self: TrainerRank,
+    signature: _impl._MemorySignature,
+    profile: _impl._MemoryProfile | None,
+) -> _MemoryRateReference | None:
+    from fractions import Fraction
+
+    floor = _rate_floor_tokens(signature)
+
+    def reference(source, profiles):
+        points = [(p, _rate_points(p, floor)) for p in profiles]
+        points = [(p, rows) for p, rows in points if rows]
+        if not points:
+            return None
+        rate = max(
+            (point for _, rows in points for point in rows),
+            key=lambda point: (Fraction(point[1], point[0]), point[0]),
+        )
+        return _MemoryRateReference(
+            source,
+            (rate[1], rate[0]),
+            max(
+                max(p.fixed_compute_bytes, _absolute_floor(p, floor)) for p, _ in points
+            ),
+            max(rows[0][0] for _, rows in points),
+            max(rows[-1][0] for _, rows in points),
+        )
+
+    if profile is not None and (own := reference("signature", (profile,))):
+        return own
+    # A TrainerRank owns one model. Never cross its replica geometry, operation
+    # or planning regime. Root counterparts additionally match the base key.
+    compatible = [
+        (key, value)
+        for key, value in self._memory_profiles.items()
+        if key.topology == signature.topology
+        and key.planner_coefficients == signature.planner_coefficients
+        and key.grad_enabled == signature.grad_enabled
+        and key.grad_modes == signature.grad_modes
+        and value.peak_model_version == 2
+    ]
+    roots = [
+        value
+        for key, value in compatible
+        if isinstance(key, _ScopedMemorySignature)
+        and (key.bounded_caller_peak or key.bounded_forward_peak)
+        and key.checkpoint_partition is None
+        and all(
+            getattr(key, name) == getattr(signature, name)
+            for name, field in _impl._MemorySignature.__dataclass_fields__.items()
+            if field.compare
+        )
+    ]
+    if root := reference("calibration_root", roots):
+        return root
+    return reference("model_anchor", [p for _, p in compatible if not _unanchored(p)])
 
 
 def _cold_extrapolation_factor(
@@ -91,8 +210,13 @@ def _profile_compute_peak(profile: _impl._MemoryProfile, tokens: int | float) ->
     if profile.peak_model_version == _memory_model._MEMORY_PROFILE_VERSION:
         # A lone long anchor does not qualify downward extrapolation of fixed
         # workspace. Price below the observed range at its smallest observation.
-        if profile.compute_observations:
-            tokens = max(tokens, profile.compute_observations[0][0])
+        extent = (
+            profile.rate_observations
+            if profile.profile_format_version == 3 and profile.rate_observations
+            else profile.compute_observations
+        )
+        if extent:
+            tokens = max(tokens, extent[0][0])
         return max(
             _memory_model.predict(
                 profile.fixed_compute_bytes, profile.compute_slope, tokens
@@ -111,7 +235,25 @@ def _merge_memory_profile_model_fields(
     observations = _memory_model.merge_points(
         *(p.compute_observations for p in profiles)
     )
-    fixed, slope = _memory_model.fit_points(observations)
+    extra: dict[str, Any] = {}
+    formats = [p for p in profiles if p.profile_format_version == 3]
+    if formats:
+        floor = formats[0].rate_floor_tokens
+        if any(p.rate_floor_tokens != floor for p in formats):
+            raise ValueError("incompatible global memory rate floors")
+        rates = _memory_model.merge_points(*(_rate_points(p, floor) for p in profiles))
+        absolute = max(_absolute_floor(p, floor) for p in profiles)
+        extra = dict(
+            profile_format_version=3,
+            rate_floor_tokens=floor,
+            rate_observations=rates,
+            absolute_compute_floor=absolute,
+        )
+        fixed, slope = _memory_model.fit_points(
+            observations, rate_points=rates, absolute_floor=absolute
+        )
+    else:
+        fixed, slope = _memory_model.fit_points(observations)
     return dict(
         peak_model_version=_memory_model._MEMORY_PROFILE_VERSION,
         compute_observations=observations,
@@ -124,6 +266,7 @@ def _merge_memory_profile_model_fields(
             )
             for p in profiles
         ),
+        **extra,
     )
 
 
@@ -139,13 +282,47 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
             or profile.fixed_compute_bytes != 0
             or profile.compute_slope != (0, 1)
             or profile.legacy_bytes_per_token != 0
+            or profile.profile_format_version != 1
+            or profile.rate_floor_tokens != 0
+            or profile.rate_observations is not None
+            or profile.absolute_compute_floor != 0
         ):
             raise ValueError("unexpected fixed/slope fields in legacy profile")
         return
     points = profile.compute_observations
     if not points or _memory_model.merge_points(points) != points:
         raise ValueError("invalid memory observation hull")
-    fixed, slope = _memory_model.fit_points(points)
+    if profile.profile_format_version == 3:
+        floor, rates, absolute = (
+            profile.rate_floor_tokens,
+            profile.rate_observations,
+            profile.absolute_compute_floor,
+        )
+        if (
+            type(floor) is not int
+            or not 64 <= floor <= 8192
+            or floor % 64
+            or type(rates) is not tuple
+            or _memory_model.merge_points(rates) != rates
+            or any(n < floor for n, _ in rates)
+            or type(absolute) is not int
+            or absolute < 0
+            or absolute < max((peak for n, peak in points if n < floor), default=0)
+            or profile.packed_tokens < max((n for n, _ in rates), default=0)
+        ):
+            raise ValueError("invalid rate-qualified memory evidence")
+        fixed, slope = _memory_model.fit_points(
+            points, rate_points=rates, absolute_floor=absolute
+        )
+    elif (
+        profile.profile_format_version == 2
+        and profile.rate_floor_tokens == 0
+        and profile.rate_observations is None
+        and profile.absolute_compute_floor == 0
+    ):
+        fixed, slope = _memory_model.fit_points(points)
+    else:
+        raise ValueError("unsupported memory evidence format")
     if (
         type(profile.fixed_compute_bytes) is not int
         or profile.fixed_compute_bytes != fixed
@@ -204,6 +381,10 @@ class _CallerMemoryProfile(_impl._MemoryProfile):
                     return max(peak, self.compute_peak_floor)
         # No discounted extrapolation: even a higher short reload cannot erase
         # earlier growth constraints beyond the measured caller extent.
+        if context_parallel and self.profile_format_version == 3:
+            # Removing tiny-derived rates must not reopen an uncovered CP
+            # ownership/workspace class. Keep its existing collective refusal.
+            return max(_MEMORY_DEFERRED_BYTES, _profile_compute_peak(self, tokens))
         return max(
             self.bytes_per_token * tokens,
             self.legacy_bytes_per_token * tokens,
@@ -264,6 +445,10 @@ def _memory_profile_from_values(values: dict[str, Any]) -> _impl._MemoryProfile:
             "fixed_compute_bytes",
             "compute_slope",
             "legacy_bytes_per_token",
+            "profile_format_version",
+            "rate_floor_tokens",
+            "rate_observations",
+            "absolute_compute_floor",
         ):
             if name in values and values.pop(name) != getattr(
                 _impl._MemoryProfile, name
@@ -1790,16 +1975,16 @@ def _update_peak_memory_profile(
     resets = self.__dict__.get("_peak_resets", 0)
     self._peak_reading = (resets, peak)
     profile = self._memory_profiles.get(plan.signature)
-    if (
-        profile is not None
-        and _fixed_slope_enabled(profile)
-        and _unanchored(profile)
-        and plan.packed_tokens
-        > profile.packed_tokens * _impl._MEMORY_PROFILE_TRUST_GROWTH
-    ):
-        # A forced minimum wave outside trust cannot silently establish an
-        # anchor. Offline/restore merges remain set-based and order independent.
-        return
+    rate_eligible = True
+    if _fixed_slope_enabled(profile):
+        floor = _rate_floor_tokens(plan.signature)
+        extent = 0 if profile is None else _trusted_extent(profile)
+        if reference := _rate_reference(self, plan.signature, profile):
+            extent = max(extent, reference.extent)
+        rate_eligible = plan.packed_tokens >= floor and (
+            (profile is not None and not _unanchored(profile))
+            or plan.packed_tokens <= extent * _impl._MEMORY_PROFILE_TRUST_GROWTH
+        )
     self._update_memory_profile(
         plan,
         max(0, peak - baseline),
@@ -1813,6 +1998,7 @@ def _update_peak_memory_profile(
         and interval is not None
         and interval[0] == resets
         and peak >= interval[1],
+        **({"rate_eligible": rate_eligible} if _fixed_slope_enabled(profile) else {}),
     )
 
 
@@ -2438,20 +2624,25 @@ def _estimate_required_memory_bytes_from_values(
     compute = (
         static_compute if profiled is None else max(static_compute, empirical(profiled))
     )
-    if (
-        profiled is not None
-        and _fixed_slope_enabled(profiled)
-        and _unanchored(profiled)
-    ):
-        # The original max-rate line upper-bounds its warm/scoped discounts.
-        # Use that set-based envelope: excluding a caller's first observation
-        # from a warm fit would make the cold guard depend on arrival order.
-        old = _impl._MemoryProfile(
-            profiled.bytes_per_token,
-            profiled.packed_tokens,
-            profiled.logical_per_packed,
-        )
-        compute = max(compute, empirical(old))
+    if _fixed_slope_enabled(profiled) and _unanchored(profiled):
+        floor = _rate_floor_tokens(signature)
+        reference = _rate_reference(self, signature, profiled)
+        if reference is None:
+            if packed_tokens >= floor:
+                # Finite and exactly representable through the existing MAX/
+                # MIN collectives. Never price an unknown large wave fixed-only.
+                compute = max(compute, _MEMORY_DEFERRED_BYTES)
+        else:
+            fixed = 0 if profiled is None else _absolute_floor(profiled, floor)
+            tokens = profiled_tokens(
+                1.0 if profiled is None else profiled.logical_per_packed
+            )
+            if reference.source != "signature":
+                fixed += reference.fixed
+                tokens = max(tokens, reference.minimum)
+            compute = max(
+                compute, fixed + _memory_model.predict(0, reference.rate, tokens)
+            )
     factor = (
         _cold_extrapolation_factor(profiled, packed_tokens)
         if include_cold_extrapolation
@@ -2556,7 +2747,8 @@ def _all_ranks_have_memory_profile(
     profile = self._memory_profiles.get(signature)
     local = packed_tokens <= 0 or (
         profile is not None
-        and profile.packed_tokens * _impl._MEMORY_PROFILE_TRUST_GROWTH >= packed_tokens
+        and _trusted_extent(profile) * _impl._MEMORY_PROFILE_TRUST_GROWTH
+        >= packed_tokens
     )
     return self._all_ranks_true(local)
 
@@ -2568,6 +2760,7 @@ def _update_memory_profile(
     *,
     retained_bytes: int | None,
     caller_phase: bool = False,
+    rate_eligible: bool = True,
 ) -> None:
     if plan.packed_tokens <= 0:
         return
@@ -2581,11 +2774,23 @@ def _update_memory_profile(
         previous = None
     model_fields: dict[str, Any] = {}
     if fixed_slope:
+        floor = _rate_floor_tokens(plan.signature)
+        qualifies = rate_eligible and plan.packed_tokens >= floor
         observations = _memory_model.merge_points(
             () if previous is None else previous.compute_observations,
             ((plan.packed_tokens, compute_delta),),
         )
-        fixed, slope = _memory_model.fit_points(observations)
+        rates = _memory_model.merge_points(
+            () if previous is None else _rate_points(previous, floor),
+            ((plan.packed_tokens, compute_delta),) if qualifies else (),
+        )
+        absolute = max(
+            0 if previous is None else _absolute_floor(previous, floor),
+            0 if qualifies else compute_delta,
+        )
+        fixed, slope = _memory_model.fit_points(
+            observations, rate_points=rates, absolute_floor=absolute
+        )
         legacy_rate = 0.0 if previous is None else previous.legacy_bytes_per_token
         model_fields = dict(
             peak_model_version=_memory_model._MEMORY_PROFILE_VERSION,
@@ -2593,6 +2798,10 @@ def _update_memory_profile(
             fixed_compute_bytes=fixed,
             compute_slope=slope,
             legacy_bytes_per_token=legacy_rate,
+            profile_format_version=3,
+            rate_floor_tokens=floor,
+            rate_observations=rates,
+            absolute_compute_floor=absolute,
         )
     logical_per_packed = plan.active_logical_tokens / max(1, plan.packed_tokens)
     warm_rate = None if previous is None else previous.warm_bytes_per_token
@@ -2603,13 +2812,14 @@ def _update_memory_profile(
     # split children and dp_rank_forward observe forward only. A caller that
     # defers backward past the yield is not covered. The profile's first
     # such plan also pays one-time costs, so it is not warm.
-    if caller_phase:
+    learns_rates = not fixed_slope or (rate_eligible and plan.packed_tokens >= floor)
+    if caller_phase and learns_rates:
         if caller_plans:
             warm_rate = max(bytes_per_token, warm_rate or 0.0)
             warm_tokens = min(plan.packed_tokens, warm_tokens or plan.packed_tokens)
             warm_sharing = max(logical_per_packed, warm_sharing or 1.0)
         caller_plans += 1
-    elif caller_plans:
+    elif caller_plans and learns_rates:
         # After the seed, other readings cannot fit the warm profile, but a
         # higher one still raises its rate (inert until a whole warm plan
         # fits the rest), as it raises the fit over every observation.
@@ -2626,12 +2836,15 @@ def _update_memory_profile(
         retained_fraction = (
             observed if retained_fraction is None else max(retained_fraction, observed)
         )
-        observed_compute = max(
-            0, min(retained_bytes, peak_delta_bytes) - plan.output_bytes
-        ) / max(1, plan.packed_tokens)
-        retained_compute = max(retained_compute or 0.0, observed_compute)
+        if learns_rates:
+            observed_compute = max(
+                0, min(retained_bytes, peak_delta_bytes) - plan.output_bytes
+            ) / max(1, plan.packed_tokens)
+            retained_compute = max(retained_compute or 0.0, observed_compute)
     profile_cls = _impl._MemoryProfileV2 if fixed_slope else _impl._MemoryProfile
     self._memory_profiles[plan.signature] = profile_cls(
+        # Preserve this legacy diagnostic/transport field. Format 3 admission
+        # sources rates exclusively from rate_observations, never this maximum.
         bytes_per_token=max(
             bytes_per_token,
             0.0 if previous is None else previous.bytes_per_token,
@@ -2641,7 +2854,7 @@ def _update_memory_profile(
             0 if previous is None else previous.packed_tokens,
         ),
         logical_per_packed=max(
-            logical_per_packed,
+            logical_per_packed if learns_rates else 1.0,
             1.0 if previous is None else previous.logical_per_packed,
         ),
         retained_fraction=retained_fraction,

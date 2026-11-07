@@ -420,9 +420,14 @@ def test_runtime_growth_only_learns_within_trust_until_anchor(monkeypatch):
         ),
     )
     monkeypatch.setattr(_impl.torch.cuda, "max_memory_allocated", lambda _: 2**30)
-    before = r._memory_profiles[sig]
     _memory._update_peak_memory_profile(r, plan, 0)
-    assert r._memory_profiles[sig] == before
+    profile = r._memory_profiles[sig]
+    # An out-of-trust forced observation retains its absolute peak, but cannot
+    # establish a rate, an anchor or a larger trust window.
+    assert profile.absolute_compute_floor == 2**30
+    assert profile.rate_observations == ()
+    assert profile.compute_slope == (0, 1)
+    assert not r._all_ranks_have_memory_profile(signature=sig, packed_tokens=8192)
     for n in [1024, 8192]:
         plan.packed_tokens = plan.active_logical_tokens = n
         _memory._update_peak_memory_profile(r, plan, 0)

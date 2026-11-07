@@ -1435,6 +1435,22 @@ def _fill_planner_snapshot(
         from . import _memory, _planner_replay
 
         fixed_slope_collection = _memory._FIXED_SLOPE_PROFILES.get()
+        # Cross-signature rate fallback is part of the estimate's frozen input.
+        # Legacy reports keep their exact payload shape.
+        profile_pool = (
+            [
+                {"signature": asdict(key), "profile": asdict(profile)}
+                for key, profile in self._memory_profiles.items()
+                if profile.peak_model_version == 2
+            ]
+            if fixed_slope_collection
+            or any(
+                profile is not None and profile.peak_model_version == 2
+                for child in children
+                for profile in (self._memory_profiles.get(child.signature),)
+            )
+            else None
+        )
 
         estimates: list[dict[str, Any]] = []
         for child, cost in zip(children, costs, strict=True):
@@ -1691,6 +1707,11 @@ def _fill_planner_snapshot(
                     "estimates": estimates,
                     **(
                         {"fixed_slope_profiles": True} if fixed_slope_collection else {}
+                    ),
+                    **(
+                        {"fixed_slope_profile_pool": profile_pool}
+                        if profile_pool is not None
+                        else {}
                     ),
                 },
                 "layouts": layouts,

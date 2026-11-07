@@ -162,6 +162,7 @@ def test_off_profile_serialization_matches_base(tmp_path):
         assert reports._encode(current) == reports._encode(expected)
         report, _ = emitted(rank, plan_, tmp_path)
     assert "fixed_slope_profiles" not in report["replay"]["memory_replay"]
+    assert "fixed_slope_profile_pool" not in report["replay"]["memory_replay"]
     assert reports._encode(
         report["replay"]["memory_replay"]["estimates"][0]["profile"]
     ) == reports._encode(expected["profile"])
@@ -216,7 +217,13 @@ def test_earlier_v2_pickle_promotes_without_losing_model_fields(record):
         object.__setattr__(old, name, value)
     restored = pickle.loads(pickle.dumps(old, protocol=4))
     assert type(restored).__name__ == record["type"] + "V2"
-    assert asdict(restored) == vars(old)
+    assert asdict(restored) == dict(
+        vars(old),
+        profile_format_version=2,
+        rate_floor_tokens=0,
+        rate_observations=None,
+        absolute_compute_floor=0,
+    )
     m._validate_memory_profile_model(restored)
 
 

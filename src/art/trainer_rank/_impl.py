@@ -677,6 +677,10 @@ class _MemoryProfile:
     fixed_compute_bytes = 0
     compute_slope = (0, 1)
     legacy_bytes_per_token = 0.0
+    profile_format_version = 1
+    rate_floor_tokens = 0
+    rate_observations = cast(tuple[tuple[int, int], ...] | None, None)
+    absolute_compute_floor = 0
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         # Earlier v2 pickles used the legacy class name. Promote their tagged
@@ -697,6 +701,12 @@ class _MemoryProfileV2(_MemoryProfile):
     # A v1 scalar has lost its observations. Never silently discard its bound
     # on update; a fresh calibration/cache key is needed to remove poisoning.
     legacy_bytes_per_token: float = 0.0
+    # Format 2 is the earlier v2 encoding. Fresh collection writes format 3,
+    # retaining rate-qualified evidence independently of tiny workspace peaks.
+    profile_format_version: int = 2
+    rate_floor_tokens: int = 0
+    rate_observations: tuple[tuple[int, int], ...] | None = None
+    absolute_compute_floor: int = 0
 
 
 @dataclass(frozen=True)
