@@ -8,15 +8,55 @@ public autograd-compatible tile override for CUTE flex attention.
 from __future__ import annotations
 
 import inspect
+import json
+import logging
 import math
+import os
 from typing import Any, cast
 
 import torch
+from torch._dynamo.utils import counters
 
 _PATCH_APPLIED = False
 _TILE_PATCH_APPLIED = False
 _DQ_POSTPROCESS_PATCH_APPLIED = False
 _DETERMINISTIC_BWD_PATCH_APPLIED = False
+_FLASH_TRITON_BACKWARD_HEAD_DIMS = frozenset({64})
+_FLASH_BACKWARD_OVERRIDE_LOGGED: set[int] = set()
+_logger = logging.getLogger(__name__)
+
+
+def _use_triton_flash_backward(head_dim: int, deterministic: bool) -> bool:
+    return deterministic or head_dim in _FLASH_TRITON_BACKWARD_HEAD_DIMS
+
+
+def _record_flash_backward_override(head_dim: int) -> None:
+    # Only the explicit affected set may allocate a log key (currently one).
+    if head_dim not in _FLASH_TRITON_BACKWARD_HEAD_DIMS:
+        return
+    counters["art"]["flex_flash_backward_override"] += 1
+    if head_dim in _FLASH_BACKWARD_OVERRIDE_LOGGED:
+        return
+    _FLASH_BACKWARD_OVERRIDE_LOGGED.add(head_dim)
+    rank = (
+        str(torch.distributed.get_rank())
+        if torch.distributed.is_initialized()
+        else os.environ.get("RANK", "0")
+    )
+    _logger.warning(
+        "ART_FLEX_ATTENTION_EVENT %s",
+        json.dumps(
+            {
+                "event": "flex_flash_backward_override",
+                "rank": rank,
+                "head_dim": head_dim,
+                "from_backend": "FLASH",
+                "to_backend": "TRITON",
+                "counter": "flex_flash_backward_override",
+                "count": counters["art"]["flex_flash_backward_override"],
+            }
+        ),
+    )
 
 
 def _sm90_block_sparse_fwd_config(cute_interface: Any, head_dim: int, head_dim_v: int):
@@ -588,10 +628,11 @@ def apply_flash_flex_dlse_patch() -> None:
 
 
 def apply_deterministic_flash_backward_patch() -> None:
-    """Keep FLASH forward; honor PyTorch determinism with Triton backward.
+    """Keep FLASH forward; use Triton backward for determinism or affected dims.
 
     FLASH saves natural-log LSE, whereas Triton consumes log2 LSE. Convert
     both the saved value and its cotangent at the existing lowering boundary.
+    Head dimension 64 avoids the incorrect non-deterministic FLASH variant.
     """
     global _DETERMINISTIC_BWD_PATCH_APPLIED
     if _DETERMINISTIC_BWD_PATCH_APPLIED:
@@ -603,20 +644,56 @@ def apply_deterministic_flash_backward_patch() -> None:
     operation = torch.ops.higher_order.flex_attention_backward
     original = lowerings[operation]
 
-    def backward(*args, **kwargs):
-        if (
-            not kwargs
-            and torch.are_deterministic_algorithms_enabled()
-            and args[11].get("BACKEND") == "FLASH"
-        ):
-            converted = list(args)
-            multiply = lowerings[torch.ops.aten.mul.Tensor]
-            converted[4] = multiply(args[4], math.log2(math.e))
-            if args[6] is not None:
-                converted[6] = multiply(args[6], math.log(2.0))
-            converted[11] = {**args[11], "BACKEND": "TRITON"}
-            return original(*converted)
-        return original(*args, **kwargs)
+    def backward(
+        query,
+        key,
+        value,
+        out,
+        logsumexp,
+        grad_out,
+        grad_logsumexp,
+        fw_graph,
+        joint_graph,
+        block_mask,
+        scale,
+        kernel_options,
+        score_mod_other_buffers,
+        mask_mod_other_buffers,
+    ):
+        if kernel_options.get("BACKEND") == "FLASH":
+            # Frontend wrappers mark head dimensions static. Guard the IR
+            # value here as well so this choice cannot depend on an unguarded
+            # symbolic size. This reads no device tensor data.
+            head_dim = flex_attention_mod.V.graph.sizevars.guard_int(
+                query.get_size()[-1]
+            )
+            deterministic = torch.are_deterministic_algorithms_enabled()
+            if _use_triton_flash_backward(head_dim, deterministic):
+                if not deterministic:
+                    _record_flash_backward_override(head_dim)
+                multiply = lowerings[torch.ops.aten.mul.Tensor]
+                logsumexp = multiply(logsumexp, math.log2(math.e))
+                if grad_logsumexp is not None:
+                    grad_logsumexp = multiply(grad_logsumexp, math.log(2.0))
+                kernel_options = {**kernel_options, "BACKEND": "TRITON"}
+        # Normalize keyword calls too; the underlying lowering unpacks
+        # positional HOP arguments. Neither form may bypass the dim guard.
+        return original(
+            query,
+            key,
+            value,
+            out,
+            logsumexp,
+            grad_out,
+            grad_logsumexp,
+            fw_graph,
+            joint_graph,
+            block_mask,
+            scale,
+            kernel_options,
+            score_mod_other_buffers,
+            mask_mod_other_buffers,
+        )
 
     cast(Any, flex_attention_mod).flex_attention_backward = backward
     lowerings[operation] = backward
