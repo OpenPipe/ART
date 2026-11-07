@@ -323,8 +323,30 @@ def _worker(rank, rendezvous, dim, deterministic, fallback):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("dim", [64, 256])
-@pytest.mark.parametrize("deterministic", [False, True])
+# Stock non-deterministic compiled FLASH backward returns uncorrelated BF16
+# gradients at head_dim 64 before any eager fallback runs (warm pass); see
+# https://github.com/OpenPipe/ART/issues/1179. Strict: an XPASS must remove this.
+_FLASH_CP2_CASES = [
+    pytest.param(
+        False,
+        64,
+        id="False-64",
+        marks=pytest.mark.xfail(
+            strict=True,
+            raises=torch.multiprocessing.ProcessRaisedException,
+            reason=(
+                "non-deterministic compiled FLASH backward at head_dim 64 "
+                "(OpenPipe/ART#1179)"
+            ),
+        ),
+    ),
+    pytest.param(False, 256, id="False-256"),
+    pytest.param(True, 64, id="True-64"),
+    pytest.param(True, 256, id="True-256"),
+]
+
+
+@pytest.mark.parametrize(("deterministic", "dim"), _FLASH_CP2_CASES)
 def test_compiled_flash_cp2_lse_and_gradients(dim, deterministic, tmp_path):
     spawn_and_join(
         _worker,
@@ -334,8 +356,7 @@ def test_compiled_flash_cp2_lse_and_gradients(dim, deterministic, tmp_path):
     )
 
 
-@pytest.mark.parametrize("dim", [64, 256])
-@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize(("deterministic", "dim"), _FLASH_CP2_CASES)
 def test_mixed_flash_fallback_cp2_lse_and_gradients(dim, deterministic, tmp_path):
     spawn_and_join(
         _worker,
