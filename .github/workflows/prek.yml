@@ -226,6 +226,7 @@ jobs:
             tests/unit/test_prefix_tree_attention_builder.py \
             tests/unit/test_prefix_tree_grad_parity.py \
             tests/unit/test_prefix_tree_packing.py \
+            tests/unit/test_trainer_rank_cp_model_state.py \
             tests/unit/test_trainer_rank_handoff_budget.py \
             tests/unit/test_qwen35_adapter_config.py \
             tests/unit/test_trainer_rank_physical_reserve.py \
@@ -295,6 +296,7 @@ jobs:
             --ignore=tests/unit/test_prefix_tree_attention_builder.py \
             --ignore=tests/unit/test_prefix_tree_grad_parity.py \
             --ignore=tests/unit/test_prefix_tree_packing.py \
+            --ignore=tests/unit/test_trainer_rank_cp_model_state.py \
             --ignore=tests/unit/test_trainer_rank_handoff_budget.py \
             --ignore=tests/unit/test_qwen35_adapter_config.py \
             --ignore=tests/unit/test_trainer_rank_physical_reserve.py \

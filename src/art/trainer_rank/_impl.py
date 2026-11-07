@@ -5173,6 +5173,9 @@ class TrainerRank:
             gdn_planner_config=_gdn_planner_config_for_provider(provider, handler),
             block_mask_variants=_art_flex_cp_block_mask_variants(provider, self.device),
             target_device=self.device,
+            model_support_handler=handler,
+            attention_head_dim=provider.kv_channels,
+            attention_value_head_dim=provider.kv_channels,
         )
         if prepared.rank_plan is None:
             raise RuntimeError("CP forward preparation did not return a rank plan")
