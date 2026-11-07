@@ -49,11 +49,7 @@ _FIXED_SLOPE_PROFILES: ContextVar[bool] = ContextVar(
 
 @contextmanager
 def fixed_slope_memory_profiles() -> Iterator[None]:
-    """Opt into the CPU prototype while collecting fresh calibration evidence.
-
-    Version-2 profiles continue to use their model outside this collection
-    scope. Production default activation awaits admission-owner GPU review.
-    """
+    """Collect fresh v2 profiles; existing v2 profiles retain their model outside this scope."""
     token = _FIXED_SLOPE_PROFILES.set(True)
     try:
         yield
@@ -105,7 +101,7 @@ def _profile_compute_peak(profile: _impl._MemoryProfile, tokens: int | float) ->
 def _merge_memory_profile_model_fields(
     *profiles: _impl._MemoryProfile,
 ) -> dict[str, Any]:
-    """Caladan restore hook: union evidence, never max fitted coefficients."""
+    """Profile restore hook: union evidence, never max fitted coefficients."""
     if all(p.peak_model_version == 1 for p in profiles):
         return {}
     observations = _memory_model.merge_points(

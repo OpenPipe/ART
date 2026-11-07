@@ -23,17 +23,17 @@ def prototype():
         yield
 
 
-def test_run6_tiny_forward_does_not_poison_large_forward():
+def test_tiny_forward_does_not_poison_large_forward():
     rank = _rank()
     seed = rank._plan_flat_forward(
         [ForwardInput(input_tokens=torch.arange(8), hidden_states=True, no_grad=True)]
     )
-    # Reconstruct run6's 529.328 GiB / 8192-token refusal rate. This is a
+    # Reconstruct a production CP8 529.328 GiB / 8192-token refusal rate. This is a
     # synthetic eight-token workspace observation, not a new GPU measurement.
     poisoned_rate = (568_361_327_001 / 1.1 - 8192 * 4096) / 8192
     large = replace(seed, packed_tokens=81920, logical_tokens=81920, output_bytes=0)
     tiny = replace(seed, output_bytes=0)
-    # A large root had already fitted before the tiny observation in run6.
+    # A large root had already fitted before the tiny observation.
     rank._update_memory_profile(large, 8 * 2**30, retained_bytes=None)
     rank._update_memory_profile(
         tiny, round(poisoned_rate * tiny.packed_tokens), retained_bytes=None
@@ -105,10 +105,7 @@ def test_all_60_sweep_peaks_covered_in_every_observation_order(key, rows):
                 signature=sig,
             )
             assert effective >= row["measured_increment_bytes"]
-            for rank_row in row["per_rank"]:
-                for attempt in rank_row["attempts"]:
-                    if attempt["status"] == "complete":
-                        assert effective >= attempt["measured_increment_bytes"]
+            assert all(effective >= peak for peak in row["rank_peak_bytes"])
 
 
 def test_tiny_points_only_change_fixed_and_largest_anchor_is_deterministic():

@@ -1,5 +1,5 @@
 {
-  "source": "/tmp/stark-gpu/cp8-long-context-qual/v8-analysis/sweeps.json",
-  "sha256": "191fcba78c284b588a8c222398c586a55aff0ea6bd1c9eb55c4ce40830ed7b31",
-  "note": "Lossless peak, admission, per-rank attempt and source fields; non-attempt timing metadata omitted. GPU observations are supplied evidence, not rerun."
+  "description": "CP8 dense/MoE peak increments; LoRA ranks 1, 8, 32; 8192\u2013131072 packed tokens.",
+  "units": "bytes",
+  "rank_peak_bytes": "Maximum successful-attempt increment for each of eight ranks."
 }
