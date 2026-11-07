@@ -670,9 +670,27 @@ class _MemoryProfile:
     warm_packed_tokens: int | None = None
     warm_logical_per_packed: float | None = None
     caller_plans: int = 0
-    # Missing fields in persisted records mean the original scalar-rate model.
-    # bytes_per_token and warm_* remain legacy diagnostics for v2 records.
-    peak_model_version: int = 1
+    # Read defaults are class attributes, not serialized v1 dataclass fields.
+    # Only versioned subclasses store the enabled model's state.
+    peak_model_version = 1
+    compute_observations = cast(tuple[tuple[int, int], ...], ())
+    fixed_compute_bytes = 0
+    compute_slope = (0, 1)
+    legacy_bytes_per_token = 0.0
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # Earlier v2 pickles used the legacy class name. Promote their tagged
+        # state on load so dataclass/report encoders cannot drop those fields.
+        from ._memory import _memory_profile_from_values
+
+        restored = _memory_profile_from_values(state)
+        object.__setattr__(self, "__class__", type(restored))
+        self.__dict__.update(vars(restored))
+
+
+@dataclass(frozen=True)
+class _MemoryProfileV2(_MemoryProfile):
+    peak_model_version: int = 2
     compute_observations: tuple[tuple[int, int], ...] = ()
     fixed_compute_bytes: int = 0
     compute_slope: tuple[int, int] = (0, 1)
