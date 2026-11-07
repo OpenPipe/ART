@@ -12,6 +12,8 @@ from test_trainer_rank_active_memory import _rank
 import torch
 import torch.distributed as dist
 
+pytest.importorskip("megatron")
+
 from art.megatron.context_parallel.types import ParallelTopology
 from art.trainer_rank import ForwardInput, ForwardOutput, _impl
 
