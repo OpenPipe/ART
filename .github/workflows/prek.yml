@@ -255,6 +255,7 @@ jobs:
             tests/unit/test_canonical_numerics.py \
             tests/unit/test_segmented_expert_lora.py \
             tests/unit/test_segmented_gdn.py \
+            tests/unit/test_gdn_empty_shards.py \
             tests/unit/test_segmented_router.py \
             tests/unit/test_lora_layouts.py \
             tests/unit/test_trainer_rank_forward_profile.py \
@@ -308,6 +309,7 @@ jobs:
             --ignore=tests/unit/test_canonical_numerics.py \
             --ignore=tests/unit/test_segmented_expert_lora.py \
             --ignore=tests/unit/test_segmented_gdn.py \
+            --ignore=tests/unit/test_gdn_empty_shards.py \
             --ignore=tests/unit/test_segmented_router.py \
             --ignore=tests/unit/test_lora_layouts.py \
             --ignore=tests/unit/test_trainer_rank_forward_profile.py \
