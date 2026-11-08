@@ -57,6 +57,22 @@ assert _CALIBRATION_SEED_TOKENS == 16384
 # requires a GPU recompute for both models; fail if measured > margin * static.
 _CALIBRATION_SEED_MARGIN = max(2.0, 1.2 * 0.782534579646491)
 _CP_BLOCKED_PAIR_BUDGET = 64
+_CP_OBSERVATION_FORMAT_KEY = "memory_observation_format"
+_CP_QUALIFIED_OBSERVATION_FORMAT = 1
+
+
+def _qualified_cp_observation(family: str) -> str:
+    """Tag only this new measurement; never relabel retained older evidence."""
+    try:
+        value = json.loads(family)
+        if isinstance(value, dict) and isinstance(
+            value.get("execution_qualification"), dict
+        ):
+            value[_CP_OBSERVATION_FORMAT_KEY] = _CP_QUALIFIED_OBSERVATION_FORMAT
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    except (ValueError, TypeError):
+        pass
+    return family
 
 
 class CalibrationCoverageViolation(RuntimeError):
@@ -98,9 +114,21 @@ class _CalibrationCoverageGuard:
 
 
 def _cp_pair(requested: str, observed: str) -> tuple[str, str]:
+    def family(value: str) -> str:
+        try:
+            data = json.loads(value)
+            if isinstance(data, dict) and _CP_OBSERVATION_FORMAT_KEY in data:
+                data.pop(_CP_OBSERVATION_FORMAT_KEY)
+                return json.dumps(data, sort_keys=True, separators=(",", ":"))
+        except (ValueError, TypeError):
+            pass
+        return value
+
+    # Provenance is not part of the ordered mask-family identity. Retain bans
+    # created before evidence tags existed when new measurements are recorded.
     return (
-        hashlib.sha256(requested.encode()).hexdigest(),
-        hashlib.sha256(observed.encode()).hexdigest(),
+        hashlib.sha256(family(requested).encode()).hexdigest(),
+        hashlib.sha256(family(observed).encode()).hexdigest(),
     )
 
 
@@ -110,6 +138,12 @@ def _cp_family_dominates(requested: str, observed: str) -> bool:
         want, have = json.loads(requested), json.loads(observed)
         if not isinstance(want, dict) or not isinstance(have, dict):
             return False
+        # Old files, including qualified format-6 families without this tag,
+        # are equality-only. Promotion/merging cannot manufacture provenance.
+        version = have.pop(_CP_OBSERVATION_FORMAT_KEY, None)
+        if type(version) is not int or version != _CP_QUALIFIED_OBSERVATION_FORMAT:
+            return False
+        want.pop(_CP_OBSERVATION_FORMAT_KEY, None)
         wm, hm = want.pop("masks"), have.pop("masks")
         qualification = want.get("execution_qualification")
         return (
@@ -194,7 +228,7 @@ def _block_cp_pair(profile: _CallerMemoryProfileV2, requested: str, observed: st
     pairs = set(profile.non_dominant_cp_pairs) | {_cp_pair(requested, observed)}
     return replace(
         profile,
-        profile_format_version=6,
+        profile_format_version=7,
         non_dominant_cp_pairs=tuple(sorted(pairs)[:_CP_BLOCKED_PAIR_BUDGET]),
         dominance_disabled=profile.dominance_disabled
         or len(pairs) > _CP_BLOCKED_PAIR_BUDGET,
@@ -667,7 +701,7 @@ def _merge_memory_profile_model_fields(
             or len(pairs) > _CP_BLOCKED_PAIR_BUDGET,
         )
         if formats:
-            extra["profile_format_version"] = 6
+            extra["profile_format_version"] = 7
     return dict(
         peak_model_version=_memory_model._MEMORY_PROFILE_VERSION,
         compute_observations=observations,
@@ -710,7 +744,7 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
     points = profile.compute_observations
     if not points or _memory_model.merge_points(points) != points:
         raise ValueError("invalid memory observation hull")
-    if profile.profile_format_version in (3, 4, 5, 6):
+    if profile.profile_format_version in (3, 4, 5, 6, 7):
         floor, rates, absolute = (
             profile.rate_floor_tokens,
             profile.rate_observations,
@@ -826,19 +860,23 @@ class _CallerMemoryProfile(_impl._MemoryProfile):
     def cp_family_equal(self, requested: str, observed: str) -> bool:
         if requested == observed:
             return True
-        if (
-            isinstance(self, _CallerMemoryProfileV2)
-            and self.profile_format_version == 5
-        ):
+        if isinstance(self, _CallerMemoryProfileV2):
             try:
                 want, have = json.loads(requested), json.loads(observed)
                 if not isinstance(want, dict) or not isinstance(have, dict):
                     return False
-                # Format 5 recorded only the original canonical family. Keep
-                # that equality contract; it grants no mask-subset dominance.
-                if "execution_qualification" not in have:
+                version = have.pop(_CP_OBSERVATION_FORMAT_KEY, None)
+                want.pop(_CP_OBSERVATION_FORMAT_KEY, None)
+                if version is not None and (
+                    type(version) is not int
+                    or version != _CP_QUALIFIED_OBSERVATION_FORMAT
+                ):
+                    return False
+                # The missing per-observation tag denotes legacy evidence,
+                # regardless of the containing profile's promoted version.
+                if version is None and "execution_qualification" not in have:
                     want.pop("execution_qualification", None)
-                    return want == have
+                return want == have
             except (ValueError, TypeError):
                 pass
         return False
@@ -953,7 +991,7 @@ class _BoundedMemoryProfile(_impl._MemoryProfile):
 
 @dataclass(frozen=True)
 class _CallerMemoryProfileV2(_impl._MemoryProfileV2, _CallerMemoryProfile):
-    profile_format_version: int = 6
+    profile_format_version: int = 7
     non_dominant_cp_pairs: tuple[tuple[str, str], ...] = ()
     dominance_disabled: bool = False
 
@@ -3845,6 +3883,8 @@ def _update_memory_profile(
         cp_workload = getattr(plan, "caller_cp_workload", None)
         if caller_phase and plan.signature.topology[2] > 1 and cp_workload is not None:
             family, loads = cp_workload
+            if fixed_slope:
+                family = _qualified_cp_observation(family)
             key = (plan.packed_tokens, family, loads)
             cp_peaks[key] = max(compute_delta, cp_peaks.get(key, 0))
         cp_observations = sorted(
@@ -3860,7 +3900,7 @@ def _update_memory_profile(
         caller_fields: dict[str, Any] = dict(vars(profile))
         if fixed_slope:
             caller_fields.update(
-                profile_format_version=6,
+                profile_format_version=7,
                 non_dominant_cp_pairs=getattr(previous, "non_dominant_cp_pairs", ()),
                 dominance_disabled=getattr(previous, "dominance_disabled", False),
             )
