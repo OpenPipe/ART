@@ -221,7 +221,9 @@ def calibration_rung(
         covered = profile.covering_cp_observation(
             plan.packed_tokens, plan.caller_cp_workload
         )
-        if covered is not None and covered[2] != plan.caller_cp_workload[0]:
+        if covered is not None and not profile.cp_family_equal(
+            plan.caller_cp_workload[0], covered[2]
+        ):
             rung._coverage_guard = _memory._CalibrationCoverageGuard(
                 plan, covered[2], covered[1]
             )

@@ -153,12 +153,12 @@ def test_calibration_violation_revokes_pair_persists_and_signals_once(monkeypatc
         profile = rank._memory_profiles[plan.signature]
         pair = memory._cp_pair(error.requested_family, error.observed_family)
         assert (
-            profile.profile_format_version == 6
+            profile.profile_format_version == 7
             and pair in profile.non_dominant_cp_pairs
         )
         # The unsafe reading tightens floors but never creates equality coverage.
         assert all(
-            family != error.requested_family
+            not profile.cp_family_equal(error.requested_family, family)
             for _, _, family, _ in profile.caller_cp_peaks
         )
         assert profile.covering_cp_peak(n, plan.caller_cp_workload) is None
@@ -191,7 +191,7 @@ def test_safe_dominance_rung_learns_equality_and_preserves_caller_error(monkeypa
         plan = executed[0]
         profile = rank._memory_profiles[plan.signature]
         assert any(
-            family == plan.caller_cp_workload[0]
+            profile.cp_family_equal(plan.caller_cp_workload[0], family)
             for _, _, family, _ in profile.caller_cp_peaks
         )
         assert rank._memory_check(plan).fits
