@@ -154,10 +154,10 @@ def _shared_prompt_plan(harness):
 
 
 def _covered(harness, enabled):
-    assert len(harness.rank._memory_profiles) == 1
+    assert len(harness.rank._memory_profiles) <= 1
     for plan, peak in harness.observations:
         assert harness.required(plan) >= peak
-        if enabled:
+        if enabled and not getattr(plan, "_exclude_subfloor_memory_sample", False):
             profile = harness.rank._memory_profiles[plan.signature]
             assert (
                 _memory_model.predict(
@@ -181,12 +181,12 @@ def _fixed_term_only(harness, before, plans, predictions):
         assert previous <= harness.required(plan) <= previous + bound
 
 
-def _cold_fit_is_only_a_fixed_floor(profile):
-    assert profile.compute_slope == (0, 1)
-    assert profile.fixed_compute_bytes == 300_254_988
-    assert [_memory._profile_compute_peak(profile, n) for n in (8192, 32768)] == [
-        profile.fixed_compute_bytes
-    ] * 2
+def _include_static_workspace(harness):
+    # The injected caller allocates this workspace. Cold static admission must
+    # price it too; live tiny samples cannot become a shared large-wave floor.
+    harness.rank._plan_head_workspace_bytes = lambda plan: (
+        WORKSPACE + RATE * plan.packed_tokens
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -195,6 +195,8 @@ def test_cold_three_then_8192_preserves_floor_and_documents_cold_guard(
 ):
     with _memory.fixed_slope_memory_profiles(enabled):
         harness = _harness(monkeypatch)
+        if enabled:
+            _include_static_workspace(harness)
         large = harness.plan([8192])
         before = harness.required(large)
         with pytest.raises(TrainerRankMemoryError, match="predicted to exceed"):
@@ -203,8 +205,7 @@ def test_cold_three_then_8192_preserves_floor_and_documents_cold_guard(
         assert harness.executed[0].signature == large.signature
         _covered(harness, enabled)
         if enabled:
-            profile = harness.rank._memory_profiles[large.signature]
-            _cold_fit_is_only_a_fixed_floor(profile)
+            assert large.signature not in harness.rank._memory_profiles
             assert harness.required(large) >= _memory._MEMORY_DEFERRED_BYTES
         else:
             # Documentation of current flag-off behavior, not a desired bound.
@@ -215,6 +216,8 @@ def test_cold_three_then_8192_preserves_floor_and_documents_cold_guard(
 def test_171_shared_three_token_roots_use_three_token_waves(monkeypatch, enabled):
     with _memory.fixed_slope_memory_profiles(enabled):
         harness = _harness(monkeypatch)
+        if enabled:
+            _include_static_workspace(harness)
         selected = harness.plan([3] * 171)
         assert (selected.logical_tokens, selected.packed_tokens) == (513, 3)
         large = harness.plan([8192])
@@ -225,8 +228,7 @@ def test_171_shared_three_token_roots_use_three_token_waves(monkeypatch, enabled
         assert all(p.signature == large.signature for p in harness.executed)
         _covered(harness, enabled)
         if enabled:
-            profile = harness.rank._memory_profiles[large.signature]
-            _cold_fit_is_only_a_fixed_floor(profile)
+            assert large.signature not in harness.rank._memory_profiles
             assert harness.required(large) >= _memory._MEMORY_DEFERRED_BYTES
         else:
             # Aggregate logical rows do not prevent a short packed observation.
@@ -237,6 +239,8 @@ def test_171_shared_three_token_roots_use_three_token_waves(monkeypatch, enabled
 def test_256_token_workspace_observation_refuses_250mb(monkeypatch, enabled):
     with _memory.fixed_slope_memory_profiles(enabled):
         harness = _harness(monkeypatch)
+        if enabled:
+            _include_static_workspace(harness)
         _ladder(harness, (512, 2048, 8192))
         small = harness.plan([256])
         plans = [harness.plan([n]) for n in (8192, 32768)]
@@ -269,6 +273,8 @@ def test_warm_tiny_waves_only_raise_fixed_term_after_anchoring(
 ):
     with _memory.fixed_slope_memory_profiles(enabled):
         harness = _harness(monkeypatch)
+        if enabled:
+            _include_static_workspace(harness)
         _ladder(harness)
         plans = [harness.plan([n]) for n in (8192, 32768)] + [
             _shared_prompt_plan(harness)

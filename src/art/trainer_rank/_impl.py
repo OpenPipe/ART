@@ -3525,6 +3525,7 @@ class TrainerRank:
         check: _MemoryCheck,
         context: str,
     ) -> tuple[list[AnyForwardOutput], int | None]:
+        _memory._mark_subfloor_cp_sample(self, plan)
         if not getattr(self, "_planner_observing_split", False):
             self._begin_planner_observation(plan, check)
         if torch.cuda.is_available() and self.device.type == "cuda":
