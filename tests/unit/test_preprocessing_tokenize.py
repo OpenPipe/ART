@@ -7,6 +7,7 @@ from transformers.tokenization_utils_base import BatchEncoding
 
 from art.preprocessing.tokenize import (
     _normalize_tool_call_arguments_for_chat_template,
+    _true_spans,
     tokenize_sft_batch,
 )
 from art.trajectories import Trajectory
@@ -20,6 +21,19 @@ from art.utils.chat_template import (
 
 pytest.importorskip("torch")
 pytest.importorskip("transformers")
+
+
+@pytest.mark.parametrize(
+    ("mask", "expected"),
+    (
+        ([], []),
+        ([False, False], []),
+        ([True, True], [(0, 2)]),
+        ([False, True, True, False, True], [(1, 3), (4, 5)]),
+    ),
+)
+def test_true_spans(mask: list[bool], expected: list[tuple[int, int]]) -> None:
+    assert _true_spans(mask) == expected
 
 
 @pytest.mark.parametrize(
