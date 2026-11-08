@@ -166,16 +166,13 @@ def _qualified_cp_workload(
             compiled.get_dense_compiled_flex_attention(**options),
             compiled.get_sparse_compiled_flex_attention(family_key="sparse", **options),
         ):
-            original = getattr(function, "_torchdynamo_orig_callable", function)
-            code = getattr(original, "__code__", None)
-            kernels.append(
-                (
-                    original.__module__,
-                    original.__qualname__,
-                    None if code is None else hashlib.sha256(code.co_code).hexdigest(),
-                    hasattr(function, "_torchdynamo_orig_callable"),
-                )
+            family_id = compiled.compiled_flex_attention_family(
+                function, device=self.device
             )
+            if family_id is None:
+                kernels = []
+                break
+            kernels.append(family_id)
     value["execution_qualification"] = dict(
         signature=hashlib.sha256(repr(plan.signature).encode()).hexdigest(),
         geometry=asdict(self._geometry),
@@ -826,6 +823,26 @@ class _CallerMemoryProfile(_impl._MemoryProfile):
     compute_peak_floor: int = 0
     caller_cp_peaks: tuple[_CPCallerPeak, ...] = ()
 
+    def cp_family_equal(self, requested: str, observed: str) -> bool:
+        if requested == observed:
+            return True
+        if (
+            isinstance(self, _CallerMemoryProfileV2)
+            and self.profile_format_version == 5
+        ):
+            try:
+                want, have = json.loads(requested), json.loads(observed)
+                if not isinstance(want, dict) or not isinstance(have, dict):
+                    return False
+                # Format 5 recorded only the original canonical family. Keep
+                # that equality contract; it grants no mask-subset dominance.
+                if "execution_qualification" not in have:
+                    want.pop("execution_qualification", None)
+                    return want == have
+            except (ValueError, TypeError):
+                pass
+        return False
+
     def covering_cp_observation(
         self, tokens: int | float, cp_workload: _CPWorkload | None
     ) -> _CPCallerPeak | None:
@@ -845,7 +862,7 @@ class _CallerMemoryProfile(_impl._MemoryProfile):
         ]
         # Prefer existing equality coverage before considering a new dominance.
         for point in covered:
-            if family == point[2]:
+            if self.cp_family_equal(family, point[2]):
                 return point
         if (
             isinstance(self, _CallerMemoryProfileV2)
