@@ -403,6 +403,54 @@ def _rate_floor_tokens(signature: _impl._MemorySignature) -> int:
     )
 
 
+def _uncovered_subfloor_cp(
+    profile: _impl._MemoryProfile | None,
+    signature: _impl._MemorySignature,
+    packed_tokens: int,
+    workload: _CPWorkload | None,
+) -> bool:
+    """No qualified CP evidence: use the existing cold path below the floor."""
+    if not (
+        _fixed_slope_enabled(profile)
+        and signature.topology[2] > 1
+        and 0 < packed_tokens < _rate_floor_tokens(signature)
+    ):
+        return False
+    if (
+        profile is not None
+        and not isinstance(profile, _CallerMemoryProfile)
+        and (
+            profile.subfloor_packed_tokens
+            or any(
+                n < _rate_floor_tokens(signature)
+                for n, _ in profile.compute_observations
+            )
+        )
+    ):
+        # Previously measured tiny evidence remains binding. New admitted
+        # sub-floor waves are isolated before reaching the shared model.
+        return False
+    return (
+        not isinstance(profile, _CallerMemoryProfile)
+        or profile.covering_cp_peak(packed_tokens, workload) is None
+    )
+
+
+def _mark_subfloor_cp_sample(self: TrainerRank, plan: _impl._FlatForwardPlan) -> None:
+    profiles = getattr(self, "_memory_profiles", None)
+    signature = getattr(plan, "signature", None)
+    if profiles is None or signature is None:
+        return
+    if (
+        _fixed_slope_enabled(profiles.get(signature))
+        and signature.topology[2] > 1
+        and 0 < plan.packed_tokens < _rate_floor_tokens(signature)
+    ):
+        # Plan-owned metadata, not a growing trainer history. Mark every
+        # admitted sub-floor CP wave independently of rank-local coverage.
+        plan.__dict__["_exclude_subfloor_memory_sample"] = True
+
+
 def _rate_points(profile: _impl._MemoryProfile, floor: int):
     if profile.peak_model_version != 2:
         return ()
@@ -618,9 +666,12 @@ def _rate_reference(
 
 
 def _cold_extrapolation_factor(
-    profile: _impl._MemoryProfile | None, packed_tokens: int
+    profile: _impl._MemoryProfile | None,
+    packed_tokens: int,
+    *,
+    fixed_slope: bool = False,
 ) -> float:
-    if _fixed_slope_enabled(profile) and packed_tokens > (
+    if (fixed_slope or _fixed_slope_enabled(profile)) and packed_tokens > (
         0 if profile is None else profile.packed_tokens
     ):
         # Anchoring selects NEW's slope; it does not qualify extrapolation.
@@ -3063,10 +3114,19 @@ def _memory_check(
             self._plan_hybridep_growth_bytes(forward) * _impl._MEMORY_SAFETY_FACTOR
         )
         if growth and not (_calibration is not None and _calibration.extrapolated):
+            profile = self._memory_profiles.get(forward.signature)
+            cold = _uncovered_subfloor_cp(
+                profile,
+                forward.signature,
+                forward.packed_tokens,
+                getattr(forward, "caller_cp_workload", None),
+            )
             growth = math.ceil(
                 growth
                 * _cold_extrapolation_factor(
-                    self._memory_profiles.get(forward.signature), forward.packed_tokens
+                    None if cold else profile,
+                    forward.packed_tokens,
+                    **({"fixed_slope": True} if cold else {}),
                 )
             )
         required += growth
@@ -3076,6 +3136,7 @@ def _memory_check(
             and not _calibration.eligible
         ):
             required = max(required, _MEMORY_DEFERRED_BYTES)
+        _mark_subfloor_cp_sample(self, forward)
     return self._memory_check_required(
         required,
         sync_across_dp=sync_across_dp,
@@ -3315,6 +3376,13 @@ def _estimate_required_memory_bytes_from_values(
     if packed_tokens <= 0:
         return output_bytes
     profiled = self._memory_profiles.get(signature)
+    cold_subfloor = _uncovered_subfloor_cp(
+        profiled, signature, packed_tokens, caller_cp_workload
+    )
+    if cold_subfloor:
+        # Reuse every ordinary unprofiled static term, including cold backward
+        # transients. Do not borrow the uncovered class's empirical workspace.
+        profiled = None
     activation_factor = max(4, min(16, self._num_layers // 4 + 4))
     static_compute = (
         packed_tokens * self._hidden_size * self._param_dtype_size * activation_factor
@@ -3565,6 +3633,7 @@ def _estimate_required_memory_bytes_from_values(
         compute = max(compute, _calibration_compute_bytes)
     if (
         _calibration_compute_bytes is None
+        and not cold_subfloor
         and _fixed_slope_enabled(profiled)
         and _unanchored(profiled)
     ):
@@ -3593,7 +3662,11 @@ def _estimate_required_memory_bytes_from_values(
                 compute, fixed + _memory_model.predict(0, reference.rate, tokens)
             )
     factor = (
-        _cold_extrapolation_factor(profiled, packed_tokens)
+        _cold_extrapolation_factor(
+            profiled,
+            packed_tokens,
+            **({"fixed_slope": True} if cold_subfloor else {}),
+        )
         if include_cold_extrapolation and _calibration_compute_bytes is None
         else 1.0
     )
@@ -3713,9 +3786,16 @@ def _update_memory_profile(
 ) -> None:
     if plan.packed_tokens <= 0:
         return
+    previous = self._memory_profiles.get(plan.signature)
+    if _fixed_slope_enabled(previous) and getattr(
+        plan, "_exclude_subfloor_memory_sample", False
+    ):
+        # Sampling/reporting still observes the wave, but its distinct tiny
+        # workspace cannot set rates, fixed/retained floors or trust extents
+        # for later large waves. Keep the whole existing profile unchanged.
+        return
     compute_delta = max(0, peak_delta_bytes - plan.output_bytes)
     bytes_per_token = compute_delta / max(1, plan.packed_tokens)
-    previous = self._memory_profiles.get(plan.signature)
     fixed_slope = _fixed_slope_enabled(previous)
     if fixed_slope and previous is not None and previous.peak_model_version == 1:
         # Explicit legacy restoration uses the merge helper. Fresh collection
