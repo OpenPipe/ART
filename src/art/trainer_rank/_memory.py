@@ -118,8 +118,20 @@ def _rate_points(profile: _impl._MemoryProfile, floor: int):
 
 
 def _absolute_floor(profile: _impl._MemoryProfile, floor: int) -> int:
+    caller_floor = 0
+    if isinstance(profile, _CallerMemoryProfile):
+        extent = max((n for n, _ in profile.caller_compute_peaks), default=0)
+        points = (
+            profile.rate_observations or ()
+            if profile.profile_format_version >= 3
+            else profile.compute_observations
+        )
+        # Old caches may contain forward-only rate evidence. Retain its peak
+        # as an absolute bound when removing the unqualified token rate.
+        caller_floor = max((peak for n, peak in points if n > extent), default=0)
     return max(
         profile.absolute_compute_floor,
+        caller_floor,
         # Earlier caller records keep incomplete readings only in this floor.
         # Preserve that bound on upgrade without turning it into a token rate.
         profile.compute_peak_floor
@@ -315,10 +327,14 @@ def _rate_reference(
             if field.compare
         )
     ]
-    if any(_rate_points(root, floor) for root in roots):
+    root_reference = reference("calibration_root", roots)
+    if root_reference is not None or any(
+        isinstance(root, _CallerMemoryProfile) for root in roots
+    ):
         # A root remains the preferred source when its coverage expires. Falling
-        # through to a model anchor could make a larger request cheaper.
-        return reference("calibration_root", roots)
+        # through to a model anchor could make a larger request cheaper. This
+        # also covers old caller hulls that lost their completed rate points.
+        return root_reference
     return reference(
         "model_anchor",
         [
@@ -2189,8 +2205,8 @@ def _estimate_flat_forward(
 
 def _rate_learning_eligible(self: TrainerRank, plan: _impl._FlatForwardPlan) -> bool:
     # Borrowed profiles qualify admission, never learning. Their caller counters
-    # and interval validity can differ locally. Own token extents are independent
-    # of peak hulls and complete-caller qualification, so no agreement is needed.
+    # and interval validity can differ locally. Own token extents do not depend
+    # on peak hulls; caller profiles additionally require completed intervals.
     profile = self._memory_profiles.get(plan.signature)
     extent = 0 if profile is None else _trusted_extent(profile)
     return plan.packed_tokens >= _rate_floor_tokens(plan.signature) and (

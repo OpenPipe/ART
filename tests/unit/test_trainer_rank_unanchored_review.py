@@ -340,5 +340,31 @@ def test_restored_forward_only_caller_cannot_supply_a_backward_rate(fmt):
     with m.fixed_slope_memory_profiles():
         assert m._unanchored(previous)
         assert m._trusted_extent(previous) == 0
+        assert m._absolute_floor(previous, 64) >= 20 * 2**30
         assert m._rate_reference(rank, root, previous, packed_tokens=8192) is None
         assert required(rank, root, 8192) >= m._MEMORY_DEFERRED_BYTES
+
+
+def test_unusable_restored_caller_root_cannot_switch_to_a_model_anchor():
+    rank = _rank()
+    key = replace(signature((0, "forward_backward", 8)), topology=(1, 1, 1, 1))
+    root = m._ScopedMemorySignature(**vars(key), bounded_caller_peak=True)
+    points = ((3, 60 * 2**30), (32768, 20 * 2**30))
+    fixed, slope = m._memory_model.fit_points(points)
+    # The raw hull lost the completed 8K point after a later forward-only read.
+    previous = m._CallerMemoryProfileV2(
+        bytes_per_token=60 * 2**30 / 3,
+        packed_tokens=32768,
+        compute_observations=points,
+        fixed_compute_bytes=fixed,
+        compute_slope=slope,
+        caller_compute_peaks=((3, 60 * 2**30), (8192, 60 * 2**30)),
+        compute_peak_floor=60 * 2**30,
+        caller_plans=2,
+    )
+    m._validate_memory_profile_model(previous)
+    rank._memory_profiles[root] = previous
+    with m.fixed_slope_memory_profiles():
+        observe(rank, replace(key, request_mix=("hidden",)), 32768, 1_000_000_000)
+        assert m._rate_reference(rank, key, None, packed_tokens=8192) is None
+        assert required(rank, key, 8192) >= m._MEMORY_DEFERRED_BYTES

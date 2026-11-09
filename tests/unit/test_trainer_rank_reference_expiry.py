@@ -1,6 +1,7 @@
 """Borrowed caller coverage must not expire into cheaper admission."""
 
 from dataclasses import replace
+from typing import Any, cast
 
 import pytest
 from test_trainer_rank_active_memory import _rank
@@ -133,9 +134,16 @@ def test_own_caller_price_does_not_drop_after_completed_extent():
     root = m._ScopedMemorySignature(**vars(key), bounded_caller_peak=True)
     with m.fixed_slope_memory_profiles():
         observe(rank, root, 8192, 1_000_000_000)
-        # A measured caller outside the own learning window supplies a floor.
-        observe(rank, root, 131072, 15_000_000_000, eligible=False)
-        assert m._trusted_extent(rank._memory_profiles[root]) == 8192
+        plan = observe(rank, root, 131072, 16_000_000_000)
+        # A subsequent forward-only reading retains a floor, not a new rate.
+        m._update_memory_profile(
+            rank,
+            cast(Any, plan),
+            15_000_000_000,
+            retained_bytes=None,
+            caller_phase=False,
+        )
+        assert m._trusted_extent(rank._memory_profiles[root]) == 131072
         before = required(rank, root, 131072)
         after = required(rank, root, 131073)
         assert after >= before
