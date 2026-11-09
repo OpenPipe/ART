@@ -411,15 +411,18 @@ def _fixed_slope_enabled(profile: _impl._MemoryProfile | None) -> bool:
 
 
 def _unanchored(profile: _impl._MemoryProfile | None) -> bool:
-    points = (
-        profile.rate_observations
-        if profile is not None and profile.profile_format_version >= 3
-        else profile.caller_compute_peaks
-        if isinstance(profile, _CallerMemoryProfile)
-        else profile.compute_observations
-        if profile is not None
-        else ()
-    )
+    if isinstance(profile, _CallerMemoryProfile):
+        points = _rate_points(
+            profile, profile.rate_floor_tokens or _memory_model._MEMORY_SLOPE_MIN_TOKENS
+        )
+    else:
+        points = (
+            profile.rate_observations
+            if profile is not None and profile.profile_format_version >= 3
+            else profile.compute_observations
+            if profile is not None
+            else ()
+        )
     return (
         profile is None
         or not points
@@ -490,30 +493,63 @@ def _rate_points(profile: _impl._MemoryProfile, floor: int):
     if profile.peak_model_version != 2:
         return ()
     if profile.profile_format_version >= 3:
-        return tuple(
+        points = tuple(
             point for point in profile.rate_observations or () if point[0] >= floor
         )
-    # Earlier v2 hulls may have discarded a qualifying intermediate rate in
-    # favor of a tiny peak. Only their definitely anchored observations seed
-    # the new rate channel; never reuse their max-merged scalar rate.
-    return tuple(point for point in profile.compute_observations if point[0] >= 8192)
+    else:
+        # Earlier v2 hulls may have discarded a qualifying intermediate rate in
+        # favor of a tiny peak. Only definitely anchored observations seed the
+        # new rate channel; never reuse their max-merged scalar rate.
+        points = tuple(
+            point for point in profile.compute_observations if point[0] >= 8192
+        )
+    if isinstance(profile, _CallerMemoryProfile):
+        # Restored forward-only extents cannot qualify a backward rate. The
+        # longest completed extent survives coverage-curve compaction.
+        extent = max((n for n, _ in profile.caller_compute_peaks), default=0)
+        points = tuple(point for point in points if point[0] <= extent)
+    return points
 
 
 def _absolute_floor(profile: _impl._MemoryProfile, floor: int) -> int:
+    caller_floor = 0
+    if isinstance(profile, _CallerMemoryProfile):
+        extent = max((n for n, _ in profile.caller_compute_peaks), default=0)
+        points = (
+            profile.rate_observations or ()
+            if profile.profile_format_version >= 3
+            else profile.compute_observations
+        )
+        # Old caches may contain forward-only rate evidence. Retain its peak
+        # as an absolute bound when removing the unqualified token rate.
+        caller_floor = max((peak for n, peak in points if n > extent), default=0)
     return max(
         profile.absolute_compute_floor,
+        caller_floor,
+        # Earlier caller records keep incomplete readings only in this floor.
+        # Preserve that bound on upgrade without turning it into a token rate.
+        profile.compute_peak_floor
+        if isinstance(profile, _CallerMemoryProfile)
+        and profile.profile_format_version < 3
+        else 0,
         max((peak for n, peak in profile.compute_observations if n < floor), default=0),
     )
 
 
 def _trusted_extent(profile: _impl._MemoryProfile) -> int:
     if profile.profile_format_version >= 4:
-        return max(profile.eligible_packed_tokens, profile.subfloor_packed_tokens)
-    if profile.profile_format_version == 3:
+        extent = max(profile.eligible_packed_tokens, profile.subfloor_packed_tokens)
+    elif profile.profile_format_version == 3:
         # Old peak hulls have already lost some sub-floor token extents. Do not
         # infer a replicated learning decision from rank-local peak pruning.
-        return max((n for n, _ in profile.rate_observations or ()), default=0)
-    return profile.packed_tokens
+        extent = max((n for n, _ in profile.rate_observations or ()), default=0)
+    else:
+        extent = profile.packed_tokens
+    if isinstance(profile, _CallerMemoryProfile):
+        extent = min(
+            extent, max((n for n, _ in profile.caller_compute_peaks), default=0)
+        )
+    return extent
 
 
 _RETAINED_POINT_BUDGET = 64
@@ -685,10 +721,14 @@ def _rate_reference(
             if field.compare
         )
     ]
-    if any(_rate_points(root, floor) for root in roots):
+    root_reference = reference("calibration_root", roots)
+    if root_reference is not None or any(
+        isinstance(root, _CallerMemoryProfile) for root in roots
+    ):
         # A root remains the preferred source when its coverage expires. Falling
-        # through to a model anchor could make a larger request cheaper.
-        return reference("calibration_root", roots)
+        # through to a model anchor could make a larger request cheaper. This
+        # also covers old caller hulls that lost their completed rate points.
+        return root_reference
     return reference(
         "model_anchor",
         [
@@ -720,15 +760,6 @@ def _profile_compute_peak(profile: _impl._MemoryProfile, tokens: int | float) ->
     if profile.peak_model_version == _memory_model._MEMORY_PROFILE_VERSION:
         points = profile.compute_observations
         fixed, slope = profile.fixed_compute_bytes, profile.compute_slope
-        if (
-            isinstance(profile, _CallerMemoryProfile)
-            and profile.profile_format_version < 3
-        ):
-            # Older v2 profiles have no independent qualified rate channel.
-            # Refit their backward curve only from completed caller evidence;
-            # forward-only peaks remain binding through compute_peak_floor.
-            points = profile.caller_compute_peaks
-            fixed, slope = _memory_model.fit_points(points)
         # A lone long anchor does not qualify downward extrapolation of fixed
         # workspace. Price below the observed range at its smallest observation.
         extent = (
@@ -837,7 +868,15 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
             raise ValueError("unexpected fixed/slope fields in legacy profile")
         return
     points = profile.compute_observations
-    if not points or _memory_model.merge_points(points) != points:
+    incomplete_caller = (
+        isinstance(profile, _CallerMemoryProfile)
+        and profile.profile_format_version == 2
+        and not profile.caller_compute_peaks
+        and not profile.caller_cp_peaks
+    )
+    if (not points and not incomplete_caller) or _memory_model.merge_points(
+        points
+    ) != points:
         raise ValueError("invalid memory observation hull")
     if profile.profile_format_version in (3, 4, 5, 6, 7):
         floor, rates, absolute = (
@@ -941,7 +980,7 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
         or profile.compute_slope != slope
         or not math.isfinite(profile.legacy_bytes_per_token)
         or profile.legacy_bytes_per_token < 0
-        or profile.packed_tokens < points[-1][0]
+        or (points and profile.packed_tokens < points[-1][0])
     ):
         raise ValueError("invalid fixed/slope memory fit")
 
@@ -1054,6 +1093,7 @@ class _CallerMemoryProfile(_impl._MemoryProfile):
         return max(
             self.bytes_per_token * tokens,
             self.legacy_bytes_per_token * tokens,
+            _profile_compute_peak(self, tokens) if self.peak_model_version == 2 else 0,
             self.compute_peak_floor,
         )
 
@@ -2654,8 +2694,8 @@ def _estimate_flat_forward(
 
 def _rate_learning_eligible(self: TrainerRank, plan: _impl._FlatForwardPlan) -> bool:
     # Borrowed profiles qualify admission, never learning. Their caller counters
-    # and interval validity can differ locally. Own token extents are independent
-    # of peak hulls and complete-caller qualification, so no agreement is needed.
+    # and interval validity can differ locally. Own token extents do not depend
+    # on peak hulls; caller profiles additionally require completed intervals.
     if getattr(plan, "_calibration_cp_family_seed", False):
         return False
     profile = self._memory_profiles.get(plan.signature)
@@ -3872,6 +3912,8 @@ def _update_memory_profile(
                 or not getattr(plan.signature, "bounded_caller_peak", False)
             )
         )
+        # Raw peak constraints and qualified rates use separate channels here;
+        # the prefix-max caller coverage curve never supplies a fitted rate.
         observations = _memory_model.merge_points(
             () if previous is None else previous.compute_observations,
             ((plan.packed_tokens, compute_delta),),

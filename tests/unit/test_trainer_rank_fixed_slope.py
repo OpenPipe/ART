@@ -162,9 +162,15 @@ def test_monotone_through_threshold_trust_extent_and_logical_rows(profile_type):
     sig = signature()
     for tokens, peak in ((1, 2**29), (8192, 2**30), (32768, 2**31)):
         observe(r, sig, tokens, peak)
-    p = _memory._memory_profile_from_values(
-        {**asdict(profile_type(1, 1)), **asdict(r._memory_profiles[sig])}
-    )
+    values = {**asdict(profile_type(1, 1)), **asdict(r._memory_profiles[sig])}
+    if profile_type is _memory._CallerMemoryProfile:
+        # Caller trust requires completed intervals in addition to token extents.
+        values.update(
+            caller_compute_peaks=((1, 2**29), (8192, 2**30), (32768, 2**31)),
+            compute_peak_floor=2**31,
+            caller_plans=3,
+        )
+    p = _memory._memory_profile_from_values(values)
     r._memory_profiles[sig] = p
     ns = [1, 2, 128, 8191, 8192, 8193, 32767, 32768, 32769, 8 * 32768, 8 * 32768 + 1]
     for sharing in (1, 2, 32):
