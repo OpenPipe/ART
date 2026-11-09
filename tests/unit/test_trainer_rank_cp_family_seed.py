@@ -9,6 +9,7 @@ import pytest
 from test_trainer_rank_active_memory import _rank
 from test_trainer_rank_calibration_seed import fake_device, metadata_rank
 from test_trainer_rank_calibration_trust_region import request
+from test_trainer_rank_subfloor_cp import SHAPE, SIZES, requests
 import torch
 
 from art.megatron.context_parallel.runtime import context_parallel_memory_workload
@@ -249,3 +250,40 @@ def test_incomplete_family_seed_teaches_no_coverage_and_cannot_retry(monkeypatch
         with rank.calibration_rung([request(512, grad=True)], no_grad=False) as rung:
             with pytest.raises(TrainerRankMemoryError):
                 rung.forward_micro_batches()
+
+
+def test_recorded_rank8_metadata_keeps_48575_token_step_unchanged_after_tiny_waves(
+    monkeypatch,
+):
+    _, key, profile = recorded("moe", 8)
+    rank = metadata_rank("moe")
+    monkeypatch.setattr(rank, "_slot_memory_shapes", lambda ref: key.slot_shapes[0][1])
+    rank._memory_profiles = {key: profile}
+    rank._available_memory_bytes = lambda sample=None: 100_000_000_000
+    with memory.fixed_slope_memory_profiles():
+        plan = rank._plan_flat_forward(requests(SHAPE, True))
+        assert plan.packed_tokens == sum(SHAPE) == 48_575
+        assert plan.signature.slot_shapes == key.slot_shapes
+        # The export never ran this step. Its own complete peak is synthetic.
+        rank._update_memory_profile(
+            plan,
+            2_000_000_000 + plan.output_bytes,
+            retained_bytes=None,
+            caller_phase=True,
+        )
+        clean = rank._memory_check(plan).estimated_required_bytes
+        assert clean < 1 << 62
+        saved = dict(rank._memory_profiles)
+        for backward in (True, False):
+            for n in SIZES:
+                tiny = rank._plan_flat_forward(requests([n], backward))
+                rank._memory_check(tiny)
+                assert getattr(tiny, "_exclude_subfloor_memory_sample", False)
+                rank._update_memory_profile(
+                    tiny,
+                    60_000_000_000,
+                    retained_bytes=50_000_000_000,
+                    caller_phase=True,
+                )
+        assert rank._memory_profiles == saved
+        assert rank._memory_check(plan).estimated_required_bytes == clean
