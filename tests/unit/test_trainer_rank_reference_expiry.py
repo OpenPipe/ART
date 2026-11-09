@@ -97,6 +97,15 @@ def test_expired_model_anchor_cannot_leave_only_a_cheaper_contributor(cp):
             8_000_000_000,
             cp_workload=work,
         )
+        # Both contributors start at the same qualified floor; only the cheap
+        # contributor extends beyond it. This isolates expiry from minimums.
+        observe(
+            rank,
+            replace(key, request_mix=("logits",)),
+            8192,
+            250_000_000,
+            cp_workload=work,
+        )
         observe(
             rank,
             replace(key, request_mix=("logits",)),
