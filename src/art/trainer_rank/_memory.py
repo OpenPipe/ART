@@ -281,6 +281,7 @@ class _CalibrationEstimate:
     eligible: bool = False
     extrapolated: bool = False
     seed: bool = False
+    seed_uncovered_cp_family: bool = False
     static_compute_bytes: int = 0
     decision: CalibrationRungDecision | None = None
 
@@ -294,7 +295,12 @@ class _CalibrationEstimate:
         return self.base + (3 * self.slope * self.delta + 1) // 2 + self.output
 
 
-def _calibration_estimate(self: TrainerRank, plan: _impl._FlatForwardPlan):
+def _calibration_estimate(
+    self: TrainerRank,
+    plan: _impl._FlatForwardPlan,
+    *,
+    seed_uncovered_cp_family: bool = False,
+):
     """Use live, complete rungs, never a pruned hull or borrowed signature.
 
     This bounded journal is intentionally not persisted. A restored profile
@@ -316,6 +322,33 @@ def _calibration_estimate(self: TrainerRank, plan: _impl._FlatForwardPlan):
         output=plan.output_bytes,
     )
     result.extrapolated = result.candidate > result.largest
+    if seed_uncovered_cp_family:
+        workload = plan.caller_cp_workload
+        if not (
+            _FIXED_SLOPE_PROFILES.get()
+            and isinstance(profile, _CallerMemoryProfileV2)
+            and not _unanchored(profile)
+            and len(points) >= 2
+            and plan.signature.topology[2] > 1
+            and workload is not None
+            and _rate_floor_tokens(plan.signature)
+            <= result.candidate
+            < _memory_model._MEMORY_SLOPE_MIN_TOKENS
+            and not profile.dominance_disabled
+            and not profile.non_dominant_cp_pairs
+            and profile.covering_cp_peak(result.candidate, workload) is None
+            and (plan.signature, _cp_pair(workload[0], workload[0])[0])
+            not in self.__dict__.get("_calibration_seeded_cp_families", ())
+        ):
+            raise ValueError(
+                "CP family seed requires an uncovered short family and live anchors"
+            )
+        # A different execution family needs its own complete measurement.
+        # This explicit static-bound trial grants no ordinary admission or rate.
+        result.seed_uncovered_cp_family = True
+        result.seed = result.extrapolated = result.eligible = True
+        result.delta = result.candidate
+        return result
     if (
         _FIXED_SLOPE_PROFILES.get()
         and result.candidate == _CALIBRATION_SEED_TOKENS
@@ -2623,6 +2656,8 @@ def _rate_learning_eligible(self: TrainerRank, plan: _impl._FlatForwardPlan) -> 
     # Borrowed profiles qualify admission, never learning. Their caller counters
     # and interval validity can differ locally. Own token extents are independent
     # of peak hulls and complete-caller qualification, so no agreement is needed.
+    if getattr(plan, "_calibration_cp_family_seed", False):
+        return False
     profile = self._memory_profiles.get(plan.signature)
     extent = 0 if profile is None else _trusted_extent(profile)
     return plan.packed_tokens >= _rate_floor_tokens(plan.signature) and (
@@ -3097,7 +3132,15 @@ def _memory_check(
 ) -> _impl._MemoryCheck:
     with self._planning_status(sync_planning_errors):
         if _calibration is not None:
-            _calibration.__dict__.update(vars(_calibration_estimate(self, forward)))
+            _calibration.__dict__.update(
+                vars(
+                    _calibration_estimate(
+                        self,
+                        forward,
+                        seed_uncovered_cp_family=_calibration.seed_uncovered_cp_family,
+                    )
+                )
+            )
         required = self._estimate_required_memory_bytes_from_values(
             packed_tokens=forward.packed_tokens,
             output_bytes=forward.output_bytes,
@@ -3552,7 +3595,10 @@ def _estimate_required_memory_bytes_from_values(
         # A prepared seed receives exactly the ordinary static term, before
         # empirical pricing and the deferred floor. No ordinary call supplies it.
         assert _calibration_compute_bytes.seed
-        assert packed_tokens == _CALIBRATION_SEED_TOKENS
+        assert (
+            _calibration_compute_bytes.seed_uncovered_cp_family
+            or packed_tokens == _CALIBRATION_SEED_TOKENS
+        )
         _calibration_compute_bytes.static_compute_bytes = math.ceil(static_compute)
         _calibration_compute_bytes = math.ceil(
             _CALIBRATION_SEED_MARGIN * _calibration_compute_bytes.static_compute_bytes

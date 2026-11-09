@@ -94,14 +94,23 @@ class TrainerRank(_impl.TrainerRank):
         *,
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
+        seed_uncovered_cp_family: bool = False,
     ) -> AbstractContextManager[CalibrationRung]:
         """Prepare an exact calibration wave and expose its pre-execution decision.
 
         Call ``rung.forward_micro_batches()`` only after recording durable intent
         for an extrapolated decision. See ``CalibrationRung`` for its lifetime.
         Ordinary forwards never use this calibration-only extrapolation.
+        ``seed_uncovered_cp_family`` explicitly measures a short uncovered CP
+        family after two live anchors, without learning a rate from its sample.
         """
-        return calibration_rung(self, inputs, checkpoint=checkpoint, no_grad=no_grad)
+        return calibration_rung(
+            self,
+            inputs,
+            checkpoint=checkpoint,
+            no_grad=no_grad,
+            seed_uncovered_cp_family=seed_uncovered_cp_family,
+        )
 
     def module(
         self,
