@@ -381,6 +381,8 @@ def _unanchored(profile: _impl._MemoryProfile | None) -> bool:
     points = (
         profile.rate_observations
         if profile is not None and profile.profile_format_version >= 3
+        else profile.caller_compute_peaks
+        if isinstance(profile, _CallerMemoryProfile)
         else profile.compute_observations
         if profile is not None
         else ()
@@ -593,17 +595,17 @@ def _rate_reference(
             return None
         if source != "signature":
             minimum = max(rows[0][0] for _, rows in points)
-            points = [
-                (p, rows)
-                for p, rows in points
-                if _borrow_covers(
+            # Losing a covering contributor must not select a cheaper bound.
+            # Unknown caller coverage defers rather than changing references.
+            if not all(
+                _borrow_covers(
                     p,
                     None if packed_tokens is None else max(packed_tokens, minimum),
                     signature.topology[2],
                     caller_cp_workload,
                 )
-            ]
-            if not points:
+                for p, _ in points
+            ):
                 return None
         rate = max(
             (point for _, rows in points for point in rows),
@@ -634,9 +636,6 @@ def _rate_reference(
         and key.slot_group_count == signature.slot_group_count
         and value.peak_model_version == 2
         and (not signature.grad_enabled or value.caller_plans > 0)
-        and _borrow_covers(
-            value, packed_tokens, signature.topology[2], caller_cp_workload
-        )
     ]
     roots = [
         value
@@ -653,8 +652,10 @@ def _rate_reference(
             if field.compare
         )
     ]
-    if root := reference("calibration_root", roots):
-        return root
+    if any(_rate_points(root, floor) for root in roots):
+        # A root remains the preferred source when its coverage expires. Falling
+        # through to a model anchor could make a larger request cheaper.
+        return reference("calibration_root", roots)
     return reference(
         "model_anchor",
         [
@@ -671,9 +672,10 @@ def _cold_extrapolation_factor(
     *,
     fixed_slope: bool = False,
 ) -> float:
-    if (fixed_slope or _fixed_slope_enabled(profile)) and packed_tokens > (
-        0 if profile is None else profile.packed_tokens
-    ):
+    extent = 0 if profile is None else profile.packed_tokens
+    if isinstance(profile, _CallerMemoryProfile):
+        extent = max((n for n, _ in profile.caller_compute_peaks), default=0)
+    if (fixed_slope or _fixed_slope_enabled(profile)) and packed_tokens > extent:
         # Anchoring selects NEW's slope; it does not qualify extrapolation.
         # The 8K-only boot option still needs the cold margin beyond its last
         # observation (the supplied sweep otherwise under-predicts at 131K).
@@ -683,19 +685,28 @@ def _cold_extrapolation_factor(
 
 def _profile_compute_peak(profile: _impl._MemoryProfile, tokens: int | float) -> float:
     if profile.peak_model_version == _memory_model._MEMORY_PROFILE_VERSION:
+        points = profile.compute_observations
+        fixed, slope = profile.fixed_compute_bytes, profile.compute_slope
+        if (
+            isinstance(profile, _CallerMemoryProfile)
+            and profile.profile_format_version < 3
+        ):
+            # Older v2 profiles have no independent qualified rate channel.
+            # Refit their backward curve only from completed caller evidence;
+            # forward-only peaks remain binding through compute_peak_floor.
+            points = profile.caller_compute_peaks
+            fixed, slope = _memory_model.fit_points(points)
         # A lone long anchor does not qualify downward extrapolation of fixed
         # workspace. Price below the observed range at its smallest observation.
         extent = (
             profile.rate_observations
             if profile.profile_format_version >= 3 and profile.rate_observations
-            else profile.compute_observations
+            else points
         )
         if extent:
             tokens = max(tokens, extent[0][0])
         return max(
-            _memory_model.predict(
-                profile.fixed_compute_bytes, profile.compute_slope, tokens
-            ),
+            _memory_model.predict(fixed, slope, tokens),
             profile.legacy_bytes_per_token * tokens,
         )
     return profile.bytes_per_token * tokens
@@ -992,12 +1003,15 @@ class _CallerMemoryProfile(_impl._MemoryProfile):
                     self.compute_peak_floor,
                 )
         else:
-            if self.peak_model_version == 2:
-                return max(_profile_compute_peak(self, tokens), self.compute_peak_floor)
             # Preserve #1165's CP1 curve and arithmetic exactly.
             for length, peak in self.caller_compute_peaks:
                 if tokens <= length:
-                    return max(peak, self.compute_peak_floor)
+                    return max(
+                        _profile_compute_peak(self, tokens)
+                        if self.peak_model_version == 2
+                        else peak,
+                        self.compute_peak_floor,
+                    )
         # No discounted extrapolation: even a higher short reload cannot erase
         # earlier growth constraints beyond the measured caller extent.
         if context_parallel and self.profile_format_version >= 3:
@@ -3804,7 +3818,14 @@ def _update_memory_profile(
     model_fields: dict[str, Any] = {}
     if fixed_slope:
         floor = _rate_floor_tokens(plan.signature)
-        qualifies = rate_eligible and plan.packed_tokens >= floor
+        qualifies = (
+            rate_eligible
+            and plan.packed_tokens >= floor
+            and (
+                caller_phase
+                or not getattr(plan.signature, "bounded_caller_peak", False)
+            )
+        )
         observations = _memory_model.merge_points(
             () if previous is None else previous.compute_observations,
             ((plan.packed_tokens, compute_delta),),
@@ -3853,7 +3874,7 @@ def _update_memory_profile(
     # split children and dp_rank_forward observe forward only. A caller that
     # defers backward past the yield is not covered. The profile's first
     # such plan also pays one-time costs, so it is not warm.
-    learns_rates = not fixed_slope or (rate_eligible and plan.packed_tokens >= floor)
+    learns_rates = not fixed_slope or qualifies
     if caller_phase and learns_rates:
         if caller_plans:
             warm_rate = max(bytes_per_token, warm_rate or 0.0)
