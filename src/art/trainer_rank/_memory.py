@@ -234,17 +234,17 @@ def _rate_reference(
             return None
         if source != "signature":
             minimum = max(rows[0][0] for _, rows in points)
-            points = [
-                (p, rows)
-                for p, rows in points
-                if _borrow_covers(
+            # Losing a covering contributor must not select a cheaper bound.
+            # Unknown caller coverage defers rather than changing references.
+            if not all(
+                _borrow_covers(
                     p,
                     None if packed_tokens is None else max(packed_tokens, minimum),
                     signature.topology[2],
                     caller_cp_workload,
                 )
-            ]
-            if not points:
+                for p, _ in points
+            ):
                 return None
         rate = max(
             (point for _, rows in points for point in rows),
@@ -275,9 +275,6 @@ def _rate_reference(
         and key.slot_group_count == signature.slot_group_count
         and value.peak_model_version == 2
         and (not signature.grad_enabled or value.caller_plans > 0)
-        and _borrow_covers(
-            value, packed_tokens, signature.topology[2], caller_cp_workload
-        )
     ]
     roots = [
         value
@@ -294,8 +291,10 @@ def _rate_reference(
             if field.compare
         )
     ]
-    if root := reference("calibration_root", roots):
-        return root
+    if any(_rate_points(root, floor) for root in roots):
+        # A root remains the preferred source when its coverage expires. Falling
+        # through to a model anchor could make a larger request cheaper.
+        return reference("calibration_root", roots)
     return reference(
         "model_anchor",
         [
@@ -324,7 +323,10 @@ def _profile_compute_peak(profile: _impl._MemoryProfile, tokens: int | float) ->
     if profile.peak_model_version == _memory_model._MEMORY_PROFILE_VERSION:
         points = profile.compute_observations
         fixed, slope = profile.fixed_compute_bytes, profile.compute_slope
-        if isinstance(profile, _CallerMemoryProfile) and profile.profile_format_version < 3:
+        if (
+            isinstance(profile, _CallerMemoryProfile)
+            and profile.profile_format_version < 3
+        ):
             # Older v2 profiles have no independent qualified rate channel.
             # Refit their backward curve only from completed caller evidence;
             # forward-only peaks remain binding through compute_peak_floor.
@@ -3131,7 +3133,10 @@ def _update_memory_profile(
         qualifies = (
             rate_eligible
             and plan.packed_tokens >= floor
-            and (caller_phase or not getattr(plan.signature, "bounded_caller_peak", False))
+            and (
+                caller_phase
+                or not getattr(plan.signature, "bounded_caller_peak", False)
+            )
         )
         observations = _memory_model.merge_points(
             () if previous is None else previous.compute_observations,
