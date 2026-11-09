@@ -117,14 +117,24 @@ class CalibrationRung:
         if self.decision.seed:
             if not _memory._FIXED_SLOPE_PROFILES.get():
                 raise RuntimeError("calibration seed requires the fixed-slope scope")
+            plan = self._candidate.plan
+            family_seed = getattr(plan, "_calibration_cp_family_seed", False)
+            key = plan.signature
+            if family_seed:
+                assert plan.caller_cp_workload is not None
+                family = plan.caller_cp_workload[0]
+                key = (key, _memory._cp_pair(family, family)[0])
             used = self._rank.__dict__.setdefault(
-                "_calibration_seeded_signatures", set()
+                "_calibration_seeded_cp_families"
+                if family_seed
+                else "_calibration_seeded_signatures",
+                set(),
             )
-            if self._candidate.plan.signature in used:
+            if key in used:
                 raise RuntimeError(
                     "calibration seed already attempted for this signature"
                 )
-            used.add(self._candidate.plan.signature)
+            used.add(key)
             previous = self._rank.__dict__.get("_calibration_seed_plan")
             self._rank.__dict__["_calibration_seed_plan"] = self._candidate.plan
         try:
@@ -169,6 +179,7 @@ def calibration_rung(
     *,
     checkpoint: AdapterSelection = _impl.Unset,
     no_grad: bool | None = None,
+    seed_uncovered_cp_family: bool = False,
 ) -> Generator[CalibrationRung, None, None]:
     """Prepare one calibration-only wave before executing any model work.
 
@@ -178,6 +189,11 @@ def calibration_rung(
     change inputs, checkpoint state, profiles or GPU allocations between prepare
     and execute. This API targets one DP replica (with any supported TP/CP).
     It grants no extrapolation permission to ordinary forward calls.
+
+    After two live anchors, ``seed_uncovered_cp_family`` may measure an
+    uncovered CP caller family between its rate floor and 8K tokens, using
+    the seed's static bound. Record its intent and block incomplete attempts
+    on restart as for the initial seed. The sample never teaches a rate.
     """
     self._guard_forward_collective("calibration_rung")
     enabled = _impl.torch.is_grad_enabled() if no_grad is None else not no_grad
@@ -192,11 +208,15 @@ def calibration_rung(
             requests, checkpoint=checkpoint, sync_planning_errors=True
         )
         estimate = _memory._CalibrationEstimate(
-            signature_id="", candidate=plan.packed_tokens
+            signature_id="",
+            candidate=plan.packed_tokens,
+            seed_uncovered_cp_family=seed_uncovered_cp_family,
         )
         check = self._memory_check(
             plan, sync_across_dp=True, sync_planning_errors=True, _calibration=estimate
         )
+        if seed_uncovered_cp_family:
+            plan.__dict__["_calibration_cp_family_seed"] = True
     assert estimate.decision is not None
     rung = CalibrationRung(
         decision=estimate.decision,
