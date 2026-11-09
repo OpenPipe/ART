@@ -11,7 +11,6 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import gc
-import math
 import os
 import time
 from typing import Any, AsyncIterator, Callable, Iterable, Literal, cast
@@ -892,52 +891,6 @@ async def run_unsloth_rl_training(
                     ctx.warmup_pending = False
                 else:
                     yield result
-
-
-async def run_unsloth_sft_forward(
-    ctx: UnslothTrainContext,
-    batches: Iterable[SFTBatch],
-) -> dict[str, float]:
-    """Sum SFT loss over held-out batches without changing the adapter.
-
-    Runs each batch exactly as ``run_unsloth_sft_training`` would, in eval mode
-    and without gradients or an optimizer step, like Tinker's
-    ``TrainingClient.forward(data, loss_fn="cross_entropy")``. ``loss_sum /
-    num_tokens`` is on the same scale as a training step's ``loss``.
-    """
-    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
-    model = ctx.peft_model
-    was_training = model.training
-    device = next(model.parameters()).device
-    loss_sum = 0.0
-    num_tokens = 0
-    model.eval()
-    try:
-        with torch.no_grad():
-            for batch in batches:
-                if not batch.trajectory_tensors or batch.num_trainable_tokens < 1:
-                    continue
-                # Training divides each trajectory's summed loss by the batch's
-                # trainable tokens; multiplying back recovers the sum.
-                num_trainable_tokens = torch.tensor(
-                    batch.num_trainable_tokens,
-                    dtype=torch.long,
-                    device=device,
-                )
-                for trajectory_tensor in batch.trajectory_tensors:
-                    outputs = model(
-                        input_ids=trajectory_tensor["input_ids"].to(device),
-                        attention_mask=trajectory_tensor["attention_mask"].to(device),
-                        labels=trajectory_tensor["labels"].to(device),
-                        num_items_in_batch=num_trainable_tokens,
-                    )
-                    loss_sum += outputs.loss.item() * batch.num_trainable_tokens
-                num_tokens += batch.num_trainable_tokens
-    finally:
-        model.train(was_training)
-    if not math.isfinite(loss_sum):
-        raise ValueError("SFT forward loss must be finite")
-    return {"loss_sum": loss_sum, "num_tokens": float(num_tokens)}
 
 
 async def run_unsloth_sft_training(

@@ -48,8 +48,6 @@ from .specs import (
     ResidentScoreJobSpec,
     ResidentScoreResult,
     ResidentScoreShard,
-    SFTForwardJobSpec,
-    SFTForwardResult,
     SFTJobSpec,
     TrainAccepted,
     TrainCancelled,
@@ -592,6 +590,7 @@ class MonarchTrainerActor(Actor):
         job_json: str,
         batches: tuple[PackedSFTBatchData, ...],
         event_port: Port[dict[str, Any]],
+        validation_batches: tuple[PackedSFTBatchData, ...] = (),
     ) -> dict[str, Any]:
         try:
             if not self._valid:
@@ -604,6 +603,7 @@ class MonarchTrainerActor(Actor):
                     batches,
                     _ActorEventSink(event_port, coordinator=coordinator),
                     Event(),
+                    validation_batches,
                 )
                 self._publish_compile_cache()
             if coordinator:
@@ -646,23 +646,6 @@ class MonarchTrainerActor(Actor):
         finally:
             if batch is not None:
                 batch.close()
-
-    @endpoint
-    def forward_sft(
-        self,
-        job_json: str,
-        batches: tuple[PackedSFTBatchData, ...],
-    ) -> dict[str, Any]:
-        try:
-            if not self._valid:
-                raise RuntimeError("trainer actor runtime is invalid")
-            job = SFTForwardJobSpec.model_validate_json(job_json)
-            with self._weight_offload.job():
-                result = self._executor.forward_sft(job, batches)
-            return {"rank": self._runtime.rank, **result.model_dump(mode="json")}
-        except BaseException:
-            self._valid = False
-            raise
 
     @endpoint
     def inspect_resident_lora(self, request_json: str) -> dict[str, Any]:
@@ -1063,31 +1046,6 @@ class MonarchTrainerRun:
                 world_size=len(self.runtime_spec.trainer_mesh.ranks),
             )
 
-    async def forward_sft(
-        self,
-        job: SFTForwardJobSpec,
-        batches: tuple[SFTBatchData, ...],
-    ) -> SFTForwardResult:
-        """Measure SFT loss on held-out batches without changing the learner."""
-        async with self._lock:
-            if error := self._validate_sft_forward(job, batches):
-                raise error
-            packed = await asyncio.to_thread(
-                pack_sft_batches,
-                batches,
-                seq_len=self.runtime_spec.packed_sequence_length,
-            )
-            values = await self._run_resident_collective(
-                job.job_id,
-                self._actors.forward_sft.call(job.model_dump_json(), packed),
-                invalidate_on_error=True,
-            )
-            # Every rank holds the all-reduced totals; rank 0 speaks for the mesh.
-            result = next(value for value in values.values() if int(value["rank"]) == 0)
-            return SFTForwardResult.model_validate(
-                {key: value for key, value in result.items() if key != "rank"}
-            )
-
     async def inspect_resident_lora(
         self,
         request: ResidentLoraInspectionSpec,
@@ -1169,16 +1127,21 @@ class MonarchTrainerRun:
             yield event
 
     async def train_sft(
-        self, job: SFTJobSpec, batches: tuple[SFTBatchData, ...]
+        self,
+        job: SFTJobSpec,
+        batches: tuple[SFTBatchData, ...],
+        validation_batches: tuple[SFTBatchData, ...] = (),
     ) -> AsyncIterator[TrainEvent]:
+        """Train on batches; validation batches add ``loss/val`` to the last step."""
+
         async def dispatch(port: Port[dict[str, Any]]) -> Any:
-            packed = await asyncio.to_thread(
-                pack_sft_batches,
-                batches,
-                seq_len=self.runtime_spec.packed_sequence_length,
+            seq_len = self.runtime_spec.packed_sequence_length
+            packed = await asyncio.to_thread(pack_sft_batches, batches, seq_len=seq_len)
+            packed_validation = await asyncio.to_thread(
+                pack_sft_batches, validation_batches, seq_len=seq_len
             )
             return await self._actors.execute_sft.call(
-                job.model_dump_json(), packed, port
+                job.model_dump_json(), packed, port, packed_validation
             )
 
         async for event in self._train(
@@ -1715,20 +1678,6 @@ class MonarchTrainerRun:
             return ValueError(
                 "resident score routing replay does not match the trainer runtime"
             )
-        return None
-
-    def _validate_sft_forward(
-        self,
-        job: SFTForwardJobSpec,
-        batches: tuple[SFTBatchData, ...],
-    ) -> BaseException | None:
-        if error := self._validate_resident_learner(
-            run_id=job.run_id,
-            learner=job.learner,
-        ):
-            return error
-        if len(batches) != job.num_batches:
-            return ValueError("SFT forward job batch count does not match its payload")
         return None
 
     def _validate_resident_inspection(

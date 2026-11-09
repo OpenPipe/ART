@@ -21,8 +21,6 @@ from .specs import (
     ResidentLoraInspectionSpec,
     ResidentScoreJobSpec,
     ResidentScoreShard,
-    SFTForwardJobSpec,
-    SFTForwardResult,
     SFTJobSpec,
     TrainerGeneration,
     TrainerJobSpec,
@@ -87,6 +85,7 @@ class MegatronTrainJobExecutor:
         batches: tuple[PackedSFTBatchData, ...],
         sink: EventSink,
         cancelled: Event,
+        validation_batches: tuple[PackedSFTBatchData, ...] = (),
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
@@ -110,6 +109,7 @@ class MegatronTrainJobExecutor:
             ),
             snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
             cancelled=cancelled,
+            validation_batches=validation_batches,
         )
         metrics.update(self._stabilize_python_gc())
         timing.previous_job_complete_s = time.monotonic()
@@ -138,16 +138,6 @@ class MegatronTrainJobExecutor:
         from art.megatron.train import execute_megatron_score_job
 
         return execute_megatron_score_job(self.runtime, job, batch.tensors)
-
-    def forward_sft(
-        self,
-        job: SFTForwardJobSpec,
-        batches: tuple[PackedSFTBatchData, ...],
-    ) -> SFTForwardResult:
-        self._validate_resident_score(job.run_id, job.learner)
-        from art.megatron.train import execute_megatron_sft_forward_job
-
-        return execute_megatron_sft_forward_job(self.runtime, job, batches)
 
     def inspect_resident_lora(
         self,
