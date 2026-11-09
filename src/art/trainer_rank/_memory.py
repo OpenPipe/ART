@@ -323,15 +323,6 @@ def _profile_compute_peak(profile: _impl._MemoryProfile, tokens: int | float) ->
     if profile.peak_model_version == _memory_model._MEMORY_PROFILE_VERSION:
         points = profile.compute_observations
         fixed, slope = profile.fixed_compute_bytes, profile.compute_slope
-        if (
-            isinstance(profile, _CallerMemoryProfile)
-            and profile.profile_format_version < 3
-        ):
-            # Older v2 profiles have no independent qualified rate channel.
-            # Refit their backward curve only from completed caller evidence;
-            # forward-only peaks remain binding through compute_peak_floor.
-            points = profile.caller_compute_peaks
-            fixed, slope = _memory_model.fit_points(points)
         # A lone long anchor does not qualify downward extrapolation of fixed
         # workspace. Price below the observed range at its smallest observation.
         extent = (
@@ -427,7 +418,15 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
             raise ValueError("unexpected fixed/slope fields in legacy profile")
         return
     points = profile.compute_observations
-    if not points or _memory_model.merge_points(points) != points:
+    incomplete_caller = (
+        isinstance(profile, _CallerMemoryProfile)
+        and profile.profile_format_version == 2
+        and not profile.caller_compute_peaks
+        and not profile.caller_cp_peaks
+    )
+    if (not points and not incomplete_caller) or _memory_model.merge_points(
+        points
+    ) != points:
         raise ValueError("invalid memory observation hull")
     if profile.profile_format_version in (3, 4, 5):
         floor, rates, absolute = (
@@ -507,7 +506,7 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
         or profile.compute_slope != slope
         or not math.isfinite(profile.legacy_bytes_per_token)
         or profile.legacy_bytes_per_token < 0
-        or profile.packed_tokens < points[-1][0]
+        or (points and profile.packed_tokens < points[-1][0])
     ):
         raise ValueError("invalid fixed/slope memory fit")
 
@@ -3138,6 +3137,8 @@ def _update_memory_profile(
                 or not getattr(plan.signature, "bounded_caller_peak", False)
             )
         )
+        # Raw peak constraints and qualified rates use separate channels here;
+        # the prefix-max caller coverage curve never supplies a fitted rate.
         observations = _memory_model.merge_points(
             () if previous is None else previous.compute_observations,
             ((plan.packed_tokens, compute_delta),),
