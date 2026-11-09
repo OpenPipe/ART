@@ -21,6 +21,8 @@ from .specs import (
     ResidentLoraInspectionSpec,
     ResidentScoreJobSpec,
     ResidentScoreShard,
+    SFTForwardJobSpec,
+    SFTForwardResult,
     SFTJobSpec,
     TrainerGeneration,
     TrainerJobSpec,
@@ -136,6 +138,16 @@ class MegatronTrainJobExecutor:
         from art.megatron.train import execute_megatron_score_job
 
         return execute_megatron_score_job(self.runtime, job, batch.tensors)
+
+    def forward_sft(
+        self,
+        job: SFTForwardJobSpec,
+        batches: tuple[PackedSFTBatchData, ...],
+    ) -> SFTForwardResult:
+        self._validate_resident_score(job.run_id, job.learner)
+        from art.megatron.train import execute_megatron_sft_forward_job
+
+        return execute_megatron_sft_forward_job(self.runtime, job, batches)
 
     def inspect_resident_lora(
         self,

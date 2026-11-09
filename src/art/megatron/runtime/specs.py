@@ -234,6 +234,44 @@ class SFTJobSpec(_TrainerJobSpec):
         return self
 
 
+class SFTForwardJobSpec(_Spec):
+    """Measure SFT loss on held-out batches against the resident learner.
+
+    This is the forward half of an SFT step: no gradients, no optimizer step,
+    and no change to the learner. It mirrors Tinker's
+    ``TrainingClient.forward(data, loss_fn="cross_entropy")``.
+    """
+
+    job_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    learner: TrainerGeneration
+    num_batches: int = Field(ge=1)
+
+
+class SFTForwardResult(_Spec):
+    """Summed SFT loss over the loss-bearing tokens of every forward batch.
+
+    ``loss_sum / num_tokens`` is on the same scale as an SFT step's
+    ``loss/train``: mean cross-entropy per trainable token.
+    """
+
+    job_id: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    learner: TrainerGeneration
+    loss_sum: float = Field(ge=0)
+    num_tokens: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_loss(self) -> "SFTForwardResult":
+        if not math.isfinite(self.loss_sum):
+            raise ValueError("SFT forward loss must be finite")
+        return self
+
+    @property
+    def loss(self) -> float:
+        return self.loss_sum / self.num_tokens if self.num_tokens else 0.0
+
+
 class ResidentScoreJobSpec(_Spec):
     job_id: str = Field(min_length=1)
     run_id: str = Field(min_length=1)

@@ -1,4 +1,5 @@
-"""Real SFT loss/gradient parity across packed rows and independent examples.
+"""Real SFT loss/gradient parity across packed rows and independent examples,
+and forward-only SFT loss parity with the training step.
 
 Run with pytest on one GPU, or torchrun this file for CP/DP/PP qualification.
 ART_SFT_TEST_MODEL optionally selects a pretrained checkpoint instead of the tiny
@@ -141,6 +142,44 @@ def _run(runtime, inputs):
     return float(result.reduced_loss), gradients
 
 
+def _forward(runtime, inputs):
+    from art.megatron.train import run_megatron_sft_forward
+    from art.megatron.training.microbatches import (
+        _zero_contribution_sft_inputs,
+        build_micro_sample_indices,
+        select_sft_micro_inputs,
+        sft_global_microbatch_count,
+    )
+
+    indices = build_micro_sample_indices(
+        step_index=0,
+        num_sequences=len(inputs),
+        global_grad_accumulation_sequences=sft_global_microbatch_count(
+            len(inputs), provider=runtime.provider
+        ),
+    )
+    trainable = [
+        (parameter, parameter.detach().clone())
+        for model in runtime.model
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    ]
+    loss_sum, num_tokens = run_megatron_sft_forward(
+        model_chunks=runtime.model,
+        provider=runtime.provider,
+        model_support_handler=runtime.model_support_handler,
+        inputs=select_sft_micro_inputs(
+            inputs, indices, _zero_contribution_sft_inputs(inputs[0])
+        ),
+        sample_index=indices,
+    )
+    for parameter, before in trainable:
+        torch.testing.assert_close(parameter.detach(), before, rtol=0, atol=0)
+    assert all(model.training for model in runtime.model)
+    assert num_tokens > 0
+    return loss_sum / num_tokens
+
+
 def _mape(candidate, reference, name):
     assert torch.isfinite(candidate).all() and torch.isfinite(reference).all()
     assert candidate.abs().sum() > 0 and reference.abs().sum() > 0, name
@@ -225,7 +264,11 @@ def test_sft_packing_loss_and_gradients():
             rows = []
             for last_only in (False, True):
                 examples = _examples(last_only)
+                # The step's learning rate is 0, so forward sees the same weights.
+                forward_loss = _forward(runtime, examples)
                 expected_loss, expected_gradients = _run(runtime, examples)
+                forward_error = abs(forward_loss - expected_loss) / expected_loss * 100
+                assert forward_error <= 0.5, (forward_loss, expected_loss)
                 for capacity in (384, 1024):
                     packed = list(pack_sft_batch(examples, seq_len=capacity))
                     loss, gradients = _run(runtime, packed)
