@@ -660,6 +660,16 @@ def _split_chunk_lower_cost(
     )
     profile = self._memory_profiles.get(signature)
     if (
+        signature.topology[2] > 1
+        and isinstance(profile, _memory._CallerMemoryProfileV2)
+        and (profile.non_dominant_cp_pairs or profile.dominance_disabled)
+    ):
+        # This preview has no CP family. A revoked-family refusal cannot be
+        # used as its lower bound. Make the preview non-binding; exact child
+        # costs below still enforce every coverage and memory check, using
+        # the existing collectives to keep all ranks on the same path.
+        return _impl._SubforwardCost(required=0, retained=0)
+    if (
         profile is not None
         and profile.retained_compute_bytes_per_token is not None
         and logical_tokens / max(1, packed_tokens)
