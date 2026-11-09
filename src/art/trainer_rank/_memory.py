@@ -207,7 +207,13 @@ def _retained_rate_extent(profile: _impl._MemoryProfile) -> int:
     if profile.profile_format_version >= 3:
         # Older v2 evidence has no independent retained-rate extent. Disable
         # that discount until a new qualified retained observation supplies it.
-        return profile.retained_rate_tokens
+        return min(
+            profile.retained_rate_tokens,
+            max(
+                (n for n, _ in _rate_points(profile, profile.rate_floor_tokens)),
+                default=0,
+            ),
+        )
     return profile.packed_tokens
 
 
@@ -401,14 +407,11 @@ def _merge_memory_profile_model_fields(
             rate_floor_tokens=floor,
             rate_observations=rates,
             absolute_compute_floor=absolute,
-            eligible_packed_tokens=max(
-                max((n for n, _ in _rate_points(p, floor)), default=0)
-                if p.profile_format_version < 4
-                else p.eligible_packed_tokens
-                for p in profiles
-            ),
+            eligible_packed_tokens=max((n for n, _ in rates), default=0),
             subfloor_packed_tokens=max(p.subfloor_packed_tokens for p in profiles),
-            retained_rate_tokens=max(p.retained_rate_tokens for p in profiles),
+            retained_rate_tokens=max(
+                min(p.retained_rate_tokens, _retained_rate_extent(p)) for p in profiles
+            ),
             retained_compute_peaks=_merge_retained_peaks(
                 *(_retained_floor_points(p) for p in profiles)
             ),
@@ -3206,14 +3209,7 @@ def _update_memory_profile(
             rate_floor_tokens=floor,
             rate_observations=rates,
             absolute_compute_floor=absolute,
-            eligible_packed_tokens=max(
-                0
-                if previous is None
-                else previous.eligible_packed_tokens
-                if previous.profile_format_version >= 4
-                else max((n for n, _ in _rate_points(previous, floor)), default=0),
-                plan.packed_tokens if qualifies else 0,
-            ),
+            eligible_packed_tokens=max((n for n, _ in rates), default=0),
             subfloor_packed_tokens=max(
                 0 if previous is None else previous.subfloor_packed_tokens,
                 plan.packed_tokens if plan.packed_tokens < floor else 0,
@@ -3260,7 +3256,11 @@ def _update_memory_profile(
     if fixed_slope:
         model_fields.update(
             retained_rate_tokens=max(
-                0 if previous is None else previous.retained_rate_tokens,
+                0
+                if previous is None
+                else min(
+                    previous.retained_rate_tokens, _retained_rate_extent(previous)
+                ),
                 plan.packed_tokens
                 if retained_bytes is not None and learns_rates
                 else 0,
