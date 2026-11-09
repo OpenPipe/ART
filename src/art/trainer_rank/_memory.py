@@ -65,21 +65,27 @@ def _fixed_slope_enabled(profile: _impl._MemoryProfile | None) -> bool:
 
 
 def _unanchored(profile: _impl._MemoryProfile | None) -> bool:
+    points = (
+        profile.caller_compute_peaks
+        if isinstance(profile, _CallerMemoryProfile)
+        else profile.compute_observations
+        if profile is not None
+        else ()
+    )
     return (
         profile is None
-        or not profile.compute_observations
-        or (
-            profile.compute_observations[-1][0] < _memory_model._MEMORY_SLOPE_MIN_TOKENS
-        )
+        or not points
+        or points[-1][0] < _memory_model._MEMORY_SLOPE_MIN_TOKENS
     )
 
 
 def _cold_extrapolation_factor(
     profile: _impl._MemoryProfile | None, packed_tokens: int
 ) -> float:
-    if _fixed_slope_enabled(profile) and packed_tokens > (
-        0 if profile is None else profile.packed_tokens
-    ):
+    extent = 0 if profile is None else profile.packed_tokens
+    if isinstance(profile, _CallerMemoryProfile):
+        extent = max((n for n, _ in profile.caller_compute_peaks), default=0)
+    if _fixed_slope_enabled(profile) and packed_tokens > extent:
         # Anchoring selects NEW's slope; it does not qualify extrapolation.
         # The 8K-only boot option still needs the cold margin beyond its last
         # observation (the supplied sweep otherwise under-predicts at 131K).
@@ -89,14 +95,20 @@ def _cold_extrapolation_factor(
 
 def _profile_compute_peak(profile: _impl._MemoryProfile, tokens: int | float) -> float:
     if profile.peak_model_version == _memory_model._MEMORY_PROFILE_VERSION:
+        points = profile.compute_observations
+        fixed, slope = profile.fixed_compute_bytes, profile.compute_slope
+        if isinstance(profile, _CallerMemoryProfile):
+            # Forward-only intervals cannot fit a backward curve. Keep their
+            # peaks in compute_peak_floor, and qualify the fit independently
+            # from completed caller evidence, including restored v2 profiles.
+            points = profile.caller_compute_peaks
+            fixed, slope = _memory_model.fit_points(points)
         # A lone long anchor does not qualify downward extrapolation of fixed
         # workspace. Price below the observed range at its smallest observation.
-        if profile.compute_observations:
-            tokens = max(tokens, profile.compute_observations[0][0])
+        if points:
+            tokens = max(tokens, points[0][0])
         return max(
-            _memory_model.predict(
-                profile.fixed_compute_bytes, profile.compute_slope, tokens
-            ),
+            _memory_model.predict(fixed, slope, tokens),
             profile.legacy_bytes_per_token * tokens,
         )
     return profile.bytes_per_token * tokens
@@ -196,12 +208,15 @@ class _CallerMemoryProfile(_impl._MemoryProfile):
                             self.compute_peak_floor,
                         )
         else:
-            if self.peak_model_version == 2:
-                return max(_profile_compute_peak(self, tokens), self.compute_peak_floor)
             # Preserve #1165's CP1 curve and arithmetic exactly.
             for length, peak in self.caller_compute_peaks:
                 if tokens <= length:
-                    return max(peak, self.compute_peak_floor)
+                    return max(
+                        _profile_compute_peak(self, tokens)
+                        if self.peak_model_version == 2
+                        else peak,
+                        self.compute_peak_floor,
+                    )
         # No discounted extrapolation: even a higher short reload cannot erase
         # earlier growth constraints beyond the measured caller extent.
         return max(
