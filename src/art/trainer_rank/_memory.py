@@ -108,6 +108,12 @@ def _rate_points(profile: _impl._MemoryProfile, floor: int):
 def _absolute_floor(profile: _impl._MemoryProfile, floor: int) -> int:
     return max(
         profile.absolute_compute_floor,
+        # Earlier caller records keep incomplete readings only in this floor.
+        # Preserve that bound on upgrade without turning it into a token rate.
+        profile.compute_peak_floor
+        if isinstance(profile, _CallerMemoryProfile)
+        and profile.profile_format_version < 3
+        else 0,
         max((peak for n, peak in profile.compute_observations if n < floor), default=0),
     )
 

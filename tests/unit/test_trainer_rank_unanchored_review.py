@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 
 from art.trainer_rank import _impl
 from art.trainer_rank import _memory as m
+from art.trainer_rank import _planner_misses as reports
 
 
 def runtime_observe(monkeypatch, rank, key, n, peak, retained=None):
@@ -285,3 +286,28 @@ def test_independent_extents_and_retained_floors_merge_and_roundtrip():
             rank, cast(Any, plan), 2_000_000_000, retained_bytes=2_000_000
         )
         assert child_cost(rank, key).retained >= 8_000_000_000
+
+
+def test_promoting_incomplete_caller_preserves_its_forward_floor():
+    rank = _rank()
+    key = replace(signature((0, "forward_backward", 8)), topology=(1, 1, 1, 1))
+    root = m._ScopedMemorySignature(**vars(key), bounded_caller_peak=True)
+    # Earlier caller-v2 records keep incomplete peaks only in the safety floor.
+    previous = m._CallerMemoryProfileV2(
+        bytes_per_token=20 * 2**30 / 32768,
+        packed_tokens=32768,
+        compute_peak_floor=20 * 2**30,
+    )
+    m._validate_memory_profile_model(previous)
+    rank._memory_profiles[root] = reports._memory_profile(
+        json.loads(json.dumps(asdict(previous)))
+    )
+    with m.fixed_slope_memory_profiles():
+        observe(rank, root, 8192, 16 * 2**30)
+        profile = rank._memory_profiles[root]
+        assert profile.absolute_compute_floor == 20 * 2**30
+        assert profile.compute_slope == (16 * 2**30, 8192)
+        assert m._trusted_extent(profile) == 8192
+        reference = m._rate_reference(rank, key, None, packed_tokens=8192)
+        assert reference is not None and reference.source == "calibration_root"
+        assert reference.fixed >= 20 * 2**30
