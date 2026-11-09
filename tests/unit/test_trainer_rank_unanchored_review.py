@@ -16,6 +16,7 @@ import torch.multiprocessing as mp
 
 from art.trainer_rank import _impl
 from art.trainer_rank import _memory as m
+from art.trainer_rank import _planner_misses as reports
 
 
 def runtime_observe(monkeypatch, rank, key, n, peak, retained=None):
@@ -285,3 +286,87 @@ def test_independent_extents_and_retained_floors_merge_and_roundtrip():
             rank, cast(Any, plan), 2_000_000_000, retained_bytes=2_000_000
         )
         assert child_cost(rank, key).retained >= 8_000_000_000
+
+
+def test_promoting_incomplete_caller_preserves_its_forward_floor():
+    rank = _rank()
+    key = replace(signature((0, "forward_backward", 8)), topology=(1, 1, 1, 1))
+    root = m._ScopedMemorySignature(**vars(key), bounded_caller_peak=True)
+    # Earlier caller-v2 records keep incomplete peaks only in the safety floor.
+    previous = m._CallerMemoryProfileV2(
+        bytes_per_token=20 * 2**30 / 32768,
+        packed_tokens=32768,
+        compute_peak_floor=20 * 2**30,
+        profile_format_version=2,
+    )
+    m._validate_memory_profile_model(previous)
+    rank._memory_profiles[root] = reports._memory_profile(
+        json.loads(json.dumps(asdict(previous)))
+    )
+    with m.fixed_slope_memory_profiles():
+        observe(rank, root, 8192, 16 * 2**30)
+        profile = rank._memory_profiles[root]
+        assert profile.absolute_compute_floor == 20 * 2**30
+        assert profile.compute_slope == (16 * 2**30, 8192)
+        assert m._trusted_extent(profile) == 8192
+        reference = m._rate_reference(rank, key, None, packed_tokens=8192)
+        assert reference is not None and reference.source == "calibration_root"
+        assert reference.fixed >= 20 * 2**30
+
+
+@pytest.mark.parametrize("fmt", [2, 5])
+def test_restored_forward_only_caller_cannot_supply_a_backward_rate(fmt):
+    rank = _rank()
+    key = replace(signature((0, "forward_backward", 8)), topology=(1, 1, 1, 1))
+    root = m._ScopedMemorySignature(**vars(key), bounded_caller_peak=True)
+    points = ((32768, 20 * 2**30),)
+    fields: dict[str, Any] = dict(
+        bytes_per_token=20 * 2**30 / 32768,
+        packed_tokens=32768,
+        compute_observations=points,
+        compute_slope=(20 * 2**30, 32768),
+        compute_peak_floor=20 * 2**30,
+        profile_format_version=fmt,
+    )
+    if fmt >= 3:
+        fields.update(
+            rate_floor_tokens=64,
+            rate_observations=points,
+            eligible_packed_tokens=32768,
+        )
+    # Earlier collection could record a long forward with no completed caller.
+    previous = m._CallerMemoryProfileV2(**fields)
+    m._validate_memory_profile_model(previous)
+    rank._memory_profiles[root] = previous
+    with m.fixed_slope_memory_profiles():
+        assert m._unanchored(previous)
+        assert m._trusted_extent(previous) == 0
+        assert m._absolute_floor(previous, 64) >= 20 * 2**30
+        assert m._rate_reference(rank, root, previous, packed_tokens=8192) is None
+        assert required(rank, root, 8192) >= m._MEMORY_DEFERRED_BYTES
+
+
+def test_unusable_restored_caller_root_cannot_switch_to_a_model_anchor():
+    rank = _rank()
+    key = replace(signature((0, "forward_backward", 8)), topology=(1, 1, 1, 1))
+    root = m._ScopedMemorySignature(**vars(key), bounded_caller_peak=True)
+    points = ((3, 60 * 2**30), (32768, 20 * 2**30))
+    fixed, slope = m._memory_model.fit_points(points)
+    # The raw hull lost the completed 8K point after a later forward-only read.
+    previous = m._CallerMemoryProfileV2(
+        bytes_per_token=60 * 2**30 / 3,
+        packed_tokens=32768,
+        compute_observations=points,
+        fixed_compute_bytes=fixed,
+        compute_slope=slope,
+        caller_compute_peaks=((3, 60 * 2**30), (8192, 60 * 2**30)),
+        compute_peak_floor=60 * 2**30,
+        caller_plans=2,
+        profile_format_version=2,
+    )
+    m._validate_memory_profile_model(previous)
+    rank._memory_profiles[root] = previous
+    with m.fixed_slope_memory_profiles():
+        observe(rank, replace(key, request_mix=("hidden",)), 32768, 1_000_000_000)
+        assert m._rate_reference(rank, key, None, packed_tokens=8192) is None
+        assert required(rank, key, 8192) >= m._MEMORY_DEFERRED_BYTES
