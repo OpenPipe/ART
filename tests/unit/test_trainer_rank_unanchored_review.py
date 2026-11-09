@@ -311,3 +311,34 @@ def test_promoting_incomplete_caller_preserves_its_forward_floor():
         reference = m._rate_reference(rank, key, None, packed_tokens=8192)
         assert reference is not None and reference.source == "calibration_root"
         assert reference.fixed >= 20 * 2**30
+
+
+@pytest.mark.parametrize("fmt", [2, 5])
+def test_restored_forward_only_caller_cannot_supply_a_backward_rate(fmt):
+    rank = _rank()
+    key = replace(signature((0, "forward_backward", 8)), topology=(1, 1, 1, 1))
+    root = m._ScopedMemorySignature(**vars(key), bounded_caller_peak=True)
+    points = ((32768, 20 * 2**30),)
+    fields: dict[str, Any] = dict(
+        bytes_per_token=20 * 2**30 / 32768,
+        packed_tokens=32768,
+        compute_observations=points,
+        compute_slope=(20 * 2**30, 32768),
+        compute_peak_floor=20 * 2**30,
+        profile_format_version=fmt,
+    )
+    if fmt >= 3:
+        fields.update(
+            rate_floor_tokens=64,
+            rate_observations=points,
+            eligible_packed_tokens=32768,
+        )
+    # Earlier collection could record a long forward with no completed caller.
+    previous = m._CallerMemoryProfileV2(**fields)
+    m._validate_memory_profile_model(previous)
+    rank._memory_profiles[root] = previous
+    with m.fixed_slope_memory_profiles():
+        assert m._unanchored(previous)
+        assert m._trusted_extent(previous) == 0
+        assert m._rate_reference(rank, root, previous, packed_tokens=8192) is None
+        assert required(rank, root, 8192) >= m._MEMORY_DEFERRED_BYTES

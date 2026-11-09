@@ -125,3 +125,17 @@ def test_expired_model_anchor_cannot_leave_only_a_cheaper_contributor(cp):
         after = required(rank, key, 8193, cp_workload=work)
         assert after >= before
         assert after >= m._MEMORY_DEFERRED_BYTES
+
+
+def test_own_caller_price_does_not_drop_after_completed_extent():
+    rank = _rank()
+    key = replace(signature((0, "forward_backward", 8)), topology=(1, 1, 1, 1))
+    root = m._ScopedMemorySignature(**vars(key), bounded_caller_peak=True)
+    with m.fixed_slope_memory_profiles():
+        observe(rank, root, 8192, 1_000_000_000)
+        # A measured caller outside the own learning window supplies a floor.
+        observe(rank, root, 131072, 15_000_000_000, eligible=False)
+        assert m._trusted_extent(rank._memory_profiles[root]) == 8192
+        before = required(rank, root, 131072)
+        after = required(rank, root, 131073)
+        assert after >= before
