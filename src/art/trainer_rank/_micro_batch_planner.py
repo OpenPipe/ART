@@ -121,6 +121,7 @@ class CalibrationRung:
             family_seed = getattr(plan, "_calibration_cp_family_seed", False)
             key = plan.signature
             if family_seed:
+                assert isinstance(plan, _impl._FlatForwardPlan)
                 assert plan.caller_cp_workload is not None
                 family = plan.caller_cp_workload[0]
                 key = (key, _memory._cp_pair(family, family)[0])

@@ -90,7 +90,8 @@ def test_recorded_short_recurrence_is_uncovered_despite_identical_kernels(lora):
     short = workload(template, 512)
     with memory.fixed_slope_memory_profiles():
         assert not memory._unanchored(profile)
-        assert memory._rate_reference(rank, key, profile).source == "signature"
+        reference = memory._rate_reference(rank, key, profile)
+        assert reference is not None and reference.source == "signature"
         assert memory._rate_floor_tokens(key) == 512
         assert not memory._uncovered_subfloor_cp(profile, key, 512, short)
         assert required(rank, key, 512, short) == row["required"] == 5072854620278311936
