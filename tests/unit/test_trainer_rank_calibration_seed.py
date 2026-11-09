@@ -50,7 +50,7 @@ class CP8Rank(TrainerRank):
         return (0, 1)
 
 
-def metadata_rank(kind):
+def metadata_rank(kind, *, head_dim=256):
     """Real checkpoint/owner types, not a full GPU model or measured static fit."""
     model = cast(
         Any, (checkpoint_rank() if kind == "moe" else dense_rank()).runtime.model[0]
@@ -67,9 +67,11 @@ def metadata_rank(kind):
             torch.nn.Module.__init__(owner)
             owner.non_gated = False
             layer.mlp.linear_fc1 = owner
-    cfg.kv_channels = 256
-    cfg.num_attention_heads = 16 if kind == "moe" else 24
-    cfg.num_query_groups = 2 if kind == "moe" else 4
+    cfg.kv_channels = head_dim
+    cfg.num_attention_heads = (
+        cfg.hidden_size // 128 if head_dim == 128 else 16 if kind == "moe" else 24
+    )
+    cfg.num_query_groups = 8 if head_dim == 128 else 2 if kind == "moe" else 4
     cfg.context_parallel_size = 8
     cfg.tensor_model_parallel_size = cfg.expert_model_parallel_size = 1
     cfg.expert_tensor_parallel_size = cfg.pipeline_model_parallel_size = 1
