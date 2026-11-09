@@ -677,6 +677,14 @@ class _MemoryProfile:
     fixed_compute_bytes = 0
     compute_slope = (0, 1)
     legacy_bytes_per_token = 0.0
+    profile_format_version = 1
+    rate_floor_tokens = 0
+    rate_observations = cast(tuple[tuple[int, int], ...] | None, None)
+    absolute_compute_floor = 0
+    eligible_packed_tokens = 0
+    subfloor_packed_tokens = 0
+    retained_rate_tokens = 0
+    retained_compute_peaks = cast(tuple[tuple[int, int], ...], ())
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         # Earlier v2 pickles used the legacy class name. Promote their tagged
@@ -697,6 +705,16 @@ class _MemoryProfileV2(_MemoryProfile):
     # A v1 scalar has lost its observations. Never silently discard its bound
     # on update; a fresh calibration/cache key is needed to remove poisoning.
     legacy_bytes_per_token: float = 0.0
+    # Fresh collection writes format 5. Earlier formats remain readable; independent
+    # token extents and retained floors cannot be recovered from their hulls.
+    profile_format_version: int = 2
+    rate_floor_tokens: int = 0
+    rate_observations: tuple[tuple[int, int], ...] | None = None
+    absolute_compute_floor: int = 0
+    eligible_packed_tokens: int = 0
+    subfloor_packed_tokens: int = 0
+    retained_rate_tokens: int = 0
+    retained_compute_peaks: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2222,6 +2240,8 @@ class TrainerRank:
         # Tracked peak-counter resets, and the latest (resets, peak) reading.
         self._peak_resets = 0
         self._peak_reading: tuple[int, int] | None = None
+        self._suppressed_caller_memory_samples = 0
+        self._caller_memory_sample_warning_logged = False
         self._split_memory_floors: dict[bytes, int] = {}
         self._split_memory_floor_status = "not_observed"
         self._last_global_micro_batch_size: int | None = None
@@ -2661,6 +2681,14 @@ class TrainerRank:
         a backward deferred past it is not. A wave with another TrainerRank
         forward inside its yield cannot lower later estimates below the
         signature's first wave.
+
+        Close this iterator on early exit to release its local references.
+        Closing never samples memory or performs a profiling collective.
+        Non-device post-yield sampling/update exceptions skip learning for that local
+        sample, are counted, and warn once per trainer instance. They do not
+        interrupt the next wave; device faults and process-control exceptions
+        still propagate.
+        The caller coordinates errors before starting another replicated wave.
         """
         if not isinstance(yield_empty, bool):
             raise TypeError("yield_empty must be a bool")

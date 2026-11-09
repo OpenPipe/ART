@@ -45,14 +45,17 @@ def fit_points(
     points: tuple[MemoryPoint, ...],
     *,
     min_tokens: int = _MEMORY_SLOPE_MIN_TOKENS,
+    rate_points: tuple[MemoryPoint, ...] | None = None,
+    absolute_floor: int = 0,
 ) -> tuple[int, MemoryPoint]:
     """Return an upward-rounded fixed term and exact rational slope (bytes, tokens)."""
     if not points:
         return 0, (0, 1)
-    length, peak = points[-1]
+    rates = points if rate_points is None else rate_points
+    length, peak = rates[-1] if rates else (0, 0)
     numerator, denominator = (peak, length) if length >= min_tokens else (0, 1)
     fixed = max(
-        0,
+        absolute_floor,
         max(
             (compute * denominator - numerator * tokens + denominator - 1)
             // denominator

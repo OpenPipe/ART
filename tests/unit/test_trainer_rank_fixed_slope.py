@@ -28,12 +28,12 @@ def test_tiny_forward_does_not_poison_large_forward():
     seed = rank._plan_flat_forward(
         [ForwardInput(input_tokens=torch.arange(8), hidden_states=True, no_grad=True)]
     )
-    # Reconstruct a production CP8 529.328 GiB / 8192-token refusal rate. This is a
-    # synthetic eight-token workspace observation, not a new GPU measurement.
+    # Synthetic eight-token workspace regression with a fixed long-wave
+    # reference; the large rate deliberately stresses per-token extrapolation.
     poisoned_rate = (568_361_327_001 / 1.1 - 8192 * 4096) / 8192
     large = replace(seed, packed_tokens=81920, logical_tokens=81920, output_bytes=0)
     tiny = replace(seed, output_bytes=0)
-    # A large root had already fitted before the tiny observation.
+    # Seed a long reference before adding the fixed workspace observation.
     rank._update_memory_profile(large, 8 * 2**30, retained_bytes=None)
     rank._update_memory_profile(
         tiny, round(poisoned_rate * tiny.packed_tokens), retained_bytes=None
@@ -162,9 +162,15 @@ def test_monotone_through_threshold_trust_extent_and_logical_rows(profile_type):
     sig = signature()
     for tokens, peak in ((1, 2**29), (8192, 2**30), (32768, 2**31)):
         observe(r, sig, tokens, peak)
-    p = _memory._memory_profile_from_values(
-        {**asdict(profile_type(1, 1)), **asdict(r._memory_profiles[sig])}
-    )
+    values = {**asdict(profile_type(1, 1)), **asdict(r._memory_profiles[sig])}
+    if profile_type is _memory._CallerMemoryProfile:
+        # Caller trust requires completed intervals in addition to token extents.
+        values.update(
+            caller_compute_peaks=((1, 2**29), (8192, 2**30), (32768, 2**31)),
+            compute_peak_floor=2**31,
+            caller_plans=3,
+        )
+    p = _memory._memory_profile_from_values(values)
     r._memory_profiles[sig] = p
     ns = [1, 2, 128, 8191, 8192, 8193, 32767, 32768, 32769, 8 * 32768, 8 * 32768 + 1]
     for sharing in (1, 2, 32):
@@ -420,9 +426,14 @@ def test_runtime_growth_only_learns_within_trust_until_anchor(monkeypatch):
         ),
     )
     monkeypatch.setattr(_impl.torch.cuda, "max_memory_allocated", lambda _: 2**30)
-    before = r._memory_profiles[sig]
     _memory._update_peak_memory_profile(r, plan, 0)
-    assert r._memory_profiles[sig] == before
+    profile = r._memory_profiles[sig]
+    # An out-of-trust forced observation retains its absolute peak, but cannot
+    # establish a rate, an anchor or a larger trust window.
+    assert profile.absolute_compute_floor == 2**30
+    assert profile.rate_observations == ()
+    assert profile.compute_slope == (0, 1)
+    assert not r._all_ranks_have_memory_profile(signature=sig, packed_tokens=8192)
     for n in [1024, 8192]:
         plan.packed_tokens = plan.active_logical_tokens = n
         _memory._update_peak_memory_profile(r, plan, 0)
