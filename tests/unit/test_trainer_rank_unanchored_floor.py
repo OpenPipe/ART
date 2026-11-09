@@ -199,13 +199,18 @@ def test_no_compatible_evidence_defers_instead_of_using_fixed_only(bad):
         assert required(rank, key, 3, raw=True) >= 300_000_000
 
 
-@pytest.mark.parametrize("n,effective", [(8192, 2_495_969_931), (32768, 8_249_907_166)])
-def test_cold_tiny_then_large_uses_reference_without_extending_learning(
-    monkeypatch, n, effective
-):
+@pytest.mark.parametrize("n", [8192, 32768])
+def test_cold_tiny_then_large_uses_reference_without_extending_learning(monkeypatch, n):
     with m.fixed_slope_memory_profiles():
         h = _harness(monkeypatch)
+        # The cold-path test must price the workspace its fake device measures.
+        monkeypatch.setattr(
+            h.rank,
+            "_plan_head_workspace_bytes",
+            lambda plan: WORKSPACE + RATE * plan.packed_tokens,
+        )
         seed_model_reference(h)
+        clean = h.required(h.plan([n]))
         demands = []
         original = h.rank._run_flat_plan_with_memory_tracking
 
@@ -218,14 +223,14 @@ def test_cold_tiny_then_large_uses_reference_without_extending_learning(
         assert [p.packed_tokens for p in h.executed] == [3, n]
         # Split retained/ephemeral integer accounting may differ by one byte
         # from the direct admission operand. Both cover the injected peak.
-        assert effective - 1 <= demands[-1] <= effective
+        assert clean - 1 <= demands[-1] <= clean
         assert demands[-1] >= WORKSPACE + RATE * n
         profile = h.rank._memory_profiles[h.plan([n]).signature]
         # The compatible reference prices admission, not learning. Until this
         # signature has its own floor-qualified evidence, real large waves
         # retain their absolute bound without widening the learning window.
         assert profile.rate_observations == ()
-        assert m._trusted_extent(profile) == 3
+        assert m._trusted_extent(profile) == 0
         assert m._unanchored(profile)
         for plan, peak in h.observations:
             with pytest.MonkeyPatch.context() as patch:
@@ -236,6 +241,7 @@ def test_cold_tiny_then_large_uses_reference_without_extending_learning(
                         output_bytes=plan.output_bytes,
                         logical_tokens=plan.active_logical_tokens,
                         signature=plan.signature,
+                        head_workspace_bytes=h.rank._plan_head_workspace_bytes(plan),
                         include_cold_extrapolation=False,
                     )
                     >= peak
@@ -244,18 +250,19 @@ def test_cold_tiny_then_large_uses_reference_without_extending_learning(
 
 
 @pytest.mark.parametrize("seed", [False, True])
-def test_tiny_only_sequence_retains_every_peak_without_learning_a_rate(
-    monkeypatch, seed
-):
+def test_tiny_only_sequence_uses_cold_bound_without_learning_a_rate(monkeypatch, seed):
     with m.fixed_slope_memory_profiles():
         h = _harness(monkeypatch)
+        monkeypatch.setattr(
+            h.rank,
+            "_plan_head_workspace_bytes",
+            lambda plan: WORKSPACE + RATE * plan.packed_tokens,
+        )
         if seed:
             seed_model_reference(h)
         for n in (3, 8, 16, 32, 256) * 3:
             h.run([n])
-            p = h.rank._memory_profiles[h.plan([n]).signature]
-            assert p.rate_observations == () and p.compute_slope == (0, 1)
-            assert p.absolute_compute_floor >= WORKSPACE + RATE * n - 4 * n
+            assert h.plan([n]).signature not in h.rank._memory_profiles
             assert h.required(h.plan([n])) >= WORKSPACE + RATE * n
             plan = h.plan([n])
             with pytest.MonkeyPatch.context() as patch:
@@ -266,6 +273,7 @@ def test_tiny_only_sequence_retains_every_peak_without_learning_a_rate(
                         logical_tokens=n,
                         output_bytes=plan.output_bytes,
                         signature=plan.signature,
+                        head_workspace_bytes=h.rank._plan_head_workspace_bytes(plan),
                         include_cold_extrapolation=False,
                     )
                     >= WORKSPACE + RATE * n
