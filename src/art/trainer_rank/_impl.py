@@ -3098,6 +3098,14 @@ class TrainerRank:
         hybridep_growth_bytes: int = 0,
         caller_cp_workload: _memory._CPWorkload | None = None,
     ) -> _SubforwardCost:
+        profile = self._memory_profiles.get(signature)
+        cold_subfloor = _memory._uncovered_subfloor_cp(
+            profile, signature, packed_tokens, caller_cp_workload
+        )
+        if cold_subfloor:
+            # Match the estimator's effective cold profile for every split
+            # charge; an uncovered family grants no retained-graph discount.
+            profile = None
         checkpoint_memory = self._sequence_parallel_lora_floor(
             self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments),
             group_rows,
@@ -3120,16 +3128,20 @@ class TrainerRank:
             include_cold_extrapolation=False,
         )
         checkpoint_retained, checkpoint_workspace = checkpoint_memory
-        retained = self._retained_memory_bytes(
-            signature,
-            packed_tokens=packed_tokens,
-            logical_tokens=logical_tokens,
-            output_bytes=output_bytes,
-            required=required,
-            checkpoint_retained_bytes=max(
-                checkpoint_retained,
-                checkpoint_floor[0],
-            ),
+        retained = (
+            required
+            if cold_subfloor
+            else self._retained_memory_bytes(
+                signature,
+                packed_tokens=packed_tokens,
+                logical_tokens=logical_tokens,
+                output_bytes=output_bytes,
+                required=required,
+                checkpoint_retained_bytes=max(
+                    checkpoint_retained,
+                    checkpoint_floor[0],
+                ),
+            )
         )
         # One logical BF16 input gradient per eligible full/uniform/1 boundary
         # (TP x SP: one input-gradient shard; the workspace is explicit).
@@ -3153,7 +3165,7 @@ class TrainerRank:
         checkpoint_workspace = max(
             checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
-        if gradient and self._memory_profiles.get(signature) is None:
+        if gradient and profile is None:
             checkpoint_workspace += self._cold_recompute_transient_bytes()
         forward_required = required
         if gradient:
@@ -3172,7 +3184,9 @@ class TrainerRank:
         # HybridEP buffer growth stays allocated through the forward and
         # backward peaks, but is not forward retention.
         cold = _memory._cold_extrapolation_factor(
-            self._memory_profiles.get(signature), packed_tokens
+            profile,
+            packed_tokens,
+            **({"fixed_slope": True} if cold_subfloor else {}),
         )
         return _SubforwardCost(
             required=math.ceil(
