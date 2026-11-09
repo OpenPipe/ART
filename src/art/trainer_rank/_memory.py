@@ -454,6 +454,22 @@ def _uncovered_subfloor_cp(
         and 0 < packed_tokens < _rate_floor_tokens(signature)
     ):
         return False
+    if isinstance(profile, _CallerMemoryProfileV2) and (
+        profile.dominance_disabled
+        or (
+            profile.non_dominant_cp_pairs
+            and (
+                workload is None
+                or any(
+                    requested == _cp_pair(workload[0], workload[0])[0]
+                    for requested, _ in profile.non_dominant_cp_pairs
+                )
+            )
+        )
+    ):
+        # A disproved covering relation is not fresh cold evidence. Keep its
+        # empirical bounds and collective refusal until valid coverage exists.
+        return False
     if (
         profile is not None
         and not isinstance(profile, _CallerMemoryProfile)
