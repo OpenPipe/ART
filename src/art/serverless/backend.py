@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, cast
 import warnings
@@ -898,6 +898,8 @@ class ServerlessBackend:
         not_after_step: int | None = None,
         verbose: bool = False,
         prefix: str | None = None,
+        *,
+        from_entity: str | None = None,
     ) -> None:
         """Fork a checkpoint from another model to initialize this model.
 
@@ -916,140 +918,140 @@ class ServerlessBackend:
             not_after_step: If provided, uses the latest checkpoint <= this step.
             verbose: Whether to print verbose output.
             prefix: Optional S3 prefix for bucket operations.
+            from_entity: W&B entity of the source model for artifacts and provenance.
+                Defaults to model.entity or W&B's default entity. Does not affect
+                S3 checkpoint paths.
         """
         import os
         import tempfile
 
         from_project = from_project or model.project
+        source_entity = from_entity or model.entity
 
-        if from_s3_bucket is not None:
-            # Pull from S3
-            from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
-            from art.utils.s3_checkpoint_utils import (
-                get_checkpoint_step_not_after_from_s3,
-                get_latest_checkpoint_step_from_s3,
-            )
-
-            if not_after_step is None:
-                target_step = await get_latest_checkpoint_step_from_s3(
-                    model_name=from_model,
-                    project=from_project,
-                    s3_bucket=from_s3_bucket,
-                    prefix=prefix,
-                )
-            else:
-                target_step = await get_checkpoint_step_not_after_from_s3(
-                    model_name=from_model,
-                    project=from_project,
-                    not_after_step=not_after_step,
-                    s3_bucket=from_s3_bucket,
-                    prefix=prefix,
+        with ExitStack() as checkpoint_stack:
+            if from_s3_bucket is not None:
+                # Pull from S3
+                from art.utils.s3 import build_s3_path, ensure_bucket_exists, s3_sync
+                from art.utils.s3_checkpoint_utils import (
+                    get_checkpoint_step_not_after_from_s3,
+                    get_latest_checkpoint_step_from_s3,
                 )
 
-            if target_step is None:
-                raise ValueError(
-                    f"No suitable checkpoint found in S3 for model {from_model}"
-                )
-
-            if verbose:
-                print(f"Pulling checkpoint step {target_step} from S3...")
-
-            checkpoint_dir = os.path.join(
-                tempfile.gettempdir(),
-                "art_fork_checkpoints",
-                from_project,
-                from_model,
-                f"{target_step:04d}",
-            )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
-            s3_path = build_s3_path(
-                model_name=from_model,
-                project=from_project,
-                step=target_step,
-                s3_bucket=from_s3_bucket,
-                prefix=prefix,
-            )
-            await ensure_bucket_exists(from_s3_bucket)
-            await s3_sync(s3_path, checkpoint_dir, verbose=verbose)
-            selected_step = target_step
-        else:
-            # Pull from W&B artifacts
-            api = wandb_sdk.api(api_key=self._client.api_key)
-            from_entity = model.entity or api.default_entity
-
-            # Iterate all artifact versions to find the best step.
-            # We avoid relying on the W&B `:latest` alias because it
-            # may not correspond to the highest training step.
-            collection_path = f"{from_entity}/{from_project}/{from_model}"
-            versions = api.artifacts("lora", collection_path)
-
-            best_step: int | None = None
-            best_artifact = None
-            for version in versions:
-                step_num = _extract_step_from_wandb_artifact(version)
-                if step_num is None:
-                    continue
-                if not_after_step is not None and step_num > not_after_step:
-                    continue
-                if best_step is None or step_num > best_step:
-                    best_step = step_num
-                    best_artifact = version
-
-            if best_step is None or best_artifact is None:
-                if not_after_step is not None:
-                    raise ValueError(
-                        f"No checkpoints found not after step {not_after_step} "
-                        f"for model {from_model}"
+                if not_after_step is None:
+                    target_step = await get_latest_checkpoint_step_from_s3(
+                        model_name=from_model,
+                        project=from_project,
+                        s3_bucket=from_s3_bucket,
+                        prefix=prefix,
                     )
-                raise ValueError(f"No checkpoints found for model {from_model}")
-            selected_step = best_step
-            artifact = best_artifact
+                else:
+                    target_step = await get_checkpoint_step_not_after_from_s3(
+                        model_name=from_model,
+                        project=from_project,
+                        not_after_step=not_after_step,
+                        s3_bucket=from_s3_bucket,
+                        prefix=prefix,
+                    )
 
-            checkpoint_dir = os.path.join(
-                tempfile.gettempdir(),
-                "art_fork_checkpoints",
-                from_project,
-                from_model,
-                f"{selected_step:04d}" if selected_step is not None else "latest",
-            )
-            os.makedirs(checkpoint_dir, exist_ok=True)
-            artifact.download(root=checkpoint_dir)
+                if target_step is None:
+                    raise ValueError(
+                        f"No suitable checkpoint found in S3 for model {from_model}"
+                    )
+
+                if verbose:
+                    print(f"Pulling checkpoint step {target_step} from S3...")
+
+                checkpoint_dir = os.path.join(
+                    tempfile.gettempdir(),
+                    "art_fork_checkpoints",
+                    from_project,
+                    from_model,
+                    f"{target_step:04d}",
+                )
+                os.makedirs(checkpoint_dir, exist_ok=True)
+
+                s3_path = build_s3_path(
+                    model_name=from_model,
+                    project=from_project,
+                    step=target_step,
+                    s3_bucket=from_s3_bucket,
+                    prefix=prefix,
+                )
+                await ensure_bucket_exists(from_s3_bucket)
+                await s3_sync(s3_path, checkpoint_dir, verbose=verbose)
+                selected_step = target_step
+            else:
+                # Pull from W&B artifacts
+                api = wandb_sdk.api(api_key=self._client.api_key)
+                source_entity = source_entity or api.default_entity
+
+                # Iterate all artifact versions to find the best step.
+                # We avoid relying on the W&B `:latest` alias because it
+                # may not correspond to the highest training step.
+                collection_path = f"{source_entity}/{from_project}/{from_model}"
+                versions = api.artifacts("lora", collection_path)
+
+                best_step: int | None = None
+                best_artifact = None
+                for version in versions:
+                    step_num = _extract_step_from_wandb_artifact(version)
+                    if step_num is None:
+                        continue
+                    if not_after_step is not None and step_num > not_after_step:
+                        continue
+                    if best_step is None or step_num > best_step:
+                        best_step = step_num
+                        best_artifact = version
+
+                if best_step is None or best_artifact is None:
+                    if not_after_step is not None:
+                        raise ValueError(
+                            f"No checkpoints found not after step {not_after_step} "
+                            f"for model {from_model}"
+                        )
+                    raise ValueError(f"No checkpoints found for model {from_model}")
+                selected_step = best_step
+                artifact = best_artifact
+
+                checkpoint_dir = checkpoint_stack.enter_context(
+                    tempfile.TemporaryDirectory(prefix="art_fork_checkpoints_")
+                )
+                artifact.download(root=checkpoint_dir)
+
+                if verbose:
+                    print(f"Downloaded source checkpoint step {selected_step} from W&B")
+
+            # Upload as W&B artifact for the destination model
+            assert model.entity is not None, "Model entity is required"
 
             if verbose:
-                print(f"Downloaded source checkpoint step {selected_step} from W&B")
+                print(
+                    "Uploading forked checkpoint as W&B artifact for "
+                    f"{model._storage_name()}..."
+                )
 
-        # Upload as W&B artifact for the destination model
-        assert model.entity is not None, "Model entity is required"
-
-        if verbose:
-            print(
-                "Uploading forked checkpoint as W&B artifact for "
-                f"{model._storage_name()}..."
+            wandb_sdk.login(key=self._client.api_key)
+            run = wandb_sdk.init(
+                project=model.project,
+                entity=model.entity,
+                job_type="checkpoint-fork",
+                name=f"fork-{from_model}-to-{model._storage_name()}",
+                settings=wandb_sdk.settings(silent=True),
             )
+            assert run is not None
 
-        wandb_sdk.login(key=self._client.api_key)
-        run = wandb_sdk.init(
-            project=model.project,
-            entity=model.entity,
-            job_type="checkpoint-fork",
-            name=f"fork-{from_model}-to-{model._storage_name()}",
-            settings=wandb_sdk.settings(silent=True),
-        )
-        assert run is not None
-
-        dest_artifact = wandb_sdk.artifact(name=model._storage_name(), type="lora")
-        dest_artifact.add_dir(checkpoint_dir)
-        aliases = ["latest"]
-        if selected_step is not None:
-            aliases.insert(0, f"step{selected_step}")
-        run.log_artifact(dest_artifact, aliases=aliases)
-        run.finish()
+            dest_artifact = wandb_sdk.artifact(name=model._storage_name(), type="lora")
+            dest_artifact.add_dir(checkpoint_dir)
+            aliases = ["latest"]
+            if selected_step is not None:
+                aliases.insert(0, f"step{selected_step}")
+            run.log_artifact(dest_artifact, aliases=aliases)
+            run.finish()
 
         # Copy provenance from the source model's W&B run to the destination model
         api = wandb_sdk.api(api_key=self._client.api_key)
         try:
-            source_run = api.run(f"{model.entity}/{from_project}/{from_model}")
+            source_run = api.run(f"{source_entity}/{from_project}/{from_model}")
             source_provenance = source_run.config.get("wandb.provenance")
             if source_provenance is not None:
                 dest_run = model._get_wandb_run()
