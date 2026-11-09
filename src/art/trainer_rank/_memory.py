@@ -97,12 +97,6 @@ def _profile_compute_peak(profile: _impl._MemoryProfile, tokens: int | float) ->
     if profile.peak_model_version == _memory_model._MEMORY_PROFILE_VERSION:
         points = profile.compute_observations
         fixed, slope = profile.fixed_compute_bytes, profile.compute_slope
-        if isinstance(profile, _CallerMemoryProfile):
-            # Forward-only intervals cannot fit a backward curve. Keep their
-            # peaks in compute_peak_floor, and qualify the fit independently
-            # from completed caller evidence, including restored v2 profiles.
-            points = profile.caller_compute_peaks
-            fixed, slope = _memory_model.fit_points(points)
         # A lone long anchor does not qualify downward extrapolation of fixed
         # workspace. Price below the observed range at its smallest observation.
         if points:
@@ -155,7 +149,14 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
             raise ValueError("unexpected fixed/slope fields in legacy profile")
         return
     points = profile.compute_observations
-    if not points or _memory_model.merge_points(points) != points:
+    incomplete_caller = (
+        isinstance(profile, _CallerMemoryProfile)
+        and not profile.caller_compute_peaks
+        and not profile.caller_cp_peaks
+    )
+    if (not points and not incomplete_caller) or _memory_model.merge_points(
+        points
+    ) != points:
         raise ValueError("invalid memory observation hull")
     fixed, slope = _memory_model.fit_points(points)
     if (
@@ -166,7 +167,7 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
         or profile.compute_slope != slope
         or not math.isfinite(profile.legacy_bytes_per_token)
         or profile.legacy_bytes_per_token < 0
-        or profile.packed_tokens < points[-1][0]
+        or (points and profile.packed_tokens < points[-1][0])
     ):
         raise ValueError("invalid fixed/slope memory fit")
 
@@ -2596,9 +2597,18 @@ def _update_memory_profile(
         previous = None
     model_fields: dict[str, Any] = {}
     if fixed_slope:
+        # The caller curve below is a prefix-max envelope for coverage, not raw
+        # fitting evidence. Keep completed readings here so a tiny high peak
+        # cannot be copied into a long root's rate. Incomplete readings retain
+        # their separate compute_peak_floor without qualifying a backward fit.
+        observation = (
+            ((plan.packed_tokens, compute_delta),)
+            if caller_phase or not getattr(plan.signature, "bounded_caller_peak", False)
+            else ()
+        )
         observations = _memory_model.merge_points(
             () if previous is None else previous.compute_observations,
-            ((plan.packed_tokens, compute_delta),),
+            observation,
         )
         fixed, slope = _memory_model.fit_points(observations)
         legacy_rate = 0.0 if previous is None else previous.legacy_bytes_per_token
