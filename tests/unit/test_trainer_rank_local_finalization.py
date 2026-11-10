@@ -74,7 +74,7 @@ def _gc_worker(index, cp, tp, dp, directory, case):
                 threading.current_thread().name,
             )
         )
-        if case == "inside_collective" and index == 0 and list(tensor.shape) == [1]:
+        if case == "inside_collective" and index == 0 and list(tensor.shape) == [5]:
             original_collect()
         return original_reduce(tensor, op=op, **kwargs)
 
@@ -175,7 +175,7 @@ def test_gc_finalization_is_local(tmp_path, geometry, case):
         for row in rows
     ), rows
     # The sole logged operation is the caller's outer MAX, on the main thread.
-    expected = [["RedOpType.MAX", [1], "torch.float64", "MainThread"]]
+    expected = [["RedOpType.MAX", [5], "torch.float64", "MainThread"]]
     assert all(
         row["operations"] == expected and row["toggles"] == [] for row in rows
     ), rows

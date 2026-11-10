@@ -4049,10 +4049,11 @@ def _memory_check_required(
             device=self._forward_collective_device() if sync_across_dp else self.device,
             dtype=_impl.torch.float64,
         )
-        _impl.dist.all_reduce(
-            values[0] if _calibration is None else values,
-            op=_impl.dist.ReduceOp.MAX,
-            group=group,
+        payload = values[0] if _calibration is None else values
+        _impl._calibration_protocol.collective(
+            lambda: _impl.dist.all_reduce(
+                payload, op=_impl.dist.ReduceOp.MAX, group=group
+            )
         )
         required = int(values[0].item())
         if _calibration is not None:
@@ -4108,6 +4109,8 @@ def _memory_check_required(
             local_available = available
         except BaseException as exc:
             error, available = exc, -1
+        if error is not None and _impl._calibration_protocol.active() is not None:
+            raise error
         exchange_error: BaseException | None = None
         try:
             # A healthy communicator carries local failure to every peer
@@ -4118,7 +4121,12 @@ def _memory_check_required(
             values[2] = (
                 available >= local_required and local_required < _MEMORY_DEFERRED_BYTES
             )
-            _impl.dist.all_reduce(values[1:3], op=_impl.dist.ReduceOp.MIN, group=group)
+            payload = values[1:3]
+            _impl._calibration_protocol.collective(
+                lambda: _impl.dist.all_reduce(
+                    payload, op=_impl.dist.ReduceOp.MIN, group=group
+                )
+            )
             available = int(values[1].item())
             fits = bool(values[2].item())
         except BaseException as exc:

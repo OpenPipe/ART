@@ -403,6 +403,7 @@ def _agreement_worker(index, directory, variant):
             with (
                 patch.object(dist, "all_reduce", reduce),
                 patch.object(dist, "all_gather_object", gather),
+                pytest.MonkeyPatch.context() as oracle_patch,
             ):
                 plan = rank._plan_flat_forward(
                     [request(65536)], sync_planning_errors=True
@@ -410,14 +411,25 @@ def _agreement_worker(index, directory, variant):
                 rank._memory_check(plan, sync_across_dp=True, sync_planning_errors=True)
                 ordinary = list(operations)
                 operations.clear()
+                from test_trainer_rank_calibration_seed import execution_oracle
+
+                oracle = execution_oracle(oracle_patch, rank)
                 with rank.calibration_rung([request(65536)], no_grad=True) as rung:
                     decision = rung.decision
+                    admission = list(operations)
+                    if decision.fits:
+                        list(rung.forward_micro_batches())
+                    else:
+                        with pytest.raises(TrainerRankMemoryError):
+                            rung.forward_micro_batches()
+                        assert oracle["executions"] == 0
             Path(directory, f"rank{index}.json").write_text(
                 json.dumps(
                     dict(
                         decision=asdict(decision),
-                        operations=operations,
+                        operations=admission,
                         ordinary=ordinary,
+                        executions=oracle["executions"],
                     )
                 )
             )
@@ -447,17 +459,14 @@ def test_gloo_replicates_decision_and_components_without_another_exchange(
     a, b = [json.loads((tmp_path / f"rank{i}.json").read_text()) for i in range(2)]
     assert a["decision"] == b["decision"]
     assert a["decision"]["fits"] is admit
+    assert a["executions"] == b["executions"] == int(admit)
     assert a["operations"] == b["operations"]
     # Callback agreement adds separate local-error and entry votes. The
     # admission/checkpoint protocol still changes only its existing MAX payload.
     admission_operations = [
         op
         for op in a["operations"]
-        if not (
-            op[0] == "RedOpType.MAX"
-            and op[1] in ([1], [3])
-            and op[2] == "torch.float64"
-        )
+        if not (op[0] == "RedOpType.MAX" and op[1] == [5] and op[2] == "torch.float64")
     ]
     assert len(admission_operations) == len(a["ordinary"])
     assert [op[0] for op in admission_operations] == [op[0] for op in a["ordinary"]]

@@ -110,6 +110,45 @@ def fake_device(monkeypatch, rank, peak):
     return executed, state
 
 
+def execution_oracle(monkeypatch, rank):
+    """Assert the cohort admitted this exact plan before model entry."""
+    state: dict[str, Any] = {
+        "complete": False,
+        "fits": False,
+        "plan": None,
+        "executions": 0,
+    }
+    original_check = rank._memory_check
+
+    def check(plan, **kwargs):
+        calibration = kwargs.get("_calibration") is not None
+        if calibration:
+            state.update(complete=False, fits=False, plan=None)
+        result = original_check(plan, **kwargs)
+        if calibration:
+            state.update(complete=True, fits=result.fits, plan=plan)
+        return result
+
+    def execute(plan):
+        assert state["complete"], "model entry preceded admission"
+        assert state["fits"], "a refused decision executed"
+        assert state["plan"] is plan, "admission belonged to another plan"
+        state["executions"] += 1
+        return []
+
+    fake_device(monkeypatch, rank, 1_000_000)
+    original_run = rank._run_flat_plan_with_memory_tracking
+
+    def run(plan, **kwargs):
+        rank._execute_flat_plan(plan)
+        return original_run(plan, **kwargs)
+
+    monkeypatch.setattr(rank, "_memory_check", check)
+    monkeypatch.setattr(rank, "_execute_flat_plan", execute)
+    monkeypatch.setattr(rank, "_run_flat_plan_with_memory_tracking", run)
+    return state
+
+
 @pytest.mark.parametrize("kind", ["moe", "dense"])
 def test_real_planner_seed_then_ordinary_8k_then_trust_32k(monkeypatch, kind):
     rank = metadata_rank(kind)
@@ -239,6 +278,19 @@ def test_attempted_seed_cannot_repeat_without_a_complete_sample(monkeypatch):
             assert not retry.decision.seed and not retry.decision.fits
 
 
+def test_invalid_initial_send_keeps_the_generator_owned_until_close(monkeypatch):
+    rank = _rank()
+    fake_device(monkeypatch, rank, 1_000_000)
+    with memory.fixed_slope_memory_profiles():
+        with rank.calibration_rung([request(16384)], no_grad=True) as rung:
+            iterator = cast(Any, rung.forward_micro_batches())
+            with pytest.raises(TypeError):
+                iterator.send(1)
+            next(iterator)
+            iterator.close()
+            assert "_calibration_seed_plan" not in rank.__dict__
+
+
 @pytest.mark.parametrize("grad", [False, True])
 def test_cold_user_paths_keep_the_floor_and_cannot_construct_seed(monkeypatch, grad):
     rank = _rank()
@@ -312,11 +364,27 @@ def _seed_worker(index, directory, variant):
                 rank._update_memory_profile(
                     p, 1_000_000, retained_bytes=None, caller_phase=True
                 )
-            with patch.object(dist, "all_reduce", reduce):
+            with (
+                patch.object(dist, "all_reduce", reduce),
+                pytest.MonkeyPatch.context() as oracle_patch,
+            ):
+                oracle = execution_oracle(oracle_patch, rank)
                 with rank.calibration_rung([request(16384)], no_grad=True) as rung:
                     decision = asdict(rung.decision)
+                    if rung.decision.fits:
+                        list(rung.forward_micro_batches())
+                    else:
+                        with pytest.raises(TrainerRankMemoryError):
+                            rung.forward_micro_batches()
+                        assert oracle["executions"] == 0
             Path(directory, f"rank{index}.json").write_text(
-                json.dumps(dict(decision=decision, operations=ops))
+                json.dumps(
+                    dict(
+                        decision=decision,
+                        operations=ops,
+                        executions=oracle["executions"],
+                    )
+                )
             )
     finally:
         dist.destroy_process_group()
@@ -335,14 +403,16 @@ def test_seed_gloo_replicates_static_decision_and_mixed_eligibility(tmp_path, va
     assert a == b
     d = a["decision"]
     assert d["fits"] is (variant == "admit")
+    assert a["executions"] == int(d["fits"])
     assert d["seed"] is (variant != "reference")
     if variant != "reference":
         assert d["static_compute_bytes"] == 2_000_000_000
         assert d["seed_margin"] == 2.0
     # Callback agreement now follows admission. Preserve the memory-decision
     # operand contract without treating that check as the context's last vote.
-    decision_index = a["operations"].index(["RedOpType.MAX", [32], "torch.float64"])
-    assert a["operations"][decision_index : decision_index + 2] == [
+    decision_ops = [op for op in a["operations"] if op[1] != [5]]
+    decision_index = decision_ops.index(["RedOpType.MAX", [32], "torch.float64"])
+    assert decision_ops[decision_index : decision_index + 2] == [
         ["RedOpType.MAX", [32], "torch.float64"],
         ["RedOpType.MIN", [2], "torch.float64"],
     ]

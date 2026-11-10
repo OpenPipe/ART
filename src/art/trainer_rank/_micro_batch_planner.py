@@ -25,6 +25,7 @@ import hashlib
 import itertools
 from typing import TYPE_CHECKING, Any, cast
 
+from art.trainer_rank import _calibration_protocol as _protocol
 from art.trainer_rank import _impl, _memory
 from art.trainer_rank._backward_work import region as _backward_region
 from art.trainer_rank._planner_cost import COEFFICIENT_VERSION_FALLBACK
@@ -74,61 +75,143 @@ if TYPE_CHECKING:
     )
 
 
-def _raise_calibration_error(self: TrainerRank, error: BaseException | None) -> None:
-    # Keep local API exceptions intact. Distributed callbacks must raise the
-    # same class everywhere, with the original local failure as the cause.
-    if not (_impl.dist.is_available() and _impl.dist.is_initialized()):
-        if error is not None:
-            raise error
-    raise RuntimeError("Calibration failed on one or more ranks") from error
-
-
 @contextmanager
 def _calibration_status(self: TrainerRank) -> Generator[None, None, None]:
-    """Agree on a local step before any subsequent calibration collective."""
-    error: BaseException | None = None
-    try:
+    # The driver owns the current local phase. Its exit is shared with peers'
+    # next orchestration collective, including preparation inside this block.
+    if _protocol.active() is not None:
         yield
-    except GeneratorExit:
-        raise  # Destruction must never introduce a collective.
-    except BaseException as exc:
-        error = exc
-    if self._recovery_reduce([float(error is not None)], op="MAX", sync_across_dp=True)[
-        0
-    ]:
-        _raise_calibration_error(self, error)
+    else:
+        with _protocol.Driver(self):
+            yield
 
 
-@dataclass
-class _CalibrationCallback:
-    rank: TrainerRank
-    entered: bool = False
-    failed: bool = False
+class _ScopeGuard:
+    def __init__(self, scope):
+        self.scope = scope
 
-    def begin(self, execute: bool, error: BaseException | None = None) -> None:
-        # A failed intent writer arrives here from context exit; peers arrive
-        # before model entry. A skipped callback must not match a model vote.
-        failed, largest, negative_smallest = self.rank._recovery_reduce(
-            [float(error is not None), float(execute), -float(execute)],
-            op="MAX",
-            sync_across_dp=True,
+    def close(self):
+        self.scope.local_close_guard()
+        self.scope.abandon_local()
+
+
+class _CalibrationIterator:
+    """Retain the private generator until the explicit driver closes it."""
+
+    def __init__(self, rung):
+        self.rung = rung
+        self._generator = rung._execute()
+        self.finished = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.send(None)
+
+    def _step(self, method, *args):
+        try:
+            return method(*args)
+        except StopIteration:
+            self.finished = True
+            raise
+        except GeneratorExit:
+            self.finished = True
+            raise
+        except BaseException as error:
+            self.finished = self._generator.gi_frame is None
+            # Coordinate execution failures before returning control to a
+            # callback that might catch them. The driver retains the failed
+            # phase even if that callback suppresses the common exception.
+            if self.rung._callback is not None:
+                self.rung._callback.protocol.end(error)
+            raise
+
+    def send(self, value):
+        return self._step(self._generator.send, value)
+
+    def throw(self, error, *args):
+        generator_exit = isinstance(error, GeneratorExit) or (
+            isinstance(error, type) and issubclass(error, GeneratorExit)
         )
-        self.entered = True
-        if failed or largest != -negative_smallest:
-            self.failed = True
-            _raise_calibration_error(self.rank, error)
+        if generator_exit and not self.finished and self.rung._callback is not None:
+            self.rung._callback.local_close_guard()
+        return self._step(self._generator.throw, error, *args)
 
-    def finish(self, error: BaseException | None) -> None:
-        if self.failed:
-            # begin() already exchanged the error on every rank.
-            assert error is not None
-            raise error
-        if not self.entered:
-            self.begin(False, error)
-        elif self.rank._recovery_reduce(
-            [float(error is not None)], op="MAX", sync_across_dp=True
-        )[0]:
-            _raise_calibration_error(self.rank, error)
+    def close(self):
+        if self.finished:
+            return
+        if self.rung._callback is not None:
+            self.rung._callback.local_close_guard()
+        self._generator.close()
+        self.finished = True
+
+
+class _CalibrationScope:
+    """Explicit collective close owner; no callback scope is a generator."""
+
+    def __init__(self, rank, inputs, checkpoint, no_grad, family):
+        self.rank, self.inputs = rank, inputs
+        self.checkpoint, self.no_grad, self.family = checkpoint, no_grad, family
+        self.driver = _protocol.Driver(rank)
+        self.rung = None
+        self.started = self.closed = self.closing = False
+        self.gen = _ScopeGuard(self)  # Guard old explicit-generator close access.
+
+    def __enter__(self):
+        self.protocol = self.driver.__enter__()
+        try:
+            self.rung = _prepare_calibration_rung(
+                self.rank,
+                self.inputs,
+                checkpoint=self.checkpoint,
+                no_grad=self.no_grad,
+                seed_uncovered_cp_family=self.family,
+            )
+            self.rung._callback = self
+            self.protocol.transition()
+            return self.rung
+        except BaseException as error:
+            self.__exit__(type(error), error, error.__traceback__)
+            raise
+
+    def begin(self, execute):
+        self.protocol.transition(execute=execute)
+        self.started = True
+
+    def local_close_guard(self):
+        if self.protocol.distributed and not self.closing:
+            raise AssertionError("Calibration close must use the collective driver")
+
+    def abandon_local(self):
+        self.protocol.abandon_local()
+        self.closed = self.closing = True
+        if self.rung is not None:
+            self.rung._close()
+            self.rung._active = False
+        if self.driver.owner and self.driver.token is not None:
+            _protocol._ACTIVE.reset(self.driver.token)
+
+    def close(self):
+        return self.__exit__(None, None, None)
+
+    def __exit__(self, kind, error, traceback):
+        if self.closed:
+            return False
+        self.closed = self.closing = True
+        try:
+            if self.rung is not None:
+                try:
+                    self.rung._close()
+                except BaseException as exc:
+                    if error is None:
+                        error = exc
+            self.driver.finish(error)
+        finally:
+            if self.rung is not None:
+                self.rung._active = False
+                self.rung._callback = None
+        return False
 
 
 @dataclass
@@ -137,7 +220,8 @@ class CalibrationRung:
 
     This object expires when its ``calibration_rung`` context exits. It cannot
     change inputs, choose another layout, split, or retry the admitted rung.
-    Exhaust or explicitly close its iterator, as with normal microbatches.
+    Exhaust its iterator or exit the owning scope on every rank. The explicit
+    driver closes partial iterators; a distributed rank-local close is guarded.
     """
 
     decision: _memory.CalibrationRungDecision
@@ -149,10 +233,8 @@ class CalibrationRung:
     _used: bool = False
     _started: bool = False
     _coverage_guard: _memory._CalibrationCoverageGuard | None = None
-    _callback: _CalibrationCallback | None = None
-    _iterator: (
-        Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None] | None
-    ) = None
+    _callback: _CalibrationScope | None = None
+    _iterator: _CalibrationIterator | None = None
 
     @property
     def inputs(self) -> tuple[ForwardInputs, ...]:
@@ -190,7 +272,7 @@ class CalibrationRung:
         if not self.decision.fits:
             raise _impl.TrainerRankMemoryError("calibration rung admission refused")
         self._used = True
-        self._iterator = self._execute()
+        self._iterator = _CalibrationIterator(self)
         return self._iterator
 
     def _close(self) -> None:
@@ -251,6 +333,12 @@ class CalibrationRung:
                 # Outside sample suppression, after this single wave completes.
                 # The caller persists/alerts the typed failure; there is no retry.
                 raise self.coverage_violation
+        except GeneratorExit:
+            # Only the explicit scope driver may close a distributed iterator.
+            # This guard itself performs no collective.
+            if self._callback is not None:
+                self._callback.local_close_guard()
+            raise
         finally:
             if (
                 self._coverage_guard is not None
@@ -273,15 +361,14 @@ class CalibrationRung:
                     self._rank.__dict__["_calibration_seed_plan"] = previous
 
 
-@contextmanager
-def calibration_rung(
+def _prepare_calibration_rung(
     self: TrainerRank,
     inputs: Iterable[ForwardInputs],
     *,
     checkpoint: AdapterSelection = _impl.Unset,
     no_grad: bool | None = None,
     seed_uncovered_cp_family: bool = False,
-) -> Generator[CalibrationRung, None, None]:
+) -> CalibrationRung:
     """Prepare one calibration-only wave before executing any model work.
 
     The caller must durably record an extrapolated intent before calling the
@@ -367,26 +454,28 @@ def calibration_rung(
                 rung._coverage_guard = _memory._CalibrationCoverageGuard(
                     plan, covered[2], covered[1]
                 )
-    rung._callback = _CalibrationCallback(self)
-    error: BaseException | None = None
-    try:
-        try:
-            yield rung
-        except GeneratorExit:
-            raise  # Abandoned contexts retain purely local cleanup.
-        except BaseException as exc:
-            error = exc
-        try:
-            rung._close()
-        except BaseException as exc:
-            if error is None:
-                error = exc
-        # Intent errors meet peers at model entry; completion errors meet peers
-        # here, before the floor pass can issue its completion MIN vote.
-        rung._callback.finish(error)
-    finally:
-        rung._active = False
-        rung._close()
+    return rung
+
+
+def calibration_rung(
+    self: TrainerRank,
+    inputs: Iterable[ForwardInputs],
+    *,
+    checkpoint: AdapterSelection = _impl.Unset,
+    no_grad: bool | None = None,
+    seed_uncovered_cp_family: bool = False,
+):
+    """Prepare one admitted wave with a driver-owned collective close path.
+
+    Use this scope on every rank. Exhaust the iterator or close the scope
+    collectively. Rank-local generator close is rejected without a vote; the
+    owning with-statement carries that error into the one phase exit vote.
+    Journal intents and completion inside the scope, with no automatic retry.
+    """
+    self._guard_forward_collective("calibration_rung")
+    return _CalibrationScope(
+        self, inputs, checkpoint, no_grad, seed_uncovered_cp_family
+    )
 
 
 def _cp_floor_requests(self: TrainerRank, template: AnyForwardInput):
@@ -428,6 +517,7 @@ def _cp_floor_requests(self: TrainerRank, template: AnyForwardInput):
         )
 
 
+@_protocol.owned
 def calibrate_request_floors(
     self: TrainerRank,
     template: AnyForwardInput,
@@ -465,9 +555,13 @@ def calibrate_request_floors(
     persist/validate format-8 floor-only evidence, and require completed floor coverage
     before accepting cached calibration or enabling v2 serving.
 
-    Distributed callback failures are exchanged before model entry and before completion
-    checks. Every rank raises RuntimeError, with the local failure retained as its
-    cause; no trial is retried. Local-only calls preserve the original exception.
+    Each local calibration phase has one entry and one exit vote. Callback,
+    journal and preparation failures join that exit before the next orchestration
+    collective or model boundary. The explicit driver closes partial iterators;
+    rank-local close is guarded without a collective in a finalizer. Phase tags
+    distinguish callback votes from the caller's outer error exchange. Every rank
+    raises RuntimeError, with its local failure retained as the cause; no trial is
+    retried. Local-only calls preserve the original exception.
     """
     self._guard_forward_collective("calibrate_request_floors")
     with _calibration_status(self):
@@ -562,6 +656,7 @@ def _forward_micro_batches(
                 else calibration_candidate
             )
         self._snapshot_planning_telemetry(candidate.plan, candidate.check)
+        _protocol.checkpoint()
         tracked_outputs: list[AnyForwardOutput] = []
         outputs: list[Any] = []
         flat_outputs = iter(tracked_outputs)
@@ -592,6 +687,10 @@ def _forward_micro_batches(
             ]
         except BaseException as exc:
             error = exc
+        if error is not None and _protocol.active() is not None:
+            # The explicit driver carries this local failure to the current
+            # phase exit before any peer enters the backward handoff vote.
+            raise error
         try:
             self._release_cached_memory_for_backward(candidate.plan, error=error)
         except BaseException:
@@ -2737,6 +2836,8 @@ def _planning_status(self: TrainerRank, enabled: bool) -> Generator[None, None, 
         yield
     except BaseException as exc:
         primary = exc
+    if primary is not None and _protocol.active() is not None:
+        raise primary
     exchange_error: BaseException | None = None
     try:
         succeeded = self._all_ranks_true(primary is None)
