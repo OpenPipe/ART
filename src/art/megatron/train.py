@@ -858,8 +858,13 @@ def execute_megatron_sft_job(
     ]
     | None = None,
     cancelled: Event | None = None,
+    validation_batches: tuple[PackedSFTBatchData, ...] = (),
 ) -> dict[str, float]:
-    """Execute SFT from in-memory batches; callers own transport and events."""
+    """Execute SFT from in-memory batches; callers own transport and events.
+
+    With validation batches, the last batch's metrics also carry ``loss/val``:
+    the loss on those batches after this job's updates.
+    """
     if len(batches) != job.num_batches:
         raise ValueError("SFT job batch count does not match its payload")
     adapter_dtypes = None
@@ -880,49 +885,16 @@ def execute_megatron_sft_job(
 
                 raise TrainingCancelledError("SFT job was cancelled")
             started = time.perf_counter()
-            trajectory_tensors = list(batch.rows)
-            grad_accumulation_sequences = sft_global_microbatch_count(
-                len(trajectory_tensors), provider=runtime.provider
+            inputs, micro_indices, hybridep_token_counts = _sft_step_inputs(
+                runtime, batch, topology
             )
-            template = _clone_sft_tensors(trajectory_tensors[0])
-            zero_template = _zero_contribution_sft_inputs(template)
-            # Packed rows, not source examples, are schedule microbatches. Each
-            # payload still owns exactly one optimizer update and learning rate.
-            hybridep_token_counts = (
-                build_sft_hybridep_token_counts(
-                    trajectory_tensors=trajectory_tensors,
-                    step_index=0,
-                    global_grad_accumulation_sequences=(grad_accumulation_sequences),
-                    topology=topology,
-                    provider=runtime.provider,
-                    model_support_handler=runtime.model_support_handler,
-                )
-                if ps.get_expert_model_parallel_world_size() > 1
-                else None
-            )
-            _ensure_hybridep_capacity(
-                runtime,
-                packed_sequence_length=max(
-                    int(inputs["input_ids"].numel()) for inputs in trajectory_tensors
-                ),
-                context_parallel_size=topology.cp,
-                required_capacity=max(hybridep_token_counts or (), default=0),
-            )
-            scheduled_indices = build_micro_sample_indices(
-                step_index=0,
-                num_sequences=len(trajectory_tensors),
-                global_grad_accumulation_sequences=grad_accumulation_sequences,
-            )
-            micro_indices = scheduled_indices
             step_result = run_megatron_sft_step(
                 model_chunks=runtime.model,
                 provider=runtime.provider,
                 model_support_handler=runtime.model_support_handler,
                 optimizer=runtime.optimizer,
                 learning_rate=batch.learning_rate,
-                inputs=select_sft_micro_inputs(
-                    trajectory_tensors, micro_indices, zero_template
-                ),
+                inputs=inputs,
                 step_index=batch_index,
                 sample_index=micro_indices,
                 moe_routing_replay_controller=(runtime.moe_routing_replay_controller),
@@ -954,9 +926,13 @@ def execute_megatron_sft_job(
                 ),
                 **step_result.pipeline_metrics,
             }
+            del step_result, inputs
+            if validation_batches and batch_index == len(batches) - 1:
+                final_metrics["loss/val"] = _sft_validation_loss(
+                    runtime, validation_batches, topology
+                )
             if runtime.rank == 0:
                 progress_sink(batch_index, len(batches), final_metrics)
-            del step_result, template, zero_template
 
         if snapshot_sink is None or runtime.adapter_export_config is None:
             raise RuntimeError("typed SFT requires an immutable snapshot publisher")
@@ -978,6 +954,83 @@ def execute_megatron_sft_job(
             runtime.optimizer_state_loaded = False
         if adapter_dtypes is not None:
             del adapter_dtypes
+
+
+def _sft_step_inputs(
+    runtime: TrainingRuntime,
+    batch: PackedSFTBatchData,
+    topology: ParallelTopology,
+) -> tuple[list[dict[str, torch.Tensor]], list[int | None], list[int] | None]:
+    trajectory_tensors = list(batch.rows)
+    grad_accumulation_sequences = sft_global_microbatch_count(
+        len(trajectory_tensors), provider=runtime.provider
+    )
+    zero_template = _zero_contribution_sft_inputs(
+        _clone_sft_tensors(trajectory_tensors[0])
+    )
+    # Packed rows, not source examples, are schedule microbatches. Each
+    # payload still owns exactly one optimizer update and learning rate.
+    hybridep_token_counts = (
+        build_sft_hybridep_token_counts(
+            trajectory_tensors=trajectory_tensors,
+            step_index=0,
+            global_grad_accumulation_sequences=(grad_accumulation_sequences),
+            topology=topology,
+            provider=runtime.provider,
+            model_support_handler=runtime.model_support_handler,
+        )
+        if ps.get_expert_model_parallel_world_size() > 1
+        else None
+    )
+    _ensure_hybridep_capacity(
+        runtime,
+        packed_sequence_length=max(
+            int(inputs["input_ids"].numel()) for inputs in trajectory_tensors
+        ),
+        context_parallel_size=topology.cp,
+        required_capacity=max(hybridep_token_counts or (), default=0),
+    )
+    micro_indices = build_micro_sample_indices(
+        step_index=0,
+        num_sequences=len(trajectory_tensors),
+        global_grad_accumulation_sequences=grad_accumulation_sequences,
+    )
+    return (
+        select_sft_micro_inputs(trajectory_tensors, micro_indices, zero_template),
+        micro_indices,
+        hybridep_token_counts,
+    )
+
+
+@torch.no_grad()
+def _sft_validation_loss(
+    runtime: TrainingRuntime,
+    batches: tuple[PackedSFTBatchData, ...],
+    topology: ParallelTopology,
+) -> float:
+    """Mean SFT loss per loss-bearing token over batches, without updating."""
+    loss_sum = 0.0
+    num_tokens = 0
+    for batch in batches:
+        inputs, micro_indices, hybridep_token_counts = _sft_step_inputs(
+            runtime, batch, topology
+        )
+        result = run_megatron_sft_step(
+            model_chunks=runtime.model,
+            provider=runtime.provider,
+            model_support_handler=runtime.model_support_handler,
+            optimizer=runtime.optimizer,
+            learning_rate=0.0,
+            inputs=inputs,
+            step_index=0,
+            sample_index=micro_indices,
+            hybridep_token_counts=hybridep_token_counts,
+            forward_only=True,
+        )
+        tokens = result.workload.loss_bearing_tokens
+        loss_sum += float(result.reduced_loss) * tokens
+        num_tokens += tokens
+    return loss_sum / max(num_tokens, 1)
 
 
 def _experimental_train_config(job: TrainJobSpec) -> dev.TrainConfig:
@@ -2401,7 +2454,9 @@ def run_megatron_sft_step(
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
     hybridep_token_counts: list[int] | None = None,
     before_optimizer_step: Callable[[], None] | None = None,
+    forward_only: bool = False,
 ) -> TrainStepResult:
+    """Run one SFT step; with forward_only, report its loss without updating."""
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
     if not micro_inputs:
         raise ValueError("run_megatron_sft_step requires at least one trajectory")
@@ -2433,8 +2488,9 @@ def run_megatron_sft_step(
         moe_routing_replay_controller,
     )
 
-    _zero_grad_buffers(model_chunks)
-    _install_schedule_finalize(model_chunks)
+    if not forward_only:
+        _zero_grad_buffers(model_chunks)
+        _install_schedule_finalize(model_chunks)
 
     pending_prepared_micro: PreparedMegatronBatch | None = None
     prepared_micros: list[PreparedSFTMicroInputs] = []
@@ -2506,7 +2562,7 @@ def run_megatron_sft_step(
 
         return output, reduce_loss
 
-    forward_data_store = schedule.run(forward_step_func, forward_only=False)
+    forward_data_store = schedule.run(forward_step_func, forward_only=forward_only)
     if moe_routing_replay_controller is not None:
         moe_routing_replay_controller.finalize_step(expect_recompute=True)
     forward_data_store = cast(
@@ -2519,12 +2575,16 @@ def run_megatron_sft_step(
         ),
         torch.zeros([], device=device, dtype=torch.float32),
     )
-    update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
-        optimizer,
-        learning_rate,
-        model_support_handler=model_support_handler,
-        model_chunks=model_chunks,
-        before_step=before_optimizer_step,
+    update_successful, grad_norm, num_zeros_in_grad = (
+        (False, 0.0, None)
+        if forward_only
+        else _optimizer_step(
+            optimizer,
+            learning_rate,
+            model_support_handler=model_support_handler,
+            model_chunks=model_chunks,
+            before_step=before_optimizer_step,
+        )
     )
     num_tokens = _local_trainable_sft_token_count_tensor(prepared_micros, device=device)
     reduced_loss = _reduce_loss_sum(
