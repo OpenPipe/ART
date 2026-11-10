@@ -354,6 +354,7 @@ def _worker(rank, init_method, output, layout_name):
             patch.object(ex, "_ready_remote_stage_batch", ready),
         ):
             for batch in batches:
+                batch = tuple(group for group in batch if group)
                 transport.completion = Completion(batch)
                 transport.remote = []
                 out, grads = _execute(state, q, k, v, go)
