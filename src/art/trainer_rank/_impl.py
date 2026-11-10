@@ -3194,7 +3194,7 @@ class TrainerRank:
             packed_tokens,
             **({"fixed_slope": True} if cold_subfloor else {}),
         )
-        request_floor, optimizer_peak = _memory._cp_fixed_phase_bytes(
+        request_floor, static_floor, optimizer_peak = _memory._cp_phase_bounds(
             self,
             signature,
             output_bytes,
@@ -3208,10 +3208,11 @@ class TrainerRank:
                     * cold
                 ),
                 request_floor,
+                static_floor,
                 optimizer_peak,
             ),
-            # A request floor may include caller retention; conservatively keep
-            # it across children. The later optimizer is never forward retention.
+            # Empirical peaks may include retention. Native initialization and
+            # the later optimizer are transient, never extra retained graphs.
             retained=max(math.ceil(retained * cold), request_floor),
             checkpoint_retained=math.ceil(checkpoint_retained * cold),
             checkpoint_workspace=math.ceil(checkpoint_workspace * cold),
