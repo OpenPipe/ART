@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -88,11 +89,18 @@ def _indices(ranges):
     return [i for r in ranges if r is not None for i in range(r.start, r.end)]
 
 
-def _plans():
+def _plans(layout_name):
     spec = build_prefix_tree_attention_spec(
         group_ids=torch.zeros(1, 16, dtype=torch.long),
         parent_ids=torch.zeros(1, 16, dtype=torch.long),
     )
+    if layout_name == "planner":
+        return spec, rt._build_runtime_plan(
+            spec,
+            topology=ParallelTopology(cp=8),
+            config=ContextParallelConfig(),
+            original_seq_len=16,
+        )
     chunks = tuple(TokenRange(i, i + 1) for i in range(16))
     owners = tuple(range(8)) + tuple(reversed(range(8)))
     layout = rt._build_runtime_token_layout_index(
@@ -241,17 +249,18 @@ def _close(actual, expected):
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
 
 
-def test_cp8_readiness_orders_match_reference(tmp_path):
+@pytest.mark.parametrize("layout_name", ["planner", "zigzag"])
+def test_cp8_readiness_orders_match_reference(tmp_path, layout_name):
     mp.start_processes(
         _worker,
-        args=(f"file://{tmp_path / 'dist'}", str(tmp_path)),
+        args=(f"file://{tmp_path / 'dist'}", str(tmp_path), layout_name),
         nprocs=8,
         join=True,
         start_method="spawn",
     )
 
 
-def _worker(rank, init_method, output):
+def _worker(rank, init_method, output, layout_name):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -261,10 +270,12 @@ def _worker(rank, init_method, output):
         timeout=timedelta(minutes=10),
     )
     try:
-        spec, plans = _plans()
+        spec, plans = _plans(layout_name)
         plan = plans[rank]
         indices = _indices(plan.local_row_ranges)
-        assert indices == [rank, 15 - rank]
+        assert indices == (
+            [rank, 15 - rank] if layout_name == "zigzag" else [2 * rank, 2 * rank + 1]
+        )
         fullq, fullk, fullv, fullgo = _inputs()
         q, k, v = [x[indices].detach().requires_grad_() for x in (fullq, fullk, fullv)]
         assert q.shape == (2, 1, 16, 256) and k.shape == v.shape == (2, 1, 2, 256)
@@ -286,7 +297,7 @@ def _worker(rank, init_method, output):
             for s in plan.stage_plans
             if not s.is_local_stage and s.q_len and s.k_len and s.slices
         )
-        assert len(active) == 7
+        assert len(active) == (7 if layout_name == "zigzag" else int(rank > 0))
         templates = {}
         native = ex._COMMUNICATOR
         original = native.launch_kv_fetch
@@ -361,6 +372,8 @@ def _worker(rank, init_method, output):
                 count += 1
                 if count % 1000 == 0:
                     print(f"rank={rank} schedules={count}", flush=True)
+        if layout_name == "zigzag" and rank == 0:
+            assert kernel.empty_rows > 0
         assert canonical is not None
         for actual, wanted in zip(canonical[2:], expected_global[1:]):
             dist.all_reduce(actual)
@@ -371,3 +384,36 @@ def _worker(rank, init_method, output):
         )
     finally:
         dist.destroy_process_group()
+
+
+def test_readiness_partition_coverage():
+    partitions = list(_partitions(tuple(range(7))))
+    assert len(partitions) == len(set(partitions)) == 47293
+    assert {len(p) for p in partitions} == set(range(1, 8))
+    assert all(
+        sorted(i for group in p for i in group) == list(range(7)) for p in partitions
+    )
+
+
+def test_ready_remote_waits_when_none_complete():
+    pending = [SimpleNamespace(stage_index=i) for i in range(3)]
+    complete = set()
+    waited = []
+
+    class Work:
+        def __init__(self, index):
+            self.index = index
+
+        def is_completed(self):
+            return self.index in complete
+
+        def wait(self):
+            waited.append(self.index)
+            complete.update((0, 2))
+
+    result = ex._ready_remote_stage_batch(
+        pending_stages=pending,
+        fetch_works_by_stage_index={i: Work(i) for i in range(3)},
+    )
+    assert waited == [0]
+    assert [s.stage_index for s in result] == [0, 2]
