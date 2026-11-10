@@ -243,11 +243,17 @@ def _patched_flash_backward_template_source(source: str) -> str:
 
 def apply_flash_flex_dlse_patch() -> None:
     global _PATCH_APPLIED
-    from .flash_pdl_patch import apply_flash_sm90_sparse_pdl_patch
+    from .flash_pdl_patch import (
+        apply_flash_sm90_sparse_pdl_patch,
+        installed_fa4_version,
+    )
 
     apply_flash_sm90_sparse_pdl_patch()
-    _apply_flash_flex_block_sparse_tile_patch()
-    _apply_flash_block_sparse_dq_postprocess_patch()
+    # These private FA4 API overrides are pinned to b5 too. Other versions
+    # install the lazy execution guard without touching their implementation.
+    if installed_fa4_version() == "4.0.0b5":
+        _apply_flash_flex_block_sparse_tile_patch()
+        _apply_flash_block_sparse_dq_postprocess_patch()
     if _PATCH_APPLIED:
         return
 

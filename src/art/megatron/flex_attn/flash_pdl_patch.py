@@ -13,7 +13,9 @@ import ast
 import importlib.metadata
 import inspect
 import linecache
+import sys
 import textwrap
+from threading import RLock
 from types import FunctionType, SimpleNamespace
 from typing import Any
 
@@ -59,6 +61,7 @@ def _preprocess_dispatch(interface: Any) -> Any:
     def dispatch(*args: Any, disable_pdl: bool, **kwargs: Any) -> Any:
         return (no_pdl if disable_pdl else original)(*args, **kwargs)
 
+    dispatch.compile_cache = no_pdl.compile_cache
     return dispatch
 
 
@@ -82,6 +85,16 @@ def _patched_backward_code(function: Any) -> Any:
             value=ast.parse("arch // 10 == 9 and use_block_sparsity", mode="eval").body,
         )
     )
+    # Only the sparse SM90 copy uses this cache. The ordinary entry's cache,
+    # key tuples and persistent paths remain exactly as FA4 created them.
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "compile_cache"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "_flash_attn_bwd"
+        ):
+            node.value.id = "_art_sparse_backward"
     ast.fix_missing_locations(tree)
     patched_source = ast.unparse(tree) + "\n"
     filename = f"{function.__code__.co_filename}.art_sm90_pdl"
@@ -127,35 +140,146 @@ def _patched_sm90_launch_code(function: Any) -> Any:
     return namespace[function.__name__].__code__
 
 
-def apply_flash_sm90_sparse_pdl_patch(interface: Any = None) -> bool:
-    """Install before compilation; preserve references imported before install.
+def installed_fa4_version() -> str | None:
+    try:
+        return importlib.metadata.version("flash-attn-4")
+    except importlib.metadata.PackageNotFoundError:
+        return None
 
-    The optional interface permits CPU contract tests without importing CUDA.
-    Missing FA4 is retryable; a different installed version fails explicitly.
+
+def _assert_quiescent(interface: Any, state: dict[str, Any]) -> None:
+    message = (
+        "Install the FA4 sparse PDL patch from ART flex_attn import before any "
+        "FA4 backward compilation or CUDA graph capture; compilation must be quiescent"
+    )
+    if state["active"]:
+        raise RuntimeError(message + " (backward call active)")
+    caches = list(state["caches"])
+    for name in ("_flash_attn_bwd", "_bwd_preprocess", "_bwd_postprocess_convert"):
+        function = getattr(interface, name, None)
+        cache = getattr(function, "compile_cache", None)
+        if cache is not None:
+            caches.append(cache)
+    for cache in caches:
+        entries = cache if isinstance(cache, dict) else cache.cache
+        if entries:
+            raise RuntimeError(message + " (backward compile cache is populated)")
+    # This query never initializes CUDA. A graph capture already in progress
+    # is also too late, even when no backward kernel has yet populated a cache.
+    torch = sys.modules.get("torch")
+    if (
+        torch is not None
+        and torch.cuda.is_initialized()
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        raise RuntimeError(message + " (CUDA graph capture active)")
+
+
+def _entry(*args: Any, **kwargs: Any) -> Any:
+    return globals()["_art_bwd_guard_dispatch"](*args, **kwargs)
+
+
+def _guarded_dispatch(
+    interface: Any, state: dict[str, Any], version: str, original: Any, sparse: Any
+) -> Any:
+    signature = inspect.signature(original)
+
+    def dispatch(*args: Any, **kwargs: Any) -> Any:
+        with state["lock"]:
+            state["active"] += 1
+        try:
+            arguments = signature.bind(*args, **kwargs).arguments
+            arch = arguments.get("arch")
+            if arch is None:
+                arch = interface._get_device_arch()
+            affected = (
+                arch // 10 == 9 and arguments.get("block_sparse_tensors") is not None
+            )
+            if affected and version != "4.0.0b5":
+                raise RuntimeError(
+                    f"Recheck FA4 sparse PDL workaround for {version}: "
+                    "refusing SM90 block-sparse backward before any launch"
+                )
+            return (sparse if affected else original)(*args, **kwargs)
+        finally:
+            with state["lock"]:
+                state["active"] -= 1
+
+    return dispatch
+
+
+def apply_flash_sm90_sparse_pdl_patch(
+    interface: Any = None, *, version: str | None = None
+) -> bool:
+    """Install while quiescent, before backward compilation or graph capture.
+
+    Non-b5 versions install only a lazy guard; unaffected calls stay unpatched.
+    An injected interface/version supports CPU contracts without importing FA4.
+    State and locking live on the interface, surviving reloads of this module.
     """
     if interface is None:
-        try:
-            version = importlib.metadata.version("flash-attn-4")
-        except importlib.metadata.PackageNotFoundError:
+        version = installed_fa4_version()
+        if version is None:
             return False
-        if version != "4.0.0b5":
-            raise RuntimeError(f"Recheck FA4 sparse PDL workaround for {version}")
         import flash_attn.cute.interface as interface  # ty: ignore[unresolved-import]
+    elif version is None:
+        version = "4.0.0b5"
 
-    backward = interface._flash_attn_bwd
-    if getattr(backward, "_art_sm90_sparse_pdl", False):
+    # setdefault publishes one lock even when callers loaded this patch module
+    # under different names. importlib.reload preserves the interface dict.
+    state = interface.__dict__.setdefault(
+        "_art_sm90_pdl_state", {"lock": RLock(), "active": 0, "caches": []}
+    )
+    with state["lock"]:
+        _assert_quiescent(interface, state)
+        backward = interface._flash_attn_bwd
+        entry_installed = getattr(backward, "_art_sm90_sparse_pdl", False)
+        launches = []
+        if version == "4.0.0b5":
+            # The interface may retain an older class after the kernel module
+            # reloads. Patch both references, independently of the entry marker.
+            classes = [interface.FlashAttentionBackwardSm90]
+            module = sys.modules.get(classes[0].__module__)
+            current = getattr(module, "FlashAttentionBackwardSm90", classes[0])
+            if current is not classes[0]:
+                classes.append(current)
+            for cls in classes:
+                raw = inspect.unwrap(cls.__call__)
+                if not getattr(raw, "_art_sm90_sparse_pdl_launch", False):
+                    if getattr(raw, "_preprocessed", False):
+                        raise RuntimeError(
+                            "Install the FA4 sparse PDL patch before any FA4 "
+                            "backward compilation (SM90 DSL preprocessing started)"
+                        )
+                    launches.append((raw, _patched_sm90_launch_code(raw)))
+
+        if not entry_installed:
+            signature = inspect.signature(backward)
+            original = _clone_function(backward, backward.__globals__)
+            sparse = None
+            if version == "4.0.0b5":
+                code = _patched_backward_code(backward)
+                preprocess = _preprocess_dispatch(interface)
+                sparse = _clone_function(backward, backward.__globals__)
+                sparse.__code__ = code
+                sparse.compile_cache = interface.get_jit_cache(
+                    "bwd_art_sm90_sparse_no_pdl_v2"
+                )
+                state["caches"].extend([sparse.compile_cache, preprocess.compile_cache])
+                backward.__globals__["_art_sparse_backward"] = sparse
+                backward.__globals__["_art_bwd_preprocess_sm90_pdl"] = preprocess
+            dispatch = _guarded_dispatch(interface, state, version, original, sparse)
+            backward.__globals__["_art_bwd_guard_dispatch"] = dispatch
+            # Keep the original function and compile_cache objects. Existing
+            # imports and unaffected on-disk lookups remain effective.
+            backward.__code__ = _entry.__code__
+            backward.__defaults__ = None
+            backward.__kwdefaults__ = None
+            backward.__signature__ = signature
+            backward._art_sm90_sparse_pdl = True
+            state["caches"].append(backward.compile_cache)
+
+        for raw, code in launches:
+            raw.__code__ = code
+            raw._art_sm90_sparse_pdl_launch = True
         return True
-    code = _patched_backward_code(backward)
-    sm90_launch = inspect.unwrap(interface.FlashAttentionBackwardSm90.__call__)
-    launch_code = _patched_sm90_launch_code(sm90_launch)
-    dispatch = _preprocess_dispatch(interface)
-    # Old compiled backward launchers embed use_pdl=True. Give the changed
-    # launcher its own cache domain, including when disk caching is enabled.
-    backward.compile_cache = interface.get_jit_cache("bwd_art_sparse_no_pdl_v1")
-    # Keep the function objects and signatures intact: already imported
-    # references and generated torch wrappers must see the patched bodies.
-    sm90_launch.__code__ = launch_code
-    backward.__globals__["_art_bwd_preprocess_sm90_pdl"] = dispatch
-    backward.__code__ = code
-    backward._art_sm90_sparse_pdl = True
-    return True
