@@ -24,6 +24,9 @@ def restored_rank():
     rank = metadata_rank("moe")
     rank._memory_profiles[signature] = profile
     rank._available_memory_bytes = lambda sample=None: 71_000_000_000
+    from test_trainer_rank_cp_output_families import fixture_floor
+
+    fixture_floor(rank, True)
     return rank, signature
 
 

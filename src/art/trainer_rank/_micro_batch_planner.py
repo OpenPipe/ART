@@ -22,6 +22,7 @@ from dataclasses import (
     replace,
 )
 import hashlib
+import itertools
 from typing import TYPE_CHECKING, Any, cast
 
 from art.trainer_rank import _impl, _memory
@@ -92,6 +93,29 @@ class CalibrationRung:
     _coverage_guard: _memory._CalibrationCoverageGuard | None = None
 
     @property
+    def inputs(self) -> tuple[ForwardInputs, ...]:
+        """The exact inputs prepared by this calibration wave."""
+        return tuple(self._candidate.inputs)
+
+    @property
+    def no_grad(self) -> bool:
+        """Whether the journal/executor should run forward only."""
+        return self._no_grad
+
+    @property
+    def family_id(self) -> str | None:
+        """Durable family identity, paired with ``decision.signature_id``."""
+        plan = self._candidate.plan
+        if (
+            not isinstance(plan, _impl._FlatForwardPlan)
+            or not getattr(plan, "_calibration_cp_family_seed", False)
+            or plan.caller_cp_workload is None
+        ):
+            return None
+        family = plan.caller_cp_workload[0]
+        return _memory._cp_pair(family, family)[0]
+
+    @property
     def coverage_violation(self) -> _memory.CalibrationCoverageViolation | None:
         return None if self._coverage_guard is None else self._coverage_guard.violation
 
@@ -123,8 +147,7 @@ class CalibrationRung:
             if family_seed:
                 assert isinstance(plan, _impl._FlatForwardPlan)
                 assert plan.caller_cp_workload is not None
-                family = plan.caller_cp_workload[0]
-                key = (key, _memory._cp_pair(family, family)[0])
+                key = (key, self.family_id)
             used = self._rank.__dict__.setdefault(
                 "_calibration_seeded_cp_families"
                 if family_seed
@@ -264,6 +287,123 @@ def calibration_rung(
     finally:
         # Pure local expiry: no destructor-time sampling or collective.
         rung._active = False
+
+
+def _cp_floor_requests(self: TrainerRank, template: AnyForwardInput):
+    """Finite output grammar and representatives of its unbounded parameters.
+
+    Seed both operations and every nonempty combination of target, top-k,
+    logits and hidden, optionally routes on MoE. Targets use flat, column and
+    three-column representatives; positive top-k uses k=1. Other exact target
+    shapes, k values and mixed request signatures use measured sibling maxima
+    or defer. Numeric widths still pay their own analytic workspace charges.
+    """
+    if template.input_tokens.ndim != 1 or not template.input_tokens.numel():
+        raise ValueError("floor calibration requires a nonempty flat root template")
+    token = template.input_tokens[:1]
+    for grad, target, topk, logits, hidden, routes in itertools.product(
+        (False, True),
+        (None, (), (1,), (3,)),
+        (None, 1),
+        (False, True),
+        (False, True),
+        (False, True) if self._moe_layers else (False,),
+    ):
+        if target is None and topk is None and not logits and not hidden:
+            continue  # inactive and routes alone execute no model work
+        routed = None
+        if routes:
+            width = int(self.runtime.provider.moe_router_topk)
+            routed = _impl.torch.arange(width, device=token.device).reshape(1, 1, width)
+            routed = routed.expand(1, self._num_layers, width)
+        yield replace(
+            template,
+            input_tokens=token,
+            target_tokens=None if target is None else token.new_zeros((1, *target)),
+            top_k=topk,
+            logits=logits,
+            hidden_states=hidden,
+            routed_experts=routed,
+            no_grad=not grad,
+        )
+
+
+def calibrate_request_floors(
+    self: TrainerRank,
+    template: AnyForwardInput,
+    *,
+    execute: Callable[[CalibrationRung], None],
+    check_pending: Callable[[], None],
+    checkpoint: AdapterSelection = _impl.Unset,
+) -> tuple[_memory.CalibrationRungDecision, ...]:
+    """Finish a CP8 calibration pass after both operations have live anchors.
+
+    This method owns the probe inventory; callers never enumerate families.
+    ``execute(rung)`` must use the existing cohort-wide durable intent/restart
+    gate, then exhaust ``rung.forward_micro_batches()`` and run backward within
+    each yielded caller interval when ``not rung.no_grad``. Record completion
+    only after touching all requested floating outputs (target logprobs,
+    top-k logprobs, logits and hidden states) in one backward, when enabled, and
+    only after exhausting it. An unresolved intent must prevent execution on
+    every rank, as for ``calibration_rung``. Callback errors propagate; there
+    is no retry. ``check_pending()`` must reject unresolved durable intents
+    before any work or completed-profile skips, including after restore.
+    Per-family journal keys include both ``decision.signature_id`` and
+    ``rung.family_id``, so native kernel configurations cannot alias an intent.
+
+    Each new one-token trial retains the existing 2x static seed cap and its
+    once-per-signature/family attempt. It records only a floor, never a rate or
+    covering peak. Success requires a positive measurement for every probe.
+    Invoke once for each selected adapter/partition/native kernel configuration.
+    Older callers must add this call after their product ladders.
+    """
+    self._guard_forward_collective("calibrate_request_floors")
+    if not _memory._FIXED_SLOPE_PROFILES.get() or self._topology_key() != (1, 1, 8, 1):
+        raise ValueError("floor calibration requires native CP8 fixed-slope collection")
+    with self._planning_status(True):
+        check_pending()
+    decisions = []
+    for probe in _cp_floor_requests(self, template):
+        with _impl.torch.set_grad_enabled(not probe.no_grad):
+            scope = _memory._CP_FAMILY_CALIBRATION.set(True)
+            try:
+                plan = self._plan_flat_forward(
+                    [probe], checkpoint=checkpoint, sync_planning_errors=True
+                )
+            finally:
+                _memory._CP_FAMILY_CALIBRATION.reset(scope)
+            if self._all_ranks_true(
+                _memory._cp_measured_request_floor(
+                    self, plan.signature, plan.caller_cp_workload
+                )
+                > 0
+            ):
+                continue
+            with calibration_rung(
+                self,
+                [probe],
+                checkpoint=checkpoint,
+                no_grad=probe.no_grad,
+                seed_uncovered_cp_family=True,
+            ) as rung:
+                execute(rung)
+                measured_plan = rung._candidate.plan
+                assert isinstance(measured_plan, _impl._FlatForwardPlan)
+                complete = (
+                    rung._used
+                    and _memory._cp_measured_request_floor(
+                        self,
+                        measured_plan.signature,
+                        measured_plan.caller_cp_workload,
+                    )
+                    > 0
+                )
+                if not self._all_ranks_true(complete):
+                    raise RuntimeError(
+                        "floor calibration requires a complete positive measurement"
+                    )
+                decisions.append(rung.decision)
+    return tuple(decisions)
 
 
 def _forward_micro_batches(
@@ -1601,18 +1741,26 @@ def _plan_flat_forward(
             inactive_logical_tokens=logical_tokens
             - _impl._active_logical_tokens(requests),
         )
-        if plan.signature.topology[2] > 1 and (
-            getattr(plan.signature, "bounded_caller_peak", False)
-            or (
-                plan.packed_tokens < _memory._memory_model._MEMORY_SLOPE_MIN_TOKENS
-                and _memory._fixed_slope_enabled(
-                    self._memory_profiles.get(plan.signature)
+        if (
+            plan.packed_tokens > 0
+            and plan.signature.topology[2] > 1
+            and (
+                getattr(plan.signature, "bounded_caller_peak", False)
+                or (
+                    len(plan.groups) == 1
+                    and _memory._cp_native_fixed(self, plan.signature)
                 )
-                and (
-                    _memory._unanchored(self._memory_profiles.get(plan.signature))
-                    or _memory._cp_request_floor(self, plan.signature, None) > 0
+                or (
+                    plan.packed_tokens < _memory._memory_model._MEMORY_SLOPE_MIN_TOKENS
+                    and _memory._fixed_slope_enabled(
+                        self._memory_profiles.get(plan.signature)
+                    )
+                    and (
+                        _memory._unanchored(self._memory_profiles.get(plan.signature))
+                        or _memory._cp_request_floor(self, plan.signature, None) > 0
+                    )
+                    and _memory._native_cp_cold_supported(self, plan.signature)
                 )
-                and _memory._native_cp_cold_supported(self, plan.signature)
             )
         ):
             from art.megatron.context_parallel.runtime import (
@@ -1643,7 +1791,9 @@ def _plan_flat_forward(
                     ),
                 ),
             )
-            if _memory._fixed_slope_enabled(self._memory_profiles.get(plan.signature)):
+            if _memory._fixed_slope_enabled(
+                self._memory_profiles.get(plan.signature)
+            ) or _memory._cp_native_fixed(self, plan.signature):
                 plan = replace(
                     plan, caller_cp_workload=_memory._qualified_cp_workload(self, plan)
                 )
@@ -1669,8 +1819,8 @@ def _fill_planner_snapshot(
         from . import _memory, _planner_replay
 
         fixed_slope_collection = _memory._FIXED_SLOPE_PROFILES.get()
-        # Cross-signature rate fallback is part of the estimate's frozen input.
-        # Legacy reports keep their exact payload shape.
+        # Pricing reads the pool for rates, scope constraints, sibling floors
+        # and native fixed-policy activation, even without a selected profile.
         profile_pool = (
             [
                 {"signature": asdict(key), "profile": asdict(profile)}
@@ -1679,9 +1829,8 @@ def _fill_planner_snapshot(
             ]
             if fixed_slope_collection
             or any(
-                profile is not None and profile.peak_model_version == 2
-                for child in children
-                for profile in (self._memory_profiles.get(child.signature),)
+                profile.peak_model_version == 2
+                for profile in self._memory_profiles.values()
             )
             else None
         )

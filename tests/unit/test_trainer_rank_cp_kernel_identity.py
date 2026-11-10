@@ -33,6 +33,9 @@ def test_format5_equal_request_keeps_coverage():
     rank = metadata_rank("moe")
     rank._memory_profiles[signature] = profile
     with memory.fixed_slope_memory_profiles():
+        from test_trainer_rank_cp_output_families import fixture_floor
+
+        fixture_floor(rank, True)
         plan = rank._plan_flat_forward([request(16384, grad=True)])
         assert plan.signature == signature
         assert plan.caller_cp_workload[1] == profile.caller_cp_peaks[0][3]

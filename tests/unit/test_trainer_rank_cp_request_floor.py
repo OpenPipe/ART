@@ -17,7 +17,7 @@ ROWS = (
 )
 
 
-def prepared_rank(kind):
+def prepared_rank(kind, *, include_floor=True):
     rank = native_rank(kind)
     from test_trainer_rank_cp_family_seed import recorded
 
@@ -43,6 +43,11 @@ def prepared_rank(kind):
                 observe(rank, n, peak, grad=grad)
             if not grad:
                 observe(rank, 262144, 37_200_000_000, grad=False)
+    if include_floor:
+        from test_trainer_rank_cp_output_families import fixture_floor
+
+        for grad in (False, True):
+            fixture_floor(rank, grad)
     return rank
 
 
@@ -91,7 +96,7 @@ def test_minimal_family_trial_is_once_complete_and_rate_isolated(
     from art.trainer_rank import _planner_misses as reports
 
     with memory.fixed_slope_memory_profiles(), torch.set_grad_enabled(grad):
-        rank = prepared_rank(kind)
+        rank = prepared_rank(kind, include_floor=False)
         before = {k: p.rate_observations for k, p in rank._memory_profiles.items()}
         fake_device(monkeypatch, rank, 100_000_000)
         with rank.calibration_rung(
@@ -228,7 +233,9 @@ def test_request_floor_isolated_monotone_and_revocation_safe(kind):
         finally:
             memory._CP_FAMILY_CALIBRATION.reset(token)
         assert (
-            memory._cp_request_floor(rank, other.signature, other.caller_cp_workload)
+            memory._cp_measured_request_floor(
+                rank, other.signature, other.caller_cp_workload
+            )
             == 0
         )
         plan = rank._plan_flat_forward([request(72)])
@@ -346,10 +353,16 @@ def test_fixed_floor_does_not_prune_an_unrelated_family_split():
         rank = prepared_rank("moe")
         record_minimal_caller(rank, False, 4_000_000_000)
         with short_kernel():
+            from test_trainer_rank_cp_output_families import fixture_floor
+
+            fixture_floor(rank, False)
             inputs = requests([256, 256], False)
             children = [rank._plan_flat_forward([r]) for r in inputs]
             assert all(
-                memory._cp_request_floor(rank, p.signature, p.caller_cp_workload) == 0
+                memory._cp_measured_request_floor(
+                    rank, p.signature, p.caller_cp_workload
+                )
+                == 0
                 for p in children
             )
             rank._available_memory_bytes = lambda sample=None: 300_000_000

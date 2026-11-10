@@ -25,6 +25,12 @@ def seed_profiles(monkeypatch, kind):
                 [request(16384, grad=grad)], no_grad=not grad
             ) as rung:
                 list(rung.forward_micro_batches())
+    from test_trainer_rank_cp_output_families import fixture_floor
+
+    for grad in (False, True):
+        fixture_floor(rank, grad)
+        with short_kernel():
+            fixture_floor(rank, grad)
     return rank
 
 

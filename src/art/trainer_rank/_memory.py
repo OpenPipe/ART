@@ -898,7 +898,7 @@ def _cp_request_floor_key(
     return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
-def _cp_request_floor(self: TrainerRank, signature, workload) -> int:
+def _cp_measured_request_floor(self: TrainerRank, signature, workload) -> int:
     profiles = [
         (key, profile)
         for key, profile in self._memory_profiles.items()
@@ -936,6 +936,62 @@ def _cp_request_floor(self: TrainerRank, signature, workload) -> int:
     )
 
 
+def _cp_sibling_scope(signature: _impl._MemorySignature) -> dict[str, Any]:
+    """One model's CP workload, with only operation and outputs varying.
+
+    The rank-owned profile map namespaces the model. Keep topology (including
+    CP degree), selected adapter shapes and checkpoint partition exact. Grad
+    flags and operation grouping do not denote different adapters. Qualified
+    workload keys additionally keep native model geometry, kernel identities
+    and runtime settings exact. Scoring policy never supplies memory evidence.
+    """
+    return dict(
+        topology=signature.topology,
+        slot_shapes=tuple(sorted({shapes for _, shapes in signature.slot_shapes})),
+        checkpoint_partition=getattr(signature, "checkpoint_partition", None),
+    )
+
+
+def _cp_native_fixed(self: TrainerRank, signature) -> bool:
+    return _native_cp_cold_supported(self, signature) and (
+        _fixed_slope_enabled(self._memory_profiles.get(signature))
+        or any(p.peak_model_version == 2 for p in self._memory_profiles.values())
+    )
+
+
+def _cp_request_floor(
+    self: TrainerRank, signature, workload, *, allow_deferred: bool = True
+) -> int:
+    own = _cp_measured_request_floor(self, signature, workload)
+    if own > 0:
+        return own
+    scope = _cp_sibling_scope(signature)
+    sibling = 0
+    if workload is None or _known_cp_kernels(workload):
+        for key, profile in self._memory_profiles.items():
+            if _cp_sibling_scope(key) != scope:
+                continue
+            floors = dict(getattr(profile, "cp_request_floors", ()))
+            # Re-key the requested workload using the sibling's own signature.
+            # This preserves old persisted floor keys without relabeling any
+            # measurement or adding new coverage, rates or profile fields.
+            value = (
+                max(floors.values(), default=0)
+                if workload is None
+                else floors.get(_cp_request_floor_key(key, workload), 0)
+            )
+            sibling = max(sibling, value)
+    if sibling > 0:
+        return sibling
+    # Only explicit calibration can bootstrap missing measurements under its
+    # existing static seed cap. Ordinary flat and split admissions fail closed.
+    return (
+        _MEMORY_DEFERRED_BYTES
+        if allow_deferred and _cp_native_fixed(self, signature)
+        else 0
+    )
+
+
 def _cp_phase_bounds(
     self: TrainerRank,
     signature,
@@ -944,8 +1000,14 @@ def _cp_phase_bounds(
     *,
     include_optimizer=True,
     packed_tokens: int = 0,
+    require_measured_floor: bool = True,
 ) -> tuple[int, int, int]:
-    floor = _cp_request_floor(self, signature, workload)
+    if packed_tokens <= 0:
+        # Inactive requests have no initialization, caller or optimizer phase.
+        return 0, 0, 0
+    floor = _cp_request_floor(
+        self, signature, workload, allow_deferred=require_measured_floor
+    )
     scope = _empirical_scope(signature)
     for key, profile in self._memory_profiles.items():
         if isinstance(profile, _CallerMemoryProfile) or _empirical_scope(key) != scope:
@@ -963,10 +1025,7 @@ def _cp_phase_bounds(
             floor,
             max((peak for n, peak in observed if n <= packed_tokens), default=0),
         )
-    native_fixed = _native_cp_cold_supported(self, signature) and (
-        _fixed_slope_enabled(self._memory_profiles.get(signature))
-        or any(p.peak_model_version == 2 for p in self._memory_profiles.values())
-    )
+    native_fixed = _cp_native_fixed(self, signature)
     static_floor = 0
     if native_fixed:
         # Missing measurements never imply zero fixed work. Retain the native
@@ -1004,6 +1063,7 @@ def _cp_fixed_phase_bytes(
     *,
     include_optimizer=True,
     packed_tokens: int = 0,
+    require_measured_floor: bool = True,
 ) -> tuple[int, int]:
     measured, static, optimizer = _cp_phase_bounds(
         self,
@@ -1012,6 +1072,7 @@ def _cp_fixed_phase_bytes(
         workload,
         include_optimizer=include_optimizer,
         packed_tokens=packed_tokens,
+        require_measured_floor=require_measured_floor,
     )
     return max(measured, static), optimizer
 
@@ -3861,6 +3922,7 @@ def _memory_check(
                 )
             )
         required = self._estimate_required_memory_bytes_from_values(
+            _require_cp_request_floor=_calibration is None,
             request_count=getattr(forward, "request_count", None),
             packed_tokens=forward.packed_tokens,
             output_bytes=forward.output_bytes,
@@ -4053,7 +4115,9 @@ def _memory_check_required(
             values[1] = available
             # Extrema can come from different DP ranks. Agree that every rank
             # fits its own demand while retaining extrema for diagnostics.
-            values[2] = available >= local_required
+            values[2] = (
+                available >= local_required and local_required < _MEMORY_DEFERRED_BYTES
+            )
             _impl.dist.all_reduce(values[1:3], op=_impl.dist.ReduceOp.MIN, group=group)
             available = int(values[1].item())
             fits = bool(values[2].item())
@@ -4072,7 +4136,8 @@ def _memory_check_required(
             else self._available_memory_bytes(details)
         )
         local_available = available
-        fits = required <= available
+        # Deferred is a policy refusal, not a price a larger budget can buy.
+        fits = required <= available and required < _MEMORY_DEFERRED_BYTES
     if _calibration is not None:
         extrapolating = _calibration.eligible and _calibration.extrapolated
         _calibration.decision = CalibrationRungDecision(
@@ -4152,6 +4217,7 @@ def _estimate_required_memory_bytes_from_values(
     caller_cp_workload: _CPWorkload | None = None,
     include_cold_extrapolation: bool = True,
     _calibration_compute_bytes: int | _CalibrationEstimate | None = None,
+    _require_cp_request_floor: bool = True,
 ) -> int:
     if packed_tokens <= 0:
         return output_bytes
@@ -4506,6 +4572,9 @@ def _estimate_required_memory_bytes_from_values(
                 caller_cp_workload,
                 include_optimizer=_calibration_compute_bytes is None,
                 packed_tokens=packed_tokens,
+                require_measured_floor=(
+                    _require_cp_request_floor and _calibration_compute_bytes is None
+                ),
             ),
         )
     return required

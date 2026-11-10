@@ -143,6 +143,9 @@ def test_real_planner_seed_then_ordinary_8k_then_trust_32k(monkeypatch, kind):
             [request(16384, grad=True)], no_grad=False
         ) as repeated:
             assert not repeated.decision.seed
+        from test_trainer_rank_cp_output_families import fixture_floor
+
+        fixture_floor(rank, True)
         plan = rank._plan_flat_forward([request(8192, grad=True)])
         if isinstance(profile, memory._CallerMemoryProfile):
             assert (
@@ -267,6 +270,9 @@ def test_moe_short_root_family_dominance_coverage_after_seed(monkeypatch, n):
     with memory.fixed_slope_memory_profiles():
         with rank.calibration_rung([request(16384, grad=True)], no_grad=False) as rung:
             list(rung.forward_micro_batches())
+        from test_trainer_rank_cp_output_families import fixture_floor
+
+        fixture_floor(rank, True)
         plan = rank._plan_flat_forward([request(n, grad=True)])
         profile = rank._memory_profiles[plan.signature]
         assert isinstance(profile, memory._CallerMemoryProfile)

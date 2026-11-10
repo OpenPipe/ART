@@ -41,7 +41,7 @@ def test_hidden_request_after_other_minimum_trials_has_a_fixed_bound(monkeypatch
                 plan = rank._plan_flat_forward(
                     output_requests(n, False, "none", True, False, None, False)
                 )
-                measured = memory._cp_request_floor(
+                measured = memory._cp_measured_request_floor(
                     rank, plan.signature, plan.caller_cp_workload
                 )
                 phases = memory._cp_fixed_phase_bytes(

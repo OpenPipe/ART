@@ -17,6 +17,7 @@ def test_unprofiled_forward_target_2971_after_backward_seed_is_finite():
     with memory.fixed_slope_memory_profiles():
         observe(rank, 8192, 1_300_000_000, grad=True)
         observe(rank, 16384, 2_200_000_000, grad=True)
+        fixture_floor(rank, True)
         with torch.no_grad():
             plan = rank._plan_flat_forward([request(2971)])
             check = rank._memory_check(plan)
@@ -62,10 +63,32 @@ def native_rank(kind):
     return rank
 
 
-def anchors(rank, grad):
+def fixture_floor(rank, grad):
+    """Restore a completed synthetic minimum reading, with no rate/coverage data."""
+    with memory.fixed_slope_memory_profiles(), torch.set_grad_enabled(grad):
+        token = memory._CP_FAMILY_CALIBRATION.set(True)
+        try:
+            plan = rank._plan_flat_forward(
+                output_requests(1, grad, "none", True, True, 2, False)
+            )
+        finally:
+            memory._CP_FAMILY_CALIBRATION.reset(token)
+        plan.__dict__["_calibration_cp_family_seed"] = True
+        rank._update_memory_profile(
+            plan,
+            1_000_000 + plan.output_bytes,
+            retained_bytes=None,
+            caller_phase=True,
+            rate_eligible=False,
+        )
+
+
+def anchors(rank, grad, *, include_floor=True):
     with torch.set_grad_enabled(grad):
         observe(rank, 8192, 10_000_000, grad=grad)
         observe(rank, 16384, 20_000_000, grad=grad)
+    if include_floor:
+        fixture_floor(rank, grad)
 
 
 def test_local_measurement_at_2048_does_not_cover_gradient_target_2971(monkeypatch):

@@ -23,6 +23,12 @@ def seed(monkeypatch, kind="moe"):
     fake_device(monkeypatch, rank, 2_500_000_000)
     with rank.calibration_rung([request(16384, grad=True)], no_grad=False) as rung:
         list(rung.forward_micro_batches())
+    from test_trainer_rank_cp_output_families import fixture_floor
+    from test_trainer_rank_subfloor_cp import short_kernel
+
+    fixture_floor(rank, True)
+    with short_kernel():
+        fixture_floor(rank, True)
     return rank
 
 

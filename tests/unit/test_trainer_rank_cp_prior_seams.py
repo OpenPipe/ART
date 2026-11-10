@@ -25,6 +25,11 @@ def observed_rank():
     assert isinstance(
         rank._memory_profiles[anchor.signature], memory._CallerMemoryProfileV2
     )
+    from test_trainer_rank_cp_output_families import fixture_floor
+
+    fixture_floor(rank, True)
+    with short_kernel():
+        fixture_floor(rank, True)
     return rank, anchor.signature
 
 
