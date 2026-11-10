@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from art.trainer_rank import ForwardInput, ForwardOutput
+from art.trainer_rank import ForwardInput, ForwardOutput, _impl
 from art.trainer_rank import _memory as m
 from art.trainer_rank import _planner_misses as reports
 
@@ -134,7 +134,28 @@ def _cohort_worker(index, rendezvous, output, variant):
                     target_plan, packed_tokens=3, logical_tokens=3, output_bytes=0
                 )
                 rank._update_memory_profile(tiny, 300_000_000, retained_bytes=None)
-                list(rank.forward_micro_batches(target_requests, no_grad=False))
+                # This CPU diagnostic intentionally collects an untrusted wave
+                # to test learning isolation. Deferred estimates are now policy
+                # refusals even under the synthetic oversized budget; supply
+                # explicit fixture execution permission, not an admission bypass
+                # in the production estimator. The final check below is real.
+                synthetic = _impl._CandidateMicroBatch(
+                    inputs=tuple(target_requests),
+                    indices=(0,),
+                    plan=target_plan,
+                    check=replace(rank._memory_check(target_plan), fits=True),
+                    stats_global_count=1,
+                    rejected_candidates=0,
+                    cold_start=True,
+                )
+                list(
+                    cast(Any, _impl.TrainerRank.forward_micro_batches)(
+                        rank,
+                        target_requests,
+                        no_grad=False,
+                        _calibration_candidate=synthetic,
+                    )
+                )
                 profile = rank._memory_profiles[target_plan.signature]
                 demand = rank._estimate_required_memory_bytes_from_values(
                     packed_tokens=32768,

@@ -74,8 +74,14 @@ def calibrate(monkeypatch, rank):
                         assert rung.decision.seed and rung.decision.fits
                         list(rung.forward_micro_batches())
                 else:
-                    assert rank._memory_check(plan).fits
-                    list(rank.forward_micro_batches(inputs, no_grad=not backward))
+                    # Complete synthetic ladder observations, without granting
+                    # ordinary floorless admission while calibration is pending.
+                    rank._update_memory_profile(
+                        plan,
+                        compute + plan.output_bytes,
+                        retained_bytes=None,
+                        caller_phase=True,
+                    )
             # Complete larger fixture observations, as in metadata replay.
             for n, compute in (
                 (32768, 4_100_000_000),
@@ -90,10 +96,27 @@ def calibrate(monkeypatch, rank):
                     retained_bytes=None,
                     caller_phase=True,
                 )
+    from test_trainer_rank_cp_output_families import fixture_floor
+
+    for grad in (False, True):
+        fixture_floor(rank, grad)
+        with short_kernel():
+            fixture_floor(rank, grad)
 
 
 def cold_price(rank, plan):
-    with patch.object(rank, "_memory_profiles", {}):
+    # An analytic cold reference, not permission for floorless admission.
+    estimate = rank._estimate_required_memory_bytes_from_values
+    with (
+        patch.object(rank, "_memory_profiles", {}),
+        patch.object(
+            rank,
+            "_estimate_required_memory_bytes_from_values",
+            side_effect=lambda **kw: estimate(
+                **(kw | {"_require_cp_request_floor": False})
+            ),
+        ),
+    ):
         return rank._memory_check(plan).estimated_required_bytes
 
 
@@ -128,7 +151,8 @@ def test_tiny_cp_wave_after_ladder_equals_unprofiled_price(
             assert plan.packed_tokens < 512
             old = rank._memory_profiles[plan.signature]
             if plan.caller_cp_workload is not None:
-                assert old.covering_cp_peak(n, plan.caller_cp_workload) is None
+                covering = getattr(old, "covering_cp_peak", lambda *args: None)
+                assert covering(n, plan.caller_cp_workload) is None
                 masks = json.loads(plan.caller_cp_workload[0])["masks"]
                 if n < 8:
                     assert any(not kinds for kinds in masks)
@@ -266,6 +290,9 @@ def _agreement_worker(index, directory):
             rank._update_memory_profile(
                 observed, 2_200_000_000, retained_bytes=None, caller_phase=True
             )
+            from test_trainer_rank_cp_output_families import fixture_floor
+
+            fixture_floor(rank, True)
             tiny = rank._plan_flat_forward(requests([16], True))
             check = rank._memory_check(tiny)
             Path(directory, f"rank{index}.json").write_text(

@@ -129,7 +129,16 @@ def family_rank(monkeypatch, lora=1):
         )
 
     monkeypatch.setattr(rank, "_plan_flat_forward", plan)
-    return rank, key, profile
+    minimum = rank._plan_flat_forward([request(1, grad=True)])
+    minimum.__dict__["_calibration_cp_family_seed"] = True
+    rank._update_memory_profile(
+        minimum,
+        1_000_000 + minimum.output_bytes,
+        retained_bytes=None,
+        caller_phase=True,
+        rate_eligible=False,
+    )
+    return rank, key, rank._memory_profiles[key]
 
 
 @pytest.mark.parametrize("lora", [1, 8, 32])
@@ -259,7 +268,9 @@ def test_recorded_rank8_metadata_keeps_48575_token_step_unchanged_after_tiny_wav
     _, key, profile = recorded("moe", 8)
     rank = metadata_rank("moe")
     monkeypatch.setattr(rank, "_slot_memory_shapes", lambda ref: key.slot_shapes[0][1])
-    rank._memory_profiles = {key: profile}
+    # Keep recorded physical adapter shapes. Fresh synthetic CPU observations
+    # must not borrow device-qualified GPU kernel evidence.
+    rank._memory_profiles = {}
     rank._available_memory_bytes = lambda sample=None: 100_000_000_000
     with memory.fixed_slope_memory_profiles():
         plan = rank._plan_flat_forward(requests(SHAPE, True))
@@ -272,6 +283,9 @@ def test_recorded_rank8_metadata_keeps_48575_token_step_unchanged_after_tiny_wav
             retained_bytes=None,
             caller_phase=True,
         )
+        from test_trainer_rank_cp_output_families import fixture_floor
+
+        fixture_floor(rank, True)
         clean = rank._memory_check(plan).estimated_required_bytes
         assert clean < 1 << 62
         saved = dict(rank._memory_profiles)
