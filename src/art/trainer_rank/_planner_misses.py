@@ -648,7 +648,13 @@ _RANK_FIELDS = frozenset(
 )
 # TP x SP floor facts; reports captured before them replay conservatively.
 _OPTIONAL_RANK_FIELDS = frozenset(
-    {"mixer_top_gaps", "lora_modules_per_layer", "parallel_shape", "moe_layers"}
+    {
+        "mixer_top_gaps",
+        "lora_modules_per_layer",
+        "parallel_shape",
+        "moe_layers",
+        "moe_memory_supported",
+    }
 )
 
 
@@ -833,6 +839,10 @@ def replay(
     if type(moe_layers) is not int or not 0 <= moe_layers <= layers:
         raise ValueError("incomplete replay: invalid MoE layer count")
     rank._moe_layers = moe_layers
+    supported = values.get("moe_memory_supported", False)
+    if type(supported) is not bool:
+        raise ValueError("incomplete replay: invalid MoE eligibility")
+    rank._moe_memory_supported = supported
     # Check the same shared subforward inventories as capture, including the
     # independently retained layout inputs, before constructing any prefix tree.
     group_offset = request_offset = 0

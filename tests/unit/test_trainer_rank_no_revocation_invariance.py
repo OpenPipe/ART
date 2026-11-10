@@ -1,4 +1,4 @@
-"""Recorded CPU admission decisions without any coverage revocation."""
+"""Recorded CPU bounds without revocation, including fixed request costs."""
 
 from contextlib import nullcontext
 from dataclasses import replace
@@ -71,6 +71,15 @@ def test_no_revocation_admission_matches_recorded_baseline(monkeypatch, kind):
             Path(__file__).parent / "fixtures/memory_fixed_slope/cp_no_revocation.json"
         ).read_text()
     )
+    overrides = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures/memory_fixed_slope/cp_request_floor_overrides.json"
+        ).read_text()
+    )
+    expected = {
+        (row["kind"], row["id"]): row["expected"] for row in overrides["overrides"]
+    }
     with memory.fixed_slope_memory_profiles():
         rank = seed_profiles(monkeypatch, kind)
         for case in fixture["cases"]:
@@ -81,4 +90,11 @@ def test_no_revocation_admission_matches_recorded_baseline(monkeypatch, kind):
                 and not getattr(p, "dominance_disabled", False)
                 for p in rank._memory_profiles.values()
             )
-            assert admission_record(rank, case) == case["expected"], case
+            record = admission_record(rank, case)
+            assert record == expected.get((kind, case["id"]), case["expected"]), case
+            assert (
+                record["unsplit_required_bytes"]
+                >= case["expected"]["unsplit_required_bytes"]
+            )
+            if case["expected"]["decision"] == "refused":
+                assert record["decision"] == "refused"

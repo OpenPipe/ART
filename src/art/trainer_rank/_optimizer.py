@@ -29,6 +29,50 @@ if TYPE_CHECKING:
     from art.trainer_rank._impl import AdamParams, TrainerRank, _DynamicOptimizer
 
 
+# Original gradient plus eight FP32 live buffers: master, two moments, reduced
+# gradient, clipped gradient, norm square, Adam denominator and update workspace.
+# Charge cold state creation even if an existing optimizer already owns it.
+_OPTIMIZER_BYTES_PER_ELEMENT = 36
+_OPTIMIZER_FIXED_BYTES = 64 * 2**20
+
+
+def _signature_optimizer_bytes(signature) -> int:
+    """A following Adam step's envelope for native CP8 adapter parameters."""
+    if signature.topology != (1, 1, 8, 1) or not signature.grad_enabled:
+        return 0
+    count = 0
+    for grad, shapes in signature.slot_shapes:
+        if not grad:
+            continue
+        for shape in shapes:
+            if not shape or shape[0] not in (2, 3) or len(shape) != 1 + 2 * shape[0]:
+                continue  # Unknown owners retain their existing deferred gate.
+            n = shape[0]
+            count += math.prod(shape[1 : 1 + n]) + math.prod(shape[1 + n :])
+    return count * _OPTIMIZER_BYTES_PER_ELEMENT + (
+        _OPTIMIZER_FIXED_BYTES if count else 0
+    )
+
+
+def _guard_optimizer_memory(self: TrainerRank, checkpoints: Sequence[str]) -> None:
+    """Collectively refuse before gradient copies, master/state creation or Adam."""
+    params = {
+        id(p): p for name in checkpoints for p in self._checkpoint_slots[name].params
+    }
+    required = math.ceil(
+        (
+            sum(p.numel() * (32 + max(4, p.element_size())) for p in params.values())
+            + (_OPTIMIZER_FIXED_BYTES if params else 0)
+        )
+        * _impl._MEMORY_SAFETY_FACTOR
+    )
+    check = self._memory_check_required(required, sync_across_dp=True)
+    if not check.fits:
+        raise _impl.TrainerRankMemoryError(
+            "optim_step is predicted to exceed available memory"
+        )
+
+
 def _extend_dynamic_optimizer(
     self: TrainerRank,
     name: str,
@@ -165,6 +209,8 @@ def optim_step(
     )
     if on_live_graphs == "error":
         self._guard_checkpoints_can_step(selected_checkpoints)
+    if self.device.type == "cuda" and self._topology_key() == (1, 1, 8, 1):
+        _guard_optimizer_memory(self, selected_checkpoints)
     with _impl._telemetry_phase(
         "optim",
         {"checkpoint_count": len(selected_checkpoints)},

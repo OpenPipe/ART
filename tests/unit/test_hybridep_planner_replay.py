@@ -96,6 +96,8 @@ def test_version3_zero_growth_replay_preserved(tmp_path):
     item["runtime_facts"]["version"] = 3
     del item["runtime_facts"]["hybridep"]
     del item["runtime_facts"]["hybridep_recompute_rows"]
+    del item["runtime_facts"]["request_count"]
+    del item["runtime_facts"]["cold_cp"]
     assert reports.replay(report)["aggregate"]["matches"]
     item["arguments"]["hybridep_growth_bytes"] = 1
     with pytest.raises(ValueError, match="hybridep_runtime_facts_unsupported"):

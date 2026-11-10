@@ -199,6 +199,9 @@ def calibration_rung(
     signature/family intent and block incomplete attempts on restart as for
     the initial seed. The sample never teaches a rate. Measure the largest
     request in each uncovered family; a smaller peak cannot cover more rows.
+    Also prepare a one-token request per operation/output class. Its complete
+    caller interval records a fixed request floor only, never rate or covering
+    evidence. It has its own once-per-family intent and the same static cap.
     """
     self._guard_forward_collective("calibration_rung")
     enabled = _impl.torch.is_grad_enabled() if no_grad is None else not no_grad
@@ -221,11 +224,11 @@ def calibration_rung(
             candidate=plan.packed_tokens,
             seed_uncovered_cp_family=seed_uncovered_cp_family,
         )
+        if seed_uncovered_cp_family:
+            plan.__dict__["_calibration_cp_family_seed"] = True
         check = self._memory_check(
             plan, sync_across_dp=True, sync_planning_errors=True, _calibration=estimate
         )
-        if seed_uncovered_cp_family:
-            plan.__dict__["_calibration_cp_family_seed"] = True
     assert estimate.decision is not None
     rung = CalibrationRung(
         decision=estimate.decision,
@@ -668,24 +671,26 @@ def _split_chunk_lower_cost(
         // signature.topology[2],
     )
     profile = self._memory_profiles.get(signature)
-    if (
-        signature.topology[2] > 1
-        and isinstance(profile, _memory._CallerMemoryProfileV2)
-        and (
-            profile.non_dominant_cp_pairs
-            or profile.dominance_disabled
-            or (
-                _memory._fixed_slope_enabled(profile)
-                and len(requests) == 1
-                and cost.required >= _memory._MEMORY_DEFERRED_BYTES
-                and packed_tokens < _memory._memory_model._MEMORY_SLOPE_MIN_TOKENS
-                and _memory._native_cp_cold_supported(self, signature)
+    if signature.topology[2] > 1 and (
+        _memory._cp_request_floor(self, signature, None) > 0
+        or (
+            isinstance(profile, _memory._CallerMemoryProfileV2)
+            and (
+                profile.non_dominant_cp_pairs
+                or profile.dominance_disabled
+                or (
+                    _memory._fixed_slope_enabled(profile)
+                    and len(requests) == 1
+                    and cost.required >= _memory._MEMORY_DEFERRED_BYTES
+                    and packed_tokens < _memory._memory_model._MEMORY_SLOPE_MIN_TOKENS
+                    and _memory._native_cp_cold_supported(self, signature)
+                )
             )
         )
     ):
-        # This preview has no CP family. A revoked-family refusal cannot be
-        # used as its lower bound. Make the preview non-binding; exact child
-        # costs below still enforce every coverage and memory check, using
+        # This preview has no CP family. A revoked refusal or a different
+        # family's fixed floor cannot be its lower bound. Make it non-binding;
+        # exact child costs still enforce every coverage and memory check, using
         # the existing collectives to keep all ranks on the same path.
         return _impl._SubforwardCost(required=0, retained=0)
     if (
@@ -1600,7 +1605,10 @@ def _plan_flat_forward(
                 and _memory._fixed_slope_enabled(
                     self._memory_profiles.get(plan.signature)
                 )
-                and _memory._unanchored(self._memory_profiles.get(plan.signature))
+                and (
+                    _memory._unanchored(self._memory_profiles.get(plan.signature))
+                    or _memory._cp_request_floor(self, plan.signature, None) > 0
+                )
                 and _memory._native_cp_cold_supported(self, plan.signature)
             )
         ):
@@ -1692,6 +1700,7 @@ def _fill_planner_snapshot(
                     if (profile := self._memory_profiles.get(child.signature))
                     else None,
                     "arguments": {
+                        "request_count": child.request_count,
                         "packed_tokens": child.packed_tokens,
                         "output_bytes": child.output_bytes,
                         "logical_tokens": child.active_logical_tokens,
@@ -1748,6 +1757,9 @@ def _fill_planner_snapshot(
         rank_fields["topology"] = list(plan.signature.topology)
         rank_fields["parallel_shape"] = asdict(self._parallel_shape)
         rank_fields["moe_layers"] = self._moe_layers
+        rank_fields["moe_memory_supported"] = bool(
+            getattr(self, "_moe_memory_supported", False)
+        )
 
         def version(tensor: torch.Tensor | None) -> int | None:
             try:

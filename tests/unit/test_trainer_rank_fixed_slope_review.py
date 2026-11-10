@@ -229,7 +229,9 @@ def test_earlier_v2_pickle_promotes_without_losing_model_fields(record):
         retained_compute_peaks=(),
     )
     if isinstance(restored, m._CallerMemoryProfileV2):
-        expected.update(non_dominant_cp_pairs=(), dominance_disabled=False)
+        expected.update(
+            non_dominant_cp_pairs=(), dominance_disabled=False, cp_request_floors=()
+        )
     assert asdict(restored) == expected
     m._validate_memory_profile_model(restored)
 

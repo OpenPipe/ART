@@ -91,6 +91,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
         raise ValueError("hybridep_runtime_facts_unsupported")
     for name in (
         "_subforward_cost",
+        "_uncovered_cp_family",
         "_split_required_memory",
         "_estimate_required_memory_bytes_from_values",
         "_retained_memory_bytes",
@@ -151,7 +152,7 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
     groups = []
     remaining = _MAX_SEGMENTS
     reserve = _fact_budget()
-    reserve(384)
+    reserve(512)
     head_values = _MAX_INPUT_VALUES
 
     def terms(checkpoint_grad: bool, ref: Any) -> list[Any]:
@@ -309,7 +310,15 @@ def capture(rank: Any, plan: Any) -> dict[str, Any]:
             }
         )
     facts: dict[str, Any] = {
-        "version": 4,
+        "version": 5,
+        "request_count": plan.request_count,
+        "cold_cp": rank._uncovered_cp_family(
+            rank._memory_profiles.get(plan.signature),
+            plan.signature,
+            plan.packed_tokens,
+            plan.caller_cp_workload,
+            request_count=plan.request_count,
+        ),
         "hybridep": _memory._plan_hybridep_dimensions(rank, plan),
         "hybridep_recompute_rows": _memory._checkpoint_hybridep_rows(
             rank, rank._plan_group_rows(plan)
@@ -357,7 +366,7 @@ def validate(facts: Any) -> None:
             raise ValueError("invalid runtime dimension")
 
     if type(facts) is dict and (
-        type(facts.get("version")) is not int or facts["version"] not in (3, 4)
+        type(facts.get("version")) is not int or facts["version"] not in (3, 4, 5)
     ):
         raise ValueError("unsupported runtime facts version")
     fields(
@@ -372,10 +381,19 @@ def validate(facts: Any) -> None:
         }
         | (
             {"hybridep", "hybridep_recompute_rows"}
-            if type(facts) is dict and facts.get("version") == 4
+            if type(facts) is dict and facts.get("version") in (4, 5)
+            else set()
+        )
+        | (
+            {"request_count", "cold_cp"}
+            if type(facts) is dict and facts.get("version") == 5
             else set()
         ),
     )
+    if facts["version"] == 5:
+        integer(facts["request_count"])
+        if type(facts["cold_cp"]) is not bool:
+            raise ValueError("invalid CP cold eligibility")
     dimensions = facts.get("hybridep")
     if facts.get("hybridep_recompute_rows") is not None:
         integer(facts["hybridep_recompute_rows"])
@@ -397,7 +415,7 @@ def validate(facts: Any) -> None:
         raise ValueError("invalid runtime groups")
     remaining = _MAX_SEGMENTS
     reserve = _fact_budget()
-    reserve(384 if facts["version"] == 4 else 0)
+    reserve(512 if facts["version"] >= 5 else 384 if facts["version"] == 4 else 0)
     for group in groups:
         fields(
             group,
@@ -558,6 +576,20 @@ class ReplayRank(_impl.TrainerRank):
     # in group order.
     _head_targets: list[int]
 
+    def _uncovered_cp_family(
+        self, profile, signature, packed_tokens, workload, *, request_count=None
+    ):
+        if self._facts is not None and self._facts["version"] >= 5:
+            return self._facts["cold_cp"]
+        return _memory._uncovered_cp_family(
+            self,
+            profile,
+            signature,
+            packed_tokens,
+            workload,
+            request_count=request_count,
+        )
+
     def _replay_slots(self, slot_refs: Any) -> Any:
         # Replay passes each group's index; map it to that group's frozen slot.
         if self._facts is None or slot_refs is None:
@@ -708,6 +740,11 @@ class ReplayRank(_impl.TrainerRank):
         """The estimator's arguments from ``facts``, except the head charge:
         ``verified_arguments`` adds it once every group's requests verify."""
         validate(facts)
+        if facts["version"] >= 5 and (
+            type(arguments.get("request_count")) is not int
+            or arguments["request_count"] != facts["request_count"]
+        ):
+            raise ValueError("runtime facts disagree with request count")
         self._facts = facts
         self._head_targets = []
         self._moe_checkpoint_grad_bytes_per_token = facts[

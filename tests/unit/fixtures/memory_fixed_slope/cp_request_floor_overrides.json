@@ -1,0 +1,1387 @@
+{
+  "parent_commit": "d932df3010ce0499df4b821449685bf9309f3274",
+  "synthetic": true,
+  "policy": "Native CP fixed initialization, preserved empirical peaks and physical optimizer envelope; original refusals stay refused and no flat estimate decreases.",
+  "overrides": [
+    {
+      "id": "10",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 129185549,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 129185549,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          64
+        ],
+        "request_counts": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "11",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129186535,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 129186535,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          128
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "12",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129187520,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129187520,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          192
+        ],
+        "request_counts": [
+          3
+        ]
+      }
+    },
+    {
+      "id": "13",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129188506,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 129188506,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          256
+        ],
+        "request_counts": [
+          4
+        ]
+      }
+    },
+    {
+      "id": "14",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 645927740,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 129189492,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          320
+        ],
+        "request_counts": [
+          5
+        ]
+      }
+    },
+    {
+      "id": "15",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129190477,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 129190477,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          384
+        ],
+        "request_counts": [
+          6
+        ]
+      }
+    },
+    {
+      "id": "18",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 129185672,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 129185672,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          72
+        ],
+        "request_counts": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "19",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129186781,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 129186781,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          144
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "20",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129187890,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129187890,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          216
+        ],
+        "request_counts": [
+          3
+        ]
+      }
+    },
+    {
+      "id": "21",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129188999,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 129188999,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          288
+        ],
+        "request_counts": [
+          4
+        ]
+      }
+    },
+    {
+      "id": "22",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 645928360,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 129190108,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          360
+        ],
+        "request_counts": [
+          5
+        ]
+      }
+    },
+    {
+      "id": "26",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129186535,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 129186535,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          128
+        ],
+        "request_counts": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "27",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129188506,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129188506,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          256
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "28",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129190477,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 129190477,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          384
+        ],
+        "request_counts": [
+          3
+        ]
+      }
+    },
+    {
+      "id": "29",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 516746132,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 4124858073,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          512
+        ],
+        "request_counts": [
+          4
+        ]
+      }
+    },
+    {
+      "id": "30",
+      "kind": "dense",
+      "expected": {
+        "decision": "split",
+        "fits": true,
+        "required_bytes": 258378982,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 4124858636,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          384,
+          256
+        ],
+        "request_counts": [
+          3,
+          2
+        ]
+      }
+    },
+    {
+      "id": "31",
+      "kind": "dense",
+      "expected": {
+        "decision": "split",
+        "fits": true,
+        "required_bytes": 258380952,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 4124859200,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          384,
+          384
+        ],
+        "request_counts": [
+          3,
+          3
+        ]
+      }
+    },
+    {
+      "id": "33",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 1033492264,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 4124860326,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          1024
+        ],
+        "request_counts": [
+          8
+        ]
+      }
+    },
+    {
+      "id": "34",
+      "kind": "dense",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129188506,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129188506,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          256
+        ],
+        "request_counts": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "36",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 387565518,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 4124859200,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          768
+        ],
+        "request_counts": [
+          3
+        ]
+      }
+    },
+    {
+      "id": "37",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 516754024,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 4124860326,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          1024
+        ],
+        "request_counts": [
+          4
+        ]
+      }
+    },
+    {
+      "id": "38",
+      "kind": "dense",
+      "expected": {
+        "decision": "split",
+        "fits": true,
+        "required_bytes": 645942530,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 4124861452,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          256,
+          256,
+          256,
+          256,
+          256
+        ],
+        "request_counts": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "id": "40",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 904319542,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 4124863705,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          1792
+        ],
+        "request_counts": [
+          7
+        ]
+      }
+    },
+    {
+      "id": "41",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 1033508048,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 4124864832,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          2048
+        ],
+        "request_counts": [
+          8
+        ]
+      }
+    },
+    {
+      "id": "151",
+      "kind": "dense",
+      "expected": {
+        "decision": "split",
+        "fits": true,
+        "required_bytes": 18153206595,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585472974848,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          1,
+          32768
+        ],
+        "request_counts": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "id": "155",
+      "kind": "dense",
+      "expected": {
+        "decision": "split",
+        "fits": true,
+        "required_bytes": 18153206826,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585472974848,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          16,
+          32768
+        ],
+        "request_counts": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "id": "159",
+      "kind": "dense",
+      "expected": {
+        "decision": "split",
+        "fits": true,
+        "required_bytes": 18153207688,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585472974848,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          72,
+          32768
+        ],
+        "request_counts": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "id": "163",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 106634287528,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585473731584,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          131073
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "167",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 106634287759,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585473731584,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          131088
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "171",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 106634288621,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585473731584,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          131144
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "172",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 82811342045,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 82682472874,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262145
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "175",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 104996772264,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585474740224,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262145
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "176",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 82811342276,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 82687203985,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262160
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "179",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 104996772495,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585474740224,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262160
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "180",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 82811343138,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 82704866799,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262216
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "183",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 104996773357,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585474740224,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262216
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "194",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 129185549,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 129185549,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          64
+        ],
+        "request_counts": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "195",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129186535,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 129186535,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          128
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "196",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129187520,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129187520,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          192
+        ],
+        "request_counts": [
+          3
+        ]
+      }
+    },
+    {
+      "id": "197",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129188506,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 129188506,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          256
+        ],
+        "request_counts": [
+          4
+        ]
+      }
+    },
+    {
+      "id": "198",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 645927740,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 129189492,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          320
+        ],
+        "request_counts": [
+          5
+        ]
+      }
+    },
+    {
+      "id": "199",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129190477,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 129190477,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          384
+        ],
+        "request_counts": [
+          6
+        ]
+      }
+    },
+    {
+      "id": "200",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129191463,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129191463,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          448
+        ],
+        "request_counts": [
+          7
+        ]
+      }
+    },
+    {
+      "id": "202",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 129185672,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 129185672,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          72
+        ],
+        "request_counts": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "203",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129186781,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 129186781,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          144
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "204",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129187890,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129187890,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          216
+        ],
+        "request_counts": [
+          3
+        ]
+      }
+    },
+    {
+      "id": "205",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129188999,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 129188999,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          288
+        ],
+        "request_counts": [
+          4
+        ]
+      }
+    },
+    {
+      "id": "206",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 645928360,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 129190108,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          360
+        ],
+        "request_counts": [
+          5
+        ]
+      }
+    },
+    {
+      "id": "207",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129191216,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 129191216,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          432
+        ],
+        "request_counts": [
+          6
+        ]
+      }
+    },
+    {
+      "id": "208",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129192325,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129192325,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          504
+        ],
+        "request_counts": [
+          7
+        ]
+      }
+    },
+    {
+      "id": "210",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129186535,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 129186535,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          128
+        ],
+        "request_counts": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "211",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129188506,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129188506,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          256
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "212",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129190477,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 129190477,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          384
+        ],
+        "request_counts": [
+          3
+        ]
+      }
+    },
+    {
+      "id": "213",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 516746132,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 4124858073,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          512
+        ],
+        "request_counts": [
+          4
+        ]
+      }
+    },
+    {
+      "id": "214",
+      "kind": "moe",
+      "expected": {
+        "decision": "split",
+        "fits": true,
+        "required_bytes": 258378982,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 4124858636,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          384,
+          256
+        ],
+        "request_counts": [
+          3,
+          2
+        ]
+      }
+    },
+    {
+      "id": "215",
+      "kind": "moe",
+      "expected": {
+        "decision": "split",
+        "fits": true,
+        "required_bytes": 258380952,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 4124859200,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          384,
+          384
+        ],
+        "request_counts": [
+          3,
+          3
+        ]
+      }
+    },
+    {
+      "id": "217",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 1033492264,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 4124860326,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          1024
+        ],
+        "request_counts": [
+          8
+        ]
+      }
+    },
+    {
+      "id": "218",
+      "kind": "moe",
+      "expected": {
+        "decision": "flat",
+        "fits": true,
+        "required_bytes": 129188506,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 129188506,
+        "unsplit_fits": true,
+        "packed_tokens": [
+          256
+        ],
+        "request_counts": [
+          1
+        ]
+      }
+    },
+    {
+      "id": "220",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 387565518,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 4124859200,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          768
+        ],
+        "request_counts": [
+          3
+        ]
+      }
+    },
+    {
+      "id": "221",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 516754024,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 4124860326,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          1024
+        ],
+        "request_counts": [
+          4
+        ]
+      }
+    },
+    {
+      "id": "222",
+      "kind": "moe",
+      "expected": {
+        "decision": "split",
+        "fits": true,
+        "required_bytes": 645942530,
+        "available_bytes": 4000000000,
+        "unsplit_required_bytes": 4124861452,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          256,
+          256,
+          256,
+          256,
+          256
+        ],
+        "request_counts": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "id": "224",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 904319542,
+        "available_bytes": 90000000,
+        "unsplit_required_bytes": 4124863705,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          1792
+        ],
+        "request_counts": [
+          7
+        ]
+      }
+    },
+    {
+      "id": "225",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 1033508048,
+        "available_bytes": 300000000,
+        "unsplit_required_bytes": 4124864832,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          2048
+        ],
+        "request_counts": [
+          8
+        ]
+      }
+    },
+    {
+      "id": "335",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495585989713731,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585472974848,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          32769
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "339",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495585989713962,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585472974848,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          32784
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "343",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495585989714824,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585472974848,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          32840
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "347",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495587153130307,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585473731584,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          131073
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "351",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495587153130538,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585473731584,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          131088
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "355",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495587153131400,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585473731584,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          131144
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "356",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 79535308422,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 79406417576,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262145
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "359",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495588704355139,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585474740224,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262145
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "360",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 79535308653,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 79410823552,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262160
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "363",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495588704355370,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585474740224,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262160
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "364",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 79535309515,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 79427272527,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262216
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "367",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495588704356232,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585474740224,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262216
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    }
+  ]
+}
