@@ -672,7 +672,10 @@ def _split_chunk_lower_cost(
     )
     profile = self._memory_profiles.get(signature)
     if signature.topology[2] > 1 and (
-        _memory._cp_request_floor(self, signature, None) > 0
+        _memory._cp_fixed_phase_bytes(
+            self, signature, output_bytes, None, packed_tokens=packed_tokens
+        )[0]
+        > 0
         or (
             isinstance(profile, _memory._CallerMemoryProfileV2)
             and (
@@ -688,8 +691,8 @@ def _split_chunk_lower_cost(
             )
         )
     ):
-        # This preview has no CP family. A revoked refusal or a different
-        # family's fixed floor cannot be its lower bound. Make it non-binding;
+        # This preview has no CP family. A revoked refusal or family fixed
+        # charge cannot be its pruning bound. Make the preview non-binding;
         # exact child costs still enforce every coverage and memory check, using
         # the existing collectives to keep all ranks on the same path.
         return _impl._SubforwardCost(required=0, retained=0)

@@ -864,12 +864,19 @@ _CP_REQUEST_FLOOR_BUDGET = 32
 _CP_COLD_REQUEST_BYTES = 64 * 2**20
 
 
-def _cp_request_scope(signature: _impl._MemorySignature) -> dict[str, Any]:
+def _empirical_scope(signature: _impl._MemorySignature) -> dict[str, Any]:
+    # Storage specializations do not change which request was measured. Keep
+    # operation, outputs, adapters, short-kernel class and partition exact.
     scope = dict(vars(signature))
-    scope.pop("short_requests", None)
     scope.pop("bounded_caller_peak", None)
     scope.pop("bounded_forward_peak", None)
     scope.setdefault("checkpoint_partition", None)
+    return scope
+
+
+def _cp_request_scope(signature: _impl._MemorySignature) -> dict[str, Any]:
+    scope = _empirical_scope(signature)
+    scope.pop("short_requests", None)
     return scope
 
 
@@ -929,7 +936,7 @@ def _cp_request_floor(self: TrainerRank, signature, workload) -> int:
     )
 
 
-def _cp_fixed_phase_bytes(
+def _cp_phase_bounds(
     self: TrainerRank,
     signature,
     output_bytes,
@@ -937,29 +944,45 @@ def _cp_fixed_phase_bytes(
     *,
     include_optimizer=True,
     packed_tokens: int = 0,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     floor = _cp_request_floor(self, signature, workload)
-    profile = self._memory_profiles.get(signature)
-    if profile is not None and not isinstance(profile, _CallerMemoryProfile):
-        # A generic profile has no family-qualified channel to replace these
-        # measured constraints. Cold status cannot erase its absolute floor or
-        # a peak at an already observed extent. Caller profiles instead retain
-        # their exact same-family peaks in cold_family_floor.
+    scope = _empirical_scope(signature)
+    for key, profile in self._memory_profiles.items():
+        if isinstance(profile, _CallerMemoryProfile) or _empirical_scope(key) != scope:
+            continue
+        # Generic and bounded-forward constraints survive selection of another
+        # storage scope. They supply bounds only, never caller coverage or rates.
+        # Caller profiles retain their exact same-family peaks separately.
         observed = profile.compute_observations
-        # A peak at a longer root is not a measurement of an unseen shorter
-        # execution family. Once any extent has been observed, its absolute
-        # constraint and observed peaks bind that extent and all larger roots.
+        # A longer root is not evidence for an unseen shorter family. Preserve
+        # the absolute floor once an observed extent applies, or if its extent
+        # was not retained, and preserve every applicable observed peak.
         if not observed or min(n for n, _ in observed) <= packed_tokens:
-            floor = max(floor, _absolute_floor(profile, _rate_floor_tokens(signature)))
+            floor = max(floor, _absolute_floor(profile, _rate_floor_tokens(key)))
         floor = max(
             floor,
             max((peak for n, peak in observed if n <= packed_tokens), default=0),
         )
+    native_fixed = _native_cp_cold_supported(self, signature) and (
+        _fixed_slope_enabled(self._memory_profiles.get(signature))
+        or any(p.peak_model_version == 2 for p in self._memory_profiles.values())
+    )
+    static_floor = 0
+    if native_fixed:
+        # Missing measurements never imply zero fixed work. Retain the native
+        # initialization/recompute reserve under the existing cold margin,
+        # even after collecting a smaller measurement or leaving collection.
+        # This is a static bound, not measured evidence or family coverage.
+        native_reserve = max(
+            _CP_COLD_REQUEST_BYTES,
+            self._cold_recompute_transient_bytes() if signature.grad_enabled else 0,
+        )
+        static_floor = math.ceil(
+            _memory_model._MEMORY_COLD_EXTRAPOLATION_FACTOR * native_reserve
+        )
     optimizer = (
         _impl._optimizer._signature_optimizer_bytes(signature)
-        if include_optimizer
-        and _fixed_slope_enabled(self._memory_profiles.get(signature))
-        and _native_cp_cold_supported(self, signature)
+        if include_optimizer and native_fixed
         else 0
     )
 
@@ -970,7 +993,27 @@ def _cp_fixed_phase_bytes(
             else 0
         )
 
-    return price(floor), price(optimizer)
+    return price(floor), price(static_floor), price(optimizer)
+
+
+def _cp_fixed_phase_bytes(
+    self: TrainerRank,
+    signature,
+    output_bytes,
+    workload,
+    *,
+    include_optimizer=True,
+    packed_tokens: int = 0,
+) -> tuple[int, int]:
+    measured, static, optimizer = _cp_phase_bounds(
+        self,
+        signature,
+        output_bytes,
+        workload,
+        include_optimizer=include_optimizer,
+        packed_tokens=packed_tokens,
+    )
+    return max(measured, static), optimizer
 
 
 def _merge_cp_request_floors(*profiles) -> tuple[tuple[str, int], ...]:
@@ -4288,16 +4331,13 @@ def _estimate_required_memory_bytes_from_values(
     if _fixed_slope_enabled(
         self._memory_profiles.get(signature)
     ) and _native_cp_cold_supported(self, signature):
-        if not signature.grad_enabled and (
-            cold_subfloor
-            or (
-                isinstance(_calibration_compute_bytes, _CalibrationEstimate)
-                and _calibration_compute_bytes.seed_uncovered_cp_family
-            )
+        if (not signature.grad_enabled and cold_subfloor) or (
+            isinstance(_calibration_compute_bytes, _CalibrationEstimate)
+            and _calibration_compute_bytes.seed_uncovered_cp_family
         ):
-            # A single native request has allocator/kernel work even at one row.
-            # Keep a conservative static initialization component when no floor
-            # measurement is available; it is also the floor trial's seed cap.
+            # Keep minimum trials inside their declared static seed cap.
+            # Ordinary split pricing adds backward transients separately; do
+            # not also charge them as retained forward work here.
             static_compute = max(static_compute, _CP_COLD_REQUEST_BYTES)
     if signature.topology[2] > 1:
         # Local head results coexist with full CP outputs during gathering.

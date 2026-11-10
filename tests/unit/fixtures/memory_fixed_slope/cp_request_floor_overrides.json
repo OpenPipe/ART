@@ -1,7 +1,7 @@
 {
-  "parent_commit": "d932df3010ce0499df4b821449685bf9309f3274",
+  "parent_commit": "cbc9df7376046c2dd65f097dcb742e4586bbee89",
   "synthetic": true,
-  "policy": "Native CP fixed initialization, preserved empirical peaks and physical optimizer envelope; original refusals stay refused and no flat estimate decreases.",
+  "policy": "Preserved empirical constraints across storage scopes, native CP fixed-cost fallback and physical optimizer envelope; no lower flat estimate or new admission.",
   "overrides": [
     {
       "id": "10",
@@ -580,12 +580,30 @@
       }
     },
     {
+      "id": "173",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 245783876815,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 247011608182,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262145
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
       "id": "175",
       "kind": "dense",
       "expected": {
         "decision": "refused",
         "fits": false,
-        "required_bytes": 104996772264,
+        "required_bytes": 245909880847,
         "available_bytes": 71000000000,
         "unsplit_required_bytes": 8877495585474740224,
         "unsplit_fits": false,
@@ -616,12 +634,30 @@
       }
     },
     {
+      "id": "177",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 245787057576,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 247011608413,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262160
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
       "id": "179",
       "kind": "dense",
       "expected": {
         "decision": "refused",
         "fits": false,
-        "required_bytes": 104996772495,
+        "required_bytes": 245909881078,
         "available_bytes": 71000000000,
         "unsplit_required_bytes": 8877495585474740224,
         "unsplit_fits": false,
@@ -652,12 +688,30 @@
       }
     },
     {
+      "id": "181",
+      "kind": "dense",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 245809322158,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 247011609276,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262216
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
       "id": "183",
       "kind": "dense",
       "expected": {
         "decision": "refused",
         "fits": false,
-        "required_bytes": 104996773357,
+        "required_bytes": 245909881940,
         "available_bytes": 71000000000,
         "unsplit_required_bytes": 8877495585474740224,
         "unsplit_fits": false,
@@ -1204,6 +1258,24 @@
       }
     },
     {
+      "id": "341",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495589985871894,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585472974848,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          32840
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
       "id": "343",
       "kind": "moe",
       "expected": {
@@ -1251,6 +1323,24 @@
         "unsplit_fits": false,
         "packed_tokens": [
           131088
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "353",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495591149288470,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585473731584,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          131144
         ],
         "request_counts": [
           2
@@ -1356,6 +1446,42 @@
         "required_bytes": 79535309515,
         "available_bytes": 71000000000,
         "unsplit_required_bytes": 79427272527,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262216
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "365",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 8877495592700513302,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585474740224,
+        "unsplit_fits": false,
+        "packed_tokens": [
+          262216
+        ],
+        "request_counts": [
+          2
+        ]
+      }
+    },
+    {
+      "id": "366",
+      "kind": "moe",
+      "expected": {
+        "decision": "refused",
+        "fits": false,
+        "required_bytes": 83531466585,
+        "available_bytes": 71000000000,
+        "unsplit_required_bytes": 8877495585474740224,
         "unsplit_fits": false,
         "packed_tokens": [
           262216
