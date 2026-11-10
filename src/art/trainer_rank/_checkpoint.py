@@ -250,10 +250,23 @@ def _rank() -> int:
     return dist.get_rank() if _distributed() else 0
 
 
-def _gather[T](value: T, group: dist.ProcessGroup | None = None) -> tuple[T, ...]:
+def _gather[T](
+    value: T, group: dist.ProcessGroup | None = None, *, _ready: bool = False
+) -> tuple[T, ...]:
     if not _distributed():
         return (value,)
     values: list[T | None] = [None] * dist.get_world_size(group)
+    if _ready:
+
+        def finish() -> tuple[T, ...]:
+            result = tuple(cast(T, item) for item in values)
+            if any(result):
+                raise RuntimeError("Checkpoint publication is not ready on every rank")
+            return result
+
+        return _calibration_protocol.all_gather_object(
+            values, value, group=group, _finish=finish
+        )
     _calibration_protocol.all_gather_object(values, value, group=group)
     return tuple(cast(T, item) for item in values)
 
@@ -1118,6 +1131,7 @@ def prepare_checkpoint_save(
                 trainer._checkpoint_save_skipped.add(sequence)
             _advance_save_queue(trainer, sequence)
             if _calibration_protocol.active() is not None:
+                _clear_checkpoint_failure_frames(failure)
                 raise
             cleanup_failure: BaseException | None = None
             try:
@@ -1719,9 +1733,12 @@ def _finalize_checkpoint_save(
                     paths.append(prepared.reservation)
                 cleanup = _cleanup_paths(paths)
             if _calibration_protocol.active() is not None:
+                cleanup_failed = cleanup is not None
                 if error is not None:
+                    _clear_checkpoint_failure_frames(error)
                     raise error
                 if cleanup is not None:
+                    _clear_checkpoint_failure_frames(cleanup)
                     raise cleanup
             try:
                 failures = _gather(
@@ -1732,6 +1749,8 @@ def _finalize_checkpoint_save(
                     group,
                 )
             except BaseException as exc:
+                if _calibration_protocol.active() is not None:
+                    cleanup_failed = cleanup is not None
                 local_failures = [
                     *([error] if error is not None else []),
                     *([cleanup] if cleanup is not None else []),
@@ -2037,7 +2056,88 @@ def _discard_snapshot_checkpoint(
         raise
 
 
-def _commit_slot(trainer: TrainerRank, source: str, destination: str) -> None:
+@dataclass(frozen=True)
+class _CheckpointChanges:
+    """Preallocated reference replacements; application performs no preparation."""
+
+    updates: tuple[tuple[dict, str, object], ...]
+
+    def apply(self) -> None:
+        for namespace, key, value in self.updates:
+            namespace[key] = value
+
+
+def _checkpoint_changes(updates: list[tuple[dict, str, object]]) -> _CheckpointChanges:
+    if any(key not in namespace for namespace, key, _value in updates):
+        raise RuntimeError("Checkpoint publication must replace existing references")
+    return _CheckpointChanges(tuple(updates))
+
+
+def _model_slot_changes(module, keys, slots) -> list[tuple[dict, str, object]]:
+    return [
+        (module._slot_modules.__dict__, "_modules", slots),
+        (module.__dict__, "_slot_keys", keys),
+    ]
+
+
+def _load_rollback_changes(trainer, snapshot) -> _CheckpointChanges:
+    updates: list[tuple[dict, str, object]] = []
+    for module, keys, slots, refs in snapshot:
+        updates.extend(_model_slot_changes(module, keys, slots))
+        updates.extend((slot.__dict__, "ref", refs[key]) for key, slot in slots.items())
+    updates.append(
+        (trainer.__dict__, "_checkpoint_slots", dict(trainer._checkpoint_slots))
+    )
+    return _checkpoint_changes(updates)
+
+
+def _prepare_slot_commit(trainer, source, destination) -> _CheckpointChanges:
+    from art.megatron.lora import LoRA
+
+    source_ref, destination_ref = (
+        trainer._slot_ref(source),
+        trainer._slot_ref(destination),
+    )
+    updates: list[tuple[dict, str, object]] = []
+    for chunk in trainer.runtime.model:
+        for module in chunk.modules():
+            if not isinstance(module, LoRA):
+                continue
+            keys, slots = dict(module._slot_keys), dict(module._slot_modules.items())
+            source_key = keys.pop(source_ref, None)
+            destination_key = keys.pop(destination_ref, None)
+            if source_key is None:
+                if destination_key is not None:
+                    del slots[destination_key]
+            else:
+                slot = slots.pop(source_key)
+                updates.append((slot.__dict__, "ref", destination_ref))
+                keys[destination_ref] = destination_key or source_key
+                slots[destination_key or source_key] = slot
+            updates.extend(_model_slot_changes(module, keys, slots))
+    return _checkpoint_changes(updates)
+
+
+def _clear_checkpoint_failure_frames(error: BaseException) -> None:
+    pending, seen = [error], set()
+    while pending:
+        failure = pending.pop()
+        if id(failure) in seen:
+            continue
+        seen.add(id(failure))
+        traceback.clear_frames(failure.__traceback__)
+        pending.extend(
+            x for x in (failure.__cause__, failure.__context__) if x is not None
+        )
+        if isinstance(failure, BaseExceptionGroup):
+            pending.extend(failure.exceptions)
+
+
+def _commit_slot(
+    trainer: TrainerRank, source: str, destination: str
+) -> _CheckpointChanges | None:
+    if _calibration_protocol.active() is not None:
+        return _prepare_slot_commit(trainer, source, destination)
     from art.megatron.lora import LoRA
 
     source_ref = trainer._slot_ref(source)
@@ -2269,6 +2369,12 @@ def _load_checkpoint(
     temporary = f"__art_loading_{uuid.uuid4().hex}"
     snapshot = _slot_snapshot(trainer)
     previous = trainer._checkpoint_slots.get(name)
+    rollback = (
+        _load_rollback_changes(trainer, snapshot)
+        if _calibration_protocol.active() is not None
+        else None
+    )
+    publication = None
     try:
         loaded = _phase(
             lambda: trainer._load_checkpoint_slot(
@@ -2318,8 +2424,8 @@ def _load_checkpoint(
                 group,
             )
             trainer._checkpoint_slots[temporary].optimizer = _phase(
-                lambda: trainer._restore_canonical_optimizer(
-                    temporary, optimizer_state
+                lambda state=optimizer_state: trainer._restore_canonical_optimizer(
+                    temporary, state
                 ),
                 "restore checkpoint optimizer",
                 group,
@@ -2331,9 +2437,41 @@ def _load_checkpoint(
             staged.revision = 0 if previous is None else previous.revision + 1
             trainer._checkpoint_slots[name] = staged
 
-        _phase(commit, "commit checkpoint", group)
-    except BaseException:
+        if rollback is None:
+            _phase(commit, "commit checkpoint", group)
+        else:
+            model = _commit_slot(trainer, temporary, name)
+            registry = dict(trainer._checkpoint_slots)
+            staged = registry.pop(temporary)
+            registry[name] = replace(
+                staged, revision=0 if previous is None else previous.revision + 1
+            )
+            publication = _checkpoint_changes(
+                [
+                    *(model.updates if model is not None else ()),
+                    (trainer.__dict__, "_checkpoint_slots", registry),
+                ]
+            )
+            # Reuse the commit error-gather's final entry vote: all allocation,
+            # decoding and map construction must succeed before live references
+            # change. No calibration vote or object gather is added.
+            _gather(None, group, _ready=True)
+            publication.apply()
+    except BaseException as error:
         if _calibration_protocol.active() is not None:
+            assert rollback is not None
+            rollback.apply()
+            # Retained exceptions must not retain staged parameters or optimizer
+            # buffers through completed frames or this still-active load frame.
+            params, adapter, prepared_adapter = (), {}, {}
+            optimizer_state, publication, model, registry, staged = (
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            _clear_checkpoint_failure_frames(error)
             raise
         _rollback_load(trainer, snapshot, temporary, name, previous, group)
         raise
