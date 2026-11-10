@@ -204,16 +204,14 @@ def all_gather_object(object_list, obj, group=None):
     sizes = torch.zeros(count, dtype=torch.long, device=device)
     size_list = [sizes[i].unsqueeze(0) for i in range(count)]
 
-    def gather():
-        dist.all_gather(size_list, local_size, group=group)
-        maximum = int(sizes.max().item())
-        payload.resize_(maximum)
-        storage = torch.empty(maximum * count, dtype=torch.uint8, device=device)
-        outputs = [storage[maximum * i : maximum * (i + 1)] for i in range(count)]
-        dist.all_gather(outputs, payload, group=group)
-        return outputs
-
-    outputs = current.collective(gather)
+    current.collective(lambda: dist.all_gather(size_list, local_size, group=group))
+    # The gathered maximum is needed before allocating either padded buffer.
+    # Prepare both in the reopened phase, then vote before the payload gather.
+    maximum = int(sizes.max().item())
+    payload.resize_(maximum)
+    storage = torch.empty(maximum * count, dtype=torch.uint8, device=device)
+    outputs = [storage[maximum * i : maximum * (i + 1)] for i in range(count)]
+    current.collective(lambda: dist.all_gather(outputs, payload, group=group))
     for index, tensor in enumerate(outputs):
         object_list[index] = c10d._tensor_to_object(tensor, size_list[index], group)
 
