@@ -7,13 +7,11 @@ execute unchanged. Set ART_CP_EXHAUSTIVE_READINESS=1 for all ordered partitions.
 
 from contextlib import contextmanager
 from datetime import timedelta
-from itertools import permutations
 import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -228,7 +226,8 @@ def _execute(state, q, k, v, go):
     )
     out, accum, lse, records = ex._run_context_parallel_forward_recorded(**args)
     dq, dk, dv, _ = ex._run_context_parallel_backward(
-        grad_output=go,
+        # Each replay receives the same upstream gradient, with private storage.
+        grad_output=go.clone(),
         **args,
         replay_records=records,
         replay_accum_out=accum,
