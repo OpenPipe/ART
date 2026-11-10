@@ -26,6 +26,8 @@ def _probe(tmp_path, mode, version="4.0.0b5"):
             **os.environ,
             "CUDA_VISIBLE_DEVICES": "",
             "CUTE_DSL_ARCH": "sm_90a",
+            "CUTE_DSL_DISABLE_FILE_CACHING": "1",
+            "CUTE_DSL_CACHE_DIR": str(tmp_path / "dsl-cache"),
             "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
             "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": str(tmp_path / "cache"),
         },
@@ -58,6 +60,11 @@ def test_real_unaffected_keys_domains_disk_paths_and_warm_entries_are_unchanged(
 
 def test_package_import_rejects_preexisting_backward_compilation(tmp_path):
     assert _probe(tmp_path, "late-import")["ok"]
+
+
+@pytest.mark.parametrize("mode", ["history-reload", "retained-before-bootstrap"])
+def test_backward_history_survives_reload(tmp_path, mode):
+    assert _probe(tmp_path, mode)["ok"]
 
 
 def _run_probe(mode, root, version):
@@ -115,6 +122,25 @@ def _run_probe(mode, root, version):
 
     from flash_attn.cute import interface
 
+    if mode == "retained-before-bootstrap":
+        from cutlass import BFloat16
+        from flash_attn.cute import flash_bwd_preprocess, flash_bwd_sm90
+
+        retained = interface._compile_bwd_preprocess(
+            BFloat16, 128, 128, 64, False, False, False
+        )
+        assert "flash_bwd" in retained.function_name
+        for module in (flash_bwd_preprocess, flash_bwd_sm90, interface):
+            importlib.reload(module)
+        try:
+            import_art()
+        except RuntimeError as error:
+            assert "retained FA4 backward handle" in str(error)
+        else:
+            raise AssertionError("Retained pre-bootstrap compiled handle was accepted")
+        assert retained is not None
+        return {"ok": True}
+
     if mode == "late-import":
         interface._flash_attn_bwd.compile_cache.cache["already compiled"] = object()
         try:
@@ -166,7 +192,7 @@ def _run_probe(mode, root, version):
         func=Compiled()
     )
     baseline_cache = interface._flash_attn_bwd.compile_cache
-    if mode == "cache-patched":
+    if mode in {"cache-patched", "history-reload"}:
         import_art()
         assert interface._flash_attn_bwd.compile_cache is baseline_cache
     with FakeTensorMode():
@@ -177,6 +203,28 @@ def _run_probe(mode, root, version):
         for arch in [90, 100]:
             interface._get_device_arch = lambda arch=arch: arch
             interface._flash_attn_bwd(q, k, v, o, dout, lse)
+    if mode == "history-reload":
+        from flash_attn.cute import flash_bwd_preprocess, flash_bwd_sm90
+
+        state = interface._art_sm90_pdl_state
+        assert state["used"] and state["compiled"]
+        retained = list(baseline_cache.cache.values())
+        for cache in state["caches"]:
+            cache.cache.clear()
+        interface._bwd_preprocess.compile_cache.cache.clear()
+        interface._bwd_postprocess_convert.compile_cache.cache.clear()
+        for module in (flash_bwd_preprocess, flash_bwd_sm90, interface):
+            importlib.reload(module)
+        assert interface._art_sm90_pdl_state is state
+        patch = importlib.import_module("art.megatron.flex_attn.flash_pdl_patch")
+        try:
+            patch.apply_flash_sm90_sparse_pdl_patch()
+        except RuntimeError as error:
+            assert "historical FA4 backward use" in str(error)
+        else:
+            raise AssertionError("Reload erased compilation history")
+        assert retained
+        return {"ok": True}
     records = []
     for function in (
         interface._flash_attn_bwd,

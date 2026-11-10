@@ -5,11 +5,23 @@ but its sparse SM90 consumer lacks the dense consumer's dependency wait.
 Disable PDL on both sides of that boundary. Suppressing only the producer's
 signal is insufficient: a PDL consumer still needs a memory-visibility wait.
 Remove after upgrading past upstream commit 4460ebbcb5ed.
+
+First installation deliberately refuses any populated backward cache, including
+otherwise unaffected dense SM90/SM100 entries. Supported integration startup
+uses a fresh child interpreter: train.py imports training/microbatches.py and
+flex_attn before compiled.py creates wrappers, model warmup or calibration.
+Disk-only warm caches are safe because their in-process dictionaries are empty.
+
+Bootstrap must be serialized before all FA4 backward use and graph capture.
+History survives module reloads, but cannot prove absence of an unpatched call
+already in flight or a graph captured before bootstrap. Existing compiled
+handles and graphs cannot be repaired retroactively; use a fresh interpreter.
 """
 
 from __future__ import annotations
 
 import ast
+import gc
 import importlib.metadata
 import inspect
 import linecache
@@ -147,6 +159,48 @@ def installed_fa4_version() -> str | None:
         return None
 
 
+def _retained_backward_handle() -> bool:
+    # A retained CuTe compiled handle remains visible even if both the FA4
+    # interface and kernel modules were reloaded before this first install.
+    compiled_types = []
+    for module_name, class_name in (
+        ("cutlass.base_dsl.jit_executor", "JitCompiledFunction"),
+        ("cutlass.cutlass_dsl.tvm_ffi_provider", "TVMFFIJitCompiledFunction"),
+    ):
+        module = sys.modules.get(module_name)
+        cls = getattr(module, class_name, None)
+        if isinstance(cls, type):
+            compiled_types.append(cls)
+    if not compiled_types:
+        return False
+    for candidate in gc.get_objects():
+        if type(candidate) in compiled_types:
+            name = getattr(candidate, "__dict__", {}).get("function_name", "")
+            if not isinstance(name, str) or not name:
+                # An opaque compiled handle cannot establish fresh bootstrap.
+                return True
+            if "flash_attncuteflash_bwd" in name or "flash_attn.cute.flash_bwd" in name:
+                return True
+    return False
+
+
+def _observe_compilation(interface: Any, state: dict[str, Any]) -> None:
+    cute = getattr(interface, "cute", None)
+    if cute is None:
+        return
+    original = cute.compile
+    if getattr(original, "_art_pdl_history", None) is state:
+        return
+
+    def compile_with_history(kernel: Any, *args: Any, **kwargs: Any) -> Any:
+        if type(kernel).__module__.startswith("flash_attn.cute.flash_bwd"):
+            state["compiled"] = True
+        return original(kernel, *args, **kwargs)
+
+    compile_with_history._art_pdl_history = state
+    cute.compile = compile_with_history
+
+
 def _assert_quiescent(interface: Any, state: dict[str, Any]) -> None:
     message = (
         "Install the FA4 sparse PDL patch from ART flex_attn import before any "
@@ -154,6 +208,10 @@ def _assert_quiescent(interface: Any, state: dict[str, Any]) -> None:
     )
     if state["active"]:
         raise RuntimeError(message + " (backward call active)")
+    if state.get("used") or state.get("compiled"):
+        raise RuntimeError(
+            message + " (historical FA4 backward use; start a fresh interpreter)"
+        )
     caches = list(state["caches"])
     for name in ("_flash_attn_bwd", "_bwd_preprocess", "_bwd_postprocess_convert"):
         function = getattr(interface, name, None)
@@ -163,7 +221,13 @@ def _assert_quiescent(interface: Any, state: dict[str, Any]) -> None:
     for cache in caches:
         entries = cache if isinstance(cache, dict) else cache.cache
         if entries:
+            state["compiled"] = True
             raise RuntimeError(message + " (backward compile cache is populated)")
+    if getattr(interface, "cute", None) is not None and _retained_backward_handle():
+        state["compiled"] = True
+        raise RuntimeError(
+            message + " (retained FA4 backward handle; start a fresh interpreter)"
+        )
     # This query never initializes CUDA. A graph capture already in progress
     # is also too late, even when no backward kernel has yet populated a cache.
     torch = sys.modules.get("torch")
@@ -182,28 +246,46 @@ def _entry(*args: Any, **kwargs: Any) -> Any:
 def _guarded_dispatch(
     interface: Any, state: dict[str, Any], version: str, original: Any, sparse: Any
 ) -> Any:
-    signature = inspect.signature(original)
+    parameters = list(inspect.signature(original).parameters)
+    sparse_position = parameters.index("block_sparse_tensors")
+    arch_position = parameters.index("arch") if "arch" in parameters else None
 
     def dispatch(*args: Any, **kwargs: Any) -> Any:
-        with state["lock"]:
-            state["active"] += 1
+        # This reload-surviving history bit is conservative even if binding or
+        # the body raises. Dense calls allocate no bound-argument dictionary
+        # and acquire no lock. The original function still validates arguments.
+        state["used"] = True
+        blocks = kwargs.get("block_sparse_tensors")
+        if blocks is None and len(args) > sparse_position:
+            blocks = args[sparse_position]
+        if blocks is None:
+            return original(*args, **kwargs)
+
+        token = object()
+        calls = state["active_calls"]
         try:
-            arguments = signature.bind(*args, **kwargs).arguments
-            arch = arguments.get("arch")
+            with state["lock"]:
+                calls.add(token)
+                state["active"] = len(calls)
+            arch = kwargs.get("arch")
+            if arch is None and arch_position is not None and len(args) > arch_position:
+                arch = args[arch_position]
             if arch is None:
                 arch = interface._get_device_arch()
-            affected = (
-                arch // 10 == 9 and arguments.get("block_sparse_tensors") is not None
-            )
-            if affected and version != "4.0.0b5":
+            if arch // 10 != 9:
+                return original(*args, **kwargs)
+            if version != "4.0.0b5":
                 raise RuntimeError(
                     f"Recheck FA4 sparse PDL workaround for {version}: "
                     "refusing SM90 block-sparse backward before any launch"
                 )
-            return (sparse if affected else original)(*args, **kwargs)
+            return sparse(*args, **kwargs)
         finally:
+            # Unconditional discard also handles interruption between adding
+            # the token and publishing the count; no post-increment gap exists.
             with state["lock"]:
-                state["active"] -= 1
+                calls.discard(token)
+                state["active"] = len(calls)
 
     return dispatch
 
@@ -228,13 +310,29 @@ def apply_flash_sm90_sparse_pdl_patch(
     # setdefault publishes one lock even when callers loaded this patch module
     # under different names. importlib.reload preserves the interface dict.
     state = interface.__dict__.setdefault(
-        "_art_sm90_pdl_state", {"lock": RLock(), "active": 0, "caches": []}
+        "_art_sm90_pdl_state",
+        {
+            "lock": RLock(),
+            "active": 0,
+            "active_calls": set(),
+            "caches": [],
+            "used": False,
+            "compiled": False,
+            "revision": 3,
+        },
     )
     with state["lock"]:
-        _assert_quiescent(interface, state)
+        if state.get("revision") != 3:
+            raise RuntimeError(
+                "Cannot rule out prior FA4 use with an older history registry; start a fresh interpreter"
+            )
         backward = interface._flash_attn_bwd
         entry_installed = getattr(backward, "_art_sm90_sparse_pdl", False)
-        launches = []
+        if entry_installed and getattr(backward, "_art_pdl_revision", None) != 3:
+            raise RuntimeError(
+                "Cannot rule out prior FA4 use with an older guard; start a fresh interpreter"
+            )
+        raw_launches = []
         if version == "4.0.0b5":
             # The interface may retain an older class after the kernel module
             # reloads. Patch both references, independently of the entry marker.
@@ -243,15 +341,26 @@ def apply_flash_sm90_sparse_pdl_patch(
             current = getattr(module, "FlashAttentionBackwardSm90", classes[0])
             if current is not classes[0]:
                 classes.append(current)
-            for cls in classes:
-                raw = inspect.unwrap(cls.__call__)
-                if not getattr(raw, "_art_sm90_sparse_pdl_launch", False):
-                    if getattr(raw, "_preprocessed", False):
-                        raise RuntimeError(
-                            "Install the FA4 sparse PDL patch before any FA4 "
-                            "backward compilation (SM90 DSL preprocessing started)"
-                        )
-                    launches.append((raw, _patched_sm90_launch_code(raw)))
+            raw_launches = [inspect.unwrap(cls.__call__) for cls in classes]
+        pending = [
+            raw
+            for raw in raw_launches
+            if not getattr(raw, "_art_sm90_sparse_pdl_launch", False)
+        ]
+        # A complete installation does no work, even after backward use or
+        # inside an active call. Reloaded components still require quiescence.
+        if entry_installed and not pending:
+            return True
+        _assert_quiescent(interface, state)
+        launches = []
+        for raw in pending:
+            if not getattr(raw, "_art_sm90_sparse_pdl_launch", False):
+                if getattr(raw, "_preprocessed", False):
+                    raise RuntimeError(
+                        "Install the FA4 sparse PDL patch before any FA4 "
+                        "backward compilation (SM90 DSL preprocessing started)"
+                    )
+                launches.append((raw, _patched_sm90_launch_code(raw)))
 
         if not entry_installed:
             signature = inspect.signature(backward)
@@ -277,9 +386,11 @@ def apply_flash_sm90_sparse_pdl_patch(
             backward.__kwdefaults__ = None
             backward.__signature__ = signature
             backward._art_sm90_sparse_pdl = True
+            backward._art_pdl_revision = 3
             state["caches"].append(backward.compile_cache)
 
         for raw, code in launches:
             raw.__code__ = code
             raw._art_sm90_sparse_pdl_launch = True
+        _observe_compilation(interface, state)
         return True
