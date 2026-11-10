@@ -339,7 +339,10 @@ def test_seed_gloo_replicates_static_decision_and_mixed_eligibility(tmp_path, va
     if variant != "reference":
         assert d["static_compute_bytes"] == 2_000_000_000
         assert d["seed_margin"] == 2.0
-    assert a["operations"][-2:] == [
+    # Callback agreement now follows admission. Preserve the memory-decision
+    # operand contract without treating that check as the context's last vote.
+    decision_index = a["operations"].index(["RedOpType.MAX", [32], "torch.float64"])
+    assert a["operations"][decision_index : decision_index + 2] == [
         ["RedOpType.MAX", [32], "torch.float64"],
         ["RedOpType.MIN", [2], "torch.float64"],
     ]

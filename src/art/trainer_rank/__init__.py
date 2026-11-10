@@ -151,6 +151,20 @@ class TrainerRank(_impl.TrainerRank):
         use a measured sibling maximum or defer. The existing native static
         reserve remains an extra bound. Existing callers need this additional
         call; their old ladder alone does not provide full floor coverage.
+
+        Caller migration requirement:
+        Before any pin bump, the caller must invoke calibrate_request_floors after both
+        live operation ladders for every selected adapter/native configuration;
+        implement cohort-wide durable (signature_id, family_id) intents and pending
+        checks, exhaust each caller interval with all floating outputs participating in
+        backward when enabled, persist/validate format-8 floor-only evidence, and
+        require completed floor coverage before accepting cached calibration or enabling
+        v2 serving.
+
+        Distributed callback failures are exchanged before model entry and before
+        completion checks. Every rank raises RuntimeError, with the local failure
+        retained as its cause; no trial is retried. Local-only calls preserve the
+        original exception.
         """
         return calibrate_request_floors(
             self,
