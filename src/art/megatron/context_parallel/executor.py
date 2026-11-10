@@ -1482,9 +1482,12 @@ def _merge_stage_output_grads_from_tape(
     if not replay_records:
         return [], []
     accum_dtype = _accum_output_dtype(grad_output_flat.dtype)
+    # Partial-row tape reversal writes into these accumulators. Own their storage
+    # even when dtype/layout conversion would otherwise alias upstream gradients.
     grad_accum_out = grad_output_flat.to(
         dtype=accum_dtype,
         memory_format=torch.contiguous_format,
+        copy=True,
     )
     if grad_lse_flat is None:
         grad_accum_lse = torch.zeros(
@@ -1496,6 +1499,7 @@ def _merge_stage_output_grads_from_tape(
         grad_accum_lse = grad_lse_flat.to(
             dtype=accum_dtype,
             memory_format=torch.contiguous_format,
+            copy=True,
         )
     stage_out_grads: list[torch.Tensor] = []
     stage_lse_grads: list[torch.Tensor] = []
