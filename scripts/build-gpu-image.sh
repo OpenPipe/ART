@@ -30,6 +30,8 @@ Node prewarm always pins the pushed digest. Refreshing the mutable tag on nodes
 depends on registry mirrors that may serve a stale tag for longer than any CI
 budget, so by default a mutable tag that has not converged after
 PREWARM_TAG_CONVERGENCE_BEST_EFFORT_ATTEMPTS checks only produces a warning.
+Only an observed stale digest is downgraded: probe pods that cannot be created,
+become Ready or have their status read still fail the prewarm.
 EOF
 }
 
@@ -839,47 +841,59 @@ pod_init_image_id() {
   local pod="$1"
   local container="$2"
 
+  # Callers must tell a failed read apart from a stale image, so keep the status.
   "${kubectl_cmd[@]}" get pod -n "${prewarm_namespace}" "${pod}" \
     -o jsonpath="{range .status.initContainerStatuses[?(@.name==\"${container}\")]}{.imageID}{end}" \
-    2>/dev/null || true
+    2>/dev/null
 }
 
+# Returns 0 when every mutable tag resolved to the pushed digest, 1 when a
+# readable pod status shows another image, and 2 when a status could not be read.
 verify_prewarm_refresh_tag_digest() {
   local pod="$1"
+  local container
+  local tag_image
   local image_id
-  local failed=0
+  local status=0
 
   if [[ -z "${prewarm_refresh_tag_image}" || -z "${image_digest}" ]]; then
     return 0
   fi
 
-  image_id="$(pod_init_image_id "${pod}" refresh-tag)"
-  prewarm_last_tag_image_id="${image_id}"
-  if [[ "${image_id}" == *"@${image_digest}" ]]; then
-    echo "Mutable tag ${prewarm_refresh_tag_image} resolved to ${image_id} in pod ${pod}"
-  else
-    echo "Mutable tag ${prewarm_refresh_tag_image} resolved to ${image_id:-<missing>} in pod ${pod}; expected @${image_digest}" >&2
-    failed=1
-  fi
-
-  if [[ -n "${prewarm_short_tag_image}" ]]; then
-    image_id="$(pod_init_image_id "${pod}" refresh-short-tag)"
-    if [[ "${image_id}" == *"@${image_digest}" ]]; then
-      echo "Mutable tag ${prewarm_short_tag_image} resolved to ${image_id} in pod ${pod}"
-    else
-      echo "Mutable tag ${prewarm_short_tag_image} resolved to ${image_id:-<missing>} in pod ${pod}; expected @${image_digest}" >&2
-      failed=1
+  for container in refresh-tag refresh-short-tag; do
+    tag_image="${prewarm_refresh_tag_image}"
+    if [[ "${container}" == "refresh-short-tag" ]]; then
+      if [[ -z "${prewarm_short_tag_image}" ]]; then
+        continue
+      fi
+      tag_image="${prewarm_short_tag_image}"
     fi
-  fi
+    if ! image_id="$(pod_init_image_id "${pod}" "${container}")" || [[ -z "${image_id}" ]]; then
+      echo "Could not read the ${container} image of pod ${pod}" >&2
+      status=2
+      continue
+    fi
+    if [[ "${image_id}" == *"@${image_digest}" ]]; then
+      echo "Mutable tag ${tag_image} resolved to ${image_id} in pod ${pod}"
+    else
+      echo "Mutable tag ${tag_image} resolved to ${image_id} in pod ${pod}; expected @${image_digest}" >&2
+      prewarm_last_tag_image_id="${image_id}"
+      if (( status == 0 )); then
+        status=1
+      fi
+    fi
+  done
 
-  return "${failed}"
+  return "${status}"
 }
 
 verify_steady_prewarm_daemonset() {
   local attempt
   local steady_pod
+  local verify_status
   local -a steady_pods
   local -a stale_pods
+  local -a unreadable_pods
 
   for attempt in $(seq 1 "${prewarm_node_retries}"); do
     if ! "${kubectl_cmd[@]}" rollout status -n "${prewarm_namespace}" "daemonset/${prewarm_name}" --timeout="${prewarm_timeout}"; then
@@ -891,17 +905,24 @@ verify_steady_prewarm_daemonset() {
         -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
     )
     stale_pods=()
+    unreadable_pods=()
     for steady_pod in "${steady_pods[@]}"; do
-      if ! verify_prewarm_refresh_tag_digest "${steady_pod}"; then
-        stale_pods+=("${steady_pod}")
-      fi
+      verify_status=0
+      verify_prewarm_refresh_tag_digest "${steady_pod}" || verify_status=$?
+      case "${verify_status}" in
+        0) ;;
+        1) stale_pods+=("${steady_pod}") ;;
+        *) unreadable_pods+=("${steady_pod}") ;;
+      esac
     done
 
-    if (( ${#stale_pods[@]} == 0 )); then
+    if (( ${#stale_pods[@]} == 0 && ${#unreadable_pods[@]} == 0 )); then
       return 0
     fi
 
-    if [[ "${prewarm_require_tag_convergence}" != "true" ]]; then
+    # Only an observed stale digest is best-effort; an unreadable pod is retried.
+    if [[ "${prewarm_require_tag_convergence}" != "true" ]] \
+      && (( ${#unreadable_pods[@]} == 0 )); then
       warn_mutable_tag_stale "${#stale_pods[@]} steady-state pod(s)"
       return 0
     fi
@@ -911,8 +932,8 @@ verify_steady_prewarm_daemonset() {
       return 1
     fi
 
-    echo "Steady-state ${prewarm_name} has ${#stale_pods[@]} pod(s) with stale ${prewarm_refresh_tag_image}; recreating them (attempt ${attempt}/${prewarm_node_retries})"
-    delete_pods_best_effort "${stale_pods[@]}"
+    echo "Steady-state ${prewarm_name} has ${#stale_pods[@]} stale and ${#unreadable_pods[@]} unreadable pod(s) for ${prewarm_refresh_tag_image}; recreating them (attempt ${attempt}/${prewarm_node_retries})"
+    delete_pods_best_effort "${stale_pods[@]}" "${unreadable_pods[@]}"
     sleep "$((attempt * 10))"
   done
 }
@@ -922,7 +943,11 @@ warn_mutable_tag_stale() {
   local message="${prewarm_refresh_tag_image} has not converged to ${image_digest} (${detail}; last seen: ${prewarm_last_tag_image_id:-<none>}). The digest is still prewarmed; consumers pulling the mutable tag may get a stale image until the registry mirror refreshes."
 
   if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-    echo "::warning title=Mutable tag not yet converged::${message}"
+    # Workflow-command data must escape %, CR and LF to display literally.
+    local annotation="${message//'%'/%25}"
+    annotation="${annotation//$'\r'/%0D}"
+    annotation="${annotation//$'\n'/%0A}"
+    echo "::warning title=Mutable tag not yet converged::${annotation}"
   fi
   echo "Warning: ${message}" >&2
   if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
@@ -930,13 +955,17 @@ warn_mutable_tag_stale() {
   fi
 }
 
+# Returns 0 once the mutable tags resolve to the pushed digest, 1 when the last
+# check observed a stale digest, and 2 when the last check could not observe one
+# (pod creation, readiness or status read failed).
 wait_for_mutable_tag_convergence() {
   local node="$1"
   local pod_base="${prewarm_name}-tag-check"
   local pod
   local attempt
   local clear_mutable_tag
-  local image_id
+  local verify_status
+  local last_failure=2
 
   if [[ -z "${prewarm_refresh_tag_image}" || -z "${image_digest}" ]]; then
     return 0
@@ -968,7 +997,9 @@ wait_for_mutable_tag_convergence() {
     fi
     pod="${pod_base}-${attempt}"
     delete_pods_best_effort "${pod}"
-    "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
+    # Callers run this function as a condition, which disables errexit here, so
+    # every kubectl step that matters is checked explicitly.
+    if ! "${kubectl_cmd[@]}" apply -n "${prewarm_namespace}" -f - <<EOF
 apiVersion: v1
 kind: Pod
 metadata:
@@ -996,27 +1027,42 @@ $(render_tag_check_init_containers "${clear_mutable_tag}")
           memory: 16Mi
 $(render_prewarm_host_volumes | sed 's/^/  /')
 EOF
-
-    if "${kubectl_cmd[@]}" wait -n "${prewarm_namespace}" \
+    then
+      echo "Mutable tag check ${attempt}/${attempts} could not create pod ${pod}"
+      last_failure=2
+    elif "${kubectl_cmd[@]}" wait -n "${prewarm_namespace}" \
       --for=condition=Ready "pod/${pod}" \
       --timeout="${prewarm_node_timeout}" >/dev/null 2>&1; then
-      if verify_prewarm_refresh_tag_digest "${pod}"; then
+      verify_status=0
+      verify_prewarm_refresh_tag_digest "${pod}" || verify_status=$?
+      if (( verify_status == 0 )); then
         echo "Mutable tags converged to ${image_digest}"
         delete_pods_without_wait "${pod}"
         return 0
       fi
-      echo "Mutable tag check ${attempt}/${attempts} has not converged to ${image_digest}"
+      if (( verify_status == 1 )); then
+        echo "Mutable tag check ${attempt}/${attempts} has not converged to ${image_digest}"
+        last_failure=1
+      else
+        echo "Mutable tag check ${attempt}/${attempts} could not read pod ${pod}"
+        last_failure=2
+      fi
     else
       echo "Mutable tag check ${attempt}/${attempts} did not become ready"
       "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${pod}" || true
+      last_failure=2
     fi
 
     delete_pods_without_wait "${pod}"
     sleep "${prewarm_tag_convergence_interval}"
   done
 
-  echo "Timed out waiting for ${prewarm_refresh_tag_image} to resolve to ${image_digest}" >&2
-  return 1
+  if (( last_failure == 1 )); then
+    echo "Timed out waiting for ${prewarm_refresh_tag_image} to resolve to ${image_digest}" >&2
+  else
+    echo "Mutable tag check for ${prewarm_refresh_tag_image} failed: the last check could not observe the pulled image" >&2
+  fi
+  return "${last_failure}"
 }
 
 prewarm_single_node() {
@@ -1024,6 +1070,7 @@ prewarm_single_node() {
   local node_slug
   local pod
   local attempt
+  local verify_status
 
   node_slug="$(sanitize_k8s_name_part "${node}")"
   if [[ -z "${node_slug}" ]]; then
@@ -1066,13 +1113,16 @@ EOF
     if "${kubectl_cmd[@]}" wait -n "${prewarm_namespace}" \
       --for=condition=Ready "pod/${pod}" \
       --timeout="${prewarm_node_timeout}"; then
-      if verify_prewarm_refresh_tag_digest "${pod}"; then
+      verify_status=0
+      verify_prewarm_refresh_tag_digest "${pod}" || verify_status=$?
+      if (( verify_status == 0 )); then
         delete_pods_best_effort "${pod}"
         return 0
       fi
-      if [[ "${prewarm_require_tag_convergence}" != "true" ]]; then
+      if (( verify_status == 1 )) && [[ "${prewarm_require_tag_convergence}" != "true" ]]; then
         # Ready means the digest-pinned prepull init container succeeded, so
         # the digest is cached on this node; only the mutable tag is stale.
+        # An unreadable pod status is not evidence of that and is retried.
         warn_mutable_tag_stale "node ${node}"
         delete_pods_best_effort "${pod}"
         return 0
@@ -1131,8 +1181,12 @@ if [[ "${prewarm_nodes}" == "true" ]]; then
     "${kubectl_cmd[@]}" delete daemonset -n "${prewarm_namespace}" "${prewarm_name}" \
       --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
-    if ! wait_for_mutable_tag_convergence "${gpu_nodes[0]}"; then
-      if [[ "${prewarm_require_tag_convergence}" == "true" ]]; then
+    tag_convergence_status=0
+    wait_for_mutable_tag_convergence "${gpu_nodes[0]}" || tag_convergence_status=$?
+    if (( tag_convergence_status != 0 )); then
+      # Only an observed stale digest is best-effort; a failed probe is an error.
+      if [[ "${prewarm_require_tag_convergence}" == "true" ]] \
+        || (( tag_convergence_status != 1 )); then
         dump_prewarm_diagnostics
         exit 1
       fi

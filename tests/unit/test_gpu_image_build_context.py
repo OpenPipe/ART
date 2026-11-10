@@ -262,13 +262,28 @@ def test_gpu_image_node_prewarm_pulls_the_digest_on_present_nodes(
     assert "--for=condition=Ready pod/art-gpu-image-prewarm-gpu-node-a" in kubectl_calls
 
 
+_TAG_CHECK_POD = "art-gpu-image-prewarm-tag-check-"
+_NODE_POD = "art-gpu-image-prewarm-gpu-node-a"
+_STEADY_POD = "art-gpu-image-prewarm-steady"
+
+
+def _status_read_fails(pod: str) -> str:
+    return f'  *" get pod "*"{pod}"*"initContainerStatuses"*) exit 9 ;;\n'
+
+
 def _run_node_prewarm_with_tag_image(
     tmp_path: Path,
     image_id: str,
     *extra_args: str,
     extra_env: dict[str, str] | None = None,
+    kubectl_faults: str = "",
 ) -> tuple[subprocess.CompletedProcess[str], list[str], str]:
-    """Prewarm one fake GPU node whose mutable-tag pulls resolve to image_id."""
+    """Prewarm one fake GPU node whose mutable-tag pulls resolve to image_id.
+
+    kubectl_faults holds extra case arms that take precedence over the fake's
+    defaults; APPLY_FAIL_MATCH in extra_env fails any apply whose manifest
+    contains it.
+    """
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     applied = tmp_path / "applied"
@@ -279,17 +294,26 @@ def _run_node_prewarm_with_tag_image(
         "#!/bin/sh\n"
         'printf "%s\\n" "$*" >> "$KUBECTL_LOG"\n'
         'case " $* " in\n'
+        f"{kubectl_faults}"
         '  *" get pod "*" -o json "*) printf \'{"items":[]}\' ;;\n'
         '  *" get nodes "*"hypervisor=true"*) exit 0 ;;\n'
         '  *" get nodes "*) printf "gpu-node-a\\n" ;;\n'
         '  *" create secret "*) printf "kind: Secret\\n" ;;\n'
-        '  *" apply "*) cat > "$APPLIED_DIR/$(date +%s%N).yaml" ;;\n'
+        '  *" apply "*) body=$(cat)\n'
+        '    printf "%s\\n" "$body" > "$APPLIED_DIR/$(date +%s%N).yaml"\n'
+        '    if [ -n "${APPLY_FAIL_MATCH:-}" ]; then\n'
+        '      case "$body" in *"$APPLY_FAIL_MATCH"*) exit 9 ;; esac\n'
+        "    fi ;;\n"
         '  *" get pod "*"initContainerStatuses"*) printf "%s" "$IMAGE_ID" ;;\n'
-        '  *" get pods "*) printf "art-gpu-image-prewarm-steady\\n" ;;\n'
+        f'  *" get pods "*) printf "{_STEADY_POD}\\n" ;;\n'
         "esac\n"
         "exit 0\n"
     )
     kubectl.chmod(0o755)
+    # Retry delays are irrelevant to these tests.
+    sleep = bin_dir / "sleep"
+    sleep.write_text("#!/bin/sh\nexit 0\n")
+    sleep.chmod(0o755)
     env: dict[str, str] = {
         **os.environ,
         "APPLIED_DIR": str(applied),
@@ -408,9 +432,105 @@ def test_gpu_image_node_prewarm_reports_stale_tags_in_github_actions(
     assert "Mutable tag not yet converged" in summary.read_text()
 
 
+def test_gpu_image_warning_annotation_escapes_workflow_command_data(
+    tmp_path: Path,
+) -> None:
+    # The image ID comes from the cluster; it must not inject workflow commands.
+    stale = "registry/art-gpu@sha256:" + "b" * 64 + "%0A\rextra"
+    summary = tmp_path / "summary.md"
+    result, _, _ = _run_node_prewarm_with_tag_image(
+        tmp_path,
+        stale,
+        extra_env={
+            "GITHUB_ACTIONS": "true",
+            "GITHUB_STEP_SUMMARY": str(summary),
+            "PREWARM_TAG_CONVERGENCE_BEST_EFFORT_ATTEMPTS": "1",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    annotations = [
+        line for line in result.stdout.splitlines() if line.startswith("::warning ")
+    ]
+    assert annotations
+    assert all("b" * 64 + "%250A%0Dextra" in line for line in annotations)
+
+
+@pytest.mark.parametrize(
+    ("fault", "env"),
+    [
+        (f'  *" wait "*"{_TAG_CHECK_POD}"*) exit 9 ;;\n', {}),
+        ("", {"APPLY_FAIL_MATCH": f"name: {_TAG_CHECK_POD}"}),
+        (_status_read_fails(_TAG_CHECK_POD), {}),
+    ],
+    ids=["probe-never-ready", "probe-apply-fails", "probe-status-unreadable"],
+)
+def test_gpu_image_node_prewarm_fails_when_the_tag_probe_fails(
+    tmp_path: Path, fault: str, env: dict[str, str]
+) -> None:
+    # Only an observed stale digest is best-effort. A probe that never shows an
+    # image says nothing about the mirror and must still fail the step.
+    result, manifests, _ = _run_node_prewarm_with_tag_image(
+        tmp_path,
+        "registry/art-gpu@sha256:" + "a" * 64,
+        extra_env={"PREWARM_TAG_CONVERGENCE_BEST_EFFORT_ATTEMPTS": "2", **env},
+        kubectl_faults=fault,
+    )
+
+    assert result.returncode != 0
+    assert "the last check could not observe the pulled image" in result.stderr
+    assert "has not converged to" not in result.stderr  # No stale-tag warning.
+    assert not [m for m in manifests if "kind: DaemonSet" in m]
+
+
+def test_gpu_image_node_prewarm_fails_when_the_tag_status_is_empty(
+    tmp_path: Path,
+) -> None:
+    result, manifests, _ = _run_node_prewarm_with_tag_image(
+        tmp_path,
+        "",
+        extra_env={"PREWARM_TAG_CONVERGENCE_BEST_EFFORT_ATTEMPTS": "1"},
+    )
+
+    assert result.returncode != 0
+    assert f"Could not read the refresh-tag image of pod {_TAG_CHECK_POD}1" in (
+        result.stderr
+    )
+    assert not [m for m in manifests if "kind: DaemonSet" in m]
+
+
+@pytest.mark.parametrize(
+    ("pod", "installs_daemonset"),
+    [(_NODE_POD, False), (_STEADY_POD, True)],
+    ids=["node-pod", "steady-state-pod"],
+)
+def test_gpu_image_node_prewarm_fails_when_a_pod_status_is_unreadable(
+    tmp_path: Path, pod: str, installs_daemonset: bool
+) -> None:
+    # The tag probe converges; a later status read fails. That is an API or pod
+    # error, not a stale mirror, so it is retried and then fails.
+    result, manifests, _ = _run_node_prewarm_with_tag_image(
+        tmp_path,
+        "registry/art-gpu@sha256:" + "a" * 64,
+        extra_env={"PREWARM_NODE_RETRIES": "2"},
+        kubectl_faults=_status_read_fails(pod),
+    )
+
+    assert result.returncode != 0
+    assert "Mutable tags converged to sha256:" in result.stdout
+    assert f"Could not read the refresh-tag image of pod {pod}" in result.stderr
+    assert "has not converged to" not in result.stderr  # No stale-tag warning.
+    daemonsets = [m for m in manifests if "kind: DaemonSet" in m]
+    assert bool(daemonsets) == installs_daemonset
+
+
 def test_gpu_image_workflow_passes_tag_convergence_policy() -> None:
     workflow = (ROOT / ".github/workflows/build-gpu-image.yml").read_text()
     assert "require_tag_convergence:" in workflow
     prewarm = workflow[workflow.index("- name: Prewarm GPU image on nodes") :]
     prewarm = prewarm[: prewarm.index("- name: Remove temporary image builder")]
-    assert "PREWARM_REQUIRE_TAG_CONVERGENCE:" in prewarm
+    # Push events have no inputs, so the expression must fall back to 'false'.
+    assert (
+        "PREWARM_REQUIRE_TAG_CONVERGENCE: "
+        "${{ inputs.require_tag_convergence && 'true' || 'false' }}"
+    ) in prewarm
