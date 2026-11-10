@@ -102,17 +102,16 @@ class Protocol:
             )
         return values, error
 
-    def start(self):
+    def start(self, error=None):
         assert not self.open and not self.broken
         sequence = self.sequence + 1
-        error = None
         try:
             self.sequence = sequence
             self.open = True
         except BaseException as exc:
             # Commit the same must-vote state if reservation was interrupted.
             self.sequence, self.open = sequence, True
-            error = exc
+            error = exc if error is None else error
         values, error = self._vote("entry", error)
         if values[0]:
             self.end(error or RuntimeError("Calibration entry preparation failed"))
@@ -133,10 +132,16 @@ class Protocol:
         self.end(execute=execute)
         self.start()
 
-    def collective(self, action):
+    def collective(self, action, *, prepare=None):
         self.end()
         result = action()
-        self.start()
+        error = None
+        if prepare is not None:
+            try:
+                result = prepare()
+            except BaseException as exc:
+                error = exc
+        self.start(error)
         return result
 
     def abandon_local(self):
@@ -191,7 +196,7 @@ def collective(action: Callable[[], Any]):
     return action() if active is None else active.collective(action)
 
 
-def all_gather_object(object_list, obj, group=None):
+def all_gather_object(object_list, obj, group=None, *, _finish=None):
     """Prepare object bytes in-phase, preserving the two tensor wire gathers."""
     from torch.distributed import distributed_c10d as c10d
 
@@ -211,9 +216,20 @@ def all_gather_object(object_list, obj, group=None):
     payload.resize_(maximum)
     storage = torch.empty(maximum * count, dtype=torch.uint8, device=device)
     outputs = [storage[maximum * i : maximum * (i + 1)] for i in range(count)]
+
+    def finish():
+        for index, tensor in enumerate(outputs):
+            object_list[index] = c10d._tensor_to_object(tensor, size_list[index], group)
+        return _finish() if _finish is not None else None
+
+    if _finish is not None:
+        # Transaction readiness includes decoding and result construction. Carry
+        # their failures into the existing post-payload entry vote.
+        return current.collective(
+            lambda: dist.all_gather(outputs, payload, group=group), prepare=finish
+        )
     current.collective(lambda: dist.all_gather(outputs, payload, group=group))
-    for index, tensor in enumerate(outputs):
-        object_list[index] = c10d._tensor_to_object(tensor, size_list[index], group)
+    finish()
 
 
 def active() -> Protocol | None:
