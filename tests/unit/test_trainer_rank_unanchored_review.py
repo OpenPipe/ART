@@ -297,6 +297,7 @@ def test_promoting_incomplete_caller_preserves_its_forward_floor():
         bytes_per_token=20 * 2**30 / 32768,
         packed_tokens=32768,
         compute_peak_floor=20 * 2**30,
+        profile_format_version=2,
     )
     m._validate_memory_profile_model(previous)
     rank._memory_profiles[root] = reports._memory_profile(
@@ -361,6 +362,7 @@ def test_unusable_restored_caller_root_cannot_switch_to_a_model_anchor():
         caller_compute_peaks=((3, 60 * 2**30), (8192, 60 * 2**30)),
         compute_peak_floor=60 * 2**30,
         caller_plans=2,
+        profile_format_version=2,
     )
     m._validate_memory_profile_model(previous)
     rank._memory_profiles[root] = previous

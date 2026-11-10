@@ -55,6 +55,7 @@ from art.megatron.prefix_tree_packing import (
     estimate_prefix_tree_packed_tokens,  # noqa: F401  # read as ``_impl.X`` by _memory / _micro_batch_planner
 )
 from art.trainer_rank import (  # noqa: F401  # ``_gdn_memory`` is read as ``_impl.X`` by _memory / _micro_batch_planner
+    _calibration_protocol,
     _gdn_memory,
     _planner_evidence,
     _planner_misses,
@@ -2668,6 +2669,7 @@ class TrainerRank:
         checkpoint: AdapterSelection = Unset,
         no_grad: bool | None = None,
         yield_empty: bool = False,
+        _calibration_candidate: _CandidateMicroBatch | None = None,
     ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
         """Yield admitted micro-batches; the caller runs its loss and backward.
 
@@ -2694,7 +2696,14 @@ class TrainerRank:
             raise TypeError("yield_empty must be a bool")
         enabled = torch.is_grad_enabled() if no_grad is None else not no_grad
         batches = self._forward_micro_batches(
-            inputs, checkpoint=checkpoint, yield_empty=yield_empty
+            inputs,
+            checkpoint=checkpoint,
+            yield_empty=yield_empty,
+            **(
+                {"calibration_candidate": _calibration_candidate}
+                if _calibration_candidate is not None
+                else {}
+            ),
         )
         token = object()
         try:
@@ -3080,6 +3089,7 @@ class TrainerRank:
         packed_tokens: int,
         output_bytes: int,
         signature: _MemorySignature,
+        request_count: int | None = None,
         logical_tokens: int,
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
@@ -3090,12 +3100,25 @@ class TrainerRank:
         hybridep_growth_bytes: int = 0,
         caller_cp_workload: _memory._CPWorkload | None = None,
     ) -> _SubforwardCost:
+        profile = self._memory_profiles.get(signature)
+        cold_subfloor = self._uncovered_cp_family(
+            profile,
+            signature,
+            packed_tokens,
+            caller_cp_workload,
+            request_count=request_count,
+        )
+        if cold_subfloor:
+            # Match the estimator's effective cold profile for every split
+            # charge; an uncovered family grants no retained-graph discount.
+            profile = None
         checkpoint_memory = self._sequence_parallel_lora_floor(
             self._checkpoint_memory_floor(group_rows, slot_refs, gdn_segments),
             group_rows,
             signature,
         )
         required = self._estimate_required_memory_bytes_from_values(
+            request_count=request_count,
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
             signature=signature,
@@ -3112,16 +3135,20 @@ class TrainerRank:
             include_cold_extrapolation=False,
         )
         checkpoint_retained, checkpoint_workspace = checkpoint_memory
-        retained = self._retained_memory_bytes(
-            signature,
-            packed_tokens=packed_tokens,
-            logical_tokens=logical_tokens,
-            output_bytes=output_bytes,
-            required=required,
-            checkpoint_retained_bytes=max(
-                checkpoint_retained,
-                checkpoint_floor[0],
-            ),
+        retained = (
+            required
+            if cold_subfloor
+            else self._retained_memory_bytes(
+                signature,
+                packed_tokens=packed_tokens,
+                logical_tokens=logical_tokens,
+                output_bytes=output_bytes,
+                required=required,
+                checkpoint_retained_bytes=max(
+                    checkpoint_retained,
+                    checkpoint_floor[0],
+                ),
+            )
         )
         # One logical BF16 input gradient per eligible full/uniform/1 boundary
         # (TP x SP: one input-gradient shard; the workspace is explicit).
@@ -3145,7 +3172,7 @@ class TrainerRank:
         checkpoint_workspace = max(
             checkpoint_workspace, head_workspace_bytes, checkpoint_floor[1]
         )
-        if gradient and self._memory_profiles.get(signature) is None:
+        if gradient and profile is None:
             checkpoint_workspace += self._cold_recompute_transient_bytes()
         forward_required = required
         if gradient:
@@ -3164,13 +3191,30 @@ class TrainerRank:
         # HybridEP buffer growth stays allocated through the forward and
         # backward peaks, but is not forward retention.
         cold = _memory._cold_extrapolation_factor(
-            self._memory_profiles.get(signature), packed_tokens
+            profile,
+            packed_tokens,
+            **({"fixed_slope": True} if cold_subfloor else {}),
+        )
+        request_floor, static_floor, optimizer_peak = _memory._cp_phase_bounds(
+            self,
+            signature,
+            output_bytes,
+            caller_cp_workload,
+            packed_tokens=packed_tokens,
         )
         return _SubforwardCost(
-            required=math.ceil(
-                (required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR)) * cold
+            required=max(
+                math.ceil(
+                    (required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR))
+                    * cold
+                ),
+                request_floor,
+                static_floor,
+                optimizer_peak,
             ),
-            retained=math.ceil(retained * cold),
+            # Empirical peaks may include retention. Native initialization and
+            # the later optimizer are transient, never extra retained graphs.
+            retained=max(math.ceil(retained * cold), request_floor),
             checkpoint_retained=math.ceil(checkpoint_retained * cold),
             checkpoint_workspace=math.ceil(checkpoint_workspace * cold),
             checkpoint_input_gradient=math.ceil(gradient * cold),
@@ -3233,10 +3277,9 @@ class TrainerRank:
         from megatron.core import parallel_state as ps
 
         # Public outputs are CP-replicated; internal shard reductions still include CP.
-        dist.all_reduce(
-            tensor,
-            op=op,
-            group=ps.get_data_parallel_group(with_context_parallel=False),
+        group = ps.get_data_parallel_group(with_context_parallel=False)
+        _calibration_protocol.collective(
+            lambda: dist.all_reduce(tensor, op=op, group=group)
         )
 
     def _compact_lora_slot_keys(self) -> None:
@@ -3269,7 +3312,8 @@ class TrainerRank:
         expected = set(templates)
         if dist.is_available() and dist.is_initialized():
             gathered: list[set[str] | None] = [None] * dist.get_world_size()
-            dist.all_gather_object(gathered, expected, group=self._checkpoint_group())
+            group = self._checkpoint_group()
+            _calibration_protocol.all_gather_object(gathered, expected, group=group)
             expected = set().union(*(value for value in gathered if value is not None))
         if unknown := sorted(keys - expected):
             preview = ", ".join(repr(key) for key in unknown[:8])
@@ -3443,10 +3487,10 @@ class TrainerRank:
                 dist.get_world_size(getattr(self, "_forward_replica_group", None))
             )
         ]
-        dist.all_gather_object(
-            configurations,
-            (int(count), yield_empty),
-            group=getattr(self, "_forward_replica_group", None),
+        configuration = (int(count), yield_empty)
+        group = getattr(self, "_forward_replica_group", None)
+        _calibration_protocol.all_gather_object(
+            configurations, configuration, group=group
         )
         if len(set(configurations)) == 1:
             return
@@ -3517,6 +3561,7 @@ class TrainerRank:
         check: _MemoryCheck,
         context: str,
     ) -> tuple[list[AnyForwardOutput], int | None]:
+        _memory._mark_subfloor_cp_sample(self, plan)
         if not getattr(self, "_planner_observing_split", False):
             self._begin_planner_observation(plan, check)
         if torch.cuda.is_available() and self.device.type == "cuda":
@@ -3740,6 +3785,7 @@ class TrainerRank:
         }
 
     def _execute_flat_plan(self, plan: _FlatForwardPlan) -> list[AnyForwardOutput]:
+        _calibration_protocol.checkpoint()
         outputs = [
             ForwardOutput(None, None, None, None, checkpoint, no_grad)
             for checkpoint, no_grad in plan.output_metadata
@@ -3774,6 +3820,7 @@ class TrainerRank:
                             self.device,
                         )
                         with use_routes(routes):
+                            _calibration_protocol.checkpoint()
                             item_outputs = self._forward_packed(group.items, prepared)
                     item_outputs = [
                         replace(
@@ -4000,20 +4047,30 @@ class TrainerRank:
         *,
         op: Literal["MAX", "MIN", "SUM"],
         sync_across_dp: bool,
+        _phase: int | None = None,
+        _buffer: torch.Tensor | None = None,
     ) -> list[float]:
         if not (dist.is_available() and dist.is_initialized()):
             return values
+        if _phase is not None:
+            return _calibration_protocol.vote(self, values, _phase, _buffer)
+        if op == "MAX" and sync_across_dp and len(values) == 1:
+            return _calibration_protocol.vote(
+                self, values, _calibration_protocol.OUTER_ERROR_PHASE
+            )
         tensor = torch.tensor(
             values,
             device=self._forward_collective_device() if sync_across_dp else self.device,
             dtype=torch.float64,
         )
-        dist.all_reduce(
-            tensor,
-            op=getattr(dist.ReduceOp, op),
-            group=getattr(self, "_forward_replica_group", None)
+        reduce_op = getattr(dist.ReduceOp, op)
+        group = (
+            getattr(self, "_forward_replica_group", None)
             if sync_across_dp
-            else self._forward_memory_group(),
+            else self._forward_memory_group()
+        )
+        _calibration_protocol.collective(
+            lambda: dist.all_reduce(tensor, op=reduce_op, group=group)
         )
         return [float(value) for value in tensor.tolist()]
 
@@ -4330,10 +4387,9 @@ class TrainerRank:
             device=self._forward_collective_device(),
             dtype=torch.int32,
         )
-        dist.all_reduce(
-            value,
-            op=dist.ReduceOp.MIN,
-            group=getattr(self, "_forward_replica_group", None),
+        group = getattr(self, "_forward_replica_group", None)
+        _calibration_protocol.collective(
+            lambda: dist.all_reduce(value, op=dist.ReduceOp.MIN, group=group)
         )
         return bool(value.item())
 
@@ -5298,6 +5354,7 @@ class TrainerRank:
     _checkpoint_adapter_gradient_bytes = _memory._checkpoint_adapter_gradient_bytes
     _adapter_gradient_walk = staticmethod(_memory._adapter_gradient_walk)
     _retained_memory_bytes = _memory._retained_memory_bytes
+    _uncovered_cp_family = _memory._uncovered_cp_family
     _estimate_flat_forward = _memory._estimate_flat_forward
     _update_peak_memory_profile = _memory._update_peak_memory_profile
     _estimate_group_request_output_bytes = _memory._estimate_group_request_output_bytes

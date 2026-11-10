@@ -18,12 +18,15 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import (
     asdict,
+    dataclass,
     replace,
 )
 import hashlib
-from typing import TYPE_CHECKING
+import itertools
+from typing import TYPE_CHECKING, Any, cast
 
-from art.trainer_rank import _impl
+from art.trainer_rank import _calibration_protocol as _protocol
+from art.trainer_rank import _impl, _memory
 from art.trainer_rank._backward_work import region as _backward_region
 from art.trainer_rank._planner_cost import COEFFICIENT_VERSION_FALLBACK
 from art.trainer_rank._prefix_tree_planner import (
@@ -37,9 +40,9 @@ if TYPE_CHECKING:
         Callable,
         Generator,
         Iterable,
+        Iterator,
         Sequence,
     )
-    from typing import Any
 
     import torch
 
@@ -72,12 +75,562 @@ if TYPE_CHECKING:
     )
 
 
+@contextmanager
+def _calibration_status(self: TrainerRank) -> Generator[None, None, None]:
+    # The driver owns the current local phase. Its exit is shared with peers'
+    # next orchestration collective, including preparation inside this block.
+    if _protocol.active() is not None:
+        yield
+    else:
+        with _protocol.Driver(self):
+            yield
+
+
+class _ScopeGuard:
+    def __init__(self, scope):
+        self.scope = scope
+
+    def close(self):
+        self.scope.local_close_guard()
+        self.scope.abandon_local()
+
+
+class _CalibrationIterator:
+    """Retain the private generator until the explicit driver closes it."""
+
+    def __init__(self, rung):
+        self.rung = rung
+        self._generator = rung._execute()
+        self.finished = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self.send(None)
+
+    def _step(self, method, *args):
+        try:
+            return method(*args)
+        except StopIteration:
+            self.finished = True
+            raise
+        except GeneratorExit:
+            self.finished = True
+            raise
+        except BaseException as error:
+            self.finished = self._generator.gi_frame is None
+            # Coordinate execution failures before returning control to a
+            # callback that might catch them. The driver retains the failed
+            # phase even if that callback suppresses the common exception.
+            if self.rung._callback is not None:
+                self.rung._callback.protocol.end(error)
+            raise
+
+    def send(self, value):
+        return self._step(self._generator.send, value)
+
+    def throw(self, error, *args):
+        generator_exit = isinstance(error, GeneratorExit) or (
+            isinstance(error, type) and issubclass(error, GeneratorExit)
+        )
+        if generator_exit and not self.finished and self.rung._callback is not None:
+            self.rung._callback.local_close_guard()
+        return self._step(self._generator.throw, error, *args)
+
+    def close(self):
+        if self.finished:
+            return
+        if self.rung._callback is not None:
+            self.rung._callback.local_close_guard()
+        self._generator.close()
+        self.finished = True
+
+
+class _CalibrationScope:
+    """Explicit collective close owner; no callback scope is a generator."""
+
+    def __init__(self, rank, inputs, checkpoint, no_grad, family):
+        self.rank, self.inputs = rank, inputs
+        self.checkpoint, self.no_grad, self.family = checkpoint, no_grad, family
+        self.driver = _protocol.Driver(rank)
+        self.rung = None
+        self.started = self.closed = self.closing = False
+        self.gen = _ScopeGuard(self)  # Guard old explicit-generator close access.
+
+    def __enter__(self):
+        self.protocol = self.driver.__enter__()
+        try:
+            self.rung = _prepare_calibration_rung(
+                self.rank,
+                self.inputs,
+                checkpoint=self.checkpoint,
+                no_grad=self.no_grad,
+                seed_uncovered_cp_family=self.family,
+            )
+            self.rung._callback = self
+            self.protocol.transition()
+            return self.rung
+        except BaseException as error:
+            self.__exit__(type(error), error, error.__traceback__)
+            raise
+
+    def begin(self, execute):
+        self.protocol.transition(execute=execute)
+        self.started = True
+
+    def local_close_guard(self):
+        if self.protocol.distributed and not self.closing:
+            raise AssertionError("Calibration close must use the collective driver")
+
+    def abandon_local(self):
+        self.protocol.abandon_local()
+        self.closed = self.closing = True
+        if self.rung is not None:
+            self.rung._close()
+            self.rung._active = False
+        if self.driver.owner and self.driver.token is not None:
+            _protocol._ACTIVE.reset(self.driver.token)
+
+    def close(self):
+        return self.__exit__(None, None, None)
+
+    def __exit__(self, kind, error, traceback):
+        if self.closed:
+            return False
+        self.closed = self.closing = True
+        try:
+            if self.rung is not None:
+                try:
+                    self.rung._close()
+                except BaseException as exc:
+                    if error is None:
+                        error = exc
+            self.driver.finish(error)
+        finally:
+            if self.rung is not None:
+                self.rung._active = False
+                self.rung._callback = None
+        return False
+
+
+@dataclass
+class CalibrationRung:
+    """One prepared, unsplit calibration wave; execute only after durable intent.
+
+    This object expires when its ``calibration_rung`` context exits. It cannot
+    change inputs, choose another layout, split, or retry the admitted rung.
+    Exhaust its iterator or exit the owning scope on every rank. The explicit
+    driver closes partial iterators; a distributed rank-local close is guarded.
+    """
+
+    decision: _memory.CalibrationRungDecision
+    _rank: TrainerRank
+    _candidate: _CandidateMicroBatch
+    _checkpoint: AdapterSelection
+    _no_grad: bool
+    _active: bool = True
+    _used: bool = False
+    _started: bool = False
+    _coverage_guard: _memory._CalibrationCoverageGuard | None = None
+    _callback: _CalibrationScope | None = None
+    _iterator: _CalibrationIterator | None = None
+
+    @property
+    def inputs(self) -> tuple[ForwardInputs, ...]:
+        """The exact inputs prepared by this calibration wave."""
+        return tuple(self._candidate.inputs)
+
+    @property
+    def no_grad(self) -> bool:
+        """Whether the journal/executor should run forward only."""
+        return self._no_grad
+
+    @property
+    def family_id(self) -> str | None:
+        """Durable family identity, paired with ``decision.signature_id``."""
+        plan = self._candidate.plan
+        if (
+            not isinstance(plan, _impl._FlatForwardPlan)
+            or not getattr(plan, "_calibration_cp_family_seed", False)
+            or plan.caller_cp_workload is None
+        ):
+            return None
+        family = plan.caller_cp_workload[0]
+        return _memory._cp_pair(family, family)[0]
+
+    @property
+    def coverage_violation(self) -> _memory.CalibrationCoverageViolation | None:
+        return None if self._coverage_guard is None else self._coverage_guard.violation
+
+    def forward_micro_batches(
+        self,
+    ) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+        """Execute the exact prepared wave, once, within the owning context."""
+        if not self._active or self._used:
+            raise RuntimeError("calibration rung is expired or already executed")
+        if not self.decision.fits:
+            raise _impl.TrainerRankMemoryError("calibration rung admission refused")
+        self._used = True
+        self._iterator = _CalibrationIterator(self)
+        return self._iterator
+
+    def _close(self) -> None:
+        if self._iterator is not None and self._started:
+            self._iterator.close()
+
+    def _execute(
+        self,
+    ) -> Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None]:
+        # Iterator creation must not let execution escape the explicit scope.
+        self._started = True
+        if not self._active:
+            raise RuntimeError("calibration rung is expired")
+        assert self._callback is not None
+        self._callback.begin(True)
+        previous = None
+        previous_guard = self._rank.__dict__.get("_calibration_coverage_guard")
+        try:
+            with _calibration_status(self._rank):
+                if self._coverage_guard is not None:
+                    self._rank.__dict__["_calibration_coverage_guard"] = (
+                        self._coverage_guard
+                    )
+                if self.decision.seed:
+                    if not _memory._FIXED_SLOPE_PROFILES.get():
+                        raise RuntimeError(
+                            "calibration seed requires the fixed-slope scope"
+                        )
+                    plan = self._candidate.plan
+                    family_seed = getattr(plan, "_calibration_cp_family_seed", False)
+                    key = plan.signature
+                    if family_seed:
+                        assert isinstance(plan, _impl._FlatForwardPlan)
+                        assert plan.caller_cp_workload is not None
+                        key = (key, self.family_id)
+                    used = self._rank.__dict__.setdefault(
+                        "_calibration_seeded_cp_families"
+                        if family_seed
+                        else "_calibration_seeded_signatures",
+                        set(),
+                    )
+                    if key in used:
+                        raise RuntimeError(
+                            "calibration seed already attempted for this signature"
+                        )
+                    used.add(key)
+                    previous = self._rank.__dict__.get("_calibration_seed_plan")
+                    self._rank.__dict__["_calibration_seed_plan"] = self._candidate.plan
+            yield from cast(Any, _impl.TrainerRank.forward_micro_batches)(
+                self._rank,
+                self._candidate.inputs,
+                checkpoint=self._checkpoint,
+                no_grad=self._no_grad,
+                yield_empty=True,
+                _calibration_candidate=self._candidate,
+            )
+            if self.coverage_violation is not None:
+                # Outside sample suppression, after this single wave completes.
+                # The caller persists/alerts the typed failure; there is no retry.
+                raise self.coverage_violation
+        except GeneratorExit:
+            # Only the explicit scope driver may close a distributed iterator.
+            # This guard itself performs no collective.
+            if self._callback is not None:
+                self._callback.local_close_guard()
+            raise
+        finally:
+            if (
+                self._coverage_guard is not None
+                and self._rank.__dict__.get("_calibration_coverage_guard")
+                is self._coverage_guard
+            ):
+                if previous_guard is None:
+                    self._rank.__dict__.pop("_calibration_coverage_guard", None)
+                else:
+                    self._rank.__dict__["_calibration_coverage_guard"] = previous_guard
+            # Only local permission cleanup, including throw/close/finalization.
+            if (
+                self.decision.seed
+                and self._rank.__dict__.get("_calibration_seed_plan")
+                is self._candidate.plan
+            ):
+                if previous is None:
+                    self._rank.__dict__.pop("_calibration_seed_plan", None)
+                else:
+                    self._rank.__dict__["_calibration_seed_plan"] = previous
+
+
+def _prepare_calibration_rung(
+    self: TrainerRank,
+    inputs: Iterable[ForwardInputs],
+    *,
+    checkpoint: AdapterSelection = _impl.Unset,
+    no_grad: bool | None = None,
+    seed_uncovered_cp_family: bool = False,
+) -> CalibrationRung:
+    """Prepare one calibration-only wave before executing any model work.
+
+    The caller must durably record an extrapolated intent before calling the
+    returned object's ``forward_micro_batches``. Incomplete intents must block
+    that extent and larger extents on restart, without automatic retry. Do not
+    change inputs, checkpoint state, profiles or GPU allocations between prepare
+    and execute. This API targets one DP replica (with any supported TP/CP).
+    It grants no extrapolation permission to ordinary forward calls.
+
+    After two live anchors, ``seed_uncovered_cp_family`` may measure an
+    uncovered CP caller family between its rate floor and 8K tokens, using
+    the seed's static bound. Both operations and each output class have
+    separate evidence; a new class may use live anchors of the same operation
+    and selected adapters to schedule its own measurement. Record each
+    signature/family intent and block incomplete attempts on restart as for
+    the initial seed. The sample never teaches a rate. Measure the largest
+    request in each uncovered family; a smaller peak cannot cover more rows.
+    Also prepare a one-token request per operation/output class. Its complete
+    caller interval records a fixed request floor only, never rate or covering
+    evidence. It has its own once-per-family intent and the same static cap.
+    """
+    self._guard_forward_collective("calibration_rung")
+    enabled = _impl.torch.is_grad_enabled() if no_grad is None else not no_grad
+    with _impl.torch.set_grad_enabled(enabled):
+        with _calibration_status(self):
+            if self._dp_rank_and_size()[1] != 1:
+                raise ValueError("calibration_rung requires one data-parallel replica")
+            items = tuple(_impl._materialize(item) for item in inputs)
+            if not items:
+                raise ValueError("calibration rung must contain an active request")
+            requests = list(_impl._flatten(items))
+        family_scope = _memory._CP_FAMILY_CALIBRATION.set(seed_uncovered_cp_family)
+        try:
+            with _calibration_status(self):
+                plan = self._plan_flat_forward(
+                    requests, checkpoint=checkpoint, sync_planning_errors=True
+                )
+        finally:
+            _memory._CP_FAMILY_CALIBRATION.reset(family_scope)
+        with _calibration_status(self):
+            estimate = _memory._CalibrationEstimate(
+                signature_id="",
+                candidate=plan.packed_tokens,
+                seed_uncovered_cp_family=seed_uncovered_cp_family,
+            )
+            if seed_uncovered_cp_family:
+                plan.__dict__["_calibration_cp_family_seed"] = True
+        with _calibration_status(self):
+            check = self._memory_check(
+                plan,
+                sync_across_dp=True,
+                sync_planning_errors=True,
+                _calibration=estimate,
+            )
+    with _calibration_status(self):
+        assert estimate.decision is not None
+        rung = CalibrationRung(
+            decision=estimate.decision,
+            _rank=self,
+            _candidate=_impl._CandidateMicroBatch(
+                inputs=items,
+                indices=tuple(range(len(items))),
+                plan=plan,
+                check=check,
+                stats_global_count=len(items),
+                rejected_candidates=0,
+                cold_start=estimate.extrapolated,
+            ),
+            _checkpoint=checkpoint,
+            _no_grad=not enabled,
+        )
+        profile = self._memory_profiles.get(plan.signature)
+        if (
+            isinstance(profile, _memory._CallerMemoryProfileV2)
+            and plan.caller_cp_workload is not None
+        ):
+            covered = profile.covering_cp_observation(
+                plan.packed_tokens, plan.caller_cp_workload
+            )
+            if covered is not None and not profile.cp_family_equal(
+                plan.caller_cp_workload[0], covered[2]
+            ):
+                rung._coverage_guard = _memory._CalibrationCoverageGuard(
+                    plan, covered[2], covered[1]
+                )
+    return rung
+
+
+def calibration_rung(
+    self: TrainerRank,
+    inputs: Iterable[ForwardInputs],
+    *,
+    checkpoint: AdapterSelection = _impl.Unset,
+    no_grad: bool | None = None,
+    seed_uncovered_cp_family: bool = False,
+):
+    """Prepare one admitted wave with a driver-owned collective close path.
+
+    Use this scope on every rank. Exhaust the iterator or close the scope
+    collectively. Rank-local generator close is rejected without a vote; the
+    owning with-statement carries that error into the one phase exit vote.
+    Journal intents and completion inside the scope, with no automatic retry.
+    """
+    self._guard_forward_collective("calibration_rung")
+    return _CalibrationScope(
+        self, inputs, checkpoint, no_grad, seed_uncovered_cp_family
+    )
+
+
+def _cp_floor_requests(self: TrainerRank, template: AnyForwardInput):
+    """Finite output grammar and representatives of its unbounded parameters.
+
+    Seed both operations and every nonempty combination of target, top-k,
+    logits and hidden, optionally routes on MoE. Targets use flat, column and
+    three-column representatives; positive top-k uses k=1. Other exact target
+    shapes, k values and mixed request signatures use measured sibling maxima
+    or defer. Numeric widths still pay their own analytic workspace charges.
+    """
+    if template.input_tokens.ndim != 1 or not template.input_tokens.numel():
+        raise ValueError("floor calibration requires a nonempty flat root template")
+    token = template.input_tokens[:1]
+    for grad, target, topk, logits, hidden, routes in itertools.product(
+        (False, True),
+        (None, (), (1,), (3,)),
+        (None, 1),
+        (False, True),
+        (False, True),
+        (False, True) if self._moe_layers else (False,),
+    ):
+        if target is None and topk is None and not logits and not hidden:
+            continue  # inactive and routes alone execute no model work
+        routed = None
+        if routes:
+            width = int(self.runtime.provider.moe_router_topk)
+            routed = _impl.torch.arange(width, device=token.device).reshape(1, 1, width)
+            routed = routed.expand(1, self._num_layers, width)
+        yield replace(
+            template,
+            input_tokens=token,
+            target_tokens=None if target is None else token.new_zeros((1, *target)),
+            top_k=topk,
+            logits=logits,
+            hidden_states=hidden,
+            routed_experts=routed,
+            no_grad=not grad,
+        )
+
+
+@_protocol.owned
+def calibrate_request_floors(
+    self: TrainerRank,
+    template: AnyForwardInput,
+    *,
+    execute: Callable[[CalibrationRung], None],
+    check_pending: Callable[[], None],
+    checkpoint: AdapterSelection = _impl.Unset,
+) -> tuple[_memory.CalibrationRungDecision, ...]:
+    """Finish a CP8 calibration pass after both operations have live anchors.
+
+    This method owns the probe inventory; callers never enumerate families.
+    ``execute(rung)`` must use the existing cohort-wide durable intent/restart
+    gate, then exhaust ``rung.forward_micro_batches()`` and run backward within
+    each yielded caller interval when ``not rung.no_grad``. Record completion
+    only after touching all requested floating outputs (target logprobs,
+    top-k logprobs, logits and hidden states) in one backward, when enabled, and
+    only after exhausting it. An unresolved intent must prevent execution on
+    every rank, as for ``calibration_rung``. Callback errors propagate; there
+    is no retry. ``check_pending()`` must reject unresolved durable intents
+    before any work or completed-profile skips, including after restore.
+    Per-family journal keys include both ``decision.signature_id`` and
+    ``rung.family_id``, so native kernel configurations cannot alias an intent.
+
+    Each new one-token trial retains the existing 2x static seed cap and its
+    once-per-signature/family attempt. It records only a floor, never a rate or
+    covering peak. Success requires a positive measurement for every probe.
+    Invoke once for each selected adapter/partition/native kernel configuration.
+    Older callers must add this call after their product ladders.
+
+    Caller migration requirement:
+    Before any pin bump, the caller must invoke calibrate_request_floors after both live
+    operation ladders for every selected adapter/native configuration; implement
+    cohort-wide durable (signature_id, family_id) intents and pending checks, exhaust each
+    caller interval with all floating outputs participating in backward when enabled,
+    persist/validate format-8 floor-only evidence, and require completed floor coverage
+    before accepting cached calibration or enabling v2 serving.
+
+    Each local calibration phase has one entry and one exit vote. Callback,
+    journal and preparation failures join that exit before the next orchestration
+    collective or model boundary. The explicit driver closes partial iterators;
+    rank-local close is guarded without a collective in a finalizer. Phase tags
+    distinguish callback votes from the caller's outer error exchange. Every rank
+    raises RuntimeError, with its local failure retained as the cause; no trial is
+    retried. Local-only calls preserve the original exception.
+    """
+    self._guard_forward_collective("calibrate_request_floors")
+    with _calibration_status(self):
+        if not _memory._FIXED_SLOPE_PROFILES.get() or self._topology_key() != (
+            1,
+            1,
+            8,
+            1,
+        ):
+            raise ValueError(
+                "floor calibration requires native CP8 fixed-slope collection"
+            )
+        check_pending()
+        probes = tuple(_cp_floor_requests(self, template))
+    decisions = []
+    for probe in probes:
+        with _impl.torch.set_grad_enabled(not probe.no_grad):
+            scope = _memory._CP_FAMILY_CALIBRATION.set(True)
+            try:
+                with _calibration_status(self):
+                    plan = self._plan_flat_forward(
+                        [probe], checkpoint=checkpoint, sync_planning_errors=True
+                    )
+            finally:
+                _memory._CP_FAMILY_CALIBRATION.reset(scope)
+            with _calibration_status(self):
+                measured = (
+                    _memory._cp_measured_request_floor(
+                        self, plan.signature, plan.caller_cp_workload
+                    )
+                    > 0
+                )
+            if self._all_ranks_true(measured):
+                continue
+            with calibration_rung(
+                self,
+                [probe],
+                checkpoint=checkpoint,
+                no_grad=probe.no_grad,
+                seed_uncovered_cp_family=True,
+            ) as rung:
+                execute(rung)
+            with _calibration_status(self):
+                measured_plan = rung._candidate.plan
+                assert isinstance(measured_plan, _impl._FlatForwardPlan)
+                complete = (
+                    rung._used
+                    and _memory._cp_measured_request_floor(
+                        self,
+                        measured_plan.signature,
+                        measured_plan.caller_cp_workload,
+                    )
+                    > 0
+                )
+            if not self._all_ranks_true(complete):
+                raise RuntimeError(
+                    "floor calibration requires a complete positive measurement"
+                )
+            decisions.append(rung.decision)
+    return tuple(decisions)
+
+
 def _forward_micro_batches(
     self: TrainerRank,
     inputs: Iterable[ForwardInputs],
     *,
     checkpoint: AdapterSelection,
     yield_empty: bool,
+    calibration_candidate: _CandidateMicroBatch | None = None,
 ) -> Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None]:
     backward = self._backward_work()
     if backward is not None:
@@ -97,10 +650,13 @@ def _forward_micro_batches(
             "plan",
             {"global_start": start, "global_remaining": len(items) - start},
         ):
-            candidate = self._select_next_micro_batch(
-                items, start, checkpoint=checkpoint
+            candidate = (
+                self._select_next_micro_batch(items, start, checkpoint=checkpoint)
+                if calibration_candidate is None
+                else calibration_candidate
             )
         self._snapshot_planning_telemetry(candidate.plan, candidate.check)
+        _protocol.checkpoint()
         tracked_outputs: list[AnyForwardOutput] = []
         outputs: list[Any] = []
         flat_outputs = iter(tracked_outputs)
@@ -131,6 +687,10 @@ def _forward_micro_batches(
             ]
         except BaseException as exc:
             error = exc
+        if error is not None and _protocol.active() is not None:
+            # The explicit driver carries this local failure to the current
+            # phase exit before any peer enters the backward handoff vote.
+            raise error
         try:
             self._release_cached_memory_for_backward(candidate.plan, error=error)
         except BaseException:
@@ -461,6 +1021,7 @@ def _split_chunk_lower_cost(
     )
     logical_tokens = _impl._active_logical_tokens(requests)
     cost = self._subforward_cost(
+        request_count=len(requests),
         packed_tokens=packed_tokens,
         output_bytes=output_bytes,
         signature=signature,
@@ -473,6 +1034,31 @@ def _split_chunk_lower_cost(
         // signature.topology[2],
     )
     profile = self._memory_profiles.get(signature)
+    if signature.topology[2] > 1 and (
+        _memory._cp_fixed_phase_bytes(
+            self, signature, output_bytes, None, packed_tokens=packed_tokens
+        )[0]
+        > 0
+        or (
+            isinstance(profile, _memory._CallerMemoryProfileV2)
+            and (
+                profile.non_dominant_cp_pairs
+                or profile.dominance_disabled
+                or (
+                    _memory._fixed_slope_enabled(profile)
+                    and len(requests) == 1
+                    and cost.required >= _memory._MEMORY_DEFERRED_BYTES
+                    and packed_tokens < _memory._memory_model._MEMORY_SLOPE_MIN_TOKENS
+                    and _memory._native_cp_cold_supported(self, signature)
+                )
+            )
+        )
+    ):
+        # This preview has no CP family. A revoked refusal or family fixed
+        # charge cannot be its pruning bound. Make the preview non-binding;
+        # exact child costs still enforce every coverage and memory check, using
+        # the existing collectives to keep all ranks on the same path.
+        return _impl._SubforwardCost(required=0, retained=0)
     if (
         profile is not None
         and profile.retained_compute_bytes_per_token is not None
@@ -533,6 +1119,7 @@ def _plan_group_rows(
 
 def _plan_cost(self: TrainerRank, plan: _FlatForwardPlan) -> _SubforwardCost:
     return self._subforward_cost(
+        request_count=getattr(plan, "request_count", None),
         packed_tokens=plan.packed_tokens,
         output_bytes=plan.output_bytes,
         signature=plan.signature,
@@ -1378,8 +1965,26 @@ def _plan_flat_forward(
             - _impl._active_logical_tokens(requests),
         )
         if (
-            getattr(plan.signature, "bounded_caller_peak", False)
+            plan.packed_tokens > 0
             and plan.signature.topology[2] > 1
+            and (
+                getattr(plan.signature, "bounded_caller_peak", False)
+                or (
+                    len(plan.groups) == 1
+                    and _memory._cp_native_fixed(self, plan.signature)
+                )
+                or (
+                    plan.packed_tokens < _memory._memory_model._MEMORY_SLOPE_MIN_TOKENS
+                    and _memory._fixed_slope_enabled(
+                        self._memory_profiles.get(plan.signature)
+                    )
+                    and (
+                        _memory._unanchored(self._memory_profiles.get(plan.signature))
+                        or _memory._cp_request_floor(self, plan.signature, None) > 0
+                    )
+                    and _memory._native_cp_cold_supported(self, plan.signature)
+                )
+            )
         ):
             from art.megatron.context_parallel.runtime import (
                 context_parallel_memory_workload,
@@ -1409,6 +2014,12 @@ def _plan_flat_forward(
                     ),
                 ),
             )
+            if _memory._fixed_slope_enabled(
+                self._memory_profiles.get(plan.signature)
+            ) or _memory._cp_native_fixed(self, plan.signature):
+                plan = replace(
+                    plan, caller_cp_workload=_memory._qualified_cp_workload(self, plan)
+                )
         return plan
 
 
@@ -1431,8 +2042,8 @@ def _fill_planner_snapshot(
         from . import _memory, _planner_replay
 
         fixed_slope_collection = _memory._FIXED_SLOPE_PROFILES.get()
-        # Cross-signature rate fallback is part of the estimate's frozen input.
-        # Legacy reports keep their exact payload shape.
+        # Pricing reads the pool for rates, scope constraints, sibling floors
+        # and native fixed-policy activation, even without a selected profile.
         profile_pool = (
             [
                 {"signature": asdict(key), "profile": asdict(profile)}
@@ -1441,9 +2052,8 @@ def _fill_planner_snapshot(
             ]
             if fixed_slope_collection
             or any(
-                profile is not None and profile.peak_model_version == 2
-                for child in children
-                for profile in (self._memory_profiles.get(child.signature),)
+                profile.peak_model_version == 2
+                for profile in self._memory_profiles.values()
             )
             else None
         )
@@ -1465,6 +2075,7 @@ def _fill_planner_snapshot(
                     if (profile := self._memory_profiles.get(child.signature))
                     else None,
                     "arguments": {
+                        "request_count": child.request_count,
                         "packed_tokens": child.packed_tokens,
                         "output_bytes": child.output_bytes,
                         "logical_tokens": child.active_logical_tokens,
@@ -1521,6 +2132,9 @@ def _fill_planner_snapshot(
         rank_fields["topology"] = list(plan.signature.topology)
         rank_fields["parallel_shape"] = asdict(self._parallel_shape)
         rank_fields["moe_layers"] = self._moe_layers
+        rank_fields["moe_memory_supported"] = bool(
+            getattr(self, "_moe_memory_supported", False)
+        )
 
         def version(tensor: torch.Tensor | None) -> int | None:
             try:
@@ -2222,6 +2836,8 @@ def _planning_status(self: TrainerRank, enabled: bool) -> Generator[None, None, 
         yield
     except BaseException as exc:
         primary = exc
+    if primary is not None and _protocol.active() is not None:
+        raise primary
     exchange_error: BaseException | None = None
     try:
         succeeded = self._all_ranks_true(primary is None)

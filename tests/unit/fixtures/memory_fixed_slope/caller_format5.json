@@ -1,0 +1,14 @@
+{
+  "generator": "make_legacy_profile.py",
+  "source_commit": "46bb0c671c8a47040555ba25878e9860a4caf91b",
+  "sha256": "e0364635f691cee973c33780c56bc5dad7059fb9a52d63d44edd3f540d95739d",
+  "description": "Synthetic CP8 caller profile created by the source commit, not re-encoded at the current version.",
+  "generation": {
+    "packed_tokens": 16384,
+    "peak_increment_bytes": 2500000000,
+    "output_bytes": 65536,
+    "caller_phase": true,
+    "pickle_payload": "(plan.signature, profile)",
+    "pickle_protocol": 4
+  }
+}
