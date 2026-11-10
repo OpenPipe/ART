@@ -23,7 +23,7 @@ import hashlib
 import json
 import math
 from types import MethodType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from art.trainer_rank import _impl, _memory_model
 
@@ -233,7 +233,7 @@ def _block_cp_pair(profile: _CallerMemoryProfileV2, requested: str, observed: st
     pairs = set(profile.non_dominant_cp_pairs) | {_cp_pair(requested, observed)}
     return replace(
         profile,
-        profile_format_version=7,
+        profile_format_version=max(7, profile.profile_format_version),
         non_dominant_cp_pairs=tuple(sorted(pairs)[:_CP_BLOCKED_PAIR_BUDGET]),
         dominance_disabled=profile.dominance_disabled
         or len(pairs) > _CP_BLOCKED_PAIR_BUDGET,
@@ -358,17 +358,30 @@ def _calibration_estimate(
             and plan.signature.topology[2] > 1
             and workload is not None
             and _known_cp_kernels(workload)
-            and _rate_floor_tokens(plan.signature)
-            <= result.candidate
-            < _memory_model._MEMORY_SLOPE_MIN_TOKENS
+            and (
+                (
+                    result.candidate == 1
+                    and plan.request_count == 1
+                    and _native_cp_cold_supported(self, plan.signature)
+                )
+                or _rate_floor_tokens(plan.signature)
+                <= result.candidate
+                < _memory_model._MEMORY_SLOPE_MIN_TOKENS
+            )
             and not getattr(profile, "dominance_disabled", False)
             and not getattr(profile, "non_dominant_cp_pairs", ())
             and (
-                profile is None
+                result.candidate == 1
+                or profile is None
                 or profile.covering_cp_peak(result.candidate, workload) is None
             )
             and (plan.signature, _cp_pair(workload[0], workload[0])[0])
             not in self.__dict__.get("_calibration_seeded_cp_families", ())
+            and not (
+                result.candidate == 1
+                and _cp_request_floor_key(plan.signature, workload)
+                in dict(getattr(profile, "cp_request_floors", ()))
+            )
         ):
             raise ValueError(
                 "CP family seed requires an uncovered short family and live anchors"
@@ -757,7 +770,11 @@ def _short_cp_execution_known(
             from types import SimpleNamespace
 
             expected, _ = _qualified_cp_workload(
-                self, SimpleNamespace(signature=signature, caller_cp_workload=workload)
+                self,
+                cast(
+                    Any,
+                    SimpleNamespace(signature=signature, caller_cp_workload=workload),
+                ),
             )
             if (
                 json.loads(expected)["execution_qualification"]
@@ -841,6 +858,160 @@ def _mark_subfloor_cp_sample(self: TrainerRank, plan: _impl._FlatForwardPlan) ->
         # Plan-owned metadata, not a growing trainer history. Mark every
         # admitted sub-floor CP wave independently of rank-local coverage.
         plan.__dict__["_exclude_subfloor_memory_sample"] = True
+
+
+_CP_REQUEST_FLOOR_BUDGET = 32
+_CP_COLD_REQUEST_BYTES = 64 * 2**20
+
+
+def _cp_request_scope(signature: _impl._MemorySignature) -> dict[str, Any]:
+    scope = dict(vars(signature))
+    scope.pop("short_requests", None)
+    scope.pop("bounded_caller_peak", None)
+    scope.pop("bounded_forward_peak", None)
+    scope.setdefault("checkpoint_partition", None)
+    return scope
+
+
+def _cp_request_floor_key(
+    signature: _impl._MemorySignature, workload: _CPWorkload
+) -> str:
+    """Fixed per-request evidence, not mask dominance or a token-rate anchor.
+
+    Dynamic ownership/masks can only increase the native cost. The fixed floor
+    is shared across those shapes within the same operation, outputs, selected
+    adapters, model and native kernel configuration. It never grants coverage.
+    """
+    fields = json.loads(workload[0])
+    fields.pop("masks", None)
+    fields.pop("gdn", None)
+    fields.pop(_CP_OBSERVATION_FORMAT_KEY, None)
+    fields["execution_qualification"].pop("signature", None)
+    fields["request_scope"] = _cp_request_scope(signature)
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
+
+
+def _cp_request_floor(self: TrainerRank, signature, workload) -> int:
+    profiles = [
+        (key, profile)
+        for key, profile in self._memory_profiles.items()
+        if getattr(profile, "cp_request_floors", ())
+    ]
+    if not profiles:
+        return 0
+    if workload is None:
+        # Ordinary model pricing and split previews may omit a CP workload.
+        # Retain all fixed bounds of this exact operation/output/adapter class;
+        # missing detail cannot erase a measured floor. No coverage is granted.
+        scope = _cp_request_scope(signature)
+        return max(
+            (
+                peak
+                for key, profile in profiles
+                if _cp_request_scope(key) == scope
+                for _, peak in getattr(profile, "cp_request_floors", ())
+            ),
+            default=0,
+        )
+    if not _known_cp_kernels(workload):
+        return 0
+    key = _cp_request_floor_key(signature, workload)
+    # A floor only raises a bound. Revocation/unknown execution checks still
+    # decide whether the native cold path may replace deferred admission.
+    return max(
+        (
+            peak
+            for _, profile in profiles
+            for family, peak in getattr(profile, "cp_request_floors", ())
+            if family == key
+        ),
+        default=0,
+    )
+
+
+def _cp_fixed_phase_bytes(
+    self: TrainerRank,
+    signature,
+    output_bytes,
+    workload,
+    *,
+    include_optimizer=True,
+    packed_tokens: int = 0,
+) -> tuple[int, int]:
+    floor = _cp_request_floor(self, signature, workload)
+    profile = self._memory_profiles.get(signature)
+    if profile is not None and not isinstance(profile, _CallerMemoryProfile):
+        # A generic profile has no family-qualified channel to replace these
+        # measured constraints. Cold status cannot erase its absolute floor or
+        # a peak at an already observed extent. Caller profiles instead retain
+        # their exact same-family peaks in cold_family_floor.
+        observed = profile.compute_observations
+        # A peak at a longer root is not a measurement of an unseen shorter
+        # execution family. Once any extent has been observed, its absolute
+        # constraint and observed peaks bind that extent and all larger roots.
+        if not observed or min(n for n, _ in observed) <= packed_tokens:
+            floor = max(floor, _absolute_floor(profile, _rate_floor_tokens(signature)))
+        floor = max(
+            floor,
+            max((peak for n, peak in observed if n <= packed_tokens), default=0),
+        )
+    optimizer = (
+        _impl._optimizer._signature_optimizer_bytes(signature)
+        if include_optimizer
+        and _fixed_slope_enabled(self._memory_profiles.get(signature))
+        and _native_cp_cold_supported(self, signature)
+        else 0
+    )
+
+    def price(value: int) -> int:
+        return (
+            math.ceil((output_bytes + value) * _impl._MEMORY_SAFETY_FACTOR)
+            if value
+            else 0
+        )
+
+    return price(floor), price(optimizer)
+
+
+def _merge_cp_request_floors(*profiles) -> tuple[tuple[str, int], ...]:
+    floors: dict[str, int] = {}
+    for profile in profiles:
+        for key, peak in getattr(profile, "cp_request_floors", ()):
+            floors[key] = max(peak, floors.get(key, 0))
+    if len(floors) > _CP_REQUEST_FLOOR_BUDGET:
+        raise ValueError("too many independent CP request floors")
+    return tuple(sorted(floors.items()))
+
+
+def _record_cp_request_floor(self: TrainerRank, plan, compute: int) -> None:
+    workload = plan.caller_cp_workload
+    if workload is None or not _known_cp_kernels(workload):
+        raise ValueError("request floor requires a qualified CP workload")
+    key = _cp_request_floor_key(plan.signature, workload)
+    old = self._memory_profiles.get(plan.signature)
+    floors = dict(getattr(old, "cp_request_floors", ()))
+    floors[key] = max(compute, floors.get(key, 0))
+    if len(floors) > _CP_REQUEST_FLOOR_BUDGET:
+        raise ValueError("too many independent CP request floors")
+    if old is None:
+        old = _CallerMemoryProfileV2(
+            bytes_per_token=0,
+            packed_tokens=1,
+            logical_per_packed=1,
+            rate_floor_tokens=_rate_floor_tokens(plan.signature),
+            rate_observations=(),
+        )
+    if not isinstance(old, _CallerMemoryProfileV2):
+        raise ValueError("request floor requires a caller profile")
+    # No hull, rate, retained floor, token extent or covering peak is changed.
+    updated = replace(
+        old, profile_format_version=8, cp_request_floors=tuple(sorted(floors.items()))
+    )
+    self._memory_profiles[plan.signature] = updated
+    journal = self.__dict__.get("_calibration_memory_rungs", {})
+    entry = journal.get(plan.signature)
+    if entry is not None and entry[0] is old:
+        journal[plan.signature] = (updated, entry[1])
 
 
 def _rate_points(profile: _impl._MemoryProfile, floor: int):
@@ -1185,6 +1356,7 @@ def _merge_memory_profile_model_fields(
             *(getattr(p, "non_dominant_cp_pairs", ()) for p in profiles)
         )
         extra.update(
+            cp_request_floors=_merge_cp_request_floors(*profiles),
             non_dominant_cp_pairs=tuple(sorted(pairs)[:_CP_BLOCKED_PAIR_BUDGET]),
             dominance_disabled=any(
                 getattr(p, "dominance_disabled", False) for p in profiles
@@ -1192,7 +1364,7 @@ def _merge_memory_profile_model_fields(
             or len(pairs) > _CP_BLOCKED_PAIR_BUDGET,
         )
         if formats:
-            extra["profile_format_version"] = 7
+            extra["profile_format_version"] = 8 if extra["cp_request_floors"] else 7
     return dict(
         peak_model_version=_memory_model._MEMORY_PROFILE_VERSION,
         compute_observations=observations,
@@ -1239,11 +1411,16 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
         and not profile.caller_compute_peaks
         and not profile.caller_cp_peaks
     )
-    if (not points and not incomplete_caller) or _memory_model.merge_points(
-        points
-    ) != points:
+    floor_only = (
+        isinstance(profile, _CallerMemoryProfileV2)
+        and profile.profile_format_version == 8
+        and bool(profile.cp_request_floors)
+    )
+    if (
+        not points and not incomplete_caller and not floor_only
+    ) or _memory_model.merge_points(points) != points:
         raise ValueError("invalid memory observation hull")
-    if profile.profile_format_version in (3, 4, 5, 6, 7):
+    if profile.profile_format_version in (3, 4, 5, 6, 7, 8):
         floor, rates, absolute = (
             profile.rate_floor_tokens,
             profile.rate_observations,
@@ -1314,6 +1491,24 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
     elif any(extents) or profile.retained_compute_peaks:
         raise ValueError("unexpected independent memory evidence in old format")
     if isinstance(profile, _CallerMemoryProfileV2):
+        floors = profile.cp_request_floors
+        if (
+            type(floors) is not tuple
+            or len(floors) > _CP_REQUEST_FLOOR_BUDGET
+            or any(
+                type(row) is not tuple
+                or len(row) != 2
+                or type(row[0]) is not str
+                or len(row[0]) != 64
+                or any(c not in "0123456789abcdef" for c in row[0])
+                or type(row[1]) is not int
+                or row[1] < 0
+                for row in floors
+            )
+            or tuple(sorted(dict(floors).items())) != floors
+            or (floors and profile.profile_format_version < 8)
+        ):
+            raise ValueError("invalid CP request floors")
         pairs = profile.non_dominant_cp_pairs
         if (
             type(pairs) is not tuple
@@ -1497,6 +1692,7 @@ class _CallerMemoryProfileV2(_impl._MemoryProfileV2, _CallerMemoryProfile):
     profile_format_version: int = 7
     non_dominant_cp_pairs: tuple[tuple[str, str], ...] = ()
     dominance_disabled: bool = False
+    cp_request_floors: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1504,9 +1700,35 @@ class _BoundedMemoryProfileV2(_impl._MemoryProfileV2, _BoundedMemoryProfile):
     pass
 
 
+def _new_memory_profile(signature, fields: dict[str, Any], *, fixed_slope: bool):
+    """Construct one storage specialization; caller evidence includes forward.
+
+    Preparation uses this same pure factory before any seed attempt or work.
+    A constructor/schema error therefore cannot consume a calibration intent.
+    """
+    fields = dict(fields)
+    if isinstance(signature, _ScopedMemorySignature) and signature.bounded_caller_peak:
+        cls = _CallerMemoryProfileV2 if fixed_slope else _CallerMemoryProfile
+        fields.setdefault("caller_compute_peaks", ())
+        fields.setdefault("caller_cp_peaks", ())
+        fields.setdefault("compute_peak_floor", 0)
+    elif (
+        isinstance(signature, _ScopedMemorySignature) and signature.bounded_forward_peak
+    ):
+        cls = _BoundedMemoryProfileV2 if fixed_slope else _BoundedMemoryProfile
+        fields.setdefault("forward_compute_peaks", ())
+    else:
+        cls = _impl._MemoryProfileV2 if fixed_slope else _impl._MemoryProfile
+    return cls(**fields)
+
+
 def _memory_profile_from_values(values: dict[str, Any]) -> _impl._MemoryProfile:
     """Decode the versioned state while preserving the legacy record classes."""
     values = dict(values)
+    if "cp_request_floors" in values:
+        values["cp_request_floors"] = tuple(
+            tuple(row) for row in values["cp_request_floors"]
+        )
     if "non_dominant_cp_pairs" in values:
         values["non_dominant_cp_pairs"] = tuple(
             tuple(p) for p in values["non_dominant_cp_pairs"]
@@ -3420,8 +3642,7 @@ def _memory_signature_from_requests(
         )
     )
     if (
-        self._moe_layers
-        and len(requests) == slot_group_count == 1
+        len(requests) == slot_group_count == 1
         and modes in ((False,), (True,))
         and _native_cp_cold_supported(self, signature)
         and bool(_checkpoint_layers(self, ((1, any(modes)),)))
@@ -3429,17 +3650,25 @@ def _memory_signature_from_requests(
             _CP_FAMILY_CALIBRATION.get()
             or (
                 (
-                    signature.grad_enabled
+                    (self._moe_layers and signature.grad_enabled)
                     or sum(int(r.input_tokens.numel()) for r in requests)
                     < _memory_model._MEMORY_SLOPE_MIN_TOKENS
                 )
-                and _ScopedMemorySignature(
-                    **vars(signature),
-                    checkpoint_partition=partition,
-                    bounded_forward_peak=bounded,
-                    bounded_caller_peak=True,
+                and (
+                    caller_profile := self._memory_profiles.get(
+                        _ScopedMemorySignature(
+                            **vars(signature),
+                            checkpoint_partition=partition,
+                            bounded_forward_peak=False,
+                            bounded_caller_peak=True,
+                        )
+                    )
                 )
-                in self._memory_profiles
+                is not None
+                and not (
+                    getattr(caller_profile, "cp_request_floors", ())
+                    and not caller_profile.compute_observations
+                )
             )
         )
     ):
@@ -3447,6 +3676,9 @@ def _memory_signature_from_requests(
         # evidence. Forward-only and hidden/routed callers must not borrow a
         # gradient target family's peak or bypass its kernel qualification.
         caller_bounded = True
+    # The caller channel records the complete interval, including forward.
+    # It supersedes a direct-forward scope rather than composing two records.
+    bounded = bounded and not caller_bounded
     if partition is not None or bounded or caller_bounded:
         return _ScopedMemorySignature(
             **vars(signature),
@@ -3565,6 +3797,17 @@ def _memory_check(
 ) -> _impl._MemoryCheck:
     with self._planning_status(sync_planning_errors):
         if _calibration is not None:
+            _new_memory_profile(
+                forward.signature,
+                dict(
+                    bytes_per_token=0,
+                    packed_tokens=forward.packed_tokens,
+                    logical_per_packed=1,
+                ),
+                fixed_slope=_fixed_slope_enabled(
+                    self._memory_profiles.get(forward.signature)
+                ),
+            )
             _calibration.__dict__.update(
                 vars(
                     _calibration_estimate(
@@ -3870,8 +4113,7 @@ def _estimate_required_memory_bytes_from_values(
     if packed_tokens <= 0:
         return output_bytes
     profiled = self._memory_profiles.get(signature)
-    cold_subfloor = _uncovered_cp_family(
-        self,
+    cold_subfloor = self._uncovered_cp_family(
         profiled,
         signature,
         packed_tokens,
@@ -4043,6 +4285,20 @@ def _estimate_required_memory_bytes_from_values(
         # boundaries but not the backward's input gradient.
         max(retained, checkpoint_floor[0]) + no_grad_stage,
     )
+    if _fixed_slope_enabled(
+        self._memory_profiles.get(signature)
+    ) and _native_cp_cold_supported(self, signature):
+        if not signature.grad_enabled and (
+            cold_subfloor
+            or (
+                isinstance(_calibration_compute_bytes, _CalibrationEstimate)
+                and _calibration_compute_bytes.seed_uncovered_cp_family
+            )
+        ):
+            # A single native request has allocator/kernel work even at one row.
+            # Keep a conservative static initialization component when no floor
+            # measurement is available; it is also the floor trial's seed cap.
+            static_compute = max(static_compute, _CP_COLD_REQUEST_BYTES)
     if signature.topology[2] > 1:
         # Local head results coexist with full CP outputs during gathering.
         # Uneven rank plans can assign all of an item's rows to one rank.
@@ -4193,11 +4449,26 @@ def _estimate_required_memory_bytes_from_values(
         if include_cold_extrapolation and _calibration_compute_bytes is None
         else 1.0
     )
-    return (
+    required = (
         math.ceil((output_bytes + compute) * _impl._MEMORY_SAFETY_FACTOR * factor)
         if factor != 1 or _calibration_compute_bytes is not None
         else int((output_bytes + compute) * _impl._MEMORY_SAFETY_FACTOR)
     )
+    if include_cold_extrapolation:
+        # These fixed components survive reference changes. The split caller
+        # applies them after its own cold factor as well, never twice.
+        required = max(
+            required,
+            *_cp_fixed_phase_bytes(
+                self,
+                signature,
+                output_bytes,
+                caller_cp_workload,
+                include_optimizer=_calibration_compute_bytes is None,
+                packed_tokens=packed_tokens,
+            ),
+        )
+    return required
 
 
 def _gdn_segment_layer_bytes(self: TrainerRank) -> float:
@@ -4310,6 +4581,16 @@ def _update_memory_profile(
     if plan.packed_tokens <= 0:
         return
     previous = self._memory_profiles.get(plan.signature)
+    if (
+        _fixed_slope_enabled(previous)
+        and getattr(plan, "_calibration_cp_family_seed", False)
+        and plan.packed_tokens == 1
+    ):
+        if caller_phase:
+            _record_cp_request_floor(
+                self, plan, max(0, peak_delta_bytes - plan.output_bytes)
+            )
+        return
     if _fixed_slope_enabled(previous) and getattr(
         plan, "_exclude_subfloor_memory_sample", False
     ):
@@ -4437,8 +4718,7 @@ def _update_memory_profile(
                 else (),
             ),
         )
-    profile_cls = _impl._MemoryProfileV2 if fixed_slope else _impl._MemoryProfile
-    profile = profile_cls(
+    profile_fields = dict(
         # Preserve this legacy diagnostic/transport field. Rate-qualified admission
         # sources rates exclusively from rate_observations, never this maximum.
         bytes_per_token=max(
@@ -4505,15 +4785,17 @@ def _update_memory_profile(
         # max rate or floor. Bound storage like the CP1 curve.
         if len(cp_observations) > 8:
             cp_observations = [cp_observations[0], *cp_observations[-7:]]
-        caller_cls = _CallerMemoryProfileV2 if fixed_slope else _CallerMemoryProfile
-        caller_fields: dict[str, Any] = dict(vars(profile))
+        caller_fields: dict[str, Any] = dict(profile_fields)
         if fixed_slope:
             caller_fields.update(
-                profile_format_version=7,
+                profile_format_version=(
+                    8 if getattr(previous, "cp_request_floors", ()) else 7
+                ),
+                cp_request_floors=getattr(previous, "cp_request_floors", ()),
                 non_dominant_cp_pairs=getattr(previous, "non_dominant_cp_pairs", ()),
                 dominance_disabled=getattr(previous, "dominance_disabled", False),
             )
-        profile = caller_cls(
+        profile_fields = dict(
             **caller_fields,
             caller_compute_peaks=tuple(observations),
             caller_cp_peaks=tuple(cp_observations),
@@ -4524,7 +4806,7 @@ def _update_memory_profile(
                 else 0,
             ),
         )
-    if (
+    elif (
         isinstance(plan.signature, _ScopedMemorySignature)
         and plan.signature.bounded_forward_peak
     ):
@@ -4541,11 +4823,10 @@ def _update_memory_profile(
             observations.append((length, peak))
         if len(observations) > 8:
             observations = [observations[0], *observations[-7:]]
-        bounded_cls = _BoundedMemoryProfileV2 if fixed_slope else _BoundedMemoryProfile
-        profile = bounded_cls(
-            **vars(profile),
-            forward_compute_peaks=tuple(observations),
-        )
+        profile_fields["forward_compute_peaks"] = tuple(observations)
+    profile = _new_memory_profile(
+        plan.signature, profile_fields, fixed_slope=fixed_slope
+    )
     # Publish only after every specialization has been constructed successfully.
     self._memory_profiles[plan.signature] = profile
     if fixed_slope:

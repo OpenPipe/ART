@@ -3100,8 +3100,7 @@ class TrainerRank:
         caller_cp_workload: _memory._CPWorkload | None = None,
     ) -> _SubforwardCost:
         profile = self._memory_profiles.get(signature)
-        cold_subfloor = _memory._uncovered_cp_family(
-            self,
+        cold_subfloor = self._uncovered_cp_family(
             profile,
             signature,
             packed_tokens,
@@ -3195,11 +3194,25 @@ class TrainerRank:
             packed_tokens,
             **({"fixed_slope": True} if cold_subfloor else {}),
         )
+        request_floor, optimizer_peak = _memory._cp_fixed_phase_bytes(
+            self,
+            signature,
+            output_bytes,
+            caller_cp_workload,
+            packed_tokens=packed_tokens,
+        )
         return _SubforwardCost(
-            required=math.ceil(
-                (required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR)) * cold
+            required=max(
+                math.ceil(
+                    (required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR))
+                    * cold
+                ),
+                request_floor,
+                optimizer_peak,
             ),
-            retained=math.ceil(retained * cold),
+            # A request floor may include caller retention; conservatively keep
+            # it across children. The later optimizer is never forward retention.
+            retained=max(math.ceil(retained * cold), request_floor),
             checkpoint_retained=math.ceil(checkpoint_retained * cold),
             checkpoint_workspace=math.ceil(checkpoint_workspace * cold),
             checkpoint_input_gradient=math.ceil(gradient * cold),
@@ -5328,6 +5341,7 @@ class TrainerRank:
     _checkpoint_adapter_gradient_bytes = _memory._checkpoint_adapter_gradient_bytes
     _adapter_gradient_walk = staticmethod(_memory._adapter_gradient_walk)
     _retained_memory_bytes = _memory._retained_memory_bytes
+    _uncovered_cp_family = _memory._uncovered_cp_family
     _estimate_flat_forward = _memory._estimate_flat_forward
     _update_peak_memory_profile = _memory._update_peak_memory_profile
     _estimate_group_request_output_bytes = _memory._estimate_group_request_output_bytes
