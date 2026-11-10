@@ -274,9 +274,9 @@ def _worker(rank, init_method, output):
             plan,
             dist.group.WORLD,
             ContextParallelConfig(),
-            torch.zeros(1, 16, dtype=torch.long),
-            torch.zeros(1, 16, dtype=torch.long),
-            torch.arange(16)[None],
+            torch.zeros(16, dtype=torch.long),
+            torch.zeros(16, dtype=torch.long),
+            torch.arange(16),
         )
         ex.prepare_context_parallel_execution_state(
             state=state, device=torch.device("cpu")
