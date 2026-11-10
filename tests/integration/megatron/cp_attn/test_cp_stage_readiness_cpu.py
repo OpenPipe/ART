@@ -10,6 +10,7 @@ from datetime import timedelta
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -136,8 +137,11 @@ def _inputs():
 
 def _oracle(q, k, v, grad):
     leaves = [x.detach().clone().requires_grad_() for x in (q, k, v)]
+    q_ref, k_ref, v_ref = [x.permute(1, 2, 0, 3) for x in leaves]
     out, _ = _attention(
-        *[x.permute(1, 2, 0, 3) for x in leaves],
+        q_ref,
+        k_ref,
+        v_ref,
         torch.ones(16, 16, dtype=torch.bool).tril(),
     )
     out = out.permute(2, 0, 1, 3)
@@ -220,7 +224,7 @@ class CachedTransport:
 
 
 def _execute(state, q, k, v, go):
-    args = dict(
+    args: dict[str, Any] = dict(
         query=q,
         key=k,
         value=v,
@@ -329,12 +333,18 @@ def _worker(rank, init_method, output, layout_name):
                 (active[::2], active[1::2]),
             ]
         )
+        shard = int(os.environ.get("ART_CP_READINESS_SHARD", "0"))
+        shards = int(os.environ.get("ART_CP_READINESS_SHARDS", "1"))
+        assert 0 <= shard < shards
+        if layout_name == "zigzag":
+            batches = (batch for i, batch in enumerate(batches) if i % shards == shard)
         canonical = None
         count = 0
         original_ready = ex._ready_remote_stage_batch
 
         def ready(**kw):
             result = original_ready(**kw)
+            assert transport.completion is not None
             transport.completion.observed.append(tuple(s.stage_index for s in result))
             return result
 
@@ -380,7 +390,7 @@ def _worker(rank, init_method, output, layout_name):
             _close(actual, wanted)
         assert not torch.cuda.is_initialized()
         (Path(output) / f"rank-{rank}.txt").write_text(
-            f"schedules={count} empty_rows={kernel.empty_rows}\n"
+            f"schedules={count} shard={shard}/{shards} empty_rows={kernel.empty_rows}\n"
         )
     finally:
         dist.destroy_process_group()
@@ -412,7 +422,7 @@ def test_ready_remote_waits_when_none_complete():
             complete.update((0, 2))
 
     result = ex._ready_remote_stage_batch(
-        pending_stages=pending,
+        pending_stages=cast(Any, pending),
         fetch_works_by_stage_index={i: Work(i) for i in range(3)},
     )
     assert waited == [0]
