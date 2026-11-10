@@ -193,8 +193,12 @@ def calibration_rung(
 
     After two live anchors, ``seed_uncovered_cp_family`` may measure an
     uncovered CP caller family between its rate floor and 8K tokens, using
-    the seed's static bound. Record its intent and block incomplete attempts
-    on restart as for the initial seed. The sample never teaches a rate.
+    the seed's static bound. Both operations and each output class have
+    separate evidence; a new class may use live anchors of the same operation
+    and selected adapters to schedule its own measurement. Record each
+    signature/family intent and block incomplete attempts on restart as for
+    the initial seed. The sample never teaches a rate. Measure the largest
+    request in each uncovered family; a smaller peak cannot cover more rows.
     """
     self._guard_forward_collective("calibration_rung")
     enabled = _impl.torch.is_grad_enabled() if no_grad is None else not no_grad
@@ -205,9 +209,13 @@ def calibration_rung(
         if not items:
             raise ValueError("calibration rung must contain an active request")
         requests = list(_impl._flatten(items))
-        plan = self._plan_flat_forward(
-            requests, checkpoint=checkpoint, sync_planning_errors=True
-        )
+        family_scope = _memory._CP_FAMILY_CALIBRATION.set(seed_uncovered_cp_family)
+        try:
+            plan = self._plan_flat_forward(
+                requests, checkpoint=checkpoint, sync_planning_errors=True
+            )
+        finally:
+            _memory._CP_FAMILY_CALIBRATION.reset(family_scope)
         estimate = _memory._CalibrationEstimate(
             signature_id="",
             candidate=plan.packed_tokens,
@@ -647,6 +655,7 @@ def _split_chunk_lower_cost(
     )
     logical_tokens = _impl._active_logical_tokens(requests)
     cost = self._subforward_cost(
+        request_count=len(requests),
         packed_tokens=packed_tokens,
         output_bytes=output_bytes,
         signature=signature,
@@ -662,7 +671,17 @@ def _split_chunk_lower_cost(
     if (
         signature.topology[2] > 1
         and isinstance(profile, _memory._CallerMemoryProfileV2)
-        and (profile.non_dominant_cp_pairs or profile.dominance_disabled)
+        and (
+            profile.non_dominant_cp_pairs
+            or profile.dominance_disabled
+            or (
+                _memory._fixed_slope_enabled(profile)
+                and len(requests) == 1
+                and cost.required >= _memory._MEMORY_DEFERRED_BYTES
+                and packed_tokens < _memory._memory_model._MEMORY_SLOPE_MIN_TOKENS
+                and _memory._native_cp_cold_supported(self, signature)
+            )
+        )
     ):
         # This preview has no CP family. A revoked-family refusal cannot be
         # used as its lower bound. Make the preview non-binding; exact child
@@ -729,6 +748,7 @@ def _plan_group_rows(
 
 def _plan_cost(self: TrainerRank, plan: _FlatForwardPlan) -> _SubforwardCost:
     return self._subforward_cost(
+        request_count=getattr(plan, "request_count", None),
         packed_tokens=plan.packed_tokens,
         output_bytes=plan.output_bytes,
         signature=plan.signature,
@@ -1573,9 +1593,16 @@ def _plan_flat_forward(
             inactive_logical_tokens=logical_tokens
             - _impl._active_logical_tokens(requests),
         )
-        if (
+        if plan.signature.topology[2] > 1 and (
             getattr(plan.signature, "bounded_caller_peak", False)
-            and plan.signature.topology[2] > 1
+            or (
+                plan.packed_tokens < _memory._memory_model._MEMORY_SLOPE_MIN_TOKENS
+                and _memory._fixed_slope_enabled(
+                    self._memory_profiles.get(plan.signature)
+                )
+                and _memory._unanchored(self._memory_profiles.get(plan.signature))
+                and _memory._native_cp_cold_supported(self, plan.signature)
+            )
         ):
             from art.megatron.context_parallel.runtime import (
                 context_parallel_memory_workload,
