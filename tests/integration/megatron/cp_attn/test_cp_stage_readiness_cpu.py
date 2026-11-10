@@ -60,7 +60,7 @@ class ReferenceKernel:
                 torch.arange(nk)[None, :],
             )
             self.masks[key] = mask
-            self.empty_rows += int((~mask.any(-1)).sum())
+            self.empty_rows += int((~mask.any(-1)).sum()) + q.shape[-2] - nq
         output, lse = _attention(
             q[..., :nq, :], k[..., :nk, :], v[..., :nk, :], self.masks[key]
         )
@@ -427,3 +427,21 @@ def test_ready_remote_waits_when_none_complete():
     )
     assert waited == [0]
     assert [s.stage_index for s in result] == [0, 2]
+
+
+def test_reference_attention_empty_row_has_zero_vjp():
+    generator = torch.Generator().manual_seed(813)
+    q = torch.randn(1, 16, 2, 256, generator=generator, requires_grad=True)
+    k = torch.randn(1, 2, 2, 256, generator=generator, requires_grad=True)
+    v = torch.randn(1, 2, 2, 256, generator=generator, requires_grad=True)
+    mask = torch.tensor([[True, False], [False, False]])
+    output, lse = _attention(q, k, v, mask)
+    assert torch.count_nonzero(output[..., 1, :]) == 0
+    assert torch.isneginf(lse[..., 1]).all()
+    grads = torch.autograd.grad(
+        (output, lse),
+        (q, k, v),
+        (torch.ones_like(output), torch.ones_like(lse)),
+    )
+    assert all(torch.isfinite(grad).all() for grad in grads)
+    assert torch.count_nonzero(grads[0][..., 1, :]) == 0
