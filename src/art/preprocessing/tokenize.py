@@ -71,10 +71,17 @@ def _flag_spans(flags: list[TokenFlag], flag: TokenFlag) -> list[tuple[int, int]
 
 
 def _true_spans(mask: list[bool]) -> list[tuple[int, int]]:
-    return _flag_spans(
-        [TokenFlag.SAMPLED if value else TokenFlag(0) for value in mask],
-        TokenFlag.SAMPLED,
-    )
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, value in enumerate(mask):
+        if value:
+            start = index if start is None else start
+        elif start is not None:
+            spans.append((start, index))
+            start = None
+    if start is not None:
+        spans.append((start, len(mask)))
+    return spans
 
 
 @dataclass(frozen=True)
