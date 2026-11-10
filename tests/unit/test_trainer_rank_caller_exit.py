@@ -214,7 +214,7 @@ def test_caller_exit_precedes_outer_error_exchange(
     )
     assert all(row["operations"] == rows[0]["operations"] for row in rows), rows
     assert len(rows[0]["operations"]) == 16
-    assert rows[0]["operations"][-1] == ["RedOpType.MAX", [1], "torch.float64"]
+    assert rows[0]["operations"][-1] == ["RedOpType.MAX", [5], "torch.float64"]
     failed = case in ("oom", "value", "throw", "multiwave")
     assert all(row["outer"] == [float(failed)] and row["closes"] == 1 for row in rows)
     assert all(row["callers"] == 0 and not any(row["rates"]) for row in rows)

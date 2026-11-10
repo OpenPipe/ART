@@ -44,6 +44,8 @@ MAX_PLANNING_REPORT_BYTES = 256 * 1024
 MAX_PLANNING_REPORTS = 64
 MAX_PLANNING_SPOOL_BYTES = 16 * 1024 * 1024
 _SOURCE_NAMES = (
+    "_calibration_protocol.py",
+    "_checkpoint.py",
     "_impl.py",
     "_memory.py",
     "_memory_model.py",

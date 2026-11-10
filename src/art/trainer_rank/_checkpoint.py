@@ -24,6 +24,8 @@ import weakref
 import torch
 import torch.distributed as dist
 
+from . import _calibration_protocol
+
 if TYPE_CHECKING:
     from safetensors import safe_open
 
@@ -252,7 +254,9 @@ def _gather[T](value: T, group: dist.ProcessGroup | None = None) -> tuple[T, ...
     if not _distributed():
         return (value,)
     values: list[T | None] = [None] * dist.get_world_size(group)
-    dist.all_gather_object(values, value, group=group)
+    _calibration_protocol.collective(
+        lambda: dist.all_gather_object(values, value, group=group)
+    )
     return tuple(cast(T, item) for item in values)
 
 
@@ -2359,10 +2363,14 @@ def _ensure_groups(
     if _distributed():
         with trainer._checkpoint_group_lock:
             if trainer._checkpoint_process_group is None:
-                trainer._checkpoint_process_group = dist.new_group(backend="gloo")
+                trainer._checkpoint_process_group = _calibration_protocol.collective(
+                    lambda: dist.new_group(backend="gloo")
+                )
             if trainer._checkpoint_finalize_process_group is None:
-                trainer._checkpoint_finalize_process_group = dist.new_group(
-                    backend="gloo"
+                trainer._checkpoint_finalize_process_group = (
+                    _calibration_protocol.collective(
+                        lambda: dist.new_group(backend="gloo")
+                    )
                 )
     return (
         trainer._checkpoint_process_group,

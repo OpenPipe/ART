@@ -107,6 +107,9 @@ class TrainerRank(_impl.TrainerRank):
         Ordinary forwards never use this calibration-only extrapolation.
         ``seed_uncovered_cp_family`` explicitly measures a short uncovered CP
         family after two live anchors, without learning a rate from its sample.
+        Use the scope on every rank. Exhaust the iterator or leave the scope
+        collectively; the driver closes partial iterators. A rank-local close
+        is guarded without entering a collective from a finalizer.
         """
         return calibration_rung(
             self,
