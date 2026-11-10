@@ -278,6 +278,9 @@ def _worker(rank, init_method, output):
             torch.zeros(1, 16, dtype=torch.long),
             torch.arange(16)[None],
         )
+        ex.prepare_context_parallel_execution_state(
+            state=state, device=torch.device("cpu")
+        )
         expected_out, expected_global = _oracle(fullq, fullk, fullv, fullgo)
         active = tuple(
             s.stage_index
