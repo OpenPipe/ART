@@ -254,9 +254,7 @@ def _gather[T](value: T, group: dist.ProcessGroup | None = None) -> tuple[T, ...
     if not _distributed():
         return (value,)
     values: list[T | None] = [None] * dist.get_world_size(group)
-    _calibration_protocol.collective(
-        lambda: dist.all_gather_object(values, value, group=group)
-    )
+    _calibration_protocol.all_gather_object(values, value, group=group)
     return tuple(cast(T, item) for item in values)
 
 

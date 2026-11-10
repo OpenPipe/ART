@@ -104,9 +104,16 @@ class Protocol:
 
     def start(self):
         assert not self.open and not self.broken
-        self.sequence += 1
-        self.open = True
-        values, error = self._vote("entry")
+        sequence = self.sequence + 1
+        error = None
+        try:
+            self.sequence = sequence
+            self.open = True
+        except BaseException as exc:
+            # Commit the same must-vote state if reservation was interrupted.
+            self.sequence, self.open = sequence, True
+            error = exc
+        values, error = self._vote("entry", error)
         if values[0]:
             self.end(error or RuntimeError("Calibration entry preparation failed"))
 
@@ -182,6 +189,33 @@ class Driver:
 def collective(action: Callable[[], Any]):
     active = _ACTIVE.get()
     return action() if active is None else active.collective(action)
+
+
+def all_gather_object(object_list, obj, group=None):
+    """Prepare object bytes in-phase, preserving the two tensor wire gathers."""
+    from torch.distributed import distributed_c10d as c10d
+
+    current = _ACTIVE.get()
+    if current is None or c10d._rank_not_in_group(group):
+        return collective(lambda: dist.all_gather_object(object_list, obj, group=group))
+    device = c10d._get_object_coll_device(group)
+    payload, local_size = c10d._object_to_tensor(obj, device, group)
+    count = dist.get_world_size(group)
+    sizes = torch.zeros(count, dtype=torch.long, device=device)
+    size_list = [sizes[i].unsqueeze(0) for i in range(count)]
+
+    def gather():
+        dist.all_gather(size_list, local_size, group=group)
+        maximum = int(sizes.max().item())
+        payload.resize_(maximum)
+        storage = torch.empty(maximum * count, dtype=torch.uint8, device=device)
+        outputs = [storage[maximum * i : maximum * (i + 1)] for i in range(count)]
+        dist.all_gather(outputs, payload, group=group)
+        return outputs
+
+    outputs = current.collective(gather)
+    for index, tensor in enumerate(outputs):
+        object_list[index] = c10d._tensor_to_object(tensor, size_list[index], group)
 
 
 def active() -> Protocol | None:

@@ -381,15 +381,17 @@ def _agreement_worker(index, directory, variant):
         12_000_000_000 if variant == "refuse" and index == 0 else 20_000_000_000
     )
     operations = []
-    original, original_gather = dist.all_reduce, dist.all_gather_object
+    from torch.distributed import distributed_c10d as c10d
+
+    original, original_gather = dist.all_reduce, c10d.all_gather
 
     def reduce(tensor, op=dist.ReduceOp.SUM, **kwargs):
         operations.append((str(op), list(tensor.shape), str(tensor.dtype)))
         return original(tensor, op=op, **kwargs)
 
-    def gather(objects, value, **kwargs):
-        operations.append(("ALL_GATHER_OBJECT", [len(objects)], "object"))
-        return original_gather(objects, value, **kwargs)
+    def gather(tensors, value, **kwargs):
+        operations.append(("ALL_GATHER", list(value.shape), str(value.dtype)))
+        return original_gather(tensors, value, **kwargs)
 
     try:
         with memory.fixed_slope_memory_profiles():
@@ -402,7 +404,8 @@ def _agreement_worker(index, directory, variant):
             )
             with (
                 patch.object(dist, "all_reduce", reduce),
-                patch.object(dist, "all_gather_object", gather),
+                patch.object(dist, "all_gather", gather),
+                patch.object(c10d, "all_gather", gather),
                 pytest.MonkeyPatch.context() as oracle_patch,
             ):
                 plan = rank._plan_flat_forward(
