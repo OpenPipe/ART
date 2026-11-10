@@ -18,10 +18,18 @@ Options:
   --prewarm-modal        Require prebuilding the pushed image in Modal
   --prewarm-nodes-only   Skip build and Modal; prewarm an existing digest
   --prewarm-timeout DUR  Timeout for the prewarm DaemonSet rollout (default: 30m)
+  --require-tag-convergence
+                         Fail unless cluster pulls of the mutable tag resolve to
+                         the pushed digest (default: warn and continue)
   --tag TAG              Image tag to publish (default: latest)
   --help                 Show this help
 
 BUILDKIT_TIMEOUT_SECONDS shortens the builder's 21600-second lifetime (maximum).
+
+Node prewarm always pins the pushed digest. Refreshing the mutable tag on nodes
+depends on registry mirrors that may serve a stale tag for longer than any CI
+budget, so by default a mutable tag that has not converged after
+PREWARM_TAG_CONVERGENCE_BEST_EFFORT_ATTEMPTS checks only produces a warning.
 EOF
 }
 
@@ -62,6 +70,9 @@ prewarm_node_retries="${PREWARM_NODE_RETRIES:-12}"
 prewarm_node_parallelism="${PREWARM_NODE_PARALLELISM:-3}"
 prewarm_tag_convergence_attempts="${PREWARM_TAG_CONVERGENCE_ATTEMPTS:-120}"
 prewarm_tag_convergence_interval="${PREWARM_TAG_CONVERGENCE_INTERVAL:-15}"
+prewarm_tag_convergence_best_effort_attempts="${PREWARM_TAG_CONVERGENCE_BEST_EFFORT_ATTEMPTS:-8}"
+prewarm_require_tag_convergence="${PREWARM_REQUIRE_TAG_CONVERGENCE:-false}"
+prewarm_last_tag_image_id=""
 prewarm_clear_mutable_tag="${PREWARM_CLEAR_MUTABLE_TAG:-true}"
 prewarm_crictl_image="${PREWARM_CRICTL_IMAGE:-alpine:3.20}"
 prewarm_crictl_version="${PREWARM_CRICTL_VERSION:-v1.36.0}"
@@ -117,6 +128,10 @@ while [[ $# -gt 0 ]]; do
     --prewarm-timeout)
       prewarm_timeout="$2"
       shift 2
+      ;;
+    --require-tag-convergence)
+      prewarm_require_tag_convergence=true
+      shift
       ;;
     --tag)
       image_tag="$2"
@@ -839,6 +854,7 @@ verify_prewarm_refresh_tag_digest() {
   fi
 
   image_id="$(pod_init_image_id "${pod}" refresh-tag)"
+  prewarm_last_tag_image_id="${image_id}"
   if [[ "${image_id}" == *"@${image_digest}" ]]; then
     echo "Mutable tag ${prewarm_refresh_tag_image} resolved to ${image_id} in pod ${pod}"
   else
@@ -885,6 +901,11 @@ verify_steady_prewarm_daemonset() {
       return 0
     fi
 
+    if [[ "${prewarm_require_tag_convergence}" != "true" ]]; then
+      warn_mutable_tag_stale "${#stale_pods[@]} steady-state pod(s)"
+      return 0
+    fi
+
     if (( attempt == prewarm_node_retries )); then
       echo "Steady-state ${prewarm_name} mutable tag verification failed after ${prewarm_node_retries} attempt(s)" >&2
       return 1
@@ -894,6 +915,19 @@ verify_steady_prewarm_daemonset() {
     delete_pods_best_effort "${stale_pods[@]}"
     sleep "$((attempt * 10))"
   done
+}
+
+warn_mutable_tag_stale() {
+  local detail="$1"
+  local message="${prewarm_refresh_tag_image} has not converged to ${image_digest} (${detail}; last seen: ${prewarm_last_tag_image_id:-<none>}). The digest is still prewarmed; consumers pulling the mutable tag may get a stale image until the registry mirror refreshes."
+
+  if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    echo "::warning title=Mutable tag not yet converged::${message}"
+  fi
+  echo "Warning: ${message}" >&2
+  if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    printf -- '- Mutable tag not yet converged: %s\n' "${message}" >> "${GITHUB_STEP_SUMMARY}" || true
+  fi
 }
 
 wait_for_mutable_tag_convergence() {
@@ -915,9 +949,19 @@ wait_for_mutable_tag_convergence() {
     echo "PREWARM_TAG_CONVERGENCE_INTERVAL must be a positive integer number of seconds, got: ${prewarm_tag_convergence_interval}" >&2
     exit 1
   fi
+  if ! [[ "${prewarm_tag_convergence_best_effort_attempts}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "PREWARM_TAG_CONVERGENCE_BEST_EFFORT_ATTEMPTS must be a positive integer, got: ${prewarm_tag_convergence_best_effort_attempts}" >&2
+    exit 1
+  fi
+
+  local attempts="${prewarm_tag_convergence_attempts}"
+  if [[ "${prewarm_require_tag_convergence}" != "true" ]] \
+    && (( prewarm_tag_convergence_best_effort_attempts < attempts )); then
+    attempts="${prewarm_tag_convergence_best_effort_attempts}"
+  fi
 
   echo "Waiting for ${prewarm_refresh_tag_image} to resolve to ${image_digest} from Kubernetes pulls"
-  for attempt in $(seq 1 "${prewarm_tag_convergence_attempts}"); do
+  for attempt in $(seq 1 "${attempts}"); do
     clear_mutable_tag=false
     if [[ "${attempt}" == "1" ]]; then
       clear_mutable_tag="${prewarm_clear_mutable_tag}"
@@ -961,9 +1005,9 @@ EOF
         delete_pods_without_wait "${pod}"
         return 0
       fi
-      echo "Mutable tag check ${attempt}/${prewarm_tag_convergence_attempts} has not converged to ${image_digest}"
+      echo "Mutable tag check ${attempt}/${attempts} has not converged to ${image_digest}"
     else
-      echo "Mutable tag check ${attempt}/${prewarm_tag_convergence_attempts} did not become ready"
+      echo "Mutable tag check ${attempt}/${attempts} did not become ready"
       "${kubectl_cmd[@]}" describe pod -n "${prewarm_namespace}" "${pod}" || true
     fi
 
@@ -1026,6 +1070,13 @@ EOF
         delete_pods_best_effort "${pod}"
         return 0
       fi
+      if [[ "${prewarm_require_tag_convergence}" != "true" ]]; then
+        # Ready means the digest-pinned prepull init container succeeded, so
+        # the digest is cached on this node; only the mutable tag is stale.
+        warn_mutable_tag_stale "node ${node}"
+        delete_pods_best_effort "${pod}"
+        return 0
+      fi
 
       echo "Prewarm mutable tag verification failed on node ${node}; retrying after tag convergence delay"
       delete_pods_best_effort "${pod}"
@@ -1081,8 +1132,11 @@ if [[ "${prewarm_nodes}" == "true" ]]; then
       --ignore-not-found --wait=true >/dev/null 2>&1 || true
 
     if ! wait_for_mutable_tag_convergence "${gpu_nodes[0]}"; then
-      dump_prewarm_diagnostics
-      exit 1
+      if [[ "${prewarm_require_tag_convergence}" == "true" ]]; then
+        dump_prewarm_diagnostics
+        exit 1
+      fi
+      warn_mutable_tag_stale "before node prewarm"
     fi
 
     prewarm_failures=0

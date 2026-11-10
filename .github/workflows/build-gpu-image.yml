@@ -45,6 +45,11 @@ on:
         required: true
         default: "30m"
         type: string
+      require_tag_convergence:
+        description: "Fail unless cluster pulls of the mutable tag resolve to the pushed digest (default: warn)"
+        required: false
+        default: false
+        type: boolean
       smoke_launch:
         description: "Launch a minimal SkyPilot task with the pushed image"
         required: true
@@ -328,6 +333,7 @@ jobs:
           IMAGE_REPO: ${{ inputs.image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
           IMAGE_TAG: ${{ inputs.tag || 'latest' }}
           PREWARM_TIMEOUT: ${{ inputs.prewarm_timeout }}
+          PREWARM_REQUIRE_TAG_CONVERGENCE: ${{ inputs.require_tag_convergence && 'true' || 'false' }}
           PULL_IMAGE_REPO: ${{ inputs.pull_image_repo || 'docker.io/bradhiltonnw/art-gpu' }}
         run: |
           bash scripts/build-gpu-image.sh \
