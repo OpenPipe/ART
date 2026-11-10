@@ -278,6 +278,19 @@ def test_attempted_seed_cannot_repeat_without_a_complete_sample(monkeypatch):
             assert not retry.decision.seed and not retry.decision.fits
 
 
+def test_invalid_initial_send_keeps_the_generator_owned_until_close(monkeypatch):
+    rank = _rank()
+    fake_device(monkeypatch, rank, 1_000_000)
+    with memory.fixed_slope_memory_profiles():
+        with rank.calibration_rung([request(16384)], no_grad=True) as rung:
+            iterator = cast(Any, rung.forward_micro_batches())
+            with pytest.raises(TypeError):
+                iterator.send(1)
+            next(iterator)
+            iterator.close()
+            assert "_calibration_seed_plan" not in rank.__dict__
+
+
 @pytest.mark.parametrize("grad", [False, True])
 def test_cold_user_paths_keep_the_floor_and_cannot_construct_seed(monkeypatch, grad):
     rank = _rank()

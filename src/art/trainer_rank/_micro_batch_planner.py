@@ -100,20 +100,26 @@ class _CalibrationIterator:
 
     def __init__(self, rung):
         self.rung = rung
-        self.iterator = rung._execute()
+        self._generator = rung._execute()
         self.finished = False
 
     def __iter__(self):
         return self
 
     def __next__(self):
+        return self.send(None)
+
+    def _step(self, method, *args):
         try:
-            return next(self.iterator)
+            return method(*args)
         except StopIteration:
             self.finished = True
             raise
-        except Exception as error:
+        except GeneratorExit:
             self.finished = True
+            raise
+        except BaseException as error:
+            self.finished = self._generator.gi_frame is None
             # Coordinate execution failures before returning control to a
             # callback that might catch them. The driver retains the failed
             # phase even if that callback suppresses the common exception.
@@ -121,12 +127,23 @@ class _CalibrationIterator:
                 self.rung._callback.protocol.end(error)
             raise
 
+    def send(self, value):
+        return self._step(self._generator.send, value)
+
+    def throw(self, error, *args):
+        generator_exit = isinstance(error, GeneratorExit) or (
+            isinstance(error, type) and issubclass(error, GeneratorExit)
+        )
+        if generator_exit and not self.finished and self.rung._callback is not None:
+            self.rung._callback.local_close_guard()
+        return self._step(self._generator.throw, error, *args)
+
     def close(self):
         if self.finished:
             return
         if self.rung._callback is not None:
             self.rung._callback.local_close_guard()
-        self.iterator.close()
+        self._generator.close()
         self.finished = True
 
 

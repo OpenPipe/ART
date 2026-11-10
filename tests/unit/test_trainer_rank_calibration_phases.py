@@ -164,7 +164,7 @@ def _worker(index, world, directory, site):
                             fail()
                     if not continue_execution:
                         pass
-                    elif site in ("local_close", "iterator_close"):
+                    elif site in ("local_close", "iterator_close", "iterator_throw"):
                         iterator = rung.forward_micro_batches()
                         next(iterator)
                         if index == world - 1:
@@ -172,6 +172,8 @@ def _worker(index, world, directory, site):
                             try:
                                 if site == "iterator_close":
                                     cast(Any, iterator).close()
+                                elif site == "iterator_throw":
+                                    cast(Any, iterator).throw(GeneratorExit)
                                 else:
                                     cast(Any, scope).gen.close()
                             finally:
@@ -258,7 +260,7 @@ def _run(tmp_path, world, site):
     assert all("Calibration failed" in row["message"] for row in rows), rows
     assert all(row["expired"] and row["elapsed"] < 45 for row in rows), rows
     assert all(row["events"] == rows[0]["events"] for row in rows), rows
-    if site in ("local_close", "iterator_close"):
+    if site in ("local_close", "iterator_close", "iterator_throw"):
         assert rows[-1]["close_collectives"] == 0, rows
     for row in rows:
         assert row["phases"], rows
@@ -297,6 +299,7 @@ def test_prior_collective_seams_are_coordinated(tmp_path, site):
         "exit_vote",
         "local_close",
         "iterator_close",
+        "iterator_throw",
         "plan",
         "admission",
         "rung",
