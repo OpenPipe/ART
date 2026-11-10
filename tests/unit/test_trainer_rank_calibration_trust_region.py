@@ -448,13 +448,22 @@ def test_gloo_replicates_decision_and_components_without_another_exchange(
     assert a["decision"] == b["decision"]
     assert a["decision"]["fits"] is admit
     assert a["operations"] == b["operations"]
-    # Existing planning status/checkpoint exchanges and admission MAX/MIN:
-    # only the MAX payload grows. There is no additional collective round.
-    assert len(a["operations"]) == len(a["ordinary"])
-    assert [op[0] for op in a["operations"]] == [op[0] for op in a["ordinary"]]
+    # Callback agreement adds separate local-error and entry votes. The
+    # admission/checkpoint protocol still changes only its existing MAX payload.
+    admission_operations = [
+        op
+        for op in a["operations"]
+        if not (
+            op[0] == "RedOpType.MAX"
+            and op[1] in ([1], [3])
+            and op[2] == "torch.float64"
+        )
+    ]
+    assert len(admission_operations) == len(a["ordinary"])
+    assert [op[0] for op in admission_operations] == [op[0] for op in a["ordinary"]]
     changed = [
         (before, after)
-        for before, after in zip(a["ordinary"], a["operations"], strict=True)
+        for before, after in zip(a["ordinary"], admission_operations, strict=True)
         if before != after
     ]
     assert len(changed) == 1

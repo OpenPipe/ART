@@ -74,6 +74,63 @@ if TYPE_CHECKING:
     )
 
 
+def _raise_calibration_error(self: TrainerRank, error: BaseException | None) -> None:
+    # Keep local API exceptions intact. Distributed callbacks must raise the
+    # same class everywhere, with the original local failure as the cause.
+    if not (_impl.dist.is_available() and _impl.dist.is_initialized()):
+        if error is not None:
+            raise error
+    raise RuntimeError("Calibration failed on one or more ranks") from error
+
+
+@contextmanager
+def _calibration_status(self: TrainerRank) -> Generator[None, None, None]:
+    """Agree on a local step before any subsequent calibration collective."""
+    error: BaseException | None = None
+    try:
+        yield
+    except GeneratorExit:
+        raise  # Destruction must never introduce a collective.
+    except BaseException as exc:
+        error = exc
+    if self._recovery_reduce([float(error is not None)], op="MAX", sync_across_dp=True)[
+        0
+    ]:
+        _raise_calibration_error(self, error)
+
+
+@dataclass
+class _CalibrationCallback:
+    rank: TrainerRank
+    entered: bool = False
+    failed: bool = False
+
+    def begin(self, execute: bool, error: BaseException | None = None) -> None:
+        # A failed intent writer arrives here from context exit; peers arrive
+        # before model entry. A skipped callback must not match a model vote.
+        failed, largest, negative_smallest = self.rank._recovery_reduce(
+            [float(error is not None), float(execute), -float(execute)],
+            op="MAX",
+            sync_across_dp=True,
+        )
+        self.entered = True
+        if failed or largest != -negative_smallest:
+            self.failed = True
+            _raise_calibration_error(self.rank, error)
+
+    def finish(self, error: BaseException | None) -> None:
+        if self.failed:
+            # begin() already exchanged the error on every rank.
+            assert error is not None
+            raise error
+        if not self.entered:
+            self.begin(False, error)
+        elif self.rank._recovery_reduce(
+            [float(error is not None)], op="MAX", sync_across_dp=True
+        )[0]:
+            _raise_calibration_error(self.rank, error)
+
+
 @dataclass
 class CalibrationRung:
     """One prepared, unsplit calibration wave; execute only after durable intent.
@@ -90,7 +147,12 @@ class CalibrationRung:
     _no_grad: bool
     _active: bool = True
     _used: bool = False
+    _started: bool = False
     _coverage_guard: _memory._CalibrationCoverageGuard | None = None
+    _callback: _CalibrationCallback | None = None
+    _iterator: (
+        Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None] | None
+    ) = None
 
     @property
     def inputs(self) -> tuple[ForwardInputs, ...]:
@@ -128,40 +190,55 @@ class CalibrationRung:
         if not self.decision.fits:
             raise _impl.TrainerRankMemoryError("calibration rung admission refused")
         self._used = True
-        return self._execute()
+        self._iterator = self._execute()
+        return self._iterator
 
-    def _execute(self) -> Iterator[MicroBatch[ForwardInputs, ForwardOutputs]]:
+    def _close(self) -> None:
+        if self._iterator is not None and self._started:
+            self._iterator.close()
+
+    def _execute(
+        self,
+    ) -> Generator[MicroBatch[ForwardInputs, ForwardOutputs], None, None]:
         # Iterator creation must not let execution escape the explicit scope.
+        self._started = True
         if not self._active:
             raise RuntimeError("calibration rung is expired")
+        assert self._callback is not None
+        self._callback.begin(True)
         previous = None
         previous_guard = self._rank.__dict__.get("_calibration_coverage_guard")
-        if self._coverage_guard is not None:
-            self._rank.__dict__["_calibration_coverage_guard"] = self._coverage_guard
-        if self.decision.seed:
-            if not _memory._FIXED_SLOPE_PROFILES.get():
-                raise RuntimeError("calibration seed requires the fixed-slope scope")
-            plan = self._candidate.plan
-            family_seed = getattr(plan, "_calibration_cp_family_seed", False)
-            key = plan.signature
-            if family_seed:
-                assert isinstance(plan, _impl._FlatForwardPlan)
-                assert plan.caller_cp_workload is not None
-                key = (key, self.family_id)
-            used = self._rank.__dict__.setdefault(
-                "_calibration_seeded_cp_families"
-                if family_seed
-                else "_calibration_seeded_signatures",
-                set(),
-            )
-            if key in used:
-                raise RuntimeError(
-                    "calibration seed already attempted for this signature"
-                )
-            used.add(key)
-            previous = self._rank.__dict__.get("_calibration_seed_plan")
-            self._rank.__dict__["_calibration_seed_plan"] = self._candidate.plan
         try:
+            with _calibration_status(self._rank):
+                if self._coverage_guard is not None:
+                    self._rank.__dict__["_calibration_coverage_guard"] = (
+                        self._coverage_guard
+                    )
+                if self.decision.seed:
+                    if not _memory._FIXED_SLOPE_PROFILES.get():
+                        raise RuntimeError(
+                            "calibration seed requires the fixed-slope scope"
+                        )
+                    plan = self._candidate.plan
+                    family_seed = getattr(plan, "_calibration_cp_family_seed", False)
+                    key = plan.signature
+                    if family_seed:
+                        assert isinstance(plan, _impl._FlatForwardPlan)
+                        assert plan.caller_cp_workload is not None
+                        key = (key, self.family_id)
+                    used = self._rank.__dict__.setdefault(
+                        "_calibration_seeded_cp_families"
+                        if family_seed
+                        else "_calibration_seeded_signatures",
+                        set(),
+                    )
+                    if key in used:
+                        raise RuntimeError(
+                            "calibration seed already attempted for this signature"
+                        )
+                    used.add(key)
+                    previous = self._rank.__dict__.get("_calibration_seed_plan")
+                    self._rank.__dict__["_calibration_seed_plan"] = self._candidate.plan
             yield from cast(Any, _impl.TrainerRank.forward_micro_batches)(
                 self._rank,
                 self._candidate.inputs,
@@ -229,64 +306,87 @@ def calibration_rung(
     self._guard_forward_collective("calibration_rung")
     enabled = _impl.torch.is_grad_enabled() if no_grad is None else not no_grad
     with _impl.torch.set_grad_enabled(enabled):
-        if self._dp_rank_and_size()[1] != 1:
-            raise ValueError("calibration_rung requires one data-parallel replica")
-        items = tuple(_impl._materialize(item) for item in inputs)
-        if not items:
-            raise ValueError("calibration rung must contain an active request")
-        requests = list(_impl._flatten(items))
+        with _calibration_status(self):
+            if self._dp_rank_and_size()[1] != 1:
+                raise ValueError("calibration_rung requires one data-parallel replica")
+            items = tuple(_impl._materialize(item) for item in inputs)
+            if not items:
+                raise ValueError("calibration rung must contain an active request")
+            requests = list(_impl._flatten(items))
         family_scope = _memory._CP_FAMILY_CALIBRATION.set(seed_uncovered_cp_family)
         try:
-            plan = self._plan_flat_forward(
-                requests, checkpoint=checkpoint, sync_planning_errors=True
-            )
+            with _calibration_status(self):
+                plan = self._plan_flat_forward(
+                    requests, checkpoint=checkpoint, sync_planning_errors=True
+                )
         finally:
             _memory._CP_FAMILY_CALIBRATION.reset(family_scope)
-        estimate = _memory._CalibrationEstimate(
-            signature_id="",
-            candidate=plan.packed_tokens,
-            seed_uncovered_cp_family=seed_uncovered_cp_family,
-        )
-        if seed_uncovered_cp_family:
-            plan.__dict__["_calibration_cp_family_seed"] = True
-        check = self._memory_check(
-            plan, sync_across_dp=True, sync_planning_errors=True, _calibration=estimate
-        )
-    assert estimate.decision is not None
-    rung = CalibrationRung(
-        decision=estimate.decision,
-        _rank=self,
-        _candidate=_impl._CandidateMicroBatch(
-            inputs=items,
-            indices=tuple(range(len(items))),
-            plan=plan,
-            check=check,
-            stats_global_count=len(items),
-            rejected_candidates=0,
-            cold_start=estimate.extrapolated,
-        ),
-        _checkpoint=checkpoint,
-        _no_grad=not enabled,
-    )
-    profile = self._memory_profiles.get(plan.signature)
-    if (
-        isinstance(profile, _memory._CallerMemoryProfileV2)
-        and plan.caller_cp_workload is not None
-    ):
-        covered = profile.covering_cp_observation(
-            plan.packed_tokens, plan.caller_cp_workload
-        )
-        if covered is not None and not profile.cp_family_equal(
-            plan.caller_cp_workload[0], covered[2]
-        ):
-            rung._coverage_guard = _memory._CalibrationCoverageGuard(
-                plan, covered[2], covered[1]
+        with _calibration_status(self):
+            estimate = _memory._CalibrationEstimate(
+                signature_id="",
+                candidate=plan.packed_tokens,
+                seed_uncovered_cp_family=seed_uncovered_cp_family,
             )
+            if seed_uncovered_cp_family:
+                plan.__dict__["_calibration_cp_family_seed"] = True
+        with _calibration_status(self):
+            check = self._memory_check(
+                plan,
+                sync_across_dp=True,
+                sync_planning_errors=True,
+                _calibration=estimate,
+            )
+    with _calibration_status(self):
+        assert estimate.decision is not None
+        rung = CalibrationRung(
+            decision=estimate.decision,
+            _rank=self,
+            _candidate=_impl._CandidateMicroBatch(
+                inputs=items,
+                indices=tuple(range(len(items))),
+                plan=plan,
+                check=check,
+                stats_global_count=len(items),
+                rejected_candidates=0,
+                cold_start=estimate.extrapolated,
+            ),
+            _checkpoint=checkpoint,
+            _no_grad=not enabled,
+        )
+        profile = self._memory_profiles.get(plan.signature)
+        if (
+            isinstance(profile, _memory._CallerMemoryProfileV2)
+            and plan.caller_cp_workload is not None
+        ):
+            covered = profile.covering_cp_observation(
+                plan.packed_tokens, plan.caller_cp_workload
+            )
+            if covered is not None and not profile.cp_family_equal(
+                plan.caller_cp_workload[0], covered[2]
+            ):
+                rung._coverage_guard = _memory._CalibrationCoverageGuard(
+                    plan, covered[2], covered[1]
+                )
+    rung._callback = _CalibrationCallback(self)
+    error: BaseException | None = None
     try:
-        yield rung
+        try:
+            yield rung
+        except GeneratorExit:
+            raise  # Abandoned contexts retain purely local cleanup.
+        except BaseException as exc:
+            error = exc
+        try:
+            rung._close()
+        except BaseException as exc:
+            if error is None:
+                error = exc
+        # Intent errors meet peers at model entry; completion errors meet peers
+        # here, before the floor pass can issue its completion MIN vote.
+        rung._callback.finish(error)
     finally:
-        # Pure local expiry: no destructor-time sampling or collective.
         rung._active = False
+        rung._close()
 
 
 def _cp_floor_requests(self: TrainerRank, template: AnyForwardInput):
@@ -356,28 +456,51 @@ def calibrate_request_floors(
     covering peak. Success requires a positive measurement for every probe.
     Invoke once for each selected adapter/partition/native kernel configuration.
     Older callers must add this call after their product ladders.
+
+    Caller migration requirement:
+    Before any pin bump, the caller must invoke calibrate_request_floors after both live
+    operation ladders for every selected adapter/native configuration; implement
+    cohort-wide durable (signature_id, family_id) intents and pending checks, exhaust each
+    caller interval with all floating outputs participating in backward when enabled,
+    persist/validate format-8 floor-only evidence, and require completed floor coverage
+    before accepting cached calibration or enabling v2 serving.
+
+    Distributed callback failures are exchanged before model entry and before completion
+    checks. Every rank raises RuntimeError, with the local failure retained as its
+    cause; no trial is retried. Local-only calls preserve the original exception.
     """
     self._guard_forward_collective("calibrate_request_floors")
-    if not _memory._FIXED_SLOPE_PROFILES.get() or self._topology_key() != (1, 1, 8, 1):
-        raise ValueError("floor calibration requires native CP8 fixed-slope collection")
-    with self._planning_status(True):
+    with _calibration_status(self):
+        if not _memory._FIXED_SLOPE_PROFILES.get() or self._topology_key() != (
+            1,
+            1,
+            8,
+            1,
+        ):
+            raise ValueError(
+                "floor calibration requires native CP8 fixed-slope collection"
+            )
         check_pending()
+        probes = tuple(_cp_floor_requests(self, template))
     decisions = []
-    for probe in _cp_floor_requests(self, template):
+    for probe in probes:
         with _impl.torch.set_grad_enabled(not probe.no_grad):
             scope = _memory._CP_FAMILY_CALIBRATION.set(True)
             try:
-                plan = self._plan_flat_forward(
-                    [probe], checkpoint=checkpoint, sync_planning_errors=True
-                )
+                with _calibration_status(self):
+                    plan = self._plan_flat_forward(
+                        [probe], checkpoint=checkpoint, sync_planning_errors=True
+                    )
             finally:
                 _memory._CP_FAMILY_CALIBRATION.reset(scope)
-            if self._all_ranks_true(
-                _memory._cp_measured_request_floor(
-                    self, plan.signature, plan.caller_cp_workload
+            with _calibration_status(self):
+                measured = (
+                    _memory._cp_measured_request_floor(
+                        self, plan.signature, plan.caller_cp_workload
+                    )
+                    > 0
                 )
-                > 0
-            ):
+            if self._all_ranks_true(measured):
                 continue
             with calibration_rung(
                 self,
@@ -387,6 +510,7 @@ def calibrate_request_floors(
                 seed_uncovered_cp_family=True,
             ) as rung:
                 execute(rung)
+            with _calibration_status(self):
                 measured_plan = rung._candidate.plan
                 assert isinstance(measured_plan, _impl._FlatForwardPlan)
                 complete = (
@@ -398,11 +522,11 @@ def calibrate_request_floors(
                     )
                     > 0
                 )
-                if not self._all_ranks_true(complete):
-                    raise RuntimeError(
-                        "floor calibration requires a complete positive measurement"
-                    )
-                decisions.append(rung.decision)
+            if not self._all_ranks_true(complete):
+                raise RuntimeError(
+                    "floor calibration requires a complete positive measurement"
+                )
+            decisions.append(rung.decision)
     return tuple(decisions)
 
 
