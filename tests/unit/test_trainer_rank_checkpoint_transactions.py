@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import time
 from typing import Any, cast
+from unittest.mock import patch as mock_patch
 import weakref
 
 import pytest
@@ -17,13 +18,85 @@ import torch.distributed as dist
 from torch.distributed import distributed_c10d as c10d
 import torch.multiprocessing as mp
 
+from art.megatron import lora as lora_module
 from art.megatron.lora import LoRA
 from art.trainer_rank import _calibration_protocol as protocol
 from art.trainer_rank import _checkpoint
-from art.trainer_rank._impl import _CheckpointSlot
+from art.trainer_rank._impl import _AdapterConfig, _CheckpointSlot
 
 
-def _worker(index, directory, mode, fault, existing=True, world=2, failed_rank=1):
+def checkpoint_rank(existing=True, gap=False):
+    """CPU weights with production slot loading, compaction and validation."""
+    rank = _rank()
+    with (
+        mock_patch.object(
+            lora_module.ps, "get_expert_model_parallel_rank", return_value=0
+        ),
+        mock_patch.object(
+            lora_module.ps, "get_tensor_model_parallel_world_size", return_value=1
+        ),
+    ):
+        owner = LoRA(
+            "layer.projection",
+            2,
+            2,
+            1,
+            1.0,
+            torch.float32,
+            torch.device("cpu"),
+            allreduce=False,
+        )
+    rank.runtime.model[0].add_module("transaction_lora", owner)
+    rank.runtime.model_identifier = "model"
+    from types import SimpleNamespace
+
+    rank.runtime.model_support_handler = SimpleNamespace(
+        canonicalize_loaded_lora_state=lambda weights, model: dict(weights),
+        from_vllm_lora_tensors=lambda weights, **kwargs: dict(weights),
+    )
+    config = dict(
+        base_model_name_or_path="model",
+        r=1,
+        lora_alpha=1.0,
+        target_modules=["projection"],
+    )
+
+    def weights(value):
+        return {
+            "layer.projection.lora_A.weight": torch.full((1, 2), value),
+            "layer.projection.lora_B.weight": torch.full((2, 1), value),
+        }
+
+    names = [
+        ("retained", 3.0),
+        *([("adapter", 1.0)] if existing else []),
+        ("other", 4.0),
+    ]
+    for name, value in names:
+        ref = rank._slot_ref(name)
+        assert owner.load_lora_slot(ref, weights(value), alpha=1.0, requires_grad=True)
+        rank._checkpoint_slots[name] = _CheckpointSlot(
+            params=tuple(owner.lora_slot_params(ref)),
+            config=cast(_AdapterConfig, config),
+            revision=7,
+        )
+    if gap:
+        entries = list(owner._slot_keys.items())
+        owner._slot_modules = torch.nn.ModuleDict(
+            {
+                f"slot_{2 + 3 * i}": owner._slot_modules[key]
+                for i, (_ref, key) in reversed(list(enumerate(entries)))
+            }
+        )
+        owner._slot_keys = {
+            ref: f"slot_{2 + 3 * i}" for i, (ref, _key) in enumerate(entries)
+        }
+    return rank, owner, config, weights(2.0)
+
+
+def _worker(
+    index, directory, mode, fault, existing=True, world=2, failed_rank=1, gap=False
+):
     calibration = mode != "outside"
     dist.set_debug_level(dist.DebugLevel.DETAIL)
     dist.init_process_group(
@@ -35,22 +108,20 @@ def _worker(index, directory, mode, fault, existing=True, world=2, failed_rank=1
     )
     group = dist.new_group(backend="gloo")
     assert group is not dist.group.WORLD
-    rank = _rank()
-    owner: Any = LoRA.__new__(LoRA)
-    torch.nn.Module.__init__(owner)
-    owner._slot_keys = {}
-    owner._slot_modules = torch.nn.ModuleDict()
-    rank.runtime.model[0].add_module("transaction_lora", owner)
+    rank, owner, config, adapter = checkpoint_rank(existing, gap)
     ref = rank._slot_ref("adapter")
-    old: Any = torch.nn.Module()
-    old.ref = ref
-    old.weight = torch.nn.Parameter(torch.tensor([1.0]))
-    old_state = None
-    if existing:
-        owner._slot_keys[ref] = "old"
-        owner._slot_modules["old"] = old
-        old_state = _CheckpointSlot(params=(old.weight,), config=None, revision=7)
-        rank._checkpoint_slots["adapter"] = old_state
+    old_state = rank._checkpoint_slots.get("adapter")
+    original_container, original_keys, original_registry = (
+        owner._slot_modules,
+        owner._slot_keys,
+        rank._checkpoint_slots,
+    )
+    original_entries = tuple(original_container.items())
+    original_key_entries = tuple(original_keys.items())
+    original_registry_entries = tuple(original_registry.items())
+    prior_slots = {
+        name: owner._slot(rank._slot_ref(name)) for name in original_registry
+    }
     references = []
     caught = []
     applying = False
@@ -60,18 +131,50 @@ def _worker(index, directory, mode, fault, existing=True, world=2, failed_rank=1
         "ready_sequence": None,
         "votes": [],
         "wire": [],
+        "gap": gap,
     }
+    real_validate_config = rank._validate_loaded_checkpoint_config
     real_commit = _checkpoint._commit_slot
     real_vote = protocol.Protocol._vote
     real_reduce, real_gather = dist.all_reduce, c10d.all_gather
     real_decode = c10d._tensor_to_object
 
-    def checksum():
-        if ref not in owner._slot_keys:
-            return None
-        tensor = owner._slot_modules[owner._slot_keys[ref]].weight.detach()
-        return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()
+    def slot_checksums():
+        result = {}
+        for name in prior_slots:
+            try:
+                params = owner.lora_slot_params(rank._slot_ref(name))
+                result[name] = hashlib.sha256(
+                    b"".join(p.detach().numpy().tobytes() for p in params)
+                ).hexdigest()
+            except KeyError:
+                result[name] = "missing-slot"
+        return result
 
+    def prior_lookups():
+        try:
+            return all(
+                owner._slot(rank._slot_ref(name)) is slot
+                for name, slot in prior_slots.items()
+            )
+        except KeyError:
+            return False
+
+    def checksum():
+        try:
+            if owner._slot(ref) is None:
+                return None
+            return hashlib.sha256(
+                b"".join(
+                    p.detach().numpy().tobytes() for p in owner.lora_slot_params(ref)
+                )
+            ).hexdigest()
+        except KeyError:
+            return "missing-slot"
+
+    real_stage = rank._load_checkpoint_slot
+    real_compact = rank._compact_lora_slot_keys
+    before_all = slot_checksums()
     before = checksum()
 
     def inject(label):
@@ -79,17 +182,22 @@ def _worker(index, directory, mode, fault, existing=True, world=2, failed_rank=1
             row["injections"] += 1
             raise MemoryError("injected checkpoint transaction failure: " + label)
 
-    def stage(name, *args, **kwargs):
-        staged: Any = torch.nn.Module()
-        staged.ref = rank._slot_ref(name)
-        staged.weight = torch.nn.Parameter(torch.tensor([2.0]))
-        references.extend([weakref.ref(staged), weakref.ref(staged.weight)])
-        owner._slot_keys[staged.ref] = "staged"
-        owner._slot_modules["staged"] = staged
+    def stage_then_fail(name, *args, **kwargs):
+        result = real_stage(name, *args, **kwargs)
+        staged = owner._slot(rank._slot_ref(name))
+        assert staged is not None
+        references.extend(
+            [weakref.ref(staged), *(weakref.ref(p) for p in staged.parameters())]
+        )
         inject("stage")
-        return 1
+        return result
+
+    def compact():
+        row["compactions"] = row.get("compactions", 0) + 1
+        return real_compact()
 
     def validate_config(*args):
+        real_validate_config(*args)
         inject("config")
 
     def commit(*args):
@@ -125,6 +233,9 @@ def _worker(index, directory, mode, fault, existing=True, world=2, failed_rank=1
             )
         )
 
+        if tensor.dtype == torch.float64 and tensor.numel() == 5:
+            row["wire"][-1]["phase_tags"] = tensor[-2:].tolist()
+
     def reduce(tensor, op=dist.ReduceOp.SUM, **kwargs):
         record(str(op), tensor, kwargs.get("group"))
         return real_reduce(tensor, op=op, **kwargs)
@@ -142,24 +253,8 @@ def _worker(index, directory, mode, fault, existing=True, world=2, failed_rank=1
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(_checkpoint, "_ensure_group", lambda trainer: group)
             patch.setattr(rank, "_checkpoint_group", lambda: group)
-            patch.setattr(rank, "_local_lora_adapter_templates", lambda: {})
-            patch.setattr(
-                rank,
-                "_validate_checkpoint_adapter_config",
-                lambda *a, **k: {"base_model_name_or_path": "model", "lora_alpha": 1.0},
-            )
-            patch.setattr(rank.runtime, "model_identifier", "model", raising=False)
-            patch.setattr(rank, "_prepare_adapter_model", lambda *a, **k: {})
-            patch.setattr(rank, "_guard_slot_can_load", lambda *a: None)
-            patch.setattr(_checkpoint, "_load_adapter", lambda *a: {})
-            patch.setattr(rank, "_load_checkpoint_slot", stage)
-            patch.setattr(
-                rank,
-                "_validate_checkpoint_consistency",
-                lambda name, *a: (
-                    owner._slot_modules[owner._slot_keys[rank._slot_ref(name)]].weight,
-                ),
-            )
+            patch.setattr(rank, "_load_checkpoint_slot", stage_then_fail)
+            patch.setattr(rank, "_compact_lora_slot_keys", compact)
             patch.setattr(rank, "_validate_loaded_checkpoint_config", validate_config)
             patch.setattr(_checkpoint, "_commit_slot", commit)
             patch.setattr(protocol.Protocol, "_vote", vote)
@@ -201,10 +296,16 @@ def _worker(index, directory, mode, fault, existing=True, world=2, failed_rank=1
                         return _original(*a, **k)
 
                     patch.setattr(torch, factory, allocate)
+            from safetensors.torch import save_file
+
+            source_path = Path(directory) / f"source-{index}"
+            source_path.mkdir()
+            save_file(adapter, source_path / "adapter_model.safetensors")
+            (source_path / "adapter_config.json").write_text(json.dumps(config))
             source = _checkpoint.PreparedCheckpoint(
-                Path(directory),
-                {"base_model_name_or_path": "model", "lora_alpha": 1.0},
-                (),
+                source_path,
+                config,
+                tuple(adapter),
                 None,
                 "synthetic-digest",
             )
@@ -223,10 +324,26 @@ def _worker(index, directory, mode, fault, existing=True, world=2, failed_rank=1
                 slots=list(rank._checkpoint_slots),
                 model_slots=[r.name for r in owner._slot_keys],
                 original_slot=rank._checkpoint_slots.get("adapter") is old_state,
+                original_container=owner._slot_modules is original_container,
+                original_keys=owner._slot_keys is original_keys,
+                original_registry=rank._checkpoint_slots is original_registry,
+                exact_module_order=tuple(owner._slot_modules.items())
+                == original_entries,
+                exact_key_order=tuple(owner._slot_keys.items()) == original_key_entries,
+                exact_registry_order=tuple(rank._checkpoint_slots)
+                == tuple(name for name, _slot in original_registry_entries)
+                and all(
+                    rank._checkpoint_slots.get(name) is slot
+                    for name, slot in original_registry_entries
+                ),
+                all_prior_lookups=prior_lookups(),
+                prior_checksums=slot_checksums(),
+                before_prior_checksums=before_all,
                 weight=cast(
-                    torch.Tensor, owner._slot_modules[owner._slot_keys[ref]].weight
-                ).item()
+                    torch.Tensor, owner._slot_modules[owner._slot_keys[ref]].A_T
+                )[0, 0].item()
                 if ref in owner._slot_keys
+                and owner._slot_keys[ref] in owner._slot_modules
                 else None,
                 checksum=checksum(),
                 before_checksum=before,
@@ -255,14 +372,14 @@ def _worker(index, directory, mode, fault, existing=True, world=2, failed_rank=1
         dist.destroy_process_group()
 
 
-def _run(tmp_path, mode, fault, existing=True, world=2, failed_rank=1):
+def _run(tmp_path, mode, fault, existing=True, world=2, failed_rank=1, gap=False):
     _rank()
     mp.set_forkserver_preload(
         ["art.trainer_rank._impl", "test_trainer_rank_calibration_seed"]
     )
     context = mp.start_processes(
         _worker,
-        args=(str(tmp_path), mode, fault, existing, world, failed_rank),
+        args=(str(tmp_path), mode, fault, existing, world, failed_rank, gap),
         nprocs=world,
         join=False,
         start_method="forkserver",
@@ -280,6 +397,7 @@ def _run(tmp_path, mode, fault, existing=True, world=2, failed_rank=1):
                 process.join(timeout=2)
     rows = [json.loads((tmp_path / f"rank{i}.json").read_text()) for i in range(world)]
     failed = fault != "none"
+    assert all(r.get("compactions") == 1 for r in rows), rows
     assert all(
         not r["active"] and r.get("outer") == [float(failed)] and "outer_error" not in r
         for r in rows
@@ -298,6 +416,17 @@ def _run(tmp_path, mode, fault, existing=True, world=2, failed_rank=1):
         ), rows
         if mode != "outside":
             assert all(
+                r["original_container"]
+                and r["original_keys"]
+                and r["original_registry"]
+                and r["exact_module_order"]
+                and r["exact_key_order"]
+                and r["exact_registry_order"]
+                and r["all_prior_lookups"]
+                and r["prior_checksums"] == r["before_prior_checksums"]
+                for r in rows
+            ), rows
+            assert all(
                 r["error"] == "RuntimeError"
                 and r["message"] == "Calibration failed on one or more ranks"
                 and r["publications"] == 0
@@ -307,7 +436,7 @@ def _run(tmp_path, mode, fault, existing=True, world=2, failed_rank=1):
         assert all(
             "error" not in r
             and r["weight"] == 2.0
-            and r["staged_alive"] == 2
+            and r["staged_alive"] == 3
             and r["publications"] == 1
             for r in rows
         ), rows
@@ -404,3 +533,16 @@ def test_deferred_save_finalization_releases_locally_cleaned_state(
         assert rank._finalized_checkpoint_saves[destination].outcome == (
             "abort" if site == "writer" else "finish"
         )
+
+
+@pytest.mark.parametrize("world", [2, 8])
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("fault", ["stage", "commit"])
+def test_gapped_slot_rollback(tmp_path, world, existing, fault):
+    _run(tmp_path, "current", fault, existing, world, world - 1, gap=True)
+
+
+@pytest.mark.parametrize("world", [2, 8])
+@pytest.mark.parametrize("existing", [False, True])
+def test_healthy_gapped_slot_compaction(tmp_path, world, existing):
+    _run(tmp_path, "current", "none", existing, world, world - 1, gap=True)

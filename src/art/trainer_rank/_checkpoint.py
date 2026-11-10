@@ -2082,12 +2082,17 @@ def _model_slot_changes(module, keys, slots) -> list[tuple[dict, str, object]]:
 
 def _load_rollback_changes(trainer, snapshot) -> _CheckpointChanges:
     updates: list[tuple[dict, str, object]] = []
-    for module, keys, slots, refs in snapshot:
-        updates.extend(_model_slot_changes(module, keys, slots))
+    for module, _keys, slots, refs in snapshot:
+        # Staging compacts by replacing both objects. Restore their owning
+        # references, not the namespace of the container it leaves behind.
+        updates.extend(
+            [
+                (module._modules, "_slot_modules", module._slot_modules),
+                (module.__dict__, "_slot_keys", module._slot_keys),
+            ]
+        )
         updates.extend((slot.__dict__, "ref", refs[key]) for key, slot in slots.items())
-    updates.append(
-        (trainer.__dict__, "_checkpoint_slots", dict(trainer._checkpoint_slots))
-    )
+    updates.append((trainer.__dict__, "_checkpoint_slots", trainer._checkpoint_slots))
     return _checkpoint_changes(updates)
 
 
@@ -2376,6 +2381,9 @@ def _load_checkpoint(
     )
     publication = None
     try:
+        if rollback is not None:
+            # Keep the original registry unchanged for identity-preserving rollback.
+            trainer._checkpoint_slots = dict(trainer._checkpoint_slots)
         loaded = _phase(
             lambda: trainer._load_checkpoint_slot(
                 temporary,
