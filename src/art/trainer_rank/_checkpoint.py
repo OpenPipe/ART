@@ -263,6 +263,9 @@ def raise_distributed(
     phase: str,
     group: dist.ProcessGroup | None = None,
 ) -> None:
+    # Calibration owns the error vote; a nested gather could meet a peer's payload.
+    if error is not None and _calibration_protocol.active() is not None:
+        raise error
     errors = _gather(None if error is None else repr(error), group)
     if not any(errors):
         return
@@ -1114,6 +1117,8 @@ def prepare_checkpoint_save(
                 trainer._checkpoint_preparing_saves.discard(output_dir)
                 trainer._checkpoint_save_skipped.add(sequence)
             _advance_save_queue(trainer, sequence)
+            if _calibration_protocol.active() is not None:
+                raise
             cleanup_failure: BaseException | None = None
             try:
                 raise_distributed(cleanup, "clean up checkpoint preparation", group)
@@ -1713,6 +1718,11 @@ def _finalize_checkpoint_save(
                 if _rank() == 0:
                     paths.append(prepared.reservation)
                 cleanup = _cleanup_paths(paths)
+            if _calibration_protocol.active() is not None:
+                if error is not None:
+                    raise error
+                if cleanup is not None:
+                    raise cleanup
             try:
                 failures = _gather(
                     (
@@ -2323,6 +2333,8 @@ def _load_checkpoint(
 
         _phase(commit, "commit checkpoint", group)
     except BaseException:
+        if _calibration_protocol.active() is not None:
+            raise
         _rollback_load(trainer, snapshot, temporary, name, previous, group)
         raise
 
