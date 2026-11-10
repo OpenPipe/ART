@@ -436,7 +436,7 @@ def test_gpu_image_warning_annotation_escapes_workflow_command_data(
     tmp_path: Path,
 ) -> None:
     # The image ID comes from the cluster; it must not inject workflow commands.
-    stale = "registry/art-gpu@sha256:" + "b" * 64 + "%0A\rextra"
+    stale = "registry/art-gpu@sha256:" + "b" * 64 + "%0A\r\nextra"
     summary = tmp_path / "summary.md"
     result, _, _ = _run_node_prewarm_with_tag_image(
         tmp_path,
@@ -453,7 +453,7 @@ def test_gpu_image_warning_annotation_escapes_workflow_command_data(
         line for line in result.stdout.splitlines() if line.startswith("::warning ")
     ]
     assert annotations
-    assert all("b" * 64 + "%250A%0Dextra" in line for line in annotations)
+    assert all("b" * 64 + "%250A%0D%0Aextra" in line for line in annotations)
 
 
 @pytest.mark.parametrize(
