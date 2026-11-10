@@ -154,6 +154,10 @@ def _worker(index, world, directory, site):
                             patch.setattr(_impl, "_materialize", fail)
                         elif site == "unflatten":
                             patch.setattr(_impl, "_unflatten", fail)
+                        elif site == "serialization":
+                            from torch.distributed import distributed_c10d as c10d
+
+                            patch.setattr(c10d, "_object_to_tensor", fail)
                         elif site == "logging":
                             patch.setattr(_impl, "_telemetry_phase", fail)
                         elif site == "stats":
@@ -307,6 +311,7 @@ def test_prior_collective_seams_are_coordinated(tmp_path, site):
         "result",
         "attach",
         "swallowed",
+        "serialization",
     ],
 )
 def test_calibration_fault_matrix(tmp_path, world, site):

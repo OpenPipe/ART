@@ -3313,9 +3313,7 @@ class TrainerRank:
         if dist.is_available() and dist.is_initialized():
             gathered: list[set[str] | None] = [None] * dist.get_world_size()
             group = self._checkpoint_group()
-            _calibration_protocol.collective(
-                lambda: dist.all_gather_object(gathered, expected, group=group)
-            )
+            _calibration_protocol.all_gather_object(gathered, expected, group=group)
             expected = set().union(*(value for value in gathered if value is not None))
         if unknown := sorted(keys - expected):
             preview = ", ".join(repr(key) for key in unknown[:8])
@@ -3491,8 +3489,8 @@ class TrainerRank:
         ]
         configuration = (int(count), yield_empty)
         group = getattr(self, "_forward_replica_group", None)
-        _calibration_protocol.collective(
-            lambda: dist.all_gather_object(configurations, configuration, group=group)
+        _calibration_protocol.all_gather_object(
+            configurations, configuration, group=group
         )
         if len(set(configurations)) == 1:
             return
