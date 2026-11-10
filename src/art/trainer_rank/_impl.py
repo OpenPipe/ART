@@ -3088,6 +3088,7 @@ class TrainerRank:
         packed_tokens: int,
         output_bytes: int,
         signature: _MemorySignature,
+        request_count: int | None = None,
         logical_tokens: int,
         gdn_segments: int = 0,
         group_rows: tuple[tuple[int, bool], ...] = (),
@@ -3099,8 +3100,13 @@ class TrainerRank:
         caller_cp_workload: _memory._CPWorkload | None = None,
     ) -> _SubforwardCost:
         profile = self._memory_profiles.get(signature)
-        cold_subfloor = _memory._uncovered_subfloor_cp(
-            profile, signature, packed_tokens, caller_cp_workload
+        cold_subfloor = _memory._uncovered_cp_family(
+            self,
+            profile,
+            signature,
+            packed_tokens,
+            caller_cp_workload,
+            request_count=request_count,
         )
         if cold_subfloor:
             # Match the estimator's effective cold profile for every split
@@ -3112,6 +3118,7 @@ class TrainerRank:
             signature,
         )
         required = self._estimate_required_memory_bytes_from_values(
+            request_count=request_count,
             packed_tokens=packed_tokens,
             output_bytes=output_bytes,
             signature=signature,

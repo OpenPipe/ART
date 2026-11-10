@@ -13,10 +13,12 @@ also lets the circular import resolve lazily.
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -45,6 +47,9 @@ _CPCallerPeak = tuple[int, int, str, tuple[tuple[int, ...], ...]]
 
 _FIXED_SLOPE_PROFILES: ContextVar[bool] = ContextVar(
     "art_fixed_slope_profiles", default=False
+)
+_CP_FAMILY_CALIBRATION: ContextVar[bool] = ContextVar(
+    "art_cp_family_calibration", default=False
 )
 
 _CALIBRATION_SEED_TOKENS = 2 * _memory_model._MEMORY_SLOPE_MIN_TOKENS
@@ -324,19 +329,44 @@ def _calibration_estimate(
     result.extrapolated = result.candidate > result.largest
     if seed_uncovered_cp_family:
         workload = plan.caller_cp_workload
+        live_anchors = len(points) >= 2 and not _unanchored(profile)
+        if (
+            profile is None or (not points and _unanchored(profile))
+        ) and _native_cp_cold_supported(self, plan.signature):
+            # An output class without a profile may use another class's live
+            # anchors to schedule a static-bound measurement, never to borrow
+            # its peak. Operation and actual selected adapters remain exact.
+            live_anchors = any(
+                observed is self._memory_profiles.get(key)
+                and len(rows) >= 2
+                and not _unanchored(observed)
+                and key.topology == plan.signature.topology
+                and key.grad_modes == plan.signature.grad_modes
+                and key.slot_shapes == plan.signature.slot_shapes
+                and key.planner_coefficients == plan.signature.planner_coefficients
+                and key.slot_group_count == plan.signature.slot_group_count
+                and not getattr(observed, "dominance_disabled", False)
+                and not getattr(observed, "non_dominant_cp_pairs", ())
+                for key, (observed, rows) in self.__dict__.get(
+                    "_calibration_memory_rungs", {}
+                ).items()
+            )
         if not (
             _FIXED_SLOPE_PROFILES.get()
-            and isinstance(profile, _CallerMemoryProfileV2)
-            and not _unanchored(profile)
-            and len(points) >= 2
+            and (isinstance(profile, _CallerMemoryProfileV2) or profile is None)
+            and live_anchors
             and plan.signature.topology[2] > 1
             and workload is not None
+            and _known_cp_kernels(workload)
             and _rate_floor_tokens(plan.signature)
             <= result.candidate
             < _memory_model._MEMORY_SLOPE_MIN_TOKENS
-            and not profile.dominance_disabled
-            and not profile.non_dominant_cp_pairs
-            and profile.covering_cp_peak(result.candidate, workload) is None
+            and not getattr(profile, "dominance_disabled", False)
+            and not getattr(profile, "non_dominant_cp_pairs", ())
+            and (
+                profile is None
+                or profile.covering_cp_peak(result.candidate, workload) is None
+            )
             and (plan.signature, _cp_pair(workload[0], workload[0])[0])
             not in self.__dict__.get("_calibration_seeded_cp_families", ())
         ):
@@ -348,6 +378,18 @@ def _calibration_estimate(
         result.seed_uncovered_cp_family = True
         result.seed = result.extrapolated = result.eligible = True
         result.delta = result.candidate
+        return result
+    if (
+        isinstance(profile, _CallerMemoryProfileV2)
+        and plan.caller_cp_workload is not None
+        and profile.covering_cp_peak(result.candidate, plan.caller_cp_workload)
+        is not None
+    ):
+        # A family-only seed deliberately establishes no rate/journal rung.
+        # Its measured covering peak still qualifies an ordinary monitored
+        # calibration call, using the same exact family admission and guard.
+        result.extrapolated = False
+        result.eligible = True
         return result
     if (
         _FIXED_SLOPE_PROFILES.get()
@@ -433,6 +475,25 @@ def _unanchored(profile: _impl._MemoryProfile | None) -> bool:
 _MEMORY_DEFERRED_BYTES = 1 << 62
 
 
+def _known_cp_kernels(workload: _CPWorkload) -> bool:
+    """Only native, identified dense/sparse kernels can receive a static trial."""
+    try:
+        qualification = json.loads(workload[0])["execution_qualification"]
+        backend = qualification["backend"]
+        kernels = [json.loads(value) for value in qualification["kernels"]]
+        return (
+            backend in ("FLASH", "TRITON")
+            and len(kernels) == 2
+            and {kernel["kind"] for kernel in kernels} == {"dense", "sparse"}
+            and all(
+                kernel["version"] == 1 and kernel["options"]["BACKEND"] == backend
+                for kernel in kernels
+            )
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 def _rate_floor_tokens(signature: _impl._MemorySignature) -> int:
     # Global pre-shard rows: 64 rows per CP rank, capped so every 8K anchor
     # qualifies. Neither a local shard nor its ownership vector sets this floor.
@@ -488,6 +549,283 @@ def _uncovered_subfloor_cp(
         not isinstance(profile, _CallerMemoryProfile)
         or profile.covering_cp_peak(packed_tokens, workload) is None
     )
+
+
+def _cp_output_modes_supported(signature: _impl._MemorySignature) -> bool:
+    """Recognize output classes emitted by _request_mix_key, including unions."""
+    for mix in signature.request_mix:
+        for part in mix.split("+"):
+            if part in ("hidden", "logits", "routes", "inactive"):
+                continue
+            if part.startswith("topk:") and part[5:].isdigit() and int(part[5:]) > 0:
+                continue
+            if part == "target:single":
+                continue
+            if part.startswith("target:"):
+                try:
+                    dims = ast.literal_eval(part[7:])
+                except (SyntaxError, ValueError):
+                    return False
+                if (
+                    isinstance(dims, tuple)
+                    and dims
+                    and all(type(n) is int and n > 0 for n in dims)
+                ):
+                    continue
+            return False
+    return bool(signature.request_mix)
+
+
+def _native_cp_cold_supported(self: TrainerRank, signature: _impl._MemorySignature):
+    """A known CP8 execution with the existing full-recompute static floor."""
+    try:
+        geometry = self._geometry
+        return (
+            signature.topology == (1, 1, 8, 1)
+            and self._parallel_shape.cp == 8
+            and getattr(self._parallel_shape, "tp", None)
+            == getattr(self._parallel_shape, "ep", None)
+            == getattr(self._parallel_shape, "etp", None)
+            == 1
+            and self._param_dtype_size == 2
+            and self._one_layer_recompute()
+            and geometry.hidden_size == self._hidden_size > 0
+            and geometry.kv_channels > 0
+            and (geometry.ffn_hidden_size > 0 or geometry.moe_ffn_hidden_size > 0)
+            and (
+                self._moe_memory_supported
+                if self._moe_layers
+                else self._dense_fc1_adapted
+            )
+            and _cp_output_modes_supported(signature)
+        )
+    except AttributeError:
+        return False
+
+
+@lru_cache(maxsize=128)
+def _short_cp_root_workload(template: str, tokens: int) -> _CPWorkload:
+    from art.megatron.context_parallel.runtime import context_parallel_memory_workload
+    from art.megatron.context_parallel.types import (
+        ContextParallelConfig,
+        ParallelTopology,
+    )
+    from art.megatron.gdn.gdn_prefix_tree import GdnPlannerConfig
+
+    fields = json.loads(template)
+    config = fields["attention_config"]
+    if config.get("attention_sparse_block_size") is not None:
+        config["attention_sparse_block_size"] = tuple(
+            config["attention_sparse_block_size"]
+        )
+    metadata = _impl.torch.zeros((1, tokens), dtype=_impl.torch.int64)
+    return context_parallel_memory_workload(
+        group_ids=metadata,
+        parent_ids=metadata,
+        topology=ParallelTopology(cp=8),
+        config=ContextParallelConfig(**config),
+        original_seq_len=tokens,
+        build_gdn_execution_spec=fields["has_gdn"],
+        gdn_planner_config=(
+            GdnPlannerConfig(**json.loads(fields["gdn_config"]))
+            if fields["has_gdn"]
+            else None
+        ),
+    )
+
+
+def _short_cp_execution_known(
+    self: TrainerRank,
+    signature: _impl._MemorySignature,
+    packed_tokens: int,
+    workload: _CPWorkload | None,
+) -> bool:
+    """Validate the selected adapter class, kernel and actual one-root loads.
+
+    Output/operation identity may change for a static trial; model, adapters
+    and identified kernels may not. No peak is borrowed across those classes.
+    Recompute the workload so malformed masks or per-rank components cannot
+    become a cold discount. The same pure planner also supports report replay.
+    """
+    shapes = tuple(shapes for _, shapes in signature.slot_shapes)
+    anchors = [
+        p
+        for key, p in self._memory_profiles.items()
+        if key.topology == signature.topology
+        and (not signature.grad_enabled or key.grad_enabled)
+        and key.planner_coefficients == signature.planner_coefficients
+        and key.slot_group_count == signature.slot_group_count
+        and tuple(s for _, s in key.slot_shapes) == shapes
+        and p.peak_model_version == 2
+        and not _unanchored(p)
+    ]
+    if not anchors or workload is None:
+        return False
+    try:
+        family = json.loads(workload[0])
+        qualification = dict(family["execution_qualification"])
+        qualification.pop("signature")
+        from dataclasses import asdict
+
+        if any(
+            qualification.get(name) != value
+            for name, value in dict(
+                geometry=asdict(self._geometry),
+                layers=self._num_layers,
+                gdn_layers=self._gdn_layers,
+                moe_layers=self._moe_layers,
+                parallel_shape=asdict(self._parallel_shape),
+                dtype_bytes=self._param_dtype_size,
+            ).items()
+        ):
+            return False
+        if not _known_cp_kernels(workload):
+            return False
+        observed = [
+            json.loads(f)
+            for p in anchors
+            if isinstance(p, _CallerMemoryProfile)
+            for _, _, f, _ in p.caller_cp_peaks
+            if _known_cp_kernels((f, ()))
+            and type(json.loads(f).get(_CP_OBSERVATION_FORMAT_KEY)) is int
+            and json.loads(f).get(_CP_OBSERVATION_FORMAT_KEY)
+            == _CP_QUALIFIED_OBSERVATION_FORMAT
+        ]
+        if any(isinstance(p, _CallerMemoryProfile) for p in anchors) and not observed:
+            # Equality-only legacy records cannot qualify a new execution.
+            return False
+        if observed:
+
+            def fixed_fields(value):
+                return {
+                    k: v
+                    for k, v in value.items()
+                    if k
+                    not in (
+                        "execution_qualification",
+                        "masks",
+                        "gdn",
+                        _CP_OBSERVATION_FORMAT_KEY,
+                    )
+                }
+
+            if not any(
+                {
+                    k: v
+                    for k, v in q["execution_qualification"].items()
+                    if k != "signature"
+                }
+                == qualification
+                and fixed_fields(q) == fixed_fields(family)
+                for q in observed
+            ):
+                return False
+        else:
+            from art.megatron.training.microbatches import (
+                _context_parallel_config_for_provider,
+                _gdn_planner_config_for_provider,
+            )
+
+            provider = self.runtime.provider
+            handler = self.runtime.model_support_handler
+            config = _context_parallel_config_for_provider(
+                provider, self.device, handler
+            )
+            gdn = _gdn_planner_config_for_provider(provider, handler)
+            expected_template = json.dumps(
+                dict(
+                    attention_config=asdict(config),
+                    gdn_config=json.dumps(
+                        asdict(gdn), sort_keys=True, separators=(",", ":")
+                    )
+                    if gdn is not None
+                    else None,
+                    has_gdn=gdn is not None,
+                ),
+                sort_keys=True,
+            )
+            native_family, native_loads = _short_cp_root_workload(
+                expected_template, packed_tokens
+            )
+            plain = {
+                k: v
+                for k, v in family.items()
+                if k not in ("execution_qualification", _CP_OBSERVATION_FORMAT_KEY)
+            }
+            if plain != json.loads(native_family) or workload[1] != native_loads:
+                return False
+            from types import SimpleNamespace
+
+            expected, _ = _qualified_cp_workload(
+                self, SimpleNamespace(signature=signature, caller_cp_workload=workload)
+            )
+            if (
+                json.loads(expected)["execution_qualification"]
+                != family["execution_qualification"]
+            ):
+                return False
+        template = json.dumps(
+            dict(
+                attention_config=family["attention_config"],
+                gdn_config=family["gdn_config"],
+                has_gdn=family["gdn"] is not None,
+            ),
+            sort_keys=True,
+        )
+        expected_family, expected_loads = _short_cp_root_workload(
+            template, packed_tokens
+        )
+        family.pop("execution_qualification")
+        family.pop(_CP_OBSERVATION_FORMAT_KEY, None)
+        return family == json.loads(expected_family) and workload[1] == expected_loads
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return False
+
+
+def _uncovered_cp_family(
+    self: TrainerRank,
+    profile: _impl._MemoryProfile | None,
+    signature: _impl._MemorySignature,
+    packed_tokens: int,
+    workload: _CPWorkload | None,
+    *,
+    request_count: int | None = None,
+) -> bool:
+    """Known short execution without a covering peak uses all cold charges.
+
+    A revoked pair, an unknown kernel and an unreadable workload remain
+    refusals. This is independent of the rate floor: a 2K family observation
+    cannot cover an unmeasured 2971-row request just because both are local.
+    """
+    if _uncovered_subfloor_cp(profile, signature, packed_tokens, workload):
+        return True
+    if not (
+        _fixed_slope_enabled(profile)
+        and request_count == 1
+        and 0 < packed_tokens < _memory_model._MEMORY_SLOPE_MIN_TOKENS
+        and _native_cp_cold_supported(self, signature)
+    ):
+        return False
+    if isinstance(profile, _CallerMemoryProfileV2):
+        if profile.dominance_disabled or (
+            profile.non_dominant_cp_pairs
+            and (
+                workload is None
+                or any(
+                    wanted == _cp_pair(workload[0], workload[0])[0]
+                    for wanted, _ in profile.non_dominant_cp_pairs
+                )
+            )
+        ):
+            return False
+        if (
+            workload is None
+            or profile.covering_cp_peak(packed_tokens, workload) is not None
+        ):
+            return False
+    elif profile is not None and not _unanchored(profile):
+        return False
+    return _short_cp_execution_known(self, signature, packed_tokens, workload)
 
 
 def _mark_subfloor_cp_sample(self: TrainerRank, plan: _impl._FlatForwardPlan) -> None:
@@ -685,6 +1023,14 @@ def _rate_reference(
         if not points:
             return None
         if source != "signature":
+            if (
+                signature.topology[2] > 1
+                and getattr(signature, "bounded_caller_peak", False)
+                and any(not isinstance(p, _CallerMemoryProfile) for p, _ in points)
+            ):
+                # A generic rate has no qualified CP family. It can schedule
+                # a new static-bound seed, never stand in for its measurement.
+                return None
             minimum = max(rows[0][0] for _, rows in points)
             # Losing a covering contributor must not select a cheaper bound.
             # Unknown caller coverage defers rather than changing references.
@@ -3073,6 +3419,34 @@ def _memory_signature_from_requests(
             _checkpoint_layers(self, ((int(requests[0].input_tokens.numel()), True),))
         )
     )
+    if (
+        self._moe_layers
+        and len(requests) == slot_group_count == 1
+        and modes in ((False,), (True,))
+        and _native_cp_cold_supported(self, signature)
+        and bool(_checkpoint_layers(self, ((1, any(modes)),)))
+        and (
+            _CP_FAMILY_CALIBRATION.get()
+            or (
+                (
+                    signature.grad_enabled
+                    or sum(int(r.input_tokens.numel()) for r in requests)
+                    < _memory_model._MEMORY_SLOPE_MIN_TOKENS
+                )
+                and _ScopedMemorySignature(
+                    **vars(signature),
+                    checkpoint_partition=partition,
+                    bounded_forward_peak=bounded,
+                    bounded_caller_peak=True,
+                )
+                in self._memory_profiles
+            )
+        )
+    ):
+        # Completed callers of each operation/output class own separate CP
+        # evidence. Forward-only and hidden/routed callers must not borrow a
+        # gradient target family's peak or bypass its kernel qualification.
+        caller_bounded = True
     if partition is not None or bounded or caller_bounded:
         return _ScopedMemorySignature(
             **vars(signature),
@@ -3201,6 +3575,7 @@ def _memory_check(
                 )
             )
         required = self._estimate_required_memory_bytes_from_values(
+            request_count=getattr(forward, "request_count", None),
             packed_tokens=forward.packed_tokens,
             output_bytes=forward.output_bytes,
             signature=forward.signature,
@@ -3231,11 +3606,13 @@ def _memory_check(
         )
         if growth and not (_calibration is not None and _calibration.extrapolated):
             profile = self._memory_profiles.get(forward.signature)
-            cold = _uncovered_subfloor_cp(
+            cold = _uncovered_cp_family(
+                self,
                 profile,
                 forward.signature,
                 forward.packed_tokens,
                 getattr(forward, "caller_cp_workload", None),
+                request_count=getattr(forward, "request_count", None),
             )
             growth = math.ceil(
                 growth
@@ -3476,6 +3853,7 @@ def _estimate_required_memory_bytes_from_values(
     packed_tokens: int,
     output_bytes: int,
     signature: _impl._MemorySignature,
+    request_count: int | None = None,
     logical_tokens: int | None = None,
     gdn_segments: int = 0,
     group_rows: tuple[tuple[int, bool], ...] = (),
@@ -3492,10 +3870,29 @@ def _estimate_required_memory_bytes_from_values(
     if packed_tokens <= 0:
         return output_bytes
     profiled = self._memory_profiles.get(signature)
-    cold_subfloor = _uncovered_subfloor_cp(
-        profiled, signature, packed_tokens, caller_cp_workload
+    cold_subfloor = _uncovered_cp_family(
+        self,
+        profiled,
+        signature,
+        packed_tokens,
+        caller_cp_workload,
+        request_count=request_count,
     )
+    cold_family_floor = 0
     if cold_subfloor:
+        if (
+            isinstance(profiled, _CallerMemoryProfile)
+            and caller_cp_workload is not None
+        ):
+            cold_family_floor = max(
+                (
+                    peak
+                    for n, peak, family, _ in profiled.caller_cp_peaks
+                    if n <= packed_tokens
+                    and profiled.cp_family_equal(caller_cp_workload[0], family)
+                ),
+                default=0,
+            )
         # Reuse every ordinary unprofiled static term, including cold backward
         # transients. Do not borrow the uncovered class's empirical workspace.
         profiled = None
@@ -3748,6 +4145,7 @@ def _estimate_required_memory_bytes_from_values(
     compute = (
         static_compute if profiled is None else max(static_compute, empirical(profiled))
     )
+    compute = max(compute, cold_family_floor)
     if _calibration_compute_bytes is not None:
         compute = max(compute, _calibration_compute_bytes)
     if (
@@ -3768,7 +4166,13 @@ def _estimate_required_memory_bytes_from_values(
             caller_cp_workload=caller_cp_workload,
         )
         if reference is None:
-            if packed_tokens >= floor:
+            covered_family = (
+                isinstance(profiled, _CallerMemoryProfile)
+                and caller_cp_workload is not None
+                and profiled.covering_cp_peak(packed_tokens, caller_cp_workload)
+                is not None
+            )
+            if packed_tokens >= floor and not covered_family:
                 # Finite and exactly representable through the existing MAX/
                 # MIN collectives. Never price an unknown large wave fixed-only.
                 compute = max(compute, _MEMORY_DEFERRED_BYTES)
