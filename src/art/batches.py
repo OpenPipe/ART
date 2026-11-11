@@ -23,30 +23,41 @@ async def trajectory_group_batches(
         )
     unstarted = list(groups)[batch_size * skip_batches :]
     pending = set[asyncio.Task[TrajectoryGroup | None]]()
+    done = set[asyncio.Task[TrajectoryGroup | None]]()
     batch = list[TrajectoryGroup]()
     context = GatherContext(
         max_exceptions=max_batch_exceptions,
         increment_pbar=False,
     )
     with set_gather_context(context):
-        while unstarted or pending or len(batch) >= batch_size:
-            if context.pbar is None:
-                context.pbar = tqdm.tqdm(desc=pbar_desc, total=batch_size)
-            while len(pending) < batch_size * max_concurrent_batches and unstarted:
-                pending.add(asyncio.create_task(wrap_group_awaitable(unstarted.pop(0))))
-            if pending:
-                done, pending = await asyncio.wait(
-                    pending,
-                    timeout=0 if len(batch) >= batch_size else None,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                context.pbar.update(len(done))
-                batch.extend(g for task in done if (g := task.result()) is not None)
-            if len(batch) >= batch_size:
-                if context.pbar is not None:
-                    context.pbar.close()
-                    context.reset()
-                yield batch[:batch_size]
-                batch = batch[batch_size:]
-        if batch:
-            yield batch
+        try:
+            while unstarted or pending or len(batch) >= batch_size:
+                if context.pbar is None:
+                    context.pbar = tqdm.tqdm(desc=pbar_desc, total=batch_size)
+                while len(pending) < batch_size * max_concurrent_batches and unstarted:
+                    pending.add(
+                        asyncio.create_task(wrap_group_awaitable(unstarted.pop(0)))
+                    )
+                if pending:
+                    done, pending = await asyncio.wait(
+                        pending,
+                        timeout=0 if len(batch) >= batch_size else None,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    context.pbar.update(len(done))
+                    batch.extend(g for task in done if (g := task.result()) is not None)
+                if len(batch) >= batch_size:
+                    if context.pbar is not None:
+                        context.pbar.close()
+                        context.reset()
+                    yield batch[:batch_size]
+                    batch = batch[batch_size:]
+            if batch:
+                yield batch
+        finally:
+            # Rollouts started here have no other owner. Stop them when the consumer
+            # closes the iterator, is cancelled, or receives a rollout error, and
+            # retrieve sibling exceptions that the error left unread.
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, *done, return_exceptions=True)
