@@ -624,6 +624,139 @@ def calibrate_request_floors(
     return tuple(decisions)
 
 
+def calibrate_packed_target_rates(
+    self: TrainerRank,
+    template: AnyForwardInput,
+    *,
+    execute: Callable[[CalibrationRung], None],
+    check_pending: Callable[[], None],
+    checkpoint: AdapterSelection = _impl.Unset,
+) -> tuple[_memory.CalibrationRungDecision, ...]:
+    """Measure one generic packed-target rate scope after the CP8 ladders.
+
+    Native, full-recompute MoE training distinguishes a completed single-root
+    caller peak from a multi-root rate profile. A request floor is a lower
+    bound, not evidence of a token rate or CP dominance. This pass measures
+    two distinct roots totaling 16384, then 8192 tokens through ordinary
+    ``calibration_rung`` admission. One generic signature serves compatible
+    request counts; no caller-family coverage check is bypassed.
+
+    Invoke for each selected adapter/native configuration, after both live
+    ladders and ``calibrate_request_floors``, before persisting a complete cache.
+    Dense returns without work. ``template`` supplies placement and adapter
+    selection; probes replace its tokens and outputs with gradient target-only
+    requests. This version supports one selected adapter and CP8 full recompute.
+
+    ``execute`` must durably journal each *rate* rung before model entry,
+    exhaust its iterator with target loss and backward inside each caller
+    interval, and record cohort-wide completion. These are not floor trials:
+    ``rung.family_id`` is absent. Pending rate intents must block the signature
+    on every rank, including cache hits; ``check_pending`` runs before skips.
+    Persist ordinary rate-bearing profiles and validate their native kernel
+    binding on reload. No retry or serving-time measurement is authorized.
+    The initial rung retains the existing 2x static seed cap. Incomplete
+    callbacks never qualify an anchor. Cache hits execute no probes.
+    """
+    # Keep the established dense startup trace unchanged, including votes.
+    if not self._moe_layers:
+        return ()
+    with _protocol.Driver(self):
+        with _calibration_status(self):
+            self._guard_forward_collective("calibrate_packed_target_rates")
+            if not _memory._FIXED_SLOPE_PROFILES.get():
+                raise ValueError("packed calibration requires fixed-slope collection")
+            check_pending()
+            if template.input_tokens.ndim != 1 or not template.input_tokens.numel():
+                raise ValueError("packed calibration requires a flat root template")
+            if self._padded_vocab_size < 2:
+                raise ValueError("packed calibration requires two distinct root tokens")
+            probes = []
+            for extent in (16384, 8192):
+                roots = []
+                for first in (0, 1):
+                    tokens = template.input_tokens.new_zeros(extent // 2)
+                    tokens[0] = first
+                    roots.append(
+                        replace(
+                            template,
+                            input_tokens=tokens,
+                            target_tokens=tokens.new_zeros(extent // 2),
+                            top_k=None,
+                            logits=False,
+                            hidden_states=False,
+                            routed_experts=None,
+                            no_grad=False,
+                        )
+                    )
+                probes.append(roots)
+        decisions = []
+        for roots in probes:
+            with _impl.torch.enable_grad():
+                with _calibration_status(self):
+                    plan = self._plan_flat_forward(
+                        roots, checkpoint=checkpoint, sync_planning_errors=True
+                    )
+                    signature = plan.signature
+                    if not (
+                        _memory._native_cp_cold_supported(self, signature)
+                        and signature.request_mix == ("target:single",)
+                        and signature.slot_group_count == 1
+                        and signature.grad_modes == (True,)
+                        and not getattr(signature, "bounded_caller_peak", False)
+                        and len(plan.groups) == 1
+                        and plan.packed_tokens
+                        == sum(r.input_tokens.numel() for r in roots)
+                    ):
+                        raise ValueError("unsupported packed-target calibration scope")
+                    profile = self._memory_profiles.get(signature)
+                    points = (
+                        ()
+                        if profile is None
+                        else _memory._rate_points(
+                            profile, _memory._rate_floor_tokens(signature)
+                        )
+                    )
+                    measured = plan.packed_tokens in dict(points) or (
+                        len(points) >= 2
+                        and points[0][0] <= 8192 <= 16384 <= points[-1][0]
+                    )
+                if self._all_ranks_true(measured):
+                    continue
+                with calibration_rung(
+                    self, roots, checkpoint=checkpoint, no_grad=False
+                ) as rung:
+                    with _calibration_status(self):
+                        if not rung.decision.fits:
+                            raise _impl.TrainerRankMemoryError(
+                                "packed calibration admission refused"
+                            )
+                    execute(rung)
+                with _calibration_status(self):
+                    profile = self._memory_profiles.get(signature)
+                    entry = self.__dict__.get("_calibration_memory_rungs", {}).get(
+                        signature
+                    )
+                    complete = (
+                        rung._used
+                        and profile is not None
+                        and entry is not None
+                        and entry[0] is profile
+                        and plan.packed_tokens in dict(entry[1])
+                        and plan.packed_tokens
+                        in dict(
+                            _memory._rate_points(
+                                profile, _memory._rate_floor_tokens(signature)
+                            )
+                        )
+                    )
+                if not self._all_ranks_true(complete):
+                    raise RuntimeError(
+                        "packed calibration requires a completed rate measurement"
+                    )
+                decisions.append(rung.decision)
+        return tuple(decisions)
+
+
 def _forward_micro_batches(
     self: TrainerRank,
     inputs: Iterable[ForwardInputs],
