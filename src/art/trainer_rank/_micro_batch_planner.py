@@ -660,9 +660,9 @@ def calibrate_packed_target_rates(
     # Keep the established dense startup trace unchanged, including votes.
     if not self._moe_layers:
         return ()
+    self._guard_forward_collective("calibrate_packed_target_rates")
     with _protocol.Driver(self):
         with _calibration_status(self):
-            self._guard_forward_collective("calibrate_packed_target_rates")
             if not _memory._FIXED_SLOPE_PROFILES.get():
                 raise ValueError("packed calibration requires fixed-slope collection")
             check_pending()

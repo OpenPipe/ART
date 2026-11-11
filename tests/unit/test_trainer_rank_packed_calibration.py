@@ -223,3 +223,27 @@ def test_long_shared_packs_use_startup_rates_without_serving_measurements(monkey
                 assert not hasattr(selected, "subforwards") and selected_check.fits
                 assert selected.request_count == count
         assert rank._memory_profiles == before and len(calls) == executed
+
+
+def test_skipped_wave_guard_precedes_protocol_entry(monkeypatch):
+    from types import SimpleNamespace
+
+    from art.trainer_rank import _calibration_protocol as protocol
+    from art.trainer_rank import _micro_batch_planner as planner
+
+    def guard(operation):
+        assert operation == "calibrate_packed_target_rates"
+        raise RuntimeError("skipped forward wave")
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("protocol entered before skipped-wave guard")
+
+    rank = SimpleNamespace(_moe_layers=1, _guard_forward_collective=guard)
+    monkeypatch.setattr(protocol, "Driver", unexpected)
+    with pytest.raises(RuntimeError, match="skipped forward wave"):
+        planner.calibrate_packed_target_rates(
+            rank,
+            request(1),
+            execute=unexpected,
+            check_pending=unexpected,
+        )
