@@ -2,6 +2,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import Token
 from datetime import datetime
 import json
+import math
 import os
 import time
 from typing import (
@@ -1045,8 +1046,8 @@ class Model(
             f.write(
                 json.dumps(
                     {
-                        k: v for k, v in prefixed.items() if v == v
-                    }  # Filter out NaN values
+                        k: v for k, v in prefixed.items() if -math.inf < v < math.inf
+                    }  # Filter out non-finite values
                     | {"step": step, "recorded_at": datetime.now().isoformat()}
                 )
                 + "\n"
