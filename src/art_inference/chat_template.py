@@ -700,10 +700,19 @@ def _template_requires_structured_tool_arguments(chat_template: object) -> bool:
         r"{%[-+]?\s*set\s+([A-Za-z_]\w*)\s*=\s*([^%]*)[-+]?%}",
         chat_template,
     )
-    return any(
+    if any(
         re.search(arguments_access, expression)
         and re.search(rf"\b{re.escape(alias)}\s*\.\s*items\s*\(", chat_template)
         for alias, expression in aliases
+    ):
+        return True
+    # Unconditional JSON serialization needs an object, or it quotes the JSON
+    # string again. String-aware templates must retain the sampled text verbatim.
+    return bool(
+        re.search(rf"{arguments_access}\s*\|\s*tojson\b", chat_template)
+        and not re.search(
+            rf"{arguments_access}\s+is\s+(?:not\s+)?string\b", chat_template
+        )
     )
 
 
@@ -716,7 +725,7 @@ def normalize_tool_call_arguments_for_chat_template(
     """Give chat templates the structured tool arguments they require.
 
     Templates that interpolate the raw JSON string must keep string arguments,
-    so only templates that iterate structured arguments trigger normalization.
+    so only templates that require structured arguments trigger normalization.
     """
     if not require_mapping and not _template_requires_structured_tool_arguments(
         chat_template
