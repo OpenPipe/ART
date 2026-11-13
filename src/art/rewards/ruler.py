@@ -10,12 +10,14 @@ For detailed documentation and examples, see: https://art.openpipe.ai/fundamenta
 """
 
 import json
+import re
 from textwrap import dedent
+from typing import Any
 
 from litellm import acompletion
 from litellm.types.utils import ModelResponse
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from rich import print
 
 import art
@@ -30,11 +32,80 @@ class TrajectoryScore(BaseModel):
     )
     score: float = Field(description="A score between 0 and 1.")
 
+    @field_validator("score", mode="before")
+    @classmethod
+    def _parse_score(cls, v: Any) -> float:
+        if isinstance(v, (int, float)):
+            return float(v)
+        if isinstance(v, str):
+            v_str = v.strip()
+            if "/" in v_str:
+                parts = v_str.split("/", 1)
+                try:
+                    num = float(parts[0])
+                    den = float(parts[1])
+                    return num / den if den != 0 else 0.0
+                except ValueError:
+                    pass
+            if v_str.endswith("%"):
+                try:
+                    return float(v_str[:-1]) / 100.0
+                except ValueError:
+                    pass
+            try:
+                return float(v_str)
+            except ValueError:
+                match = re.search(r"[-+]?(?:\d*\.\d+|\d+)", v_str)
+                if match:
+                    try:
+                        return float(match.group(0))
+                    except ValueError:
+                        pass
+        return float(v)
+
 
 class Response(BaseModel):
     """Response format expected from the LLM judge."""
 
     scores: list[TrajectoryScore] = Field(description="The scores for each trajectory.")
+
+
+def _extract_json_content(content: str) -> str:
+    """Extract JSON string from raw model output, handling markdown code fences and surrounding text."""
+    trimmed = content.strip()
+    if not trimmed:
+        return "{}"
+
+    # 1. Check for markdown code fences: ```json ... ``` or ``` ... ```
+    if "```" in trimmed:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", trimmed)
+        if match:
+            inner = match.group(1).strip()
+            if inner:
+                return inner
+
+    # 2. If not in a code fence, extract outermost JSON object { ... }
+    start = trimmed.find("{")
+    end = trimmed.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return trimmed[start : end + 1]
+
+    return trimmed
+
+
+def _normalize_scores(raw_scores: list[float]) -> list[float]:
+    """Normalize and clamp scores to ensure all values are strictly within [0.0, 1.0]."""
+    if not raw_scores:
+        return []
+    max_val = max(raw_scores)
+    # If the judge graded on a 0-100 scale (e.g. 75, 80, 100)
+    if max_val > 10.0 and max_val <= 100.0:
+        return [max(0.0, min(1.0, s / 100.0)) for s in raw_scores]
+    # If the judge graded on a 0-10 scale (e.g. 7, 8, 10)
+    elif max_val >= 2.0 and max_val <= 10.0:
+        return [max(0.0, min(1.0, s / 10.0)) for s in raw_scores]
+    # Otherwise clamp directly to [0.0, 1.0]
+    return [max(0.0, min(1.0, s)) for s in raw_scores]
 
 
 DEFAULT_RUBRIC = dedent(
@@ -257,7 +328,33 @@ async def ruler(
                 print(f"[RULER] Raw choice content: {raw_content}")
 
         content = first_choice.message.content or "{}"
-        parsed = Response.model_validate_json(content)
+        try:
+            extracted_json = _extract_json_content(content)
+            parsed = Response.model_validate_json(extracted_json)
+        except (ValueError, json.JSONDecodeError, ValidationError) as exc:
+            if attempt + 1 < _STRUCTURAL_ATTEMPTS:
+                messages = [
+                    *messages,
+                    {"role": "assistant", "content": content},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Your response could not be parsed as valid JSON matching the required schema: {exc}. "
+                            f"Return a valid JSON object matching the schema with {expected_scores} score object"
+                            f"{'' if expected_scores == 1 else 's'}, one for each of these trajectory IDs: {required_ids}."
+                        ),
+                    },
+                ]
+                continue
+            raise ValueError(
+                f"Failed to parse RULER judge response as JSON matching schema: {exc}\nRaw content: {content}"
+            ) from exc
+
+        # Normalize and clamp scores to ensure valid range [0.0, 1.0]
+        raw_scores = [s.score for s in parsed.scores]
+        normalized_scores = _normalize_scores(raw_scores)
+        for score_obj, norm_val in zip(parsed.scores, normalized_scores):
+            score_obj.score = norm_val
         structure_error: ValueError | None = None
         if len(parsed.scores) != expected_scores:
             qualifier = " for identical trajectories" if all_identical else ""
