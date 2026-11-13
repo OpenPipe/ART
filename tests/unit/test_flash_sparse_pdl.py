@@ -242,10 +242,18 @@ def test_install_during_backward_requires_quiescence(patch, interface, monkeypat
     # Unaffected calls retain a live reference to this module global.
     patch.apply_flash_sm90_sparse_pdl_patch(interface)
     monkeypatch.setattr(interface, "_bwd_preprocess", paused)
-    worker = Thread(target=lambda: interface._flash_attn_bwd(100))
+    worker = Thread(target=lambda: interface._flash_attn_bwd(100, object()))
     worker.start()
     try:
         assert ready.wait(10)
+        # An already complete install is a no-op; only a changed/reloaded
+        # component needs quiescence and must refuse while a call is active.
+        assert patch.apply_flash_sm90_sparse_pdl_patch(interface)
+        monkeypatch.setattr(
+            interface.FlashAttentionBackwardSm90.__call__,
+            "_art_sm90_sparse_pdl_launch",
+            False,
+        )
         with pytest.raises(RuntimeError, match="backward call active"):
             patch.apply_flash_sm90_sparse_pdl_patch(interface)
     finally:
@@ -264,4 +272,91 @@ def test_install_during_graph_capture_is_rejected(patch, interface, monkeypatch)
     )
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
     with pytest.raises(RuntimeError, match="CUDA graph capture active"):
+        patch.apply_flash_sm90_sparse_pdl_patch(interface)
+
+
+@pytest.mark.parametrize("point", ["enter_try", "after_increment"])
+def test_interrupt_at_active_increment_restores_count(patch, interface, point):
+    import inspect
+    import sys
+
+    patch.apply_flash_sm90_sparse_pdl_patch(interface, version="4.0.0b26")
+    dispatch = interface._art_bwd_guard_dispatch
+    lines, start = inspect.getsourcelines(dispatch)
+    if point == "enter_try":
+        target = start + next(
+            n for n, line in enumerate(lines) if line.strip() == "try:"
+        )
+    else:
+        target = start + next(
+            n
+            for n, line in enumerate(lines)
+            if line.strip().startswith(("arch =", "arguments ="))
+        )
+
+    def interrupt(frame, event, arg):
+        if (
+            frame.f_code is dispatch.__code__
+            and event == "line"
+            and frame.f_lineno == target
+        ):
+            raise KeyboardInterrupt("active-call boundary")
+        return interrupt
+
+    sys.settrace(interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="active-call boundary"):
+            interface._flash_attn_bwd(90, object())
+    finally:
+        sys.settrace(None)
+    assert interface._art_sm90_pdl_state["active"] == 0
+    assert not interface._art_sm90_pdl_state.get("active_calls")
+    assert patch.apply_flash_sm90_sparse_pdl_patch(interface, version="4.0.0b26")
+
+
+def test_repeat_install_after_backward_does_not_check_quiescence(
+    patch, interface, monkeypatch
+):
+    patch.apply_flash_sm90_sparse_pdl_patch(interface)
+    assert interface._flash_attn_bwd(90, object()) is False
+    code = interface._flash_attn_bwd.__code__
+    cache = interface._flash_attn_bwd.compile_cache
+    monkeypatch.setattr(
+        patch,
+        "_assert_quiescent",
+        lambda *a: pytest.fail("repeat install inspected caches"),
+    )
+    assert patch.apply_flash_sm90_sparse_pdl_patch(interface)
+    assert interface._flash_attn_bwd.__code__ is code
+    assert interface._flash_attn_bwd.compile_cache is cache
+
+
+def test_nonsparse_dispatch_does_not_bind_or_lock(patch, interface, monkeypatch):
+    patch.apply_flash_sm90_sparse_pdl_patch(interface)
+
+    class NoLock:
+        def __enter__(self):
+            pytest.fail("nonsparse backward acquired installation lock")
+
+        def __exit__(self, *args):
+            pass
+
+    interface._art_sm90_pdl_state["lock"] = NoLock()
+    monkeypatch.setattr(
+        patch.inspect.Signature,
+        "bind",
+        lambda *a, **kw: pytest.fail("nonsparse backward bound arguments"),
+    )
+    assert interface._flash_attn_bwd(90) is True
+    assert interface._flash_attn_bwd(arch=100, block_sparse_tensors=None) is True
+    assert interface._art_sm90_pdl_state["used"] is True
+
+
+def test_known_history_cannot_be_erased_by_clearing_caches(patch, interface):
+    interface._flash_attn_bwd(100)
+    with pytest.raises(RuntimeError, match="backward compile cache"):
+        patch.apply_flash_sm90_sparse_pdl_patch(interface)
+    interface._flash_attn_bwd.compile_cache.clear()
+    interface._bwd_preprocess.compile_cache.clear()
+    with pytest.raises(RuntimeError, match="historical FA4 backward use"):
         patch.apply_flash_sm90_sparse_pdl_patch(interface)
