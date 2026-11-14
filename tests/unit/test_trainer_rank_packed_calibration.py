@@ -1,6 +1,7 @@
 """Generic packed rate measurements; synthetic CPU peaks are not GPU evidence."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import json
 import pickle
 
 import pytest
@@ -247,3 +248,100 @@ def test_skipped_wave_guard_precedes_protocol_entry(monkeypatch):
             execute=unexpected,
             check_pending=unexpected,
         )
+
+
+def complete_16k(rank):
+    with rank.calibration_rung(packed_requests(2, length=8192), no_grad=False) as rung:
+        for batch in rung.forward_micro_batches():
+            sum(o.target_logprobs.sum() for o in batch.outputs).backward()
+    return rung._candidate.plan.signature
+
+
+def restore_profiles(rank, codec):
+    if codec == "json":
+        return {
+            signature: reports._memory_profile(json.loads(json.dumps(asdict(profile))))
+            for signature, profile in rank._memory_profiles.items()
+        }
+    return pickle.loads(pickle.dumps(rank._memory_profiles))
+
+
+@pytest.mark.parametrize("codec", [None, "json", "pickle"])
+def test_forward_only_8k_cannot_complete_packed_backward_calibration(
+    monkeypatch, codec
+):
+    with memory.fixed_slope_memory_profiles(), torch.enable_grad():
+        rank = prepared_rank("moe")
+        marker_device(monkeypatch, rank)
+        signature = complete_16k(rank)
+        rank.dp_rank_forward(packed_requests(2, length=4096), no_grad=False)
+        profile = rank._memory_profiles[signature]
+        assert set(dict(profile.rate_observations)) == {8192, 16384}
+        assert set(dict(rank._calibration_memory_rungs[signature][1])) == {16384}
+        if codec is not None:
+            profiles = restore_profiles(rank, codec)
+            rank = prepared_rank("moe")
+            rank._memory_profiles = profiles
+            assert signature not in rank._calibration_memory_rungs
+        calls = marker_device(monkeypatch, rank)
+        decisions = finish(rank)
+        assert [d.candidate_packed_tokens for d in decisions] == [8192]
+        assert [p.packed_tokens for p in calls] == [8192]
+        assert finish(rank) == ()
+
+
+@pytest.mark.parametrize("codec", ["json", "pickle"])
+def test_fresh_rank_can_finish_8k_below_restored_completed_16k(monkeypatch, codec):
+    with memory.fixed_slope_memory_profiles(), torch.enable_grad():
+        rank = prepared_rank("moe")
+        marker_device(monkeypatch, rank)
+        signature = complete_16k(rank)
+        profiles = restore_profiles(rank, codec)
+        rank = prepared_rank("moe")
+        rank._memory_profiles = profiles
+        assert signature not in rank._calibration_memory_rungs
+        calls = marker_device(monkeypatch, rank)
+        decisions = finish(rank)
+        assert len(decisions) == 1
+        decision = decisions[0]
+        assert decision.candidate_packed_tokens == 8192
+        assert decision.fits and decision.eligible
+        assert not decision.seed and not decision.extrapolated
+        assert decision.observed_rungs == 0
+        assert [p.packed_tokens for p in calls] == [8192]
+        # The cache supplied ordinary admission, never a live slope anchor.
+        assert set(dict(rank._calibration_memory_rungs[signature][1])) == {8192}
+        assert finish(rank) == ()
+        profiles = restore_profiles(rank, codec)
+        rank = prepared_rank("moe")
+        rank._memory_profiles = profiles
+        calls = marker_device(monkeypatch, rank)
+        assert finish(rank) == () and not calls
+        larger = rank._plan_flat_forward(packed_requests(2, length=16384))
+        assert not memory._calibration_estimate(rank, larger).eligible
+
+
+def test_completed_caller_extents_are_validated_without_inference(monkeypatch):
+    with memory.fixed_slope_memory_profiles(), torch.enable_grad():
+        rank = prepared_rank("moe")
+        marker_device(monkeypatch, rank)
+        signature = complete_16k(rank)
+        profile = rank._memory_profiles[signature]
+        assert profile.completed_caller_tokens == (16384,)
+        merged = replace(profile, **memory._merge_memory_profile_model_fields(profile))
+        assert merged.completed_caller_tokens == (16384,)
+        memory._validate_memory_profile_model(merged)
+        values = asdict(profile)
+        del values["completed_caller_tokens"]
+        # Old rate hulls load, but cannot invent completed caller intervals.
+        assert reports._memory_profile(values).completed_caller_tokens == ()
+        for invalid in (
+            (0,),
+            (32768,),
+            (True,),
+            (16384.0,),
+            (8192, 8192),
+            (16384, 8192),
+        ):
+            with pytest.raises(ValueError, match="completed caller extents"):
+                reports._memory_profile(dict(values, completed_caller_tokens=invalid))

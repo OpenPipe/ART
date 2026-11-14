@@ -655,7 +655,8 @@ def calibrate_packed_target_rates(
     Persist ordinary rate-bearing profiles and validate their native kernel
     binding on reload. No retry or serving-time measurement is authorized.
     The initial rung retains the existing 2x static seed cap. Incomplete
-    callbacks never qualify an anchor. Cache hits execute no probes.
+    callbacks never qualify an anchor. Cache hits require persisted completed
+    caller extents as well as rate points and execute no probes.
     """
     # Keep the established dense startup trace unchanged, including votes.
     if not self._moe_layers:
@@ -716,9 +717,16 @@ def calibrate_packed_target_rates(
                             profile, _memory._rate_floor_tokens(signature)
                         )
                     )
-                    measured = plan.packed_tokens in dict(points) or (
-                        len(points) >= 2
-                        and points[0][0] <= 8192 <= 16384 <= points[-1][0]
+                    measured = (
+                        profile is not None
+                        and plan.packed_tokens in profile.completed_caller_tokens
+                        and (
+                            plan.packed_tokens in dict(points)
+                            or (
+                                len(points) >= 2
+                                and points[0][0] <= 8192 <= 16384 <= points[-1][0]
+                            )
+                        )
                     )
                 if self._all_ranks_true(measured):
                     continue
@@ -741,6 +749,7 @@ def calibrate_packed_target_rates(
                         and profile is not None
                         and entry is not None
                         and entry[0] is profile
+                        and plan.packed_tokens in profile.completed_caller_tokens
                         and plan.packed_tokens in dict(entry[1])
                         and plan.packed_tokens
                         in dict(

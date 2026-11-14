@@ -306,11 +306,12 @@ def _calibration_estimate(
     *,
     seed_uncovered_cp_family: bool = False,
 ):
-    """Use live, complete rungs, never a pruned hull or borrowed signature.
+    """Extrapolate from live, complete rungs, never a pruned hull or borrowed signature.
 
     This bounded journal is intentionally not persisted. A restored profile
     needs two new observations before extrapolation; serialized upper hulls
-    cannot recover the last-two-rung marginal slope.
+    cannot recover the last-two-rung marginal slope. A persisted completed
+    extent may still qualify ordinary admission below that extent.
     """
     if plan.packed_tokens <= 0:
         raise ValueError("calibration rung must contain an active request")
@@ -401,6 +402,18 @@ def _calibration_estimate(
         # A family-only seed deliberately establishes no rate/journal rung.
         # Its measured covering peak still qualifies an ordinary monitored
         # calibration call, using the same exact family admission and guard.
+        result.extrapolated = False
+        result.eligible = True
+        return result
+    if (
+        profile is not None
+        and not isinstance(profile, _CallerMemoryProfile)
+        and not _unanchored(profile)
+        and result.candidate <= max(profile.completed_caller_tokens, default=0)
+    ):
+        # A cached complete extent can bound an ordinary calibration call below
+        # it. Keep the live journal untouched: a hull cannot supply the last
+        # two actual rungs needed for marginal-slope extrapolation.
         result.extrapolated = False
         result.eligible = True
         return result
@@ -1471,6 +1484,7 @@ def _merge_memory_profile_model_fields(
             extra["profile_format_version"] = 8 if extra["cp_request_floors"] else 7
     return dict(
         peak_model_version=_memory_model._MEMORY_PROFILE_VERSION,
+        completed_caller_tokens=_merge_completed_caller_tokens(*profiles),
         compute_observations=observations,
         fixed_compute_bytes=fixed,
         compute_slope=slope,
@@ -1483,6 +1497,14 @@ def _merge_memory_profile_model_fields(
         ),
         **extra,
     )
+
+
+def _merge_completed_caller_tokens(
+    *profiles: _impl._MemoryProfile, tokens: tuple[int, ...] = ()
+) -> tuple[int, ...]:
+    extents = sorted(set(tokens).union(*(p.completed_caller_tokens for p in profiles)))
+    # Match the live journal's bounded inventory without inventing observations.
+    return tuple(extents if len(extents) <= 8 else [extents[0], *extents[-7:]])
 
 
 def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
@@ -1505,9 +1527,25 @@ def _validate_memory_profile_model(profile: _impl._MemoryProfile) -> None:
             or profile.subfloor_packed_tokens != 0
             or profile.retained_rate_tokens != 0
             or profile.retained_compute_peaks
+            or profile.completed_caller_tokens
         ):
             raise ValueError("unexpected fixed/slope fields in legacy profile")
         return
+    completed = profile.completed_caller_tokens
+    if (
+        type(completed) is not tuple
+        or len(completed) > 8
+        or any(
+            type(n) is not int
+            or not _memory_model._MEMORY_SLOPE_MIN_TOKENS
+            <= n
+            <= profile.eligible_packed_tokens
+            for n in completed
+        )
+        or tuple(sorted(set(completed))) != completed
+        or (completed and profile.profile_format_version < 5)
+    ):
+        raise ValueError("invalid completed caller extents")
     points = profile.compute_observations
     incomplete_caller = (
         isinstance(profile, _CallerMemoryProfile)
@@ -1829,6 +1867,8 @@ def _new_memory_profile(signature, fields: dict[str, Any], *, fixed_slope: bool)
 def _memory_profile_from_values(values: dict[str, Any]) -> _impl._MemoryProfile:
     """Decode the versioned state while preserving the legacy record classes."""
     values = dict(values)
+    if "completed_caller_tokens" in values:
+        values["completed_caller_tokens"] = tuple(values["completed_caller_tokens"])
     if "cp_request_floors" in values:
         values["cp_request_floors"] = tuple(
             tuple(row) for row in values["cp_request_floors"]
@@ -1859,6 +1899,7 @@ def _memory_profile_from_values(values: dict[str, Any]) -> _impl._MemoryProfile:
             "subfloor_packed_tokens",
             "retained_rate_tokens",
             "retained_compute_peaks",
+            "completed_caller_tokens",
         ):
             if name in values and values.pop(name) != getattr(
                 _impl._MemoryProfile, name
@@ -4760,6 +4801,14 @@ def _update_memory_profile(
             profile_format_version=5,
             rate_floor_tokens=floor,
             rate_observations=rates,
+            completed_caller_tokens=_merge_completed_caller_tokens(
+                *(() if previous is None else (previous,)),
+                tokens=(plan.packed_tokens,)
+                if qualifies
+                and caller_phase
+                and plan.packed_tokens >= _memory_model._MEMORY_SLOPE_MIN_TOKENS
+                else (),
+            ),
             absolute_compute_floor=absolute,
             eligible_packed_tokens=max((n for n, _ in rates), default=0),
             subfloor_packed_tokens=max(

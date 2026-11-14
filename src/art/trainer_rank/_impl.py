@@ -686,6 +686,7 @@ class _MemoryProfile:
     subfloor_packed_tokens = 0
     retained_rate_tokens = 0
     retained_compute_peaks = cast(tuple[tuple[int, int], ...], ())
+    completed_caller_tokens = cast(tuple[int, ...], ())
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         # Earlier v2 pickles used the legacy class name. Promote their tagged
@@ -716,6 +717,9 @@ class _MemoryProfileV2(_MemoryProfile):
     subfloor_packed_tokens: int = 0
     retained_rate_tokens: int = 0
     retained_compute_peaks: tuple[tuple[int, int], ...] = ()
+    # Exact qualified caller intervals, independent of forward-only rate points.
+    # Completion survives restore; these extents never supply a marginal slope.
+    completed_caller_tokens: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
