@@ -3,7 +3,7 @@
 from dataclasses import asdict, replace
 import pickle
 import sys
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -194,7 +194,6 @@ def memory_rank():
         _topology_key=lambda: (1, 1, 1, 1),
         _gdn_segment_layer_bytes=lambda: 0,
     )
-    r._uncovered_cp_family = MethodType(m._uncovered_cp_family, r)
     return r
 
 

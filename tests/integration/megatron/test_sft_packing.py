@@ -98,7 +98,7 @@ def test_sft_packing_preserves_training_targets():
             pack_sft_batch(examples, seq_len=64)
 
 
-def _run(runtime, inputs):
+def _run(runtime, inputs, forward_only=False):
     from art.megatron.train import run_megatron_sft_step
     from art.megatron.training.microbatches import (
         _zero_contribution_sft_inputs,
@@ -137,6 +137,7 @@ def _run(runtime, inputs):
         step_index=0,
         sample_index=indices,
         before_optimizer_step=capture_gradients,
+        forward_only=forward_only,
     )
     return float(result.reduced_loss), gradients
 
@@ -225,7 +226,33 @@ def test_sft_packing_loss_and_gradients():
             rows = []
             for last_only in (False, True):
                 examples = _examples(last_only)
+                weights = [
+                    parameter.detach().clone()
+                    for model in runtime.model
+                    for parameter in model.parameters()
+                    if parameter.requires_grad
+                ]
+                with torch.no_grad():
+                    forward_loss, forward_gradients = _run(
+                        runtime, examples, forward_only=True
+                    )
+                assert not forward_gradients
+                for before, parameter in zip(
+                    weights,
+                    (
+                        parameter
+                        for model in runtime.model
+                        for parameter in model.parameters()
+                        if parameter.requires_grad
+                    ),
+                    strict=True,
+                ):
+                    torch.testing.assert_close(
+                        parameter.detach(), before, rtol=0, atol=0
+                    )
                 expected_loss, expected_gradients = _run(runtime, examples)
+                # The step's learning rate is 0, so both runs see the same weights.
+                assert abs(forward_loss - expected_loss) / expected_loss <= 0.005
                 for capacity in (384, 1024):
                     packed = list(pack_sft_batch(examples, seq_len=capacity))
                     loss, gradients = _run(runtime, packed)
