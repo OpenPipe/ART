@@ -6,6 +6,8 @@ import torch
 from torch import Tensor
 import torch.distributed as dist
 
+from .fla_autotune import ensure_blackwell_fwd_h_configs
+
 
 def chunk_gated_delta_rule_native_cp(
     q: Tensor,
@@ -141,6 +143,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
         output_final_state: bool,
         scale: float,
     ) -> tuple[Tensor, Tensor | None]:
+        ensure_blackwell_fwd_h_configs()
         from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
         from fla.ops.common.chunk_o import chunk_fwd_o
         from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd

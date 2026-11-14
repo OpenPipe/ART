@@ -15,6 +15,7 @@ import triton.language as tl
 from art.megatron.canonical.layout import current_layout
 
 from .conv_gelu import packed_varlen_causal_conv
+from .fla_autotune import ensure_blackwell_fwd_h_configs
 from .fla_cp import chunk_gated_delta_rule_native_cp
 from .gdn_prefix_tree import (
     GdnPackedExecutionSpec,
@@ -65,6 +66,7 @@ def set_gdn_trace_token_uid_hooks(hooks: Any | None) -> Any | None:
 def install_prefix_tree_gdn_hooks(model_chunks: Sequence[Any]) -> None:
     """Patch Megatron GatedDeltaNet modules to honor ART prefix-tree packing."""
 
+    ensure_blackwell_fwd_h_configs()
     gated_delta_net_type = _optional_gated_delta_net_type()
     if gated_delta_net_type is None:
         return
@@ -2850,6 +2852,7 @@ def _l2norm(x: Tensor) -> Tensor:
 
 
 def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor | None]:
+    ensure_blackwell_fwd_h_configs()
     try:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     except ImportError as exc:
