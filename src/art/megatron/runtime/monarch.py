@@ -521,6 +521,11 @@ class MonarchTrainerActor(Actor):
         )
 
     @endpoint
+    def enable_compiled_flash_supervision(self) -> None:
+        # Called only after this actor mesh has a registered cohort supervisor.
+        self._runtime.compiled_flash_cohort_supervisor_pid = os.getpid()
+
+    @endpoint
     def ready(self) -> dict[str, Any]:
         return _TrainerRankReady(
             rank=self._runtime.rank,
@@ -702,6 +707,7 @@ class MonarchTrainerActor(Actor):
             raise
 
     def __cleanup__(self, exc: Exception | None) -> None:
+        self._runtime.compiled_flash_cohort_supervisor_pid = None
         if exc is not None:
             self._valid = False
         self._stop_cp_lookahead()
@@ -729,6 +735,7 @@ async def spawn_monarch_trainer_actors(
     )
     supervision.own_mesh(await actors._name)
     await actors.initialized
+    await actors.enable_compiled_flash_supervision.call()
     values = await actors.ready.call()
     ready = tuple(
         sorted(

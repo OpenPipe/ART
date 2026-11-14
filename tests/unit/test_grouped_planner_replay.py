@@ -344,9 +344,11 @@ def test_fact_validation_rejects_inconsistent_or_unbounded_input(
     )
     facts = report["replay"]["memory_replay"]["estimates"][0]["runtime_facts"]
     if change in {"version", "parent_version", "future_version"}:
-        facts["version"] = {"version": 1, "parent_version": 2, "future_version": 5}[
-            change
-        ]
+        facts["version"] = {
+            "version": 1,
+            "parent_version": 2,
+            "future_version": facts["version"] + 1,
+        }[change]
     elif change == "group":
         facts["groups"][0]["rows"] += 1
     elif change == "layout":
