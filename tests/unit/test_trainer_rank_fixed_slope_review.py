@@ -227,6 +227,7 @@ def test_earlier_v2_pickle_promotes_without_losing_model_fields(record):
         subfloor_packed_tokens=0,
         retained_rate_tokens=0,
         retained_compute_peaks=(),
+        completed_caller_tokens=(),
     )
     if isinstance(restored, m._CallerMemoryProfileV2):
         expected.update(

@@ -17,6 +17,7 @@ from ._memory import (
 )
 from ._micro_batch_planner import (
     CalibrationRung,
+    calibrate_packed_target_rates,
     calibrate_request_floors,
     calibration_rung,
 )
@@ -117,6 +118,33 @@ class TrainerRank(_impl.TrainerRank):
             checkpoint=checkpoint,
             no_grad=no_grad,
             seed_uncovered_cp_family=seed_uncovered_cp_family,
+        )
+
+    def calibrate_packed_target_rates(
+        self,
+        template: AnyForwardInput,
+        *,
+        execute: Callable[[CalibrationRung], None],
+        check_pending: Callable[[], None],
+        checkpoint: AdapterSelection = Unset,
+    ) -> tuple[CalibrationRungDecision, ...]:
+        """Finish native MoE CP8 packed-target calibration after both ladders.
+
+        Call after ``calibrate_request_floors`` for each selected adapter/native
+        configuration, before completing the calibration cache. Use the durable
+        *rate-rung* executor and pending-intent gate, not the floor-only executor.
+        The trainer supplies two distinct roots at 16384 and 8192 total tokens.
+        Exhaust each interval with loss and backward, then journal completion
+        on every rank. Completed cached rate points skip execution; unresolved
+        intents still block. Ordinary serving never executes a refused request
+        to learn a rate. Dense returns without probes or added collectives.
+        """
+        return calibrate_packed_target_rates(
+            self,
+            template,
+            execute=execute,
+            check_pending=check_pending,
+            checkpoint=checkpoint,
         )
 
     def calibrate_request_floors(
