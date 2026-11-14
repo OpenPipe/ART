@@ -1,0 +1,55 @@
+{
+  "cost": {
+    "checkpoint_adapter_gradient": 0,
+    "checkpoint_adapter_gradient_slots": "",
+    "checkpoint_input_gradient": 0,
+    "checkpoint_peak_increment": 0,
+    "checkpoint_retained": 32768,
+    "checkpoint_workspace": 0,
+    "hybridep_growth": 0,
+    "required": 1181116006,
+    "retained": 1181116006
+  },
+  "demands": [
+    144179,
+    18454937,
+    1181116006,
+    1181260185,
+    4724464025,
+    9448928051,
+    9449072230
+  ],
+  "profile": {
+    "bytes_per_token": 131068.0,
+    "caller_plans": 0,
+    "logical_per_packed": 1.0,
+    "packed_tokens": 8192,
+    "retained_compute_bytes_per_token": null,
+    "retained_fraction": null,
+    "warm_bytes_per_token": null,
+    "warm_logical_per_packed": null,
+    "warm_packed_tokens": null
+  },
+  "signature": {
+    "grad_enabled": false,
+    "grad_modes": [
+      false
+    ],
+    "planner_coefficients": [
+      2,
+      "dense-h2560-h200-bf16"
+    ],
+    "request_mix": [
+      "target:single"
+    ],
+    "short_requests": false,
+    "slot_group_count": 1,
+    "slot_shapes": [],
+    "topology": [
+      1,
+      1,
+      1,
+      1
+    ]
+  }
+}

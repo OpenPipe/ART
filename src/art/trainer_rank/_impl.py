@@ -670,6 +670,33 @@ class _MemoryProfile:
     warm_packed_tokens: int | None = None
     warm_logical_per_packed: float | None = None
     caller_plans: int = 0
+    # Read defaults are class attributes, not serialized v1 dataclass fields.
+    # Only versioned subclasses store the enabled model's state.
+    peak_model_version = 1
+    compute_observations = cast(tuple[tuple[int, int], ...], ())
+    fixed_compute_bytes = 0
+    compute_slope = (0, 1)
+    legacy_bytes_per_token = 0.0
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # Earlier v2 pickles used the legacy class name. Promote their tagged
+        # state on load so dataclass/report encoders cannot drop those fields.
+        from ._memory import _memory_profile_from_values
+
+        restored = _memory_profile_from_values(state)
+        object.__setattr__(self, "__class__", type(restored))
+        self.__dict__.update(vars(restored))
+
+
+@dataclass(frozen=True)
+class _MemoryProfileV2(_MemoryProfile):
+    peak_model_version: int = 2
+    compute_observations: tuple[tuple[int, int], ...] = ()
+    fixed_compute_bytes: int = 0
+    compute_slope: tuple[int, int] = (0, 1)
+    # A v1 scalar has lost its observations. Never silently discard its bound
+    # on update; a fresh calibration/cache key is needed to remove poisoning.
+    legacy_bytes_per_token: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -3054,6 +3081,7 @@ class TrainerRank:
             include_checkpoint_input_gradient=False,
             checkpoint_memory=checkpoint_memory,
             caller_cp_workload=caller_cp_workload,
+            include_cold_extrapolation=False,
         )
         checkpoint_retained, checkpoint_workspace = checkpoint_memory
         retained = self._retained_memory_bytes(
@@ -3107,15 +3135,20 @@ class TrainerRank:
             )
         # HybridEP buffer growth stays allocated through the forward and
         # backward peaks, but is not forward retention.
+        cold = _memory._cold_extrapolation_factor(
+            self._memory_profiles.get(signature), packed_tokens
+        )
         return _SubforwardCost(
-            required=required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR),
-            retained=retained,
-            checkpoint_retained=checkpoint_retained,
-            checkpoint_workspace=checkpoint_workspace,
-            checkpoint_input_gradient=gradient,
-            checkpoint_peak_increment=required - forward_required,
-            hybridep_growth=hybridep_growth_bytes,
-            checkpoint_adapter_gradient=adapter_gradient,
+            required=math.ceil(
+                (required + int(hybridep_growth_bytes * _MEMORY_SAFETY_FACTOR)) * cold
+            ),
+            retained=math.ceil(retained * cold),
+            checkpoint_retained=math.ceil(checkpoint_retained * cold),
+            checkpoint_workspace=math.ceil(checkpoint_workspace * cold),
+            checkpoint_input_gradient=math.ceil(gradient * cold),
+            checkpoint_peak_increment=math.ceil((required - forward_required) * cold),
+            hybridep_growth=math.ceil(hybridep_growth_bytes * cold),
+            checkpoint_adapter_gradient=math.ceil(adapter_gradient * cold),
             checkpoint_adapter_gradient_slots=json.dumps(
                 [
                     [ref.kind, ref.name]
