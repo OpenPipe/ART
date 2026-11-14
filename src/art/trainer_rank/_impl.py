@@ -3578,11 +3578,15 @@ class TrainerRank:
             observation["phase"] = "forward"
         started = self._recovery_clock() if baseline is not None else None
         try:
-            with _telemetry_phase(
-                "forward",
-                self._telemetry_signature(plan),
-                dedup_signature=self._telemetry_plan_signature(plan),
-                synchronized=torch.cuda.is_available() and self.device.type == "cuda",
+            with (
+                _memory._compiled_cp_execution(self, plan),
+                _telemetry_phase(
+                    "forward",
+                    self._telemetry_signature(plan),
+                    dedup_signature=self._telemetry_plan_signature(plan),
+                    synchronized=torch.cuda.is_available()
+                    and self.device.type == "cuda",
+                ),
             ):
                 outputs = self._execute_flat_plan(plan)
                 if torch.cuda.is_available() and self.device.type == "cuda":

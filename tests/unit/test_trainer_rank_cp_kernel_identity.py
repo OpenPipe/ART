@@ -274,8 +274,9 @@ def test_cache_exhaustion_cannot_reuse_or_record_compiled_caller_evidence(monkey
     )
     options = dict(block_mask=mask, scale=0.125, enable_gqa=False)
     try:
-        with memory.fixed_slope_memory_profiles(), torch._dynamo.config.patch(
-            recompile_limit=1
+        with (
+            memory.fixed_slope_memory_profiles(),
+            torch._dynamo.config.patch(recompile_limit=1),
         ):
             entries["sparse"](q, k, k, **options)
             observed = rank._plan_flat_forward([request(16384, grad=True)])
@@ -295,8 +296,9 @@ def test_cache_exhaustion_cannot_reuse_or_record_compiled_caller_evidence(monkey
                 pytest.fail("compiled caller evidence admitted eager math")
 
             monkeypatch.setattr(hop, "_math_attention_inner", forbidden_math)
-            with pytest.raises(RuntimeError, match="refusing eager FLASH fallback"):
-                entries["sparse"](q, k, k, **options)
+            with memory._compiled_cp_execution(rank, observed):
+                with pytest.raises(RuntimeError, match="refusing eager FLASH fallback"):
+                    entries["sparse"](q, k, k, **options)
             # Even if an outer caller catches the refusal, the stale plan may
             # neither publish a compiled observation nor extend live rungs.
             rank._update_memory_profile(
@@ -309,3 +311,85 @@ def test_cache_exhaustion_cannot_reuse_or_record_compiled_caller_evidence(monkey
             assert profile.covering_cp_peak(8192, requested) is None
     finally:
         torch._dynamo.reset()
+
+
+def test_rejected_workload_identity_preserves_ordinary_eager_calls(monkeypatch):
+    import importlib
+
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    flex = importlib.import_module("torch.nn.attention.flex_attention")
+    monkeypatch.setattr(flex, "_validate_device", lambda *args: None)
+    originals = {
+        "dense": compiled._flex_attention_with_options({"BACKEND": "FLASH"}),
+        "sparse": compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"}),
+    }
+    entries = {
+        kind: torch.compile(original, backend="eager")
+        for kind, original in originals.items()
+    }
+    for kind, entry in entries.items():
+        monkeypatch.setattr(
+            compiled,
+            f"get_{kind}_compiled_flex_attention",
+            lambda _entry=entry, **kw: _entry,
+        )
+    rank = metadata_rank("moe", head_dim=64)
+    rank.device = torch.device("cpu")
+    q = torch.ones(1, 1, 2, 64)
+    mask = create_block_mask(
+        lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=2, KV_LEN=2, device="cpu"
+    )
+    options = dict(block_mask=mask, scale=0.125, enable_gqa=False)
+    originals["sparse"](q, q, q, **options)
+    with memory.fixed_slope_memory_profiles():
+        plan = rank._plan_flat_forward([request(16384, grad=True)])
+        assert not memory._known_cp_kernels(plan.caller_cp_workload)
+        # Dense qualified successfully before sparse rejected. Neither query
+        # may leave an active execution requirement behind.
+        assert all(
+            not compiled._flex_execution_state(entry)["required"]
+            for entry in entries.values()
+        )
+        with memory._compiled_cp_execution(rank, plan):
+            originals["sparse"](q, q, q, **options)
+    assert not rank._memory_profiles
+    originals["sparse"](q, q, q, **options)
+
+
+@pytest.mark.parametrize("split", [False, True])
+def test_compiled_requirement_is_scoped_to_qualified_plan(monkeypatch, split):
+    from types import SimpleNamespace
+
+    entries = {
+        kind: torch.compile(factory({"BACKEND": "FLASH"}))
+        for kind, factory in (
+            ("dense", compiled._flex_attention_with_options),
+            ("sparse", compiled._sparse_flex_attention_with_options),
+        )
+    }
+    for kind, entry in entries.items():
+        monkeypatch.setattr(
+            compiled,
+            f"get_{kind}_compiled_flex_attention",
+            lambda _entry=entry, **kw: _entry,
+        )
+    rank = metadata_rank("moe", head_dim=64)
+    rank.device = torch.device("cpu")
+    with memory.fixed_slope_memory_profiles():
+        plan = rank._plan_flat_forward([request(16384, grad=True)])
+    assert memory._known_cp_kernels(plan.caller_cp_workload)
+    states = [compiled._flex_execution_state(entry) for entry in entries.values()]
+    assert not any(state["required"] for state in states)
+    candidate = SimpleNamespace(subforwards=(plan, plan)) if split else plan
+    # A retained v2 workload needs the guard even outside collection scope.
+    with pytest.raises(ValueError, match="caller failed"):
+        with memory._compiled_cp_execution(rank, candidate):
+            assert all(state["required"] for state in states)
+            with memory._compiled_cp_execution(rank, plan):
+                assert all(state["required"] for state in states)
+            assert all(state["required"] for state in states)
+            raise ValueError("caller failed")
+    assert not any(state["required"] for state in states)
+    with memory._compiled_cp_execution(rank, SimpleNamespace(caller_cp_workload=None)):
+        assert not any(state["required"] for state in states)

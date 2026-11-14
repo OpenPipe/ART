@@ -657,101 +657,104 @@ def _forward_micro_batches(
             )
         self._snapshot_planning_telemetry(candidate.plan, candidate.check)
         _protocol.checkpoint()
-        tracked_outputs: list[AnyForwardOutput] = []
-        outputs: list[Any] = []
-        flat_outputs = iter(tracked_outputs)
-        error: BaseException | None = None
-        interval: tuple[int, int] | None = None
-        try:
-            if isinstance(candidate.plan, _impl._FlatForwardPlan):
-                tracked_outputs, memory_baseline = (
-                    self._run_flat_plan_with_memory_tracking(
-                        candidate.plan,
-                        check=candidate.check,
-                        context="forward_micro_batches",
-                    )
-                )
-                # This wave's peak interval, which its caller phase continues.
-                interval = self.__dict__.get("_peak_reading")
-            else:
-                tracked_outputs, memory_baseline, forward_peak = (
-                    self._execute_split_plan_with_memory_tracking(
-                        candidate.plan,
-                        check=candidate.check,
-                        context="forward_micro_batches",
-                    )
-                )
+        # Keep the requirement through the caller's in-yield backward/recompute;
+        # restore it on normal completion, error, close, and generator teardown.
+        with _memory._compiled_cp_execution(self, candidate.plan):
+            tracked_outputs: list[AnyForwardOutput] = []
+            outputs: list[Any] = []
             flat_outputs = iter(tracked_outputs)
-            outputs = [
-                _impl._unflatten(item, flat_outputs) for item in candidate.inputs
-            ]
-        except BaseException as exc:
-            error = exc
-        if error is not None and _protocol.active() is not None:
-            # The explicit driver carries this local failure to the current
-            # phase exit before any peer enters the backward handoff vote.
-            raise error
-        try:
-            self._release_cached_memory_for_backward(candidate.plan, error=error)
-        except BaseException:
-            # Do not retain our completed graph through a new handoff traceback.
-            del tracked_outputs, flat_outputs, outputs
-            raise
-        if backward is not None:
-            backward.attach(tracked_outputs)
-        stop = start + candidate.stats_global_count
-        if stop < len(items):
-            self._last_global_micro_batch_size = max(
-                self._last_global_micro_batch_size or 0,
-                candidate.stats_global_count,
-            )
-            # Overlap next-wave planning with the caller's GPU time: the
-            # width search seeds from the last wave's width, so pre-plan
-            # that slice while this generator is suspended at the yield.
-            self._submit_speculative_wave_planning(items, stop, checkpoint=checkpoint)
-        self._snapshot_planning_telemetry(candidate.plan, candidate.check)
-        try:
-            with _impl._telemetry_phase(
-                "caller",
-                self._telemetry_signature(candidate.plan),
-                dedup_signature=self._telemetry_plan_signature(candidate.plan),
-            ):
-                yield _impl.MicroBatch(
-                    inputs=candidate.inputs,
-                    outputs=outputs,
-                    indices=candidate.indices,
-                    stats=_impl.MicroBatchStats(
-                        global_start=start,
-                        global_stop=stop,
-                        global_count=candidate.stats_global_count,
-                        local_count=len(candidate.inputs),
-                        packed_tokens=candidate.plan.packed_tokens,
-                        logical_tokens=candidate.plan.logical_tokens,
-                        estimated_required_bytes=candidate.check.estimated_required_bytes,
-                        available_bytes=candidate.check.available_bytes,
-                        rejected_candidates=candidate.rejected_candidates,
-                        cold_start=candidate.cold_start,
-                        subforward_count=candidate.plan.subforward_count,
-                    ),
-                )
+            error: BaseException | None = None
+            interval: tuple[int, int] | None = None
+            try:
+                if isinstance(candidate.plan, _impl._FlatForwardPlan):
+                    tracked_outputs, memory_baseline = (
+                        self._run_flat_plan_with_memory_tracking(
+                            candidate.plan,
+                            check=candidate.check,
+                            context="forward_micro_batches",
+                        )
+                    )
+                    # This wave's peak interval, which its caller phase continues.
+                    interval = self.__dict__.get("_peak_reading")
+                else:
+                    tracked_outputs, memory_baseline, forward_peak = (
+                        self._execute_split_plan_with_memory_tracking(
+                            candidate.plan,
+                            check=candidate.check,
+                            context="forward_micro_batches",
+                        )
+                    )
+                flat_outputs = iter(tracked_outputs)
+                outputs = [
+                    _impl._unflatten(item, flat_outputs) for item in candidate.inputs
+                ]
+            except BaseException as exc:
+                error = exc
+            if error is not None and _protocol.active() is not None:
+                # The explicit driver carries this local failure to the current
+                # phase exit before any peer enters the backward handoff vote.
+                raise error
+            try:
+                self._release_cached_memory_for_backward(candidate.plan, error=error)
+            except BaseException:
+                # Do not retain our completed graph through a new handoff traceback.
+                del tracked_outputs, flat_outputs, outputs
+                raise
             if backward is not None:
-                backward.harvest()
-            # Normal resume alone closes the caller's measured interval.
-            # Close/throw/GC must remain local and preserve pending OOM context.
-            from . import _memory
-
-            if _memory._try_update_caller_memory_profile(
-                self,
-                candidate.plan,
-                memory_baseline,
-                interval,
-                0
-                if isinstance(candidate.plan, _impl._FlatForwardPlan)
-                else forward_peak,
-            ):
-                self._complete_planner_observation()
-        finally:
-            del tracked_outputs, flat_outputs, outputs
+                backward.attach(tracked_outputs)
+            stop = start + candidate.stats_global_count
+            if stop < len(items):
+                self._last_global_micro_batch_size = max(
+                    self._last_global_micro_batch_size or 0,
+                    candidate.stats_global_count,
+                )
+                # Overlap next-wave planning with the caller's GPU time: the
+                # width search seeds from the last wave's width, so pre-plan
+                # that slice while this generator is suspended at the yield.
+                self._submit_speculative_wave_planning(
+                    items, stop, checkpoint=checkpoint
+                )
+            self._snapshot_planning_telemetry(candidate.plan, candidate.check)
+            try:
+                with _impl._telemetry_phase(
+                    "caller",
+                    self._telemetry_signature(candidate.plan),
+                    dedup_signature=self._telemetry_plan_signature(candidate.plan),
+                ):
+                    yield _impl.MicroBatch(
+                        inputs=candidate.inputs,
+                        outputs=outputs,
+                        indices=candidate.indices,
+                        stats=_impl.MicroBatchStats(
+                            global_start=start,
+                            global_stop=stop,
+                            global_count=candidate.stats_global_count,
+                            local_count=len(candidate.inputs),
+                            packed_tokens=candidate.plan.packed_tokens,
+                            logical_tokens=candidate.plan.logical_tokens,
+                            estimated_required_bytes=candidate.check.estimated_required_bytes,
+                            available_bytes=candidate.check.available_bytes,
+                            rejected_candidates=candidate.rejected_candidates,
+                            cold_start=candidate.cold_start,
+                            subforward_count=candidate.plan.subforward_count,
+                        ),
+                    )
+                if backward is not None:
+                    backward.harvest()
+                # Normal resume alone closes the caller's measured interval.
+                # Close/throw/GC must remain local and preserve pending OOM context.
+                if _memory._try_update_caller_memory_profile(
+                    self,
+                    candidate.plan,
+                    memory_baseline,
+                    interval,
+                    0
+                    if isinstance(candidate.plan, _impl._FlatForwardPlan)
+                    else forward_peak,
+                ):
+                    self._complete_planner_observation()
+            finally:
+                del tracked_outputs, flat_outputs, outputs
         start = stop
 
 

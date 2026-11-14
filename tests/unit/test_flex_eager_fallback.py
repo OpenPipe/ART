@@ -1,18 +1,22 @@
 """CPU math HOP, real CP merge autograd, and mixed-rank cache fallback."""
 
 import ast
+from contextlib import nullcontext
 from datetime import timedelta
 import importlib
 import json
 import logging
 import math
 from pathlib import Path
+import signal
+import time
 from typing import Any, cast
 
 import pytest
 import torch
 from torch._dynamo.utils import counters
 import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch.nn.attention.flex_attention import AuxRequest, create_block_mask
 from torch.utils.checkpoint import checkpoint
 
@@ -327,9 +331,14 @@ def test_flash_wrappers_have_no_graph_breaks(entry, qualified):
             is not None
         )
     try:
-        explanation = torch._dynamo.explain(fn)(
-            q, k, k, block_mask=mask, scale=0.125, enable_gqa=False, **extra
-        )
+        with (
+            compiled.require_compiled_flex_attention(torch.compile(fn))
+            if qualified
+            else nullcontext()
+        ):
+            explanation = torch._dynamo.explain(fn)(
+                q, k, k, block_mask=mask, scale=0.125, enable_gqa=False, **extra
+            )
         assert explanation.graph_count == 1
         assert explanation.graph_break_count == 0, explanation.break_reasons
     finally:
@@ -516,8 +525,9 @@ def test_qualified_flash_refuses_cache_exhaustion_before_eager_math(
 
             hop = importlib.import_module("torch._higher_order_ops.flex_attention")
             monkeypatch.setattr(hop, "_math_attention_inner", forbidden_math)
-            with pytest.raises(RuntimeError, match="refusing eager FLASH fallback"):
-                attention(q, k, k, **options)
+            with compiled.require_compiled_flex_attention(attention):
+                with pytest.raises(RuntimeError, match="refusing eager FLASH fallback"):
+                    attention(q, k, k, **options)
         assert (
             compiled.compiled_flex_attention_family(
                 attention, device=q.device, head_dim=8
@@ -551,8 +561,11 @@ def test_earlier_eager_flash_cannot_be_relabelled_as_compiled(monkeypatch, entry
         compiled.compiled_flex_attention_family(attention, device=q.device, head_dim=8)
         is None
     )
-    with pytest.raises(RuntimeError, match="refusing eager FLASH fallback"):
-        original(q, q, q, **options)
+    # Rejected qualification cannot change ordinary eager serving.
+    original(q, q, q, **options)
+    assert not getattr(
+        original, "_art_flex_execution_state", compiled._FORCED_FLEX_EXECUTION_STATE
+    )["required"]
 
 
 @pytest.mark.parametrize("forced", [False, True])
@@ -591,7 +604,192 @@ def test_qualified_dense_flash_cannot_resume_inside_public_api(monkeypatch, forc
     hop = importlib.import_module("torch._higher_order_ops.flex_attention")
     monkeypatch.setattr(hop, "_math_attention_inner", forbidden_math)
     try:
-        with pytest.raises(RuntimeError, match="graph_break"):
-            attention(q, k, k, block_mask=mask, scale=0.125, enable_gqa=False)
+        with compiled.require_compiled_flex_attention(attention):
+            with pytest.raises(RuntimeError, match="graph_break"):
+                attention(q, k, k, block_mask=mask, scale=0.125, enable_gqa=False)
     finally:
         torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("entry", ["sparse", "dense", "forced_dense"])
+def test_identity_query_and_requirement_have_separate_lifetimes(entry):
+    original = (
+        compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"})
+        if entry == "sparse"
+        else compiled._forced_flex_attention_dense
+        if entry == "forced_dense"
+        else compiled._flex_attention_with_options({"BACKEND": "FLASH"})
+    )
+    attention = torch.compile(original, backend="eager")
+    state = compiled._flex_execution_state(attention)
+    assert state is not None
+    # A missing head dimension rejects qualification without arming execution.
+    assert (
+        compiled.compiled_flex_attention_family(attention, device=torch.device("cpu"))
+        is None
+    )
+    assert not state["required"]
+    assert (
+        compiled.compiled_flex_attention_family(
+            attention, device=torch.device("cpu"), head_dim=8
+        )
+        is not None
+    )
+    assert not state["required"]
+    with pytest.raises(ValueError, match="caller failed"):
+        with compiled.require_compiled_flex_attention(attention):
+            assert state["required"]
+            with compiled.require_compiled_flex_attention(attention):
+                assert state["required"]
+            assert state["required"]
+            raise ValueError("caller failed")
+    assert not state["required"]
+    q = torch.ones(1, 1, 2, 8)
+    mask = create_block_mask(
+        lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=2, KV_LEN=2, device="cpu"
+    )
+    original(q, q, q, block_mask=mask, scale=0.125, enable_gqa=False)
+    assert state["fallback"]
+    assert (
+        compiled.compiled_flex_attention_family(attention, device=q.device, head_dim=8)
+        is None
+    )
+    assert not state["required"]
+    original(q, q, q, block_mask=mask, scale=0.125, enable_gqa=False)
+
+
+def _qualified_cache_rank_worker(rank, rendezvous, directory, entry, peer_entered):
+    torch.set_num_threads(1)
+    torch._dynamo.reset()
+    # A long model timeout makes a timeout-based refusal fail this test.
+    dist.init_process_group(
+        "gloo",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    cp = dist.new_group([0, 1], backend="gloo", timeout=timedelta(seconds=60))
+    from art.trainer_rank import _calibration_protocol as protocol
+
+    class Rank:
+        _forward_replica_group = None
+
+        def _forward_collective_device(self):
+            return torch.device("cpu")
+
+        def _recovery_reduce(self, values, *, _phase, _buffer, **kwargs):
+            return protocol.vote(self, values, _phase, _buffer)
+
+    progress = Path(directory) / f"rank{rank}.json"
+
+    def dense_math(q, *args, **kwargs):
+        if not torch.compiler.is_compiling():
+            progress.write_text(json.dumps({"eager_math": True}))
+            raise AssertionError("qualified execution entered eager math")
+        return q + 1
+
+    def sparse_math(q, k, v, *args):
+        out = dense_math(q)
+        return out, q.sum(-1), q.sum(-1)
+
+    compiled.flex_attention = dense_math
+    compiled.flex_attention_hop = sparse_math
+    original = (
+        compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"})
+        if entry == "sparse"
+        else compiled._forced_flex_attention_dense
+        if entry == "forced_dense"
+        else compiled._flex_attention_with_options({"BACKEND": "FLASH"})
+    )
+    attention = torch.compile(original, backend="eager", dynamic=False)
+    mask = (
+        create_block_mask(
+            lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=128, KV_LEN=128, device="cpu"
+        )
+        if entry == "sparse"
+        else None
+    )
+    options = dict(block_mask=mask, scale=1.0, enable_gqa=False)
+    assert (
+        compiled.compiled_flex_attention_family(
+            attention, device=torch.device("cpu"), head_dim=8
+        )
+        is not None
+    )
+    q = torch.zeros(1, 1, 2, 8)
+    with (
+        compiled.require_compiled_flex_attention(attention),
+        torch._dynamo.config.patch(recompile_limit=1),
+    ):
+        attention(q, q, q, **options)
+        dist.barrier()
+        progress.write_text(json.dumps({"qualified": True}))
+        try:
+            with protocol.Driver(Rank()):
+                if rank == 0:
+                    assert peer_entered.wait(
+                        10
+                    ), "peer never entered model communication"
+                q = torch.zeros(1, 1, 3 if rank == 0 else 2, 8)
+                attention(q, q, q, **options)
+                progress.write_text(
+                    json.dumps({"attention": "returned", "model_collective": "entered"})
+                )
+                received = torch.empty(2)
+                peer_entered.set()
+                dist.all_to_all_single(
+                    received, torch.full((2,), float(rank)), group=cp
+                )
+                progress.write_text(json.dumps({"model_collective": "completed"}))
+        except BaseException as error:
+            progress.write_text(
+                json.dumps({"error": str(error), "cause": str(error.__cause__)})
+            )
+            if rank != 1:
+                raise
+        finally:
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("entry", ["sparse", "dense", "forced_dense"])
+def test_qualified_mixed_cache_failure_terminates_rank_and_unblocks_peer(
+    tmp_path, entry
+):
+    # PyTorch's supervisor is the CPU stand-in for Monarch's ProcMesh teardown:
+    # a dead rank must terminate the cohort even if a peer is stuck in Gloo.
+    peer_entered = mp.get_context("spawn").Event()
+    processes = mp.spawn(
+        _qualified_cache_rank_worker,
+        args=(f"file://{tmp_path}/rendezvous", str(tmp_path), entry, peer_entered),
+        nprocs=2,
+        join=False,
+    )
+    started = time.monotonic()
+    try:
+        with pytest.raises(mp.ProcessExitedException) as failure:
+            while not processes.join(timeout=20, grace_period=1):
+                assert time.monotonic() - started < 25, "qualified cohort hung"
+        assert failure.value.exit_code == 1
+        assert failure.value.error_index == 0
+        assert time.monotonic() - started < 25  # Model/control timeout is 60s.
+        assert all(not process.is_alive() for process in processes.processes)
+        assert processes.processes[0].exitcode == 1
+        assert processes.processes[1].exitcode in (0, -signal.SIGTERM, -signal.SIGKILL)
+        failed = json.loads((tmp_path / "rank0.json").read_text())
+        peer = json.loads((tmp_path / "rank1.json").read_text())
+        assert failed == {"qualified": True}, failed
+        if "error" in peer:
+            text = (peer["error"] + peer["cause"]).lower()
+            assert "closed" in text or "reset" in text, peer
+            assert "timed out" not in text and "timeout" not in text, peer
+        else:
+            assert peer == {
+                "attention": "returned",
+                "model_collective": "entered",
+            }, peer
+    finally:
+        for process in processes.processes:
+            if process.is_alive():
+                process.kill()
+            process.join()

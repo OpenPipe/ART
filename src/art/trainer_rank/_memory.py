@@ -177,7 +177,6 @@ def _qualified_cp_workload(
     from dataclasses import asdict
 
     from art.megatron.flex_attn import compiled
-    from art.megatron.flex_attn.attention import _triton_num_stages_2_head_dims
 
     assert plan.caller_cp_workload is not None
     family, loads = plan.caller_cp_workload
@@ -192,19 +191,7 @@ def _qualified_cp_workload(
     )
     kernels = []
     if backend is not None:
-        options: dict[str, Any] = dict(
-            backend=backend,
-            head_dim=head,
-            head_dim_v=head,
-            triton_num_stages_2_head_dims=_triton_num_stages_2_head_dims(
-                self.runtime.provider
-            ),
-            device=self.device,
-        )
-        for function in (
-            compiled.get_dense_compiled_flex_attention(**options),
-            compiled.get_sparse_compiled_flex_attention(family_key="sparse", **options),
-        ):
+        for function in _cp_flex_entrypoints(self):
             family_id = compiled.compiled_flex_attention_family(
                 function, device=self.device, head_dim=head
             )
@@ -231,6 +218,48 @@ def _qualified_cp_workload(
         dtype_bytes=self._param_dtype_size,
     )
     return json.dumps(value, sort_keys=True, separators=(",", ":")), loads
+
+
+def _cp_flex_entrypoints(self: TrainerRank) -> tuple[Any, Any]:
+    from art.megatron.flex_attn import compiled
+    from art.megatron.flex_attn.attention import _triton_num_stages_2_head_dims
+
+    head = self._geometry.kv_channels
+    options: dict[str, Any] = dict(
+        backend=compiled.flex_backend_for_head_dims(
+            head_dim=head, head_dim_v=head, device=self.device
+        ),
+        head_dim=head,
+        head_dim_v=head,
+        triton_num_stages_2_head_dims=_triton_num_stages_2_head_dims(
+            self.runtime.provider
+        ),
+        device=self.device,
+    )
+    return (
+        compiled.get_dense_compiled_flex_attention(**options),
+        compiled.get_sparse_compiled_flex_attention(family_key="sparse", **options),
+    )
+
+
+@contextmanager
+def _compiled_cp_execution(
+    self: TrainerRank, plan: _impl._AnyForwardPlan
+) -> Iterator[None]:
+    """Cover forward and in-yield recompute, including retained v2 admission."""
+    plans = getattr(plan, "subforwards", (plan,))
+    if any(
+        (workload := getattr(child, "caller_cp_workload", None)) is not None
+        and _known_cp_kernels(workload)
+        and json.loads(workload[0])["execution_qualification"]["backend"] == "FLASH"
+        for child in plans
+    ):
+        from art.megatron.flex_attn.compiled import require_compiled_flex_attention
+
+        with require_compiled_flex_attention(*_cp_flex_entrypoints(self)):
+            yield
+    else:
+        yield
 
 
 def _block_cp_pair(profile: _CallerMemoryProfileV2, requested: str, observed: str):

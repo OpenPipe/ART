@@ -4,7 +4,8 @@ Production uses Inductor; eager/aot_eager capture backends lack its FLASH LSE co
 """
 
 from collections import OrderedDict
-from contextlib import nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 import json
 import logging
 import math
@@ -157,10 +158,20 @@ def _flash_eager_fallback(
         # the HOP boundary, including resumed frames after cache exhaustion.
         runtime_state["fallback"] = True
         if runtime_state["required"]:
-            raise RuntimeError(
+            message = (
                 "Compiled FLASH execution is required for kernel-family evidence; "
                 "refusing eager FLASH fallback"
             )
+            if torch.distributed.is_initialized():
+                # A peer may already be entering CP/TP communication. Do not
+                # unwind into calibration's unrelated control-group vote.
+                # Process death notifies Monarch supervision, which invalidates
+                # and stops the entire trainer ProcMesh, as for device faults.
+                try:
+                    os.write(2, (message + "; terminating trainer rank\n").encode())
+                finally:
+                    os._exit(1)
+            raise RuntimeError(message)
     rank = (
         str(torch.distributed.get_rank())
         if torch.distributed.is_initialized()
@@ -394,15 +405,45 @@ def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
     return _flex_attention
 
 
+def _flex_execution_state(entrypoint: Any) -> dict[str, bool] | None:
+    original = getattr(entrypoint, "_torchdynamo_orig_callable", None)
+    if original is _forced_flex_attention_dense:
+        return _FORCED_FLEX_EXECUTION_STATE
+    return getattr(original, "_art_flex_execution_state", None)
+
+
+@contextmanager
+def require_compiled_flex_attention(*entrypoints: Any) -> Iterator[None]:
+    """Enforce compiled evidence only for the admitted execution/caller interval.
+
+    Identity queries never arm this requirement. Keep fallback history separate:
+    leaving this scope permits ordinary eager calls but cannot restore evidence.
+    Trainer model execution is serialized; nested scopes restore their owner.
+    """
+    states = []
+    try:
+        for entrypoint in entrypoints:
+            state = _flex_execution_state(entrypoint)
+            if state is None:
+                raise ValueError("Unknown compiled Flex attention entrypoint")
+            states.append((state, state["required"]))
+            state["required"] = True
+        yield
+    finally:
+        for state, required in reversed(states):
+            state["required"] = required
+
+
 def compiled_flex_attention_family(
     entrypoint: Any, *, device: torch.device, head_dim: int | None = None
 ) -> str | None:
-    """Qualify this entrypoint for compiled-only FLASH memory evidence.
+    """Identify an entrypoint eligible for compiled-only FLASH memory evidence.
 
     Include effective forward/backward overrides and capability: omitted options
     use Torch's device-dependent defaults. Unknown entrypoints cannot grant reuse.
-    Once qualified, eager FLASH raises before attention allocates. Any earlier
-    fallback permanently disqualifies this entrypoint, including mixed intervals.
+    This query has no execution side effects. Qualified executions must use
+    require_compiled_flex_attention. Earlier fallback permanently disqualifies
+    the entrypoint, including mixed intervals.
     """
     original = getattr(entrypoint, "_torchdynamo_orig_callable", None)
     if original is _forced_flex_attention_dense:
@@ -419,7 +460,6 @@ def compiled_flex_attention_family(
     if runtime_state is None:
         return None
     if options.get("BACKEND") == "FLASH":
-        runtime_state["required"] = True
         if runtime_state["fallback"] or head_dim is None:
             return None
     if head_dim is not None:
