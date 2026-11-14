@@ -70,6 +70,9 @@ def _cpu_math(monkeypatch):
     counters["art"]["flex_flash_eager_fallback"] = 0
     counters["art"]["flex_flash_eager_fallback_overflow"] = 0
     monkeypatch.setattr(compiled, "_FLASH_EAGER_FALLBACK_WARNINGS", 0, raising=False)
+    monkeypatch.setattr(
+        compiled, "_FORCED_FLEX_EXECUTION_STATE", {"required": False, "fallback": False}
+    )
     if hasattr(compiled, "_FLASH_EAGER_FALLBACK_KEYS"):
         compiled._FLASH_EAGER_FALLBACK_KEYS.clear()
     try:
@@ -298,7 +301,8 @@ def test_fallback_warning_budget_is_process_wide(caplog):
 
 
 @pytest.mark.parametrize("entry", ["forced_dense", "sparse", "dense"])
-def test_flash_wrappers_have_no_graph_breaks(entry):
+@pytest.mark.parametrize("qualified", [False, True])
+def test_flash_wrappers_have_no_graph_breaks(entry, qualified):
     torch._dynamo.reset()
     q = torch.ones(1, 1, 2, 8, requires_grad=True)
     k = torch.ones(1, 1, 1, 8, requires_grad=True)
@@ -315,6 +319,13 @@ def test_flash_wrappers_have_no_graph_breaks(entry):
             else compiled._flex_attention_with_options({"BACKEND": "FLASH"})
         )
         extra = {"return_aux": AuxRequest(lse=True)}
+    if qualified:
+        assert (
+            compiled.compiled_flex_attention_family(
+                torch.compile(fn), device=q.device, head_dim=8
+            )
+            is not None
+        )
     try:
         explanation = torch._dynamo.explain(fn)(
             q, k, k, block_mask=mask, scale=0.125, enable_gqa=False, **extra
@@ -446,3 +457,141 @@ def test_cache_hit_and_fallback_ranks_complete_collectives(tmp_path):
         timeout=45,
         failure="Cache hit and fallback ranks diverged in model collectives",
     )
+
+
+@pytest.mark.parametrize(
+    "entry,resumed",
+    [("sparse", False), ("dense", False), ("forced_dense", False), ("sparse", True)],
+)
+def test_qualified_flash_refuses_cache_exhaustion_before_eager_math(
+    monkeypatch, entry, resumed
+):
+    torch._dynamo.reset()
+    monkeypatch.setattr(
+        compiled, "_FORCED_FLEX_EXECUTION_STATE", {"required": False, "fallback": False}
+    )
+    mask = create_block_mask(
+        lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=128, KV_LEN=128, device="cpu"
+    )
+    if resumed:
+        as_tuple = mask.as_tuple
+
+        def graph_breaking_tuple():
+            torch._dynamo.graph_break()
+            return as_tuple()
+
+        monkeypatch.setattr(mask, "as_tuple", graph_breaking_tuple)
+    original = (
+        compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"})
+        if entry == "sparse"
+        else compiled._forced_flex_attention_dense
+        if entry == "forced_dense"
+        else compiled._flex_attention_with_options({"BACKEND": "FLASH"})
+    )
+    attention = torch.compile(
+        original, backend=lambda graph, _: _FlashContract(graph).run, dynamic=False
+    )
+    q = torch.ones(1, 1, 2, 8, requires_grad=True)
+    k = torch.ones(1, 1, 1, 8, requires_grad=True)
+    options = dict(
+        block_mask=mask if entry == "sparse" else None, scale=0.125, enable_gqa=False
+    )
+    try:
+        with torch._dynamo.config.patch(recompile_limit=1):
+            attention(q, k, k, **options)
+            # Qualify after warming, so the fallback cannot use captured state.
+            assert (
+                compiled.compiled_flex_attention_family(
+                    attention, device=q.device, head_dim=8
+                )
+                is not None
+            )
+            if resumed:
+                options["scale"] = 0.25
+            else:
+                q = torch.ones(1, 1, 3, 8, requires_grad=True)
+
+            def forbidden_math(*args, **kwargs):
+                pytest.fail("qualified FLASH reached quadratic eager math")
+
+            hop = importlib.import_module("torch._higher_order_ops.flex_attention")
+            monkeypatch.setattr(hop, "_math_attention_inner", forbidden_math)
+            with pytest.raises(RuntimeError, match="refusing eager FLASH fallback"):
+                attention(q, k, k, **options)
+        assert (
+            compiled.compiled_flex_attention_family(
+                attention, device=q.device, head_dim=8
+            )
+            is None
+        )
+    finally:
+        torch._dynamo.reset()
+
+
+@pytest.mark.parametrize("entry", ["sparse", "dense", "forced_dense"])
+def test_earlier_eager_flash_cannot_be_relabelled_as_compiled(monkeypatch, entry):
+    monkeypatch.setattr(
+        compiled, "_FORCED_FLEX_EXECUTION_STATE", {"required": False, "fallback": False}
+    )
+    original = (
+        compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"})
+        if entry == "sparse"
+        else compiled._forced_flex_attention_dense
+        if entry == "forced_dense"
+        else compiled._flex_attention_with_options({"BACKEND": "FLASH"})
+    )
+    q = torch.ones(1, 1, 2, 8)
+    mask = create_block_mask(
+        lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=2, KV_LEN=2, device="cpu"
+    )
+    options = dict(block_mask=mask, scale=0.125, enable_gqa=False)
+    original(q, q, q, **options)
+    attention = torch.compile(original, backend="eager")
+    assert (
+        compiled.compiled_flex_attention_family(attention, device=q.device, head_dim=8)
+        is None
+    )
+    with pytest.raises(RuntimeError, match="refusing eager FLASH fallback"):
+        original(q, q, q, **options)
+
+
+@pytest.mark.parametrize("forced", [False, True])
+def test_qualified_dense_flash_cannot_resume_inside_public_api(monkeypatch, forced):
+    torch._dynamo.reset()
+    original = (
+        compiled._forced_flex_attention_dense
+        if forced
+        else compiled._flex_attention_with_options({"BACKEND": "FLASH"})
+    )
+    mask = create_block_mask(
+        lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=2, KV_LEN=1, device="cpu"
+    )
+    as_tuple = mask.as_tuple
+
+    def graph_breaking_tuple():
+        torch._dynamo.graph_break()
+        return as_tuple()
+
+    monkeypatch.setattr(mask, "as_tuple", graph_breaking_tuple)
+    attention = torch.compile(
+        original, backend=lambda graph, _: _FlashContract(graph).run, dynamic=False
+    )
+    assert (
+        compiled.compiled_flex_attention_family(
+            attention, device=torch.device("cpu"), head_dim=8
+        )
+        is not None
+    )
+    q = torch.ones(1, 1, 2, 8, requires_grad=True)
+    k = torch.ones(1, 1, 1, 8, requires_grad=True)
+
+    def forbidden_math(*args, **kwargs):
+        pytest.fail("qualified dense FLASH resumed into eager math")
+
+    hop = importlib.import_module("torch._higher_order_ops.flex_attention")
+    monkeypatch.setattr(hop, "_math_attention_inner", forbidden_math)
+    try:
+        with pytest.raises(RuntimeError, match="graph_break"):
+            attention(q, k, k, block_mask=mask, scale=0.125, enable_gqa=False)
+    finally:
+        torch._dynamo.reset()

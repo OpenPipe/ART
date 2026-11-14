@@ -206,9 +206,13 @@ def _qualified_cp_workload(
             compiled.get_sparse_compiled_flex_attention(family_key="sparse", **options),
         ):
             family_id = compiled.compiled_flex_attention_family(
-                function, device=self.device
+                function, device=self.device, head_dim=head
             )
             if family_id is None:
+                # A fallback/mixed entrypoint cannot preserve live compiled rungs.
+                self.__dict__.get("_calibration_memory_rungs", {}).pop(
+                    plan.signature, None
+                )
                 kernels = []
                 break
             kernels.append(family_id)
@@ -4698,6 +4702,17 @@ def _update_memory_profile(
     if plan.packed_tokens <= 0:
         return
     previous = self._memory_profiles.get(plan.signature)
+    workload = getattr(plan, "caller_cp_workload", None)
+    if (
+        _fixed_slope_enabled(previous)
+        and workload is not None
+        and _known_cp_kernels(workload)
+        and _qualified_cp_workload(self, plan) != workload
+    ):
+        # Recheck before publishing: even a caught fallback refusal must not
+        # turn an interrupted/mixed interval into compiled caller/rate evidence.
+        self.__dict__.get("_calibration_memory_rungs", {}).pop(plan.signature, None)
+        return
     if (
         _fixed_slope_enabled(previous)
         and getattr(plan, "_calibration_cp_family_seed", False)

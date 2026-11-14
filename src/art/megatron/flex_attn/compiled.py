@@ -4,6 +4,7 @@ Production uses Inductor; eager/aot_eager capture backends lack its FLASH LSE co
 """
 
 from collections import OrderedDict
+from contextlib import nullcontext
 import json
 import logging
 import math
@@ -40,6 +41,7 @@ _FLASH_LSE_RESCALE = math.log(2.0)
 _logger = logging.getLogger(__name__)
 _FLASH_EAGER_FALLBACK_KEYS: OrderedDict[tuple[object, ...], int] = OrderedDict()
 _FLASH_EAGER_FALLBACK_WARNINGS = 0
+_FORCED_FLEX_EXECUTION_STATE = {"required": False, "fallback": False}
 FlexBackend: TypeAlias = Literal["FLASH", "TRITON"]
 SparseBlockSize: TypeAlias = int | tuple[int, int]
 
@@ -139,10 +141,26 @@ def flash_sparse_block_size_for_head_dim(
     return (128, 64)
 
 
-def _flash_eager_fallback(backend: object, frame: str, q, k, v) -> bool:
+def _flash_eager_fallback(
+    backend: object,
+    frame: str,
+    q,
+    k,
+    v,
+    runtime_state: dict[str, bool] | None = None,
+) -> bool:
     global _FLASH_EAGER_FALLBACK_WARNINGS
     if backend != "FLASH" or torch.compiler.is_compiling():
         return False
+    if runtime_state is not None:
+        # An identity is a promise about memory, not just LSE units. Check at
+        # the HOP boundary, including resumed frames after cache exhaustion.
+        runtime_state["fallback"] = True
+        if runtime_state["required"]:
+            raise RuntimeError(
+                "Compiled FLASH execution is required for kernel-family evidence; "
+                "refusing eager FLASH fallback"
+            )
     rank = (
         str(torch.distributed.get_rank())
         if torch.distributed.is_initialized()
@@ -208,18 +226,30 @@ def _forced_flex_attention_dense(
         flash_backward_compatibility_options(_FORCED_FLEX_KERNEL_OPTIONS, q.shape[-1]),
     )
     eager_flash = _flash_eager_fallback(
-        _FORCED_FLEX_BACKEND, "_forced_flex_attention_dense", q, k, v
-    )
-    result = flex_attention(
+        _FORCED_FLEX_BACKEND,
+        "_forced_flex_attention_dense",
         q,
         k,
         v,
-        block_mask=block_mask,
-        scale=scale,
-        enable_gqa=enable_gqa,
-        kernel_options=kernel_options,
-        return_aux=return_aux,
+        _FORCED_FLEX_EXECUTION_STATE,
     )
+    # The public API can graph-break while materializing mask metadata.
+    # Qualified traces must not resume past the eager-mode check above.
+    with (
+        torch._dynamo.error_on_graph_break(True)
+        if _FORCED_FLEX_EXECUTION_STATE["required"]
+        else nullcontext()
+    ):
+        result = flex_attention(
+            q,
+            k,
+            v,
+            block_mask=block_mask,
+            scale=scale,
+            enable_gqa=enable_gqa,
+            kernel_options=kernel_options,
+            return_aux=return_aux,
+        )
     return _adapt_eager_flash_aux(result) if eager_flash else result
 
 
@@ -228,6 +258,7 @@ def _identity_score(score, _batch, _head, _query, _key):
 
 
 def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
+    runtime_state = {"required": False, "fallback": False}
     resolved_options = dict(kernel_options)
     resolved_options.setdefault("PRESCALE_QK", False)
     resolved_options.setdefault("ROWS_GUARANTEED_SAFE", False)
@@ -249,7 +280,12 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
             flash_backward_compatibility_options(resolved_options, q.shape[-1]),
         )
         eager_flash = _flash_eager_fallback(
-            resolved_options.get("BACKEND"), "sparse_flex_attention", q, k, v
+            resolved_options.get("BACKEND"),
+            "sparse_flex_attention",
+            q,
+            k,
+            v,
+            runtime_state,
         )
         out, lse, _max_scores = flex_attention_hop(
             q,
@@ -269,6 +305,7 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
     # Keep the exact mapping consumed by this entrypoint, including backward
     # overrides and the sparse defaults above. Factory bytecode is not an ID.
     setattr(_flex_attention, "_art_flex_kernel_family", ("sparse", resolved_options))
+    setattr(_flex_attention, "_art_flex_execution_state", runtime_state)
     return _flex_attention
 
 
@@ -309,6 +346,8 @@ def prepare_sparse_flex_attention(
 
 
 def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
+    runtime_state = {"required": False, "fallback": False}
+
     def _flex_attention(
         q,
         k,
@@ -324,46 +363,72 @@ def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
             flash_backward_compatibility_options(kernel_options, q.shape[-1]),
         )
         eager_flash = _flash_eager_fallback(
-            kernel_options.get("BACKEND"), "dense_flex_attention", q, k, v
-        )
-        result = flex_attention(
+            kernel_options.get("BACKEND"),
+            "dense_flex_attention",
             q,
             k,
             v,
-            block_mask=block_mask,
-            scale=scale,
-            enable_gqa=enable_gqa,
-            kernel_options=options,
-            return_aux=return_aux,
+            runtime_state,
         )
+        # The public API can graph-break while materializing mask metadata.
+        # Qualified traces must not resume past the eager-mode check above.
+        with (
+            torch._dynamo.error_on_graph_break(True)
+            if runtime_state["required"]
+            else nullcontext()
+        ):
+            result = flex_attention(
+                q,
+                k,
+                v,
+                block_mask=block_mask,
+                scale=scale,
+                enable_gqa=enable_gqa,
+                kernel_options=options,
+                return_aux=return_aux,
+            )
         return _adapt_eager_flash_aux(result) if eager_flash else result
 
     setattr(_flex_attention, "_art_flex_kernel_family", ("dense", kernel_options))
+    setattr(_flex_attention, "_art_flex_execution_state", runtime_state)
     return _flex_attention
 
 
 def compiled_flex_attention_family(
-    entrypoint: Any, *, device: torch.device
+    entrypoint: Any, *, device: torch.device, head_dim: int | None = None
 ) -> str | None:
-    """Stable identity of the selected options, not its factory or wrapper.
+    """Qualify this entrypoint for compiled-only FLASH memory evidence.
 
-    Include all forward/backward overrides and capability: omitted options use
-    Torch's device-dependent defaults. Unknown entrypoints cannot grant reuse.
+    Include effective forward/backward overrides and capability: omitted options
+    use Torch's device-dependent defaults. Unknown entrypoints cannot grant reuse.
+    Once qualified, eager FLASH raises before attention allocates. Any earlier
+    fallback permanently disqualifies this entrypoint, including mixed intervals.
     """
     original = getattr(entrypoint, "_torchdynamo_orig_callable", None)
     if original is _forced_flex_attention_dense:
         # This entrypoint reads the global mapping at execution, unlike the
         # sparse factory, which captures its own resolved copy.
         kind, options = "dense", _FORCED_FLEX_KERNEL_OPTIONS
+        runtime_state = _FORCED_FLEX_EXECUTION_STATE
     else:
         family = getattr(original, "_art_flex_kernel_family", None)
         if family is None:
             return None
         kind, options = family
+        runtime_state = getattr(original, "_art_flex_execution_state", None)
+    if runtime_state is None:
+        return None
+    if options.get("BACKEND") == "FLASH":
+        runtime_state["required"] = True
+        if runtime_state["fallback"] or head_dim is None:
+            return None
+    if head_dim is not None:
+        options = flash_backward_compatibility_options(options, head_dim)
     try:
         return json.dumps(
             dict(
                 version=1,
+                execution_revision=1,  # Compiled-only FLASH and backward routing.
                 kind=kind,
                 options=options,
                 device_type=device.type,

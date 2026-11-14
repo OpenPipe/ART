@@ -192,3 +192,120 @@ def test_selected_family_identity_is_canonical_and_includes_sparse_defaults():
         OUTPUT_MAX=False,
     )
     assert family(lambda: None, device=torch.device("cpu")) is None
+
+
+@pytest.mark.parametrize("kind", ["dense", "sparse", "forced_dense"])
+def test_head64_identity_includes_effective_backward_routing(monkeypatch, kind):
+    monkeypatch.setattr(
+        compiled, "_FORCED_FLEX_EXECUTION_STATE", {"required": False, "fallback": False}
+    )
+    original = (
+        compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"})
+        if kind == "sparse"
+        else compiled._forced_flex_attention_dense
+        if kind == "forced_dense"
+        else compiled._flex_attention_with_options({"BACKEND": "FLASH"})
+    )
+    entry = torch.compile(original)
+    identity = compiled.compiled_flex_attention_family(
+        entry, device=torch.device("cpu"), head_dim=64
+    )
+    assert identity is not None
+    effective = json.loads(identity)
+    assert effective["options"]["bwd_ART_TRITON_BACKWARD_VERSION"] == 1
+    # Recreate a pre-routing serialized identity on the very same runtime/device.
+    old = dict(effective, version=1, options=dict(effective["options"]))
+    del old["options"]["bwd_ART_TRITON_BACKWARD_VERSION"]
+    del old["execution_revision"]
+    old_identity = json.dumps(old, sort_keys=True, separators=(",", ":"))
+    assert old_identity != identity
+
+    def workload(kernel):
+        return json.dumps(
+            dict(
+                version=1,
+                masks=[["causal"]],
+                execution_qualification=dict(backend="FLASH", kernels=[kernel]),
+            ),
+            sort_keys=True,
+        )
+
+    assert not memory._cp_family_dominates(
+        workload(identity), memory._qualified_cp_observation(workload(old_identity))
+    )
+    assert (
+        compiled.compiled_flex_attention_family(entry, device=torch.device("cpu"))
+        is None
+    )  # FLASH cannot qualify without its effective head dimension.
+
+
+def test_cache_exhaustion_cannot_reuse_or_record_compiled_caller_evidence(monkeypatch):
+    import importlib
+
+    from test_flex_eager_fallback import _FlashContract
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    torch._dynamo.reset()
+    flex = importlib.import_module("torch.nn.attention.flex_attention")
+    monkeypatch.setattr(flex, "_validate_device", lambda *args: None)
+    entries = {
+        kind: torch.compile(
+            factory({"BACKEND": "FLASH"}),
+            backend=lambda graph, _: _FlashContract(graph).run,
+            dynamic=False,
+        )
+        for kind, factory in (
+            ("dense", compiled._flex_attention_with_options),
+            ("sparse", compiled._sparse_flex_attention_with_options),
+        )
+    }
+    for kind, entry in entries.items():
+        monkeypatch.setattr(
+            compiled,
+            f"get_{kind}_compiled_flex_attention",
+            lambda _entry=entry, **kw: _entry,
+        )
+    rank = metadata_rank("moe", head_dim=64)
+    rank.device = torch.device("cpu")
+    q = torch.ones(1, 1, 2, 64, requires_grad=True)
+    k = torch.ones(1, 1, 1, 64, requires_grad=True)
+    mask = create_block_mask(
+        lambda b, h, q, k: q >= 0, B=1, H=1, Q_LEN=128, KV_LEN=128, device="cpu"
+    )
+    options = dict(block_mask=mask, scale=0.125, enable_gqa=False)
+    try:
+        with memory.fixed_slope_memory_profiles(), torch._dynamo.config.patch(
+            recompile_limit=1
+        ):
+            entries["sparse"](q, k, k, **options)
+            observed = rank._plan_flat_forward([request(16384, grad=True)])
+            assert memory._known_cp_kernels(observed.caller_cp_workload)
+            rank._update_memory_profile(
+                observed, 2_500_000_000, retained_bytes=None, caller_phase=True
+            )
+            profile = rank._memory_profiles[observed.signature]
+            assert (
+                profile.covering_cp_peak(8192, observed.caller_cp_workload) is not None
+            )
+            assert observed.signature in rank._calibration_memory_rungs
+            q = torch.ones(1, 1, 3, 64, requires_grad=True)
+            hop = importlib.import_module("torch._higher_order_ops.flex_attention")
+
+            def forbidden_math(*args, **kwargs):
+                pytest.fail("compiled caller evidence admitted eager math")
+
+            monkeypatch.setattr(hop, "_math_attention_inner", forbidden_math)
+            with pytest.raises(RuntimeError, match="refusing eager FLASH fallback"):
+                entries["sparse"](q, k, k, **options)
+            # Even if an outer caller catches the refusal, the stale plan may
+            # neither publish a compiled observation nor extend live rungs.
+            rank._update_memory_profile(
+                observed, 9_000_000_000, retained_bytes=None, caller_phase=True
+            )
+            assert rank._memory_profiles[observed.signature] is profile
+            assert observed.signature not in rank._calibration_memory_rungs
+            requested = memory._qualified_cp_workload(rank, observed)
+            assert not memory._known_cp_kernels(requested)
+            assert profile.covering_cp_peak(8192, requested) is None
+    finally:
+        torch._dynamo.reset()
