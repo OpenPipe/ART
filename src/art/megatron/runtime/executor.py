@@ -85,6 +85,7 @@ class MegatronTrainJobExecutor:
         batches: tuple[PackedSFTBatchData, ...],
         sink: EventSink,
         cancelled: Event,
+        validation_batches: tuple[PackedSFTBatchData, ...] = (),
     ) -> dict[str, float]:
         if self._closed:
             raise RuntimeError("Megatron executor is closed")
@@ -108,6 +109,7 @@ class MegatronTrainJobExecutor:
             ),
             snapshot_sink=lambda *args: self._publisher.submit(*args, sink=sink),
             cancelled=cancelled,
+            validation_batches=validation_batches,
         )
         metrics.update(self._stabilize_python_gc())
         timing.previous_job_complete_s = time.monotonic()

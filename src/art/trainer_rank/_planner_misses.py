@@ -46,6 +46,7 @@ MAX_PLANNING_SPOOL_BYTES = 16 * 1024 * 1024
 _SOURCE_NAMES = (
     "_impl.py",
     "_memory.py",
+    "_memory_model.py",
     "_micro_batch_planner.py",
     "_planner_cost.py",
     "_prefix_tree_planner.py",
@@ -720,23 +721,26 @@ def _memory_signature(values: dict[str, Any]) -> Any:
 
 
 def _memory_profile(values: dict[str, Any]) -> Any:
-    from . import _impl, _memory
+    from . import _memory
 
     values = dict(values)
-    cls = _impl._MemoryProfile
-    for field, profile_cls in (
-        ("caller_compute_peaks", _memory._CallerMemoryProfile),
-        ("forward_compute_peaks", _memory._BoundedMemoryProfile),
+    for field in (
+        "caller_compute_peaks",
+        "forward_compute_peaks",
+        "compute_observations",
+        "rate_observations",
+        "retained_compute_peaks",
     ):
-        if field in values:
+        if field in values and values[field] is not None:
             values[field] = tuple(tuple(point) for point in values[field])
-            cls = profile_cls
+    if "compute_slope" in values:
+        values["compute_slope"] = tuple(values["compute_slope"])
     if "caller_cp_peaks" in values:
         values["caller_cp_peaks"] = tuple(
             (length, peak, family, tuple(tuple(rank) for rank in loads))
             for length, peak, family, loads in values["caller_cp_peaks"]
         )
-    return cls(**values)
+    return _memory._memory_profile_from_values(values)
 
 
 def replay(
@@ -755,7 +759,7 @@ def replay(
             "report has incomplete replay inputs: "
             + "; ".join(report.get("incomplete_reasons", []))
         )
-    from . import _impl, _planner_replay
+    from . import _impl, _memory, _planner_replay
     from ._planner_cost import ModelGeometry
     from ._prefix_tree_planner import (
         build_canonical_prefix_tree,
@@ -769,6 +773,9 @@ def replay(
             "planner source differs; use --allow-source-drift for comparison"
         )
     state = payload["memory_replay"]
+    collection = state.get("fixed_slope_profiles", False)
+    if type(collection) is not bool:
+        raise ValueError("invalid memory estimator collection mode")
     if not state["estimates"]:
         raise ValueError("memory replay has no candidate estimates")
     # Reports from before the dense no-grad FC1 floor omit this fact; their
@@ -959,12 +966,22 @@ def replay(
             rank._topology_key(), item["runtime_facts"], key
         ):
             raise ValueError("incomplete replay: TP x SP adapter ranks unavailable")
-        rank._memory_profiles = (
-            {key: _memory_profile(item["profile"])}
-            if item["profile"] is not None
-            else {}
-        )
-        cost = rank._subforward_cost(signature=key, **arguments)
+        pool = state.get("fixed_slope_profile_pool", [])
+        if type(pool) is not list or any(
+            type(entry) is not dict or set(entry) != {"signature", "profile"}
+            for entry in pool
+        ):
+            raise ValueError("invalid fixed-slope fallback inventory")
+        rank._memory_profiles = {
+            _memory_signature(entry["signature"]): _memory_profile(entry["profile"])
+            for entry in pool
+        }
+        if item["profile"] is not None:
+            rank._memory_profiles[key] = _memory_profile(item["profile"])
+        else:
+            rank._memory_profiles.pop(key, None)
+        with _memory.fixed_slope_memory_profiles(collection):
+            cost = rank._subforward_cost(signature=key, **arguments)
         costs.append(cost)
         estimates.append(
             {

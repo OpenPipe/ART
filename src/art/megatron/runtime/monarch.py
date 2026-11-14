@@ -590,6 +590,7 @@ class MonarchTrainerActor(Actor):
         job_json: str,
         batches: tuple[PackedSFTBatchData, ...],
         event_port: Port[dict[str, Any]],
+        validation_batches: tuple[PackedSFTBatchData, ...] = (),
     ) -> dict[str, Any]:
         try:
             if not self._valid:
@@ -602,6 +603,7 @@ class MonarchTrainerActor(Actor):
                     batches,
                     _ActorEventSink(event_port, coordinator=coordinator),
                     Event(),
+                    validation_batches,
                 )
                 self._publish_compile_cache()
             if coordinator:
@@ -1125,16 +1127,21 @@ class MonarchTrainerRun:
             yield event
 
     async def train_sft(
-        self, job: SFTJobSpec, batches: tuple[SFTBatchData, ...]
+        self,
+        job: SFTJobSpec,
+        batches: tuple[SFTBatchData, ...],
+        validation_batches: tuple[SFTBatchData, ...] = (),
     ) -> AsyncIterator[TrainEvent]:
+        """Train on batches; validation batches add ``loss/val`` to the last step."""
+
         async def dispatch(port: Port[dict[str, Any]]) -> Any:
-            packed = await asyncio.to_thread(
-                pack_sft_batches,
-                batches,
-                seq_len=self.runtime_spec.packed_sequence_length,
+            seq_len = self.runtime_spec.packed_sequence_length
+            packed = await asyncio.to_thread(pack_sft_batches, batches, seq_len=seq_len)
+            packed_validation = await asyncio.to_thread(
+                pack_sft_batches, validation_batches, seq_len=seq_len
             )
             return await self._actors.execute_sft.call(
-                job.model_dump_json(), packed, port
+                job.model_dump_json(), packed, port, packed_validation
             )
 
         async for event in self._train(
