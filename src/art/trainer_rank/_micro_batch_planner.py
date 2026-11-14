@@ -150,52 +150,48 @@ def _forward_micro_batches(
             # that slice while this generator is suspended at the yield.
             self._submit_speculative_wave_planning(items, stop, checkpoint=checkpoint)
         self._snapshot_planning_telemetry(candidate.plan, candidate.check)
-        with _impl._telemetry_phase(
-            # This interval is controlled by the caller and normally contains
-            # loss construction and backward for the yielded microbatch.
-            "caller",
-            self._telemetry_signature(candidate.plan),
-            dedup_signature=self._telemetry_plan_signature(candidate.plan),
-        ):
-            yield _impl.MicroBatch(
-                inputs=candidate.inputs,
-                outputs=outputs,
-                indices=candidate.indices,
-                stats=_impl.MicroBatchStats(
-                    global_start=start,
-                    global_stop=stop,
-                    global_count=candidate.stats_global_count,
-                    local_count=len(candidate.inputs),
-                    packed_tokens=candidate.plan.packed_tokens,
-                    logical_tokens=candidate.plan.logical_tokens,
-                    estimated_required_bytes=candidate.check.estimated_required_bytes,
-                    available_bytes=candidate.check.available_bytes,
-                    rejected_candidates=candidate.rejected_candidates,
-                    cold_start=candidate.cold_start,
-                    subforward_count=candidate.plan.subforward_count,
-                ),
-            )
-        if backward is not None:
-            backward.harvest()
-        # The caller normally runs backward while the micro-batch is yielded.
-        # Include that peak in future planning; forward-only profiling can
-        # otherwise admit a later micro-batch that leaves no collective or
-        # optimizer headroom. Peak only: the retained observation belongs
-        # to the forward's return, already recorded for this same plan.
-        if isinstance(candidate.plan, _impl._FlatForwardPlan):
-            self._update_peak_memory_profile(
+        try:
+            with _impl._telemetry_phase(
+                "caller",
+                self._telemetry_signature(candidate.plan),
+                dedup_signature=self._telemetry_plan_signature(candidate.plan),
+            ):
+                yield _impl.MicroBatch(
+                    inputs=candidate.inputs,
+                    outputs=outputs,
+                    indices=candidate.indices,
+                    stats=_impl.MicroBatchStats(
+                        global_start=start,
+                        global_stop=stop,
+                        global_count=candidate.stats_global_count,
+                        local_count=len(candidate.inputs),
+                        packed_tokens=candidate.plan.packed_tokens,
+                        logical_tokens=candidate.plan.logical_tokens,
+                        estimated_required_bytes=candidate.check.estimated_required_bytes,
+                        available_bytes=candidate.check.available_bytes,
+                        rejected_candidates=candidate.rejected_candidates,
+                        cold_start=candidate.cold_start,
+                        subforward_count=candidate.plan.subforward_count,
+                    ),
+                )
+            if backward is not None:
+                backward.harvest()
+            # Normal resume alone closes the caller's measured interval.
+            # Close/throw/GC must remain local and preserve pending OOM context.
+            from . import _memory
+
+            if _memory._try_update_caller_memory_profile(
+                self,
                 candidate.plan,
                 memory_baseline,
-                caller_phase=True,
-                interval=interval,
-            )
-        elif memory_baseline is not None:
-            self._record_split_memory_floor(
-                candidate.plan, memory_baseline, forward_peak
-            )
-        # Only the caller may retain completed outputs into the next wave.
-        self._complete_planner_observation()
-        del tracked_outputs, flat_outputs, outputs
+                interval,
+                0
+                if isinstance(candidate.plan, _impl._FlatForwardPlan)
+                else forward_peak,
+            ):
+                self._complete_planner_observation()
+        finally:
+            del tracked_outputs, flat_outputs, outputs
         start = stop
 
 
@@ -1435,6 +1431,22 @@ def _fill_planner_snapshot(
         from . import _memory, _planner_replay
 
         fixed_slope_collection = _memory._FIXED_SLOPE_PROFILES.get()
+        # Cross-signature rate fallback is part of the estimate's frozen input.
+        # Legacy reports keep their exact payload shape.
+        profile_pool = (
+            [
+                {"signature": asdict(key), "profile": asdict(profile)}
+                for key, profile in self._memory_profiles.items()
+                if profile.peak_model_version == 2
+            ]
+            if fixed_slope_collection
+            or any(
+                profile is not None and profile.peak_model_version == 2
+                for child in children
+                for profile in (self._memory_profiles.get(child.signature),)
+            )
+            else None
+        )
 
         estimates: list[dict[str, Any]] = []
         for child, cost in zip(children, costs, strict=True):
@@ -1691,6 +1703,11 @@ def _fill_planner_snapshot(
                     "estimates": estimates,
                     **(
                         {"fixed_slope_profiles": True} if fixed_slope_collection else {}
+                    ),
+                    **(
+                        {"fixed_slope_profile_pool": profile_pool}
+                        if profile_pool is not None
+                        else {}
                     ),
                 },
                 "layouts": layouts,

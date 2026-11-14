@@ -2,8 +2,8 @@
 
 CP8 topology/row metadata and scalar peaks are injected on CPU; no model or GPU
 peak is measured. Flag-off numbers document the current residual poisoning,
-not desired behavior. Unanchored v2 admission deliberately retains its OLD
-envelope/cold guard; slope/floor resistance does not remove that fallback.
+not desired behavior. Unanchored v2 admission needs qualifying rate evidence;
+these cases without references defer large requests rather than price them fixed-only.
 """
 
 from dataclasses import dataclass
@@ -106,10 +106,10 @@ def _harness(monkeypatch):
         harness.peak = WORKSPACE + RATE * plan.packed_tokens
         harness.observations.extend(((plan, forward_peak), (plan, harness.peak)))
         rank._peak_resets += 1
-        rank._peak_reading = (rank._peak_resets, forward_peak)
-        rank._update_memory_profile(
-            plan, forward_peak, retained_bytes=plan.output_bytes
-        )
+        caller_peak = harness.peak
+        harness.peak = forward_peak
+        rank._update_peak_memory_profile(plan, 0, retained_after=plan.output_bytes)
+        harness.peak = caller_peak
         return [
             ForwardOutput(torch.zeros(len(item.request.input_tokens)), None, None, None)
             for group in plan.groups
@@ -205,7 +205,7 @@ def test_cold_three_then_8192_preserves_floor_and_documents_cold_guard(
         if enabled:
             profile = harness.rank._memory_profiles[large.signature]
             _cold_fit_is_only_a_fixed_floor(profile)
-            assert harness.required(large) == 1_578_300_416_001
+            assert harness.required(large) >= _memory._MEMORY_DEFERRED_BYTES
         else:
             # Documentation of current flag-off behavior, not a desired bound.
             assert (before, harness.required(large)) == (516_810_342, 901_885_952_000)
@@ -227,7 +227,7 @@ def test_171_shared_three_token_roots_use_three_token_waves(monkeypatch, enabled
         if enabled:
             profile = harness.rank._memory_profiles[large.signature]
             _cold_fit_is_only_a_fixed_floor(profile)
-            assert harness.required(large) == 1_578_300_416_001
+            assert harness.required(large) >= _memory._MEMORY_DEFERRED_BYTES
         else:
             # Aggregate logical rows do not prevent a short packed observation.
             assert (before, harness.required(large)) == (516_810_342, 901_883_969_536)
