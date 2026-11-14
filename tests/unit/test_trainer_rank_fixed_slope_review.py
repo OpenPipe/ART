@@ -217,7 +217,7 @@ def test_earlier_v2_pickle_promotes_without_losing_model_fields(record):
         object.__setattr__(old, name, value)
     restored = pickle.loads(pickle.dumps(old, protocol=4))
     assert type(restored).__name__ == record["type"] + "V2"
-    assert asdict(restored) == dict(
+    expected = dict(
         vars(old),
         profile_format_version=2,
         rate_floor_tokens=0,
@@ -228,6 +228,11 @@ def test_earlier_v2_pickle_promotes_without_losing_model_fields(record):
         retained_rate_tokens=0,
         retained_compute_peaks=(),
     )
+    if isinstance(restored, m._CallerMemoryProfileV2):
+        expected.update(
+            non_dominant_cp_pairs=(), dominance_disabled=False, cp_request_floors=()
+        )
+    assert asdict(restored) == expected
     m._validate_memory_profile_model(restored)
 
 

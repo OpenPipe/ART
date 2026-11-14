@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Literal, TypeVar, cast, overload
 
 import torch
@@ -9,7 +10,16 @@ import torch.distributed as dist
 
 from . import _impl
 from ._checkpoint import CheckpointManifest, materialize_lora, validate_checkpoint
-from ._memory import bounded_forward_peaks
+from ._memory import (
+    CalibrationCoverageViolation,
+    CalibrationRungDecision,
+    bounded_forward_peaks,
+)
+from ._micro_batch_planner import (
+    CalibrationRung,
+    calibrate_request_floors,
+    calibration_rung,
+)
 
 AdapterSelection = _impl.AdapterSelection
 AdamParams = _impl.AdamParams
@@ -51,6 +61,7 @@ for _public_type in (
     TrainerRankPartialExecutionError,
     TrainerRankRuntimeSupportError,
     TrainerRankSlotStateError,
+    CalibrationCoverageViolation,
     MaterializedCheckpoint,
     PushedCheckpoint,
 ):
@@ -80,6 +91,91 @@ class TrainerRank(_impl.TrainerRank):
 
     def zero_grad(self) -> None:
         super().zero_grad()
+
+    def calibration_rung(
+        self,
+        inputs: Iterable[ForwardInputs],
+        *,
+        checkpoint: AdapterSelection = Unset,
+        no_grad: bool | None = None,
+        seed_uncovered_cp_family: bool = False,
+    ) -> AbstractContextManager[CalibrationRung]:
+        """Prepare an exact calibration wave and expose its pre-execution decision.
+
+        Call ``rung.forward_micro_batches()`` only after recording durable intent
+        for an extrapolated decision. See ``CalibrationRung`` for its lifetime.
+        Ordinary forwards never use this calibration-only extrapolation.
+        ``seed_uncovered_cp_family`` explicitly measures a short uncovered CP
+        family after two live anchors, without learning a rate from its sample.
+        Use the scope on every rank. Exhaust the iterator or leave the scope
+        collectively; the driver closes partial iterators. A rank-local close
+        is guarded without entering a collective from a finalizer.
+        """
+        return calibration_rung(
+            self,
+            inputs,
+            checkpoint=checkpoint,
+            no_grad=no_grad,
+            seed_uncovered_cp_family=seed_uncovered_cp_family,
+        )
+
+    def calibrate_request_floors(
+        self,
+        template: AnyForwardInput,
+        *,
+        execute: Callable[[CalibrationRung], None],
+        check_pending: Callable[[], None],
+        checkpoint: AdapterSelection = Unset,
+    ) -> tuple[CalibrationRungDecision, ...]:
+        """Measure all finite CP8 output classes after the product ladders.
+
+        Pass the existing durable-intent rung executor as ``execute``. It must
+        check unresolved intents before execution, complete backward within the
+        caller interval when ``not rung.no_grad``, and journal completion after
+        exhaustion. The trainer supplies every probe through ``rung.inputs``;
+        callers do not list output families. ``check_pending`` must reject all
+        unresolved durable intents before work or completed-profile skips.
+        Per-family intent keys include ``rung.decision.signature_id`` and
+        ``rung.family_id``; the latter distinguishes kernel configurations.
+        For example, after both operation ladders, call::
+
+            trainer.calibrate_request_floors(
+                template,
+                execute=journal_and_execute,
+                check_pending=reject_unresolved_intents,
+                checkpoint=selected_checkpoint,
+            )
+
+        The executor uses ``rung.inputs`` and ``rung.no_grad``; it must handle
+        all requested floating outputs, not only target logprobs. There are 62
+        dense or 124 MoE trials across both operations: every output combination
+        with flat/column/three-column targets and top-k disabled or k=1, plus
+        routes on MoE. Other exact target shapes, k values and mixed signatures
+        use a measured sibling maximum or defer. The existing native static
+        reserve remains an extra bound. Existing callers need this additional
+        call; their old ladder alone does not provide full floor coverage.
+
+        Caller migration requirement:
+        Before any pin bump, the caller must invoke calibrate_request_floors after both
+        live operation ladders for every selected adapter/native configuration;
+        implement cohort-wide durable (signature_id, family_id) intents and pending
+        checks, exhaust each caller interval with all floating outputs participating in
+        backward when enabled, persist/validate format-8 floor-only evidence, and
+        require completed floor coverage before accepting cached calibration or enabling
+        v2 serving.
+
+        Distributed callback failures are exchanged before model entry and before
+        completion checks. Every rank raises RuntimeError, with the local failure
+        retained as its cause; no trial is retried. Local-only calls preserve the
+        original exception.
+        """
+        return calibrate_request_floors(
+            self,
+            template,
+            execute=execute,
+            check_pending=check_pending,
+            checkpoint=checkpoint,
+        )
 
     def module(
         self,
@@ -420,6 +516,9 @@ __all__ = [
     "AdapterSelection",
     "AdamParams",
     "CheckpointManifest",
+    "CalibrationRung",
+    "CalibrationRungDecision",
+    "CalibrationCoverageViolation",
     "bounded_forward_peaks",
     "ForwardInput",
     "ForwardOutput",

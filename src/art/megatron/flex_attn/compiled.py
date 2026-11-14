@@ -266,6 +266,9 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
             lse = lse * _FLASH_LSE_RESCALE
         return out, lse
 
+    # Keep the exact mapping consumed by this entrypoint, including backward
+    # overrides and the sparse defaults above. Factory bytecode is not an ID.
+    setattr(_flex_attention, "_art_flex_kernel_family", ("sparse", resolved_options))
     return _flex_attention
 
 
@@ -335,7 +338,46 @@ def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
         )
         return _adapt_eager_flash_aux(result) if eager_flash else result
 
+    setattr(_flex_attention, "_art_flex_kernel_family", ("dense", kernel_options))
     return _flex_attention
+
+
+def compiled_flex_attention_family(
+    entrypoint: Any, *, device: torch.device
+) -> str | None:
+    """Stable identity of the selected options, not its factory or wrapper.
+
+    Include all forward/backward overrides and capability: omitted options use
+    Torch's device-dependent defaults. Unknown entrypoints cannot grant reuse.
+    """
+    original = getattr(entrypoint, "_torchdynamo_orig_callable", None)
+    if original is _forced_flex_attention_dense:
+        # This entrypoint reads the global mapping at execution, unlike the
+        # sparse factory, which captures its own resolved copy.
+        kind, options = "dense", _FORCED_FLEX_KERNEL_OPTIONS
+    else:
+        family = getattr(original, "_art_flex_kernel_family", None)
+        if family is None:
+            return None
+        kind, options = family
+    try:
+        return json.dumps(
+            dict(
+                version=1,
+                kind=kind,
+                options=options,
+                device_type=device.type,
+                capability=torch.cuda.get_device_capability(device)
+                if device.type == "cuda"
+                else None,
+                torch=torch.__version__,
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def select_sparse_execution_family(

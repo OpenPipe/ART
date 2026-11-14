@@ -143,6 +143,7 @@ def _caller_exit_worker(index, cp, tp, dp, directory, case):
                         break
             except Exception as exc:
                 caller_error = type(exc).__name__
+                result["error_message"] = str(exc)
             finally:
                 iterator.close()
                 iterator.close()
@@ -181,13 +182,18 @@ def test_caller_exit_precedes_outer_error_exchange(
 ):
     _rank()  # Prime optional imports before starting bounded distributed work.
     monkeypatch.setenv("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
+    # Earlier tests may initialize reentrant autograd worker threads. A clean
+    # preloaded server keeps those threads out of the Gloo child processes.
+    mp.set_forkserver_preload(
+        ["art.trainer_rank._impl", "art.megatron.context_parallel.types"]
+    )
     cp, tp, dp = geometry
     context = mp.start_processes(
         _caller_exit_worker,
         args=(cp, tp, dp, str(tmp_path), case),
         nprocs=cp * tp * dp,
         join=False,
-        start_method="fork",
+        start_method="forkserver",
     )
     deadline = time.monotonic() + 35
     try:
@@ -208,7 +214,7 @@ def test_caller_exit_precedes_outer_error_exchange(
     )
     assert all(row["operations"] == rows[0]["operations"] for row in rows), rows
     assert len(rows[0]["operations"]) == 16
-    assert rows[0]["operations"][-1] == ["RedOpType.MAX", [1], "torch.float64"]
+    assert rows[0]["operations"][-1] == ["RedOpType.MAX", [5], "torch.float64"]
     failed = case in ("oom", "value", "throw", "multiwave")
     assert all(row["outer"] == [float(failed)] and row["closes"] == 1 for row in rows)
     assert all(row["callers"] == 0 and not any(row["rates"]) for row in rows)
@@ -218,6 +224,6 @@ def test_caller_exit_precedes_outer_error_exchange(
         else "ValueError"
         if case in ("value", "throw", "multiwave")
         else None
-    )
-    assert all(row["error"] is None for row in rows[1:])
+    ), rows
+    assert all(row["error"] is None for row in rows[1:]), rows
     assert all(row["yielded"] <= 1 for row in rows)
