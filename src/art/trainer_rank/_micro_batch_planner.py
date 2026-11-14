@@ -1432,7 +1432,9 @@ def _fill_planner_snapshot(
         # Freeze calibration before forward updates it. Versioned CPU inputs
         # remain references; versionless CPU inputs need an owned bounded copy.
         costs = [self._plan_cost(child) for child in children]
-        from . import _planner_replay
+        from . import _memory, _planner_replay
+
+        fixed_slope_collection = _memory._FIXED_SLOPE_PROFILES.get()
 
         estimates: list[dict[str, Any]] = []
         for child, cost in zip(children, costs, strict=True):
@@ -1684,7 +1686,13 @@ def _fill_planner_snapshot(
                             incomplete.add(reason)
                             item["input_tokens"] = {"unavailable": reason}
             return {
-                "memory_replay": {"rank": rank_fields, "estimates": estimates},
+                "memory_replay": {
+                    "rank": rank_fields,
+                    "estimates": estimates,
+                    **(
+                        {"fixed_slope_profiles": True} if fixed_slope_collection else {}
+                    ),
+                },
                 "layouts": layouts,
                 "incomplete_reasons": sorted(incomplete),
                 "model": model["name_or_path"],
@@ -1768,7 +1776,7 @@ def finish_planner_observation(self: TrainerRank) -> None:
 
     ART compares completed peaks at its existing profiling boundaries:
     dp_rank_forward's return or forward_micro_batches' iterator resume.
-    Caladan calls this at execution end. Direct callers can report a caught
+    The trainer calls this at execution end. Direct callers can report a caught
     caller OOM before cleanup, then call this method to release the context.
     An abandoned microbatch iterator cannot mint a completed comparison.
     """

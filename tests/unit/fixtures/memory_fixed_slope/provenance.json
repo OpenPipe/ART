@@ -1,0 +1,5 @@
+{
+  "description": "CP8 dense/MoE peak increments; LoRA ranks 1, 8, 32; 8192\u2013131072 packed tokens.",
+  "units": "bytes",
+  "rank_peak_bytes": "Maximum successful-attempt increment for each of eight ranks."
+}

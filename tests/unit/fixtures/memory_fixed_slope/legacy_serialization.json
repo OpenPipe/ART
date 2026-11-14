@@ -1,0 +1,77 @@
+[
+  {
+    "type": "_MemoryProfile",
+    "profile": {
+      "bytes_per_token": 128.0,
+      "packed_tokens": 8192,
+      "logical_per_packed": 1.0,
+      "retained_fraction": null,
+      "retained_compute_bytes_per_token": null,
+      "warm_bytes_per_token": null,
+      "warm_packed_tokens": null,
+      "warm_logical_per_packed": null,
+      "caller_plans": 0
+    },
+    "pickle_protocol4": "gASVFAEAAAAAAACMFmFydC50cmFpbmVyX3JhbmsuX2ltcGyUjA5fTWVtb3J5UHJvZmlsZZSTlCmBlH2UKIwPYnl0ZXNfcGVyX3Rva2VulEdAYAAAAAAAAIwNcGFja2VkX3Rva2Vuc5RNACCMEmxvZ2ljYWxfcGVyX3BhY2tlZJRHP/AAAAAAAACMEXJldGFpbmVkX2ZyYWN0aW9ulE6MIHJldGFpbmVkX2NvbXB1dGVfYnl0ZXNfcGVyX3Rva2VulE6MFHdhcm1fYnl0ZXNfcGVyX3Rva2VulE6MEndhcm1fcGFja2VkX3Rva2Vuc5ROjBd3YXJtX2xvZ2ljYWxfcGVyX3BhY2tlZJROjAxjYWxsZXJfcGxhbnOUSwB1Yi4="
+  },
+  {
+    "type": "_CallerMemoryProfile",
+    "profile": {
+      "bytes_per_token": 128.0,
+      "packed_tokens": 8192,
+      "logical_per_packed": 1.0,
+      "retained_fraction": null,
+      "retained_compute_bytes_per_token": null,
+      "warm_bytes_per_token": null,
+      "warm_packed_tokens": null,
+      "warm_logical_per_packed": null,
+      "caller_plans": 0,
+      "caller_compute_peaks": [
+        [
+          8192,
+          1048576
+        ]
+      ],
+      "compute_peak_floor": 1048576,
+      "caller_cp_peaks": [
+        [
+          8192,
+          1048576,
+          "test-layout",
+          [
+            [
+              512,
+              512
+            ],
+            [
+              512,
+              512
+            ]
+          ]
+        ]
+      ]
+    },
+    "pickle_protocol4": "gASVkgEAAAAAAACMGGFydC50cmFpbmVyX3JhbmsuX21lbW9yeZSMFF9DYWxsZXJNZW1vcnlQcm9maWxllJOUKYGUfZQojA9ieXRlc19wZXJfdG9rZW6UR0BgAAAAAAAAjA1wYWNrZWRfdG9rZW5zlE0AIIwSbG9naWNhbF9wZXJfcGFja2VklEc/8AAAAAAAAIwRcmV0YWluZWRfZnJhY3Rpb26UTowgcmV0YWluZWRfY29tcHV0ZV9ieXRlc19wZXJfdG9rZW6UTowUd2FybV9ieXRlc19wZXJfdG9rZW6UTowSd2FybV9wYWNrZWRfdG9rZW5zlE6MF3dhcm1fbG9naWNhbF9wZXJfcGFja2VklE6MDGNhbGxlcl9wbGFuc5RLAIwUY2FsbGVyX2NvbXB1dGVfcGVha3OUTQAgSgAAEACGlIWUjBJjb21wdXRlX3BlYWtfZmxvb3KUSgAAEACMD2NhbGxlcl9jcF9wZWFrc5QoTQAgSgAAEACMC3Rlc3QtbGF5b3V0lE0AAk0AAoaUaBSGlHSUhZR1Yi4="
+  },
+  {
+    "type": "_BoundedMemoryProfile",
+    "profile": {
+      "bytes_per_token": 128.0,
+      "packed_tokens": 8192,
+      "logical_per_packed": 1.0,
+      "retained_fraction": null,
+      "retained_compute_bytes_per_token": null,
+      "warm_bytes_per_token": null,
+      "warm_packed_tokens": null,
+      "warm_logical_per_packed": null,
+      "caller_plans": 0,
+      "forward_compute_peaks": [
+        [
+          8192,
+          1048576
+        ]
+      ]
+    },
+    "pickle_protocol4": "gASVQQEAAAAAAACMGGFydC50cmFpbmVyX3JhbmsuX21lbW9yeZSMFV9Cb3VuZGVkTWVtb3J5UHJvZmlsZZSTlCmBlH2UKIwPYnl0ZXNfcGVyX3Rva2VulEdAYAAAAAAAAIwNcGFja2VkX3Rva2Vuc5RNACCMEmxvZ2ljYWxfcGVyX3BhY2tlZJRHP/AAAAAAAACMEXJldGFpbmVkX2ZyYWN0aW9ulE6MIHJldGFpbmVkX2NvbXB1dGVfYnl0ZXNfcGVyX3Rva2VulE6MFHdhcm1fYnl0ZXNfcGVyX3Rva2VulE6MEndhcm1fcGFja2VkX3Rva2Vuc5ROjBd3YXJtX2xvZ2ljYWxfcGVyX3BhY2tlZJROjAxjYWxsZXJfcGxhbnOUSwCMFWZvcndhcmRfY29tcHV0ZV9wZWFrc5RNACBKAAAQAIaUhZR1Yi4="
+  }
+]
