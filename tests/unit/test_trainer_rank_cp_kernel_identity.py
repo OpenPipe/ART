@@ -3,6 +3,7 @@
 from dataclasses import replace
 import hashlib
 import json
+import os
 from pathlib import Path
 import pickle
 from types import SimpleNamespace
@@ -267,6 +268,7 @@ def test_cache_exhaustion_cannot_reuse_or_record_compiled_caller_evidence(monkey
         )
     rank = metadata_rank("moe", head_dim=64)
     rank.device = torch.device("cpu")
+    rank.runtime.compiled_flash_cohort_supervisor_pid = os.getpid()
     q = torch.ones(1, 1, 2, 64, requires_grad=True)
     k = torch.ones(1, 1, 1, 64, requires_grad=True)
     mask = create_block_mask(
@@ -376,6 +378,7 @@ def test_compiled_requirement_is_scoped_to_qualified_plan(monkeypatch, split):
         )
     rank = metadata_rank("moe", head_dim=64)
     rank.device = torch.device("cpu")
+    rank.runtime.compiled_flash_cohort_supervisor_pid = os.getpid()
     with memory.fixed_slope_memory_profiles():
         plan = rank._plan_flat_forward([request(16384, grad=True)])
     assert memory._known_cp_kernels(plan.caller_cp_workload)

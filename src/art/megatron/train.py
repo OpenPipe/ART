@@ -180,6 +180,8 @@ class TrainingRuntime(BaseModel):
     optimizer_runtime_sha256: str | None = None
     optimizer_persistent: bool = True
     resident_run_id: str | None = None
+    # Installed only after the launcher registers whole-cohort process teardown.
+    compiled_flash_cohort_supervisor_pid: int | None = None
     resident_training_session_id: str | None = None
     resident_policy_step: int | None = None
     resident_generation_id: str | None = None

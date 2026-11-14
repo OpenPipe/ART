@@ -22,6 +22,7 @@ from functools import lru_cache
 import hashlib
 import json
 import math
+import os
 from types import MethodType
 from typing import TYPE_CHECKING, Any, cast
 
@@ -256,7 +257,25 @@ def _compiled_cp_execution(
     ):
         from art.megatron.flex_attn.compiled import require_compiled_flex_attention
 
-        with require_compiled_flex_attention(*_cp_flex_entrypoints(self)):
+        # Admission is a pre-model boundary, including for retained v2 plans.
+        # A runtime must explicitly carry its launcher's peer-teardown contract;
+        # neither a process group nor a resident run id establishes supervision.
+        # Bind it to this PID so forked workers cannot inherit the capability.
+        supervised = (
+            getattr(self.runtime, "compiled_flash_cohort_supervisor_pid", None)
+            == os.getpid()
+        )
+        if _impl.torch.distributed.is_initialized():
+            supervised = bool(
+                self._recovery_reduce(
+                    [float(supervised)], op="MIN", sync_across_dp=True
+                )[0]
+            )
+        if not supervised:
+            raise RuntimeError("Compiled FLASH execution requires cohort supervision")
+        with require_compiled_flex_attention(
+            *_cp_flex_entrypoints(self), cohort_supervised=True
+        ):
             yield
     else:
         yield

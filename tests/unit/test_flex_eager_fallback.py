@@ -719,7 +719,7 @@ def _qualified_cache_rank_worker(rank, rendezvous, directory, entry, peer_entere
     )
     q = torch.zeros(1, 1, 2, 8)
     with (
-        compiled.require_compiled_flex_attention(attention),
+        compiled.require_compiled_flex_attention(attention, cohort_supervised=True),
         torch._dynamo.config.patch(recompile_limit=1),
     ):
         attention(q, q, q, **options)

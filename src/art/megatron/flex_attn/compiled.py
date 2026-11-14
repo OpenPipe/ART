@@ -42,7 +42,10 @@ _FLASH_LSE_RESCALE = math.log(2.0)
 _logger = logging.getLogger(__name__)
 _FLASH_EAGER_FALLBACK_KEYS: OrderedDict[tuple[object, ...], int] = OrderedDict()
 _FLASH_EAGER_FALLBACK_WARNINGS = 0
-_FORCED_FLEX_EXECUTION_STATE = {"required": False, "fallback": False}
+_FORCED_FLEX_EXECUTION_STATE: dict[str, bool | int] = {
+    "required": False,
+    "fallback": False,
+}
 FlexBackend: TypeAlias = Literal["FLASH", "TRITON"]
 SparseBlockSize: TypeAlias = int | tuple[int, int]
 
@@ -148,7 +151,7 @@ def _flash_eager_fallback(
     q,
     k,
     v,
-    runtime_state: dict[str, bool] | None = None,
+    runtime_state: dict[str, bool | int] | None = None,
 ) -> bool:
     global _FLASH_EAGER_FALLBACK_WARNINGS
     if backend != "FLASH" or torch.compiler.is_compiling():
@@ -162,7 +165,10 @@ def _flash_eager_fallback(
                 "Compiled FLASH execution is required for kernel-family evidence; "
                 "refusing eager FLASH fallback"
             )
-            if torch.distributed.is_initialized():
+            if (
+                runtime_state.get("supervised_owners", 0)
+                and torch.distributed.is_initialized()
+            ):
                 # A peer may already be entering CP/TP communication. Do not
                 # unwind into calibration's unrelated control-group vote.
                 # Process death notifies Monarch supervision, which invalidates
@@ -269,7 +275,7 @@ def _identity_score(score, _batch, _head, _query, _key):
 
 
 def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
-    runtime_state = {"required": False, "fallback": False}
+    runtime_state: dict[str, bool | int] = {"required": False, "fallback": False}
     resolved_options = dict(kernel_options)
     resolved_options.setdefault("PRESCALE_QK", False)
     resolved_options.setdefault("ROWS_GUARANTEED_SAFE", False)
@@ -357,7 +363,7 @@ def prepare_sparse_flex_attention(
 
 
 def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
-    runtime_state = {"required": False, "fallback": False}
+    runtime_state: dict[str, bool | int] = {"required": False, "fallback": False}
 
     def _flex_attention(
         q,
@@ -405,7 +411,7 @@ def _flex_attention_with_options(kernel_options: FlexKernelOptions) -> Any:
     return _flex_attention
 
 
-def _flex_execution_state(entrypoint: Any) -> dict[str, bool] | None:
+def _flex_execution_state(entrypoint: Any) -> dict[str, bool | int] | None:
     original = getattr(entrypoint, "_torchdynamo_orig_callable", None)
     if original is _forced_flex_attention_dense:
         return _FORCED_FLEX_EXECUTION_STATE
@@ -413,25 +419,40 @@ def _flex_execution_state(entrypoint: Any) -> dict[str, bool] | None:
 
 
 @contextmanager
-def require_compiled_flex_attention(*entrypoints: Any) -> Iterator[None]:
-    """Enforce compiled evidence only for the admitted execution/caller interval.
+def require_compiled_flex_attention(
+    *entrypoints: Any, cohort_supervised: bool = False
+) -> Iterator[None]:
+    """Own compiled-only execution through forward and caller recomputation.
 
-    Identity queries never arm this requirement. Keep fallback history separate:
-    leaving this scope permits ordinary eager calls but cannot restore evidence.
-    Trainer model execution is serialized; nested scopes restore their owner.
+    Suspended callers may finish out of order, so count live owners rather than
+    restoring a saved Boolean. Fallback history remains permanently ineligible.
+    Distributed callers must affirm that a supervisor will stop the whole cohort
+    on process loss; required FLASH fallback can terminate this process. TrainerRank
+    checks that capability collectively before model entry. A process group alone
+    does not supply it. Local (non-distributed) guards raise RuntimeError instead.
     """
+    if torch.distributed.is_initialized() and not cohort_supervised:
+        raise RuntimeError("Compiled FLASH execution requires cohort supervision")
     states = []
     try:
         for entrypoint in entrypoints:
             state = _flex_execution_state(entrypoint)
             if state is None:
                 raise ValueError("Unknown compiled Flex attention entrypoint")
-            states.append((state, state["required"]))
+            state["owners"] = int(state.get("owners", 0)) + 1
+            state["supervised_owners"] = int(state.get("supervised_owners", 0)) + int(
+                cohort_supervised
+            )
             state["required"] = True
+            states.append(state)
         yield
     finally:
-        for state, required in reversed(states):
-            state["required"] = required
+        for state in reversed(states):
+            state["owners"] = int(state["owners"]) - 1
+            state["supervised_owners"] = int(state["supervised_owners"]) - int(
+                cohort_supervised
+            )
+            state["required"] = bool(state["owners"])
 
 
 def compiled_flex_attention_family(
