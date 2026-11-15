@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 import importlib
 from importlib.metadata import PackageNotFoundError, version
 import logging
@@ -37,10 +38,10 @@ def _config_tuple(config: Any) -> tuple[int, int, int]:
 def filter_fwd_h_configs(
     kernel: Any, *, fla_version: str, capability: tuple[int, int]
 ) -> bool:
-    """Filter one verified Heuristics -> Autotuner -> JITFunction in place.
+    """Install device dispatch for one verified Heuristics -> Autotuner.
 
-    Return whether the verified safe list is in effect. Repeated imports/calls
-    preserve tuned safe choices. No CUDA calls are made here, allowing CPU tests.
+    Return whether the verified safe list is in effect for this capability.
+    Repeated imports/calls preserve both tuners. Installation makes no CUDA calls.
     """
     if capability[0] != 10:
         return False
@@ -63,10 +64,12 @@ def filter_fwd_h_configs(
         return False
 
     if not already_filtered:
+        original = tuner
+        tuner = copy(original)
         tuner.configs = [
             config for config in tuner.configs if _config_tuple(config) not in _RACY
         ]
-        tuner.cache.clear()
+        tuner.cache = {}
         # These are diagnostic state, but must not advertise a racy selection.
         for attr in ("best_config", "configs_timings"):
             if hasattr(tuner, attr):
@@ -74,6 +77,17 @@ def filter_fwd_h_configs(
         # Triton 3.6's disk autotune key hashes the candidate config list, so the
         # nine-config list cannot reuse results from the original twelve.
         tuner._art_sm100_safe_fwd_h = True
+        safe_run = tuner.run
+
+        def run(*args: Any, **kwargs: Any) -> Any:
+            # Dispatch on every launch, including backward recomputation and
+            # direct FLA calls after ART setup. Leave the original tuner intact.
+            if torch.cuda.get_device_capability()[0] == 10:
+                return safe_run(*args, **kwargs)
+            return original.run(*args, **kwargs)
+
+        tuner.run = run
+        kernel.fn = tuner
     logger.debug("ART Blackwell FLA %s configs (warps, stages, BV): %s", _KERNEL, _SAFE)
     return True
 

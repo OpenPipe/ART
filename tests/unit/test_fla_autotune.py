@@ -24,6 +24,14 @@ SAFE = (
 )
 
 
+class FakeAutotuner(SimpleNamespace):
+    def run(self, key):
+        if key not in self.cache:
+            self.cache[key] = self.configs[0]
+        self.best_config = self.cache[key]
+        return self.best_config
+
+
 def fake_kernel():
     configs = [
         SimpleNamespace(
@@ -37,7 +45,7 @@ def fake_kernel():
         )
         for warps, stages, bv in EXPECTED
     ]
-    tuner = SimpleNamespace(
+    tuner = FakeAutotuner(
         fn=SimpleNamespace(
             __name__="chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
             __module__="fla.ops.common.chunk_delta_h",
@@ -103,6 +111,44 @@ def test_repeated_imports_preserve_safe_tuning_cache():
     assert kernel.fn.configs is config_list
     assert tuples(kernel) == SAFE
     assert kernel.fn.cache == {"safe-choice": config_list[0]}
+
+
+@pytest.mark.parametrize("majors", [(10, 9), (9, 10, 9, 10, 9)])
+def test_same_process_architecture_transitions_preserve_tuner_state(monkeypatch, majors):
+    kernel = mock_runtime(monkeypatch)
+    original = kernel.fn
+    original_state = vars(original).copy()
+    original_choice = original.configs[6]
+    safe = None
+    safe_cache = None
+    for major in majors:
+        monkeypatch.setattr(
+            patch.torch.cuda, "get_device_capability", lambda: (major, 0)
+        )
+        patch.ensure_blackwell_fwd_h_configs()
+        assert patch.filter_fwd_h_configs(
+            kernel, fla_version="0.5.0", capability=(major, 0)
+        ) == (major == 10)
+        # Model the Heuristics wrapper calling its current Autotuner.run.
+        selected = kernel.fn.run(("previous-shape",))
+        if major == 10:
+            assert selected in kernel.fn.configs
+            assert tuples(kernel) == SAFE
+            if safe is None:
+                safe, safe_cache = kernel.fn, kernel.fn.cache
+            assert kernel.fn is safe
+            assert kernel.fn.cache is safe_cache
+            assert kernel.fn.best_config is selected
+        else:
+            assert selected is original_choice
+            assert vars(original) == original_state
+            assert all(
+                getattr(original, name) is value
+                for name, value in original_state.items()
+            )
+            if safe is not None:
+                assert safe.cache is safe_cache
+                assert safe.best_config is safe_cache[("previous-shape",)]
 
 
 @pytest.mark.parametrize(
@@ -311,10 +357,17 @@ def test_real_triton_tuner_cannot_reuse_cached_racy_config(monkeypatch):
     # benchmarking and launching only. No driver or GPU is initialized.
     monkeypatch.setattr(tuner, "_bench", lambda *args, **kwargs: 1.0)
     monkeypatch.setattr(noop, "run", lambda *args, **kwargs: kwargs)
+    monkeypatch.setattr(patch.torch.cuda, "get_device_capability", lambda: (10, 0))
     assert patch.filter_fwd_h_configs(kernel, fla_version="0.5.0", capability=(10, 0))
-    result = tuner.run(1)
+    result = kernel.fn.run(1)
     assert (result["num_warps"], result["num_stages"], result["BV"]) in SAFE
-    assert tuner.cache[(1,)] in tuner.configs
+    assert kernel.fn.cache[(1,)] in kernel.fn.configs
+    # Launch through the same wrapper after switching devices, without another
+    # ART setup call. Hopper must still use the original cached choice.
+    monkeypatch.setattr(patch.torch.cuda, "get_device_capability", lambda: (9, 0))
+    result = kernel.fn.run(1)
+    assert (result["num_warps"], result["num_stages"], result["BV"]) == EXPECTED[6]
+    assert tuner.cache == {(1,): configs[6]}
 
 
 def test_real_triton_disk_cache_namespace_changes(monkeypatch):
@@ -363,5 +416,6 @@ def test_real_triton_disk_cache_namespace_changes(monkeypatch):
 
     tuner.check_disk_cache((1,), tuner.configs, benchmark)
     assert patch.filter_fwd_h_configs(kernel, fla_version="0.5.0", capability=(10, 0))
+    tuner = kernel.fn
     tuner.check_disk_cache((1,), tuner.configs, benchmark)
     assert len(keys) == 2 and keys[0] != keys[1]
