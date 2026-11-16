@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import subprocess
@@ -69,7 +70,8 @@ def _managed_runtime_extra() -> Literal["cuda12", "cuda13"]:
             ).stdout
         except FileNotFoundError:
             continue
-        if "release 13." in output or "CUDA Version: 13." in output:
+        # nvidia-smi from driver 595 on prints "CUDA UMD Version: X.Y"; 617+ drops "CUDA Version: X.Y"
+        if "release 13." in output or re.search(r"CUDA (?:UMD )?Version: 13\.", output):
             return "cuda13"
     return "cuda12"
 
