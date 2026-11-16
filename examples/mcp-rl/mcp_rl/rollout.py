@@ -12,9 +12,8 @@ import os
 
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from mcp_transport import StreamableHttpServerParameters, connect_mcp_transport
 from openai import AsyncOpenAI
-from servers.python.mcp_alphavantage.server_params import server_params
 import weave
 
 import art
@@ -35,8 +34,9 @@ class McpScenario:
     """A scenario for MCP agent evaluation."""
 
     task_description: str
-    server_params: StdioServerParameters
+    server_params: StdioServerParameters | StreamableHttpServerParameters
     max_turns: int = 10
+    max_tool_result_chars: int = 20000
 
 
 @weave.op()
@@ -69,9 +69,12 @@ async def rollout(
     # Initialize system prompt
     system_prompt = f"""You are an MCP (Model Context Protocol) agent.\n\nYou have access to MCP tools through the server. Use them to complete your task.\n\nWhen you believe you have completed the task, call the 'complete_task' function with a summary of what you accomplished. You have a total of {scenario.max_turns} turns to complete the task. Only use tool calls, do not write any content. After you have completed the task, call the 'complete_task' function with a summary of what you accomplished. Call complete_task by itself, not in conjunction with any other tools."""
 
-    # Connect to MCP server using stdio
+    num_turns = 0
+    task_completed = False
+
+    # Connect using the scenario's transport
     try:
-        async with stdio_client(scenario.server_params) as (read, write):
+        async with connect_mcp_transport(scenario.server_params) as (read, write):
             async with ClientSession(read, write) as session:
                 # Initialize the connection
                 await session.initialize()
@@ -134,9 +137,6 @@ async def rollout(
                 if debug:
                     print(traj.messages())
 
-                num_turns = 0
-                task_completed = False
-
                 # Main interaction loop
                 while num_turns < scenario.max_turns and not task_completed:
                     num_turns += 1
@@ -192,7 +192,10 @@ async def rollout(
 
                                         content_text = get_content_text(result)
 
-                                        if len(content_text) > 20000:
+                                        if (
+                                            len(content_text)
+                                            > scenario.max_tool_result_chars
+                                        ):
                                             print(
                                                 f"Tool call result for {tool_call.function.name} is too long: {len(content_text)}"
                                             )
@@ -252,6 +255,8 @@ async def rollout(
 
 
 async def test_rollout():
+    from servers.python.mcp_alphavantage.server_params import server_params
+
     model = art.Model(
         name="o4-mini",
         project="mcp-agent-training",
