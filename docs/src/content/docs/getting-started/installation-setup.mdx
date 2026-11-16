@@ -30,7 +30,7 @@ backend = LocalBackend()
 model = TrainableModel(
     name="agent-001",
     project="my-agentic-task",
-    base_model="OpenPipe/Qwen3-14B-Instruct",
+    base_model="Qwen/Qwen3.8-27B",
 )
 
 await model.register(backend)
