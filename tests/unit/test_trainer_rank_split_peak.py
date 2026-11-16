@@ -444,3 +444,64 @@ def test_default_split_key_matches_main_digest():
     assert rank._split_memory_key(plan).hex() == (
         "be5eda58754725f9c25471f8d0adf483d498f3d86c5a99364952d8df1c68b46f"
     )
+
+
+@pytest.mark.parametrize("mode", ["plain", "growth", "shared-slots", "distinct-slots"])
+def test_split_memory_check_bounds_every_execution_order(monkeypatch, mode):
+    rank = _rank()
+    plan = _split(rank, _requests(3), ((0,), (1,), (2,)))
+    costs = [
+        tr._SubforwardCost(required=100, retained=30),
+        tr._SubforwardCost(required=90, retained=60),
+        tr._SubforwardCost(required=80, retained=20),
+    ]
+    if mode == "growth":
+        costs = [replace(cost, hybridep_growth=10 * i) for i, cost in enumerate(costs)]
+    elif mode.endswith("slots"):
+        costs = [
+            replace(
+                cost,
+                checkpoint_retained=20,
+                checkpoint_workspace=40,
+                checkpoint_input_gradient=30,
+                checkpoint_peak_increment=10 * i,
+                checkpoint_adapter_gradient=25,
+                checkpoint_adapter_gradient_slots=str(i)
+                if mode == "distinct-slots"
+                else "shared",
+            )
+            for i, cost in enumerate(costs)
+        ]
+    required = rank._split_required_memory(costs)
+    monkeypatch.setattr(rank, "_available_memory_bytes", lambda: required)
+    expected = rank._split_plan_memory_check(plan, costs)
+    assert expected.fits
+    for order in permutations(range(3)):
+        ordered_costs = [costs[i] for i in order]
+        reordered = replace(
+            plan,
+            subforwards=tuple(plan.subforwards[i] for i in order),
+            request_indices=tuple(plan.request_indices[i] for i in order),
+        )
+        assert rank._split_plan_memory_check(reordered, ordered_costs) == expected
+        retained = growth = 0
+        for cost in ordered_costs:
+            growth = max(growth, int(cost.hybridep_growth * tr._MEMORY_SAFETY_FACTOR))
+            peak = (
+                retained
+                + cost.required
+                - int(cost.hybridep_growth * tr._MEMORY_SAFETY_FACTOR)
+                + growth
+            )
+            assert peak <= expected.estimated_required_bytes
+            retained += cost.retained
+        # The same bound reserves checkpoint backward space with all graphs live.
+        if mode.endswith("slots"):
+            adapter = 75 if mode == "distinct-slots" else 25
+            assert (
+                int((3 * (20 + 30) + 40 + adapter) * tr._MEMORY_SAFETY_FACTOR)
+                <= required
+            )
+        with monkeypatch.context() as patch:
+            patch.setattr(rank, "_available_memory_bytes", lambda: required - 1)
+            assert not rank._split_plan_memory_check(reordered, ordered_costs).fits
