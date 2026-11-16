@@ -70,9 +70,11 @@ Report the row count and validation result to the user. Do NOT read the whole da
 Do NOT ask the user to review or confirm their answers after collecting them — just proceed to the next step.
 
 - **Base model**: Recommend ONLY these models:
-  - `OpenPipe/Qwen3-14B-Instruct`
-  - `Qwen/Qwen3-30B-A3B-Instruct-2507`
+  - `Qwen/Qwen3.8-27B`
+  - `Qwen/Qwen3.6-35B-A3B`
   - `meta-llama/Llama-3.1-8B-Instruct`
+  - `google/gemma-4-26B-A4B-it`
+  - `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B`
 - **Project name**: A name for this training project (default: `sft-project`)
 - **Run name**: A static, descriptive name (e.g., `agent-001`, `pii-redactor-001`, `math-tutor-001`). Ask the user for a meaningful name. Do NOT generate random names.
 
