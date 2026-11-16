@@ -307,6 +307,24 @@ def test_create_sft_dataset_iterator_initial_step():
     assert resumed_chunks[0].config.learning_rate == all_chunks[1].config.learning_rate
 
 
+def test_create_sft_dataset_iterator_initial_step_in_later_epoch():
+    """Resuming from any chunk's step starts at that chunk, even when an
+    epoch's batch count is not a multiple of chunk_size."""
+    trajs = _make_trajectories(25)
+    kwargs: dict[str, Any] = dict(
+        chunk_size=10, epochs=2, batch_size=2, peak_lr=2e-4, show_progress=False
+    )
+    all_chunks = list(create_sft_dataset_iterator(trajs, **kwargs))
+    # 13 batches per epoch -> chunks start at steps 0, 10, 13, 23
+    assert [chunk.step for chunk in all_chunks] == [0, 10, 13, 23]
+
+    for index, chunk in enumerate(all_chunks):
+        resumed_chunks = list(
+            create_sft_dataset_iterator(trajs, initial_step=chunk.step, **kwargs)
+        )
+        assert [c.step for c in resumed_chunks] == [c.step for c in all_chunks[index:]]
+
+
 def test_create_sft_dataset_iterator_deterministic():
     """Test that create_sft_dataset_iterator is deterministic with the same seed."""
     trajs = _make_trajectories(50)
