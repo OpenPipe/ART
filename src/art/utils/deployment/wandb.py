@@ -16,10 +16,11 @@ class WandbDeploymentConfig(DeploymentConfig):
     """Configuration for deploying to W&B.
 
     Supported base models:
+    - Qwen/Qwen3.8-27B
+    - Qwen/Qwen3.6-35B-A3B
     - meta-llama/Llama-3.1-8B-Instruct
-    - meta-llama/Llama-3.1-70B-Instruct
-    - OpenPipe/Qwen3-14B-Instruct
-    - Qwen/Qwen2.5-14B-Instruct
+    - google/gemma-4-26B-A4B-it
+    - nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B
     """
 
     provenance: list[str]
@@ -27,10 +28,11 @@ class WandbDeploymentConfig(DeploymentConfig):
 
 
 WANDB_SUPPORTED_BASE_MODELS = [
+    "Qwen/Qwen3.8-27B",
+    "Qwen/Qwen3.6-35B-A3B",
     "meta-llama/Llama-3.1-8B-Instruct",
-    "meta-llama/Llama-3.1-70B-Instruct",
-    "OpenPipe/Qwen3-14B-Instruct",
-    "Qwen/Qwen2.5-14B-Instruct",
+    "google/gemma-4-26B-A4B-it",
+    "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B",
 ]
 
 

@@ -63,13 +63,13 @@ async def main() -> None:
     # The ServerlessBackend requires a `WANDB_API_KEY` environment variable to be set. You can also use the ART `LocalBackend` to train on a local GPU.
     backend = ServerlessBackend()
 
-    # We define a model that we'll train. The model is a LoRA adapter on top of Qwen3-14B.
+    # We define a model that we'll train. The model is a LoRA adapter on top of Qwen3.8-27B.
     run_name = f"openenv-echo-{datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
     model = art.TrainableModel(
         name=run_name,
         run_name=run_name,
         project="openenv-demo",
-        base_model="OpenPipe/Qwen3-14B-Instruct",
+        base_model="Qwen/Qwen3.8-27B",
     )
     await model.register(backend)
 
