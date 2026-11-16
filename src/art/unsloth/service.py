@@ -311,9 +311,6 @@ class UnslothService:
 
     async def _reload_adapter(self, checkpoint_path: str, step: int) -> None:
         """Reload LoRA adapter in vLLM subprocess via HTTP."""
-        import httpx
-
-        self._raise_if_child_failed()
         lora_name = f"{self.model_name}@{step}"
         logger.info(
             f"[DEDICATED] _reload_adapter START: lora_name={lora_name} "
@@ -325,14 +322,14 @@ class UnslothService:
         }
         if self.serving_capabilities.inplace_lora_load:
             payload["load_inplace"] = True
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{self._vllm_base_url}/v1/load_lora_adapter",
-                json=payload,
-                **self._runtime_request_kwargs(),
-                timeout=60.0,
-            )
-            response.raise_for_status()
+        response = await self._vllm_runtime.post_with_retry(
+            "/v1/load_lora_adapter",
+            json=payload,
+            timeout=60.0,
+            before_attempt=self._raise_if_child_failed,
+            operation="LoRA adapter reload",
+            failure_context=f"step={step}; checkpoint={checkpoint_path}",
+        )
         logger.info(
             f"[DEDICATED] _reload_adapter DONE: lora_name={lora_name} "
             f"status={response.status_code}"
