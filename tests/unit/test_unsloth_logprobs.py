@@ -121,3 +121,65 @@ def test_fp16_flat_vocab_has_finite_logprobs_and_entropy() -> None:
     assert torch.isfinite(entropy).all()
     torch.testing.assert_close(logprobs, -expected_entropy, rtol=1e-6, atol=1e-6)
     torch.testing.assert_close(entropy, expected_entropy, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 6])
+def test_row_mask_matches_full_projection(chunk_size: int) -> None:
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 6, 5, dtype=torch.float64)
+    head = torch.randn(5, 7, dtype=torch.float64)
+    targets = torch.randint(0, 7, (2, 6))
+    mask = torch.zeros(2, 6, dtype=torch.bool)
+    mask[0, 1] = mask[0, 4] = mask[1, 3] = True
+
+    masked_hidden = hidden.clone().requires_grad_()
+    masked_head = head.clone().requires_grad_()
+    logprobs, entropy = _calculate_logprobs(
+        masked_head, masked_hidden, targets, chunk_size, row_mask=mask
+    )
+    (logprobs * mask).sum().backward()
+
+    full_hidden = hidden.clone().requires_grad_()
+    full_head = head.clone().requires_grad_()
+    ref_logprobs, ref_entropy = _calculate_logprobs(
+        full_head, full_hidden, targets, chunk_size
+    )
+    (ref_logprobs * mask).sum().backward()
+
+    torch.testing.assert_close(logprobs[mask], ref_logprobs[mask])
+    torch.testing.assert_close(entropy[mask], ref_entropy[mask])
+    assert (logprobs[~mask] == 0).all()
+    assert (entropy[~mask] == 0).all()
+    torch.testing.assert_close(masked_hidden.grad, full_hidden.grad)
+    torch.testing.assert_close(masked_head.grad, full_head.grad)
+
+
+def test_row_mask_covering_every_row_matches_unmasked() -> None:
+    torch.manual_seed(1)
+    hidden = torch.randn(1, 4, 3)
+    head = torch.randn(3, 6)
+    targets = torch.randint(0, 6, (1, 4))
+
+    logprobs, entropy = _calculate_logprobs(
+        head, hidden, targets, 2, row_mask=torch.ones(1, 4, dtype=torch.bool)
+    )
+    ref_logprobs, ref_entropy = _calculate_logprobs(head, hidden, targets, 2)
+
+    torch.testing.assert_close(logprobs, ref_logprobs)
+    torch.testing.assert_close(entropy, ref_entropy)
+
+
+def test_row_mask_without_selected_rows_keeps_a_graph() -> None:
+    hidden = torch.randn(1, 4, 3, requires_grad=True)
+    logprobs, _ = _calculate_logprobs(
+        torch.eye(3),
+        hidden,
+        torch.zeros(1, 4, dtype=torch.long),
+        2,
+        row_mask=torch.zeros(1, 4, dtype=torch.bool),
+    )
+
+    assert logprobs.requires_grad
+    logprobs.sum().backward()
+    assert hidden.grad is not None
+    assert torch.isfinite(hidden.grad).all()
