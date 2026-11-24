@@ -42,6 +42,7 @@ def layer() -> Any:
         num_layers=40,
         num_moe_experts=256,
         moe_router_topk=8,
+        moe_aux_loss_coeff=0.0,
         moe_ffn_hidden_size=512,
         moe_expert_capacity_factor=None,
         moe_pad_expert_input_to_capacity=False,
@@ -54,6 +55,7 @@ def layer() -> Any:
     value = module(MoELayer)
     value.config = config
     value.router = module(TopKRouter)
+    value.router.config = config
     value.router.topk = 8
     value.token_dispatcher = object.__new__(MoEAlltoAllTokenDispatcher)
     value.token_dispatcher.config = config
@@ -678,9 +680,13 @@ def hybrid_checkpoint_rank(layer, monkeypatch):
         model: Any = torch.nn.Module()
         model.config, model.decoder = decoder.config, decoder
         model._preprocess = lambda: None
-        # Only distributed topology is mocked. Real constructor metadata selects
-        # the HybridEP coefficient, without loading a model or initializing CUDA.
+        # Stand in for a contained EP2/CP2 cohort without initializing groups.
+        # Real Gloo containment is covered by test_trainer_rank_init_cohort.
+        # Constructor metadata still selects the actual HybridEP coefficient.
         monkeypatch.setattr(TrainerRank, "_topology_key", lambda self: (1, 1, 2, 1))
+        monkeypatch.setattr(
+            TrainerRank, "_expert_admission_scope_error", lambda self, cohort: None
+        )
         rank = TrainerRank(
             cast(
                 Any,
