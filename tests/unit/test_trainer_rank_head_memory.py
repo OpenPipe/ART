@@ -495,3 +495,13 @@ def test_later_sparse_loss_does_not_reduce_6330_projected_targets():
     assert r._plan_head_workspace_bytes(plan) == 7 * 512 * 248320 * 2 + targets(
         6330, [item], grad=True
     )
+
+
+def test_head_workspace_supported_with_fp32_residual_connection():
+    r = rank()
+    bf16_head = r._head_workspace_bytes(512)
+    assert bf16_head == 512 * 248320 * 2
+    r.runtime.model[0].config.fp32_residual_connection = True
+    assert r._head_workspace_bytes(512) == bf16_head
+    r.runtime.model[0].config.fp32_residual_connection = 1
+    assert r._head_workspace_bytes(512) == 0

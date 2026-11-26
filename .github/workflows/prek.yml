@@ -264,6 +264,7 @@ jobs:
             tests/unit/test_gdn_empty_shards.py \
             tests/unit/test_gdn_cp_radix_correctness.py \
             tests/unit/test_prefix_tree_chunk_alignment.py \
+            tests/unit/test_fp32_residual.py \
             tests/unit/test_segmented_router.py \
             tests/unit/test_lora_layouts.py \
             tests/unit/test_trainer_rank_forward_profile.py \
@@ -324,6 +325,7 @@ jobs:
             --ignore=tests/unit/test_segmented_expert_lora.py \
             --ignore=tests/unit/test_segmented_gdn.py \
             --ignore=tests/unit/test_gdn_empty_shards.py \
+            --ignore=tests/unit/test_fp32_residual.py \
             --ignore=tests/unit/test_segmented_router.py \
             --ignore=tests/unit/test_lora_layouts.py \
             --ignore=tests/unit/test_trainer_rank_forward_profile.py \

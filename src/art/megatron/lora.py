@@ -2267,19 +2267,24 @@ class SharedExpertsLinearFC1LoRA(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         if int(x.numel()) == 0:
-            zero = x.sum() * 0.0
             weight = getattr(self.linear_fc1, "weight", None)
+            out_dtype = weight.dtype if isinstance(weight, torch.Tensor) else x.dtype
+            zero = x.sum().to(dtype=out_dtype) * 0.0
             if isinstance(weight, torch.Tensor):
-                zero = zero + weight.to(dtype=x.dtype).sum() * 0.0
+                zero = zero + weight.to(dtype=out_dtype).sum() * 0.0
+            ln_weight = getattr(self.linear_fc1, "layer_norm_weight", None)
+            if isinstance(ln_weight, torch.Tensor):
+                zero = zero + ln_weight.to(dtype=out_dtype).sum() * 0.0
             loras = (
                 (self.up_lora,) if self.non_gated else (self.gate_lora, self.up_lora)
             )
+            lora_x = x.to(dtype=out_dtype)
             for lora in loras:
                 if _CURRENT_LORA_SEGMENTS.get() is not None:
-                    zero = zero + lora(x).sum() * 0.0
+                    zero = zero + lora(lora_x).to(dtype=out_dtype).sum() * 0.0
                 else:
-                    zero = zero + lora.A_T.to(dtype=x.dtype).sum() * 0.0
-                    zero = zero + lora.B_T.to(dtype=x.dtype).sum() * 0.0
+                    zero = zero + lora.A_T.to(dtype=out_dtype).sum() * 0.0
+                    zero = zero + lora.B_T.to(dtype=out_dtype).sum() * 0.0
             return zero.expand(*x.shape[:-1], self.out_features).clone(), None
         base_output, bias_out = self.linear_fc1(x)
         if isinstance(base_output, tuple):

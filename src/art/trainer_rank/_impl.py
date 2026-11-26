@@ -1529,7 +1529,6 @@ def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
         "params_dtype": torch.bfloat16,
         "moe_shared_expert_overlap": False,
         "sequence_parallel": False,
-        "fp32_residual_connection": False,
         "add_bias_linear": False,
         "use_te_activation_func": False,
         "bias_activation_fusion": False,
@@ -1555,6 +1554,12 @@ def _shared_expert_output_bytes_per_token(layer: torch.nn.Module) -> int:
                 "postprocess",
             )
         )
+        or any(
+            type(getattr(c, "fp32_residual_connection", None)) is not bool
+            for c in (config, shared_config)
+        )
+        or getattr(config, "fp32_residual_connection", None)
+        is not getattr(shared_config, "fp32_residual_connection", None)
         or any(
             type(getattr(c, name, None)) is not type(value) or getattr(c, name) != value
             for c in (config, shared_config)

@@ -434,6 +434,7 @@ class Qwen35MoeHandler(Qwen35BaseHandler):
     def configure_provider_for_runtime(self, provider: Any) -> None:
         super().configure_provider_for_runtime(provider)
         provider.moe_shared_expert_overlap = False
+        provider.fp32_residual_connection = True
 
     def collect_layer_families(self, provider: Any) -> list[LayerFamilyInstance]:
         if int(getattr(provider, "num_moe_experts", 0) or 0) <= 0:

@@ -957,6 +957,9 @@ def _optimized_load_weights_hf_to_megatron(
 def install_art_bridge_runtime_patches() -> None:
     from megatron.bridge.models import model_provider as model_provider_module
 
+    from art.megatron.fp32_residual import install_fp32_residual_patches
+
+    install_fp32_residual_patches()
     _patch_router_gating_linear_empty_input()
     _patch_bias_swiglu_empty_input()
     _patch_moe_unpermute_empty_input()

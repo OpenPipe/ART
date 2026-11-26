@@ -475,3 +475,16 @@ def test_pending_counts_bucket_backing_and_output_rank_separately():
     assert replace(shape, output_lora_rank=0).pending(50640, buckets) == shape.pending(
         50640, buckets
     ) - 50640 * (8192 + 2)
+
+
+def test_pending_floor_prices_fp32_residual_boundaries(pending_rank):
+    rank = pending_rank
+    plan = rank._plan_flat_forward(full_requests())
+    bf16_retained, bf16_workspace = g.plan_floor(rank, plan)
+    rank.runtime.model[0].decoder.config.fp32_residual_connection = True
+    assert g.model_shapes(rank) is not None
+    fp32_retained, fp32_workspace = g.plan_floor(rank, plan)
+    assert fp32_retained == 2 * bf16_retained
+    assert fp32_workspace == bf16_workspace
+    rank.runtime.model[0].decoder.config.fp32_residual_connection = 1
+    assert g.model_shapes(rank) is None
