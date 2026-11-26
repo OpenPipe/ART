@@ -763,6 +763,7 @@ def replay(
     from ._planner_cost import ModelGeometry
     from ._prefix_tree_planner import (
         build_canonical_prefix_tree,
+        canonical_prefix_tree_chunk_size,
         plan_prefix_tree_layout,
     )
 
@@ -890,9 +891,16 @@ def replay(
         or request_offset != len(payload["requests"])
     ):
         raise ValueError("unused grouped replay metadata")
+    tree_chunk_size = canonical_prefix_tree_chunk_size(
+        uses_gdn=rank._gdn_layers > 0,
+        cp_size=cp,
+    )
     selected_layouts = [
         plan_prefix_tree_layout(
-            build_canonical_prefix_tree(item["input_tokens"]),
+            build_canonical_prefix_tree(
+                item["input_tokens"],
+                chunk_size=tree_chunk_size,
+            ),
             frozenset(item["selected_decisions"]),
         )
         for item in payload.get("layouts", [])

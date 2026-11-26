@@ -231,6 +231,7 @@ class ContextParallelExecutionCache:
         default_factory=dict
     )
     stage_execution_specs: dict[Any, "StageExecutionSpec"] = field(default_factory=dict)
+    k_align_index_tensors: dict[Any, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -245,6 +246,8 @@ class StageExecutionSpec:
     k_len: int
     compile_key: str
     mask_metadata: "ExactMaskMetadata | None" = None
+    slices: tuple[AttnSlice, ...] | None = None
+    k_align_dst_indices: tuple[int, ...] | None = None
 
 
 @dataclass

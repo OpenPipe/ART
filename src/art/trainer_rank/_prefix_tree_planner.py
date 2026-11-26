@@ -39,6 +39,7 @@ FixedPointScore: TypeAlias = int | tuple[int, ...]
 _TREE_SCHEMA_VERSION = 2
 _LAYOUT_SCHEMA_VERSION = 2
 _PARTITION_SCHEMA_VERSION = 1
+GDN_CP_PREFIX_TREE_CHUNK_SIZE = 64
 
 
 _U64 = struct.Struct("<Q")
@@ -295,8 +296,23 @@ def _finalize_canonical_prefix_tree(
     )
 
 
+def canonical_prefix_tree_chunk_size(*, uses_gdn: bool, cp_size: int) -> int:
+    """Return shared-prefix alignment granularity for canonical radix trees.
+
+    FLA's gated-delta recurrence uses 64-token WY chunks. On ``CP == 1``,
+    ``_build_chunk_aligned_cp1_tree_buckets`` aligns shared prefixes during GDN
+    bucket construction; on ``CP > 1`` with GDN, aligning shared prefix splits
+    to 64-token boundaries in the canonical radix tree ensures no WY chunk is
+    ever split mid-chunk across ranks or tree depth boundaries.
+    """
+
+    return GDN_CP_PREFIX_TREE_CHUNK_SIZE if uses_gdn and cp_size > 1 else 1
+
+
 def build_canonical_prefix_tree(
     sequences: Iterable[Sequence[int] | torch.Tensor],
+    *,
+    chunk_size: int = 1,
 ) -> CanonicalPrefixTree:
     """Build a full radix tree iteratively, with no depth limit.
 
@@ -304,11 +320,19 @@ def build_canonical_prefix_tree(
     are retained.  Parents are always emitted before children, which permits
     all subsequent transforms to remain iterative as well.
 
+    When ``chunk_size > 1``, every multi-sequence shared prefix segment length
+    is floored to a multiple of ``chunk_size`` so downstream chunked kernels
+    (such as FLA's 64-token GDN WY chunks on ``CP > 1``) never split a chunk
+    mid-way across a shared-prefix boundary.
+
     Token equality is the only thing the tree needs from the token values, so
     each shared-segment scan is one vectorized comparison over the active
     rows' candidate span rather than a per-position Python loop; the result is
     identical to the scalar algorithm.
     """
+
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 
     rows = tuple(_token_row(sequence) for sequence in sequences)
     if not rows:
@@ -352,7 +376,8 @@ def build_canonical_prefix_tree(
                 if first_mismatch.numel()
                 else shared_end - start
             )
-        if cursor > start:
+        aligned_cursor = start + ((cursor - start) // chunk_size) * chunk_size
+        if aligned_cursor > start:
             segment_index = len(segments)
             segments.append(
                 CanonicalSegment(
@@ -360,25 +385,35 @@ def build_canonical_prefix_tree(
                     parent_index=parent_index,
                     sequence_indices=active,
                     start=start,
-                    end=cursor,
+                    end=aligned_cursor,
                     depth=depth,
                 )
             )
-            tasks.append((active, cursor, segment_index))
+            tasks.append((active, aligned_cursor, segment_index))
             continue
 
         # Preserve first-seen sibling order.  Pushing in reverse makes the
         # explicit stack produce the same order as a deterministic DFS.
+        # When 0 <= cursor - start < chunk_size, branch at `cursor` so
+        # sequences ending at `cursor` peel off as leaves and continuing
+        # sequences group by their diverging token without splitting a chunk.
+        branch_pos = cursor
         groups: dict[int, list[int]] = {}
-        sibling_tokens: list[int] = []
+        sibling_order: list[tuple[str, int]] = []
         for sequence_index in active:
-            token = int(rows[sequence_index][start])
-            if token not in groups:
-                groups[token] = []
-                sibling_tokens.append(token)
-            groups[token].append(sequence_index)
-        for token in reversed(sibling_tokens):
-            tasks.append((tuple(groups[token]), start, parent_index))
+            if lengths[sequence_index] == branch_pos:
+                sibling_order.append(("leaf", sequence_index))
+            else:
+                token = int(rows[sequence_index][branch_pos])
+                if token not in groups:
+                    groups[token] = []
+                    sibling_order.append(("group", token))
+                groups[token].append(sequence_index)
+        for kind, value in reversed(sibling_order):
+            if kind == "leaf":
+                tasks.append(((value,), start, parent_index))
+            else:
+                tasks.append((tuple(groups[value]), start, parent_index))
 
     return _finalize_canonical_prefix_tree(
         sequence_lengths=lengths,
@@ -838,10 +873,12 @@ __all__ = [
     "DecisionSet",
     "Fingerprint",
     "FixedPointScore",
+    "GDN_CP_PREFIX_TREE_CHUNK_SIZE",
     "LayoutCandidate",
     "PlannedSegment",
     "PrefixTreeLayout",
     "build_canonical_prefix_tree",
+    "canonical_prefix_tree_chunk_size",
     "effective_span_breakpoints",
     "effective_span_decisions",
     "iter_all_prefix_tree_layouts",

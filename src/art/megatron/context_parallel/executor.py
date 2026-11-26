@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any, cast
 
 import torch
@@ -31,6 +32,7 @@ from .range_ops import (
 )
 from .types import (
     ArtContextParallelState,
+    AttnSlice,
     CpBlockMaskVariant,
     DkvReducePlan,
     ExactMaskMetadata,
@@ -759,12 +761,15 @@ def _build_stage_block_mask(
             input_pos=state.input_pos,
         )
         state.execution_cache.block_mask_context = block_mask_context
+    mask_slices = (
+        stage_plan.slices if execution_spec.slices is None else execution_spec.slices
+    )
     mask = build_block_mask_from_context(
         FlexMaskSpec(
             q_len=int(execution_spec.q_len),
             k_len=int(execution_spec.k_len),
             block_size=resolved_block_size,
-            slices=stage_plan.slices,
+            slices=mask_slices,
             exact_mask=mask_metadata,
         ),
         context=block_mask_context,
@@ -851,6 +856,14 @@ def prepare_context_parallel_execution_state(
                 state=state,
                 block_size=variant.block_size,
             )
+            if execution_spec.k_align_dst_indices is not None:
+                _k_align_dst_index_tensor(
+                    state=state,
+                    stage_index=int(stage_plan.stage_index),
+                    block_size=normalize_sparse_block_size(variant.block_size),
+                    dst_indices=execution_spec.k_align_dst_indices,
+                    device=device,
+                )
             _build_stage_block_mask(
                 stage_plan=stage_plan,
                 state=state,
@@ -906,6 +919,216 @@ def _pad_stage_token_tensor(
     return torch.cat((tensor, pad), dim=dim)
 
 
+def _compute_group_aligned_k_map(
+    k_token_indices: Sequence[int],
+    group_ids: Sequence[int],
+    *,
+    k_block: int,
+) -> tuple[tuple[int, ...], int] | None:
+    """Map logical stage K token offsets to ``k_block``-aligned positions at group transitions.
+
+    Returns ``(dst_indices, aligned_k_len)`` when at least one tree-group
+    transition falls mid-``k_block`` (``dst % k_block != 0``), or ``None`` when
+    every group boundary is already ``k_block``-aligned (fast-path zero-op).
+    """
+
+    if k_block <= 1 or len(k_token_indices) <= 1:
+        return None
+    n_groups = len(group_ids)
+    dst_indices: list[int] = []
+    dst = 0
+    prev_group: int | None = None
+    for tok_idx in k_token_indices:
+        if tok_idx < 0 or tok_idx >= n_groups:
+            return None
+        group = int(group_ids[tok_idx])
+        if prev_group is not None and group != prev_group and (dst % k_block) != 0:
+            dst = ((dst + k_block - 1) // k_block) * k_block
+        dst_indices.append(dst)
+        dst += 1
+        prev_group = group
+    if dst == len(k_token_indices):
+        return None
+    return tuple(dst_indices), dst
+
+
+def _remap_slices_for_k_alignment(
+    slices: Sequence[AttnSlice],
+    dst_indices: Sequence[int],
+) -> tuple[AttnSlice, ...]:
+    """Remap stage ``AttnSlice.k_range`` intervals onto contiguous valid runs in ``dst_indices``.
+
+    Splitting across inserted pad gaps guarantees every remapped slice covers
+    only valid (non-``-1``) K indices so ``block_mask.py`` boundary lookups
+    never touch ``-1`` padding slots.
+    """
+
+    remapped: list[AttnSlice] = []
+    n_dst = len(dst_indices)
+    for sl in slices:
+        ks = int(sl.k_range.start)
+        ke = min(int(sl.k_range.end), n_dst)
+        if ke <= ks or ks < 0 or ks >= n_dst:
+            continue
+        run_start = int(dst_indices[ks])
+        prev = run_start
+        for pos in range(ks + 1, ke):
+            cur = int(dst_indices[pos])
+            if cur != prev + 1:
+                remapped.append(
+                    AttnSlice(
+                        q_range=sl.q_range,
+                        k_range=TokenRange(start=run_start, end=prev + 1),
+                        mask_kind=sl.mask_kind,
+                        row_index=sl.row_index,
+                        family_index=sl.family_index,
+                    )
+                )
+                run_start = cur
+            prev = cur
+        remapped.append(
+            AttnSlice(
+                q_range=sl.q_range,
+                k_range=TokenRange(start=run_start, end=prev + 1),
+                mask_kind=sl.mask_kind,
+                row_index=sl.row_index,
+                family_index=sl.family_index,
+            )
+        )
+    return tuple(remapped)
+
+
+def _k_align_dst_index_tensor(
+    *,
+    state: ArtContextParallelState,
+    stage_index: int,
+    block_size: tuple[int, int],
+    dst_indices: tuple[int, ...],
+    device: torch.device,
+) -> torch.Tensor:
+    execution_cache = getattr(state, "execution_cache", None)
+    cache = getattr(execution_cache, "k_align_index_tensors", None)
+    key = (int(stage_index), block_size, device.type, device.index)
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+    tensor = torch.tensor(dst_indices, dtype=torch.int64, device=device)
+    if cache is not None:
+        cache[key] = tensor
+    return tensor
+
+
+def _scatter_aligned_stage_token_tensor(
+    tensor: torch.Tensor,
+    *,
+    dst_indices: torch.Tensor,
+    target_len: int,
+    head_major: bool = False,
+) -> torch.Tensor:
+    seq_dim = 1 if head_major else 0
+    padded_shape = list(tensor.shape)
+    padded_shape[seq_dim] = int(target_len)
+    # Out-of-place `index_copy` keeps pad slots zero-filled and preserves exact
+    # autograd gradients back to the logical stage K/V tensor.
+    return tensor.new_zeros(padded_shape).index_copy(seq_dim, dst_indices, tensor)
+
+
+def _build_stage_execution_spec(
+    *,
+    stage_plan: StagePlan,
+    state: ArtContextParallelState,
+    resolved_block_size: tuple[int, int],
+) -> StageExecutionSpec:
+    _, k_block = resolved_block_size
+    mask_meta = stage_plan.mask_metadata
+    group_ids_tensor = getattr(state, "group_ids", None)
+    logical_k_len = _logical_stage_k_len(stage_plan)
+    align: tuple[tuple[int, ...], int] | None = None
+    if (
+        mask_meta is not None
+        and group_ids_tensor is not None
+        and stage_plan.slices
+        and logical_k_len > 1
+        and int(k_block) > 1
+        and int(mask_meta.k_token_indices.numel()) >= logical_k_len
+    ):
+        k_abs_cpu = (
+            mask_meta.k_token_indices[:logical_k_len]
+            .detach()
+            .to(device="cpu", dtype=torch.int64)
+            .tolist()
+        )
+        group_ids_cpu = (
+            group_ids_tensor.detach()
+            .to(device="cpu", dtype=torch.int64)
+            .reshape(-1)
+            .tolist()
+        )
+        align = _compute_group_aligned_k_map(
+            k_abs_cpu,
+            group_ids_cpu,
+            k_block=int(k_block),
+        )
+
+    if align is not None and mask_meta is not None:
+        dst_indices, aligned_k_len = align
+        target_q_len, target_k_len, compile_key = select_sparse_execution_family(
+            is_local_stage=bool(stage_plan.is_local_stage),
+            q_len=int(stage_plan.q_len),
+            k_len=max(int(stage_plan.k_len), int(aligned_k_len)),
+            block_size=resolved_block_size,
+        )
+        q_idx = _pad_exact_indices(mask_meta.q_token_indices, int(target_q_len))
+        k_idx = torch.full(
+            (int(target_k_len),),
+            -1,
+            dtype=mask_meta.k_token_indices.dtype,
+            device=mask_meta.k_token_indices.device,
+        )
+        dst_idx_tensor = torch.tensor(
+            dst_indices,
+            dtype=torch.int64,
+            device=k_idx.device,
+        )
+        k_idx.index_copy_(
+            0, dst_idx_tensor, mask_meta.k_token_indices[: len(dst_indices)]
+        )
+        aligned_meta = ExactMaskMetadata(
+            q_token_indices=q_idx,
+            k_token_indices=k_idx,
+            cache_key=(
+                f"{mask_meta.cache_key}:kalign:q{int(target_q_len)}:k{int(target_k_len)}"
+            ),
+        )
+        aligned_slices = _remap_slices_for_k_alignment(stage_plan.slices, dst_indices)
+        return StageExecutionSpec(
+            q_len=int(target_q_len),
+            k_len=int(target_k_len),
+            compile_key=str(compile_key),
+            mask_metadata=aligned_meta,
+            slices=aligned_slices,
+            k_align_dst_indices=dst_indices,
+        )
+
+    target_q_len, target_k_len, compile_key = select_sparse_execution_family(
+        is_local_stage=bool(stage_plan.is_local_stage),
+        q_len=int(stage_plan.q_len),
+        k_len=int(stage_plan.k_len),
+        block_size=resolved_block_size,
+    )
+    return StageExecutionSpec(
+        q_len=int(target_q_len),
+        k_len=int(target_k_len),
+        compile_key=str(compile_key),
+        mask_metadata=_resize_exact_mask_metadata(
+            stage_plan.mask_metadata,
+            q_len=int(target_q_len),
+            k_len=int(target_k_len),
+        ),
+    )
+
+
 def _resolve_stage_execution_spec(
     *,
     stage_plan: StagePlan,
@@ -917,61 +1140,22 @@ def _resolve_stage_execution_spec(
     )
     cache_key = (int(stage_plan.stage_index), resolved_block_size)
     execution_cache = getattr(state, "execution_cache", None)
-    if execution_cache is None:
-        target_q_len, target_k_len, compile_key = select_sparse_execution_family(
-            is_local_stage=bool(stage_plan.is_local_stage),
-            q_len=int(stage_plan.q_len),
-            k_len=int(stage_plan.k_len),
-            block_size=resolved_block_size,
-        )
-        return StageExecutionSpec(
-            q_len=int(target_q_len),
-            k_len=int(target_k_len),
-            compile_key=str(compile_key),
-            mask_metadata=_resize_exact_mask_metadata(
-                stage_plan.mask_metadata,
-                q_len=int(target_q_len),
-                k_len=int(target_k_len),
-            ),
-        )
-    cache = getattr(execution_cache, "stage_execution_specs", None)
-    if cache is None:
-        target_q_len, target_k_len, compile_key = select_sparse_execution_family(
-            is_local_stage=bool(stage_plan.is_local_stage),
-            q_len=int(stage_plan.q_len),
-            k_len=int(stage_plan.k_len),
-            block_size=resolved_block_size,
-        )
-        return StageExecutionSpec(
-            q_len=int(target_q_len),
-            k_len=int(target_k_len),
-            compile_key=str(compile_key),
-            mask_metadata=_resize_exact_mask_metadata(
-                stage_plan.mask_metadata,
-                q_len=int(target_q_len),
-                k_len=int(target_k_len),
-            ),
-        )
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-    target_q_len, target_k_len, compile_key = select_sparse_execution_family(
-        is_local_stage=bool(stage_plan.is_local_stage),
-        q_len=int(stage_plan.q_len),
-        k_len=int(stage_plan.k_len),
-        block_size=resolved_block_size,
+    cache = (
+        None
+        if execution_cache is None
+        else getattr(execution_cache, "stage_execution_specs", None)
     )
-    resolved = StageExecutionSpec(
-        q_len=int(target_q_len),
-        k_len=int(target_k_len),
-        compile_key=str(compile_key),
-        mask_metadata=_resize_exact_mask_metadata(
-            stage_plan.mask_metadata,
-            q_len=int(target_q_len),
-            k_len=int(target_k_len),
-        ),
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+    resolved = _build_stage_execution_spec(
+        stage_plan=stage_plan,
+        state=state,
+        resolved_block_size=resolved_block_size,
     )
-    cache[cache_key] = resolved
+    if cache is not None:
+        cache[cache_key] = resolved
     return resolved
 
 
@@ -988,17 +1172,18 @@ def _run_stage_attention(
     sliding_window: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     sparse_block_size = _stage_sparse_block_size(q_stage, v_stage)
+    resolved_block_size = normalize_sparse_block_size(sparse_block_size)
     execution_spec = _resolve_stage_execution_spec(
         stage_plan=stage_plan,
         state=state,
-        block_size=sparse_block_size,
+        block_size=resolved_block_size,
     )
     block_mask = _get_prepared_stage_block_mask(
         stage_plan=stage_plan,
         state=state,
         device=q_stage.device,
         execution_spec=execution_spec,
-        block_size=sparse_block_size,
+        block_size=resolved_block_size,
         sliding_window=sliding_window,
     )
     _validate_stage_block_alignment(
@@ -1008,21 +1193,44 @@ def _run_stage_attention(
     )
     logical_q_len = _logical_stage_q_len(stage_plan)
     input_head_major = q_stage.ndim == 3 and int(q_stage.shape[1]) == logical_q_len
+    seq_dim = 1 if input_head_major else 0
     q_stage = _pad_stage_token_tensor(
         q_stage,
         target_len=int(execution_spec.q_len),
         head_major=input_head_major,
     )
-    k_stage = _pad_stage_token_tensor(
-        k_stage,
-        target_len=int(execution_spec.k_len),
-        head_major=input_head_major,
-    )
-    v_stage = _pad_stage_token_tensor(
-        v_stage,
-        target_len=int(execution_spec.k_len),
-        head_major=input_head_major,
-    )
+    dst_indices = execution_spec.k_align_dst_indices
+    if dst_indices is not None and len(dst_indices) == int(k_stage.shape[seq_dim]):
+        dst_tensor = _k_align_dst_index_tensor(
+            state=state,
+            stage_index=int(stage_plan.stage_index),
+            block_size=resolved_block_size,
+            dst_indices=dst_indices,
+            device=k_stage.device,
+        )
+        k_stage = _scatter_aligned_stage_token_tensor(
+            k_stage,
+            dst_indices=dst_tensor,
+            target_len=int(execution_spec.k_len),
+            head_major=input_head_major,
+        )
+        v_stage = _scatter_aligned_stage_token_tensor(
+            v_stage,
+            dst_indices=dst_tensor,
+            target_len=int(execution_spec.k_len),
+            head_major=input_head_major,
+        )
+    else:
+        k_stage = _pad_stage_token_tensor(
+            k_stage,
+            target_len=int(execution_spec.k_len),
+            head_major=input_head_major,
+        )
+        v_stage = _pad_stage_token_tensor(
+            v_stage,
+            target_len=int(execution_spec.k_len),
+            head_major=input_head_major,
+        )
     if input_head_major:
         q_flex = q_stage.unsqueeze(0).contiguous()
         k_flex = k_stage.unsqueeze(0).contiguous()

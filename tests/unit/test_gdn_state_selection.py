@@ -28,8 +28,9 @@ def test_state_selection_reuses_indices_and_preserves_values_gradients_and_views
     monkeypatch.setattr(operator, "_long_tensor", record)
     selected = cache.states_for_families(None, rows, state_reference=conv)
     expected = tuple(chunk[list(rows)] for chunk in refs)
-    is_view = len(set(rows)) == 1 or rows == tuple(range(rows[0], rows[0] + len(rows)))
-    assert len(indices) == (0 if is_view else 1)
+    is_broadcast = len(set(rows)) == 1 and len(rows) > 1
+    is_view = len(rows) == 1 or rows == tuple(range(rows[0], rows[0] + len(rows)))
+    assert len(indices) == (0 if (is_view or is_broadcast) else 1)
     if indices:
         assert indices[0].dtype == torch.long
         assert indices[0].device == conv.device
@@ -43,6 +44,9 @@ def test_state_selection_reuses_indices_and_preserves_values_gradients_and_views
                 actual.untyped_storage().data_ptr()
                 == chunk.untyped_storage().data_ptr()
             )
+        if is_broadcast:
+            assert actual.is_contiguous()
+            assert actual.stride(0) > 0
         weights = (
             torch.arange(actual.numel(), dtype=actual.dtype).reshape(actual.shape) % 3
         )
