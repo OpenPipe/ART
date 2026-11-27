@@ -32,6 +32,10 @@ def _compile_workaround_flags_for_provider(
         # HybridEP owns native communication, dynamic routing metadata, and
         # side-stream lifetimes. Keep only Megatron's thin flex wrapper eager.
         flags = (*flags, "flex_token_dispatch_combine")
+        # Keep TopKRouter.routing eager so Inductor cannot choose different
+        # persistent-reduction XBLOCK layouts across CP ranks from per-rank
+        # sequence-length size_hints.
+        flags = (*flags, "moe_router_routing")
     if bool(getattr(provider, "moe_shared_expert_overlap", False)):
         flags = (*flags, "shared_expert_stream_handoffs")
     if (

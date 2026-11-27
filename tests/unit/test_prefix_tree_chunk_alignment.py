@@ -25,13 +25,24 @@ def _assert_chunk_aligned_tree_valid(
     chunk_size: int = GDN_CP_PREFIX_TREE_CHUNK_SIZE,
 ) -> CanonicalPrefixTree:
     tree = build_canonical_prefix_tree(sequences, chunk_size=chunk_size)
+    parent_indices = {
+        segment.parent_index
+        for segment in tree.segments
+        if segment.parent_index is not None
+    }
 
     for segment in tree.segments:
         if len(segment.sequence_indices) > 1:
             assert segment.start % chunk_size == 0
-            assert segment.end % chunk_size == 0
-            assert (segment.end - segment.start) % chunk_size == 0
             assert segment.end > segment.start
+            if segment.index in parent_indices:
+                assert segment.end % chunk_size == 0
+                assert (segment.end - segment.start) % chunk_size == 0
+            else:
+                assert all(
+                    len(sequences[seq_idx]) == segment.end
+                    for seq_idx in segment.sequence_indices
+                )
         if segment.parent_index is not None:
             assert segment.parent_index < segment.index
             assert tree.segments[segment.parent_index].end == segment.start
@@ -57,11 +68,20 @@ def _assert_chunk_aligned_tree_valid(
                 0, packed.positions_by_sequence[seq_idx]
             )
             assert torch.equal(reconstructed, expected_tensor)
+        packed_parent_ids = {
+            seg.parent_id for seg in packed.segments if seg.parent_id != seg.group_id
+        }
         for seg in packed.segments:
             if len(seg.sequence_indices) > 1:
                 assert seg.start % chunk_size == 0
-                assert seg.end % chunk_size == 0
-                assert (seg.end - seg.start) % chunk_size == 0
+                if seg.group_id in packed_parent_ids:
+                    assert seg.end % chunk_size == 0
+                    assert (seg.end - seg.start) % chunk_size == 0
+                else:
+                    assert all(
+                        len(sequences[seq_idx]) == seg.end
+                        for seq_idx in seg.sequence_indices
+                    )
     return tree
 
 
@@ -112,13 +132,59 @@ def test_chunk_aligned_prefix_tree_s05_nested_duplicates_and_prefix_of_prefix() 
         (4096, 4160, (0, 1)),
     ]
 
-    # Identical sequences: unaligned length 4103, exact aligned 4096, and short 30.
-    _assert_chunk_aligned_tree_valid([p4096 + s7, p4096 + s7])
+    # Identical sequences: unaligned length 4103, exact aligned 4096, and short 3/30
+    # deduplicate cleanly into a single terminal shared leaf with zero chunk splits.
+    tree_unaligned_dup = _assert_chunk_aligned_tree_valid([p4096 + s7, p4096 + s7])
+    assert [
+        (s.start, s.end, s.sequence_indices) for s in tree_unaligned_dup.segments
+    ] == [(0, 4103, (0, 1))]
     tree_exact = _assert_chunk_aligned_tree_valid([p4096, p4096])
     assert [(s.start, s.end, s.sequence_indices) for s in tree_exact.segments] == [
         (0, 4096, (0, 1))
     ]
-    _assert_chunk_aligned_tree_valid([list(range(30)), list(range(30))])
+    tree_short_3 = _assert_chunk_aligned_tree_valid(
+        [[3838, 198, 3838], [3838, 198, 3838]]
+    )
+    assert [(s.start, s.end, s.sequence_indices) for s in tree_short_3.segments] == [
+        (0, 3, (0, 1))
+    ]
+    tree_short_30 = _assert_chunk_aligned_tree_valid([list(range(30)), list(range(30))])
+    assert [(s.start, s.end, s.sequence_indices) for s in tree_short_30.segments] == [
+        (0, 30, (0, 1))
+    ]
+
+    # Duplicate leaves alongside a continuing sequence: shared root stays aligned
+    # at 4096, duplicate 4103-token leaves deduplicate cleanly without splitting a chunk.
+    tree_dup_plus_cont = _assert_chunk_aligned_tree_valid(
+        [p4096 + s7, p4096 + s7, p4096 + s7 + [999]]
+    )
+    assert [
+        (s.start, s.end, s.sequence_indices) for s in tree_dup_plus_cont.segments
+    ] == [
+        (0, 4096, (0, 1, 2)),
+        (4096, 4103, (0, 1)),
+        (4096, 4104, (2,)),
+    ]
+
+    # Interleaved short duplicate leaves + continuing sequence preserve first-seen order.
+    tree_interleaved = _assert_chunk_aligned_tree_valid(
+        [[1, 2, 3], [1, 2, 3, 4], [1, 2, 3]]
+    )
+    assert [
+        (s.start, s.end, s.sequence_indices) for s in tree_interleaved.segments
+    ] == [
+        (0, 3, (0, 2)),
+        (0, 4, (1,)),
+    ]
+
+    # Distinct short sequences sharing a sub-chunk prefix never split a chunk.
+    tree_distinct_short = _assert_chunk_aligned_tree_valid([[1, 2, 3], [1, 2, 4]])
+    assert [
+        (s.start, s.end, s.sequence_indices) for s in tree_distinct_short.segments
+    ] == [
+        (0, 3, (0,)),
+        (0, 3, (1,)),
+    ]
 
     # Prefix-of-prefix: seq 0 ends at 4103, seqs 1 & 2 share 4200 tokens.
     tree_pop = _assert_chunk_aligned_tree_valid(

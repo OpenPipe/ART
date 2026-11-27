@@ -64,6 +64,7 @@ from art.megatron.model_support.spec import (
 
 _GEMMA4_MOE_COMPILE_WORKAROUND_FLAGS = (
     "gemma4_moe_postprocess",
+    "gemma4_moe_router_routing",
     "moe_postprocess",
     "te_triton_permute_with_mask_map",
 )

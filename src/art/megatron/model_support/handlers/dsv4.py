@@ -45,7 +45,10 @@ _DSV4_SPLIT_MOE_EXPERT_KEY_RE = re.compile(
     r"^.*(?:\.mlp\.experts\.\d+\.(?:gate_proj|up_proj)|"
     r"\.ffn\.experts\.\d+\.w[123])\.lora_[AB]\.weight$"
 )
-_DSV4_MOE_COMPILE_WORKAROUND_FLAGS = ("te_triton_permute_with_mask_map",)
+_DSV4_MOE_COMPILE_WORKAROUND_FLAGS = (
+    "dsv4_moe_router_routing",
+    "te_triton_permute_with_mask_map",
+)
 
 
 def _dsv4_input_activator(
