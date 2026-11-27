@@ -1,6 +1,6 @@
 """Two-rank FLASH contracts through real CP plans, transport and backward."""
 
-from contextlib import nullcontext
+from contextlib import ExitStack
 from datetime import timedelta
 import math
 from typing import Any
@@ -246,12 +246,18 @@ def _worker(rank, rendezvous, dim, deterministic, fallback):
                 warm_count = counters["art"]["flex_flash_eager_fallback"]
                 counters["art"]["flex_flash_eager_fallback"] = 0
                 raw = compiled._sparse_flex_attention_with_options({"BACKEND": "FLASH"})
-                scope = (
-                    patch.object(cp, "sparse_compiled_flex_attention", raw)
-                    if fallback and rank == 0
-                    else nullcontext()
-                )
-                with scope:
+                with ExitStack() as stack:
+                    if fallback and rank == 0:
+                        stack.enter_context(
+                            patch.object(cp, "sparse_compiled_flex_attention", raw)
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                cp,
+                                "short_deterministic_flash_sparse_compiled_flex_attention",
+                                raw,
+                            )
+                        )
                     measured = _measure(local_values, state, dim**-0.5, True)
                 fallback_count = counters["art"]["flex_flash_eager_fallback"]
             target = (

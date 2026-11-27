@@ -2777,6 +2777,19 @@ def _runtime_plan_assignment(
             f"got {len(spec.rows)} rows."
         )
     row_spec = spec.rows[0]
+    valid_tokens = int(row_spec.valid_tokens)
+    # Keep sub-block sequences on CP rank 0 as a single contiguous chunk.
+    # Every FlashAttention CP stage pads Q/K/V to block_size, so splitting
+    # sub-block sequences across CP ranks adds remote KV ring stages and
+    # GDN<->attention all-to-alls without reducing attention compute, and
+    # shifts token-to-rank ownership / LSE-merge depth across adjacent lengths.
+    if cp_size > 1 and 0 < valid_tokens < max(int(config.block_size), cp_size):
+        return (
+            row_spec,
+            (TokenRange(start=0, end=valid_tokens),),
+            (0,),
+            (0,),
+        )
     chunk_size = _normalized_chunk_size(
         valid_tokens=int(row_spec.valid_tokens),
         block_size=int(config.block_size),

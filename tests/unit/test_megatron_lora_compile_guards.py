@@ -298,6 +298,49 @@ def test_wrapper_graphs_ignore_layer_prefix(lm, family, record_property):
             assert backend.frame_count == graphs
 
 
+@pytest.mark.parametrize("grad_enabled", [True, False])
+def test_switching_lora_slot_names_causes_zero_dynamo_recompiles(
+    lm, grad_enabled: bool
+) -> None:
+    """@torch.compiler.disable on LoRA._active_lora_storage prevents ref.name recompiles."""
+    torch.manual_seed(31)
+    backend = CompileCounterWithBackend("aot_eager")
+    compiled = torch.compile(lambda module, x: module(x), backend=backend)
+    module = make_lora(lm, 0, "dense")
+    module.A_T.requires_grad_(False)
+    module.B_T.requires_grad_(False)
+    base_state = module.sharded_lora_state_dict()
+    refs = [lm.LoRASlotRef("checkpoint", f"slot_{idx}") for idx in range(10)]
+    for idx, ref in enumerate(refs):
+        scaled_state = {
+            k: v * (1.0 + 0.1 * (idx + 1)) if "lora_B" in k else v.clone()
+            for k, v in base_state.items()
+        }
+        assert module.load_lora_slot(
+            ref, scaled_state, alpha=1.5, requires_grad=grad_enabled
+        )
+
+    x = torch.randn(5, 4, dtype=torch.float64, requires_grad=grad_enabled)
+    graphs = 0
+    with torch.set_grad_enabled(grad_enabled):
+        for idx, ref in enumerate(refs):
+            token = lm._CURRENT_LORA_SLOT.set(ref)
+            try:
+                if idx == 0:
+                    out = compiled(module, x)
+                    graphs = backend.frame_count
+                    assert 1 <= graphs <= 4
+                else:
+                    with torch._dynamo.config.patch(error_on_recompile=True):
+                        out = compiled(module, x)
+                    assert backend.frame_count == graphs
+                # Verify exact parity with eager for every distinct slot.
+                eager_out = module(x)
+                assert torch.equal(out, eager_out)
+            finally:
+                lm._CURRENT_LORA_SLOT.reset(token)
+
+
 @pytest.mark.parametrize("kind", ["dense", "expert", "shared_a", "shared_b"])
 def test_state_dict_and_export_names(lm, kind):
     module = make_lora(lm, 7, kind)

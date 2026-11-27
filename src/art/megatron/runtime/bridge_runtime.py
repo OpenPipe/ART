@@ -692,6 +692,9 @@ def _art_get_model(
         from art.megatron.runtime.external_weights import validate_external_weights
 
         validate_external_weights(model)
+    from art.megatron.fp32_residual import disable_te_parameter_transpose_cache
+
+    disable_te_parameter_transpose_cache(model)
     return model
 
 

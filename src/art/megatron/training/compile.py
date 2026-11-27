@@ -26,6 +26,11 @@ def _configure_dynamo() -> None:
     # behind one LoRA.forward code object. Let automatic dynamic shapes generalize
     # those parameter dimensions instead of compiling once per projection site.
     _DYNAMO_CONFIG.force_parameter_static_shapes = False
+    # Compile dynamic shapes from the very first call instead of specializing on
+    # call #1's static sequence length and recompiling to symbolic shapes on
+    # call #2 (static vs dynamic Inductor reductions can differ by ~1 BF16 ULP,
+    # which amplifies across deep GDN/MoE layers into cold-start drift).
+    _DYNAMO_CONFIG.assume_static_by_default = False
 
 
 def compile_enabled() -> bool:

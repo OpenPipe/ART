@@ -23,18 +23,21 @@ from art.megatron.gdn import operator
 def test_short_row_ownership(cp_size, length, datums):
     # Independent roots, including a long root followed by one-token roots.
     groups = torch.tensor([[0] * length + list(range(1, datums))])
+    config = ContextParallelConfig()
     spec = build_prefix_tree_attention_spec(group_ids=groups, parent_ids=groups)
     plans = _build_runtime_plan(
         spec,
         topology=ParallelTopology(cp=cp_size),
-        config=ContextParallelConfig(),
+        config=config,
         original_seq_len=groups.shape[1],
     )
     counts = [p.local_valid_lengths[0] for p in plans]
     assert sum(counts) == groups.numel()
-    assert (min(counts) > 0) == (groups.numel() >= cp_size)
-    if groups.numel() < cp_size:
-        assert counts == [0] * (cp_size - 1) + [groups.numel()]
+    sub_block_threshold = max(config.block_size, cp_size)
+    if groups.numel() < sub_block_threshold:
+        assert counts == [groups.numel()] + [0] * (cp_size - 1)
+    else:
+        assert min(counts) > 0
 
 
 @pytest.mark.parametrize("valid,physical", [(0, 1), (0, 4), (1, 1), (1, 4), (3, 4)])
@@ -76,16 +79,20 @@ def test_restore_empty_no_grad():
 def test_long_physical_row_and_large_chunks_use_valid_token_ownership(cp_size, valid):
     groups = torch.full((1, 1024), -1, dtype=torch.long)
     groups[:, :valid] = 0
+    config = ContextParallelConfig(planner_chunk_size=1048576)
     spec = build_prefix_tree_attention_spec(group_ids=groups, parent_ids=groups)
     plans = _build_runtime_plan(
         spec,
         topology=ParallelTopology(cp=cp_size),
-        config=ContextParallelConfig(planner_chunk_size=1048576),
+        config=config,
         original_seq_len=1024,
     )
     counts = [p.local_valid_lengths[0] for p in plans]
     assert sum(counts) == valid
-    assert (min(counts) > 0) == (valid >= cp_size)
+    if valid < max(config.block_size, cp_size):
+        assert counts == [valid] + [0] * (cp_size - 1)
+    else:
+        assert min(counts) > 0
 
 
 @pytest.mark.parametrize("mode", ["forward", "backward", "recompute"])

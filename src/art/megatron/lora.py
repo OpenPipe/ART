@@ -1125,10 +1125,17 @@ class LoRA(torch.nn.Module):
         active = self._active_lora_storage()
         return None if active is None else self._expert_views(*active)
 
+    @torch.compiler.disable
     def _active_lora_storage(
         self,
     ) -> tuple[torch.Tensor, torch.Tensor, float] | None:
-        """Return stored factors without an expanded-view autograd chain."""
+        """Return stored factors without an expanded-view autograd chain.
+
+        Disabled for TorchDynamo tracing so reading ``_CURRENT_LORA_SLOT`` inside
+        compiled ``TransformerLayer`` frames never guards on ``ref.name`` or
+        triggers per-slot-name recompiles, while keeping the surrounding LoRA
+        matmuls compiled.
+        """
         ref = _CURRENT_LORA_SLOT.get()
         if ref is None:
             return self.A_T, self.B_T, self.scale

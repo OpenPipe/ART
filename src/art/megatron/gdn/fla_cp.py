@@ -7,6 +7,7 @@ from torch import Tensor
 import torch.distributed as dist
 
 from .fla_autotune import ensure_blackwell_fwd_h_configs
+from .fla_tilelang import ensure_tilelang_varlen_bwd
 
 
 def chunk_gated_delta_rule_native_cp(
@@ -144,6 +145,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
         scale: float,
     ) -> tuple[Tensor, Tensor | None]:
         ensure_blackwell_fwd_h_configs()
+        ensure_tilelang_varlen_bwd()
         from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
         from fla.ops.common.chunk_o import chunk_fwd_o
         from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
@@ -215,6 +217,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: Tensor | None) -> tuple[Any, ...]:
+        ensure_tilelang_varlen_bwd()
         from fla.ops.common.chunk_o import chunk_bwd_dv_local
         from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd
         from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd

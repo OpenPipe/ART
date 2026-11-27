@@ -18,6 +18,7 @@ from art.megatron.canonical.layout import current_layout
 from .conv_gelu import packed_varlen_causal_conv
 from .fla_autotune import ensure_blackwell_fwd_h_configs
 from .fla_cp import chunk_gated_delta_rule_native_cp
+from .fla_tilelang import ensure_tilelang_varlen_bwd
 from .gdn_prefix_tree import (
     GdnPackedExecutionSpec,
     GdnRankExecutionPlan,
@@ -68,6 +69,7 @@ def install_prefix_tree_gdn_hooks(model_chunks: Sequence[Any]) -> None:
     """Patch Megatron GatedDeltaNet modules to honor ART prefix-tree packing."""
 
     ensure_blackwell_fwd_h_configs()
+    ensure_tilelang_varlen_bwd()
     gated_delta_net_type = _optional_gated_delta_net_type()
     if gated_delta_net_type is None:
         return
@@ -2972,6 +2974,7 @@ class _UnifiedChunkGatedDeltaRule(torch.autograd.Function):
             getattr(ctx, "_art_native_gdn_reductions", False)
         )
         device_ctx = torch.cuda.device(q.device) if q.is_cuda else nullcontext()
+        ensure_tilelang_varlen_bwd()
         try:
             with device_ctx:
                 dq, dk, dv, db, dg, dh0, _, _ = chunk_gated_delta_rule_bwd(
@@ -3007,6 +3010,7 @@ class _UnifiedChunkGatedDeltaRule(torch.autograd.Function):
 
 def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor | None]:
     ensure_blackwell_fwd_h_configs()
+    ensure_tilelang_varlen_bwd()
     if (
         len(args) == 3
         and not bool(kwargs.get("use_qk_l2norm_in_kernel", False))

@@ -99,7 +99,7 @@ def _plans(layout_name):
         return spec, rt._build_runtime_plan(
             spec,
             topology=ParallelTopology(cp=8),
-            config=ContextParallelConfig(),
+            config=ContextParallelConfig(block_size=2),
             original_seq_len=16,
         )
     chunks = tuple(TokenRange(i, i + 1) for i in range(16))
