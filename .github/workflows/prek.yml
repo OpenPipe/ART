@@ -217,6 +217,7 @@ jobs:
           megatron_runtime/.venv/bin/python -c "import megatron.core.packed_seq_params"
           megatron_runtime/.venv/bin/python -m pytest --nbval --current-env --tb=short \
             tests/unit/test_fla_cp_transition.py \
+            tests/unit/test_context_parallel_folded_assignment.py \
             tests/unit/test_megatron_reference_logprobs.py \
             tests/unit/test_preprocessing_tokenize.py::test_gemma4_normalizes_json_tool_arguments_for_mapping_template \
             tests/unit/test_moe_routing_replay.py \
@@ -294,6 +295,7 @@ jobs:
             --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_fits_after_recovery \
             --deselect=tests/unit/test_trainer_rank_cache_recovery.py::test_dense_cp_exact_demand_refuses_after_recovery \
             --deselect=tests/unit/test_trainer_rank_eager_head_memory.py::test_optional_stats_refusal_keeps_capacity_separate_from_lower_bound \
+            --ignore=tests/unit/test_context_parallel_folded_assignment.py \
             --ignore=tests/unit/test_megatron_reference_logprobs.py \
             --ignore=tests/unit/test_moe_routing_replay.py \
             --ignore=tests/unit/test_moe_routing_real_path.py \
