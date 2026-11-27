@@ -40,6 +40,12 @@ from .types import (
 
 _CP4_SEARCH_PROBE_CANDIDATE_LIMIT = 2
 _CP4_SEARCH_PROBE_IMPROVEMENT_MS = 1.0
+_FOLDED_REFINEMENT_MAX_STEPS = 2
+_FOLDED_REFINEMENT_CANDIDATE_LIMIT = 4
+_FOLDED_REFINEMENT_SPREAD_THRESHOLD = 0.01
+_FOLDED_FASTER_TOKEN_REDUCTION_MIN = 0.10
+_FOLDED_PARITY_TOKEN_REDUCTION_MIN = 0.15
+_FOLDED_PARITY_SCORE_TOLERANCE = 1.015
 _PLAN_CACHE_MAX_ENTRIES = 128
 
 StagePiece = tuple[TokenRange, TokenRange, AttnMaskKind, int | None]
@@ -1693,7 +1699,275 @@ def _search_generic_chunk_assignment(
             best = (current_owners, wave_assignment, current_eval)
     if best is None:
         raise RuntimeError("Failed to evaluate any CP planner wave assignment.")
+
+    allow_folded = cp_size >= 2 and (
+        config.workload_profile is None
+        or int(config.workload_profile.max_ownership_ranges_per_rank) >= 2
+    )
+    if allow_folded:
+        chunk_lengths = [int(length) for length in program.chunk_lengths.tolist()]
+        folded_init = _folded_causal_ramp_assignment(
+            contiguous_owners=best[0],
+            chunk_lengths=chunk_lengths,
+            pair_positive=program.pair_positive,
+            q_weights=q_weights,
+            cp_size=cp_size,
+            min_slab_tokens=max(int(config.planner_remote_stage_token_floor), 0),
+        )
+        if folded_init:
+            candidate_waves = [
+                _wave_assignment(chunk_count=len(chunk_ranges), wave_count=1)
+            ]
+            if best[1] != candidate_waves[0]:
+                candidate_waves.append(best[1])
+            best_folded: (
+                tuple[tuple[int, ...], tuple[int, ...], dict[str, Any]] | None
+            ) = None
+            for wave_assignment in candidate_waves:
+                folded_owners = folded_init
+                folded_eval = _evaluate_candidate(
+                    owners=folded_owners,
+                    wave_assignment=wave_assignment,
+                )
+                rank_scores = cast(tuple[float, ...], folded_eval["rank_scores"])
+                max_rank_score = max(rank_scores, default=0.0)
+                min_rank_score = min(rank_scores, default=0.0)
+                if (
+                    max_rank_score > 0.0
+                    and (max_rank_score - min_rank_score) / max_rank_score
+                    > _FOLDED_REFINEMENT_SPREAD_THRESHOLD
+                ):
+                    initial_max_tokens = _max_rank_tokens(
+                        folded_owners,
+                        chunk_lengths=chunk_lengths,
+                        cp_size=cp_size,
+                    )
+                    for _ in range(_FOLDED_REFINEMENT_MAX_STEPS):
+                        move = _best_improving_move(
+                            current_owners=folded_owners,
+                            current_eval=folded_eval,
+                            wave_assignment=wave_assignment,
+                            cp_size=cp_size,
+                            q_weights=chunk_weights,
+                            candidate_limit=min(
+                                int(config.planner_candidate_chunk_limit),
+                                _FOLDED_REFINEMENT_CANDIDATE_LIMIT,
+                            ),
+                            evaluate_candidates=_evaluate_candidates,
+                        )
+                        if move is None:
+                            break
+                        move_max_tokens = _max_rank_tokens(
+                            move[0],
+                            chunk_lengths=chunk_lengths,
+                            cp_size=cp_size,
+                        )
+                        if move_max_tokens > initial_max_tokens:
+                            break
+                        if (
+                            max(
+                                _ownership_range_counts(move[0], cp_size=cp_size),
+                                default=0,
+                            )
+                            > 2
+                        ):
+                            break
+                        folded_owners, folded_eval = move
+                if best_folded is None or float(folded_eval["score"]) + 1e-9 < float(
+                    best_folded[2]["score"]
+                ):
+                    best_folded = (folded_owners, wave_assignment, folded_eval)
+            if best_folded is not None and _should_prefer_folded_plan(
+                contiguous_owners=best[0],
+                contiguous_eval=best[2],
+                folded_owners=best_folded[0],
+                folded_eval=best_folded[2],
+                chunk_lengths=chunk_lengths,
+                cp_size=cp_size,
+            ):
+                best = best_folded
     return best
+
+
+def _max_rank_tokens(
+    owners: tuple[int, ...],
+    *,
+    chunk_lengths: list[int],
+    cp_size: int,
+) -> int:
+    if cp_size <= 0:
+        return 0
+    totals = [0 for _ in range(cp_size)]
+    for length, owner in zip(chunk_lengths, owners, strict=True):
+        totals[int(owner)] += int(length)
+    return max(totals, default=0)
+
+
+def _should_prefer_folded_plan(
+    *,
+    contiguous_owners: tuple[int, ...],
+    contiguous_eval: dict[str, Any],
+    folded_owners: tuple[int, ...],
+    folded_eval: dict[str, Any],
+    chunk_lengths: list[int],
+    cp_size: int,
+) -> bool:
+    contiguous_max = _max_rank_tokens(
+        contiguous_owners,
+        chunk_lengths=chunk_lengths,
+        cp_size=cp_size,
+    )
+    folded_max = _max_rank_tokens(
+        folded_owners,
+        chunk_lengths=chunk_lengths,
+        cp_size=cp_size,
+    )
+    contiguous_score = float(contiguous_eval["score"])
+    folded_score = float(folded_eval["score"])
+    if contiguous_max <= 0 or contiguous_score <= 0.0:
+        return False
+    token_reduction = (contiguous_max - folded_max) / float(contiguous_max)
+    if (
+        token_reduction >= _FOLDED_FASTER_TOKEN_REDUCTION_MIN
+        and folded_score + 1e-9 < contiguous_score
+    ):
+        return True
+    return (
+        token_reduction >= _FOLDED_PARITY_TOKEN_REDUCTION_MIN
+        and folded_score <= contiguous_score * _FOLDED_PARITY_SCORE_TOLERANCE
+    )
+
+
+def _folded_causal_ramp_assignment(
+    *,
+    contiguous_owners: tuple[int, ...],
+    chunk_lengths: list[int],
+    pair_positive: np.ndarray,
+    q_weights: list[float],
+    cp_size: int,
+    min_slab_tokens: int,
+) -> tuple[int, ...]:
+    """Fold multi-rank causal ramps in a contiguous assignment via 2-slab zigzag.
+
+    Inside a single causal chain (or a shared-prefix root followed by its first
+    leaf), each chunk attends the previous chunk and the mean attended key count
+    per query token increases monotonically. A contiguous split balances causal
+    compute only by assigning several times more tokens to the earliest rank.
+    Folding each multi-rank causal ramp across its owning ranks balances both
+    token count (saved activations / recompute HBM) and causal attention work
+    while keeping every rank at most two contiguous ranges and avoiding
+    cross-sequence / cross-branch pairing.
+    """
+    chunk_count = len(chunk_lengths)
+    if cp_size < 2 or chunk_count < 4 or len(contiguous_owners) != chunk_count:
+        return tuple()
+
+    densities = [
+        (float(q_weights[index]) / float(chunk_lengths[index]))
+        if chunk_lengths[index] > 0
+        else 0.0
+        for index in range(chunk_count)
+    ]
+    ramps: list[tuple[int, int]] = []
+    ramp_start = 0
+    for index in range(1, chunk_count):
+        continues = (
+            bool(pair_positive[index, index - 1] > 0.0)
+            and bool(pair_positive[index, ramp_start] > 0.0)
+            and densities[index] >= densities[index - 1] - 1e-9
+        )
+        if not continues:
+            ramps.append((ramp_start, index))
+            ramp_start = index
+    ramps.append((ramp_start, chunk_count))
+
+    # Extract each rank's contiguous chunk span from the contiguous assignment.
+    rank_spans: list[tuple[int, int] | None] = [None for _ in range(cp_size)]
+    cursor = 0
+    while cursor < chunk_count:
+        rank = int(contiguous_owners[cursor])
+        start = cursor
+        while cursor < chunk_count and int(contiguous_owners[cursor]) == rank:
+            cursor += 1
+        if rank_spans[rank] is not None:
+            return tuple()
+        rank_spans[rank] = (start, cursor)
+
+    ordered_ranks = sorted(
+        (
+            (span[0], span[1], rank)
+            for rank, span in enumerate(rank_spans)
+            if span is not None
+        ),
+        key=lambda item: item[0],
+    )
+    new_owners = list(contiguous_owners)
+    used_ranks: set[int] = set()
+    changed = False
+
+    for ramp_start, ramp_end in ramps:
+        if ramp_end - ramp_start < 4:
+            continue
+        matching: list[tuple[int, int, int, int]] = []
+        for pos_index, (span_start, span_end, rank) in enumerate(ordered_ranks):
+            if rank in used_ranks:
+                continue
+            ov_start = max(ramp_start, span_start)
+            ov_end = min(ramp_end, span_end)
+            # Require the rank to live almost entirely inside this ramp (at most
+            # one boundary chunk straddling into a neighbouring sequence/branch)
+            # so folding never overloads a rank that also owns external work.
+            if ov_end - ov_start >= 2 and (ov_end - ov_start) >= (
+                span_end - span_start - 1
+            ):
+                matching.append((pos_index, rank, ov_start, ov_end))
+        if len(matching) < 2:
+            continue
+
+        runs: list[list[tuple[int, int, int, int]]] = []
+        current_run = [matching[0]]
+        for item in matching[1:]:
+            prev = current_run[-1]
+            if item[0] == prev[0] + 1 and item[2] == prev[3]:
+                current_run.append(item)
+            else:
+                runs.append(current_run)
+                current_run = [item]
+        runs.append(current_run)
+
+        for run in runs:
+            span_ranks = len(run)
+            if span_ranks < 2:
+                continue
+            fold_start = run[0][2]
+            fold_end = run[-1][3]
+            if fold_end - fold_start < 2 * span_ranks:
+                continue
+            span_tokens = sum(chunk_lengths[fold_start:fold_end])
+            if min_slab_tokens > 0 and span_tokens < 2 * span_ranks * min_slab_tokens:
+                continue
+            sub_owners = _folded_chunk_assignment(
+                weights=[
+                    float(length) for length in chunk_lengths[fold_start:fold_end]
+                ],
+                cp_size=span_ranks,
+            )
+            if not sub_owners:
+                continue
+            run_ranks = tuple(item[1] for item in run)
+            for offset, local_rank in enumerate(sub_owners):
+                new_owners[fold_start + offset] = run_ranks[int(local_rank)]
+            used_ranks.update(run_ranks)
+            changed = True
+
+    if not changed:
+        return tuple()
+    candidate = tuple(new_owners)
+    if len(set(candidate)) != cp_size:
+        return tuple()
+    if max(_ownership_range_counts(candidate, cp_size=cp_size), default=0) > 2:
+        return tuple()
+    return candidate
 
 
 def _folded_chunk_assignment(
