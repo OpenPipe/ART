@@ -187,11 +187,12 @@ def _guard_optim_step_configuration(
 
     def adam_values(
         value: AdamParams,
-    ) -> tuple[float, float, float, float, float]:
+    ) -> tuple[float, float, float, float, float, float]:
         return (
             value.learning_rate,
             value.beta1,
             value.beta2,
+            value.eps,
             value.weight_decay,
             value.grad_clip_norm,
         )
@@ -278,7 +279,7 @@ def _dynamic_optim_step(
             None
             if slot.optimizer is None
             else [
-                {key: group[key] for key in ("lr", "betas", "weight_decay")}
+                {key: group[key] for key in ("lr", "betas", "eps", "weight_decay")}
                 for group in slot.optimizer.optimizer.param_groups
             ],
         )
@@ -363,6 +364,7 @@ def _dynamic_optimizer(
     for group in dynamic.optimizer.param_groups:
         group["lr"] = params.learning_rate
         group["betas"] = (params.beta1, params.beta2)
+        group["eps"] = params.eps
         group["weight_decay"] = params.weight_decay
     return dynamic
 
@@ -404,6 +406,7 @@ def _new_dynamic_optimizer(
         masters,
         lr=params.learning_rate,
         betas=(params.beta1, params.beta2),
+        eps=params.eps,
         weight_decay=params.weight_decay,
     )
     dynamic = _impl._DynamicOptimizer(optimizer, masters)
@@ -446,11 +449,11 @@ def _restore_canonical_optimizer(
             learning_rate=state.config["learning_rate"],
             beta1=state.config["beta1"],
             beta2=state.config["beta2"],
+            eps=state.config["eps"],
             weight_decay=state.config["weight_decay"],
         ),
         master_params=state.masters,
     )
-    dynamic.optimizer.param_groups[0]["eps"] = state.config["eps"]
     for master, exp_avg, exp_avg_sq, step in zip(
         dynamic.master_params,
         state.exp_avgs,
