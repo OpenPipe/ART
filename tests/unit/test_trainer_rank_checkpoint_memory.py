@@ -164,7 +164,8 @@ def test_no_grad_enclosure_empty_and_unsupported():
         ("recompute_num_layers", 2),
         ("distribute_saved_activations", True),
         ("sequence_parallel", True),
-        ("fp32_residual_connection", True),
+        ("fp32_residual_connection", 1),
+        ("fp32_residual_connection", None),
         ("cpu_offloading", True),
         ("cuda_graph_impl", "local"),
         ("params_dtype", torch.float32),
@@ -1186,3 +1187,20 @@ def test_megatron_checkpoint_shards_one_boundary_per_layer(monkeypatch):
     assert value.shape == x.shape
     assert stats.tensors == len(model)
     assert stats.original_bytes == len(model) * x.numel() * x.element_size()
+
+
+def test_fp32_residual_connection_doubles_saved_boundary_floor():
+    r = rank()
+    bf16_retained, bf16_work = r._checkpoint_memory_floor(((16, True), (24, False)))
+    assert bf16_retained == 16 * 40 * 2048 * 2
+    assert bf16_work == 24 * (188416 + 4 * 2048 * 2)
+
+    r.runtime.model[0].decoder.config.fp32_residual_connection = True
+    fp32_retained, fp32_work = r._checkpoint_memory_floor(((16, True), (24, False)))
+    assert fp32_retained == 16 * 40 * 2048 * 4
+    assert fp32_retained == 2 * bf16_retained
+    # No-grad holds 3 FP32 residual/input tensors + 1 BF16 norm output = 14 B/elem.
+    assert fp32_work == 24 * (188416 + (3 * 4 + 2) * 2048)
+
+    groups = r._checkpoint_gradient_groups(((16, True),), None)
+    assert groups == ((None, (16 * 2048 * 4,) * 40),)

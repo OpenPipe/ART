@@ -1049,7 +1049,7 @@ def _head_vocabulary(self: TrainerRank) -> int:
         or head.output_size != self._padded_vocab_size
         or head.input_size != self._hidden_size
         or getattr(config, "params_dtype", None) is not _impl.torch.bfloat16
-        or getattr(config, "fp32_residual_connection", None) is not False
+        or type(getattr(config, "fp32_residual_connection", None)) is not bool
         or getattr(config, "fp8", None)
         or getattr(config, "fp4", None)
         or "forward" in vars(head)
@@ -1508,6 +1508,16 @@ def _moe_workspace_bytes(
     )
 
 
+def _residual_dtype_size(self: TrainerRank) -> int:
+    try:
+        config = _impl._language_model(self.runtime.model[0]).decoder.config
+    except (AttributeError, IndexError, RuntimeError):
+        return self._param_dtype_size
+    if getattr(config, "fp32_residual_connection", False) is True:
+        return max(4, self._param_dtype_size)
+    return self._param_dtype_size
+
+
 def _checkpoint_layers(
     self: TrainerRank,
     group_rows: tuple[tuple[int, bool], ...],
@@ -1552,7 +1562,6 @@ def _checkpoint_layers(
         "recompute_num_layers": 1,
         "distribute_saved_activations": False,
         "sequence_parallel": tp > 1,
-        "fp32_residual_connection": False,
         "cpu_offloading": False,
         "cuda_graph_impl": "none",
     }
@@ -1567,6 +1576,7 @@ def _checkpoint_layers(
         or next(self.runtime.model[0].parameters()).dtype is not _impl.torch.bfloat16
         or pp != 1
         or (tp > 1 and not self._sequence_parallel_floor_covered(tp, cp))
+        or type(getattr(config, "fp32_residual_connection", None)) is not bool
         or any(
             type(getattr(config, name, None)) is not type(value)
             or getattr(config, name) != value
@@ -1645,19 +1655,21 @@ def _checkpoint_floor_from_facts(
     gradient_rows = sum(rows for rows, grad in group_rows if grad)
     tp = self._topology_key()[1]
     dense_cp = _native_dense_cp(self)
+    residual_bytes = _residual_dtype_size(self)
     # Physical rows are padded to a multiple of TP; each rank saves its shard.
     retained = (
         sum(-(-rows // tp) for rows, grad in group_rows if grad)
         * layers
         * self._hidden_size
-        * 2
+        * residual_bytes
     )
     if gradient_rows:
         self._checkpoint_moe_bytes_per_token()
     refs = (None,) * len(group_rows) if slot_refs is None else slot_refs
+    no_grad_boundary_bytes = 3 * residual_bytes + self._param_dtype_size
     workspace = max(
         self._moe_workspace_bytes(rows, checkpoint_grad=grad, slot_ref=ref)
-        + (0 if grad else 4 * rows * self._hidden_size * 2)
+        + (0 if grad else rows * self._hidden_size * no_grad_boundary_bytes)
         for (rows, grad), ref in zip(group_rows, refs, strict=True)
     )
     if (tp > 1 or dense_cp) and gradient_rows:
@@ -1687,11 +1699,11 @@ def _checkpoint_floor_from_facts(
         if group_rows != ((shape[0], True),):
             raise ValueError("checkpoint shards require one complete gradient root")
         width = math.ceil(math.prod(shape) / degree)
-        retained = width * self._param_dtype_size * layers
+        retained = width * residual_bytes * layers
         # Recompute still runs the complete CP1 layer, beside the all-gather
         # buffer. Only the saved boundaries shrink; workspace does not.
         workspace = max(workspace, self._sequence_parallel_workspace_bytes(shape[0]))
-        workspace += width * degree * self._param_dtype_size
+        workspace += width * degree * residual_bytes
     return retained, workspace
 
 
@@ -1734,11 +1746,13 @@ def _sequence_parallel_workspace_bytes(self: TrainerRank, rows: int) -> int:
         4 * geometry.gdn_key_heads * geometry.gdn_key_head_dim
         + 8 * geometry.gdn_value_heads * geometry.gdn_value_head_dim
     )
+    residual_bytes = _residual_dtype_size(self)
     shard = -(-rows // tp) * hidden
     gaps = getattr(self, "_mixer_top_gaps", None) or (None, None)
     peak = (
         max(
-            rows * -(-width // tp) + (1 - (0 if gap is None else gap)) * shard
+            rows * -(-width // tp) * self._param_dtype_size
+            + (1 - (0 if gap is None else gap)) * shard * residual_bytes
             for present, width, gap in (
                 (attention_layers, attention, gaps[0]),
                 (bool(self._gdn_layers), gdn, gaps[1]),
@@ -1752,7 +1766,7 @@ def _sequence_parallel_workspace_bytes(self: TrainerRank, rows: int) -> int:
     gathered = rows * (2 * hidden + -(-stage // tp))
     sharded = -(-rows // tp) * -(-13 * hidden // 4)
     rotary = 2 * rows * geometry.kv_channels if attention_layers else 0
-    return (gathered + sharded + peak + rotary) * self._param_dtype_size
+    return (gathered + sharded + rotary) * self._param_dtype_size + peak
 
 
 def _sequence_parallel_lora_floor(
@@ -1847,13 +1861,14 @@ def _checkpoint_input_gradient_bytes(
     from art.megatron.context_parallel.checkpoint import current_checkpoint_partition
 
     partition = current_checkpoint_partition()
+    residual_bytes = _residual_dtype_size(self)
     if partition is not None and retained:
         # One full recomputed root's dX; its layer workspace is explicit.
-        return math.prod(partition[1]) * self._param_dtype_size
+        return math.prod(partition[1]) * residual_bytes
     if not retained or (tp == 1 and not dense_cp):
         return retained
     rows = max((rows for rows, grad in group_rows if grad), default=0)
-    return -(-rows // tp) * self._hidden_size * self._param_dtype_size
+    return -(-rows // tp) * self._hidden_size * residual_bytes
 
 
 def _gradient_slots(
@@ -1974,10 +1989,11 @@ def _checkpoint_gradient_groups(
     model (no name) has no adapter slot.
     """
     tp = self._topology_key()[1]
+    residual_bytes = _residual_dtype_size(self)
     return tuple(
         (
             ref if ref is not None and ref.name is not None else None,
-            (-(-rows // tp) * self._hidden_size * 2,) * self._num_layers,
+            (-(-rows // tp) * self._hidden_size * residual_bytes,) * self._num_layers,
         )
         for (rows, grad), ref in zip(
             group_rows, slot_refs or (None,) * len(group_rows), strict=True
@@ -2874,13 +2890,12 @@ def _estimate_required_memory_bytes_from_values(
             (n for n, grad in group_rows if not grad),
             default=0 if signature.grad_enabled else packed_tokens,
         )
-        no_grad_stage = (
-            rows
+        residual_bytes = _residual_dtype_size(self)
+        no_grad_stage = rows * (
+            max(6, self._mlp_activation_factor)
+            * self._geometry.ffn_hidden_size
             * self._param_dtype_size
-            * (
-                max(6, self._mlp_activation_factor) * self._geometry.ffn_hidden_size
-                + 4 * self._hidden_size
-            )
+            + (3 * residual_bytes + self._param_dtype_size) * self._hidden_size
         )
     if signature.grad_enabled and self._recompute_granularity != "full":
         geometry = self._geometry

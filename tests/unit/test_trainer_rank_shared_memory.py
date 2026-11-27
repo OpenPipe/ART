@@ -418,3 +418,17 @@ def test_shared_return_escapes_the_ep_routed_allowance(layer, checkpoint_grad, s
         )
         == 12 * 11776 * 2 + shared
     )
+
+
+def test_shared_return_supported_with_fp32_residual_connection(layer):
+    shared_layer(layer)
+    layer.config.fp32_residual_connection = True
+    layer.shared_experts.config.fp32_residual_connection = True
+    assert _shared_expert_output_bytes_per_token(layer) == 4096
+    assert coefficient(layer) == 192512
+    # Mismatched or non-bool flags remain rejected.
+    layer.shared_experts.config.fp32_residual_connection = False
+    assert _shared_expert_output_bytes_per_token(layer) == 0
+    layer.config.fp32_residual_connection = 1
+    layer.shared_experts.config.fp32_residual_connection = 1
+    assert _shared_expert_output_bytes_per_token(layer) == 0

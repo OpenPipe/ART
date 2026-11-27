@@ -56,6 +56,7 @@ _BOOL_ENV_FIELDS = (
         "ART_MEGATRON_FINE_GRAINED_ACTIVATION_OFFLOADING",
     ),
     ("moe_shared_expert_overlap", "ART_MEGATRON_MOE_SHARED_EXPERT_OVERLAP"),
+    ("fp32_residual_connection", "ART_MEGATRON_FP32_RESIDUAL_CONNECTION"),
 )
 _INT_ENV_FIELDS = (
     ("tensor_model_parallel_size", "ART_MEGATRON_TENSOR_MODEL_PARALLEL_SIZE"),
@@ -202,6 +203,7 @@ class _ProviderRuntimeEnv(BaseModel):
     recompute_num_layers: int | None = None
     recompute_modules: list[str] | None = None
     moe_shared_expert_overlap: bool | None = None
+    fp32_residual_connection: bool | None = None
     moe_router_dtype: Literal["fp32", "fp64"] | None = None
 
     @classmethod
@@ -573,6 +575,7 @@ def _apply_runtime_env_overrides(
     _apply_provider_attr_if_set(provider, runtime_env, "recompute_num_layers")
     _apply_provider_attr_if_set(provider, runtime_env, "recompute_modules")
     _apply_provider_attr_if_value(provider, runtime_env, "moe_shared_expert_overlap")
+    _apply_provider_attr_if_value(provider, runtime_env, "fp32_residual_connection")
     _apply_provider_attr_if_set(provider, runtime_env, "moe_router_dtype")
     _enforce_ep_overlap_recompute_contract(provider)
     _normalize_recompute_settings(provider)

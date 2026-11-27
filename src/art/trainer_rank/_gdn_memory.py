@@ -160,7 +160,6 @@ def model_shapes(
         recompute_num_layers=1,
         distribute_saved_activations=False,
         sequence_parallel=False,
-        fp32_residual_connection=False,
         cpu_offloading=False,
         cuda_graph_impl="none",
     )
@@ -174,6 +173,7 @@ def model_shapes(
         or config.params_dtype is not torch.bfloat16
         or rank._param_dtype_size != 2
         or next(rank.runtime.model[0].parameters()).dtype is not torch.bfloat16
+        or type(getattr(config, "fp32_residual_connection", None)) is not bool
         or any(
             type(getattr(config, k, None)) is not type(v) or getattr(config, k) != v
             for k, v in expected.items()
@@ -305,6 +305,16 @@ def model_shapes(
     return (len(decoder.layers), tuple(shapes)) if shapes else None
 
 
+def _residual_bytes(rank: Any) -> int:
+    try:
+        from art.trainer_rank._impl import _language_model
+
+        config = _language_model(rank.runtime.model[0]).decoder.config
+    except (AttributeError, IndexError, RuntimeError):
+        return 2
+    return 4 if getattr(config, "fp32_residual_connection", False) is True else 2
+
+
 def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
     """Boundary retention plus pending attention and the cached MoE maximum.
 
@@ -315,6 +325,7 @@ def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
         return 0, 0
     retained = 0
     workspace = 0
+    residual_bytes = _residual_bytes(rank)
     for group in plan.groups:
         rows = int(group.packed.tokens.numel())
         model = model_shapes(rank, group.slot_ref)
@@ -327,7 +338,12 @@ def plan_floor(rank: Any, plan: Any) -> tuple[int, int]:
             )
             continue
         saved, pending = pending_floor(
-            rank._hidden_size, rows, layers, shapes, group.packed.segments
+            rank._hidden_size,
+            rows,
+            layers,
+            shapes,
+            group.packed.segments,
+            residual_bytes=residual_bytes,
         )
         retained += saved
         moe = rank._moe_workspace_bytes(
@@ -343,9 +359,13 @@ def pending_floor(
     layers: int,
     shapes: tuple[Shape, ...],
     segments: Sequence[Any],
+    *,
+    residual_bytes: int = 2,
 ) -> tuple[int, int]:
     """Shared CPU arithmetic over admitted dimensions and segment metadata."""
     buckets = cp1_buckets(segments)
     if sum(s.end - s.start for s in segments) != rows:
         raise ValueError("GDN packed rows disagree with segment geometry")
-    return rows * layers * hidden * 2, max(s.pending(rows, buckets) for s in shapes)
+    return rows * layers * hidden * residual_bytes, max(
+        s.pending(rows, buckets) for s in shapes
+    )

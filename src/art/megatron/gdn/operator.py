@@ -1716,15 +1716,36 @@ def _project_empty_gdn_inputs(
         seq_len *= int(getattr(gdn, "sp_size", 1))
     value_heads = _local_value_heads(gdn)
     qkv_width = (gdn.qk_dim * 2 + gdn.v_dim) // gdn.tp_size
+    config = getattr(gdn, "config", None)
+    proj_dtype = getattr(config, "params_dtype", None)
+    if not isinstance(proj_dtype, torch.dtype):
+        in_proj = _gdn_input_projection(gdn)
+        weight = getattr(in_proj, "weight", None)
+        proj_dtype = weight.dtype if isinstance(weight, Tensor) else hidden_states.dtype
     dependency = hidden_states.sum() * 0
-    qkv = hidden_states.new_zeros((batch_size, seq_len, qkv_width)) + dependency
-    gate = (
-        hidden_states.new_zeros((batch_size, seq_len, value_heads, gdn.value_head_dim))
-        + dependency
+    proj_dependency = dependency.to(dtype=proj_dtype)
+    g_dependency = dependency.to(dtype=torch.float32)
+    qkv = (
+        hidden_states.new_zeros((batch_size, seq_len, qkv_width), dtype=proj_dtype)
+        + proj_dependency
     )
-    beta = hidden_states.new_zeros((batch_size, seq_len, value_heads)) + dependency
+    gate = (
+        hidden_states.new_zeros(
+            (batch_size, seq_len, value_heads, gdn.value_head_dim),
+            dtype=proj_dtype,
+        )
+        + proj_dependency
+    )
+    beta = (
+        hidden_states.new_zeros((batch_size, seq_len, value_heads), dtype=proj_dtype)
+        + proj_dependency
+    )
     recurrent_g = (
-        hidden_states.new_zeros((batch_size, seq_len, value_heads)) + dependency
+        hidden_states.new_zeros(
+            (batch_size, seq_len, value_heads),
+            dtype=torch.float32,
+        )
+        + g_dependency
     )
     return (
         qkv.contiguous(),
@@ -2045,7 +2066,6 @@ def _apply_explicit_norm(
     weight = getattr(module, weight_name, None)
     if not isinstance(weight, Tensor):
         return x
-    x_dtype = x.dtype
     x_float = x.float()
     eps = float(getattr(module, "eps", getattr(config, "layernorm_epsilon", 1e-5)))
     normalization = getattr(module, "normalization", None)
@@ -2073,7 +2093,7 @@ def _apply_explicit_norm(
     bias = getattr(module, bias_name, None)
     if isinstance(bias, Tensor):
         normed = normed + bias.float()
-    return normed.to(dtype=x_dtype)
+    return normed.to(dtype=weight.dtype)
 
 
 def _gdn_uses_sequence_parallel(gdn: Any | None) -> bool:
