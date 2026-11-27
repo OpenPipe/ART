@@ -264,10 +264,12 @@ jobs:
             tests/unit/test_segmented_gdn.py \
             tests/unit/test_gdn_empty_shards.py \
             tests/unit/test_gdn_cp_radix_correctness.py \
+            tests/unit/test_gdn_planner_depth_epochs.py \
             tests/unit/test_moe_router_compile_invariance.py \
             tests/unit/test_prefix_tree_chunk_alignment.py \
             tests/unit/test_fp32_residual.py \
             tests/unit/test_megatron_runtime_invariants.py \
+            tests/unit/test_shared_expert_gate_invariance.py \
             tests/unit/test_segmented_router.py \
             tests/unit/test_lora_layouts.py \
             tests/unit/test_trainer_rank_forward_profile.py \

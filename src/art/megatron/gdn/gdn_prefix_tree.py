@@ -409,12 +409,16 @@ class _GdnLocalRuntimeEstimate(NamedTuple):
     rank_work: tuple[int, ...]
     rank_bucket_counts: tuple[int, ...]
     rank_segment_counts: tuple[int, ...]
+    rank_work_by_depth: tuple[tuple[int, ...], ...] = ()
+    rank_bucket_counts_by_depth: tuple[tuple[int, ...], ...] = ()
+    rank_segment_counts_by_depth: tuple[tuple[int, ...], ...] = ()
 
 
 class _GdnChainRuntimeEstimate(NamedTuple):
     rank_work: tuple[int, ...]
     bucket_count: int
     segment_count: int
+    rank_work_by_depth: tuple[tuple[int, ...], ...] = ()
 
 
 def _tokens_from_rank_ranges(
@@ -1271,36 +1275,49 @@ def _score_chain_segment_keys(
         tuple(tuple(depth_counts) for depth_counts in chain_rank_counts_by_depth),
         cp_size=cp_size,
     )
-    parent_state_exchange_count = _count_parent_state_exchanges(
+    parent_state_exchanges_by_depth = _count_parent_state_exchanges_by_depth(
         spec,
         owner_by_node=tuple(owner_by_node),
         chain_nodes=tuple(chain_nodes),
+        depth_count=search_metadata.depth_count,
     )
     return _predict_gdn_plan_runtime_ms(
         local_runtime,
         chain_runtime,
         cross_rank_token_count=cross_rank_token_count,
-        parent_state_exchange_count=parent_state_exchange_count,
+        parent_state_exchange_count=sum(parent_state_exchanges_by_depth),
         planner_config=planner_config,
         rank_token_counts=tuple(rank_loads),
+        parent_state_exchanges_by_depth=parent_state_exchanges_by_depth,
     )
 
 
 def _estimate_local_runtime_from_lengths(
     local_lengths_by_rank_depth: tuple[tuple[tuple[int, ...], ...], ...],
 ) -> _GdnLocalRuntimeEstimate:
+    rank_count = len(local_lengths_by_rank_depth)
+    depth_count = max(
+        (len(lengths_by_depth) for lengths_by_depth in local_lengths_by_rank_depth),
+        default=0,
+    )
     rank_work: list[int] = []
     rank_bucket_counts: list[int] = []
     rank_segment_counts: list[int] = []
-    for lengths_by_depth in local_lengths_by_rank_depth:
+    work_by_depth = [[0] * rank_count for _ in range(depth_count)]
+    buckets_by_depth = [[0] * rank_count for _ in range(depth_count)]
+    segments_by_depth = [[0] * rank_count for _ in range(depth_count)]
+    for rank, lengths_by_depth in enumerate(local_lengths_by_rank_depth):
         work = 0
         bucket_count = 0
         segment_count = 0
-        for lengths in lengths_by_depth:
+        for depth, lengths in enumerate(lengths_by_depth):
             bucket_work, depth_bucket_count = _padded_work_from_lengths(lengths)
             work += bucket_work
             bucket_count += depth_bucket_count
             segment_count += len(lengths)
+            work_by_depth[depth][rank] = bucket_work
+            buckets_by_depth[depth][rank] = depth_bucket_count
+            segments_by_depth[depth][rank] = len(lengths)
         rank_work.append(work)
         rank_bucket_counts.append(bucket_count)
         rank_segment_counts.append(segment_count)
@@ -1308,6 +1325,9 @@ def _estimate_local_runtime_from_lengths(
         rank_work=tuple(rank_work),
         rank_bucket_counts=tuple(rank_bucket_counts),
         rank_segment_counts=tuple(rank_segment_counts),
+        rank_work_by_depth=tuple(tuple(row) for row in work_by_depth),
+        rank_bucket_counts_by_depth=tuple(tuple(row) for row in buckets_by_depth),
+        rank_segment_counts_by_depth=tuple(tuple(row) for row in segments_by_depth),
     )
 
 
@@ -1317,20 +1337,27 @@ def _estimate_chain_runtime_from_counts(
     cp_size: int,
 ) -> _GdnChainRuntimeEstimate:
     rank_work = [0] * cp_size
+    work_by_depth: list[tuple[int, ...]] = []
     bucket_count = 0
     segment_count = 0
     for rank_counts_by_segment in chain_rank_counts_by_depth:
         if not rank_counts_by_segment:
+            work_by_depth.append((0,) * cp_size)
             continue
         bucket_count += 1
         segment_count += len(rank_counts_by_segment)
+        depth_work = [0] * cp_size
         for rank in range(cp_size):
             lengths = tuple(counts[rank] for counts in rank_counts_by_segment)
-            rank_work[rank] += max(lengths, default=0) * len(lengths)
+            padded = max(lengths, default=0) * len(lengths)
+            depth_work[rank] = padded
+            rank_work[rank] += padded
+        work_by_depth.append(tuple(depth_work))
     return _GdnChainRuntimeEstimate(
         rank_work=tuple(rank_work),
         bucket_count=bucket_count,
         segment_count=segment_count,
+        rank_work_by_depth=tuple(work_by_depth),
     )
 
 
@@ -1342,6 +1369,7 @@ def _predict_gdn_plan_runtime_ms(
     parent_state_exchange_count: int,
     planner_config: GdnPlannerConfig,
     rank_token_counts: tuple[int, ...] = (),
+    parent_state_exchanges_by_depth: tuple[int, ...] = (),
 ) -> float:
     """Predict exposed fwd+bwd runtime for a GDN CP plan in milliseconds.
 
@@ -1349,42 +1377,131 @@ def _predict_gdn_plan_runtime_ms(
     the critical per-rank recurrent path separately from exposed communication
     and chain-summary work, so chain/local decisions compare predicted wall time
     rather than abstract balance or token-count penalties.
+
+    When cross-rank state exchanges or CP chain collectives separate tree
+    depths, ``_run_tree_depth_buckets`` synchronizes across CP ranks between
+    those depths, so recurrent work across synchronized epochs adds sequentially
+    rather than overlapping across ranks.
     """
 
-    rank_runtime_ms = 0.0
     rank_count = max(
         len(local_runtime.rank_work),
         len(chain_runtime.rank_work),
     )
-    for rank in range(rank_count):
-        local_work = (
-            local_runtime.rank_work[rank] if rank < len(local_runtime.rank_work) else 0
-        )
-        local_bucket_count = (
-            local_runtime.rank_bucket_counts[rank]
-            if rank < len(local_runtime.rank_bucket_counts)
-            else 0
-        )
-        local_segment_count = (
-            local_runtime.rank_segment_counts[rank]
-            if rank < len(local_runtime.rank_segment_counts)
-            else 0
-        )
-        chain_work = (
-            chain_runtime.rank_work[rank] if rank < len(chain_runtime.rank_work) else 0
-        )
-        owned_tokens = rank_token_counts[rank] if rank < len(rank_token_counts) else 0
-        rank_runtime_ms = max(
-            rank_runtime_ms,
-            _predict_local_rank_runtime_ms(
-                local_work,
-                bucket_count=local_bucket_count,
-                segment_count=local_segment_count,
-                planner_config=planner_config,
+    depth_count = max(
+        len(local_runtime.rank_work_by_depth),
+        len(chain_runtime.rank_work_by_depth),
+    )
+    has_chain_at_depth = tuple(
+        depth < len(chain_runtime.rank_work_by_depth)
+        and any(work > 0 for work in chain_runtime.rank_work_by_depth[depth])
+        for depth in range(depth_count)
+    )
+    has_depth_barrier = tuple(
+        depth > 0
+        and (
+            (
+                depth < len(parent_state_exchanges_by_depth)
+                and parent_state_exchanges_by_depth[depth] > 0
             )
-            + chain_work / planner_config.runtime_chain_recurrent_tokens_per_ms
-            + owned_tokens / planner_config.runtime_dense_tokens_per_ms,
+            or has_chain_at_depth[depth - 1]
+            or has_chain_at_depth[depth]
         )
+        for depth in range(depth_count)
+    )
+    if depth_count > 1 and any(has_depth_barrier):
+        epoch_rank_ms = [0.0] * rank_count
+        recurrent_runtime_ms = 0.0
+        for depth in range(depth_count):
+            if has_depth_barrier[depth]:
+                recurrent_runtime_ms += max(epoch_rank_ms, default=0.0)
+                epoch_rank_ms = [0.0] * rank_count
+            local_depth_work = (
+                local_runtime.rank_work_by_depth[depth]
+                if depth < len(local_runtime.rank_work_by_depth)
+                else ()
+            )
+            local_depth_buckets = (
+                local_runtime.rank_bucket_counts_by_depth[depth]
+                if depth < len(local_runtime.rank_bucket_counts_by_depth)
+                else ()
+            )
+            local_depth_segments = (
+                local_runtime.rank_segment_counts_by_depth[depth]
+                if depth < len(local_runtime.rank_segment_counts_by_depth)
+                else ()
+            )
+            chain_depth_work = (
+                chain_runtime.rank_work_by_depth[depth]
+                if depth < len(chain_runtime.rank_work_by_depth)
+                else ()
+            )
+            for rank in range(rank_count):
+                epoch_rank_ms[rank] += (
+                    _predict_local_rank_runtime_ms(
+                        local_depth_work[rank] if rank < len(local_depth_work) else 0,
+                        bucket_count=(
+                            local_depth_buckets[rank]
+                            if rank < len(local_depth_buckets)
+                            else 0
+                        ),
+                        segment_count=(
+                            local_depth_segments[rank]
+                            if rank < len(local_depth_segments)
+                            else 0
+                        ),
+                        planner_config=planner_config,
+                    )
+                    + (chain_depth_work[rank] if rank < len(chain_depth_work) else 0)
+                    / planner_config.runtime_chain_recurrent_tokens_per_ms
+                )
+        recurrent_runtime_ms += max(epoch_rank_ms, default=0.0)
+        dense_runtime_ms = max(
+            (
+                (rank_token_counts[rank] if rank < len(rank_token_counts) else 0)
+                / planner_config.runtime_dense_tokens_per_ms
+                for rank in range(rank_count)
+            ),
+            default=0.0,
+        )
+        rank_runtime_ms = recurrent_runtime_ms + dense_runtime_ms
+    else:
+        rank_runtime_ms = 0.0
+        for rank in range(rank_count):
+            local_work = (
+                local_runtime.rank_work[rank]
+                if rank < len(local_runtime.rank_work)
+                else 0
+            )
+            local_bucket_count = (
+                local_runtime.rank_bucket_counts[rank]
+                if rank < len(local_runtime.rank_bucket_counts)
+                else 0
+            )
+            local_segment_count = (
+                local_runtime.rank_segment_counts[rank]
+                if rank < len(local_runtime.rank_segment_counts)
+                else 0
+            )
+            chain_work = (
+                chain_runtime.rank_work[rank]
+                if rank < len(chain_runtime.rank_work)
+                else 0
+            )
+            owned_tokens = (
+                rank_token_counts[rank] if rank < len(rank_token_counts) else 0
+            )
+            rank_runtime_ms = max(
+                rank_runtime_ms,
+                _predict_local_rank_runtime_ms(
+                    local_work,
+                    bucket_count=local_bucket_count,
+                    segment_count=local_segment_count,
+                    planner_config=planner_config,
+                )
+                + chain_work / planner_config.runtime_chain_recurrent_tokens_per_ms
+                + owned_tokens / planner_config.runtime_dense_tokens_per_ms,
+            )
     return (
         rank_runtime_ms
         + _predict_chain_exposed_runtime_ms(
@@ -1484,13 +1601,14 @@ def _padded_work_from_lengths(lengths: tuple[int, ...]) -> tuple[int, int]:
     return max(real_lengths) * len(real_lengths), 1
 
 
-def _count_parent_state_exchanges(
+def _count_parent_state_exchanges_by_depth(
     spec: GdnPackedExecutionSpec,
     *,
     owner_by_node: tuple[int, ...],
     chain_nodes: tuple[bool, ...],
-) -> int:
-    exchange_count = 0
+    depth_count: int,
+) -> tuple[int, ...]:
+    exchanges_by_depth = [0] * max(0, int(depth_count))
     for child_index, parent_index in enumerate(spec.tree_parent_indices):
         if parent_index < 0 or chain_nodes[parent_index]:
             continue
@@ -1498,8 +1616,26 @@ def _count_parent_state_exchanges(
         if parent_owner < 0:
             continue
         if chain_nodes[child_index] or owner_by_node[child_index] != parent_owner:
-            exchange_count += 1
-    return exchange_count
+            depth = spec.tree_depths[child_index]
+            if 0 <= depth < len(exchanges_by_depth):
+                exchanges_by_depth[depth] += 1
+    return tuple(exchanges_by_depth)
+
+
+def _count_parent_state_exchanges(
+    spec: GdnPackedExecutionSpec,
+    *,
+    owner_by_node: tuple[int, ...],
+    chain_nodes: tuple[bool, ...],
+) -> int:
+    return sum(
+        _count_parent_state_exchanges_by_depth(
+            spec,
+            owner_by_node=owner_by_node,
+            chain_nodes=chain_nodes,
+            depth_count=max(spec.tree_depths, default=0) + 1,
+        )
+    )
 
 
 def _chain_beam_neighbor_groups(
