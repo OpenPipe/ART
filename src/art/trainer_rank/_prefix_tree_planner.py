@@ -320,10 +320,12 @@ def build_canonical_prefix_tree(
     are retained.  Parents are always emitted before children, which permits
     all subsequent transforms to remain iterative as well.
 
-    When ``chunk_size > 1``, every multi-sequence shared prefix segment length
-    is floored to a multiple of ``chunk_size`` so downstream chunked kernels
-    (such as FLA's 64-token GDN WY chunks on ``CP > 1``) never split a chunk
-    mid-way across a shared-prefix boundary.
+    When ``chunk_size > 1``, every multi-sequence internal shared prefix
+    segment length is floored to a multiple of ``chunk_size`` so downstream
+    chunked kernels (such as FLA's 64-token GDN WY chunks on ``CP > 1``) never
+    split a chunk mid-way across a shared-prefix boundary. Exact full-sequence
+    duplicate leaves have no continuing child segments and are deduplicated as
+    a single terminal shared leaf without splitting any chunk.
 
     Token equality is the only thing the tree needs from the token values, so
     each shared-segment scan is one vectorized comparison over the active
@@ -376,7 +378,14 @@ def build_canonical_prefix_tree(
                 if first_mismatch.numel()
                 else shared_end - start
             )
-        aligned_cursor = start + ((cursor - start) // chunk_size) * chunk_size
+        all_terminate = cursor > start and all(
+            lengths[index] == cursor for index in active
+        )
+        aligned_cursor = (
+            cursor
+            if all_terminate
+            else start + ((cursor - start) // chunk_size) * chunk_size
+        )
         if aligned_cursor > start:
             segment_index = len(segments)
             segments.append(
@@ -389,20 +398,25 @@ def build_canonical_prefix_tree(
                     depth=depth,
                 )
             )
-            tasks.append((active, aligned_cursor, segment_index))
+            if not all_terminate:
+                tasks.append((active, aligned_cursor, segment_index))
             continue
 
         # Preserve first-seen sibling order.  Pushing in reverse makes the
         # explicit stack produce the same order as a deterministic DFS.
         # When 0 <= cursor - start < chunk_size, branch at `cursor` so
-        # sequences ending at `cursor` peel off as leaves and continuing
-        # sequences group by their diverging token without splitting a chunk.
+        # sequences ending at `cursor` peel off together as a deduplicated
+        # terminal leaf group (no continuing children, so no chunk split) and
+        # continuing sequences group by their diverging token.
         branch_pos = cursor
         groups: dict[int, list[int]] = {}
+        leaves: list[int] = []
         sibling_order: list[tuple[str, int]] = []
         for sequence_index in active:
             if lengths[sequence_index] == branch_pos:
-                sibling_order.append(("leaf", sequence_index))
+                if not leaves:
+                    sibling_order.append(("leaves", 0))
+                leaves.append(sequence_index)
             else:
                 token = int(rows[sequence_index][branch_pos])
                 if token not in groups:
@@ -410,8 +424,8 @@ def build_canonical_prefix_tree(
                     sibling_order.append(("group", token))
                 groups[token].append(sequence_index)
         for kind, value in reversed(sibling_order):
-            if kind == "leaf":
-                tasks.append(((value,), start, parent_index))
+            if kind == "leaves":
+                tasks.append((tuple(leaves), start, parent_index))
             else:
                 tasks.append((tuple(groups[value]), start, parent_index))
 

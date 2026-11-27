@@ -93,6 +93,41 @@ def _install_moe_postprocess_workaround(moe_layer: Any) -> None:
     moe_layer.MoELayer.postprocess = _disable(moe_layer.MoELayer.postprocess)
 
 
+def _install_moe_router_routing_workaround() -> None:
+    from megatron.core.transformer.moe import router as moe_router
+
+    # Under torch.compile with CP > 1, Inductor compiles TopKRouter.routing's
+    # top-k softmax reduction independently per rank using per-rank sequence
+    # length size_hints (e.g. XBLOCK=1 vs XBLOCK=32 after empty/1-token shards
+    # on non-zero ranks), changing FP32 reduction order by 1-3 ULPs across CP
+    # ranks and amplifying into multi-centinat logprob drift between seq_idx=0
+    # and seq_idx>=1. TopKRouter.gating already breaks the graph right before
+    # routing and MoE token dispatch breaks right after, so keeping routing
+    # eager adds no new graph breaks while guaranteeing bit-exact rank-invariant
+    # routing probabilities.
+    moe_router.TopKRouter.routing = _disable(moe_router.TopKRouter.routing)
+
+
+def _install_gemma4_moe_router_routing_workaround() -> None:
+    from megatron.bridge.models.gemma import gemma4_provider
+
+    # Gemma4 overrides TopKRouter.routing to normalize selected probabilities
+    # and apply per-expert scaling after calling TopKRouter.routing. Keep the
+    # override eager for the same cross-rank reduction invariance.
+    gemma4_provider.Gemma4TopKRouter.routing = _disable(
+        gemma4_provider.Gemma4TopKRouter.routing
+    )
+
+
+def _install_dsv4_moe_router_routing_workaround() -> None:
+    from art.megatron.dsv4 import layer as dsv4_layer
+
+    # Dsv4Router overrides TopKRouter.routing with custom softmax/sigmoid/
+    # sqrtsoftplus normalization and top-k selection; keep it eager for
+    # cross-rank reduction invariance.
+    dsv4_layer.Dsv4Router.routing = _disable(dsv4_layer.Dsv4Router.routing)
+
+
 def _install_gemma4_moe_postprocess_workaround() -> None:
     from megatron.bridge.models.gemma import gemma4_provider
 
@@ -166,6 +201,12 @@ def install_torch_compile_workarounds(
         _install_self_attn_linear_proj_reduce_scatter_workaround()
     if "moe_postprocess" in flags:
         _install_moe_postprocess_workaround(moe_layer)
+    if "moe_router_routing" in flags:
+        _install_moe_router_routing_workaround()
+    if "gemma4_moe_router_routing" in flags:
+        _install_gemma4_moe_router_routing_workaround()
+    if "dsv4_moe_router_routing" in flags:
+        _install_dsv4_moe_router_routing_workaround()
     if "gemma4_moe_postprocess" in flags:
         _install_gemma4_moe_postprocess_workaround()
 

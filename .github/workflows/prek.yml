@@ -263,6 +263,7 @@ jobs:
             tests/unit/test_segmented_gdn.py \
             tests/unit/test_gdn_empty_shards.py \
             tests/unit/test_gdn_cp_radix_correctness.py \
+            tests/unit/test_moe_router_compile_invariance.py \
             tests/unit/test_prefix_tree_chunk_alignment.py \
             tests/unit/test_fp32_residual.py \
             tests/unit/test_segmented_router.py \
@@ -295,6 +296,7 @@ jobs:
             --ignore=tests/unit/test_megatron_reference_logprobs.py \
             --ignore=tests/unit/test_moe_routing_replay.py \
             --ignore=tests/unit/test_moe_routing_real_path.py \
+            --ignore=tests/unit/test_moe_router_compile_invariance.py \
             --ignore=tests/unit/test_pipeline_trainer_local_backend.py \
             --ignore=tests/unit/test_prefix_tree.py \
             --ignore=tests/unit/test_prefix_tree_attention_builder.py \
