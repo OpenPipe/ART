@@ -3,12 +3,49 @@ import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import polars as pl
 import pytest
 
 from art import Model
 
 
 class TestMetricRoutingBaseline:
+    @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -float("inf")])
+    def test_history_omits_nonfinite_metrics(
+        self, tmp_path: Path, invalid: float
+    ) -> None:
+        model = Model(
+            name="test-model",
+            project="test-project",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+        model._log_metrics({"valid": 0.75, "invalid": invalid}, split="train", step=7)
+
+        history_path = tmp_path / "test-project/models/test-model/history.jsonl"
+        history = pl.read_ndjson(history_path)
+        entry = json.loads(
+            history_path.read_text(),
+            parse_constant=lambda value: pytest.fail(f"Non-JSON constant: {value}"),
+        )
+        assert "train/invalid" not in entry
+        assert entry["train/valid"] == 0.75
+        assert entry["step"] == entry["training_step"] == 7
+        assert history["train/valid"].to_list() == [0.75]
+
+    def test_history_preserves_integer_metrics(self, tmp_path: Path) -> None:
+        model = Model(
+            name="test-model",
+            project="test-project",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+        value = 10**400
+        model._log_metrics({"count": value}, split="train", step=0)
+
+        history_path = tmp_path / "test-project/models/test-model/history.jsonl"
+        assert json.loads(history_path.read_text())["train/count"] == value
+
     def test_log_metrics_routes_known_sections_without_split_prefix(
         self, tmp_path: Path
     ) -> None:
