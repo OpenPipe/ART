@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import MethodType
 from typing import Any, Callable, Iterable, Literal, NamedTuple, Sequence, cast
 
@@ -875,10 +876,12 @@ def _select_state_rows(
 ) -> tuple[Tensor, ...]:
     source_rows = tuple(source_row for _, source_row in pairs)
     if len(set(source_rows)) == 1:
+        if len(source_rows) == 1:
+            return tuple(chunk.narrow(0, source_rows[0], 1) for chunk in chunks)
         return tuple(
-            chunk.narrow(0, source_rows[0], 1).expand(
-                len(source_rows), *tuple(chunk.shape[1:])
-            )
+            chunk.narrow(0, source_rows[0], 1)
+            .expand(len(source_rows), *tuple(chunk.shape[1:]))
+            .contiguous()
             for chunk in chunks
         )
     first_row = source_rows[0]
@@ -2615,13 +2618,17 @@ class _ConvTailScan(torch.autograd.Function):
                 "conv tail source maps must be [segments, tail_width], got "
                 f"{tuple(source_ids.shape)} and {tuple(source_pos.shape)}"
             )
+        parent_initial = parent_initial.contiguous()
+        tails_by_rank = tails_by_rank.contiguous()
+        source_ids = source_ids.contiguous()
+        source_pos = source_pos.contiguous()
         output = torch.empty_like(parent_initial)
         block_c = 256
         _conv_tail_scan_kernel[(segments, triton.cdiv(channels, block_c))](
             parent_initial,
             tails_by_rank,
-            source_ids.contiguous(),
-            source_pos.contiguous(),
+            source_ids,
+            source_pos,
             output,
             segments,
             channels,
@@ -2851,8 +2858,165 @@ def _l2norm(x: Tensor) -> Tensor:
     return dynamic_l2norm(x)
 
 
+class _UnifiedChunkGatedDeltaRule(torch.autograd.Function):
+    """Local-bucket FLA gated-delta recurrence unified on ``use_exp2=False``.
+
+    Matches ``fla_cp._NativeCpChunkGatedDeltaRule`` so depth-0 CP chains and
+    depth >= 1 local buckets execute the same fused intra-chunk kernel and
+    natural-exp recurrence math without ``use_exp2`` drift.
+    """
+
+    @staticmethod
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(
+        ctx: Any,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        g: Tensor,
+        beta: Tensor,
+        scale: float,
+        initial_state: Tensor | None,
+        output_final_state: bool,
+        cu_seqlens: Tensor | None,
+        cu_seqlens_cpu: Tensor | None,
+    ) -> tuple[Tensor, Tensor | None]:
+        from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_fwd
+        from fla.ops.utils import prepare_chunk_indices
+
+        from ..segmented_gdn import _ACTIVE as native_gdn_reductions_active
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        g = g.contiguous()
+        beta = beta.contiguous()
+        if initial_state is not None:
+            initial_state = initial_state.contiguous()
+        if cu_seqlens is not None:
+            cu_seqlens = cu_seqlens.contiguous()
+
+        device_ctx = torch.cuda.device(q.device) if q.is_cuda else nullcontext()
+        with device_ctx:
+            chunk_indices = (
+                prepare_chunk_indices(cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu)
+                if cu_seqlens is not None
+                else None
+            )
+            g_c, o, a_mat, final_state, init_out, _ = chunk_gated_delta_rule_fwd(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                cu_seqlens=cu_seqlens,
+                chunk_indices=chunk_indices,
+                use_exp2=False,
+            )
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            g_c,
+            beta,
+            a_mat,
+            init_out,
+            cu_seqlens,
+            chunk_indices,
+        )
+        ctx.scale = scale
+        ctx._art_native_gdn_reductions = native_gdn_reductions_active.get()
+        return o.to(q.dtype), final_state
+
+    @staticmethod
+    @torch.amp.custom_bwd(device_type="cuda")
+    def backward(ctx: Any, *grad_outputs: Tensor | None) -> tuple[Any, ...]:
+        from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd
+
+        from ..segmented_gdn import _ACTIVE as native_gdn_reductions_active
+
+        q, k, v, g_c, beta, a_mat, init_s, cu_sl, c_idx = ctx.saved_tensors
+        do = grad_outputs[0]
+        if do is None:
+            do = v.new_zeros(v.shape)
+        else:
+            do = do.contiguous()
+        dht = grad_outputs[1]
+        if dht is not None:
+            dht = dht.contiguous()
+
+        token = native_gdn_reductions_active.set(
+            getattr(ctx, "_art_native_gdn_reductions", False)
+        )
+        device_ctx = torch.cuda.device(q.device) if q.is_cuda else nullcontext()
+        try:
+            with device_ctx:
+                dq, dk, dv, db, dg, dh0, _, _ = chunk_gated_delta_rule_bwd(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g_c,
+                    beta=beta,
+                    A=a_mat,
+                    scale=ctx.scale,
+                    initial_state=init_s,
+                    do=do,
+                    dht=dht,
+                    cu_seqlens=cu_sl,
+                    chunk_indices=c_idx,
+                    use_exp2=False,
+                )
+        finally:
+            native_gdn_reductions_active.reset(token)
+        return (
+            dq.to(q),
+            dk.to(k),
+            dv.to(v),
+            dg.to(g_c),
+            db.to(beta),
+            None,
+            dh0,
+            None,
+            None,
+            None,
+        )
+
+
 def _chunk_gated_delta_rule(*args: Any, **kwargs: Any) -> tuple[Tensor, Tensor | None]:
     ensure_blackwell_fwd_h_configs()
+    if (
+        len(args) == 3
+        and not bool(kwargs.get("use_qk_l2norm_in_kernel", False))
+        and not bool(kwargs.get("head_first", False))
+        and not bool(kwargs.get("use_exp2", False))
+        and kwargs.get("cp_context") is None
+        and not bool(kwargs.get("transpose_state_layout", False))
+        and not bool(kwargs.get("use_gate_in_kernel", False))
+        and "g" in kwargs
+        and "beta" in kwargs
+    ):
+        q, k, v = args
+        scale = kwargs.get("scale")
+        if scale is None:
+            scale = float(k.shape[-1] ** -0.5)
+        initial_state = kwargs.get("initial_state")
+        if initial_state is not None and not initial_state.is_contiguous():
+            initial_state = initial_state.contiguous()
+        return _UnifiedChunkGatedDeltaRule.apply(
+            q,
+            k,
+            v,
+            kwargs["g"],
+            kwargs["beta"],
+            float(scale),
+            initial_state,
+            bool(kwargs.get("output_final_state", False)),
+            kwargs.get("cu_seqlens"),
+            kwargs.get("cu_seqlens_cpu"),
+        )
     try:
         from fla.ops.gated_delta_rule import chunk_gated_delta_rule
     except ImportError as exc:

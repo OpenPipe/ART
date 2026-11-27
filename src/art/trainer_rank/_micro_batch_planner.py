@@ -29,6 +29,7 @@ from art.trainer_rank._memory import _with_planning_inventory
 from art.trainer_rank._planner_cost import COEFFICIENT_VERSION_FALLBACK
 from art.trainer_rank._prefix_tree_planner import (
     build_canonical_prefix_tree,
+    canonical_prefix_tree_chunk_size,
     prefix_tree_layout_candidates,
     select_prefix_tree_layout,
 )
@@ -1078,14 +1079,21 @@ def _compute_group_layout(
     """
 
     content_key, facts, anchor = key
+    tree_chunk_size = canonical_prefix_tree_chunk_size(
+        uses_gdn=facts.uses_gdn,
+        cp_size=facts.cp_size,
+    )
+    tree_cache_key = (
+        content_key if tree_chunk_size == 1 else f"{content_key}:c{tree_chunk_size}"
+    )
     with self._layout_cache_lock:
-        tree = self._tree_cache.get(content_key)
+        tree = self._tree_cache.get(tree_cache_key)
         if tree is not None:
-            self._tree_cache.move_to_end(content_key)
+            self._tree_cache.move_to_end(tree_cache_key)
     if tree is None:
-        tree = build_canonical_prefix_tree(input_ids)
+        tree = build_canonical_prefix_tree(input_ids, chunk_size=tree_chunk_size)
         with self._layout_cache_lock:
-            self._tree_cache[content_key] = tree
+            self._tree_cache[tree_cache_key] = tree
             while len(self._tree_cache) > _impl._LAYOUT_SELECTION_CACHE_LIMIT:
                 self._tree_cache.popitem(last=False)
     if anchor is not None:
@@ -1655,6 +1663,11 @@ def _fill_planner_snapshot(
             ]
             layouts = []
             cursor = 0
+            observation_facts = self._planner_topology_facts()
+            observation_tree_chunk_size = canonical_prefix_tree_chunk_size(
+                uses_gdn=observation_facts.uses_gdn,
+                cp_size=observation_facts.cp_size,
+            )
             for group in plan.groups:
                 rows: list[Any] = [
                     item["input_tokens"]
@@ -1670,8 +1683,13 @@ def _fill_planner_snapshot(
                     reason = "selected_layout_input_unverified"
                 elif any(not row for row in rows) or (
                     build_canonical_prefix_tree(
-                        _impl.torch.tensor(row, dtype=_impl.torch.long, device="cpu")
-                        for row in rows
+                        (
+                            _impl.torch.tensor(
+                                row, dtype=_impl.torch.long, device="cpu"
+                            )
+                            for row in rows
+                        ),
+                        chunk_size=observation_tree_chunk_size,
                     ).fingerprint
                     != group.layout.tree_fingerprint
                 ):

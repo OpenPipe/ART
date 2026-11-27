@@ -146,9 +146,8 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
         ensure_blackwell_fwd_h_configs()
         from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_fwd_h
         from fla.ops.common.chunk_o import chunk_fwd_o
-        from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-        from fla.ops.gated_delta_rule.wy_fast import recompute_w_u_fwd
-        from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices, solve_tril
+        from fla.ops.gated_delta_rule.chunk_fwd import chunk_gated_delta_rule_fwd_intra
+        from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
 
         chunk_indices = (
             prepare_chunk_indices(cu_seqlens, 64, cu_seqlens_cpu=cu_seqlens_cpu)
@@ -157,44 +156,28 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
         )
         chunk_local_cumsum = cast(Any, chunk_local_cumsum)
         chunk_fwd_o = cast(Any, chunk_fwd_o)
-        chunk_scaled_dot_kkt_fwd = cast(Any, chunk_scaled_dot_kkt_fwd)
-        solve_tril = cast(Any, solve_tril)
-        recompute_w_u_fwd = cast(Any, recompute_w_u_fwd)
+        chunk_gated_delta_rule_fwd_intra = cast(Any, chunk_gated_delta_rule_fwd_intra)
         g_cumsum = chunk_local_cumsum(
             g,
             chunk_size=64,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
         )
-        a = chunk_scaled_dot_kkt_fwd(
-            k=k,
-            g=g_cumsum,
-            beta=beta,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            output_dtype=torch.float32,
-        )
-        a = solve_tril(
-            A=a,
-            cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
-            output_dtype=k.dtype,
-        )
-        w, u = recompute_w_u_fwd(
+        w, u, a = chunk_gated_delta_rule_fwd_intra(
             k=k,
             v=v,
-            beta=beta,
-            A=a,
             g=g_cumsum,
+            beta=beta,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            use_exp2=False,
         )
         summary = _fwd_summary(k=k, w=w, u=u, g=g_cumsum, cu_seqlens=cu_seqlens)
         prefix_summary = _prefix_summary_exclusive(summary, group)
         local_initial = _scan_fwd_initial_state(
             prefix_summary,
             initial_state,
-        )
+        ).contiguous()
         h, v_new, local_final_state = chunk_gated_delta_rule_fwd_h(
             k=k,
             w=w,
@@ -204,6 +187,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            use_exp2=False,
         )
         out = chunk_fwd_o(
             q=q,
@@ -214,6 +198,7 @@ class _NativeCpChunkGatedDeltaRule(torch.autograd.Function):
             scale=scale,
             cu_seqlens=cu_seqlens,
             chunk_indices=chunk_indices,
+            use_exp2=False,
         )
         final_state = (
             _broadcast_chain_final_state(local_final_state, group)
@@ -552,11 +537,11 @@ def _compose_summary(after: Tensor, before: Tensor) -> Tensor:
 
 def _scan_fwd_initial_state(summary: Tensor | None, h0: Tensor) -> Tensor:
     if summary is None:
-        return h0.float()
+        return h0.float().contiguous()
     multi = summary.ndim == 4
     state = h0.float() if multi else h0[0].float()
     state = _apply_summary(summary, state)
-    return state if multi else state.unsqueeze(0)
+    return (state if multi else state.unsqueeze(0)).contiguous()
 
 
 def _broadcast_chain_final_state(final_state: Tensor | None, group: Any) -> Tensor:
@@ -579,18 +564,18 @@ def _scan_bwd_local_final_grad(
     dht: Tensor,
 ) -> Tensor:
     if summary is None:
-        return dht.float()
+        return dht.float().contiguous()
     multi = summary.ndim == 4
     state = dht.float() if multi else dht[0].float()
     state = _apply_summary(summary, state)
-    return state if multi else state.unsqueeze(0)
+    return (state if multi else state.unsqueeze(0)).contiguous()
 
 
 def _scan_bwd_initial_state_grad(summary: Tensor, dht: Tensor) -> Tensor:
     multi = summary.ndim == 4
     state = dht.float() if multi else dht[0].float()
     state = _apply_summary(summary, state)
-    return state if multi else state.unsqueeze(0)
+    return (state if multi else state.unsqueeze(0)).contiguous()
 
 
 def _apply_summary(summary: Tensor, state: Tensor) -> Tensor:

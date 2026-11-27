@@ -262,6 +262,8 @@ jobs:
             tests/unit/test_segmented_expert_lora.py \
             tests/unit/test_segmented_gdn.py \
             tests/unit/test_gdn_empty_shards.py \
+            tests/unit/test_gdn_cp_radix_correctness.py \
+            tests/unit/test_prefix_tree_chunk_alignment.py \
             tests/unit/test_segmented_router.py \
             tests/unit/test_lora_layouts.py \
             tests/unit/test_trainer_rank_forward_profile.py \

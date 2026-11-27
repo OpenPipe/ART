@@ -626,9 +626,19 @@ class ReplayRank(_impl.TrainerRank):
             )
             for r in records
         )
-        from ._prefix_tree_planner import build_canonical_prefix_tree
+        from ._prefix_tree_planner import (
+            build_canonical_prefix_tree,
+            canonical_prefix_tree_chunk_size,
+        )
 
-        tree = build_canonical_prefix_tree([r.input_tokens for r in requests])
+        tree_chunk_size = canonical_prefix_tree_chunk_size(
+            uses_gdn=self._gdn_layers > 0,
+            cp_size=self._topology_key()[2],
+        )
+        tree = build_canonical_prefix_tree(
+            [r.input_tokens for r in requests],
+            chunk_size=tree_chunk_size,
+        )
         packed = _impl.materialize_prefix_tree_layout(
             [r.input_tokens for r in requests], tree, layout, verify_shared_tokens=True
         )
