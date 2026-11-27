@@ -23,16 +23,20 @@ def filter_rename_model_split(
     )
 
     df = df.filter(z)
+    if not models:
+        return df
 
-    for model in models:
+    # Evaluate every rename against the original names, not earlier display names.
+    # Reverse the order so the first non-identity rename wins for duplicate keys.
+    model_name = pl.col("model")
+    for model in reversed(models):
         if model.name != model.display_name:
-            df = df.with_columns(
+            model_name = (
                 pl.when(
                     (pl.col("model") == model.name) & (pl.col("split") == model.split)
                 )
                 .then(pl.lit(model.display_name))
-                .otherwise(pl.col("model"))
-                .alias("model")
+                .otherwise(model_name)
             )
 
-    return df
+    return df.with_columns(model_name.alias("model"))
