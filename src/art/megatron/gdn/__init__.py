@@ -1,6 +1,7 @@
 """ART helpers for Megatron GatedDeltaNet integration."""
 
 from .fla_cp import chunk_gated_delta_rule_native_cp
+from .fla_tilelang import ensure_tilelang_varlen_bwd
 from .gdn_prefix_tree import (
     GdnGlobalExecutionDecision,
     GdnPackedExecutionSpec,
@@ -19,6 +20,7 @@ from .operator import run_gdn_layer
 
 __all__ = [
     "chunk_gated_delta_rule_native_cp",
+    "ensure_tilelang_varlen_bwd",
     "GdnGlobalExecutionDecision",
     "GdnPackedExecutionSpec",
     "GdnPlannerConfig",

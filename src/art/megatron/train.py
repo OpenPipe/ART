@@ -529,6 +529,9 @@ def build_training_runtime(
         print("Resolved inductor cache_dir():", inductor_cache_dir())
         print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
+    from art.megatron.fp32_residual import disable_te_parameter_transpose_cache
+
+    disable_te_parameter_transpose_cache(model)
     provider_bundle.handler.install_preprocess_patch(model)
     if replay_requested:
         prepare_moe_routing_replay_boundaries(model)

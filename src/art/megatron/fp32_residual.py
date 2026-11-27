@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import Any, cast
 
 import torch
@@ -307,6 +308,81 @@ def _fp32_layernorm_linear_forward(
     return linear_out, None
 
 
+def _slice_mod4_padded_output(
+    val: Any,
+    orig_rows: int,
+    padded_prefix: tuple[int, ...],
+    expected_ndim: int,
+) -> Any:
+    if isinstance(val, torch.Tensor):
+        if val.ndim == expected_ndim and tuple(val.shape[:-1]) == padded_prefix:
+            # Clone (not .contiguous()) so the sliced tensor owns its storage
+            # (_base is None), matching the unpadded rows % 4 == 0 path and
+            # avoiding Dynamo view-base recompiles on resumed frames.
+            return val[:orig_rows].clone(memory_format=torch.contiguous_format)
+        return val
+    if isinstance(val, tuple):
+        return tuple(
+            _slice_mod4_padded_output(item, orig_rows, padded_prefix, expected_ndim)
+            for item in val
+        )
+    if isinstance(val, list):
+        return [
+            _slice_mod4_padded_output(item, orig_rows, padded_prefix, expected_ndim)
+            for item in val
+        ]
+    return val
+
+
+@torch.compiler.disable
+def _call_with_mod4_row_padding(
+    fn: Callable[..., Any],
+    module: Any,
+    x: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Pad leading dim-0 rows to a multiple of 4 for batch-invariant TE RMSNorm.
+
+    Transformer Engine 2.11 selects different CUDA RMSNorm kernels depending on
+    ``rows % 4 == 0`` vs ``rows % 4 != 0``, causing up to 1 BF16 ULP divergence
+    on identical prefix rows across adjacent sequence lengths. Padding dim-0 by
+    at most 3 zero rows and slicing outputs back keeps every forward/backward on
+    the same vectorized kernel with zero gradient contribution from padded rows.
+    Sequence-parallel modules are left untouched because SP all-gathers along
+    dim-0 across TP ranks.
+    """
+    if (
+        not bool(getattr(module, "sequence_parallel", False))
+        and not any(isinstance(arg, torch.Tensor) for arg in args)
+        and isinstance(x, torch.Tensor)
+        and x.ndim >= 2
+        and int(x.shape[0]) > 0
+        and int(x.shape[0]) % 4 != 0
+    ):
+        orig_rows = int(x.shape[0])
+        pad_rows = (-orig_rows) % 4
+        xp = F.pad(x, (0, 0) * (x.ndim - 1) + (0, pad_rows))
+        out = fn(module, xp, *args, **kwargs)
+        return _slice_mod4_padded_output(
+            out,
+            orig_rows,
+            tuple(xp.shape[:-1]),
+            x.ndim,
+        )
+    return fn(module, x, *args, **kwargs)
+
+
+def disable_te_parameter_transpose_cache(model_chunks: Sequence[Any]) -> None:
+    """Disable TE parameter transpose caching across dynamic sequence shapes."""
+    for chunk in model_chunks:
+        if not isinstance(chunk, torch.nn.Module):
+            continue
+        for module in chunk.modules():
+            if hasattr(module, "disable_parameter_transpose_cache"):
+                module.disable_parameter_transpose_cache = True
+
+
 def _is_patched(fn: Any) -> bool:
     if getattr(fn, "__art_fp32_residual__", False):
         return True
@@ -339,7 +415,7 @@ def _patch_te_layernorm_column_parallel_linear() -> None:
             in {"RMSNorm", "LayerNorm"}
         ):
             return _fp32_layernorm_linear_forward(self, x, weight, ln_weight)
-        return original_forward(self, x)
+        return _call_with_mod4_row_padding(original_forward, self, x)
 
     setattr(
         _fp32_layernorm_column_parallel_linear_forward, "__art_fp32_residual__", True
@@ -349,6 +425,25 @@ def _patch_te_layernorm_column_parallel_linear() -> None:
         "forward",
         _fp32_layernorm_column_parallel_linear_forward,
     )
+
+
+def _patch_te_layernorm_linear() -> None:
+    import transformer_engine.pytorch as te
+
+    original_forward = te.LayerNormLinear.forward
+    if _is_patched(original_forward):
+        return
+
+    def _mod4_te_layernorm_linear_forward(
+        self: Any,
+        inp: torch.Tensor,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        return _call_with_mod4_row_padding(original_forward, self, inp, *args, **kwargs)
+
+    setattr(_mod4_te_layernorm_linear_forward, "__art_fp32_residual__", True)
+    setattr(te.LayerNormLinear, "forward", _mod4_te_layernorm_linear_forward)
 
 
 def _patch_te_rmsnorm() -> None:
@@ -390,7 +485,9 @@ def _patch_te_rmsnorm() -> None:
                 fwd_sm_margin=fwd_sm_margin,
                 bwd_sm_margin=bwd_sm_margin,
             )
-        return original_forward(self, input, *extra_inputs, **kwargs)
+        return _call_with_mod4_row_padding(
+            original_forward, self, input, *extra_inputs, **kwargs
+        )
 
     setattr(_fp32_rmsnorm_forward, "__art_fp32_residual__", True)
     setattr(te.RMSNorm, "forward", _fp32_rmsnorm_forward)
@@ -439,7 +536,8 @@ def _patch_moe_layer_postprocess() -> None:
 
 
 def install_fp32_residual_patches() -> None:
-    """Install FP32 residual stream support for TE norms and MoE postprocess."""
+    """Install FP32 residual and batch-invariant mod-4 RMSNorm patches for TE/MoE."""
     _patch_te_layernorm_column_parallel_linear()
+    _patch_te_layernorm_linear()
     _patch_te_rmsnorm()
     _patch_moe_layer_postprocess()

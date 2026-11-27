@@ -24,6 +24,7 @@ _DQ_POSTPROCESS_PATCH_APPLIED = False
 _DETERMINISTIC_BWD_PATCH_APPLIED = False
 _FLASH_TRITON_BACKWARD_HEAD_DIMS = frozenset({64})
 _FLASH_BACKWARD_COMPATIBILITY_KEY = "bwd_ART_TRITON_BACKWARD_VERSION"
+SHORT_DETERMINISTIC_BACKWARD_OPTION_KEY = "bwd_ART_SHORT_TRITON_BWD"
 _FLASH_BACKWARD_OVERRIDE_LOGGED: set[int] = set()
 _logger = logging.getLogger(__name__)
 
@@ -683,16 +684,20 @@ def apply_deterministic_flash_backward_patch() -> None:
                 query.get_size()[-1]
             )
             deterministic = torch.are_deterministic_algorithms_enabled()
-            if _use_triton_flash_backward(head_dim, deterministic):
-                if not deterministic:
+            short_triton_bwd = bool(
+                kernel_options.get(SHORT_DETERMINISTIC_BACKWARD_OPTION_KEY)
+            )
+            if short_triton_bwd or _use_triton_flash_backward(head_dim, deterministic):
+                if not deterministic and not short_triton_bwd:
                     _record_flash_backward_override(head_dim)
                 multiply = lowerings[torch.ops.aten.mul.Tensor]
                 logsumexp = multiply(logsumexp, math.log2(math.e))
                 if grad_logsumexp is not None:
                     grad_logsumexp = multiply(grad_logsumexp, math.log(2.0))
                 kernel_options = {**kernel_options, "BACKEND": "TRITON"}
-                # This is graph-cache metadata, not a Triton tuning option.
+                # These are graph-cache / routing metadata, not Triton tuning options.
                 kernel_options.pop(_FLASH_BACKWARD_COMPATIBILITY_KEY, None)
+                kernel_options.pop(SHORT_DETERMINISTIC_BACKWARD_OPTION_KEY, None)
         # Normalize keyword calls too; the underlying lowering unpacks
         # positional HOP arguments. Neither form may bypass the dim guard.
         return original(

@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from art.megatron.flex_attn.compiled import (
+    SHORT_DETERMINISTIC_ATTN_MAX_STAGE_LEN,
     SparseBlockSize,
     flash_sparse_block_size_for_head_dim,
     flex_backend_for_head_dims,
@@ -19,6 +20,7 @@ from art.megatron.flex_attn.compiled import (
     normalize_sparse_block_size,
     prepare_sparse_flex_attention,
     select_sparse_execution_family,
+    short_deterministic_flash_sparse_compiled_flex_attention,
     sparse_compiled_flex_attention,
 )
 
@@ -681,8 +683,21 @@ class FlexAttentionKernel:
                 k_len=int(k.shape[2]),
                 block_size=block_mask.BLOCK_SIZE,
             )
+        # Route short grad-enabled FLASH sparse stages through the dedicated
+        # compiled callable (FLASH forward + deterministic Triton backward) so
+        # Hopper SM90 GQA dK/dV backward avoids non-deterministic atomicAdd drift
+        # while long stages (> 256) remain on unmodified FA4 forward+backward.
+        use_short_deterministic_bwd = (
+            torch.is_grad_enabled()
+            and backend == "FLASH"
+            and str(compile_key) == "sparse"
+            and int(q.shape[2]) <= SHORT_DETERMINISTIC_ATTN_MAX_STAGE_LEN
+            and int(k.shape[2]) <= SHORT_DETERMINISTIC_ATTN_MAX_STAGE_LEN
+        )
         compiled_flex_attention = (
-            sparse_compiled_flex_attention
+            short_deterministic_flash_sparse_compiled_flex_attention
+            if use_short_deterministic_bwd
+            else sparse_compiled_flex_attention
             if str(compile_key) == "sparse" and backend == "FLASH"
             else get_sparse_compiled_flex_attention(
                 family_key=str(compile_key),

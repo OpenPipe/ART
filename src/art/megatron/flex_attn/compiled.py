@@ -24,6 +24,7 @@ from torch.nn.attention.flex_attention import (
 )
 
 from art.megatron.flex_attn.flash_dlse_patch import (
+    SHORT_DETERMINISTIC_BACKWARD_OPTION_KEY,
     apply_deterministic_flash_backward_patch,
     apply_flash_flex_dlse_patch,
     flash_backward_compatibility_options,
@@ -269,6 +270,53 @@ def _sparse_flex_attention_with_options(kernel_options: FlexKernelOptions) -> An
     return _flex_attention
 
 
+SHORT_DETERMINISTIC_ATTN_MAX_STAGE_LEN = 256
+# Use boolean True (never int 1) so assume_static_by_default=False cannot
+# promote the option value into a SymInt node during Dynamo tracing.
+_SHORT_DETERMINISTIC_FLASH_SPARSE_OPTIONS: dict[str, Any] = {
+    "BACKEND": "FLASH",
+    SHORT_DETERMINISTIC_BACKWARD_OPTION_KEY: True,
+    "PRESCALE_QK": False,
+    "ROWS_GUARANTEED_SAFE": False,
+    "BLOCKS_ARE_CONTIGUOUS": False,
+    "WRITE_DQ": True,
+    "OUTPUT_LOGSUMEXP": True,
+    "OUTPUT_MAX": False,
+}
+
+
+def _short_deterministic_flash_sparse_flex_attention(
+    q, k, v, *, block_mask, scale, enable_gqa
+):
+    """FLASH forward + deterministic Triton backward for short grad-enabled stages.
+
+    Defined as a dedicated Python function (distinct ``__code__`` object) so
+    TorchDynamo keeps its guard chain completely disjoint from
+    ``sparse_compiled_flex_attention``.
+    """
+    del enable_gqa
+    for tensor in (q, k, v):
+        torch._dynamo.mark_static(tensor, -3)
+        torch._dynamo.mark_static(tensor, -1)
+    mask_tuple = (q.shape[-2], k.shape[-2], *block_mask.as_tuple()[2:])
+    eager_flash = _flash_eager_fallback(
+        "FLASH", "short_deterministic_sparse_flex_attention", q, k, v
+    )
+    out, lse, _max_scores = flex_attention_hop(
+        q,
+        k,
+        v,
+        _identity_score,
+        mask_tuple,
+        scale,
+        _SHORT_DETERMINISTIC_FLASH_SPARSE_OPTIONS,
+    )
+    lse = lse * _FLASH_LSE_RESCALE
+    if eager_flash:
+        lse = lse * _FLASH_LSE_RESCALE
+    return out, lse
+
+
 def prepare_sparse_flex_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -494,6 +542,9 @@ blackwell_wide_head_dense_compiled_flex_attention = torch.compile(
 
 sparse_compiled_flex_attention = torch.compile(
     _sparse_flex_attention_with_options(_FORCED_FLEX_KERNEL_OPTIONS),
+)
+short_deterministic_flash_sparse_compiled_flex_attention = torch.compile(
+    _short_deterministic_flash_sparse_flex_attention,
 )
 flash_sparse_compiled_flex_attention = torch.compile(
     _sparse_flex_attention_with_options(_FLASH_FLEX_KERNEL_OPTIONS),
