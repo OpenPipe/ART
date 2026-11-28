@@ -3,13 +3,24 @@ from collections import Counter
 import contextlib
 import contextvars
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, Iterable, Iterator, Literal, Sequence, overload
+from typing import (
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Literal,
+    Sequence,
+    TypeVar,
+    overload,
+)
 
 from openai.types.chat.chat_completion import Choice
 from tqdm import auto as tqdm
 
 from .preprocessing.vllm_tokens import choice_completion_tokens
 from .trajectories import Trajectory, TrajectoryGroup
+
+T = TypeVar("T")
 
 
 async def gather_trajectory_groups(
@@ -45,10 +56,10 @@ async def gather_trajectory_groups(
         return await after_each(group)
 
     with set_gather_context(context):
-        future = asyncio.gather(*[group_forward(g) for g in groups])
+        tasks = [asyncio.ensure_future(group_forward(g)) for g in groups]
         total = sum(getattr(g, "_num_trajectories", 1) for g in groups)
         context.pbar = tqdm.tqdm(desc=pbar_desc, total=total)
-        result_groups = await future
+        result_groups = await _gather_or_cancel(tasks)
 
     if context.pbar is not None:
         context.pbar.close()
@@ -125,12 +136,30 @@ async def gather_trajectories(
         max_exceptions=max_exceptions,
     )
     with set_gather_context(context):
-        results = await asyncio.gather(
-            *[wrap_trajectories_awaitable(t) for t in trajectories_list]
+        results = await _gather_or_cancel(
+            [
+                asyncio.ensure_future(wrap_trajectories_awaitable(t))
+                for t in trajectories_list
+            ]
         )
     if context.pbar is not None:
         context.pbar.close()
     return results
+
+
+async def _gather_or_cancel(tasks: list[asyncio.Future[T]]) -> list[T]:
+    """Like `asyncio.gather`, but a failure also stops the remaining tasks.
+
+    `asyncio.gather` re-raises the first exception and leaves the other rollouts
+    running with no owner. Cancel and await them before re-raising.
+    """
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
 
 
 async def wrap_group_awaitable(
