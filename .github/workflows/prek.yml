@@ -269,6 +269,7 @@ jobs:
             tests/unit/test_prefix_tree_chunk_alignment.py \
             tests/unit/test_fp32_residual.py \
             tests/unit/test_megatron_runtime_invariants.py \
+            tests/unit/test_fast_weight_loader.py \
             tests/unit/test_shared_expert_gate_invariance.py \
             tests/unit/test_segmented_router.py \
             tests/unit/test_lora_layouts.py \

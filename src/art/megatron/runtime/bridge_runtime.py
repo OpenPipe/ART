@@ -476,14 +476,19 @@ class _CachedStateLookup(Mapping[str, torch.Tensor | ExpertTensorSlice]):
         *,
         cache: Mapping[str, torch.Tensor | ExpertTensorSlice],
         source: Mapping[str, torch.Tensor],
+        device: str | torch.device | None = None,
     ) -> None:
         self._cache = cache
         self._source = source
+        self._device = device
 
     def __getitem__(self, key: str) -> torch.Tensor | ExpertTensorSlice:
         if key in self._cache:
             return self._cache[key]
-        return _pin_cpu_tensor(self._source[key])
+        tensor = self._source[key]
+        if self._device is not None:
+            return tensor.to(device=self._device, non_blocking=True)
+        return _pin_cpu_tensor(tensor)
 
     def __iter__(self):
         seen = set(self._cache)
@@ -758,8 +763,9 @@ def _scatter_to_tp_ranks(
         shard = cast(list[torch.Tensor], splits)[0]
         if output_tensor is None:
             return shard.to(device=device, dtype=dtype, non_blocking=True)
-        output_tensor.copy_(shard, non_blocking=True)
-        if output_tensor.device.type == "cuda":
+        if shard.data_ptr() != output_tensor.data_ptr():
+            output_tensor.copy_(shard, non_blocking=True)
+        if output_tensor.device.type == "cuda" and shard.device.type != "cuda":
             torch.cuda.synchronize(output_tensor.device)
         return output_tensor
     output = (
@@ -769,6 +775,7 @@ def _scatter_to_tp_ranks(
     )
     dist = cast(Any, torch.distributed)
     global_src = dist.get_global_rank(group=self.tp_group, group_rank=src_rank)
+    need_host_sync = False
     if self.tp_rank == src_rank:
         if not splits:
             raise RuntimeError("source TP rank must provide tensor splits")
@@ -779,22 +786,33 @@ def _scatter_to_tp_ranks(
             )
         for peer_rank, shard in enumerate(splits):
             if peer_rank == src_rank:
-                output.copy_(shard, non_blocking=True)
+                if shard.data_ptr() != output.data_ptr():
+                    output.copy_(shard, non_blocking=True)
+                if output.device.type == "cuda" and shard.device.type != "cuda":
+                    need_host_sync = True
                 continue
-            send_buffer = torch.empty(output_shape, dtype=dtype, device=device)
-            send_buffer.copy_(shard, non_blocking=True)
-            if send_buffer.device.type == "cuda":
-                torch.cuda.current_stream(send_buffer.device).synchronize()
+            if (
+                device.type == "cuda"
+                and shard.device == device
+                and shard.dtype == dtype
+                and shard.is_contiguous()
+            ):
+                send_buffer = shard
+            else:
+                send_buffer = torch.empty(output_shape, dtype=dtype, device=device)
+                send_buffer.copy_(shard, non_blocking=True)
+                if send_buffer.device.type == "cuda" and shard.device.type != "cuda":
+                    torch.cuda.current_stream(send_buffer.device).synchronize()
             dist.send(
                 send_buffer,
                 dst=dist.get_global_rank(group=self.tp_group, group_rank=peer_rank),
                 group=self.tp_group,
             )
-            if send_buffer.device.type == "cuda":
+            if send_buffer.device.type == "cuda" and shard.device.type != "cuda":
                 torch.cuda.synchronize(send_buffer.device)
     else:
         dist.recv(output, src=global_src, group=self.tp_group)
-    if output.device.type == "cuda":
+    if need_host_sync and output.device.type == "cuda":
         torch.cuda.synchronize(output.device)
     return output
 
@@ -881,22 +899,13 @@ def _validate_local_pretrained_tasks(
         )
 
 
-def _optimized_load_weights_hf_to_megatron(
+def _sequential_load_weights_hf_to_megatron(
     self: MegatronModelBridge,
     hf_pretrained: Any,
-    megatron_model: Any,
+    megatron_model: list[Any],
+    tasks: list[Any],
     allowed_mismatched_params: list[str] | None = None,
 ) -> list[Any]:
-    if not isinstance(megatron_model, list):
-        megatron_model = [megatron_model]
-    with contextlib.ExitStack() as stack:
-        if hasattr(megatron_model[0], "hide_teacher_model"):
-            stack.enter_context(megatron_model[0].hide_teacher_model())
-        if hasattr(megatron_model[0], "hide_loss_modules"):
-            stack.enter_context(megatron_model[0].hide_loss_modules())
-        tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
-        _validate_local_pretrained_tasks(self, megatron_model, tasks)
-        tasks = _prepare_nonuniform_expert_tasks(tasks)
     hf_state_dict = hf_pretrained.state
     raw_cache = load_unique_hf_keys_once(
         tasks,
@@ -955,6 +964,57 @@ def _optimized_load_weights_hf_to_megatron(
         torch.cuda.synchronize()
     self._broadcast_shared_embeddings(_shared_embedding_broadcast_model(megatron_model))
     return megatron_model
+
+
+def _optimized_load_weights_hf_to_megatron(
+    self: MegatronModelBridge,
+    hf_pretrained: Any,
+    megatron_model: Any,
+    allowed_mismatched_params: list[str] | None = None,
+) -> list[Any]:
+    if not isinstance(megatron_model, list):
+        megatron_model = [megatron_model]
+    with contextlib.ExitStack() as stack:
+        if hasattr(megatron_model[0], "hide_teacher_model"):
+            stack.enter_context(megatron_model[0].hide_teacher_model())
+        if hasattr(megatron_model[0], "hide_loss_modules"):
+            stack.enter_context(megatron_model[0].hide_loss_modules())
+        tasks = self.build_conversion_tasks(hf_pretrained, megatron_model)
+        _validate_local_pretrained_tasks(self, megatron_model, tasks)
+        tasks = _prepare_nonuniform_expert_tasks(tasks)
+
+    from art.megatron.runtime._fast_weight_loader import (
+        fast_load_prepared_weights_hf_to_megatron,
+        fast_weight_load_enabled,
+    )
+
+    hf_state_dict = hf_pretrained.state
+    source = getattr(hf_state_dict, "source", None)
+    key_to_filename = (
+        getattr(source, "key_to_filename_map", None) if source is not None else None
+    )
+    source_path = getattr(source, "path", None) if source is not None else None
+    if (
+        fast_weight_load_enabled()
+        and key_to_filename is not None
+        and source_path is not None
+    ):
+        return fast_load_prepared_weights_hf_to_megatron(
+            self,
+            hf_pretrained,
+            megatron_model,
+            tasks,
+            allowed_mismatched_params=allowed_mismatched_params,
+            key_to_filename=key_to_filename,
+            source_path=source_path,
+        )
+    return _sequential_load_weights_hf_to_megatron(
+        self,
+        hf_pretrained,
+        megatron_model,
+        tasks,
+        allowed_mismatched_params=allowed_mismatched_params,
+    )
 
 
 def install_art_bridge_runtime_patches() -> None:
